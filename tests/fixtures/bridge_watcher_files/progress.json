@@ -1,0 +1,15 @@
+{
+  "count": 2,
+  "persona": "nell",
+  "phase": "stopping",
+  "pid": 4242,
+  "pid_token": "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456",
+  "reason": "user_stop",
+  "requested_at": "2026-10-19T21:00:00.000000+00:00",
+  "tasks": [
+    "background job: compaction",
+    "chat reply"
+  ],
+  "updated_at": "2026-10-19T21:00:01.000000+00:00",
+  "version": 1
+}

@@ -62,14 +62,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from brain.health.anomaly import BrainAnomaly
-from brain.health.attempt_heal import (
+from brain.health.attempt_heal import _classify_cause, _filename_safe_timestamp
+from brain.health.jsonl_reader import JsonlLineError, _parse_lines
+from brain.utils.atomic_write import (
     _REPLACE_RETRY_SLEEP_S,
-    _classify_cause,
-    _filename_safe_timestamp,
     _replace_with_retry,
     save_with_backup_text,
 )
-from brain.health.jsonl_reader import JsonlLineError, _parse_lines
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
 
@@ -560,7 +559,7 @@ def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: 
         index, bak = chosen_bak
         raw, _sig = _read_bytes(bak)
         data = _check(raw, expect, validate)
-        _replace_with_retry(bak, path)
+        _replace_with_retry(bak, path)  # atomic-write: ok -- restores a finished backup file over the live one, a rename of a finished file (the heal), not a write
         return data, f"restored_from_bak{index}", detail
     except (FileNotFoundError, _BadContentError):
         # the candidate was rotated away or rewritten (a save that took no heal sidecar): someone else acted
@@ -649,7 +648,7 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
         try:
             _seam("before_quarantine_backup", corrupt)
             _expect_unchanged(corrupt, csig)
-            _replace_with_retry(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))
+            _replace_with_retry(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))  # atomic-write: ok -- moves a corrupt backup aside to a .corrupt name, a rename of a finished file (the heal), not a write
         except _ChangedError:
             logger.warning("backup %s changed during the heal; left alone", corrupt)
         except OSError:

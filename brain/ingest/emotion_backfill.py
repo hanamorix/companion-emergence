@@ -111,6 +111,14 @@ def _today_str(now: _datetime) -> str:
     return now.astimezone().strftime("%Y-%m-%d")
 
 
+def _budget_allows(persona_dir: Path, *, now: _datetime, cap: int) -> bool:
+    """Read-only: True while today's count is under ``cap`` (#473: checked before a call, charged after it)."""
+    raw = read_json(_budget_path(persona_dir), default=dict, recover=Recovery.CONTENT, expect=dict)
+    if raw.get("date") != _today_str(now):
+        return cap > 0
+    return int(raw.get("count", 0)) < cap
+
+
 def _consume_budget(persona_dir: Path, *, now: _datetime, cap: int) -> bool:
     """Return True and decrement if under cap; False if exhausted."""
     path = _budget_path(persona_dir)
@@ -192,6 +200,10 @@ def _make_default_tagger(provider: LLMProvider | None, persona_dir: Path | None 
             raw = json.loads(raw_text)
             return _normalize(raw, vocab)
         except Exception as exc:  # noqa: BLE001
+            from brain.bridge.cli_throttle import ThrottleDeferred
+
+            if isinstance(exc, ThrottleDeferred):
+                raise  # #456/#473: "not now": the run stops here, this memory stays untagged and uncharged
             logger.warning("emotion_backfill: default tagger error: %s", exc)
             return {}
 
@@ -434,9 +446,12 @@ def run_emotion_backfill(
                         "emotion_backfill: throttle slot unavailable — "
                         "deferring; cursor preserved for next pass"
                     )
-                    break
+                    # #487: RETURN, not break: falling through would run the completion tail and mark a run
+                    # that stopped part-way `complete`, leaving the rest untagged forever.
+                    return state
 
-                if not _consume_budget(persona_dir, now=now_dt, cap=cap):
+                # #473: check the budget now (read-only); charge it after a tagger call that was not refused.
+                if not _budget_allows(persona_dir, now=now_dt, cap=cap):
                     state = replace(state, status="deferred_to_next_day")
                     _save_state(persona_dir, state)
                     logger.info(
@@ -448,9 +463,13 @@ def run_emotion_backfill(
 
                 try:
                     raw_emotions = tagger_fn(memory)
+                except _cli_throttle.ThrottleDeferred:
+                    raise  # #456/#473: "not now": state, cursor and budget stay as they are
                 except Exception as exc:  # noqa: BLE001
+                    _consume_budget(persona_dir, now=now_dt, cap=cap)
                     logger.warning("emotion_backfill: tagger error on %s: %s", memory.id, exc)
                     continue
+                _consume_budget(persona_dir, now=now_dt, cap=cap)
 
                 filtered = _normalize(raw_emotions, vocab)
                 if not filtered:

@@ -2171,7 +2171,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
- "libc",
  "minisign-verify",
  "nell_shortcut",
  "reqwest 0.12.28",
@@ -2184,7 +2183,6 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "tokio",
- "windows 0.58.0",
 ]
 
 [[package]]

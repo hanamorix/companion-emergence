@@ -506,8 +506,6 @@ def sync_file() -> None:
     unreadable: toml_io.TomlRead | None = None
     try:
         with locked_within(path, dev_constants.SETTINGS_FILE_LOCK_WAIT_S):
-            # Every writer of the file holds this lock, so a temp file of the writer's shape is a crashed write's leftover.
-            toml_io.remove_orphan_temp_files(path)
             res = toml_io.read_toml_result(path)
             if res.outcome in ("damaged", "io"):
                 unreadable = res

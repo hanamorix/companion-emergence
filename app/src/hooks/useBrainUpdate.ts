@@ -69,6 +69,11 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** True while a brain update (check, apply or the switch back) runs (#456: the crash watchdog stays out of it). */
+export function brainUpdateInFlight(): boolean {
+  return shared.busy;
+}
+
 /** Reset for test isolation — never call in production code. */
 export function _resetBrainUpdateForTests(): void {
   shared = { state: { kind: "idle" }, busy: false };

@@ -14,6 +14,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { modelRejectionMessage, type ModelFallbackInfo } from "./lib/friendlyChatError";
 import { isCheckFreeAlias } from "./lib/modelId";
+import { REQUEST_TIMEOUT_MS } from "./lib/requestTimeout";
 
 export interface BridgeCredentials {
   url: string;        // http base — for fetch() calls
@@ -204,6 +205,8 @@ export interface PersonaState {
    *  until the user fixes the file (#462). Null/absent when there is nothing to say. Optional so older bridge builds degrade to
    *  no notice. */
   tunables_notice?: TunablesNotice | null;
+  /** #456 (Q6): the supervisor's state ("restarted" with its error, or "failed"); absent on older bridges. */
+  supervisor?: SupervisorInfo | null;
 }
 
 /** See `PersonaState.tunables_notice`. */
@@ -326,9 +329,9 @@ export async function newSession(persona: string): Promise<string> {
  * treats a throw the same as null (transient network flake).
  *
  * Part of the F-201 sticky-session reattach: combined with the
- * server-side hydration path and the non-destructive shutdown drain,
- * this lets Cmd-Q + reopen pick up mid-thread instead of starting a
- * fresh session every cold start.
+ * server-side hydration path (a bridge stop leaves the session buffers
+ * on disk), this lets Cmd-Q + reopen pick up mid-thread instead of
+ * starting a fresh session every cold start.
  */
 export async function fetchActiveSession(persona: string): Promise<string | null> {
   const r = await bridgeFetch(persona, (creds) =>
@@ -466,51 +469,13 @@ export async function closeSession(
   return (await r.json()) as CloseSessionResponse;
 }
 
-// ── Bridge restart support (v0.0.14) ───────────────────────────────────
-
-/**
- * Close whichever session the bridge currently has open.
- *
- * Used by the restart-bridge flow as the "safe path" step: looks up the
- * active session, closes it (commits buffer + snapshots memories), then
- * returns. Returns a synthetic 204 when there's nothing to close so the
- * caller can treat "no active session" the same as a successful close
- * without parsing a body. Per spec §6.2 the restart hook treats any 4xx
- * from the underlying close as success too — only 5xx + timeouts force
- * escalation — so this helper deliberately resolves rather than throws
- * on non-2xx, returning the raw Response for the hook to inspect.
- */
-export async function closeActiveSession(
-  persona: string,
-  signal?: AbortSignal,
-): Promise<Response> {
-  let sessionId: string | null = null;
-  try {
-    sessionId = await fetchActiveSession(persona);
-  } catch {
-    // Bridge can't tell us — fall through, hook proceeds to shutdown.
-    return new Response(null, { status: 204 });
-  }
-  if (sessionId === null) {
-    return new Response(null, { status: 204 });
-  }
-  return bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/sessions/close`, {
-      method: "POST",
-      headers: authHeaders(creds),
-      body: JSON.stringify({ session_id: sessionId }),
-      signal,
-    }),
-  );
-}
-
 /**
  * Extract memories from a session's live buffer without deleting the buffer.
  *
  * Non-destructive variant of closeSession: uses a cursor sidecar to extract
  * only turns added since the previous snapshot. The raw replay buffer is
  * preserved on disk so a future close or finalise pass can still commit it.
- * Use this wherever replay buffer preservation is required (app close, restart).
+ * Use this wherever replay buffer preservation is required (app close).
  */
 export async function snapshotSession(
   persona: string,
@@ -536,70 +501,118 @@ export async function snapshotSession(
   return (await r.json()) as CloseSessionResponse;
 }
 
-/**
- * Snapshot whichever session the bridge currently has open, without closing it.
- *
- * Non-destructive variant of closeActiveSession: looks up the active session
- * and snapshots it (buffer preserved). Returns a synthetic 204 when there is
- * nothing to snapshot so the caller can treat "no active session" identically
- * to a successful snapshot.
- */
-export async function snapshotActiveSession(
-  persona: string,
-  signal?: AbortSignal,
-): Promise<Response> {
-  let sessionId: string | null = null;
-  try {
-    sessionId = await fetchActiveSession(persona);
-  } catch {
-    return new Response(null, { status: 204 });
-  }
-  if (sessionId === null) {
-    return new Response(null, { status: 204 });
-  }
-  return bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/sessions/snapshot`, {
-      method: "POST",
-      headers: authHeaders(creds),
-      body: JSON.stringify({ session_id: sessionId }),
-      signal,
-    }),
-  );
-}
+// ── Bridge restart support (v0.0.14) ───────────────────────────────────
 
 /**
- * Trigger bridge graceful shutdown. Returns 202 immediately; the actual
- * 30s drain runs server-side via SIGTERM/lifespan teardown. Returns the
- * raw Response so the caller can distinguish 202 (scheduled) from a
- * network error (bridge already gone — also a valid "shutdown complete"
- * signal per spec §6.4).
+ * Ask the bridge to stop (#456). 202: the stop began. 503 `{"code": "bridge_stopping"}`: it had begun already. The
+ * stop itself waits for everything running to finish (no time limit); follow it with `readBridgeShutdown` and
+ * `bridgeStatus`, never over HTTP (the listener closes once the stop begins). `reason` is "app_restart" for the
+ * app's restarts; none = the bridge records "manual_restart".
  */
 export async function shutdownBridge(
   persona: string,
   signal?: AbortSignal,
+  reason?: "app_restart" | "user_stop",
 ): Promise<Response> {
   return bridgeFetch(persona, (creds) =>
     fetch(`${creds.url}/supervisor/shutdown`, {
       method: "POST",
       headers: authHeaders(creds),
+      body: reason ? JSON.stringify({ reason }) : undefined,
       signal,
     }),
   );
 }
 
 /**
- * Tauri SIGKILL fallback for the restart-bridge flow. Reads pid from
- * bridge.json, sends SIGKILL (or TerminateProcess on Windows), waits
- * 500ms for OS reap, then re-spawns via ensure_bridge_running. Rejects
- * with a structured error string when bridge.json lacks the pid field
- * (older bridges) — the UI shows the message verbatim.
+ * The forced path (#456 D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
+ * started), then the normal start, inside Rust. `skipHardExitRequest`: after a hard exit the bridge ignored, do not
+ * ask it again. `startAfter` false (a service install, #456 review M4): only end the bridge. `expected` (the watched
+ * bridge, review S8): the helper kills only that bridge, else rejects with `bridge_changed`. Rejects with the helper's
+ * error (or `force_restart_timeout` when the kill is still running).
  */
-export async function invokeForceRestart(persona: string): Promise<void> {
+export async function invokeForceRestart(
+  persona: string,
+  skipHardExitRequest = false,
+  startAfter = true,
+  expected?: { pid: number; pid_token: string | null },
+): Promise<void> {
   try {
-    await invoke<void>("force_restart_bridge", { persona });
+    await invoke<void>("force_restart_bridge", {
+      persona,
+      skipHardExitRequest,
+      startAfter,
+      pid: expected?.pid ?? null,
+      pidToken: expected?.pid_token ?? null,
+    });
   } finally {
     // The respawned bridge writes a new port and token to bridge.json (#365).
     resetBridgeCredentialCache(persona);
+  }
+}
+
+/** The stop progress record of the current bridge (#456; tests/fixtures/bridge_watcher_files/progress.json). */
+export interface BridgeShutdown {
+  version?: number;
+  pid: number;
+  pid_token: string | null;
+  persona?: string | null;
+  phase?: string | null;
+  requested_at?: string | null;
+  reason?: string | null;
+  tasks: string[];
+  count?: number | null;
+  updated_at?: string | null;
+}
+
+/** The progress record of the bridge bridge.json names, or null (no stop recorded, or a record of another process). */
+export async function readBridgeShutdown(persona: string): Promise<BridgeShutdown | null> {
+  return invoke<BridgeShutdown | null>("read_bridge_shutdown", { persona });
+}
+
+/** Ask the current bridge (its pid + identity token) for a hard exit (#456 D17). With ``expected`` (the bridge being
+ *  watched) the request is refused with `bridge_changed` when bridge.json names another bridge now (review S8). */
+export async function requestBridgeHardExit(
+  persona: string,
+  expected?: { pid: number; pid_token: string | null },
+): Promise<void> {
+  await invoke<void>("request_bridge_hard_exit", { persona, pid: expected?.pid ?? null, pidToken: expected?.pid_token ?? null });
+}
+
+/** The supervisor's state (#456 Q6): "running" | "restarted" | "failed" | "stopped" | "starting". */
+export interface SupervisorInfo {
+  state: string;
+  restarts: number;
+  last_error: string | null;
+  last_error_at: string | null;
+}
+
+/** `nell supervisor status --json` (#456; tests/fixtures/bridge_watcher_files/status.json). */
+export interface BridgeStatus {
+  alive: "alive" | "gone" | "unknown";
+  legacy?: boolean;
+  proven?: boolean;
+  pid?: number | null;
+  pid_token?: string | null;
+  identity?: string | null;
+  phase?: string | null;
+  stop_reason?: string | null;
+  stop_requested_at?: string | null;
+  stop_intent?: { state: string; pid: number; pid_token: string | null; reason?: string } | null;
+  remaining?: { count: number | null; tasks: string[] | null } | null;
+  client_origin?: string | null;
+  service_installed?: boolean;
+  recovery_needed?: boolean;
+  supervisor?: SupervisorInfo | null;
+  kill_bound_s?: number;
+}
+
+/** The bridge's status from files and process checks only (no HTTP). A timeout or failure is "unknown". */
+export async function bridgeStatus(persona: string): Promise<BridgeStatus> {
+  try {
+    return await invoke<BridgeStatus>("bridge_status", { persona });
+  } catch {
+    return { alive: "unknown" };
   }
 }
 
@@ -677,13 +690,21 @@ export interface BridgeHealth {
 /** Lightweight /health probe used by the restart hook's poll loop and the
  *  boot-time version handshake.  The `version` field is present from v0.0.33+
  *  (bridge V2 handshake); older bridges omit it. */
-export async function fetchHealth(persona: string): Promise<BridgeHealth> {
-  const r = await bridgeFetch(persona, (creds) =>
-    fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds) }),
-    REPLAYABLE,
-  );
-  if (!r.ok) throw new Error(`/health ${r.status}`);
-  return (await r.json()) as BridgeHealth;
+export async function fetchHealth(persona: string, signal?: AbortSignal): Promise<BridgeHealth> {
+  // #456 review: a wedged bridge can accept the connection and never answer; without a caller's signal the probe is
+  // cut after REQUEST_TIMEOUT_MS.
+  const own = signal ? null : new AbortController();
+  const timer = own ? setTimeout(() => own.abort(), REQUEST_TIMEOUT_MS) : undefined;
+  try {
+    const r = await bridgeFetch(persona, (creds) =>
+      fetch(`${creds.url}/health`, { headers: authOnlyHeaders(creds), signal: signal ?? own?.signal }),
+      REPLAYABLE,
+    );
+    if (!r.ok) throw new Error(`/health ${r.status}`);
+    return (await r.json()) as BridgeHealth;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** The chat model: one of the picker's words or a full model id (it starts with "claude-"). */

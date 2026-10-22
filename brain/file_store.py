@@ -1,7 +1,7 @@
 """General (non-image) content-addressable file store.
 
-Mirrors :mod:`brain.images`'s idempotent ``tmp`` + ``os.replace`` + dedup
-pattern, but for arbitrary (non-image) uploads that a user hands the
+Shares :func:`brain.utils.atomic_write.save_blob_once` with :mod:`brain.images`
+(idempotent atomic write + dedup), but for arbitrary (non-image) uploads that a user hands the
 companion so she can read them via the ``read_file`` MCP tool.
 
 Content-addressable layout: ``<persona_dir>/files/<sha256>``.
@@ -22,13 +22,12 @@ Because the on-disk key is pure content sha, dedup is by content alone.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from brain import tunables
+from brain.utils.atomic_write import save_blob_once
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -86,30 +85,13 @@ def file_path(persona_dir: Path, sha: str) -> Path:
 def save_file_bytes(persona_dir: Path, data: bytes) -> FileRecord:
     """Save ``data`` content-addressably under ``persona_dir/files/``.
 
-    Atomic via a unique per-writer ``.new`` tmp + ``os.replace``. If the
+    Atomic through :func:`brain.utils.atomic_write.save_blob_once`. If the
     target already exists with matching sha (deduplication), no write is
     performed and the existing record is returned.
     """
     sha = compute_sha(data)
     target = file_path(persona_dir, sha)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        return FileRecord(sha=sha, size_bytes=len(data))
-    # Unique tmp path per writer so identical concurrent uploads of the
-    # same sha don't race on a shared `<sha>.new` file. The pid + uuid
-    # suffix disambiguates threads + processes; the final `os.replace` is
-    # atomic so the target reflects exactly one writer.
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new")
-    try:
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
-    except (FileNotFoundError, OSError):
-        # If a concurrent writer beat us to it, the target should now
-        # exist with the same sha (content-addressed). Fall through to a
-        # final-state check before re-raising.
-        if target.exists():
-            tmp.unlink(missing_ok=True)
-            return FileRecord(sha=sha, size_bytes=len(data))
-        tmp.unlink(missing_ok=True)
-        raise
+    # The shared content-addressed blob writer (the same one brain.images uses): dedup by name, a unique temp per
+    # writer, fsync, a retried atomic replace, and success when a concurrent writer of the same content wins.
+    save_blob_once(target, data)
     return FileRecord(sha=sha, size_bytes=len(data))

@@ -20,11 +20,12 @@ interface Props {
 }
 
 const LABELS: Record<RestartState, string> = {
-  idle: "End conversation and restart",
-  closing: "Ending conversation…",
-  shutting_down: "Shutting bridge down…",
-  waiting_for_health: "Waiting for bridge to come back…",
-  forcing: "Bridge not responding — forcing restart…",
+  idle: "Restart the brain",
+  requesting: "Asking the brain to stop…",
+  stopping: "Waiting for the brain to finish…",
+  forcing: "The brain is not answering, ending it…",
+  starting: "Starting the brain…",
+  waiting_for_health: "Waiting for the brain to come back…",
   reconnecting: "Reconnecting…",
   success: "Restarted ✓",
   failed: "Retry",
@@ -66,7 +67,7 @@ export function RestartBridgeButton({ persona, currentMode }: Props) {
             wordBreak: "break-word",
           }}
         >
-          Graceful restart gave up: {fellThrough}
+          Had to end the brain: {fellThrough}
         </div>
       )}
       {state === "failed" && errorDetail && (

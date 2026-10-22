@@ -257,12 +257,14 @@ def test_write_toml_text_creates_the_parent_directory(tmp_path: Path) -> None:
 
 
 def test_write_toml_text_fsyncs_before_the_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.utils import atomic_write
+
     order: list[str] = []
-    real_fsync, real_replace = os.fsync, toml_io._replace_with_retry
+    real_fsync, real_replace = os.fsync, atomic_write._replace_with_retry
     monkeypatch.setattr(toml_io.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
-    monkeypatch.setattr(toml_io, "_replace_with_retry", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
+    monkeypatch.setattr(atomic_write, "_replace_with_retry", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
     toml_io.write_toml_text(tmp_path / "a.toml", b"a = 1\n")
-    assert order == ["fsync", "replace"]
+    assert order[:2] == ["fsync", "replace"]  # the data is on disk before the replace; the folder fsync comes after
 
 
 def test_write_toml_text_can_skip_the_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,10 +274,10 @@ def test_write_toml_text_can_skip_the_fsync(tmp_path: Path, monkeypatch: pytest.
     assert calls == []
 
 
-def test_the_replace_is_the_same_implementation_json_io_uses() -> None:
-    from brain.health import attempt_heal, json_io
+def test_the_write_is_the_shared_atomic_writer() -> None:
+    from brain.utils import atomic_write
 
-    assert toml_io._replace_with_retry is attempt_heal._replace_with_retry is json_io._replace_with_retry
+    assert toml_io.save_bytes_atomic is atomic_write.save_bytes_atomic
 
 
 def test_write_toml_text_removes_the_temp_file_when_the_replace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,7 +287,9 @@ def test_write_toml_text_removes_the_temp_file_when_the_replace_fails(tmp_path: 
     def boom(src: Path, dst: Path) -> None:
         raise PermissionError("held open")
 
-    monkeypatch.setattr(toml_io, "_replace_with_retry", boom)
+    from brain.utils import atomic_write
+
+    monkeypatch.setattr(atomic_write, "_replace_with_retry", boom)
     with pytest.raises(PermissionError):
         toml_io.write_toml_text(p, b"new = 2\n")
     assert p.read_bytes() == b"old = 1\n"
@@ -321,29 +325,6 @@ def test_write_toml_text_replaces_a_dangling_link_as_before(tmp_path: Path) -> N
     toml_io.write_toml_text(link, b"new = 2\n")
     assert not link.is_symlink() and link.read_bytes() == b"new = 2\n"
     assert not (tmp_path / "nowhere").exists()
-
-
-def test_remove_orphan_temp_files_removes_only_the_writers_leftovers(tmp_path: Path) -> None:
-    """A crash between the temp write and the replace leaves ``.<name>.<pid>.<hex>.tmp`` behind; only that shape goes."""
-    p = tmp_path / "tunables.toml"
-    p.write_bytes(b"a = 1\n")
-    orphans = [tmp_path / ".tunables.toml.4242.deadbeef.tmp", tmp_path / ".tunables.toml.7.0a1b2c3d.tmp"]
-    keep = [
-        tmp_path / ".tunables.toml.notes.tmp",  # not the writer's shape
-        tmp_path / ".other.toml.4242.deadbeef.tmp",  # another file's temp
-        tmp_path / "tunables.toml.bak",
-        tmp_path / ".tunables.toml.4242.deadbeef.tmp.keep",
-    ]
-    for f in [*orphans, *keep]:
-        f.write_bytes(b"x")
-    assert toml_io.remove_orphan_temp_files(p) == 2
-    assert not any(f.exists() for f in orphans)
-    assert all(f.exists() for f in keep) and p.read_bytes() == b"a = 1\n"
-    assert toml_io.remove_orphan_temp_files(p) == 0
-
-
-def test_remove_orphan_temp_files_is_quiet_when_the_folder_is_missing(tmp_path: Path) -> None:
-    assert toml_io.remove_orphan_temp_files(tmp_path / "nope" / "tunables.toml") == 0
 
 
 def test_a_read_result_carries_no_unused_text_field() -> None:

@@ -18,7 +18,6 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import (
     Recovery,
     append_jsonl,
@@ -28,6 +27,7 @@ from brain.health.json_io import (
     write_json,
     write_jsonl,
 )
+from brain.utils.atomic_write import fsync_dir, save_with_backup_text
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -236,7 +236,7 @@ def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> None:
-    """Atomically write the successor pointer (tmp + fsync + os.replace). Written
+    """Atomically write the successor pointer (through the shared atomic writer). Written
     under the compaction lock BEFORE the old buffer is deleted, so the old sid never
     resolves to nothing."""
     _validate_session_id(session_id)
@@ -360,24 +360,6 @@ def _archive_read_order(persona_dir: Path, session_id: str) -> list[Path]:
     return paths
 
 
-def _fsync_dir(path: Path) -> None:
-    """fsync a directory so a newly-created entry is durable (crash-mid-roll
-    protection, C11). POSIX-only — Windows has no O_DIRECTORY and raises; guarded
-    like brain/health/attempt_heal.py so Windows CI does not break."""
-    if os.name != "posix":
-        return
-    try:
-        dir_fd = os.open(str(path), os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
-
-
 def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> int:
     """Append ``records`` to the conversation archive, fsync, return byte count.
 
@@ -417,7 +399,7 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
 
     written = append_jsonl(active_path, data, fsync=True)
     if is_new_segment:
-        _fsync_dir(d)
+        fsync_dir(d)
     return written
 
 
@@ -470,7 +452,7 @@ def write_archive_marker(persona_dir: Path, session_id: str, key: str) -> None:
     if is_new:
         # fsync the containing dir so the new sidecar's directory entry is durable
         # (crash-mid-create), matching append_archive's new-segment durability.
-        _fsync_dir(path.parent)
+        fsync_dir(path.parent)
 
 
 def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
@@ -480,23 +462,6 @@ def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
     _validate_session_id keeps it inside the dir."""
     _validate_session_id(session_id)
     return _active_conversations_dir(persona_dir) / f"{session_id}.compacting"
-
-
-def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists.
-
-    Delegates to state_file.pid_is_alive, which carries the Windows-safe
-    branch. NEVER use a raw ``os.kill(pid, 0)`` probe here: on Windows,
-    signal 0 is CTRL_C_EVENT, and probing a bogus pid delivers a real
-    Ctrl+C to our OWN console group (this aborted the whole pytest session
-    on windows-latest CI, and in production would interrupt whatever
-    console hosts the bridge). Lazy import: ingest is a lower layer than
-    bridge, so the dependency stays function-local."""
-    if pid <= 0:
-        return False
-    from brain.bridge.state_file import pid_is_alive
-
-    return pid_is_alive(pid)
 
 
 def acquire_compaction_lock(
@@ -511,7 +476,9 @@ def acquire_compaction_lock(
     (skip). The caller releases via release_compaction_lock in a finally.
     """
     path = _compacting_lock_path(persona_dir, session_id)
-    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
+    from brain import process_identity
+
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso(), "token": process_identity.own_token()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -525,7 +492,8 @@ def acquire_compaction_lock(
             holder_pid = int(holder.get("pid", -1))
         except (TypeError, ValueError):
             holder_pid = -1
-        if not _pid_alive(holder_pid):
+        holder_token = holder.get("token") if isinstance(holder.get("token"), str) else None
+        if holder_pid <= 0 or not process_identity.holder_alive(holder_pid, holder_token):
             reap = True
         else:
             try:

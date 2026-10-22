@@ -664,7 +664,7 @@ def test_cs2_g_the_call_node_oracle_one_over_fails_and_at_the_ceiling_passes(
 
 
 def test_cs4_json_io_has_no_second_atomic_writer_or_backup_rotation() -> None:
-    """One API: json_io.py writes through attempt_heal's save engine; the only deliberate duplicate is the heal (plan P11)."""
+    """One API: json_io.py writes through the shared save engine in brain.utils.atomic_write; the only deliberate duplicate is the heal (plan P11)."""
     src = (REPO / "brain" / "health" / "json_io.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     forbidden = {

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     acquire_compaction_lock,
@@ -627,6 +628,9 @@ def compact_conversation(
         fell_soft = False
         try:
             generated = _generate_validated_fold(provider, prompt)
+        except ThrottleDeferred:
+            # #456/#473: a refusal stores nothing (no fold, no note, no stand-in); the lock is released below.
+            raise
         except Exception:
             logger.exception(
                 "compaction: provider summarisation failed session=%s; falling back",
@@ -854,6 +858,8 @@ def _fold_into_section(
     fell_soft = False
     try:
         text = _generate_validated_fold(provider, prompt)
+    except ThrottleDeferred:
+        raise  # #456/#473: no fallback section on a refusal; the caller installs nothing
     except Exception:
         logger.exception("cascade: provider fold failed; using lossless-leaning fallback")
         text = None

@@ -489,26 +489,18 @@ def test_a_lock_timeout_skips_the_pass_and_writes_nothing(t, tmp_path, monkeypat
     assert any("not" in r.getMessage() for r in caplog.records)
 
 
-def test_sync_removes_the_temp_files_a_crashed_write_left_behind(t, tmp_path) -> None:
-    """Rev-4 review bycatch: a crash between the temp write and the replace leaves ``.tunables.toml.<pid>.<hex>.tmp``."""
+def test_a_write_removes_the_temp_a_killed_save_left_behind(t, tmp_path) -> None:
+    """The settings file is written by the shared atomic writer, which sweeps the dead-owner temps of the file it saves
+    (a killed save leaves ``tunables.toml.t<pid>-<hex>.new``); a file that is not such a temp is never touched."""
     t.register("a", 1, description="A.")
-    orphan = tmp_path / ".tunables.toml.4242.deadbeef.tmp"
+    dead_pid = 2**22 + 7  # above any pid the kernel hands out
+    orphan = tmp_path / f"tunables.toml.t{dead_pid}-0a1b2c3d4e5f.new"
     orphan.write_bytes(b"half a write")
-    other = tmp_path / ".tunables.toml.notes.tmp"
+    other = tmp_path / "tunables.toml.notes.new"
     other.write_bytes(b"not ours")
     t.sync_file()
     assert not orphan.exists() and other.exists()
     assert read_values(tmp_path) == {"a": 1}
-
-
-def test_sync_removes_orphans_even_when_nothing_else_needs_writing(t, tmp_path) -> None:
-    t.register("a", 1, description="A.")
-    t.sync_file()
-    orphan = tmp_path / ".tunables.toml.1.0a0a0a0a.tmp"
-    orphan.write_bytes(b"x")
-    before = _file(tmp_path).stat().st_mtime_ns
-    t.sync_file()
-    assert not orphan.exists() and _file(tmp_path).stat().st_mtime_ns == before
 
 
 def test_sync_never_raises_into_startup(t, tmp_path, monkeypatch) -> None:

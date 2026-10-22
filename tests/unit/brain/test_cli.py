@@ -86,6 +86,9 @@ def test_status_reports_persona_config_memory_and_bridge_state(
         ),
     )
     monkeypatch.setattr(cli.state_file, "pid_is_alive", lambda pid: pid == 12345)
+    # #456 (D22): a token-less record names a live bridge only when its command line proves it; this record stands
+    # for one, so the proof is patched to pass (the patched pid stands for the bridge process).
+    monkeypatch.setattr(cli.state_file, "prove_bridge_cmdline", lambda *a, **k: True)
 
     result = cli.main(["status", "--persona", "nell"])
 

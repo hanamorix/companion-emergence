@@ -1,6 +1,6 @@
 """P0 image-tool-route — brain.file_store (general non-image content store).
 
-Mirrors brain.images' idempotent tmp+os.replace+dedup pattern. The on-disk
+Shares brain.utils.atomic_write.save_blob_once (the idempotent atomic write + dedup) with brain.images. The on-disk
 name is the validated 64-hex content sha ONLY — no client filename/extension
 is ever a path component (path-traversal defense, C17).
 """

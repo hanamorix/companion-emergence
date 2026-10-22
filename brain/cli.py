@@ -133,7 +133,7 @@ def _status_handler(args: argparse.Namespace) -> int:
 
     state = state_file.read(persona_dir)
     if not persona_exists:
-        _print_bridge_status(state)
+        _print_bridge_status(state, persona_dir)
         return 1
 
     config = PersonaConfig.load(persona_dir / "persona_config.json")
@@ -151,17 +151,35 @@ def _status_handler(args: argparse.Namespace) -> int:
     else:
         print("memories_active: missing")
 
-    _print_bridge_status(state)
+    _print_bridge_status(state, persona_dir)
     return 0
 
 
-def _print_bridge_status(state: state_file.BridgeState | None) -> None:
+def _supervisor_status_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor status`; with --json, one machine-readable object for the desktop app (#456)."""
+    from brain.bridge import daemon
+
+    if getattr(args, "json", False):
+        print(json.dumps(daemon.status_dict(get_persona_dir(args.persona))))  # json-io: ok -- CLI output, not a file
+        return 0
+    return daemon.cmd_status(args)
+
+
+def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path) -> None:
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
         print("bridge: not running")
+        if state is not None and state_file.recovery_needed(persona_dir):
+            # C33 (#471): a record whose pid was cleared but whose stop was not clean.
+            print("recovery: needed on next bridge start")
         return
 
-    if state_file.pid_is_alive(state.pid):
+    live = state_file.bridge_liveness(state, persona_dir)
+    if live == state_file.UNKNOWN:
+        print("bridge: unknown (its process identity could not be read)")
+        print(f"pid: {state.pid}")
+        return
+    if live == state_file.ALIVE:
         print("bridge: running")
         print(f"pid: {state.pid}")
         print(f"port: {state.port or 'unknown'}")
@@ -219,7 +237,10 @@ def _service_backend_errors(backend: object) -> tuple[type[BaseException], ...]:
         if isinstance((exc := getattr(backend, name, None)), type)
         and issubclass(exc, BaseException)
     )
-    return found or (ValueError, RuntimeError)
+    # #456: an install refused while the bridge runs is reported like any other service error.
+    from brain.service.lifecycle import BridgeRunningError
+
+    return (*found, BridgeRunningError) if found else (ValueError, RuntimeError)
 
 
 def _render_service_config(
@@ -320,6 +341,12 @@ def _service_install_handler(args: argparse.Namespace) -> int:
     if backend is None:
         return 1
 
+    # #456 (C58 d): on a terminal, an install over a running bridge first stops it through the stop watcher.
+    from brain.bridge import daemon as _daemon
+    from brain.service import lifecycle as _lifecycle
+
+    _lifecycle.interactive_stop = lambda persona: _daemon._stop_before_service_change(persona, 180.0)
+
     try:
         nell_path = backend.resolve_nell_path(args.nell_path)
         if args.dry_run:
@@ -348,11 +375,22 @@ def _service_install_handler(args: argparse.Namespace) -> int:
 
 
 def _service_uninstall_handler(args: argparse.Namespace) -> int:
-    """Stop/remove the persona OS service."""
+    """Stop/remove the persona OS service.
+
+    #456 (C54): a running bridge is first asked to stop (the shutdown request and the stop watcher, with the hard-exit
+    offer on a terminal); without a terminal, a bridge still stopping after --timeout leaves the service installed.
+    """
     backend = _service_backend("uninstall")
     if backend is None:
         return 1
 
+    from brain.bridge import daemon as _daemon
+    from brain.service import lifecycle as _lifecycle
+
+    if _lifecycle.bridge_running(args.persona):
+        if not _daemon._stop_before_service_change(args.persona, float(getattr(args, "timeout", 180.0))):
+            print("service uninstall: the bridge is still stopping; the service stays installed", file=sys.stderr)
+            return 1
     try:
         service_path = backend.uninstall_service(persona=args.persona, keep_plist=args.keep_plist)
     except _service_backend_errors(backend) as exc:
@@ -1863,7 +1901,7 @@ def _personas_handler(args: argparse.Namespace) -> int:
         for n in names:
             pd = get_persona_dir(n)
             st = state_file.read(pd)
-            running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+            running = st is not None and state_file.bridge_liveness(st, pd) == state_file.ALIVE
             rows.append({"name": n, "bridge_running": running})
         print(json.dumps(rows, indent=2))
         return 0
@@ -1878,7 +1916,7 @@ def _personas_handler(args: argparse.Namespace) -> int:
     for n in names:
         pd = get_persona_dir(n)
         st = state_file.read(pd)
-        running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+        running = st is not None and state_file.bridge_liveness(st, pd) == state_file.ALIVE
         marker = "running" if running else "not running"
         print(f"{n:<{width}}  {marker}")
     return 0
@@ -1926,11 +1964,17 @@ def _drain_pass2_at_exit(persona_dir: Path) -> None:
     def _print_progress(done: int, total: int) -> None:
         print(f"pass-2: {done} of {total} done")
 
-    pass2_queue.drain_all_locked(
-        persona_dir,
-        on_progress=_print_progress,
-        time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
-    )
+    from brain.bridge.cli_throttle import ThrottleDeferred
+
+    try:
+        pass2_queue.drain_all_locked(
+            persona_dir,
+            on_progress=_print_progress,
+            time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
+        )
+    except ThrottleDeferred as exc:
+        # #473: a refused call ("not now", e.g. an expired login) leaves the rest queued for a later drain.
+        print(f"pass-2: stopped early ({exc}); the rest stays queued")
 
 
 def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool) -> None:
@@ -3046,7 +3090,6 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd_restart,
         cmd_run,
         cmd_start,
-        cmd_status,
         cmd_stop,
         cmd_tail,
         cmd_tail_log,
@@ -3098,12 +3141,41 @@ def _build_parser() -> argparse.ArgumentParser:
     s_stop = s_actions.add_parser("stop", help="Stop the bridge daemon.")
     _add_persona_arg(s_stop)
     s_stop.add_argument("--timeout", type=float, default=180.0)
-    s_stop.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_stop.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
+    s_stop.add_argument(
+        "--kill",
+        action="store_true",
+        help="end the bridge and every process it started without waiting for running work (identity-checked; a "
+        "bridge run by an OS service is first asked to hard-exit and given up to --timeout seconds before its service "
+        "manager stops it; the next start picks up anything left unfinished)",
+    )
+    s_stop.add_argument(
+        "--skip-hard-exit-request",
+        action="store_true",
+        help="with --kill: do not ask a service-run bridge for a hard exit first (used after a hard exit was ignored)",
+    )
+    s_stop.add_argument(
+        "--expect-pid",
+        type=int,
+        default=None,
+        help="with --kill: end the bridge only if it is still this pid (with --expect-token); used by the desktop app",
+    )
+    s_stop.add_argument(
+        "--expect-token",
+        default=None,
+        help="with --kill and --expect-pid: the identity token the bridge must still carry",
+    )
     s_stop.set_defaults(func=cmd_stop)
 
     s_status = s_actions.add_parser("status", help="Show bridge daemon status.")
     _add_persona_arg(s_status)
-    s_status.set_defaults(func=cmd_status)
+    s_status.add_argument(
+        "--json",
+        action="store_true",
+        help="print the status as one JSON object from the state files and process checks (no HTTP); "
+        "used by the desktop app",
+    )
+    s_status.set_defaults(func=_supervisor_status_handler)
 
     s_restart = s_actions.add_parser(
         "restart",
@@ -3113,7 +3185,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
     s_restart.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_restart.add_argument("--timeout", type=float, default=180.0)
-    s_restart.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_restart.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
     s_restart.set_defaults(func=cmd_restart)
 
     s_tail_events = s_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
@@ -3213,6 +3285,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-plist",
         action="store_true",
         help="Boot out the service but leave the plist file in place.",
+    )
+    svc_uninstall.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="how long to wait for a running bridge to stop before giving up (no terminal) or escalating",
     )
     svc_uninstall.set_defaults(func=_service_uninstall_handler)
 

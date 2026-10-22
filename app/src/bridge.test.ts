@@ -21,12 +21,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { REQUEST_TIMEOUT_MS } from "./lib/requestTimeout";
 import {
   acceptVoiceEdit,
   approvePendingWrite,
   closeSession,
   declinePendingWrite,
   fetchPersonaFeed,
+  fetchHealth,
   fetchPersonaState,
   getBridgeCredentials,
   invokeForceRestart,
@@ -242,6 +244,47 @@ describe("getBridgeCredentials", () => {
     await getBridgeCredentials("alice");
     const credentialReads = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "get_bridge_credentials");
     expect(credentialReads).toHaveLength(2);
+  });
+
+  it("(#456 review M1) a /health probe that never answers is cut after the request time limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const hang = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const sig = init?.signal;
+            if (sig?.aborted) return reject(new DOMException("aborted", "AbortError"));
+            sig?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      );
+      vi.stubGlobal("fetch", hang);
+      const probe = fetchHealth("alice");
+      const settled = vi.fn();
+      probe.then(settled, settled);
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS - 100);
+      expect(settled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(probe).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("(#456 C17 m) the forced path passes skipHardExitRequest to the kill helper command", async () => {
+    await invokeForceRestart("alice");
+    await invokeForceRestart("alice", true);
+    await invokeForceRestart("alice", true, false);
+    await invokeForceRestart("alice", true, true, { pid: 4242, pid_token: "linux:b:4242:1" });
+    const calls = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "force_restart_bridge");
+    expect(calls.map(([, args]) => args)).toEqual([
+      { persona: "alice", skipHardExitRequest: false, startAfter: true, pid: null, pidToken: null },
+      { persona: "alice", skipHardExitRequest: true, startAfter: true, pid: null, pidToken: null },
+      // #456 review M4: end only, for an install
+      { persona: "alice", skipHardExitRequest: true, startAfter: false, pid: null, pidToken: null },
+      // #456 review S8: kill only the watched bridge
+      { persona: "alice", skipHardExitRequest: true, startAfter: true, pid: 4242, pidToken: "linux:b:4242:1" },
+    ]);
   });
 });
 

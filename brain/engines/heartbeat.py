@@ -1157,6 +1157,10 @@ class HeartbeatEngine:
                 dry_run=dry_run,
                 anomalies_collector=anomalies_collector,
             )
+        except ThrottleDeferred as exc:
+            # #456: "not now": last_growth_at is not advanced, so growth stays due.
+            logger.info("growth tick deferred: %s", exc)
+            return (0, False, "deferred")
         except Exception as exc:
             logger.warning("growth tick raised; isolating: %.200s", exc)
             return (0, False, f"{type(exc).__name__}: {exc}"[:200])

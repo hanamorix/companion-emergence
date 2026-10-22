@@ -2,8 +2,8 @@
  * bridgeVersionCheck.ts — boot-time stale-bridge detection (V2 handshake).
  *
  * After `ensureBridgeRunning`, compares /health.version against the Tauri
- * app version.  On a mismatch: ONE automatic force-replace (invokeForceRestart
- * — kill-by-pid + reap + ensure, blocks until healthy).  Never loops — a
+ * app version.  On a mismatch: ONE automatic replace through the app's restart (#456: the old bridge is asked to
+ * stop and waited for, with the progress display and the hard-exit offer, then the new one starts).  Never loops: a
  * module-level flag guards the second attempt.
  *
  * Returns:
@@ -20,10 +20,10 @@
 import { getVersion } from "@tauri-apps/api/app";
 import {
   fetchHealth,
-  invokeForceRestart,
   type BridgeHealth,
   type BridgeOverlay,
 } from "./bridge";
+import { clearRestartState, restartBridge } from "./hooks/useRestartBridge";
 import { errString } from "./lib/errString";
 
 export type BridgeVersionResult =
@@ -129,15 +129,21 @@ export async function ensureBridgeCurrent(
     `[bridgeVersionCheck] stale bridge detected (bridge=${health.version ?? "unknown"}, app=${appVersion}) — replacing`,
   );
 
-  // 5. Force-replace: Tauri command kills by pid, reaps, re-ensures, blocks
-  //    until healthy.  Shutdown + ensureBridgeRunning can't replace a gracefully-
-  //    draining bridge (the old bridge answers /health 200 for up to 30s).
+  // 5. Replace through the app's restart (#456): the old bridge stops only once everything it runs has finished
+  //    (the user sees why and is offered a hard exit at 180 s), then the new bridge starts. A launch-time restart,
+  //    not one the user pressed: keep it off the Restart button.
   try {
-    await invokeForceRestart(persona);
+    const ok = await restartBridge(persona);
+    if (!ok) {
+      // The result alone ("unresolved") can't say why; keep the cause (#365).
+      console.warn("[bridgeVersionCheck] forced replace failed: the restart did not bring a bridge back");
+      return "version_mismatch_unresolved";
+    }
   } catch (e) {
-    // The result alone ("unresolved") can't say why; keep the cause (#365).
     console.warn(`[bridgeVersionCheck] forced replace failed: ${errString(e)}`);
     return "version_mismatch_unresolved";
+  } finally {
+    clearRestartState();
   }
 
   // 6. Recheck (normalised compare — same logic as step 3).

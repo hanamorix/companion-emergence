@@ -96,9 +96,14 @@ def _call_haiku(
         TIER_ATTUNEMENT_DETECTOR,
         timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
     )
+    from brain.bridge.cli_throttle import ThrottleDeferred
+
     pd: Path | None = Path(persona_dir) if isinstance(persona_dir, str) else persona_dir
     try:
         return provider.generate(user_message, system=system_prompt, persona_dir=pd)
+    except ThrottleDeferred:
+        # #456/#473: a refusal is "not now", not a failed call: no haiku_call_failed row, no decline output.
+        raise
     except Exception as exc:  # noqa: BLE001
         log.warning("attunement detector: claude CLI call failed: %s", exc)
         if pd is not None:

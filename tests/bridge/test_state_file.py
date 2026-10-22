@@ -90,6 +90,10 @@ def test_clean_shutdown_predicate(persona_dir: Path):
 
 
 def test_running_predicate_with_live_pid(persona_dir: Path):
+    # #456: a live pid counts as the bridge only with its identity token (a token-less, pre-PR record must also prove
+    # by command line that it is a bridge; tests/bridge/test_identity_readers.py covers that).
+    from brain import process_identity
+
     s = state_file.BridgeState(
         persona="test-persona",
         pid=os.getpid(),
@@ -98,6 +102,8 @@ def test_running_predicate_with_live_pid(persona_dir: Path):
         stopped_at=None,
         shutdown_clean=False,
         client_origin="cli",
+        pid_token=process_identity.own_token(),
+        identity="token",
     )
     state_file.write(persona_dir, s)
     assert state_file.is_running(persona_dir) is True

@@ -12,7 +12,7 @@ Public API:
     ingest_turn(persona_dir, turn) -> str
     close_session(persona_dir, session_id, *, store, hebbian, provider, ...) -> IngestReport
     close_stale_sessions(persona_dir, *, silence_minutes, store, ...) -> list[IngestReport]
-        Destructive shutdown-drain sweep — used by bridge teardown.
+        Destructive sweep; retained for explicit close callers (a bridge stop runs no sweep).
     extract_session_snapshot(persona_dir, session_id, *, store, hebbian, provider, ...) -> IngestReport
         Non-destructive cursor-driven snapshot — leaves buffer + cursor intact.
     snapshot_stale_sessions(persona_dir, *, silence_minutes, store, ...) -> list[IngestReport]

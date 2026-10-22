@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
-import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
-import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
+import { installNellCliSymlink, installSupervisorService, type InitResult } from "../../appConfig";
+import { stopBridgeThen } from "../../hooks/useRestartBridge";
+import type { PersonaState, ChatModel, PronounPreset, SupervisorInfo } from "../../bridge";
 import { getClientPlatform, platformLabel, detectInstallShape, supportsNellCliShortcut } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
@@ -187,18 +188,29 @@ export function ConnectionPanel({
 
   async function onInstallSupervisor() {
     setInstall({ kind: "running" });
+    // #456 (C58 d, review M4): the install refuses a running bridge, so the bridge is stopped through the restart's
+    // stop flow first (the same display and hard-exit offer), installed while stopped, then started again (through
+    // the new service).
+    const box: { result: InitResult | null } = { result: null };
     try {
-      const result = await installSupervisorService(persona);
-      if (result.success) {
-        setInstall({
-          kind: "ok",
-          detail: result.stdout.split("\n")[0] || "service installed",
-        });
+      const outcome = await stopBridgeThen(
+        persona,
+        async () => {
+          const result = await installSupervisorService(persona);
+          box.result = result;
+          if (!result.success) throw new Error(result.stderr || `exit ${result.exit_code}`);
+        },
+        { start: true },
+      );
+      const result = box.result;
+      if (!outcome.stopped) {
+        setInstall({ kind: "error", detail: `The brain could not be stopped for the install. ${outcome.error ?? ""}`.trim() });
+      } else if (result?.success && outcome.error) {
+        setInstall({ kind: "error", detail: `Installed, but the brain did not start again: ${outcome.error}` });
+      } else if (result?.success) {
+        setInstall({ kind: "ok", detail: result.stdout.split("\n")[0] || "service installed" });
       } else {
-        setInstall({
-          kind: "error",
-          detail: result.stderr || `exit ${result.exit_code}`,
-        });
+        setInstall({ kind: "error", detail: result?.stderr || outcome.error || `exit ${result?.exit_code}` });
       }
     } catch (e) {
       setInstall({ kind: "error", detail: errString(e) });
@@ -235,7 +247,7 @@ export function ConnectionPanel({
       <Row label="Heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
       <Row label="Privacy" value="Local-only" accent />
 
-      <StatusBanner mode={mode} stateError={stateError} persona={persona} />
+      <StatusBanner mode={mode} stateError={stateError} persona={persona} supervisor={state?.supervisor ?? null} />
 
       <Divider />
       <RecoverLauncher persona={persona} />
@@ -672,10 +684,13 @@ function StatusBanner({
   mode,
   stateError,
   persona,
+  supervisor = null,
 }: {
   mode: PersonaState["mode"];
   stateError: string | null;
   persona: string;
+  /** #456 (Q6): the brain's background loop restarted after an error, or stopped after repeated ones. */
+  supervisor?: SupervisorInfo | null;
 }) {
   // Pick the worst signal — bridge_down is more critical than provider_down.
   let kind: "warning" | "error" | null = null;
@@ -699,6 +714,18 @@ function StatusBanner({
     headline = "LLM provider unreachable.";
     detail =
       "Replies will fall back to a local backup voice. Check that `claude` is on PATH for the launchd agent.";
+  } else if (supervisor?.state === "failed") {
+    kind = "warning";
+    headline = "Background work stopped.";
+    detail =
+      "The brain's background work stopped after repeated errors. Chat still works; restart the brain to try again." +
+      (supervisor.last_error ? ` Last error: ${supervisor.last_error}` : "");
+  } else if (supervisor?.state === "restarted") {
+    kind = "warning";
+    headline = "Background work restarted.";
+    detail =
+      "The brain's background work hit an error and started again." +
+      (supervisor.last_error ? ` Error: ${supervisor.last_error}` : "");
   }
 
   if (kind === null) return null;

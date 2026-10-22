@@ -261,7 +261,7 @@ def _create_machine_id(path: Path) -> str:
                 return winner
             # A file is there but holds no valid id (empty, damaged): replace it
             # whole, so persistence is not lost for good on this machine.
-            os.replace(temp, path)
+            os.replace(temp, path)  # atomic-write: ok -- the machine id is an exclusive-create case: os.link arbitrates a race between processes (exactly one wins); this replace only overwrites an id file that holds no valid id
             return fresh
         try:
             os.link(temp, path)

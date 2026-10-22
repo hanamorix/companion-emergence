@@ -17,7 +17,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from brain.bridge.state_file import pid_is_alive
+from brain import process_identity
 from brain.health.json_io import read_json, write_json
 from brain.paths import get_home
 from brain.update.overlay_hook import BUNDLE_ID_FILE
@@ -98,7 +98,7 @@ def replace_retrying(src: Path, dst: Path) -> None:
     start-up (#302). Anything else, or a lock that outlasts the retries, raises."""
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            os.replace(src, dst)
+            os.replace(src, dst)  # atomic-write: ok -- replace_retrying is the C3 retried-rename helper that C3 folds into the shared one; a rename of a finished file, not a write
             return
         except PermissionError:
             if attempt == _RETRY_ATTEMPTS - 1:
@@ -116,16 +116,26 @@ def mark_in_use(root: Path | None = None) -> None:
         return
     marks = root / folder / IN_USE_DIR
     marks.mkdir(exist_ok=True)
-    (marks / str(os.getpid())).write_text("", encoding="utf-8")
+    # The file name stays the pid (older readers use only the name); its content is this process's identity (#472).
+    (marks / str(os.getpid())).write_text(process_identity.own_token() or "", encoding="utf-8")
 
 
 def in_use(folder: Path) -> bool:
-    """A live process runs `brain` from this folder (it wrote an .in-use marker)."""
-    # ponytail: a reused pid keeps a folder one prune longer — the safe direction.
+    """A live process runs `brain` from this folder (it wrote an .in-use marker). A marker with an identity token is
+    judged by it (#472); an empty one, from an older version, by its pid only (a reused pid keeps a folder one prune
+    longer: the safe direction)."""
     try:
-        return any(m.name.isdigit() and pid_is_alive(int(m.name)) for m in (folder / IN_USE_DIR).iterdir())
+        marks = [m for m in (folder / IN_USE_DIR).iterdir() if m.name.isdigit()]
     except OSError:
         return False
+    for m in marks:
+        try:
+            token = m.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            token = None
+        if process_identity.holder_alive(int(m.name), token):
+            return True
+    return False
 
 
 def activate(root: Path, entry: dict) -> None:
@@ -178,6 +188,9 @@ def overlay_lock(root: Path) -> Iterator[None]:
     observable empty; release removes it only if it still names this process."""
     root.mkdir(parents=True, exist_ok=True)
     path = root / LOCK_FILE
+    # #472: the lock file stays the bare pid (older readers parse it as an int); the holder's identity goes in a
+    # sidecar "<pid> <token>", trusted only while its pid equals the lock's.
+    side = root / (LOCK_FILE + ".token")
     me = str(os.getpid())
     tmp = root / f".lock.{me}.tmp"
     tmp.write_text(me, encoding="utf-8")
@@ -191,20 +204,35 @@ def overlay_lock(root: Path) -> Iterator[None]:
                     holder = int(path.read_text(encoding="utf-8").strip())
                 except (OSError, ValueError):
                     holder = 0
-                if holder and pid_is_alive(holder):
+                holder_token = None
+                try:
+                    side_pid, _, side_token = side.read_text(encoding="utf-8").strip().partition(" ")
+                    if side_pid == str(holder) and side_token:
+                        holder_token = side_token
+                except OSError:
+                    pass
+                if holder and process_identity.holder_alive(holder, holder_token):
                     raise OverlayBusy(f"an update is already running (pid {holder}; lock {path})") from None
                 # ponytail: best-effort stale takeover, like bridge.daemon.acquire_lock —
                 # two takers racing on the same dead lock at the same instant can still collide.
                 path.unlink(missing_ok=True)
+                side.unlink(missing_ok=True)
         else:
             raise OverlayBusy("could not take the overlay lock")
     finally:
         tmp.unlink(missing_ok=True)
     try:
+        side.write_text(f"{me} {process_identity.own_token() or ''}".strip(), encoding="utf-8")
+    except OSError:
+        pass  # without a sidecar the lock reads pid-only, as before
+    try:
         yield
     finally:
         try:
             if path.read_text(encoding="utf-8").strip() == me:
+                with contextlib.suppress(OSError):
+                    if side.read_text(encoding="utf-8").split()[0] == me:
+                        side.unlink()
                 path.unlink()
         except OSError:
             pass

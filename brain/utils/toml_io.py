@@ -13,7 +13,7 @@ Surface:
 * ``read_toml_result(path)``: never raises; ``outcome`` is ``ok``, ``missing``, ``empty``, ``damaged`` or ``io``.
 * ``read_toml_cached(path)``: strict, parsed again only when the file's ``(st_mtime_ns, st_size, st_ino)`` changes.
 * ``parse_toml(text)``, ``dumps_value(value)``, ``flatten_toml(data)``, ``write_toml_text(path, data)`` (atomic; writes
-  through a symbolic link), ``remove_orphan_temp_files(path)`` (the leftovers of a crashed write).
+  through a symbolic link).
 * :class:`TomlDocument`: the text of a file as lines. It edits a SINGLE-LINE ``key = value`` entry in place (only the value
   text changes; a trailing ``# comment``, every other line, the BOM and the file's own line endings stay byte for byte),
   inserts a new entry before the first ``[table]`` header, and reads or replaces the comment lines directly above an entry.
@@ -28,19 +28,17 @@ understand.
 
 from __future__ import annotations
 
-import contextlib
 import math
 import os
 import re
-import secrets
 import threading
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from brain.health.attempt_heal import _replace_with_retry
 from brain.health.json_io import _read_bytes
+from brain.utils.atomic_write import save_bytes_atomic
 
 _BOM = b"\xef\xbb\xbf"
 _REASON_CAP = 120
@@ -315,54 +313,18 @@ def _write_target(path: Path) -> Path:
     return path
 
 
-_TEMP_SUFFIX = re.compile(r"\.\d+\.[0-9a-f]{8}\.tmp$")
-
-
-def remove_orphan_temp_files(path: Path | str) -> int:
-    """Delete the temp files a crashed :func:`write_toml_text` left beside ``path``; return how many went.
-
-    A write crashing between its temp write and the replace leaves ``.<name>.<pid>.<8 hex>.tmp``. Only that exact shape for
-    THIS file is removed. The caller holds the file's lock (every writer of the settings file does), so no live write
-    owns a temp file at that moment. Best effort: a file that cannot be removed is skipped.
-    """
-    target = _write_target(Path(path))
-    prefix = f".{target.name}"
-    removed = 0
-    try:
-        names = [c for c in target.parent.iterdir() if c.name.startswith(prefix) and _TEMP_SUFFIX.fullmatch(c.name[len(prefix) :])]
-    except OSError:
-        return 0
-    for orphan in names:
-        try:
-            orphan.unlink()
-            removed += 1
-        except OSError:
-            continue
-    return removed
-
-
 def write_toml_text(path: Path | str, data: bytes, *, fsync: bool = True) -> None:
     """Atomically replace ``path`` with ``data`` (bytes: no newline translation, a BOM is kept as given).
 
-    A temp file in the same directory is written, flushed and (by default) fsynced BEFORE the replace, and the replace goes
-    through ``json_io``'s own ``_replace_with_retry`` (a transient Windows sharing violation is retried). The temp file is
-    removed when anything fails, so a reader sees the old file or the new one whole, never a torn one. A symbolic link to an
-    existing file is written through (the link stays a link; the temp file is made beside the target).
+    The write goes through the product's one atomic writer, ``brain.utils.atomic_write.save_bytes_atomic`` (a unique temp in
+    the same directory, flushed and, by default, fsynced BEFORE one retried replace; a transient Windows sharing violation
+    is retried; the save's own temp is removed when anything fails, and the leftovers of a killed save are swept by the next
+    save), so a reader sees the old file or the new one whole, never a torn one. A symbolic link to an existing file is
+    written through (the link stays a link; the temp file is made beside the target).
     """
     path = _write_target(Path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            if fsync:
-                os.fsync(fh.fileno())
-        _replace_with_retry(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    save_bytes_atomic(path, data, fsync=fsync)
 
 
 # --------------------------------------------------------------------------------------------------

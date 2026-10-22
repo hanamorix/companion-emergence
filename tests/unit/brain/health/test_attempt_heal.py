@@ -1,4 +1,6 @@
-"""Tests for brain.health.attempt_heal — core heal + save helpers."""
+"""Tests for the healing readers in brain.health.attempt_heal and for the atomic save helpers they sit beside,
+which live in brain.utils.atomic_write (the ``heal`` alias below). The newer writer tests are in
+tests/unit/brain/utils/test_atomic_write.py."""
 
 from __future__ import annotations
 
@@ -15,12 +17,10 @@ from pathlib import Path
 
 import pytest
 
-import brain.health.attempt_heal as heal
-from brain.health.attempt_heal import (
-    save_with_backup,
-    save_with_backup_text,
-)
+import brain.utils.atomic_write as heal
+from brain.health.attempt_heal import save_with_backup
 from brain.health.json_io import Recovery, read_json_result
+from brain.utils.atomic_write import save_with_backup_text
 
 
 def attempt_heal(path, default_factory, schema_validator=None):
@@ -279,7 +279,7 @@ def test_save_with_backup_text_retries_transient_permission_error(
     """
     import os
 
-    import brain.health.attempt_heal as heal
+    import brain.utils.atomic_write as heal
 
     p = tmp_path / "x.json"
     save_with_backup_text(p, "v1")
@@ -305,7 +305,7 @@ def test_save_with_backup_text_reraises_persistent_permission_error(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A real permission problem must still fail loud after the retry budget."""
-    import brain.health.attempt_heal as heal
+    import brain.utils.atomic_write as heal
 
     p = tmp_path / "x.json"
     save_with_backup_text(p, "v1")
@@ -355,7 +355,7 @@ def _fd_name(fd: int, root: Path) -> str:
     return "<unknown>"
 
 
-_TEMP_TAG = re.compile(r"\.t\d+-[0-9a-f]+(?=\.(?:bak1\.)?new$)")
+_TEMP_TAG = re.compile(r"\.t\d+-(?:k[0-9a-f]{12}-)?[0-9a-f]+(?=\.(?:bak1\.)?new$)")  # #472: optional identity digest
 
 
 def _norm(name: str) -> str:
@@ -752,14 +752,17 @@ def test_save_helper_has_no_bare_replace_or_side_door_rename() -> None:
     live file is never moved by another rename API."""
     forbidden = {"os.replace", "os.rename", "shutil.move", "os.renames"}
     attr_forbidden = {"rename", "replace"}
-    for node in ast.walk(_function("save_with_backup_text")):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        dotted = ast.unparse(fn)
-        assert dotted not in forbidden, dotted
-        if isinstance(fn, ast.Attribute):
-            assert fn.attr not in attr_forbidden, dotted
+    # The engine is `_save_payload` (the text and bytes writers delegate to it); walk the delegates too so a bare
+    # replace added to any of them is caught, not only one added to the thin wrapper.
+    for name in ("save_with_backup_text", "save_bytes_atomic", "_save_payload"):
+        for node in ast.walk(_function(name)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            dotted = ast.unparse(fn)
+            assert dotted not in forbidden, (name, dotted)
+            if isinstance(fn, ast.Attribute):
+                assert fn.attr not in attr_forbidden, (name, dotted)
 
 
 def test_fsync_of_new_file_and_backup_copy_precede_their_replaces(

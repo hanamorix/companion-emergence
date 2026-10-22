@@ -106,6 +106,10 @@ def run_sweep_tick(
         if result["spawned"] or result["retired"]:
             interests.save(interests_path)
     except Exception as exc:  # noqa: BLE001
+        from brain.bridge.cli_throttle import ThrottleDeferred
+
+        if isinstance(exc, ThrottleDeferred):
+            raise  # #456/#473: "not now": the central pass skips the job without advancing its cadence
         logger.warning("interest sweep failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result

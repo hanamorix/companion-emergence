@@ -127,14 +127,6 @@ maker = 'I made something —'
 note = 'I left you a note —'
 kindled_link = 'a friendship deepened —'
 
-[bridge.server]
-# _run_heartbeat_close's persona_system_prompt segments, reassembled
-# around 1 var: persona_dir.name -- seg[0] + persona_dir.name + seg[1].
-heartbeat_close_system_prompt_segments = [
-  'You are ',
-  '.',
-]
-
 [bridge.supervisor]
 # _run_heartbeat_tick's persona_system_prompt segments, reassembled
 # around 1 var: persona_dir.name -- seg[0] + persona_dir.name + seg[1].

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from brain.paths import get_home, get_log_dir, get_persona_dir
 from brain.setup import validate_persona_name
+from brain.utils.atomic_write import save_with_backup_text
 
 LABEL_PREFIX = "com.companion-emergence.supervisor"
 
@@ -267,10 +268,9 @@ def write_launchd_plist(
     )
     paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
     paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = paths.plist_path.with_suffix(paths.plist_path.suffix + ".tmp")
-    tmp.write_text(xml, encoding="utf-8")
-    tmp.chmod(0o644)
-    os.replace(tmp, paths.plist_path)
+    # The shared atomic text writer (#465): a unique temp created 0644, fsynced, one retried atomic replace; a failed
+    # write keeps the previous plist and removes the temp. The explicit chmod keeps the final mode exact under a umask.
+    save_with_backup_text(paths.plist_path, xml, keep_backups=False, mode=0o644)
     paths.plist_path.chmod(0o644)
     return paths.plist_path
 
@@ -310,14 +310,23 @@ def launchctl_target(persona: str) -> str:
     return f"{launchctl_domain()}/{service_label(persona)}"
 
 
-def run_launchctl(args: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run launchctl with captured output. Tests mock this seam."""
-    return subprocess.run(  # windows-lint: ok -- launchd is macOS-only
-        ["launchctl", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def run_launchctl(args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """Run launchctl with captured output. Tests mock this seam.
+
+    ``timeout`` (#456): a capped call (the kill path's ``bootout`` / ``print``, 15 s) returns a synthetic result with
+    exit code 124 when the cap is reached, so callers treat it like any failed call."""
+    try:
+        return subprocess.run(  # windows-lint: ok -- launchd is macOS-only
+            ["launchctl", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["launchctl", *args], returncode=124, stdout="", stderr=f"launchctl timed out after {timeout}s"
+        )
 
 
 def install_service(
@@ -327,7 +336,14 @@ def install_service(
     env_path: str = DEFAULT_LAUNCHD_PATH,
     nellbrain_home: str | Path | None = None,
 ) -> Path:
-    """Write, bootstrap, and kickstart the persona LaunchAgent."""
+    """Write, bootstrap, and kickstart the persona LaunchAgent.
+
+    #456: never behind a running bridge's back, any stop intent and start back-off record cleared first
+    (``lifecycle.before_install``), and a plain ``kickstart`` (never ``-k``, which would kill a running job: S-k).
+    """
+    from brain.service import lifecycle
+
+    lifecycle.before_install(persona)
     reason = unstable_nell_path_reason(nell_path)
     if reason is not None:
         raise LaunchdConfigError(reason)
@@ -345,11 +361,23 @@ def install_service(
     if result.returncode != 0:
         raise LaunchdCommandError(_format_launchctl_error("bootstrap", result))
 
-    result = run_launchctl(["kickstart", "-k", launchctl_target(persona)])
+    result = run_launchctl(["kickstart", launchctl_target(persona)])
     if result.returncode != 0:
         raise LaunchdCommandError(_format_launchctl_error("kickstart", result))
 
     return plist_path
+
+
+def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
+    """Start the installed LaunchAgent (#456 D20): bootstrap it when it is not loaded (a kill's ``bootout`` unloaded
+    it), then a plain ``kickstart`` (a no-op when ``RunAtLoad`` already started it). Any stop intent and the
+    start back-off record are cleared first (D25, D26). Each call is capped at 15 s."""
+    from brain.service import lifecycle
+
+    lifecycle.note_explicit_start(persona)
+    if run_launchctl(["print", launchctl_target(persona)], timeout=15).returncode != 0:
+        run_launchctl(["bootstrap", launchctl_domain(), str(paths_for_persona(persona).plist_path)], timeout=15)
+    return run_launchctl(["kickstart", launchctl_target(persona)], timeout=15)
 
 
 def uninstall_service(*, persona: str, keep_plist: bool = False) -> Path:

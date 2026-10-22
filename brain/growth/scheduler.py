@@ -159,6 +159,10 @@ def run_growth_tick(
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001
+            from brain.bridge.cli_throttle import ThrottleDeferred
+
+            if isinstance(exc, ThrottleDeferred):
+                raise  # #456: "not now": the heartbeat records no growth run (see _try_run_growth)
             logger.warning("creative_dna crystallizer skipped: %s", exc)
 
     return GrowthTickResult(

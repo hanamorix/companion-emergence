@@ -107,7 +107,7 @@ def _archive(legacy: Path) -> None:
         target = legacy.with_name(f"{legacy.name}.migrated-{stamp}-{n}")
         n += 1
     try:
-        legacy.rename(target)
+        legacy.rename(target)  # atomic-write: ok -- moves the finished old settings file aside as its backup, a rename of a finished file, not a write
     except FileNotFoundError:
         return  # another bridge folded it first
     except OSError as exc:

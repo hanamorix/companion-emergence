@@ -97,6 +97,9 @@ def test_an_incomplete_registry_keeps_the_old_settings_file_for_the_next_start(t
     monkeypatch.undo()  # the next start imports everything
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables.register("boot.test_key", 7, description="A key registered before boot.")
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()  # the next start is a new bridge process in production (the first stop sealed the registry)
     app = build_app(persona_dir=persona_dir, client_origin="tests", auth_token=None)
     with TestClient(app) as client:  # the key is no longer a setting, so it is discarded and the file archived
         assert client.get("/health").status_code == 200

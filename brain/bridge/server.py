@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -39,17 +40,19 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
-from brain import prompt_strings, tunables
-from brain.bridge import events, model_error, provider_auth
+from brain import tunables
+from brain.bridge import cli_throttle, events, model_error, provider_auth, shutdown_progress
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -64,14 +67,22 @@ from brain.bridge.model_tier import (
     build_tier_provider,
 )
 from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
-from brain.bridge.shutdown import BridgeShutdownController
+from brain.bridge.shutdown import POLL_S as _STOP_POLL_S
+from brain.bridge.shutdown import (
+    REASON_APP_RESTART,
+    REASON_IDLE,
+    REASON_MANUAL_RESTART,
+    REASON_USER_STOP,
+    BridgeShutdownController,
+)
+from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
+from brain.bridge.shutdown_progress import tracked_to_thread
 from brain.chat.session import (
     all_sessions,
     create_session,
     get_or_hydrate_session,
 )
 from brain.health.alarm import compute_pending_alarms
-from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
@@ -83,13 +94,9 @@ from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
+from brain.utils.atomic_write import save_with_backup_text
 
 logger = logging.getLogger(__name__)
-
-# Text externalized to prompt_strings.toml [bridge.server] (issue #129 stage 2b).
-_HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
-    "bridge.server.heartbeat_close_system_prompt_segments"
-)
 
 # Browser/WebView origins that are allowed to call the localhost bridge.
 # HTTP routes are still bearer-token protected; CORS is only the browser's
@@ -200,7 +207,10 @@ async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> 
         await asyncio.sleep(min(idle_shutdown_seconds, 60))
         if _check_idle(state, idle_shutdown_seconds):
             logger.info("idle shutdown firing — no traffic for >%ss", idle_shutdown_seconds)
-            if state.shutdown_controller is None or not state.shutdown_controller.request("idle_timeout"):
+            # Off the event loop: the request writes the bridge.json "stopping" mark (review O-6).
+            if state.shutdown_controller is None or not await asyncio.to_thread(
+                state.shutdown_controller.request, REASON_IDLE
+            ):
                 logger.error("idle shutdown could not request controller shutdown")
             return
 
@@ -214,10 +224,9 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
 
     Bridge startup counts as activity so a freshly launched app has the
     full idle window before the watcher fires. Without that fallback,
-    ``last_chat_at is None`` collapsed to "idle" and the bridge SIGTERM'd
-    itself ~60s after every launch — which then triggered the
-    close-heartbeat (decay + dream + reflex + growth) on every relaunch,
-    looking from the UI like the brain was 'flooding'.
+    ``last_chat_at is None`` collapsed to "idle" and the bridge stopped
+    itself ~60s after every launch, so every relaunch was followed by an
+    idle stop.
     """
     now = datetime.now(UTC)
     last_activity = state.last_chat_at or state.started_at
@@ -522,19 +531,25 @@ def _close_session_blocking(
     from contextlib import ExitStack
 
     from brain.ingest.pipeline import close_session
+    from brain.ingest.types import IngestReport
 
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        return close_session(
-            persona_dir,
-            session_id,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
+        try:
+            return close_session(
+                persona_dir,
+                session_id,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+            )
+        except cli_throttle.ShutdownDeferred:
+            # #456 x #473: the bridge began stopping after this close was admitted; its extraction call was refused
+            # (raised so the background sweeps end). "Not now": the buffer and the session stay, like any deferral.
+            return IngestReport(session_id=session_id, deferred=True)
 
 
 def _snapshot_session_blocking(
@@ -551,41 +566,24 @@ def _snapshot_session_blocking(
     from contextlib import ExitStack
 
     from brain.ingest.pipeline import extract_session_snapshot
+    from brain.ingest.types import IngestReport
 
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        return extract_session_snapshot(
-            persona_dir,
-            session_id,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
+        try:
+            return extract_session_snapshot(
+                persona_dir,
+                session_id,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+            )
+        except cli_throttle.ShutdownDeferred:
+            return IngestReport(session_id=session_id, deferred=True)  # #456 x #473: see _close_session_blocking
 
-
-async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 30.0) -> None:
-    """Wait for all per-session in_flight locks to release, up to `timeout` seconds.
-
-    Spec §7 step 2: graceful shutdown waits up to 30s for active chat turns
-    to finish before proceeding to the close-and-stop steps. We poll every
-    100ms — locks are asyncio.Lock so this stays on the loop.
-    """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        if not any(lock.locked() for lock in state.in_flight_locks.values()):
-            return
-        await asyncio.sleep(0.1)
-    held = sum(1 for lock in state.in_flight_locks.values() if lock.locked())
-    if held:
-        logger.warning(
-            "shutdown drain: %d in-flight chat(s) did not release in %.0fs", held, timeout
-        )
-
-
-_CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
 
 # Stream keepalive: while a chat turn is in flight, the provider can go silent
 # for long stretches — first-token latency on a large persona prompt, or a
@@ -698,6 +696,8 @@ def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tupl
         return "ok", ""
     except provider_auth.ProviderAuthDeferred:
         return "inconclusive", "auth_deferred"
+    except cli_throttle.ShutdownDeferred:
+        return "inconclusive", "stopping"
     except TimeoutError:
         return "inconclusive", "timeout"
     except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
@@ -756,7 +756,7 @@ async def _apply_chat_model(model: str, *, check: bool, lock: asyncio.Lock) -> t
             waited = (_clock() - waiting_since) if contended else 0.0
             remaining = budget - waited
             if remaining >= _MIN_PROBE_S:
-                outcome, reason = await asyncio.to_thread(_check_model_blocking, to_write, remaining)
+                outcome, reason = await tracked_to_thread("model check", _check_model_blocking, to_write, remaining)
             else:  # the wait behind another check used the budget: save unchecked, as for any inconclusive check
                 outcome, reason = "inconclusive", "budget"
         if outcome == "rejected":
@@ -812,120 +812,6 @@ async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
         )
     except Exception:
         logger.exception("recall diagnostics flush failed during shutdown")
-
-
-def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
-    """Fire HeartbeatEngine.run_tick(trigger='close') in-process.
-
-    Per SP-7 spec §7 step 5 + Reflex Phase 2's anchor for weekly growth.
-    Best-effort: any exception is logged by the caller; we don't block
-    shutdown on heartbeat issues.
-
-    Debounced: when a close-heartbeat fired within the last 5 minutes
-    (e.g. during a dev cycle of repeated rebuild+relaunch), skip the
-    decay/dream/reflex/growth tail and exit. The session-drain step
-    above this call already saved everything; the tail is what causes
-    the 'flooding' perception when the bridge restarts often.
-
-    Per H-A: opens its own per-call stores inside the worker thread.
-    Constructor pattern mirrors brain/cli.py:_heartbeat_handler.
-    """
-    from contextlib import ExitStack
-
-    from brain.engines.heartbeat import HeartbeatEngine
-    from brain.persona_config import PersonaConfig
-    from brain.search.factory import get_searcher
-
-    state_path = persona_dir / "heartbeat_state.json"
-    if state_path.exists():
-        try:
-            state = read_json(state_path, default=dict, expect=dict)
-            last_run = state.get("last_close_at") or state.get("last_run")
-            if last_run:
-                if last_run.endswith("Z"):
-                    last_run = last_run[:-1] + "+00:00"
-                last_dt = datetime.fromisoformat(last_run)
-                if last_dt.tzinfo is None:
-                    last_dt = last_dt.replace(tzinfo=UTC)
-                age = (datetime.now(UTC) - last_dt).total_seconds()
-                if age < _CLOSE_HEARTBEAT_DEBOUNCE_S:
-                    logger.info(
-                        "close-heartbeat debounced (last fire %.0fs ago < %.0fs)",
-                        age,
-                        _CLOSE_HEARTBEAT_DEBOUNCE_S,
-                    )
-                    return
-        except Exception:  # noqa: BLE001
-            logger.debug("close-heartbeat debounce check failed", exc_info=True)
-
-    config = PersonaConfig.load(persona_dir / "persona_config.json")
-    searcher = get_searcher(config.searcher)
-    default_arcs_path = Path(__file__).parent.parent / "engines" / "default_reflex_arcs.json"
-
-    with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
-        stack.callback(store.close)
-        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-        stack.callback(hebbian.close)
-
-        engine = HeartbeatEngine(
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-            state_path=persona_dir / "heartbeat_state.json",
-            config_path=persona_dir / "heartbeat_config.json",
-            dream_log_path=persona_dir / "dreams.log.jsonl",
-            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
-            reflex_arcs_path=persona_dir / "reflex_arcs.json",
-            reflex_log_path=persona_dir / "reflex_log.json",
-            reflex_default_arcs_path=default_arcs_path,
-            searcher=searcher,
-            interests_path=persona_dir / "interests.json",
-            research_log_path=persona_dir / "research_log.json",
-            default_interests_path=Path(__file__).parent.parent
-            / "engines"
-            / "default_interests.json",
-            persona_name=persona_dir.name,
-            persona_system_prompt=(
-                _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[0] + persona_dir.name
-                + _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[1]
-            ),
-        )
-        engine.run_tick(trigger="close", dry_run=False)
-
-
-def _drain_sessions_blocking(
-    persona_dir: Path,
-    provider: LLMProvider,
-    silence_minutes: float = 0,
-) -> Any:
-    """Wrap brain.ingest.pipeline.snapshot_stale_sessions — used by shutdown.
-
-    Non-destructive — buffers + cursors survive across shutdown so the next
-    bridge start can resume sticky sessions. Memories still extract
-    durably here (the data-saving step on Cmd-Q). The 24h
-    finalize_stale_sessions cadence picks up genuinely-stale buffers on
-    the next bridge run.
-
-    Same per-call store pattern. Silence_minutes=0 (default) snapshots
-    EVERY live session, which is what graceful shutdown wants.
-    """
-    from contextlib import ExitStack
-
-    from brain.ingest.pipeline import snapshot_stale_sessions
-
-    with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
-        stack.callback(store.close)
-        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-        stack.callback(hebbian.close)
-        return snapshot_stale_sessions(
-            persona_dir,
-            silence_minutes=silence_minutes,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1078,6 +964,8 @@ class BridgeAppState:
     in_flight_locks: dict[str, asyncio.Lock]
     last_chat_at: datetime | None = None
     supervisor_thread: Any | None = None
+    # #456 (Q6): the supervisor's state ("running" / "restarted" / "failed" ...), shown on /health and /persona/state.
+    supervisor_status: Any | None = None
     migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
@@ -1095,6 +983,46 @@ class BridgeAppState:
 # NOT an ops/user knob — no env var, no config; production never sets it. An
 # explicit ``build_app(background_threads=...)`` always wins over this flag.
 _background_threads_inhibited: bool = False
+
+
+# #456 test seam for the real-process stop tests (spec section 8: test-only hooks). Set ONLY in-process, by the test
+# launcher ``tests/bridge/_hooked_bridge.py`` before the runner starts; never from an environment variable, so nothing
+# outside a test can start a bridge with a stub supervisor (pre-merge review O-5). None in production. When set:
+# ``supervisor(stop_event)`` runs in place of the supervisor loop, ``start_tasks(persona_dir)`` starts the test's
+# counted tasks, and no other background thread starts.
+_lifespan_test_hooks: dict[str, Any] | None = None
+
+
+class _TrackedSyncRoute(APIRoute):
+    """Every synchronous endpoint but ``GET /health`` is a counted stop task while its worker thread runs (review of
+    #458).
+
+    The count is taken inside the thread, so uvicorn cancelling the request task after its 30 s graceful window does
+    not uncount work that is still running (the same rule as ``tracked_to_thread``). A GET is not always a read:
+    ``GET /sessions/active`` rolls a stale buffer over (a final extraction, memory writes, the buffer's deletion) and
+    ``GET /kindled-link/my-code`` writes its identity files. Only ``/health``, which a stop must keep answering, is
+    left uncounted."""
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        is_health = path == "/health" and set(kwargs.get("methods") or ()) == {"GET"}
+        if not inspect.iscoroutinefunction(endpoint) and not is_health:
+            endpoint = _tracked_sync(f"request {path}", endpoint)
+        super().__init__(path, endpoint, **kwargs)
+
+
+def _tracked_sync(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    import functools
+
+    @functools.wraps(fn)  # FastAPI reads the endpoint's signature through __wrapped__
+    def _run(*args: Any, **kwargs: Any) -> Any:
+        # Sealed: ShutdownDeferred, which the app's handler answers with the admission middleware's 503 body.
+        handle = shutdown_progress.registry.register(label)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            shutdown_progress.registry.unregister(handle)
+
+    return _run
 
 
 def build_app(
@@ -1131,6 +1059,9 @@ def build_app(
             if background_threads is not None
             else not _background_threads_inhibited
         )
+        hooks = _lifespan_test_hooks
+        if hooks is not None:
+            logger.warning("bridge lifespan: TEST HOOKS ON (stub supervisor and stub tasks)")
         if not bg:
             logger.warning(
                 "bridge lifespan: background threads OFF (supervisor + backlog migration "
@@ -1149,6 +1080,20 @@ def build_app(
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())
         events.set_publisher(bus.publish)
+
+        # #456: one stop per bridge app. A new app in this process (tests) starts unstopped; the controller is the
+        # bridge's single stop entry point (a local one when none is passed). A stop that already began (a signal
+        # before the lifespan, review S1) keeps the process-wide flag set. The task registry is the process's own (a
+        # bridge process runs one app); tests that build several apps reset it themselves.
+        controller = (
+            shutdown_controller
+            if isinstance(shutdown_controller, BridgeShutdownController)
+            else BridgeShutdownController()
+        )
+        if not controller.stopping:
+            cli_throttle.clear_shutdown()
+        if controller.persona_dir is None:
+            controller.configure(persona_dir)
 
         app.state.bridge = BridgeAppState(
             persona_dir=persona_dir,
@@ -1290,13 +1235,14 @@ def build_app(
             except Exception:  # noqa: BLE001 — startup must not break on the migration
                 logger.exception("compaction backlog migration thread crashed")
 
-        if bg:
-            mig_thread = threading.Thread(
-                target=_run_backlog_migration,
+        if bg and hooks is None:
+            # #456 (C9): a counted task while it runs; not started once the stop has begun.
+            mig_thread = shutdown_progress.start_tracked_thread(
+                "backlog migration",
+                _run_backlog_migration,
                 name="compaction-backlog-migration",
                 daemon=True,
             )
-            mig_thread.start()
             app.state.bridge.migration_thread = mig_thread
 
         # S82: seed is_chat_idle's anchor from the newest message timestamp
@@ -1325,7 +1271,7 @@ def build_app(
         # Started AFTER the is-chat-idle seed above (the retry rule reads the
         # same anchor through `chat_activity_marker`, so nothing may read it
         # before the seed) and before the supervisor thread.
-        if bg:
+        if bg and hooks is None:
             try:
                 from brain.bridge import cli_throttle as _cli_throttle
                 from brain.memory import floor_startup as _floor_startup
@@ -1345,7 +1291,7 @@ def build_app(
         bridge_started_at = datetime.now(UTC)
 
         # Spawn supervisor thread (non-daemon — joins on shutdown)
-        from brain.bridge.supervisor import run_folded
+        from brain.bridge import supervisor as _supervisor_mod
 
         def _is_session_busy(sid: str) -> bool:
             """Best-effort cross-thread check: is a request in-flight for ``sid``?
@@ -1369,24 +1315,51 @@ def build_app(
             return lk is not None and lk.locked()
 
         stop_event = threading.Event()
+        controller.add_stop_event(stop_event)
         sup_thread: threading.Thread | None = None
         if bg:
-            sup_thread = threading.Thread(
-                target=run_folded,
-                kwargs={
-                    "stop_event": stop_event,
-                    "persona_dir": persona_dir,
-                    "provider": provider,
-                    "event_bus": bus,
-                    "tick_interval_s": tick_interval_s,
-                    "is_session_busy": _is_session_busy,
-                    "bridge_started_at": bridge_started_at,
-                },
-                name="sp7-supervisor",
-                daemon=False,
+            # #456 (D1): the supervisor is a counted task from before its thread starts until its loop returns.
+            sup_handle = shutdown_progress.registry.register("supervisor")
+
+            sup_status = _supervisor_mod.SupervisorStatus()
+            app.state.bridge.supervisor_status = sup_status
+            from brain.bridge import state_file as _state_file_mod
+
+            sup_status.on_change = lambda d: _state_file_mod.update(
+                persona_dir, lambda st: setattr(st, "supervisor", d)
             )
-            sup_thread.start()
+
+            def _run_supervisor() -> None:
+                try:
+                    if hooks is not None:
+                        hooks["supervisor"](stop_event)
+                        return
+                    # #456 (D9): a loop death restarts the loop; a startup death re-runs the startup once.
+                    _supervisor_mod.run_supervised(
+                        stop_event,
+                        status=sup_status,
+                        persona_dir=persona_dir,
+                        provider=provider,
+                        event_bus=bus,
+                        tick_interval_s=tick_interval_s,
+                        is_session_busy=_is_session_busy,
+                        bridge_started_at=bridge_started_at,
+                        activity=lambda job: shutdown_progress.registry.set_activity(
+                            sup_handle, f"background job: {job}" if job else "supervisor"
+                        ),
+                    )
+                finally:
+                    shutdown_progress.registry.unregister(sup_handle)
+
+            sup_thread = threading.Thread(target=_run_supervisor, name="sp7-supervisor", daemon=False)
+            try:
+                sup_thread.start()
+            except BaseException:
+                shutdown_progress.registry.unregister(sup_handle)
+                raise
             app.state.bridge.supervisor_thread = sup_thread
+            if hooks is not None:
+                hooks["start_tasks"](persona_dir)
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -1396,15 +1369,18 @@ def build_app(
         try:
             yield
         finally:
-            # Shutdown sequence per spec §7:
-            #   1. Cancel idle watcher (so it can't fire SIGTERM during teardown)
-            #   2. Drain in-flight chats (best-effort wait, 30s cap)
-            #   3. Close all live sessions via ingest pipeline (silence_minutes=0)
-            #   4. Stop supervisor thread (180s join cap)
-            #   4b. Flush the buffered cost-series samples to memories.db
-            #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
-            #   6. Publish shutdown event
-            #   7. Clear publisher
+            # #456 stop sequence (spec 2.1, Q-B: no session drain, no close heartbeat):
+            #   0. begin_stop belt (never overwrites the reason a path recorded first)
+            #   1. cancel the idle watcher and the derived-model re-check
+            #   2. wait, with no time limit, until the supervisor thread has ended and the task registry is empty,
+            #      then seal it in the same step (nothing registers after)
+            #   3. flush the cost series and recall diagnostics
+            #   4. publish the shutdown event
+            #   5. clear the publisher
+            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13). "unknown" means no stop was
+            # asked for (uvicorn ended for its own reasons); the runner's after-run decision records that as a crash.
+            # Off the event loop: a first stop writes the bridge.json mark (review O-6).
+            await asyncio.to_thread(controller.begin_stop, controller.signal_reason or _STOP_REASON_UNKNOWN)
 
             # 1. Cancel idle watcher
             if idle_task is not None:
@@ -1416,92 +1392,52 @@ def build_app(
                 except Exception:
                     logger.exception("idle watcher raised during teardown")
 
-            # 2. Drain in-flight chats — wait up to 30s for active locks to release
-            await _wait_for_in_flight_drain(app.state.bridge, timeout=30.0)
+            # 2. Wait for everything that is running. No internal time limit (C10): the user decides when to give up
+            #    (the watcher's hard-exit offer); this process never writes "stopped" while work runs.
+            while (sup_thread is not None and sup_thread.is_alive()) or not shutdown_progress.registry.seal():
+                await asyncio.sleep(_STOP_POLL_S)
 
-            # 3. Close all live sessions (silence_minutes=0) via per-call stores.
-            #    This is the data-saving step — every conversation that was open
-            #    becomes memory before the lights go out.
-            drain_errors = 0
-            try:
-                reports = await asyncio.to_thread(
-                    _drain_sessions_blocking,
-                    persona_dir,
-                    provider,
-                    0,
-                )
-            except Exception:
-                logger.exception("shutdown drain failed")
-                reports = []
-                drain_errors = 1
-
-            # 3b. Record drain-error count to the state file. The runner's
-            # `_write_clean_shutdown` (atexit + finally) reads this and
-            # leaves shutdown_clean=False if any session failed to ingest,
-            # so the next bridge start re-runs `run_recovery_if_needed`
-            # against the orphan buffers instead of treating the dirty
-            # exit as clean. This closes the "clean shutdown that
-            # happened to have a failed drain" hole.
-            drain_errors += sum(getattr(r, "errors", 0) for r in reports)
-            if drain_errors > 0:
-                try:
-                    from brain.bridge import state_file as _state_file_mod
-
-                    cur = _state_file_mod.read(persona_dir)
-                    if cur is not None:
-                        cur.drain_errors = drain_errors
-                        cur.shutdown_clean = False
-                        _state_file_mod.write(persona_dir, cur)
-                    logger.warning(
-                        "shutdown drain produced %d ingest errors; marked dirty for next start",
-                        drain_errors,
-                    )
-                except Exception:
-                    logger.exception("failed to record drain_errors to state file")
-
-            # 4. Stop supervisor thread (None when background threads are off)
-            stop_event.set()
-            if sup_thread is not None:
-                sup_thread.join(timeout=180.0)
-                if sup_thread.is_alive():
-                    logger.warning("supervisor thread did not stop within 180s")
-
-            # 4b. Save the buffered cost-series samples (S146, S164) now that
-            #     the supervisor, the only other flusher, has stopped.
+            # 3. Save the buffered cost-series samples (S146, S164) now that the supervisor, the only other flusher,
+            #    has stopped.
             await _flush_cost_series_at_stop(persona_dir)
 
-            # 5. Heartbeat close-trigger — anchor for Reflex Phase 2 weekly growth.
-            #    In-process import + run_tick(trigger="close"). Best-effort:
-            #    failure is logged but doesn't block shutdown.
+            # 4. Publish shutdown event
             try:
-                await asyncio.to_thread(_run_heartbeat_close, persona_dir, provider)
-            except Exception:
-                logger.exception("heartbeat close-trigger failed during shutdown")
-
-            # 6. Publish shutdown event
-            try:
-                bus.publish(
-                    {
-                        "type": "shutdown",
-                        "clean": drain_errors == 0,
-                        "drained": len(reports),
-                        "drain_errors": drain_errors,
-                        "at": _now(),
-                    }
-                )
+                bus.publish({"type": "shutdown", "clean": True, "reason": controller.reason, "at": _now()})
             except Exception:
                 logger.exception("shutdown event publish failed")
 
-            # 7. Clear publisher
+            # 5. Clear publisher
             events.set_publisher(None)
             logger.info("bridge stopped persona=%s", persona_dir.name)
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
+    app.router.route_class = _TrackedSyncRoute
 
     # CORS — narrowly scoped to the same allowed_origins used for WS auth,
     # plus localhost dev origins (Tauri devUrl + Vite default ports). Bearer
     # auth still gates every route — CORS is not a security boundary, just a
     # same-origin policy waiver for the trusted local app surface.
+    # #456 (C40, D21): once the stop has begun, every request except GET /health is refused with 503
+    # {"code": "bridge_stopping"} and runs no engine code. A request admitted before the stop runs to its end.
+    @app.middleware("http")
+    async def _admission(request: Request, call_next):  # noqa: ANN202 - Starlette middleware signature
+        if (
+            cli_throttle.shutdown_requested()
+            and request.method != "OPTIONS"
+            and not (request.method == "GET" and request.url.path == "/health")
+        ):
+            return JSONResponse(
+                status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"}
+            )
+        return await call_next(request)
+
+    # A request admitted just before the stop whose worker registers after the seal (tracked_to_thread) is refused the
+    # same way as one that arrives after it, not with a 500 (review of #458).
+    @app.exception_handler(cli_throttle.ShutdownDeferred)
+    async def _stopping(_request: Request, _exc: cli_throttle.ShutdownDeferred) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"})
+
     from fastapi.middleware.cors import CORSMiddleware
 
     cors_origins = list(allowed_origins) + list(DEV_ALLOWED_ORIGINS)
@@ -1637,6 +1573,8 @@ def build_app(
             "sessions_active": len(all_sessions()),
             "last_chat_at": s.last_chat_at.isoformat() if s.last_chat_at else None,
             "supervisor_thread": sup_status,
+            # #456 (Q6): "running" / "restarted" (with the error) / "failed" / "stopped", or None (not started).
+            "supervisor": s.supervisor_status.as_dict() if s.supervisor_status is not None else None,
             "health_scan": health_scan,
             "health_error": health_error,
             "pending_alarms": len(alarms),
@@ -1784,7 +1722,11 @@ def build_app(
         """
         from brain.bridge.persona_state import build_persona_state
 
-        return build_persona_state(persona_dir)
+        state = build_persona_state(persona_dir)
+        sup_state = app.state.bridge.supervisor_status
+        if isinstance(state, dict):
+            state["supervisor"] = sup_state.as_dict() if sup_state is not None else None  # #456 (Q6)
+        return state
 
     # ── /persona/feed — visible inner life journal ──────────────────────────
     @app.get("/persona/feed", dependencies=[Depends(require_http_auth)])
@@ -2412,7 +2354,7 @@ def build_app(
         """Apply an accepted voice-edit proposal — three-place write.
 
         Three writes on accept (all best-effort isolated):
-          1. nell-voice.md — atomic temp+rename, replace old_text with new_text.
+          1. nell-voice.md — atomic (the shared writer), replace old_text with new_text.
           2. initiate_audit.jsonl — record `replied_explicit` transition.
           3. crystallizations.db.voice_evolution — durable record of the edit.
 
@@ -2503,7 +2445,7 @@ def build_app(
             at=now_iso,
         )
 
-        # Place 2: voice template file (atomic via temp+rename).
+        # Place 2: voice template file (atomic via the shared writer).
         # If this raises after the audit update, the 500 propagates and
         # leaves the persona in a recoverable state: audit says
         # "replied_explicit", file unchanged. Hana can re-issue accept
@@ -2687,7 +2629,8 @@ def build_app(
                     status_code=422,
                     detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
                 )
-            record = save_image_bytes(s.persona_dir, raw, sniffed)
+            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the 20 MB cap.
+            record = await tracked_to_thread("upload", save_image_bytes, s.persona_dir, raw, sniffed)
             return {
                 "kind": "image",
                 "sha": record.sha,
@@ -2696,7 +2639,7 @@ def build_app(
             }
         # Non-image path (#43). The on-disk name is the content sha only; the
         # client filename is returned as display metadata, never a path part.
-        frecord = file_store.save_file_bytes(s.persona_dir, raw)
+        frecord = await tracked_to_thread("upload", file_store.save_file_bytes, s.persona_dir, raw)
         return {
             "kind": "file",
             "sha": frecord.sha,
@@ -2923,7 +2866,7 @@ def build_app(
     @app.post("/tools/search_memories", dependencies=[Depends(require_http_auth)])
     async def search_memories_endpoint(req: SearchMemoriesReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
-        return await asyncio.to_thread(_search_memories_blocking, s.persona_dir, req)
+        return await tracked_to_thread("memory search", _search_memories_blocking, s.persona_dir, req)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
@@ -2945,7 +2888,8 @@ def build_app(
             t0 = datetime.now(UTC)
             events.publish("chat_started", session_id=sid, client=s.client_origin)
             try:
-                result = await asyncio.to_thread(
+                result = await tracked_to_thread(
+                    "chat reply",
                     _respond_blocking,
                     s.persona_dir,
                     sess,
@@ -3080,6 +3024,12 @@ def build_app(
                 return
             reply_to_audit_id = raw_reply_id
 
+        # #456 (C40): no new turn once the stop has begun.
+        if cli_throttle.shutdown_requested():
+            await ws.send_json({"type": "error", "code": "bridge_stopping", "done": True})
+            await ws.close()
+            return
+
         async with lock:
             t0 = datetime.now(UTC)
             await ws.send_json({"type": "started", "session_id": session_id, "at": _now()})
@@ -3092,7 +3042,8 @@ def build_app(
             # complete even if the audit/memory write fails.
             if reply_to_audit_id is not None:
                 try:
-                    await asyncio.to_thread(
+                    await tracked_to_thread(
+                        "chat reply",
                         _apply_replied_explicit_transition,
                         s.persona_dir,
                         reply_to_audit_id,
@@ -3112,7 +3063,8 @@ def build_app(
 
             async def _guarded_respond() -> Any:
                 try:
-                    return await asyncio.to_thread(
+                    return await tracked_to_thread(
+                        "chat reply",
                         _respond_blocking,
                         s.persona_dir,
                         sess,
@@ -3239,12 +3191,12 @@ def build_app(
         status_code=202,
         dependencies=[Depends(require_http_auth)],
     )
-    async def supervisor_shutdown() -> dict[str, Any]:
+    async def supervisor_shutdown(request: Request) -> dict[str, Any]:
         """Trigger graceful shutdown via the shutdown controller.
 
-        Returns 202 immediately. The actual drain (30s in-flight chat wait +
-        supervisor join + buffer snapshot) runs in the FastAPI lifespan
-        teardown triggered by uvicorn server.should_exit via the controller.
+        Returns 202 immediately. The stop itself (#456) runs in the FastAPI
+        lifespan teardown, triggered through the controller: it waits, with no
+        time limit, for every registered task to end, then seals the registry.
 
         Requires a shutdown controller (set by runner.py via build_app). If the
         bridge was started without one (e.g. tests that do not pass a controller),
@@ -3265,10 +3217,20 @@ def build_app(
                 },
             )
 
-        ok = s.shutdown_controller.request("manual_restart")
+        # #456 (C13): an optional body names why: {"reason": "user_stop" | "app_restart"}; none = "manual_restart".
+        reason = REASON_MANUAL_RESTART
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - no body, or not JSON: the default reason
+            body = None
+        if isinstance(body, dict) and body.get("reason") in (REASON_USER_STOP, REASON_APP_RESTART):
+            reason = body["reason"]
+        # Off the event loop (review O-6): the request writes the bridge.json "stopping" mark, which can fsync; it is
+        # still on disk before the 202 (C6).
+        ok = await asyncio.to_thread(s.shutdown_controller.request, reason)
         if not ok:
             logger.error("manual restart could not request controller shutdown")
-        return {"status": "shutting_down", "drain_seconds": 30}
+        return {"status": "shutting_down"}
 
     # ── POST /sessions/snapshot — non-destructive ingest (preserves buffer) ──
     @app.post("/sessions/snapshot", dependencies=[Depends(require_http_auth)])
@@ -3284,7 +3246,8 @@ def build_app(
         lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             try:
-                report = await asyncio.to_thread(
+                report = await tracked_to_thread(
+                    "session snapshot",
                     _snapshot_session_blocking,
                     s.persona_dir,
                     sid,
@@ -3363,7 +3326,8 @@ def build_app(
             # H-A: per-call stores inside the worker thread, not shared singletons.
             # Wrap the pipeline call so internal exceptions don't crash the handler.
             try:
-                report = await asyncio.to_thread(
+                report = await tracked_to_thread(
+                    "session close",
                     _close_session_blocking,
                     s.persona_dir,
                     sid,

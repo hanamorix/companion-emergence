@@ -8,7 +8,8 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { resetBridgeCredentialCache } from "./bridge";
+import { fetchHealth, resetBridgeCredentialCache } from "./bridge";
+import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS } from "./lib/requestTimeout";
 import { errString } from "./lib/errString";
 
 export interface AppConfig {
@@ -105,10 +106,34 @@ export async function listPersonas(): Promise<PersonaSummary[]> {
   }
 }
 
+/** `nell supervisor start` exit 2: another start already holds the bridge lock, or a bridge is alive but not yet
+ *  answering (a service the app's install, or the OS, has just started). */
+const START_UNDER_WAY = /supervisor start failed \(exit 2\)/;
+
+/** #456 review R2-M1: wait for a bridge another start has under way to answer /health; false after HEALTH_WAIT_MS. */
+async function awaitStartedBridge(persona: string): Promise<boolean> {
+  resetBridgeCredentialCache(persona); // the starting bridge writes a new port and token
+  const deadline = Date.now() + HEALTH_WAIT_MS;
+  while (Date.now() < deadline) {
+    try {
+      await fetchHealth(persona); // bounded per request
+      return true;
+    } catch {
+      await new Promise<void>((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS));
+    }
+  }
+  return false;
+}
+
 export async function ensureBridgeRunning(persona: string): Promise<void> {
   try {
     await invoke("ensure_bridge_running", { persona });
   } catch (e) {
+    // A start already under way (exit 2) is not a failure: wait for that bridge instead (review R2-M1).
+    if (START_UNDER_WAY.test(errString(e))) {
+      if (await awaitStartedBridge(persona)) return;
+      throw e;
+    }
     // Browser dev mode — Tauri's invoke is undefined. Treat as a no-op
     // and assume the bridge is already running externally; the next
     // fetch through bridge.ts will surface a real failure if it isn't.

@@ -19,6 +19,7 @@ refer to `changes/f2c-inc9-open-findings/1.5-criteria.md`.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -185,7 +186,7 @@ def test_k2_accept_writes_knob_first_then_swaps_then_deletes_the_previous(
         store.delete_judge_knob_calibration,
         store.mark_selftune_consumed,
     )
-    real_replace = judge_lora.os.replace
+    real_replace = os.replace
     real_rmtree = judge_lora.shutil.rmtree
 
     def write(key, **kw):
@@ -212,7 +213,7 @@ def test_k2_accept_writes_knob_first_then_swaps_then_deletes_the_previous(
     monkeypatch.setattr(store, "write_judge_knob_calibration", write)
     monkeypatch.setattr(store, "delete_judge_knob_calibration", delete)
     monkeypatch.setattr(store, "mark_selftune_consumed", consume)
-    monkeypatch.setattr(judge_lora.os, "replace", replace)
+    monkeypatch.setattr(os, "replace", replace)
     monkeypatch.setattr(judge_lora.shutil, "rmtree", rmtree)
 
     result = _tick(store, tmp_path)

@@ -11,9 +11,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.bridge.state_file import pid_is_alive
+from brain import process_identity
 from brain.emotion import vocabulary as _vocabulary
-from brain.health.attempt_heal import save_with_backup_text
 from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -29,6 +28,7 @@ from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
+from brain.utils.atomic_write import save_with_backup_text
 
 _MIGRATOR_MARKER_FILES = frozenset({"migration-report.md", "source-manifest.json", "memories.db"})
 
@@ -57,12 +57,14 @@ def _acquire_migrate_lock(lock_path: Path) -> int:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         existing_pid: int | None = None
+        existing_token: str | None = None
         try:
-            first_line = lock_path.read_text(encoding="utf-8").splitlines()[0]
-            existing_pid = int(first_line.strip())
+            lines = lock_path.read_text(encoding="utf-8").splitlines()
+            existing_pid = int(lines[0].strip())
+            existing_token = lines[2].strip() if len(lines) > 2 else None  # #472: holder identity (newer format)
         except (OSError, ValueError, IndexError):
             existing_pid = None
-        if existing_pid is None or not pid_is_alive(existing_pid):
+        if existing_pid is None or not process_identity.holder_alive(existing_pid, existing_token):
             # Stale or unreadable — take over.
             try:
                 lock_path.unlink()
@@ -73,7 +75,8 @@ def _acquire_migrate_lock(lock_path: Path) -> int:
             f"another migrate is in progress: pid={existing_pid} holds {lock_path}. "
             f"If you're sure no other migrate is running, remove the lockfile."
         ) from None
-    payload = f"{os.getpid()}\n{datetime.now(UTC).isoformat()}\n"
+    # Line 1 stays the bare pid (older readers parse only it); line 3 is this process's identity token (#472).
+    payload = f"{os.getpid()}\n{datetime.now(UTC).isoformat()}\n{process_identity.own_token() or ''}\n"
     os.write(fd, payload.encode("utf-8"))
     return fd
 
@@ -424,9 +427,9 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
         if finalise_target.exists():
             ts = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%S")
             backup = finalise_target.with_name(f"{finalise_target.name}.backup-{ts}")
-            os.rename(finalise_target, backup)
+            os.rename(finalise_target, backup)  # atomic-write: ok -- installs a persona directory (a directory rename), not a file write
         finalise_target.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(work_dir, finalise_target)
+        os.rename(work_dir, finalise_target)  # atomic-write: ok -- installs a persona directory (a directory rename), not a file write
 
     return report
 

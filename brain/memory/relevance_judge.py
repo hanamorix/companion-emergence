@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings, tunables
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.health.json_io import read_json
 
@@ -714,6 +715,8 @@ def _make_haiku_tiebreak(provider: LLMProvider) -> Callable[[str, str], str | No
             if label not in ("relevant", "irrelevant"):
                 return None
             return label
+        except ThrottleDeferred:
+            raise  # #456/#473: "not now": the calibration job is skipped, the row stays unlabeled
         except Exception:  # noqa: BLE001
             logger.warning("calibration judge: Haiku tie-break failed; keeping local judge's label")
             return None
@@ -876,6 +879,8 @@ def label_calibration_sample(
                         haiku_labels.append(haiku_tiebreak(query, mem.content))
                     else:
                         haiku_labels.append(None)
+                except ThrottleDeferred:
+                    raise
                 except Exception:  # noqa: BLE001 — one candidate must not sink the row
                     logger.exception(
                         "calibration judge: candidate %r in row id=%s failed; marking error",
@@ -888,6 +893,8 @@ def label_calibration_sample(
                 row["id"], local_labels, haiku_labels, local_judge_raw_score=raw_scores
             )
             labeled += 1
+        except ThrottleDeferred:
+            raise  # the row is written only once all its candidates are labeled, so it stays unlabeled
         except Exception:  # noqa: BLE001 — one row must not sink the whole pass
             logger.exception(
                 "calibration judge: row id=%s failed; leaving unlabeled for a later tick",

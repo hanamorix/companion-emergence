@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.utils.atomic_write import save_with_backup_text
 from brain.utils.file_lock import file_lock
 
 NOTES_DIR = "research"

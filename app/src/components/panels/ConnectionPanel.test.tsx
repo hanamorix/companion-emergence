@@ -53,6 +53,7 @@ import type { PersonaState } from "../../bridge";
 import { getClientPlatform, detectInstallShape } from "../../platform";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { invoke } from "@tauri-apps/api/core";
+import * as restartModule from "../../hooks/useRestartBridge";
 import { getVersion } from "@tauri-apps/api/app";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
@@ -125,6 +126,57 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(banner.textContent).toMatch(/provider unreachable/i);
   });
 
+  it("(#456 C25) says the background work restarted, with the error", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: {
+            state: "restarted",
+            restarts: 1,
+            last_error: "RuntimeError: tick failed",
+            last_error_at: "2026-10-19T12:00:00+00:00",
+          },
+        })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner.textContent).toMatch(/background work restarted/i);
+    expect(banner.textContent).toMatch(/RuntimeError: tick failed/);
+  });
+
+  it("(#456 C25) says the background work stopped after repeated errors, chat still works", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: {
+            state: "failed",
+            restarts: 1,
+            last_error: "RuntimeError: again",
+            last_error_at: "2026-10-19T12:00:00+00:00",
+          },
+        })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner.textContent).toMatch(/background work stopped/i);
+    expect(banner.textContent).toMatch(/chat still works/i);
+    expect(banner.textContent).toMatch(/RuntimeError: again/);
+  });
+
+  it("(#456 C25) shows no banner while the background work runs normally", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: { state: "running", restarts: 0, last_error: null, last_error_at: null },
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("surfaces stateError even when mode is live", () => {
     render(
       <ConnectionPanel
@@ -187,13 +239,14 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
       <ConnectionPanel state={baseState({ mode: "bridge_down" })} persona="test" />,
     );
     const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent(/end conversation and restart/i);
+    // #456 (Q-A): the button's idle label is now "Restart the brain" (no session is ended by a restart).
+    expect(banner).toHaveTextContent(/restart the brain/i);
   });
 
   it("does not render RestartBridgeButton when mode is healthy", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(
-      screen.queryByText(/end conversation and restart/i),
+      screen.queryByRole("button", { name: /restart the brain/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -207,7 +260,7 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     const banner = screen.getByRole("alert");
     expect(banner).toBeInTheDocument();
     expect(
-      screen.queryByText(/end conversation and restart/i),
+      screen.queryByRole("button", { name: /restart the brain/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -644,6 +697,45 @@ describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
     vi.mocked(getClientPlatform).mockReturnValue("windows");
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(screen.getByText(/install Task Scheduler supervisor/i)).toBeInTheDocument();
+  });
+
+  it("(#456 C58 d, review M4) install stops the bridge through the stop flow, installs on the stopped bridge, then starts it", async () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    const order: string[] = [];
+    const spy = vi.spyOn(restartModule, "stopBridgeThen").mockImplementation(async (_p, action, opts) => {
+      order.push("stop");
+      await action();
+      order.push(opts.start ? "start" : "no start");
+      return { stopped: true, error: null };
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "install_supervisor_service") order.push("install");
+      return { success: true, stdout: "service installed", stderr: "", exit_code: 0 };
+    });
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /install systemd supervisor/i }));
+    await waitFor(() => expect(screen.getByText(/supervisor installed/i)).toBeInTheDocument());
+    expect(order).toEqual(["stop", "install", "start"]);
+    expect(spy).toHaveBeenCalledWith("test", expect.any(Function), { start: true });
+    spy.mockRestore();
+  });
+
+  it("(#456 C58 d, review M4) a bridge the stop flow could not stop is not installed over", async () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    const spy = vi.spyOn(restartModule, "stopBridgeThen").mockResolvedValue({
+      stopped: false,
+      error: "Restart failed. Try `nell service status` from terminal, or restart Companion Emergence.",
+    });
+    const installs: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "install_supervisor_service") installs.push(cmd);
+      return { success: true, stdout: "", stderr: "", exit_code: 0 };
+    });
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /install systemd supervisor/i }));
+    await waitFor(() => expect(screen.getByText(/could not be stopped for the install/i)).toBeInTheDocument());
+    expect(installs).toEqual([]);
+    spy.mockRestore();
   });
 });
 

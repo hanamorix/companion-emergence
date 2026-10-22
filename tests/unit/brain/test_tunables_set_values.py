@@ -234,16 +234,16 @@ def test_an_absent_file_is_created_by_the_sync_pass_then_edited(t, tmp_path) -> 
 
 
 def test_the_write_is_fsynced_before_the_replace(t, tmp_path, monkeypatch) -> None:
-    from brain.utils import toml_io
+    from brain.utils import atomic_write, toml_io
 
     t.register("a", 1)
     write_text(tmp_path, '"a" = 1\n')
     order: list[str] = []
-    real_fsync, real_replace = os.fsync, toml_io._replace_with_retry
+    real_fsync, real_replace = os.fsync, atomic_write._replace_with_retry
     monkeypatch.setattr(toml_io.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
-    monkeypatch.setattr(toml_io, "_replace_with_retry", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
+    monkeypatch.setattr(atomic_write, "_replace_with_retry", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
     t.set_values({"a": 2})
-    assert order == ["fsync", "replace"]
+    assert order[:2] == ["fsync", "replace"]  # the data is on disk before the replace; the folder fsync comes after
 
 
 def test_a_failed_verify_before_the_replace_leaves_the_file_unchanged(t, tmp_path, monkeypatch) -> None:

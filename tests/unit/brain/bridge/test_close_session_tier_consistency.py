@@ -73,13 +73,3 @@ def test_close_session_and_idle_sweep_ticks_all_name_the_same_tier():
     snapshot_tier, finalize_tier = _tiers_passed_to_snapshot_and_finalize(supervisor_src)
 
     assert close_session_tier == snapshot_tier == finalize_tier == "TIER_BACKGROUND_HOUSEKEEPING"
-
-
-def test_daemon_recovery_also_names_the_same_tier():
-    """The dirty-shutdown recovery path (daemon.py) independently constructs its
-    own provider (not threaded from supervisor/server) but feeds the identical
-    snapshot_stale_sessions extraction — must also resolve to housekeeping."""
-    daemon_src = _read("bridge/daemon.py")
-    m = re.search(r"provider = build_tier_provider\(persona_dir,\s*([A-Z_]+)\)", daemon_src)
-    assert m is not None, "could not find daemon.py's build_tier_provider(...) call"
-    assert m.group(1) == "TIER_BACKGROUND_HOUSEKEEPING"
