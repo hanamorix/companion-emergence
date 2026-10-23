@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from brain.felt_time.anchors import scan_since
+from brain.felt_time.anchors import extract_all, scan_since
 from brain.felt_time.lived_age import _MIGRATION_SEED_RATE, IntensityDrivers, advance
 from brain.felt_time.pressure import TickInput, apply_horizon_tick, apply_tick
 from brain.felt_time.state import (
@@ -68,6 +68,14 @@ def _compute_first_tick_ts(prev: FeltTimeState, now_iso: str) -> str:
     ).isoformat()
 
 
+def _arc_log_index(anchor: Anchor) -> int | None:
+    """Position of an arc anchor in arcs.log.jsonl, from its source_ref
+    ("arcs.log.jsonl:N", N = 1-based valid-entry index, i.e. append order).
+    None when the ref has no parseable index."""
+    _, _, tail = anchor.source_ref.rpartition(":")
+    return int(tail) if tail.isdigit() else None
+
+
 class FeltTime:
     """Composes state + anchors + pressure + lived_age behind one tick()."""
 
@@ -92,7 +100,12 @@ class FeltTime:
         return self._state
 
     def tick(self, ctx: TickContext) -> None:
-        new_anchors = scan_since(self.persona_dir, self._state.last_tick_ts)
+        # Parse the logs once. new_anchors is exactly scan_since(last_tick_ts):
+        # strictly newer than the last tick; it drives the per-type anchors map and
+        # the pressure reset.
+        all_anchors = extract_all(self.persona_dir)
+        last_tick_ts = self._state.last_tick_ts
+        new_anchors = [a for a in all_anchors if last_tick_ts is None or a.ts > last_tick_ts]
 
         # Update anchors map — newest of each type wins.
         anchors = dict(self._state.anchors)
@@ -113,9 +126,20 @@ class FeltTime:
             new_anchors=new_anchors,
         )
 
-        # Arc anchor list — append all new arc-type anchors, cap at _ARC_ANCHOR_CAP.
+        # Arc anchor list — append arc events not yet folded in, cap at _ARC_ANCHOR_CAP.
+        # Selected by position in arcs.log.jsonl, not by timestamp: an arc_opened row is
+        # stamped with its SEED anchor's time, which is at or before the last tick, so a
+        # timestamp scan would never see it. Folding by position is idempotent (an event
+        # is folded once, never re-added after the cap evicts it) and does not reset
+        # pressure (only the timestamp-newer new_anchors above do).
         arc_anchors = list(self._state.arc_anchors)
-        new_arc_anchors = [a for a in new_anchors if a.type == "arc"]
+        folded_upto = max((i for i in map(_arc_log_index, arc_anchors) if i is not None), default=0)
+        new_arc_anchors = sorted(
+            (a for a in all_anchors if a.type == "arc" and (_arc_log_index(a) or 0) > folded_upto),
+            key=lambda a: _arc_log_index(a) or 0,  # log order, so the cap evicts the oldest-appended
+        )
+        # Known limit: if arcs.log.jsonl were ever replaced by a shorter log, folding pauses
+        # until it grows past folded_upto. Nothing in brain/ rotates or truncates it.
         arc_anchors.extend(new_arc_anchors)
         if len(arc_anchors) > _ARC_ANCHOR_CAP:
             arc_anchors = arc_anchors[-_ARC_ANCHOR_CAP:]
