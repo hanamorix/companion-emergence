@@ -512,7 +512,7 @@ def test_respond_file_send_surfaces_path_in_user_text(
     path = file_store.file_path(persona_dir, sha)
     assert (
         f'[the user shared a file "notes.txt": {path}. '
-        "Open it with your read_file tool to see what it says.]"
+        "Open it with your `read_file` tool to see what it says.]"
     ) in last_user
     # Shown-able-to-fail: with no shared file, the path line is absent.
     respond(
@@ -549,7 +549,7 @@ def test_respond_file_send_without_filename_still_carries_tool_cue(
     last_user = [m for m in recording_provider.last_messages if m.role == "user"][-1].content_text()
     path = file_store.file_path(persona_dir, sha)
     assert (
-        f"[the user shared a file: {path}. Open it with your read_file tool to see what it says.]"
+        f"[the user shared a file: {path}. Open it with your `read_file` tool to see what it says.]"
     ) in last_user
     assert '"' not in last_user.split("[the user shared a file")[1].split(":")[0]
 

@@ -1263,8 +1263,8 @@ class ClaudeCliProvider(LLMProvider):
                     "tool-calling via MCP requires options['persona_dir']",
                 )
             return self._chat_with_mcp_tools(
-                flat_prompt=flat_prompt,
-                system_prompt=system_prompt,
+                flat_prompt=_mcp_tool_names(flat_prompt),
+                system_prompt=_mcp_tool_names(system_prompt),
                 persona_dir=Path(persona_dir_str),
                 session_id=(options or {}).get("session_id"),
             )
@@ -1448,6 +1448,8 @@ class ClaudeCliProvider(LLMProvider):
                 return
             cmd.extend(["--mcp-config", tmp_mcp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
+            flat_prompt = _mcp_tool_names(flat_prompt)
+            system_prompt = _mcp_tool_names(system_prompt)
         # Always, not only with tools: a tools-less turn must not get every built-in (#329).
         _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
 
@@ -1954,6 +1956,24 @@ class ClaudeCliProvider(LLMProvider):
 
 _CLI_BUILTIN_ORIGIN = "cli_builtin"
 _BRAIN_TOOLS_PREFIX = "mcp__brain-tools__"
+
+
+def _mcp_tool_names(text: str | None) -> str | None:
+    """Rewrite backticked brain-tool names to the names the CLI registers (#416).
+
+    Prompt text is shared across providers and names tools bare (`record_monologue`), but on
+    the MCP path the CLI only knows `mcp__brain-tools__record_monologue`; a model that calls the
+    bare name gets "No such tool available". Only backtick-quoted names are touched, so prose and
+    built-ins (`WebSearch`) stay as written. Deterministic, so the frozen system prompt stays
+    byte-stable across turns. History in stdin is rewritten too (also deterministic per message).
+    Tool RESULTS (served by the MCP child) are not, so tool-reply text should not name tools.
+    """
+    if not text:
+        return text
+    from brain.tools import NELL_TOOL_NAMES  # local import avoids circular
+
+    names = "|".join(sorted(map(re.escape, NELL_TOOL_NAMES), key=len, reverse=True))
+    return re.sub(rf"`({names})(?=[`(])", rf"`{_BRAIN_TOOLS_PREFIX}\1", text)
 
 
 def _collect_builtin_calls(content: Any, calls: dict[str, dict[str, Any]]) -> None:
