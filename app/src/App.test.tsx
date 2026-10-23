@@ -341,11 +341,9 @@ describe("App tunables notice (#462)", () => {
 
   afterEach(cleanup);
 
-  const KEPT = "tunables.json.corrupt-20261019T120000Z";
   const cases: Array<[TunablesNotice, RegExp]> = [
-    [{ kind: "reset", kept_as: KEPT }, /kept as tunables\.json\.corrupt-20261019T120000Z/],
-    [{ kind: "restored", kept_as: KEPT }, /older saved copy/],
-    [{ kind: "unreadable", kept_as: null }, /cannot be read right now/],
+    [{ kind: "unreadable", line: 7, column: 12, reason: "Invalid statement" }, /tunables\.toml could not be read at line 7, column 12 \(Invalid statement\)/],
+    [{ kind: "unreadable", line: null, column: null, reason: null }, /Fix the file to use your settings again/],
   ];
 
   it.each(cases)("shows the notice for %j", async (notice, text) => {

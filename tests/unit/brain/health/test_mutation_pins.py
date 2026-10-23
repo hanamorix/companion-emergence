@@ -188,42 +188,64 @@ def test_mut_closure_sites_pass_recover_raise() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# F1: tunables write_defaults_section must not wipe overrides it could not read
+# F1: tunables sync_file must not touch a settings file it could not read
 # ---------------------------------------------------------------------------------------------
 
 
-def test_mut_tunables_defaults_refresh_keeps_overrides_when_the_file_is_unreadable(tmp_path: Path, monkeypatch, deny) -> None:
+def test_mut_tunables_boot_pass_keeps_values_when_the_file_is_unreadable(tmp_path: Path, monkeypatch, deny) -> None:
     from brain import tunables
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
+    tunables.register("a.b", 1, description="A setting.")
     p = tunables._file_path()
-    p.write_text(json.dumps({"overrides": {"a.b": 3}}))
+    p.write_text('"a.b" = 3\n')
     before = p.read_bytes()
-    deny("tunables.json")
-    tunables.write_defaults_section()  # never breaks startup; the refresh is skipped
+    deny("tunables.toml")
+    tunables.sync_file()  # never breaks startup; the pass is skipped and the file is left as it is
     assert p.read_bytes() == before
 
 
-def test_mut_tunables_writes_sorted_keys_and_survives_a_hand_edited_nan(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("os_name", [None, "nt"], ids=["this-os", "simulated-windows"])
+def test_mut_tunables_boot_pass_keeps_a_hand_edited_nan_and_makes_the_write_durable(
+    tmp_path: Path, monkeypatch, os_name: str | None
+) -> None:
     import os
 
     from brain import tunables
+    from brain.utils import atomic_write
 
-    synced: list[int] = []
+    events: list[str] = []
     real_fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    real_replace = os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
+    if os_name is not None:
+        # Give the writer alone a view of ``os`` that reports another platform name (patching ``os.name`` itself would
+        # break pathlib); every other attribute is the real one, including the instrumented fsync and replace above.
+        class _OsAs:
+            name = os_name
+
+            def __getattr__(self, attr: str):
+                return getattr(os, attr)
+
+        monkeypatch.setattr(atomic_write, "os", _OsAs())
 
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
     tunables._reset_for_tests()
+    tunables.register("new.key", 1, description="A setting.")
     p = tunables._file_path()
-    p.write_text('{"overrides": {"z.k": NaN, "a.k": 1}}')  # json.loads accepts NaN; a hand edit can contain it
-    tunables.write_defaults_section()
-    data = json.loads(p.read_text())
-    assert data["overrides"] == {"a.k": 1, "z.k": None}
+    p.write_text('"z.k" = nan\n"a.k" = 1\n')  # TOML reads nan; a hand edit can contain it
+    tunables.sync_file()
     text = p.read_text()
-    assert text == json.dumps(data, indent=2, sort_keys=True) + "\n"  # sorted keys, indent 2, trailing newline
-    assert synced == []  # the defaults refresh never synced
+    assert text.startswith('"z.k" = nan\n"a.k" = 1\n')  # the user's lines are byte for byte, in their order
+    assert '"new.key" = 1' in text
+    # The pass writes once through the shared atomic writer: the file's data is fsynced BEFORE the one replace (a power
+    # loss must not leave a zero-byte file) on every OS. The writer then fsyncs the directory so the rename itself is
+    # durable, but only where it can: ``fsync_dir`` returns early unless ``os.name == "posix"`` (Windows has no directory
+    # handles), so the trailing fsync is expected exactly when the writer's own check says it runs.
+    expected = ["fsync", "replace"] + (["fsync"] if atomic_write.os.name == "posix" else [])
+    assert events == expected
 
 
 # ---------------------------------------------------------------------------------------------
@@ -392,8 +414,6 @@ def test_mut_float_bearing_logs_without_a_float_reader_write_nan_as_null(tmp_pat
     from brain.engines.reflex import ReflexArc
     from brain.growth.arc_storage import append_removed_arc, read_removed_arcs
     from brain.health.soul_candidate_repair import _save_candidates
-    from brain.tunables_migration import migrate_idle_keys
-
     arc = ReflexArc(name="a", description="d", trigger={"love": float("nan")}, days_since_human_min=1.0,
                     cooldown_hours=1.0, action="x", output_memory_type="reflex", prompt_template="p")
     append_removed_arc(tmp_path, arc=arc, removed_at=NOW, removed_by="user_edit", reasoning=None)
@@ -403,12 +423,6 @@ def test_mut_float_bearing_logs_without_a_float_reader_write_nan_as_null(tmp_pat
     _save_candidates(tmp_path / "c.jsonl", [{"memory_id": "m", "importance": float("nan")}])
     assert json.loads((tmp_path / "c.jsonl").read_text())["importance"] is None
 
-    (tmp_path / "tunables.json").write_text(
-        '{"defaults": {}, "overrides": {"throttle.background_min_idle_seconds": 120.0, "x.y": NaN}}'
-    )
-    migrate_idle_keys(tmp_path)
-    overrides = json.loads((tmp_path / "tunables.json").read_text())["overrides"]
-    assert overrides["x.y"] is None and overrides["chat.idle_lull_seconds"] == 120.0
 
 
 def test_mut_audit_and_queue_rewrites_survive_a_legacy_nan_row(tmp_path: Path) -> None:

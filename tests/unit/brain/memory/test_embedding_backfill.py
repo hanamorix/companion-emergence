@@ -792,7 +792,7 @@ def test_backfill_writes_land_in_the_warm_matrix(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -823,7 +823,7 @@ def test_warm_matrix_put_failure_is_not_counted_as_a_backfill_error(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     def _boom_put(self, memory_id: str, vector) -> None:  # noqa: ANN001, ARG001
         raise RuntimeError("simulated warm-matrix put failure")
@@ -877,7 +877,7 @@ def test_backfill_reembeds_stale_model_rows_after_a_model_swap(
     store = _open_store(tmp_path)
     # Embed both rows under the "old" model first.
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: old_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, old_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, old_provider.model_id())
     store.embed_row(stale_row.id, stale_row.content)
     store.embed_row(current_row.id, current_row.content)
 
@@ -887,7 +887,7 @@ def test_backfill_reembeds_stale_model_rows_after_a_model_swap(
     new_provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     assert new_provider.model_id() != old_provider.model_id()
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: new_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, new_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, new_provider.model_id())
     store.embed_row(current_row.id, current_row.content)
 
     result = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
@@ -923,7 +923,7 @@ def test_backfill_is_a_no_op_when_all_rows_match_the_current_model(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 3)
     store = _open_store(tmp_path)
@@ -955,7 +955,7 @@ def test_drain_embeds_every_row_and_terminates_with_empty_backlog(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 11)
     store = _open_store(tmp_path)
@@ -1018,7 +1018,7 @@ def test_drain_terminates_when_a_row_permanently_fails_without_looping_forever(
 
     provider = _AlwaysFailsOnTwo()
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     store = _open_store(tmp_path)
     try:
@@ -1082,7 +1082,7 @@ def test_drain_scattered_failure_in_a_large_backlog_still_terminates(
 
     provider = _FailsOnOneBuried()
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     store = _open_store(tmp_path)
     try:
@@ -1118,7 +1118,7 @@ def test_drain_progress_cb_reports_cumulative_running_totals(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     _seed(tmp_path, 7)
     store = _open_store(tmp_path)
@@ -1153,7 +1153,7 @@ def test_drain_empty_backlog_returns_immediately(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     store = _open_store(tmp_path)  # no memories seeded at all
     try:
@@ -1197,7 +1197,7 @@ def test_delete_legacy_embeddings_db_deletes_when_fully_embedded(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
@@ -1228,7 +1228,7 @@ def test_delete_legacy_embeddings_db_defers_when_backlog_nonempty(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
@@ -1283,7 +1283,7 @@ def test_delete_legacy_embeddings_db_idempotent_rerun(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -1311,7 +1311,7 @@ def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -1365,7 +1365,7 @@ def test_delete_legacy_embeddings_db_builds_no_provider_to_read_the_model_id(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
     try:
@@ -1400,7 +1400,7 @@ def test_drain_final_count_builds_no_provider_of_its_own(
         return provider
 
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _counting)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
     _seed(tmp_path, 4)
     store = _open_store(tmp_path)
     try:

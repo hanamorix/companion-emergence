@@ -55,7 +55,7 @@ def swapped_provider(monkeypatch: pytest.MonkeyPatch) -> embeddings_mod.FakeEmbe
     harmless."""
     provider = embeddings_mod.FakeEmbeddingProvider(dim=_SWAPPED_DIM)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
     assert model_tier.MODEL_EMBEDDING_DIM != _SWAPPED_DIM, (
         "sanity: the swap dim must differ from the declared constant, or this "
         "test stops exercising the mismatch it exists to prove is harmless"

@@ -24,7 +24,7 @@ def test_load_default_is_none(tmp_path: Path) -> None:
 
 def test_touch_writes_iso_timestamp(tmp_path: Path) -> None:
     path = tmp_path / "persona_config.json"
-    cfg = PersonaConfig(provider="claude-cli", model="sonnet")
+    cfg = PersonaConfig(provider="claude-cli")
     cfg.save(path)
 
     cfg = PersonaConfig.load(path)

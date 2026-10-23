@@ -1,9 +1,9 @@
 """Wiring canaries: each ops-tier call site actually consults tunables."""
 from __future__ import annotations
 
-import json
-
 import pytest
+
+from tests.tunables_file import write_values
 
 
 @pytest.fixture()
@@ -16,57 +16,50 @@ def tunables_home(tmp_path, monkeypatch):
     t._reset_for_tests()
 
 
-def _write(home, overrides):
-    (home / "tunables.json").write_text(
-        json.dumps({"defaults": {}, "overrides": overrides}), encoding="utf-8"
-    )
-
-
 def test_chat_idle_lull_override(tunables_home):
     """The ONE registered ops-timing key (ram-spike-fix INC-6, C4(b)/C27):
     chat.idle_lull_seconds, read only by cli_throttle's private
     _lull_seconds(), called only from is_chat_idle()."""
-    _write(tunables_home, {"chat.idle_lull_seconds": 30.0})
+    write_values(tunables_home, {"chat.idle_lull_seconds": 30.0})
     from brain.bridge import cli_throttle
 
     assert cli_throttle._lull_seconds() == 30.0
 
 
 def test_throttle_concurrency_override(tunables_home):
-    _write(tunables_home, {"throttle.max_concurrent_background": 2})
+    write_values(tunables_home, {"throttle.max_concurrent_background": 2})
     from brain.bridge import cli_throttle
 
     assert cli_throttle._max_concurrent_background() == 2
 
 
 def test_keepalive_override(tunables_home):
-    _write(tunables_home, {"bridge.stream_keepalive_seconds": 5.0})
+    write_values(tunables_home, {"bridge.stream_keepalive_seconds": 5.0})
     from brain.bridge import server
 
     assert server._stream_keepalive_seconds() == 5.0
 
 
 def test_read_file_cap_override(tunables_home):
-    _write(tunables_home, {"files.read_max_bytes": 1024})
+    write_values(tunables_home, {"files.read_max_bytes": 1024})
     from brain.tools.impls import read_file
 
     assert read_file._file_read_max_bytes() == 1024
 
 
 def test_extraction_chunk_chars_override(tunables_home):
-    """#523: the extraction chunk size is read from tunables.json (``ingest.extraction_chunk_chars``)."""
-    _write(tunables_home, {"ingest.extraction_chunk_chars": 1500})
+    """#523: the extraction chunk size is read from tunables.toml (``ingest.extraction_chunk_chars``)."""
+    write_values(tunables_home, {"ingest.extraction_chunk_chars": 1500})
     from brain.ingest import ingest_utils
 
     assert ingest_utils.extraction_chunk_chars() == 1500
-
 
 
 @pytest.mark.parametrize(("override", "expected"), [(0, 15.0), (-3.0, 15.0), (True, 15.0), (0.2, 1.0), (2.5, 2.5)])
 def test_keepalive_override_has_a_positive_floor(tunables_home, override, expected):
     """A keepalive of 0 (or a negative, or a bool) would make the streamed bodies spin spaces: it falls back to the default; a
     positive value below one second is raised to one second."""
-    _write(tunables_home, {"bridge.stream_keepalive_seconds": override})
+    write_values(tunables_home, {"bridge.stream_keepalive_seconds": override})
     from brain.bridge import server
 
     assert server._stream_keepalive_seconds() == expected

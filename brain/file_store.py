@@ -33,11 +33,14 @@ _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 # General upload cap. Defaults to >= the 20 MB /upload image cap so the
 # two caps are coherent (no "upload succeeds but store refuses" dead zone).
-_UPLOAD_MAX_BYTES = tunables.register("files.upload_max_bytes", 20 * 1024 * 1024)
+_UPLOAD_MAX_BYTES = tunables.register(
+    "files.upload_max_bytes", 20 * 1024 * 1024,
+    description="Largest file you can upload, in bytes.",
+)
 
 
 def upload_max_bytes() -> int:
-    """Current general-file upload byte cap (tunable-overridable)."""
+    """Current general-file upload byte cap (a tunable)."""
     return tunables.get_tunable("files.upload_max_bytes", _UPLOAD_MAX_BYTES)
 
 

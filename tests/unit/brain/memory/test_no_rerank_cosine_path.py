@@ -129,7 +129,7 @@ def _seed_pool(
     monkeypatch.setattr(
         "brain.memory.embeddings.build_embedding_provider", lambda: _Embedder(**embedder_kwargs)
     )
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _EMBEDDER_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _EMBEDDER_ID)
     mems = []
     for i, c in enumerate(cosines):
         m = _mem(store, f"r2 candidate memory number {i}")

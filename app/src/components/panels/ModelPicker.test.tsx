@@ -27,7 +27,7 @@ describe("ModelPicker", () => {
 
   it("renders all three model options with cost hints", () => {
     render(
-      <ModelPicker current="sonnet" persona="test" onClose={() => {}} />,
+      <ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />,
     );
 
     expect(screen.getByLabelText(/sonnet/i)).toBeInTheDocument();
@@ -42,7 +42,7 @@ describe("ModelPicker", () => {
 
   it("Apply button is disabled when the selection matches current", () => {
     render(
-      <ModelPicker current="sonnet" persona="test" onClose={() => {}} />,
+      <ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />,
     );
     const apply = screen.getByRole("button", { name: /apply/i });
     expect(apply).toBeDisabled();
@@ -50,7 +50,7 @@ describe("ModelPicker", () => {
 
   it("Apply button becomes enabled after selecting a different model", () => {
     render(
-      <ModelPicker current="sonnet" persona="test" onClose={() => {}} />,
+      <ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />,
     );
     fireEvent.click(screen.getByLabelText(/opus/i));
     const apply = screen.getByRole("button", { name: /apply/i });
@@ -67,7 +67,7 @@ describe("ModelPicker", () => {
 
     const onClose = vi.fn();
     render(
-      <ModelPicker current="sonnet" persona="test" onClose={onClose} />,
+      <ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />,
     );
 
     fireEvent.click(screen.getByLabelText(/opus/i));
@@ -81,7 +81,7 @@ describe("ModelPicker", () => {
   it("calls onClose with no argument when Cancel is clicked", () => {
     const onClose = vi.fn();
     render(
-      <ModelPicker current="sonnet" persona="test" onClose={onClose} />,
+      <ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />,
     );
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     expect(onClose).toHaveBeenCalledWith();
@@ -96,7 +96,7 @@ describe("ModelPicker", () => {
     );
 
     render(
-      <ModelPicker current="sonnet" persona="test" onClose={() => {}} />,
+      <ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />,
     );
 
     fireEvent.click(screen.getByLabelText(/opus/i));
@@ -120,7 +120,7 @@ describe("ModelPicker", () => {
   }
 
   it("offers a custom model ID option and input beside the three aliases", () => {
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     expect(customRadio()).toBeInTheDocument();
     expect(customRadio()).not.toBeChecked();
     expect(idInput()).toBeInTheDocument();
@@ -133,7 +133,7 @@ describe("ModelPicker", () => {
       new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
     );
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
 
     fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
     expect(customRadio()).toBeChecked();
@@ -148,7 +148,7 @@ describe("ModelPicker", () => {
   it.each(["Claude-Sonnet-5", "sonnet-5", "claude-", "claude-sonnet 5", "claude_sonnet_5"])(
     "disables Apply and shows the format hint for %j",
     (bad) => {
-      render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+      render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
       fireEvent.change(idInput(), { target: { value: bad } });
       expect(applyBtn()).toBeDisabled();
       expect(screen.getByText(/start with claude-/i)).toBeInTheDocument();
@@ -156,7 +156,7 @@ describe("ModelPicker", () => {
   );
 
   it("shows no hint before anything is typed and keeps Apply disabled", () => {
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     fireEvent.click(customRadio());
     expect(applyBtn()).toBeDisabled();
     expect(screen.queryByText(/start with claude-/i)).not.toBeInTheDocument();
@@ -167,7 +167,7 @@ describe("ModelPicker", () => {
       new Response(JSON.stringify({ ok: true, model: "claude-opus-4-8", checked: true }), { status: 200 }),
     );
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
 
     fireEvent.change(idInput(), { target: { value: "  claude-opus-4-8  " } });
     expect(applyBtn()).not.toBeDisabled();
@@ -178,16 +178,16 @@ describe("ModelPicker", () => {
   });
 
   it("opens with Custom selected and the id filled in when the current model is a full id", () => {
-    render(<ModelPicker current="claude-sonnet-5" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-4-6" choice={null} persona="test" onClose={() => {}} />);
     expect(customRadio()).toBeChecked();
-    expect(idInput()).toHaveValue("claude-sonnet-5");
+    expect(idInput()).toHaveValue("claude-sonnet-4-6");
     expect(applyBtn()).toBeDisabled(); // unchanged
-    fireEvent.change(idInput(), { target: { value: "claude-sonnet-5-b" } });
+    fireEvent.change(idInput(), { target: { value: "claude-sonnet-4-6-b" } });
     expect(applyBtn()).not.toBeDisabled();
   });
 
   it("selecting Custom by focusing the input unchecks the aliases", () => {
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     fireEvent.focus(idInput());
     expect(customRadio()).toBeChecked();
     expect(screen.getByLabelText(/sonnet/i)).not.toBeChecked();
@@ -201,7 +201,7 @@ describe("ModelPicker", () => {
       ),
     );
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
 
     fireEvent.change(idInput(), { target: { value: "claude-sonet-5" } });
     fireEvent.click(applyBtn());
@@ -221,7 +221,7 @@ describe("ModelPicker", () => {
       "fetch",
       vi.fn().mockReturnValue(new Promise<Response>((res) => (release = res))),
     );
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
     fireEvent.click(applyBtn());
     await waitFor(() => expect(screen.getByRole("button", { name: /checking/i })).toBeDisabled());
@@ -233,7 +233,7 @@ describe("ModelPicker", () => {
       "fetch",
       vi.fn().mockReturnValue(new Promise<Response>((res) => (releaseAlias = res))),
     );
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     fireEvent.click(screen.getByLabelText(/opus/i));
     fireEvent.click(applyBtn());
     await waitFor(() => expect(screen.getByRole("button", { name: /applying/i })).toBeDisabled());
@@ -241,7 +241,7 @@ describe("ModelPicker", () => {
   });
 
   it("the new custom-option strings contain no em-dash", () => {
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     fireEvent.change(idInput(), { target: { value: "Bad ID" } });
     const customRow = customRadio().closest("label")!;
     expect(customRow.textContent).not.toContain("—");
@@ -253,7 +253,7 @@ describe("ModelPicker", () => {
       new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: false }), { status: 200 }),
     );
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
     fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
     fireEvent.click(applyBtn());
     await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { checked: false }));
@@ -262,7 +262,7 @@ describe("ModelPicker", () => {
   it("a confirmed or alias apply calls onClose with the model only", async () => {
     stubFetch(new Response(JSON.stringify({ ok: true, model: "opus" }), { status: 200 }));
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
     fireEvent.click(screen.getByLabelText(/opus/i));
     fireEvent.click(applyBtn());
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
@@ -270,32 +270,54 @@ describe("ModelPicker", () => {
   });
 
   it("does not accept an id over 64 characters", () => {
-    render(<ModelPicker current="sonnet" persona="test" onClose={() => {}} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
     fireEvent.change(idInput(), { target: { value: "claude-" + "a".repeat(58) } });
     expect(applyBtn()).toBeDisabled();
   });
 
-  it("passes the bridge's tier fallbacks to the caller", async () => {
-    const fb = [{ family: "haiku", wanted: "claude-haiku-5", using: "haiku" }];
-    stubFetch(
-      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, fallbacks: fb }), { status: 200 }),
-    );
+  it("typing the id of the highlighted word's model is a change: it is checked and saved as that id", async () => {
+    stubFetch(new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }));
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} />);
     fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
+    expect(applyBtn()).not.toBeDisabled();
     fireEvent.click(applyBtn());
-    await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { fallbacks: fb }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5"));
   });
 
-  it("passes the tiers the bridge could not check yet to the caller", async () => {
-    stubFetch(
-      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true, tiers_unchecked: ["claude-haiku-5"] }), { status: 200 }),
-    );
-    const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} />);
-    fireEvent.change(idInput(), { target: { value: "claude-sonnet-5" } });
+  it("an unchanged word stays disabled, and a custom id highlights no word", () => {
+    render(<ModelPicker current="claude-sonnet-4-6" choice={null} persona="test" onClose={() => {}} />);
+    expect(screen.getByLabelText(/sonnet/i)).not.toBeChecked();
+    expect(screen.getByLabelText(/opus/i)).not.toBeChecked();
+    expect(screen.getByLabelText(/haiku/i)).not.toBeChecked();
+  });
+
+  it("does not offer or send any model id of its own for the three words", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true, model: "claude-opus-5" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText(/opus/i));
     fireEvent.click(applyBtn());
-    await waitFor(() => expect(onClose).toHaveBeenCalledWith("claude-sonnet-5", { tiersUnchecked: ["claude-haiku-5"] }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toEqual({ model: "opus" });
+  });
+
+  it("explains the refusal when the persona does not use Claude", async () => {
+    stubFetch(new Response(JSON.stringify({ ok: false, error: "model_not_applicable" }), { status: 400 }));
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText(/opus/i));
+    fireEvent.click(applyBtn());
+    expect(await screen.findByRole("alert")).toHaveTextContent(/does not use Claude/);
+  });
+
+  it("explains the refusal when the settings file could not be saved", async () => {
+    stubFetch(new Response(JSON.stringify({ ok: false, error: "tunables_unwritable", detail: "x" }), { status: 500 }));
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={() => {}} />);
+    fireEvent.click(screen.getByLabelText(/opus/i));
+    fireEvent.click(applyBtn());
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/settings file/);
+    expect(alert.textContent).not.toContain("—");
   });
 
   it("allowReapply lets the user apply the model that is already current (an unsupported setting fell back to it)", async () => {
@@ -304,7 +326,7 @@ describe("ModelPicker", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     const onClose = vi.fn();
-    render(<ModelPicker current="sonnet" persona="test" onClose={onClose} allowReapply />);
+    render(<ModelPicker current="claude-sonnet-5" choice="sonnet" persona="test" onClose={onClose} allowReapply />);
     const apply = screen.getByRole("button", { name: /apply/i });
     expect(apply).not.toBeDisabled();
     fireEvent.click(apply);

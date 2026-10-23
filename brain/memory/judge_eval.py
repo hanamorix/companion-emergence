@@ -76,7 +76,10 @@ logger = logging.getLogger(__name__)
 # 2026-09-24): "a standard significance convention... not a model-pinned
 # magic number" — a documented, widely-used default, not hand-picked for
 # this codebase.
-JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register("judge_selftune.eval_alpha", 0.05)
+JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register(
+    "judge_selftune.eval_alpha", 0.05,
+    description="Strictness of the weekly test that decides whether a retrained memory judge replaces the old one.",
+)
 
 # Held-out test-set size floor (spec §4 "DEGENERATE FLOOR"): below this,
 # there is too little data to evaluate the challenger at all, so the
@@ -85,7 +88,10 @@ JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register("judge_selftune.eval_alpha",
 # JUDGE_TUNE_GATE_HANDFUL_DECISIONS`'s own docstring: not hardware-derived,
 # so a dry-run doesn't set it either) — 30 is the conventional rule-of-thumb
 # floor for a binomial-family test to have any meaningful power at all.
-JUDGE_EVAL_MIN_TEST_N_DEFAULT: int = tunables.register("judge_selftune.eval_min_test_n", 30)
+JUDGE_EVAL_MIN_TEST_N_DEFAULT: int = tunables.register(
+    "judge_selftune.eval_min_test_n", 30,
+    description="Fewest held-back examples needed before a retrained memory judge is tested at all.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -232,10 +238,10 @@ def challenger_not_worse(
     re-hardcoding the numbers here — ONE source of truth for the default
     value, no duplicate magic number (mirrors `fit_platt_knob`'s sibling
     pure functions in `judge_selftune.py`, which also take plain
-    parameters and leave TUNABLE-OVERRIDE RESOLUTION to the caller: this
+    parameters and leave SETTING RESOLUTION to the caller: this
     function itself never calls `tunables.get_tunable` — an orchestrating
     caller like `run_champion_challenger` below resolves the live
-    tunables.json override and passes the resolved value in, so this stays
+    tunables.toml value and passes the resolved value in, so this stays
     a pure, deterministically-testable function of its arguments alone).
     """
     n = len(champion_correct)
@@ -348,10 +354,10 @@ def run_champion_challenger(
     once, before the eval loop starts).
 
     `alpha`/`min_n` default to `None`, meaning "read the live
-    `tunables.json` override (falling back to this module's registered
+    `tunables.toml` value (falling back to this module's registered
     default) at call time" — this is the ORCHESTRATION layer, so unlike
     `challenger_not_worse`'s own plain-parameter pure-function contract,
-    THIS function is where a tunables override actually takes effect
+    THIS function is where a tunables value actually takes effect
     (mirrors `judge_selftune._run_judge_selftune_tick` resolving its own
     tunables via `tunables.get_tunable` right before calling the pure
     fit function it wraps).

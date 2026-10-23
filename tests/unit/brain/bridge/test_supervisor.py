@@ -651,7 +651,7 @@ def test_supervisor_clustering_tick_writes_row_and_centroids_not_embeddings_db(
     from brain.memory.store import Memory, MemoryStore
 
     test_model_id = "fake-clustering-tick-model"
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, test_model_id)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, test_model_id)
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
@@ -712,7 +712,7 @@ def test_supervisor_startup_deletes_legacy_embeddings_db_when_fully_embedded(
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
     # The deletion gate reads the current model id without building a provider.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
@@ -757,7 +757,7 @@ def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
     # The deletion gate reads the current model id without building a provider.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)

@@ -60,20 +60,22 @@ def test_tagger_uses_exactly_the_provider_it_was_given(tmp_path):
 def test_make_default_tagger_dead_branch_sources_from_model_for_tier(monkeypatch):
     """C5: the `provider is None` fallback branch (confirmed dead in production —
     the live caller always supplies a provider) constructs its ClaudeCliProvider
-    with the SAME model `model_for_tier(TIER_BACKGROUND_CLASSIFIER)` returns —
-    no separately-hardcoded literal to drift out of sync."""
+    for the background-classifier JOB, so the model it runs is whatever
+    `model_for_tier(TIER_BACKGROUND_CLASSIFIER)` returns at call time — no
+    separately-hardcoded literal to drift out of sync."""
     captured: dict[str, object] = {}
     real_init = ClaudeCliProvider.__init__
 
-    def _capturing_init(self, model="sonnet", timeout_seconds=60):
-        captured["model"] = model
-        real_init(self, model=model, timeout_seconds=timeout_seconds)
+    def _capturing_init(self, tier="interactive-chat", *, probe_model=None, timeout_seconds=60):
+        captured["tier"] = tier
+        real_init(self, tier, probe_model=probe_model, timeout_seconds=timeout_seconds)
 
     monkeypatch.setattr(ClaudeCliProvider, "__init__", _capturing_init)
 
     _make_default_tagger(None)
 
-    assert captured["model"] == model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
+    assert captured["tier"] == TIER_BACKGROUND_CLASSIFIER
+    assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 
 def _emotion_backfill_call_site_tier(supervisor_src: str) -> str | None:

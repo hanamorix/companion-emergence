@@ -1,20 +1,30 @@
 /**
- * The chat model setting: an alias (sonnet / opus / haiku) or a full model id such as
- * `claude-sonnet-5`, stored and passed to `claude --model` as written.
+ * The chat model setting: one of three words (sonnet / opus / haiku, the picker's vocabulary) or a full model id
+ * (it starts with `claude-`), stored in the install's settings file (tunables.toml) and passed to `claude --model` as written.
+ * The app holds no model id of its own: the brain resolves the words.
  *
- * KEEP IN SYNC with brain/persona_config.py (`KNOWN_MODELS`, `MODEL_ID_PATTERN`, `MODEL_ID_MAX_LENGTH`). The pattern is
+ * KEEP IN SYNC with brain/bridge/model_tier.py (`KNOWN_MODELS`, `MODEL_ID_PATTERN`, `MODEL_ID_MAX_LENGTH`). The pattern is
  * anchored with `^...$`; without the `m` flag a JS `$` matches only at the very end, so a trailing
  * newline is rejected, exactly like Python's `fullmatch`.
  */
 export const CHAT_MODEL_ALIASES = ["sonnet", "opus", "haiku"] as const;
 export const CHAT_MODEL_ID_PATTERN = /^claude-[a-z0-9.-]+$/;
 
-/** Longest full id accepted (brain/persona_config.py `MODEL_ID_MAX_LENGTH`, enforced on every write path).
+/** Longest full id accepted (brain/bridge/model_tier.py `MODEL_ID_MAX_LENGTH`, enforced on every write path).
  *  Real ids are well under it. */
 export const MODEL_ID_MAX_LENGTH = 64;
 
 export function isChatModelAlias(value: string): boolean {
   return (CHAT_MODEL_ALIASES as readonly string[]).includes(value);
+}
+
+/** The words a save runs NO check call for: `sonnet` is written as the chat job's shipped default id and `haiku`
+ *  is written as the alias. `opus` is written as its full id and every full id is written as typed, so both are
+ *  checked first (brain/server.py `_apply_chat_model`). KEEP IN SYNC with that rule. */
+export const CHECK_FREE_ALIASES = ["sonnet", "haiku"] as const;
+
+export function isCheckFreeAlias(value: string): boolean {
+  return (CHECK_FREE_ALIASES as readonly string[]).includes(value);
 }
 
 export function isValidChatModel(value: string): boolean {

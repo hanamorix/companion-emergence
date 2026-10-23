@@ -60,8 +60,14 @@ logger = logging.getLogger(__name__)
 # day one rather than being retrofitted later.
 # ---------------------------------------------------------------------------
 
-LORA_RANK_DEFAULT: int = tunables.register("judge_selftune.lora_rank", 8)
-LORA_EPOCHS_DEFAULT: int = tunables.register("judge_selftune.lora_epochs", 1)
+LORA_RANK_DEFAULT: int = tunables.register(
+    "judge_selftune.lora_rank", 8,
+    description="Size of the add-on layers used when the memory judge is retrained the lightweight way.",
+)
+LORA_EPOCHS_DEFAULT: int = tunables.register(
+    "judge_selftune.lora_epochs", 1,
+    description="How many passes the lightweight judge retrain makes over its examples.",
+)
 
 # Max sequence length for training (`build_lora_retrain_fn`'s `CrossEncoder`)
 # — and, because the merged checkpoint is saved through
@@ -73,7 +79,10 @@ LORA_EPOCHS_DEFAULT: int = tunables.register("judge_selftune.lora_epochs", 1)
 # tier reads the same tunable. PROVISIONAL 512 (the practical bge-reranker
 # sequence length); the real value is the deferred timed dry-run's job,
 # overridable meanwhile.
-LORA_MAX_LENGTH_DEFAULT: int = tunables.register("judge_selftune.lora_max_length", 512)
+LORA_MAX_LENGTH_DEFAULT: int = tunables.register(
+    "judge_selftune.lora_max_length", 512,
+    description="Longest stretch of text, in tokens, the memory judge reads when trained and when used.",
+)
 
 # `(query, doc, label)` triple — label is "relevant" or "irrelevant", the
 # EFFECTIVE (Haiku-over-local) label per judge_eval.py's docstring / spec

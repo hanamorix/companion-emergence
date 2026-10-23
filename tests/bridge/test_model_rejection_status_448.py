@@ -28,7 +28,6 @@ from brain.bridge import server as server_mod
 from brain.bridge.chat import ChatMessage, StreamError
 from brain.bridge.provider import ClaudeCliProvider, ProviderError
 from brain.bridge.server import build_app
-from brain.persona_config import PersonaConfig
 from brain.utils import log_throttle
 
 FIXDIR = Path(__file__).parent / "fixtures"
@@ -177,7 +176,7 @@ def test_pure_404_is_generic_and_nothing_is_recorded(caplog):
 
 
 def _stream_error(frames: list[dict], model: str = BAD) -> StreamError:
-    provider = ClaudeCliProvider(model=model)
+    provider = ClaudeCliProvider(probe_model=model)
     with patch("subprocess.Popen", return_value=_FakePopen(_lines(frames))):
         events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
     errors = [e for e in events if isinstance(e, StreamError)]
@@ -206,7 +205,7 @@ def test_stream_last_string_error_code_wins_and_later_frames_do_not_erase_it():
 
 
 def _client(persona_dir: Path, monkeypatch, model: str = BAD) -> TestClient:
-    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(model=model))
+    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(probe_model=model))
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests"))
 
 
@@ -242,7 +241,7 @@ def _persona(tmp_path: Path) -> Path:
 
 
 def test_generate_json_argv_failure_is_a_rejection():
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
     with patch("brain.bridge.provider.subprocess.run", return_value=_proc(1, json.dumps(F302_JSON))):
         with pytest.raises(RuntimeError) as err:
             provider.generate("hi")
@@ -250,7 +249,7 @@ def test_generate_json_argv_failure_is_a_rejection():
 
 
 def test_generate_exit0_in_frame_failure_is_a_rejection():
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
     with patch("brain.bridge.provider.subprocess.run", return_value=_proc(0, json.dumps(F302_JSON))):
         with pytest.raises(RuntimeError) as err:
             provider.generate("hi")
@@ -259,7 +258,7 @@ def test_generate_exit0_in_frame_failure_is_a_rejection():
 
 @pytest.mark.parametrize("frames", [F302, _reword(F302)], ids=["sentence", "reworded"])
 def test_blocking_text_chat_exit1_is_a_rejection(tmp_path: Path, frames):
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
     with patch("brain.bridge.provider.subprocess.run", return_value=_proc(1, _ndjson(frames))):
         with pytest.raises(ProviderError) as err:
             provider.chat([ChatMessage(role="user", content="hi")], tools=None, options={"persona_dir": str(_persona(tmp_path))})
@@ -267,7 +266,7 @@ def test_blocking_text_chat_exit1_is_a_rejection(tmp_path: Path, frames):
 
 
 def test_blocking_text_chat_exit0_in_frame_is_a_rejection(tmp_path: Path):
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
     with patch("brain.bridge.provider.subprocess.run", return_value=_proc(0, _ndjson(_reword(F302)))):
         with pytest.raises(ProviderError) as err:
             provider.chat([ChatMessage(role="user", content="hi")], tools=None, options={"persona_dir": str(_persona(tmp_path))})
@@ -275,7 +274,7 @@ def test_blocking_text_chat_exit0_in_frame_is_a_rejection(tmp_path: Path):
 
 
 def test_blocking_tools_chat_exit1_is_a_rejection(tmp_path: Path):
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
     with patch("brain.bridge.provider.subprocess.run", return_value=_proc(1, _ndjson(_reword(F302)))):
         with pytest.raises(ProviderError) as err:
             provider.chat([ChatMessage(role="user", content="hi")], tools=[{"name": "search_memories"}], options={"persona_dir": str(_persona(tmp_path))})
@@ -351,10 +350,10 @@ def test_name_from_sentence_when_valid_else_argv_token_else_none():
 
 def test_chat_error_model_never_uses_the_provider_model():
     text = f"model={BAD}; error=model_not_found; {REWORDED}"
-    assert server_mod._chat_error_model(RuntimeError(text), ClaudeCliProvider(model="opus")) == BAD
+    assert server_mod._chat_error_model(RuntimeError(text), ClaudeCliProvider(probe_model="opus")) == BAD
     # nothing usable in the text: no name, even though the provider has a model
-    assert server_mod._chat_error_model(RuntimeError("error=model_not_found; Model unknown."), ClaudeCliProvider(model="opus")) is None
-    assert server_mod._chat_error_detail(RuntimeError("error=model_not_found; Model unknown."), ClaudeCliProvider(model="opus")) == "model_unavailable"
+    assert server_mod._chat_error_model(RuntimeError("error=model_not_found; Model unknown."), ClaudeCliProvider(probe_model="opus")) is None
+    assert server_mod._chat_error_detail(RuntimeError("error=model_not_found; Model unknown."), ClaudeCliProvider(probe_model="opus")) == "model_unavailable"
 
 
 def test_hot_swap_during_a_streaming_turn_still_names_the_executed_model(persona_dir: Path, monkeypatch):
@@ -373,7 +372,7 @@ def test_hot_swap_during_a_streaming_turn_still_names_the_executed_model(persona
 
 
 def test_hot_swap_on_the_blocking_path_names_and_records_the_executed_model(tmp_path: Path):
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
 
     def _run(cmd, **kw):
         provider._model = "opus"
@@ -390,18 +389,20 @@ def test_hot_swap_on_the_blocking_path_names_and_records_the_executed_model(tmp_
 
 
 def test_reworded_rejection_on_the_ndjson_path_is_recorded_warned_and_reported(tmp_path: Path, caplog):
-    provider = ClaudeCliProvider(model=BAD)
+    provider = ClaudeCliProvider(probe_model=BAD)
     with caplog.at_level(logging.WARNING), patch("brain.bridge.provider.subprocess.run", return_value=_proc(1, _ndjson(_reword(F302)))):
         with pytest.raises(ProviderError):
             provider.chat([ChatMessage(role="user", content="hi")], tools=None, options={"persona_dir": str(_persona(tmp_path))})
     state = model_error.state()
     assert [r["model"] for r in state] == [BAD] and state[0]["count"] == 1
     assert len([r for r in caplog.records if BAD in r.getMessage() and r.name.endswith("model_error")]) == 1
+    from brain import tunables
     from brain.bridge.persona_state import build_persona_state
 
     d = tmp_path / "p2"
     d.mkdir()
-    (d / "persona_config.json").write_text(json.dumps({"provider": "claude-cli", "model": BAD}))
+    (d / "persona_config.json").write_text(json.dumps({"provider": "claude-cli"}))
+    tunables.set_values({"model.interactive_chat": BAD})  # the chat job is configured with the rejected id
     assert [r["model"] for r in build_persona_state(d)["model_rejections"]] == [BAD]
 
 
@@ -531,7 +532,7 @@ def test_probe_runs_stream_json_without_tools_or_a_usage_row():
     with patch("brain.bridge.provider.subprocess.run", _probe_run(0, ok, seen)), patch(
         "brain.bridge.provider.log_usage", side_effect=AssertionError("the probe writes no usage row")
     ):
-        assert ClaudeCliProvider(model="claude-sonnet-5", timeout_seconds=7).probe("hi") == "OK"
+        assert ClaudeCliProvider(probe_model="claude-sonnet-5", timeout_seconds=7).probe("hi") == "OK"
     cmd, kw = seen[0]
     assert cmd[cmd.index("--output-format") + 1] == "stream-json" and "--verbose" in cmd
     assert cmd[cmd.index("--model") + 1] == "claude-sonnet-5"
@@ -572,21 +573,21 @@ def test_save_time_check_timeout_and_expired_login_are_inconclusive():
 
 
 def test_apply_refuses_a_reworded_rejection_because_the_check_reads_the_code(persona_dir: Path, monkeypatch):
-    p = persona_dir / "persona_config.json"
-    before = p.read_bytes()
-    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(model="sonnet"))
+    from brain import tunables
+
+    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(probe_model="sonnet"))
     with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as c:
         with patch("subprocess.run", _probe_run(1, _ndjson(_reword(F302)))), patch(
             "subprocess.Popen", side_effect=AssertionError("no streaming Popen for the check")
         ):
             r = c.post("/persona/config/model", json={"model": BAD})
     assert r.status_code == 400 and r.json() == {"ok": False, "error": "model_unavailable", "model": BAD}
-    assert PersonaConfig.load(p).model == "sonnet" and b"claude-sonet" not in p.read_bytes() and before is not None
+    assert tunables.get_raw("model.interactive_chat") == "claude-sonnet-5" and BAD not in tunables._file_path().read_text()
 
 
 def test_generate_json_argv_is_unaffected_by_the_probe():
     seen: list = []
     with patch("brain.bridge.provider.subprocess.run", _probe_run(0, json.dumps({"is_error": False, "result": "x"}), seen)):
-        assert ClaudeCliProvider(model="haiku").generate("hi") == "x"
+        assert ClaudeCliProvider(probe_model="haiku").generate("hi") == "x"
     cmd = seen[0][0]
     assert cmd[cmd.index("--output-format") + 1] == "json" and "--verbose" not in cmd

@@ -177,16 +177,16 @@ _TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backf
 def _make_default_tagger(provider: LLMProvider | None, persona_dir: Path | None = None) -> Callable:
     """Return a tagger closure that calls ``provider.generate`` for each memory.
 
-    When ``provider`` is None, constructs a ``ClaudeCliProvider`` pointed at
-    the Haiku model — mirroring the ``_call_haiku`` pattern in
-    ``brain/attunement/detector.py``.
+    When ``provider`` is None, constructs a ``ClaudeCliProvider`` for the
+    background-classifier job (the model its setting in tunables.toml names), mirroring the
+    ``_call_haiku`` pattern in ``brain/attunement/detector.py``.
     """
     if provider is None:
-        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, resolve_tier_model
+        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
         from brain.bridge.provider import ClaudeCliProvider
 
         provider = ClaudeCliProvider(
-            model=resolve_tier_model(persona_dir, TIER_BACKGROUND_CLASSIFIER)[0],
+            TIER_BACKGROUND_CLASSIFIER,
             timeout_seconds=_BACKFILL_TIMEOUT_SECONDS,
         )
 

@@ -200,7 +200,7 @@ def _mem(
 
 def _install(monkeypatch: pytest.MonkeyPatch, embedder: _AxisEmbedder, reranker=None) -> None:
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", lambda: embedder)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _EMBEDDER_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _EMBEDDER_ID)
     if reranker is not None:
         monkeypatch.setattr("brain.memory.reranker.build_reranker_provider", lambda **kw: reranker)
 

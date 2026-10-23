@@ -387,7 +387,7 @@ def run_replay(
     """
     os.environ["NELL_CACHE_DEBUG"] = "1"
 
-    from brain.bridge.provider import get_provider
+    from brain.bridge.provider import ClaudeCliProvider, get_provider
     from brain.chat.engine import respond
     from brain.chat.session import create_session
     from brain.memory.hebbian import HebbianMatrix
@@ -402,9 +402,11 @@ def run_replay(
     tool_offset = _file_size(tool_path)
 
     if model is None:
-        provider = get_provider(provider_name, persona_dir=persona_dir)
+        provider = get_provider(provider_name)  # the chat model of tunables.toml
+    elif provider_name == "claude-cli":
+        provider = ClaudeCliProvider(probe_model=model)  # one explicit id for the whole run
     else:
-        provider = get_provider(provider_name, persona_dir=persona_dir, model_override=model)
+        raise ValueError(f"--model applies to the claude-cli provider only, not {provider_name!r}")
     if force_text_path:
         provider = _TextPathProvider(provider)  # route every turn through the logging text path
     store = MemoryStore(persona_dir / "memories.db")
@@ -1181,7 +1183,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="default",
         help="content prompts: default (the cache workload), reach (#525: deferred brain tools) or recall (#525: memory reach)",
     )
-    p.add_argument("--model", help="model for the claude-cli provider (get_provider model_override), e.g. haiku")
+    p.add_argument("--model", help="one explicit model id for the whole run, claude-cli provider only (default: the chat model in tunables.toml), e.g. haiku")
     p.add_argument(
         "--render-only",
         action="store_true",

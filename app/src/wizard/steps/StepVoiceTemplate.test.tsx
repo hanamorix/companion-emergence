@@ -32,6 +32,12 @@ describe("StepVoiceTemplate — optional Claude model (#441)", () => {
     expect(screen.getByRole("button", { name: /continue/i })).not.toBeDisabled();
   });
 
+  it("says a blank field keeps the install's current setting, not the default (#530 review)", () => {
+    renderStep("");
+    expect(screen.getByText(/Leave blank to keep the current setting/)).toBeInTheDocument();
+    expect(screen.queryByText(/keep the default/)).not.toBeInTheDocument();
+  });
+
   it("reports what is typed", () => {
     const p = renderStep("");
     fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "claude-sonnet-5" } });

@@ -9,7 +9,7 @@ raw turns are moved to the lossless archive.
 This is the manual sibling of the daily timed cadence and the apply_budget
 backstop; all three share brain/chat/compaction.py — including the provider:
 like every other caller, this tool builds its own cost-pinned
-(COMPACTION_MODEL="haiku") provider via build_compaction_provider(persona_dir)
+(the compaction job's model) provider via build_compaction_provider(persona_dir)
 rather than requiring one injected. #80: an injected live provider cannot cross
 the parent -> claude-CLI -> mcp_server grandchild process boundary the MCP
 dispatch path runs through, so requiring one made this tool unreachable via MCP.

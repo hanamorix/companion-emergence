@@ -123,7 +123,7 @@ def _patch_query_embedding(monkeypatch: pytest.MonkeyPatch, query: str) -> None:
     # stamps rows with — see `test_semantic_recall.py::_align_embedding_tier`'s
     # docstring for why this must match or the matrix's lazy-build filters
     # the seeded rows straight out.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _TEST_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _TEST_MODEL_ID)
 
 
 def _seed_floor(store: MemoryStore, floor: float = _FLOOR) -> None:

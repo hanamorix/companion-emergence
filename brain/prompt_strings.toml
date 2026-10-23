@@ -1,7 +1,7 @@
 # Dev-facing prompt-strings registry for companion-emergence.
 #
 # Parallel, dev-facing counterpart to brain/tunables.py (which is the
-# USER-facing ops-tunables mechanism, backed by $KINDLED_HOME/tunables.json).
+# USER-facing ops-tunables mechanism, backed by $KINDLED_HOME/tunables.toml).
 # This file is the opposite: it ships WITH the code, is meant to be hand-
 # edited by a developer, and carries NO in-code fallback -- a missing key
 # is a hard error (see brain/prompt_strings.py).

@@ -23,16 +23,12 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
     Must be called BEFORE opening a TestClient so the lifespan picks up the
     stub at app startup.
 
-    Patches brain.bridge.provider.get_provider (the SOURCE module) — both
-    `build_tier_provider` (used by e.g. the `/sessions/close` route's
-    housekeeping-tier extraction) and, since #154's completion,
-    `build_interactive_chat_provider` (server.py's live `/chat` provider) do a
-    fresh, function-scoped `from brain.bridge.provider import get_provider` on
-    every call, so patching the source module reaches both. (Previously also
-    patched `brain.bridge.server.get_provider` — server.py no longer imports
-    that name at all now that its lifespan calls
-    `model_tier.build_interactive_chat_provider` instead of `get_provider`
-    directly, so that patch target no longer exists; dropped.)
+    Patches brain.bridge.provider.get_provider (the SOURCE module).
+    `build_tier_provider` (the `/sessions/close` route's housekeeping-tier
+    extraction, and server.py's live `/chat` provider) does a fresh,
+    function-scoped `from brain.bridge.provider import get_provider` on every
+    call, so patching the source module reaches every site. server.py itself
+    does not import `get_provider`.
     """
     import brain.bridge.provider as provider_module
     from brain.bridge.chat import ChatResponse
@@ -406,11 +402,15 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
     import time as _time
 
     import brain.bridge.provider as provider_module
-    import brain.bridge.server as srv
+    from brain import paths
     from brain.bridge.chat import ChatResponse
 
-    # Tiny keepalive interval so the test doesn't sleep for the real 15s.
-    monkeypatch.setattr(srv, "_STREAM_KEEPALIVE_SECONDS", 0.05)
+    # Short keepalive interval so the test doesn't sleep for the real 15s. The settings file holds every setting, so the
+    # interval is set the way a user would set it (in the file), not by patching the code default. One second is the
+    # smallest interval an override may set (#524 raises anything lower to it), so the silent stretch below is longer.
+    from tests.tunables_file import write_values
+
+    write_values(paths.get_home(), {"bridge.stream_keepalive_seconds": 1.0})
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
 
     class _SlowFake:
@@ -420,15 +420,15 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
         def chat(self, messages, *, tools=None, options=None):
             # Simulate the model going silent (no streamed deltas) for well
             # over the keepalive interval before the reply lands.
-            _time.sleep(0.3)
+            _time.sleep(1.5)
             return ChatResponse(content="late reply", tool_calls=[])
 
         def generate(self, prompt, *, system=None):
             return "[]"
 
-    # #154: server.py's lifespan now calls model_tier.build_interactive_chat_
-    # provider (a function-scoped import of get_provider from the SOURCE
-    # module), not a module-level `server.get_provider` — patch the source.
+    # server.py's lifespan calls model_tier.build_tier_provider (a
+    # function-scoped import of get_provider from the SOURCE module), not a
+    # module-level `server.get_provider`: patch the source.
     monkeypatch.setattr(provider_module, "get_provider", lambda _name, **_kw: _SlowFake())
 
     with _make_client(persona_dir) as c:

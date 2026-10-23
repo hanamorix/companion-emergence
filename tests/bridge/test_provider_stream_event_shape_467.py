@@ -214,7 +214,7 @@ _OVER_BUDGET = json.dumps(
 def _generate(stdout: str) -> str:
     done = subprocess.CompletedProcess(["claude"], 0, stdout, "")
     with patch("brain.bridge.provider.subprocess.run", return_value=done):
-        return ClaudeCliProvider(model="haiku").generate("hi")
+        return ClaudeCliProvider(probe_model="haiku").generate("hi")
 
 
 def test_generate_with_a_null_result_returns_empty_not_none():

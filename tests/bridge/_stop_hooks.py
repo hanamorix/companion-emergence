@@ -15,7 +15,7 @@ MODEL = "claude-haiku-4-5"
 def _provider():
     from brain.bridge.provider import ClaudeCliProvider
 
-    return ClaudeCliProvider(model=MODEL, timeout_seconds=600)
+    return ClaudeCliProvider(probe_model=MODEL, timeout_seconds=600)
 
 
 def generate_call(persona_dir: Path) -> None:

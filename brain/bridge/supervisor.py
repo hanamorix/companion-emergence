@@ -661,8 +661,8 @@ def run_folded(
                 # outage doesn't take the supervisor down.
                 # This tick, and voice-reflection/maker/notes below, each build their
                 # OWN `background-generative` tier provider (#154) rather than reusing
-                # the bare ambient `provider` — same model (`MODEL_MEDIUM`) it already
-                # resolves to, so this is routing-only, not a model change.
+                # the bare ambient `provider`, so the job runs the model of its own
+                # setting (`model.background_generative`), not the chat model's.
                 # Soul-review cadence — PERSISTED + self-pacing. Unlike the monotonic
                 # timers, soul_review_state.json survives restart/sleep, so the 6h
                 # interval can't be reset to zero by an app quit/reboot (the defect that
@@ -2677,7 +2677,7 @@ def _run_compaction_tick(
     live-turn persist (see brain/chat/rollover.py + session.persist_turns_following_
     successor).
 
-    Provider is COMPACTION_MODEL (haiku) via build_compaction_provider — cost
+    Provider is the compaction job's model via build_compaction_provider: cost
     stays off the chat model. Called only by the central cadence function's
     compaction job (daily default, persisted cadence per #21; ram-spike-fix
     INC-9 removed the startup catch-up call — an overdue cascade runs at the

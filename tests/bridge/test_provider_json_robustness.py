@@ -72,7 +72,7 @@ def test_generate_with_a_hostile_stdout_raises_its_normal_error(hostile):
     done = subprocess.CompletedProcess(["claude"], 0, f"{hostile}\n{_RESULT}\n", "")
     with patch("brain.bridge.provider.subprocess.run", return_value=done):
         with pytest.raises(RuntimeError, match="unexpected output format"):
-            ClaudeCliProvider(model="haiku").generate("hi")
+            ClaudeCliProvider(probe_model="haiku").generate("hi")
 
 
 @_HOSTILE
@@ -129,7 +129,7 @@ def test_generate_with_a_json_stdout_that_is_not_an_object_raises_its_normal_err
     done = subprocess.CompletedProcess(["claude"], 0, stdout, "")
     with patch("brain.bridge.provider.subprocess.run", return_value=done):
         with pytest.raises(RuntimeError, match="unexpected output format"):
-            ClaudeCliProvider(model="haiku").generate("hi")
+            ClaudeCliProvider(probe_model="haiku").generate("hi")
 
 
 @_HOSTILE

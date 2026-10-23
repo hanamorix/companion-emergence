@@ -54,23 +54,16 @@ logger = logging.getLogger(__name__)
 # words. With new ≈ 0.5·(prior + batch) the folded head converges to ~one batch's
 # worth of text — bounded, not growing.
 
-# Compaction always summarises with this model regardless of the persona's chat
-# model — a small, cheap model is plenty for memory folding and keeps the cost off
-# the (larger) chat model. Change this one string to swap (e.g. "sonnet"/"opus");
-# the future model-agnostic refactor replaces the whole seam below.
-COMPACTION_MODEL = "haiku"
-
-
 def build_compaction_provider(persona_dir):
-    """The provider compaction should use — the persona's provider *kind* but
-    forced to COMPACTION_MODEL. For a ``fake`` persona (tests) this resolves to a
+    """The provider compaction should use: the persona's provider *kind*, running
+    the model of the compaction job (its own line in the tunables, a small cheap
+    model by default: plenty for memory folding, and it keeps the cost off the
+    larger chat model). For a ``fake`` persona (tests) this resolves to a
     FakeProvider, so no real CLI is shelled. Production call sites pass the result
     into ``compact_conversation``; the core keeps its injected ``provider`` param so
     unit tests can still pass a deterministic stub directly.
 
-    Thin wrapper over the centralized model-tier accessor (#154) —
-    ``TIER_COMPACTION``'s model is ``COMPACTION_MODEL`` ("haiku"), so this is a
-    routing-only change with no model-value difference."""
+    Thin wrapper over the centralized model-tier accessor (#154)."""
     from brain.bridge.model_tier import TIER_COMPACTION, build_tier_provider
 
     return build_tier_provider(persona_dir, TIER_COMPACTION)

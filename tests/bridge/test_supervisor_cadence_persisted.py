@@ -21,7 +21,7 @@ from brain.memory.store import MemoryStore
 
 # #210: every test below stops the loop from inside its counted callback, so this is only a
 # ceiling for the failure path. 2 s was too tight for the windows-latest runner under load.
-_WATCHDOG_S = 10.0
+_WATCHDOG_S = 60.0
 
 
 def _cadence_dir(persona_dir: Path) -> Path:
@@ -404,7 +404,7 @@ def test_vocab_repair_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_vocab_repair_tick", _counter)
 
-    watchdog = threading.Timer(10.0, stop.set)  # failure-path ceiling only (#210)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)  # failure-path ceiling only (#210)
     watchdog.start()
     run_folded(
         stop,

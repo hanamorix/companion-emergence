@@ -476,7 +476,7 @@ def build_embedding_matrix(db_path: str | Path) -> EmbeddingMatrix:
     never hardcoded here — same convention as every other tier lookup (see
     `build_embedding_provider`'s own docstring). Looked up via the `model_tier`
     MODULE (not a bare imported name) so a test that monkeypatches
-    `brain.bridge.model_tier.model_for_tier` (or the `TIER_MODEL` dict it
+    `brain.bridge.model_tier.model_for_tier` (or the `LOCAL_MODEL_IDS` dict it
     reads) intercepts this call too, mirroring `build_embedding_provider`'s
     own `model_for_tier` lookup.
 

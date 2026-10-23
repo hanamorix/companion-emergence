@@ -43,7 +43,9 @@ pub struct InitArgs {
     pub voice_template: String,
     pub migrate_from: Option<String>,
     pub force: bool,
-    pub model: String,
+    /// The chat model the user typed in the wizard, or None to keep the install's current setting (the model is
+    /// one install-wide setting the brain owns, so the app never names a default of its own).
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1122,7 +1124,7 @@ const BRAIN_LOGIN_STATUS_TIMEOUT_SECS: u64 = 15;
 const BRAIN_LOGIN_START_TIMEOUT_SECS: u64 = 30;
 
 /// Build the argv for `nell init`. Extracted so argument construction
-/// (especially the always-present `--model`) is covered by a unit test,
+/// (especially `--model`, present only when the user chose one) is covered by a unit test,
 /// mirroring `build_service_install_args`. `--user-name` stays optional;
 /// `run_init` closes stdin so any unfilled prompt EOFs to its default.
 fn build_init_args(args: &InitArgs) -> Vec<String> {
@@ -1143,8 +1145,10 @@ fn build_init_args(args: &InitArgs) -> Vec<String> {
     } else {
         v.push("--fresh".to_string());
     }
-    v.push("--model".to_string());
-    v.push(args.model.clone());
+    if let Some(model) = &args.model {
+        v.push("--model".to_string());
+        v.push(model.clone());
+    }
     if args.force {
         v.push("--force".to_string());
     }
@@ -2376,16 +2380,32 @@ mod tests {
             voice_template: "default".into(),
             migrate_from: None,
             force: false,
-            model: "sonnet".into(),
+            model: Some("opus".into()),
         };
         let argv = build_init_args(&args);
         assert_eq!(argv[0], "init");
         assert!(argv.windows(2).any(|w| w == ["--persona", "nell"]));
-        assert!(argv.windows(2).any(|w| w == ["--model", "sonnet"]));
+        assert_eq!(argv.iter().filter(|a| a.as_str() == "--model").count(), 1);
+        assert!(argv.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(argv.windows(2).any(|w| w == ["--voice-template", "default"]));
         assert!(argv.windows(2).any(|w| w == ["--user-pronouns", "they/them"]));
         assert!(argv.iter().any(|a| a == "--fresh"));
         assert!(!argv.iter().any(|a| a == "--force"));
+    }
+
+    #[test]
+    fn build_init_args_has_no_model_flag_when_none_was_chosen() {
+        let args = InitArgs {
+            persona: "nell".into(),
+            user_name: None,
+            user_pronouns: None,
+            voice_template: "default".into(),
+            migrate_from: None,
+            force: false,
+            model: None,
+        };
+        let argv = build_init_args(&args);
+        assert!(!argv.iter().any(|a| a == "--model"));
     }
 
     #[test]
@@ -2397,7 +2417,7 @@ mod tests {
             voice_template: "default".into(),
             migrate_from: Some("/tmp/og".into()),
             force: true,
-            model: "opus".into(),
+            model: None,
         };
         let argv = build_init_args(&args);
         assert!(argv.windows(2).any(|w| w == ["--migrate-from", "/tmp/og"]));

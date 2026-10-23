@@ -18,6 +18,7 @@ from brain.ingest import extraction_backfill as eb
 from brain.ingest import pipeline
 from brain.ingest.buffer import append_archive, ingest_turn
 from brain.ingest.ingest_utils import chunk_turns
+from brain.service import lifecycle
 
 _CHUNK = 600
 _OLD = datetime(2026, 8, 3, 19, 0, 0, tzinfo=UTC)
@@ -77,7 +78,7 @@ def persona(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(paths, "get_home", lambda: tmp_path)
     monkeypatch.setattr(eb, "extraction_chunk_chars", lambda: _CHUNK)
     monkeypatch.setattr(pipeline, "extraction_chunk_chars", lambda: _CHUNK, raising=False)
-    monkeypatch.setattr(cli, "_bridge_running", lambda _pd: None)
+    monkeypatch.setattr(lifecycle, "bridge_running", lambda _persona: False)
     return d
 
 
@@ -171,7 +172,7 @@ def test_b14_dry_run_prints_both_modes_and_writes_nothing(persona, stub, capsys)
 
 def test_b8_with_a_bridge_running_the_cli_only_arms_the_plan(persona, stub, monkeypatch, capsys) -> None:
     _archived_history(persona)
-    monkeypatch.setattr(cli, "_bridge_running", lambda _pd: object())
+    monkeypatch.setattr(lifecycle, "bridge_running", lambda _persona: True)
     assert _nell("--all", "--yes") == 0
     out = capsys.readouterr().out
     assert eb.load_state(persona)["status"] == "armed"
@@ -317,7 +318,7 @@ def test_524_2_the_foreground_run_prints_the_count_and_with_yes_makes_exactly_th
 def test_524_2_no_path_that_starts_spending_runs_without_yes(persona, stub, monkeypatch, capsys, flags, bridge) -> None:
     _archived_history(persona)
     if bridge:
-        monkeypatch.setattr(cli, "_bridge_running", lambda _pd: object())
+        monkeypatch.setattr(lifecycle, "bridge_running", lambda _persona: True)
     assert _nell(*flags) == 1
     captured = capsys.readouterr()
     assert "--yes" in captured.err  # the refusal names the flag

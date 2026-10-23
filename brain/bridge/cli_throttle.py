@@ -37,7 +37,10 @@ from brain.health.json_io import Recovery, read_jsonl_tail
 
 log = logging.getLogger(__name__)
 
-_MAX_CONCURRENT_BACKGROUND = tunables.register("throttle.max_concurrent_background", 1)
+_MAX_CONCURRENT_BACKGROUND = tunables.register(
+    "throttle.max_concurrent_background", 1,
+    description="How many background Claude calls may run at the same time.",
+)
 
 
 def _max_concurrent_background() -> int:
@@ -295,7 +298,7 @@ def seed_last_message_from_active_conversations(
 
     Call once, synchronously, at bridge start — BEFORE anything can call
     ``is_chat_idle``/``time_since_last_message`` (same ordering rationale as
-    ``tunables_migration.migrate_idle_keys``): both functions read the SAME
+    ``tunables_migration.migrate_legacy_json``): both functions read the SAME
     ``_last_message_mono`` anchor this seeds, so seeding it once here keeps
     them consistent with each other for free — there is no separate anchor
     for the S72 prune accessor to fall out of step with.

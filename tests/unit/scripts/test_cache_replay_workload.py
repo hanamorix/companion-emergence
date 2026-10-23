@@ -1132,6 +1132,8 @@ class _Scripted:
         from brain.bridge.usage_log import log_usage
 
         user_text = messages[-1].content_text()
+        if (options or {}).get("persona_dir"):  # the persona the engine is running: where the real CLI logs its usage
+            self.persona_dir = Path(options["persona_dir"])
         self.calls.append({"tools": tools is not None, "user": user_text})
         entry = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
         for creation, read, turns, *rest in entry if isinstance(entry, list) else [entry]:
@@ -1163,8 +1165,8 @@ def _patch_provider(monkeypatch, tmp_path, script, cls=None):
     crw._seed_scratch_persona(pd)
     holder = {}
 
-    def fake_get_provider(name, *, persona_dir=None, model_override=None):
-        holder["p"] = (cls or _Scripted)(persona_dir, script)
+    def fake_get_provider(name, *, tier=None):
+        holder["p"] = (cls or _Scripted)(pd, script)
         return holder["p"]
 
     monkeypatch.setattr(provider_mod, "get_provider", fake_get_provider)
@@ -1432,7 +1434,7 @@ def test_replay_with_a_real_provider_that_logs_no_usage_is_unmeasured_not_a_cras
     monkeypatch.setenv("NELL_CACHE_DEBUG", "0")
     pd = tmp_path / "personas" / "replay"
     crw._seed_scratch_persona(pd)
-    monkeypatch.setattr(provider_mod, "get_provider", lambda name, *, persona_dir=None, model_override=None: provider_mod.FakeProvider())
+    monkeypatch.setattr(provider_mod, "get_provider", lambda name, *, tier=None: provider_mod.FakeProvider())
     summary, _ = crw.run_replay(pd, turns=2, gap_s=0, provider_name="claude-cli", seed=False, force_text_path=True)
     assert summary["cache_break_check"]["status"] == "UNMEASURED" and summary["chat_rows_observed"] == 0
     assert crw._read_rows_fail_closed(tmp_path / "missing.jsonl") == []
@@ -1444,7 +1446,7 @@ def test_k3_a_provider_that_never_logs_usage_is_not_applicable_and_exits_0(tmp_p
 
     monkeypatch.setenv("NELL_CACHE_DEBUG", "0")
     _scratch_under(monkeypatch, tmp_path)
-    monkeypatch.setattr(provider_mod, "get_provider", lambda name, *, persona_dir=None, model_override=None: provider_mod.FakeProvider())
+    monkeypatch.setattr(provider_mod, "get_provider", lambda name, *, tier=None: provider_mod.FakeProvider())
     out = tmp_path / "metrics.json"
     rc = crw.main(["--scratch", "--turns", "2", "--gap-s", "0", "--provider", provider, "--out", str(out)])
     cap = capsys.readouterr()
@@ -1460,7 +1462,7 @@ def test_k3_a_real_provider_with_zero_usage_rows_exits_11(tmp_path, monkeypatch,
 
     monkeypatch.setenv("NELL_CACHE_DEBUG", "0")
     _scratch_under(monkeypatch, tmp_path)
-    monkeypatch.setattr(provider_mod, "get_provider", lambda name, *, persona_dir=None, model_override=None: provider_mod.FakeProvider())
+    monkeypatch.setattr(provider_mod, "get_provider", lambda name, *, tier=None: provider_mod.FakeProvider())
     rc = crw.main(["--scratch", "--turns", "2", "--gap-s", "0", "--out", str(tmp_path / "m.json")])
     assert rc == 11
     assert json.loads((tmp_path / "m.json").read_text(encoding="utf-8"))["cache_break_check"]["status"] == "UNMEASURED"
@@ -1896,21 +1898,29 @@ def test_525_reach_set_seeds_the_desk_and_substitutes_its_path(tmp_path, monkeyp
     assert sum(str(desk) in p for p in prompts) == 1
 
 
-def test_525_model_reaches_get_provider(tmp_path, monkeypatch):
+def test_525_model_reaches_the_claude_cli_provider(tmp_path, monkeypatch):
     import brain.bridge.provider as provider_mod
 
     seen = {}
-
-    def fake(name, *, persona_dir=None, model_override=None):
-        seen["model"] = model_override
-        return _Scripted(persona_dir, _HEALTHY_TEXT)
-
     pd = tmp_path / "personas" / "replay"
     crw._seed_scratch_persona(pd)
+
+    def fake_cli(tier="interactive-chat", *, probe_model=None, timeout_seconds=None):
+        seen["model"] = probe_model
+        return _Scripted(pd, _HEALTHY_TEXT)
+
     monkeypatch.setenv("NELL_CACHE_DEBUG", "0")
-    monkeypatch.setattr(provider_mod, "get_provider", fake)
+    monkeypatch.setattr(provider_mod, "ClaudeCliProvider", fake_cli)
+    monkeypatch.setattr(provider_mod, "get_provider", lambda *a, **k: pytest.fail("an explicit --model skips get_provider"))
     crw.run_replay(pd, turns=1, gap_s=0, provider_name="claude-cli", seed=False, model="haiku")
     assert seen["model"] == "haiku"
+
+
+def test_525_model_with_another_provider_is_refused(tmp_path):
+    pd = tmp_path / "personas" / "replay"
+    crw._seed_scratch_persona(pd)
+    with pytest.raises(ValueError, match="claude-cli provider only"):
+        crw.run_replay(pd, turns=1, gap_s=0, provider_name="fake", seed=False, model="haiku")
 
 
 def test_525_per_turn_attribution_maps_tool_and_usage_rows_to_turns(tmp_path, monkeypatch):

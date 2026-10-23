@@ -89,11 +89,11 @@ def _call_haiku(
 
     Returns empty string on any failure so callers can decline cleanly.
     """
-    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR, resolve_tier_model
+    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR
     from brain.bridge.provider import ClaudeCliProvider
 
     provider = ClaudeCliProvider(
-        model=resolve_tier_model(persona_dir, TIER_ATTUNEMENT_DETECTOR)[0],
+        TIER_ATTUNEMENT_DETECTOR,
         timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
     )
     from brain.bridge.cli_throttle import ThrottleDeferred

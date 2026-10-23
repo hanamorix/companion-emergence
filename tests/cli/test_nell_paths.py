@@ -52,7 +52,7 @@ def test_paths_table_contains_persona_dir_key(tmp_path):
 
 
 def test_paths_reports_tunables_location(tmp_path):
-    """`nell paths` must surface tunables.json — it is the ONLY ops-override
+    """`nell paths` must surface tunables.toml — it is the ONLY ops-settings
     surface, and it lives under the platformdirs home where nobody would find
     it by accident (issue #63)."""
     _setup_persona(tmp_path)
@@ -66,7 +66,7 @@ def test_paths_reports_tunables_location(tmp_path):
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert "tunables" in payload
-    assert payload["tunables"]["path"].endswith("tunables.json")
+    assert payload["tunables"]["path"].endswith("tunables.toml")
 
 
 def test_paths_json_is_valid_json(tmp_path):

@@ -40,7 +40,7 @@ def test_flag_set_during_the_first_model_stage_stops_every_later_model_call(tmp_
                                            stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    provider = ClaudeCliProvider(model="claude-haiku-4-5")
+    provider = ClaudeCliProvider(probe_model="claude-haiku-4-5")
     monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", lambda *a, **k: provider)
     monkeypatch.setattr("brain.bridge.model_tier.build_tier_provider", lambda *a, **k: provider)
 

@@ -142,21 +142,3 @@ def test_login_expired_reads_the_auth_status():
     provider_auth.note_cli_failure("Invalid API key · Please run /login")
     assert provider_auth.login_expired() is (provider_auth.state()["status"] == "expired")
     provider_auth.reset()
-
-
-def test_derived_model_recheck_starts_no_probe_after_the_stop(tmp_path):
-    """C7: #450's start-up re-check starts no probe once the stop is requested, and changes nothing."""
-    import asyncio
-
-    from brain.bridge import server as server_mod
-    from brain.persona_config import PersonaConfig
-
-    pd = tmp_path / "nell"
-    pd.mkdir()
-    PersonaConfig(model="claude-sonnet-5", derived_unavailable=["claude-haiku-5"]).save(pd / "persona_config.json")
-    before = (pd / "persona_config.json").read_bytes()
-    cli_throttle.request_shutdown()
-    with mock.patch.object(subprocess, "run") as run, mock.patch.object(subprocess, "Popen") as popen:
-        asyncio.run(server_mod._recheck_derived_unavailable(pd, asyncio.Lock()))
-    assert not run.called and not popen.called
-    assert (pd / "persona_config.json").read_bytes() == before

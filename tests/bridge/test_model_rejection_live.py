@@ -49,7 +49,7 @@ def _cli_version():
 
 def test_generate_path_rejection_is_recognised_and_matches_the_pinned_sentence():
     with pytest.raises(RuntimeError) as err:
-        ClaudeCliProvider(model=BOGUS).generate("hi")
+        ClaudeCliProvider(probe_model=BOGUS).generate("hi")
     text = str(err.value)
     assert model_error.is_model_rejection(text), text
     assert _pinned_sentence(BOGUS) in text, text
@@ -59,7 +59,7 @@ def test_generate_path_rejection_is_recognised_and_matches_the_pinned_sentence()
 
 
 def test_chat_stream_path_rejection_is_recognised_and_matches_the_pinned_sentence():
-    events = list(ClaudeCliProvider(model=BOGUS).chat_stream([ChatMessage(role="user", content="hi")]))
+    events = list(ClaudeCliProvider(probe_model=BOGUS).chat_stream([ChatMessage(role="user", content="hi")]))
     errors = [e for e in events if isinstance(e, StreamError)]
     assert errors, events
     text = f"[{errors[0].stage}] {errors[0].detail}"
@@ -73,7 +73,7 @@ def test_chat_stream_path_rejection_is_recognised_and_matches_the_pinned_sentenc
 def test_save_time_probe_receives_the_model_not_found_code():
     """Owner decision D15: the picker's / `nell model set`'s check runs stream-json, so it gets the code."""
     with pytest.raises(Exception) as err:
-        ClaudeCliProvider(model=BOGUS).probe("hi")
+        ClaudeCliProvider(probe_model=BOGUS).probe("hi")
     text = str(err.value)
     print(f"\nprobe() failure text: {text}")
     assert model_error.is_model_rejection(text), text

@@ -1,6 +1,6 @@
 """#488: no test may write into the real per-user data directory.
 
-At least one test (any that builds the bridge app: its lifespan rewrites `tunables.json`) resolved the data home to the platformdirs
+At least one test (any that builds the bridge app: its lifespan syncs the settings file) resolved the data home to the platformdirs
 default, the real `~/.local/share/companion-emergence` of whoever ran the suite. The autouse fixture `_isolate_user_data_home`
 (tests/conftest.py) now gives every test its own empty default.
 """
@@ -73,7 +73,7 @@ def test_building_the_app_leaves_the_real_data_home_untouched(tmp_path, monkeypa
         pass
     assert _snapshot(real) == before
     # the lifespan did write its tunables file: into the test's own home
-    assert (paths.get_home() / "tunables.json").exists()
+    assert (paths.get_home() / "tunables.toml").exists()
 
 
 def test_the_isolated_dirs_keep_the_appauthor_distinction():
@@ -121,3 +121,30 @@ def test_a_subprocess_resolves_the_same_model_cache_as_the_run_started_with():
     )
     assert out.returncode == 0, out.stderr
     assert Path(out.stdout.strip()).resolve() == REAL_PLATFORM_DIRS["user_cache_path"]
+
+
+# --- a test's own monkeypatch.undo() must not reopen the real home (#530) ---------------------------------------------------
+
+
+def test_a_tests_monkeypatch_undo_does_not_put_back_the_real_data_home(monkeypatch):
+    """The fixture's patches are held by its own MonkeyPatch. A test of the model setter called ``monkeypatch.undo()`` and then
+    ``set_job_models``, which wrote ``model.interactive_chat`` into the real install's ``tunables.toml``. After an ``undo()`` the
+    default home must still be the test's own, a write must land there, and the real file must be byte-for-byte what it was."""
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, set_job_models
+    from brain.tunables_migration import LEGACY_FILE_NAME
+
+    real_files = [REAL_PLATFORM_DIRS["user_data_path"] / name for name in ("tunables.toml", LEGACY_FILE_NAME)]
+    before = [f.read_bytes() if f.exists() else None for f in real_files]
+    monkeypatch.delenv("KINDLED_HOME", raising=False)
+    monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
+    monkeypatch.undo()
+    monkeypatch.delenv("KINDLED_HOME", raising=False)
+    monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
+    home = paths.get_home()
+    assert not _is_under(home, REAL_PLATFORM_DIRS["user_data_path"])
+    for var in ("XDG_DATA_HOME", "XDG_STATE_HOME"):
+        assert not _is_under(Path(os.environ[var]).resolve(), REAL_PLATFORM_DIRS["user_data_path"])
+    set_job_models({TIER_INTERACTIVE_CHAT: "claude-opus-5"})  # a value that differs from the default, so a file is written
+    assert (home / "tunables.toml").exists()
+    after = [f.read_bytes() if f.exists() else None for f in real_files]
+    assert after == before

@@ -155,7 +155,7 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
     # `_seed_vectors` stamped on the rows; otherwise the first matrix read
     # reloads from disk filtered to the real production model id, finds
     # nothing, and silently discards the seeded vectors.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:

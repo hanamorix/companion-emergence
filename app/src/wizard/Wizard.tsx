@@ -1,6 +1,5 @@
 import { useState } from "react";
 import {
-  DEFAULT_INIT_MODEL,
   installSupervisorService,
   runInit,
   runMigrate,
@@ -40,7 +39,7 @@ export interface WizardState {
   userName: string;
   userPronouns: string;
   voiceTemplate: VoiceTemplate;
-  /** Optional Claude model (alias or full id); blank = the default. */
+  /** Optional Claude model (a word or a full id); blank = keep the current setting. */
   chatModel: string;
   migrateFromPath: string;
   migrateSource: MigrateSource;
@@ -225,7 +224,7 @@ export function Wizard({ onDone }: Props) {
         migrate_from:
           state.mode === "migrate" && !useEmergenceKitMigrator ? state.migrateFromPath : null,
         force: false,
-        model: wizardInitModel(state.chatModel, DEFAULT_INIT_MODEL),
+        model: wizardInitModel(state.chatModel),
       };
 
       if (useEmergenceKitMigrator) {

@@ -32,7 +32,10 @@ from brain.bridge.cli_throttle import ThrottleDeferred
 
 log = logging.getLogger(__name__)
 
-_REPROBE_S_DEFAULT = tunables.register("provider_auth.reprobe_seconds", 900.0)
+_REPROBE_S_DEFAULT = tunables.register(
+    "provider_auth.reprobe_seconds", 900.0,
+    description="Seconds between checks on whether an expired Claude login works again.",
+)
 REPROBE_S = _REPROBE_S_DEFAULT  # read through reprobe_interval_s() at call time
 WEAK_CONFIRM_S = 60.0
 

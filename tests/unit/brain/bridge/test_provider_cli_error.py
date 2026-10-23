@@ -35,7 +35,7 @@ def test_generate_raises_on_an_is_error_frame_instead_of_returning_it():
     mock_result.stderr = ""
 
     with patch("subprocess.run", return_value=mock_result):
-        p = ClaudeCliProvider(model="claude-haiku-4-5-20251001")
+        p = ClaudeCliProvider(probe_model="claude-haiku-4-5-20251001")
         with pytest.raises(Exception) as exc_info:  # noqa: PT011 — see assert below
             p.generate("classify this", system="you are a detector")
 

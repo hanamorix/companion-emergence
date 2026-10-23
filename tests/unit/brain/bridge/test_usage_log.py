@@ -86,7 +86,7 @@ def test_generate_logs_usage_when_persona_dir_given(tmp_path):
         "duration_ms": 500,
         "session_id": "xyz",
     }
-    provider = ClaudeCliProvider(model="haiku")
+    provider = ClaudeCliProvider(probe_model="haiku")
     with patch("subprocess.run", return_value=_fake_result(fake_payload)):
         result = provider.generate("hi", persona_dir=tmp_path)
     assert result == "hello"
@@ -137,7 +137,7 @@ def test_chat_stream_logs_usage_on_result_frame(tmp_path):
         def poll(self) -> int:  # the streaming path reaps its child (#482)
             return 0
 
-    provider = ClaudeCliProvider(model="sonnet")
+    provider = ClaudeCliProvider(probe_model="sonnet")
     messages = [ChatMessage(role="user", content="hello")]
 
     with patch("subprocess.Popen", return_value=_FakeProc()):
@@ -177,7 +177,7 @@ def test_nonstreaming_chat_logs_usage(tmp_path):
         "duration_ms": 100,
         "session_id": "s",
     }
-    provider = ClaudeCliProvider(model="sonnet")
+    provider = ClaudeCliProvider(probe_model="sonnet")
     with patch(
         "brain.bridge.provider.subprocess.run",
         return_value=_fake_result(payload),

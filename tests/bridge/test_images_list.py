@@ -21,9 +21,9 @@ def _patch_fake_provider(monkeypatch):
     """Replace get_provider so bridge lifespan doesn't need a real LLM.
 
     Patches brain.bridge.provider.get_provider (the SOURCE module) —
-    server.py's lifespan no longer imports get_provider directly since #154's
-    completion; it calls model_tier.build_interactive_chat_provider, which
-    does its own function-scoped import of get_provider from this module.
+    server.py's lifespan does not import get_provider directly; it calls
+    model_tier.build_tier_provider, which does its own function-scoped
+    import of get_provider from this module.
     """
     import brain.bridge.provider as _provider_module
     from brain.bridge.chat import ChatResponse

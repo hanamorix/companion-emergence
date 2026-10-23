@@ -3,9 +3,9 @@
 When the Tauri app spawns `nell init` with stdin redirected to NUL/dev-null,
 every `input()` raises EOFError. _prompt/_prompt_choice must absorb that and
 fall back to defaults so init completes non-interactively. This is the bug
-behind the Windows init_timeout report (2026-05-24): the app never passed
---model, init reached the model prompt, and on Windows a live console stdin
-made it hang. We keep model passed explicitly AND guarantee EOF-safety here.
+behind the Windows init_timeout report (2026-05-24): init reached the model
+prompt and, on Windows, a live console stdin made it hang. The model prompt
+now returns blank on EOF, which leaves the install-wide model setting as it is.
 """
 
 from __future__ import annotations
@@ -13,9 +13,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from brain import cli
-from brain.paths import get_persona_dir
-from brain.persona_config import DEFAULT_MODEL, PersonaConfig
+from brain import cli, tunables
 
 
 def test_init_handler_non_interactive_under_eof(tmp_path: Path, monkeypatch) -> None:
@@ -25,7 +23,7 @@ def test_init_handler_non_interactive_under_eof(tmp_path: Path, monkeypatch) -> 
 
     args = argparse.Namespace(
         persona="testbot",
-        user_name="Hana",
+        user_name="Ada",
         migrate_from=None,
         voice_template="default",
         force=False,
@@ -35,5 +33,5 @@ def test_init_handler_non_interactive_under_eof(tmp_path: Path, monkeypatch) -> 
     rc = cli._init_handler(args)
     assert rc == 0
 
-    cfg = PersonaConfig.load(get_persona_dir("testbot") / "persona_config.json")
-    assert cfg.model == DEFAULT_MODEL  # prompt EOF'd to the default
+    assert tunables.get_raw("model.interactive_chat") is None  # the prompt EOF'd to "keep the current setting"
+    assert not (tmp_path / "tunables.toml").exists()  # and wrote nothing

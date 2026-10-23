@@ -796,7 +796,6 @@ def test_cs2_h_the_allowlist_end_state_has_only_not_file_io_and_held_entries() -
         "brain/health/log_rotation.py",
         "brain/ingest/buffer.py",
         "brain/migrator/og.py",
-        "brain/tunables_migration.py",
         "brain/update/overlay_hook.py",
     }, marked
 

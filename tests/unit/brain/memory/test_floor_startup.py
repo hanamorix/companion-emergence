@@ -1084,7 +1084,7 @@ def test_the_embedder_id_pin_follows_a_repointed_tier(
 ) -> None:
     monkeypatch.setattr("fastembed.TextEmbedding", _StubTextEmbedding)
     monkeypatch.setattr("brain.paths.get_cache_dir", lambda: tmp_path)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, "some/other-embedder")
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, "some/other-embedder")
 
     assert build_embedding_provider().model_id() == floor_startup.embedder_model_id()
     assert floor_startup.embedder_model_id() == "some/other-embedder"

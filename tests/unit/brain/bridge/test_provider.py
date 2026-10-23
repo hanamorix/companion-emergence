@@ -85,7 +85,7 @@ def test_claude_cli_provider_builds_expected_command() -> None:
     mock_result.stderr = ""
 
     with patch("subprocess.run", return_value=mock_result) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         out = p.generate("test prompt", system="you are helpful")
 
     assert out == "DREAM: test output"
@@ -185,7 +185,7 @@ def test_claude_cli_provider_nonzero_exit_includes_json_stdout_error() -> None:
 
 def test_claude_cli_provider_name() -> None:
     """Name includes the model identifier."""
-    assert ClaudeCliProvider(model="sonnet").name() == "claude-cli:sonnet"
+    assert ClaudeCliProvider(probe_model="sonnet").name() == "claude-cli:sonnet"
 
 
 def test_claude_cli_provider_subprocess_timeout_surfaced() -> None:

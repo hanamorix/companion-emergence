@@ -5,8 +5,11 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+import subprocess
+import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
 import pytest
@@ -97,12 +100,10 @@ def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_user_data_home(
-    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[None]:
+def _isolate_user_data_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """#488: no test may write into the real per-user data directory.
 
-    A test that builds the bridge app (its lifespan rewrites ``tunables.json``) or calls ``get_home()`` with neither
+    A test that builds the bridge app (its lifespan syncs the settings file) or calls ``get_home()`` with neither
     ``KINDLED_HOME`` nor ``NELLBRAIN_HOME`` set resolved to the platformdirs default, the REAL ``~/.local/share/companion-emergence``
     of whoever ran the tests, so a run could change real settings and a later test could read what an earlier one left. Every test
     now gets its own empty root as that default. The directory properties are replaced on the platform's ``PlatformDirs`` class
@@ -114,12 +115,17 @@ def _isolate_user_data_home(
     The CACHE directory and ``XDG_CACHE_HOME`` are deliberately NOT redirected: the cache is where downloaded models live, not user
     state. platformdirs reads ``XDG_CACHE_HOME`` on Linux and macOS and huggingface_hub derives ``HF_HOME`` from it on every OS, so
     moving it made a subprocess a test starts (the judge release RSS job's C3a) find no cached judge, go to the network and fail.
+
+    The patches are held by this fixture's OWN ``MonkeyPatch``, not the test's: a test that calls ``monkeypatch.undo()`` reverts
+    only what it patched itself. With the test's instance, an ``undo()`` put the platform default back and the next
+    ``set_job_models`` wrote a model line into the real install's settings file (#530).
     """
     from platformdirs import PlatformDirs
 
     from brain import paths
 
     root = tmp_path_factory.mktemp("userdata")
+    monkeypatch = pytest.MonkeyPatch()
     # Two classes when something (the update overlay hook drops platformdirs from sys.modules) made a new one after brain.paths
     # built its instance: patch the one `brain.paths._dirs` is an instance of AND the one `from platformdirs import PlatformDirs` gives now.
     for cls in {type(paths._dirs), PlatformDirs}:
@@ -135,7 +141,10 @@ def _isolate_user_data_home(
         ("XDG_STATE_HOME", "xdg-state"),
     ):
         monkeypatch.setenv(var, str(root / sub))
-    yield
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
 
 
 @pytest.fixture(autouse=True)
@@ -499,17 +508,53 @@ def _keyword_budget_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _tunables_overrides_cache_reset() -> Iterator[None]:
-    """#462: forget the cached tunables overrides before and after each test.
+def _tunables_values_cache_reset() -> Iterator[None]:
+    """#462: forget the cached tunables values before and after each test.
 
-    `tunables._load_overrides_locked` caches the overrides (a failed read too) keyed on the file's mtime, and a healed read changes
-    what the cache holds. Only the cache is cleared: the registry that modules fill at import time is left alone.
+    `tunables._load_values_locked` caches the parsed values (a content failure too) keyed on the file's stat signature.
+    Only the cache is cleared: the registry that modules fill at import time is left alone.
     """
     from brain import tunables
 
-    tunables._reset_overrides_cache()
+    tunables._reset_values_cache()
     yield
-    tunables._reset_overrides_cache()
+    tunables._reset_values_cache()
+
+
+_REAL_TUNABLE_KEYS: frozenset[str] | None = None
+
+
+def _real_tunable_keys() -> frozenset[str]:
+    """Every literal key a ``tunables.register`` call in brain/ declares (an AST scan, once per session)."""
+    global _REAL_TUNABLE_KEYS
+    if _REAL_TUNABLE_KEYS is None:
+        from tests.tunables_file import registered_literal_keys
+
+        keys = registered_literal_keys(Path(__file__).resolve().parents[1])
+        _REAL_TUNABLE_KEYS = frozenset(keys)
+    return _REAL_TUNABLE_KEYS
+
+
+@pytest.fixture(autouse=True)
+def _tunables_registry_restore() -> Iterator[None]:
+    """A test may clear the tunables registry (``_reset_for_tests``) or register throwaway keys. The registry that modules fill
+    at import time must survive for the tests after it, so restore it: the state before the test, plus any real brain key the
+    test's own imports registered (a module imported for the first time inside a test stays imported)."""
+    from brain import tunables
+
+    with tunables._lock:
+        saved = (dict(tunables._registry), dict(tunables._descriptions))
+    yield
+    real = _real_tunable_keys()
+    with tunables._lock:
+        kept = {k: v for k, v in tunables._registry.items() if k in real}
+        kept_desc = {k: v for k, v in tunables._descriptions.items() if k in real}
+        tunables._registry.clear()
+        tunables._registry.update(saved[0])
+        tunables._registry.update(kept)
+        tunables._descriptions.clear()
+        tunables._descriptions.update(saved[1])
+        tunables._descriptions.update(kept_desc)
 
 
 @pytest.fixture(autouse=True)
@@ -722,3 +767,166 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ]:
         monkeypatch.delenv(key, raising=False)
     yield
+
+
+_WEDGED_HOLDER = """
+import sys
+sys.path.insert(0, {root!r})
+from pathlib import Path
+from brain.utils.file_lock import file_lock
+with file_lock(Path(sys.argv[1])):
+    print("READY", flush=True)
+    sys.stdin.read()
+"""
+
+
+@pytest.fixture
+def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None]]:
+    """Hold ``file_lock(path)`` in ANOTHER process for the length of a ``with`` block (a wedged lock holder).
+
+    Used by the lock-timeout tests: the holder never releases until the block ends, so a bounded wait must give up
+    and a caller must not write.
+    """
+
+    @contextmanager
+    def _hold(path: Path) -> Iterator[None]:
+        code = _WEDGED_HOLDER.format(root=str(repo_root))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "READY"
+            yield
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=20)
+
+    return _hold
+
+
+_OK_FRAME = (
+    '{"type": "result", "subtype": "success", "is_error": false, "result": "OK", "duration_ms": 1, "num_turns": 1}\n'
+)
+
+
+def _rejection_frame(model: str) -> str:
+    import json
+
+    return (
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 404,
+                "result": f"There's an issue with the selected model ({model}). It may not exist or you may not have "
+                "access to it.",
+            }
+        )
+        + "\n"
+    )
+
+
+class ClaudeArgvCapture:
+    """Every ``claude`` argv the provider spawned, and the answer each one got (#529 test instrument).
+
+    ``reject(id)`` makes the CLI answer that model id with its real rejection frame (exit 1, status 404, the
+    "issue with the selected model" sentence); every other id gets a clean frame. The seam is the subprocess call the
+    provider tests already patch, so the argv is built by the real provider code.
+    """
+
+    def __init__(self) -> None:
+        self.argvs: list[list[str]] = []
+        self.rejected: set[str] = set()
+
+    def reject(self, *models: str) -> None:
+        self.rejected.update(models)
+
+    def accept(self, *models: str) -> None:
+        self.rejected.difference_update(models)
+
+    @staticmethod
+    def model_of(argv: list[str]) -> str:
+        return argv[argv.index("--model") + 1]
+
+    @property
+    def models(self) -> list[str]:
+        """The ``--model`` value of every spawn, in order."""
+        return [self.model_of(a) for a in self.argvs]
+
+    @property
+    def last_model(self) -> str:
+        return self.models[-1]
+
+    def _answer(self, cmd: list[str]) -> tuple[int, str]:
+        self.argvs.append(list(cmd))
+        model = self.model_of(cmd)
+        if model in self.rejected:
+            return 1, _rejection_frame(model)
+        return 0, _OK_FRAME
+
+
+@pytest.fixture
+def capture_claude_argv(monkeypatch: pytest.MonkeyPatch) -> ClaudeArgvCapture:
+    """Patch the provider's subprocess seam (run and Popen) and record every argv (see ``ClaudeArgvCapture``)."""
+    import io
+
+    from brain.bridge import provider as provider_mod
+
+    cap = ClaudeArgvCapture()
+    real_run, real_popen = subprocess.run, subprocess.Popen  # `subprocess` is one module: only `claude` is faked
+
+    def fake_run(cmd, *args, **kwargs):
+        if not (isinstance(cmd, list) and cmd and cmd[0] == "claude"):
+            return real_run(cmd, *args, **kwargs)
+        rc, out = cap._answer(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=rc, stdout=out, stderr="")
+
+    class FakePopen(real_popen):  # type: ignore[misc, valid-type]
+        def __new__(cls, cmd, *args, **kwargs):
+            if not (isinstance(cmd, list) and cmd and cmd[0] == "claude"):
+                return real_popen(cmd, *args, **kwargs)
+            return super().__new__(cls)
+
+        def __init__(self, cmd, *args, **kwargs):
+            self._rc, out = cap._answer(cmd)
+            self.stdin = io.StringIO()
+            self.stdout = iter(out.splitlines(keepends=True))
+            self.stderr = io.StringIO("")
+            self.pid = 4242
+
+        def wait(self, timeout=None):
+            return self._rc
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(provider_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(provider_mod.subprocess, "Popen", FakePopen)
+    return cap
+
+
+@pytest.fixture
+def model_override() -> Callable[[str, str | None], None]:
+    """Set (or with ``None`` clear) one job's model in the sandbox home's tunables file, through the one writer.
+
+    ``model_override(tier, value)`` is ``set_job_models({tier: value})`` under the per-test home, so the write rule
+    applies (a word that means the job's default removes the line, a full id is written as given).
+    """
+    from brain.bridge.model_tier import set_job_models
+
+    def _set(tier: str, value: str | None) -> None:
+        set_job_models({tier: value})
+
+    return _set

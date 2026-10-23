@@ -1,10 +1,10 @@
-"""Spec §5 canary 5: an override actually changes the streaming loop's
+"""Spec §5 canary 5: a value in the file actually changes the streaming loop's
 timeout — through the provider path, not the getter in isolation."""
 from __future__ import annotations
 
-import json
-
 import pytest
+
+from tests.tunables_file import write_values
 
 
 @pytest.fixture()
@@ -18,13 +18,10 @@ def tunables_home(tmp_path, monkeypatch):
 
 
 def test_stream_timeouts_honor_overrides(tunables_home):
-    (tunables_home / "tunables.json").write_text(
-        json.dumps({"defaults": {}, "overrides": {
-            "provider.stream_per_event_idle_seconds": 240.0,
-            "provider.stream_first_event_seconds": 300.0,
-        }}),
-        encoding="utf-8",
-    )
+    write_values(tunables_home, {
+        "provider.stream_per_event_idle_seconds": 240.0,
+        "provider.stream_first_event_seconds": 300.0,
+    })
     from brain.bridge import provider as p
 
     assert p._stream_per_event_idle_seconds() == 240.0
@@ -39,12 +36,7 @@ def test_stream_timeouts_default_without_file(tunables_home):
 
 
 def test_turn_budget_override_per_tier(tunables_home):
-    (tunables_home / "tunables.json").write_text(
-        json.dumps({"defaults": {}, "overrides": {
-            "provider.max_turn_budget_usd.sonnet": 2.50,
-        }}),
-        encoding="utf-8",
-    )
+    write_values(tunables_home, {"provider.max_turn_budget_usd.sonnet": 2.50})
     from brain.bridge import provider as p
 
     assert p._MAX_TURN_BUDGET_USD("claude-sonnet-4-6") == 2.50

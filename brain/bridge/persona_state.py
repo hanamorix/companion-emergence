@@ -64,8 +64,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
         currently-running gated job/heartbeat names (ram-spike-fix INC-11),
         ordered LONGEST-RUNNING FIRST; [] when none are running
-      - tunables_notice: {"kind", "kept_as"} | None — a damaged tunables.json
-        that was healed or could not be read, until the user acts (#462)
+      - tunables_notice: {"kind", "line", "column", "reason"} | None — a
+        tunables.toml that could not be read and was left as it is, until the
+        user fixes it (#462)
 
     Never raises. Each subsystem failure contributes None / {} rather
     than propagating.
@@ -75,9 +76,6 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     persona_name = persona_dir.name
     connection = _build_connection(persona_dir)
     from brain import tunables
-    from brain.bridge.model_tier import _load_config
-
-    tier_cfg = _load_config(persona_dir)
 
     return {
         "persona": persona_name,
@@ -91,18 +89,19 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "recovering": _is_recovering(persona_dir),
         # #246: True while the brain's CLI login is expired (bridge-process state).
         "provider_auth_expired": provider_auth.state()["status"] == "expired",
-        # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the
-        # configured chat model and the tier models so a refused or stale id is never reported. [] when none.
-        "model_rejections": _model_rejections(connection.get("model"), tier_cfg),
-        # #441: derived tier models being replaced by what those tiers use today, [] when none.
-        "tier_fallbacks": _tier_fallbacks(tier_cfg),
-        # #441: derived tier ids an Apply could not check yet (budget used up, timeout); [] when none.
-        "tier_unconfirmed": _tier_unconfirmed(tier_cfg),
-        # #440: the chat model when it was saved without the Apply-time check being able to confirm it and no
-        # clean reply has arrived for it since. [] otherwise.
-        "model_unconfirmed": model_error.unconfirmed(only={connection.get("model")}),
-        # #446: the hand-edited model value the app does not support (the default is used instead), else None.
-        "model_unsupported": _model_unsupported(tier_cfg),
+        # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the ids the
+        # jobs are CONFIGURED with (not the ids they run now) so a rejected id stays in the notice while its job runs
+        # the shipped default instead. [] when none.
+        "model_rejections": _model_rejections(),
+        # Jobs now running their shipped default because the id they are configured with was rejected:
+        # [{"job", "configured", "using"}], [] when none.
+        "model_fallbacks": _model_fallbacks(),
+        # #440: the chat model (as configured) when it was saved without the save-time check being able to confirm
+        # it and no clean reply has arrived for it since. [] otherwise.
+        "model_unconfirmed": _model_unconfirmed(),
+        # #446: the model setting in tunables.toml that is not a usable model (the shipped default runs instead),
+        # shown display-safe, else None. Only for a claude-cli persona.
+        "model_unsupported": _model_unsupported(connection),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
         # ram-spike-fix INC-11 (spec §6, S15/S23/S38): gated jobs and/or the
@@ -113,46 +112,49 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             {"name": name, "running_for_seconds": round(elapsed, 3)}
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
-        # #462: a damaged tunables.json that was healed (or could not be read), persisted beside the file so EVERY bridge
-        # reports it until the user acts: {"kind": "reset" | "restored" | "unreadable", "kept_as": <file name> | None}, else None.
+        # #462: a tunables.toml that could not be read, left as it is and persisted beside the file so EVERY bridge reports
+        # it until the user fixes it: {"kind": "unreadable", "line": <int | None>, "column": <int | None>, "reason": <text>}, else None.
         "tunables_notice": tunables.current_notice(),
     }
 
 
-def _model_rejections(configured_model: str | None, cfg: Any = None) -> list[dict]:
-    from brain.bridge.model_tier import TIER_MODEL, candidate_tier_models
+def _model_rejections() -> list[dict]:
+    from brain.bridge.model_tier import configured_job_models
 
-    allowed = set(TIER_MODEL.values())
-    if cfg is not None:
-        allowed |= candidate_tier_models(cfg)
-    if configured_model:
-        allowed.add(configured_model)
-    return model_error.state(only=allowed)
+    return model_error.state(only=set(configured_job_models().values()))
 
 
-def _model_unsupported(cfg: Any) -> str | None:
-    # The model setting only matters for the claude-cli provider; ollama / fake ignore it.
-    if cfg is None or cfg.provider != "claude-cli":
-        return None
-    return cfg.model_unsupported_display()
-
-
-def _tier_unconfirmed(cfg: Any) -> list[str]:
-    from brain.bridge.model_tier import candidate_tier_models, unchecked_tiers
-
-    if cfg is None:
-        return []
-    return unchecked_tiers(cfg, model_error.tier_unconfirmed(only=candidate_tier_models(cfg)))
-
-
-def _tier_fallbacks(cfg: Any) -> list[dict]:
-    from brain.bridge.model_tier import tier_fallbacks
+def _model_fallbacks() -> list[dict]:
+    """The jobs whose configured id Claude rejected, so they run their shipped default now."""
+    from brain.bridge.model_tier import configured_job_models, model_for_tier
 
     try:
-        return tier_fallbacks(cfg)
+        return [
+            {"job": job, "configured": configured, "using": using}
+            for job, configured, using in (
+                (job, configured, model_for_tier(job)) for job, configured in configured_job_models().items()
+            )
+            if using != configured
+        ]
     except Exception:  # noqa: BLE001 - never breaks /persona/state
-        logger.warning("persona_state: tier_fallbacks failed", exc_info=True)
+        logger.warning("persona_state: model_fallbacks failed", exc_info=True)
         return []
+
+
+def _model_unconfirmed() -> list[str]:
+    """The chat id as configured, when it was saved unchecked (only the Claude model picker ever marks one)."""
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, configured_job_models
+
+    return model_error.unconfirmed(only={configured_job_models()[TIER_INTERACTIVE_CHAT]})
+
+
+def _model_unsupported(connection: dict[str, Any]) -> str | None:
+    # The model setting only matters for the claude-cli provider; ollama / fake ignore it.
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, unusable_setting_text
+
+    if connection.get("provider") != "claude-cli":
+        return None
+    return unusable_setting_text(TIER_INTERACTIVE_CHAT)
 
 
 def _is_recovering(persona_dir: Path) -> bool:
@@ -284,15 +286,18 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
     """Provider + model + last-heartbeat — drives the Connection panel.
 
     Provider comes from persona_config (the operator-tier choice).
-    Model is provider-specific; for v1 we surface a sensible default
-    per provider rather than read it from a separate config (the
-    runner-side model isn't currently persisted).
+    Model: for a claude-cli persona, the id the chat job runs right now (the
+    install-wide ``model.interactive_chat`` setting, or its fallback to the
+    shipped default after a rejection) and ``model_choice``, the picker word that
+    id means (sonnet / opus / haiku) or None for a custom id; both are None for
+    any other provider (its own model is not a Claude id).
     Last-heartbeat-at comes from heartbeat_state.json — null when the
     heartbeat has never run.
     """
     out: dict[str, Any] = {
         "provider": None,
         "model": None,
+        "model_choice": None,
         "last_heartbeat_at": None,
         "user_pronouns": None,
         "kindled_link_enabled": False,
@@ -301,12 +306,16 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         "notes_folder": None,
     }
     try:
+        from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, choice_for, model_for_tier
         from brain.persona_config import PersonaConfig
         from brain.pronouns import preset_key_for
 
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
         out["provider"] = cfg.provider
-        out["model"] = cfg.model
+        if cfg.provider == "claude-cli":
+            chat_model = model_for_tier(TIER_INTERACTIVE_CHAT)
+            out["model"] = chat_model
+            out["model_choice"] = choice_for(chat_model)
         out["user_pronouns"] = preset_key_for(cfg.user_pronouns)
         out["kindled_link_enabled"] = cfg.kindled_link_enabled
         out["kindled_relay_url"] = cfg.kindled_relay_url
@@ -318,18 +327,6 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
     if hb.outcome == "ok":  # missing or unreadable: left unset (the module reports an unreadable one)
         out["last_heartbeat_at"] = hb.data.get("last_tick_at")
     return out
-
-
-def _default_model_for(provider: str) -> str | None:
-    """v1 default model per provider. Replace with a real config field
-    when callers need provider-specific overrides."""
-    if provider == "claude-cli":
-        return "sonnet"
-    if provider == "ollama":
-        return "huihui_ai/qwen2.5-abliterated:7b"
-    if provider == "fake":
-        return "fake"
-    return None
 
 
 def _build_emotions(persona_dir: Path) -> dict[str, float]:

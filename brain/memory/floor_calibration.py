@@ -131,7 +131,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tunables (I7/I3) — every numeric literal below is either registered here
-# (operator-overridable via tunables.json, mirroring relevance_judge.py's
+# (operator-changeable in tunables.toml, mirroring relevance_judge.py's
 # CALIBRATION_SAMPLE_ROWS/AMBIGUOUS_BAND_HALF_WIDTH pattern) or derived from
 # one of these at call time.
 # ---------------------------------------------------------------------------
@@ -143,7 +143,10 @@ logger = logging.getLogger(__name__)
 # recall-leaning F-measure (recall weighted 2x precision), squarely within
 # the signed-off "recall-lean" mandate and reversible via the tunable — not
 # an owner-blocking pin.
-FLOOR_FIT_BETA: float = tunables.register("calibration.floor_fit_beta", 2.0)
+FLOOR_FIT_BETA: float = tunables.register(
+    "calibration.floor_fit_beta", 2.0,
+    description="How strongly the memory score cutoff favors catching every relevant memory. Higher means more.",
+)
 
 # Lower bound on labeled (reranker_score, label) PAIRS required, in the
 # MOST RECENTLY COMPLETED DAY, before a real fit is attempted (below this,
@@ -155,7 +158,10 @@ FLOOR_FIT_BETA: float = tunables.register("calibration.floor_fit_beta", 2.0)
 # derived by the pre-flip revision (Change 1's Open Reconfirmations
 # explicitly leave this one alone) — reused as-is from the original F2a
 # build.
-FLOOR_FIT_MIN_LABELED_PAIRS: int = tunables.register("calibration.floor_fit_min_labeled_pairs", 200)
+FLOOR_FIT_MIN_LABELED_PAIRS: int = tunables.register(
+    "calibration.floor_fit_min_labeled_pairs", 200,
+    description="Fewest judged recalls from one day needed before the memory score cutoff is fitted again.",
+)
 
 # Pre-flip revision Change 1, retention-window Open Reconfirmation: the
 # safety buffer (in DAYS) added on top of the 2 calendar days
@@ -171,7 +177,8 @@ FLOOR_FIT_MIN_LABELED_PAIRS: int = tunables.register("calibration.floor_fit_min_
 # like every other tunable here, but 1.0 is not an arbitrary pick — see
 # `derive_retention_window_days`'s docstring for the full derivation.
 FLOOR_RETENTION_SAFETY_BUFFER_DAYS: float = tunables.register(
-    "calibration.floor_retention_safety_buffer_days", 1.0
+    "calibration.floor_retention_safety_buffer_days", 1.0,
+    description="Extra days of recall history kept beyond the two the memory score cutoff fit needs.",
 )
 
 # Structural (not operator-tunable) minimum: TODAY's in-progress

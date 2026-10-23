@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 # was written as a token budget times a 4-chars-per-token guess. Keeping the value keeps each call's prompt size and
 # per-call behaviour as they were, so chunking changes only how much of a span reaches the extractor. An ops bound on one
 # background call's input (like ``files.read_max_bytes``), not physiology. Measured in characters, the unit it bounds.
-_CHUNK_CHARS_DEFAULT: int = tunables.register("ingest.extraction_chunk_chars", 24_000)
+_CHUNK_CHARS_DEFAULT: int = tunables.register(
+    "ingest.extraction_chunk_chars", 24_000,
+    description="Most characters of conversation sent to memory extraction in one call.",
+)
 
 
 def extraction_chunk_chars() -> int:

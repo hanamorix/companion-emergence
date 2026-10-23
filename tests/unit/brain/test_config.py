@@ -162,3 +162,29 @@ def test_persona_name_derived_from_dir(tmp_path: Path, clean_env: None) -> None:
 
     result = config.load_config(persona_dir)
     assert result.persona_name == "sage"
+
+
+# --- persona.toml is read through brain.utils.toml_io (#529): behaviour pins ---------------------------------------------
+
+
+def test_a_missing_persona_toml_loads_as_empty(tmp_path: Path) -> None:
+    from brain.config import _load_persona_toml
+
+    assert _load_persona_toml(tmp_path) == {}
+
+
+def test_a_malformed_persona_toml_raises_and_names_the_file_and_line(tmp_path: Path) -> None:
+    from brain.config import _load_persona_toml
+    from brain.utils.toml_io import TomlFileError
+
+    (tmp_path / "persona.toml").write_text("[bridge]\nbind = \n", encoding="utf-8")
+    with pytest.raises(TomlFileError) as err:
+        _load_persona_toml(tmp_path)
+    assert "persona.toml" in str(err.value) and "line 2" in str(err.value)
+
+
+def test_a_persona_toml_with_a_bom_loads(tmp_path: Path) -> None:
+    from brain.config import _load_persona_toml
+
+    (tmp_path / "persona.toml").write_bytes(b'\xef\xbb\xbf[model]\r\nprovider = "p"\r\ntag = "t"\r\n')
+    assert _load_persona_toml(tmp_path) == {"PROVIDER": "p", "MODEL": "t"}

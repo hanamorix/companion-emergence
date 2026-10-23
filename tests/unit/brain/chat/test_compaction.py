@@ -339,7 +339,7 @@ def test_c1a_over_cap_backstop_fires_once_not_per_turn(tmp_path: Path, monkeypat
                                "text": "x" * 4000, "ts": ts})
     write_cursor(tmp_path, sid, tss[-1])  # all extracted
     provider = _StubProvider("SUM")
-    # The backstop builds its own COMPACTION_MODEL provider; pin it to our stub so
+    # The backstop builds its own compaction-job provider; pin it to our stub so
     # the fire-once count is observable (and no real CLI is shelled in the test).
     monkeypatch.setattr(
         "brain.chat.compaction.build_compaction_provider", lambda pd: provider

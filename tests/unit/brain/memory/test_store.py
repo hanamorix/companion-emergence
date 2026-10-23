@@ -1230,7 +1230,7 @@ def _use_matrix_dim_fake_provider(monkeypatch: pytest.MonkeyPatch):
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=model_tier.MODEL_EMBEDDING_DIM)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
     return provider
 
 

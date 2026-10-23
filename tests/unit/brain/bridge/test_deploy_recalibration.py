@@ -492,7 +492,13 @@ def _run_folded_in_thread(persona_dir: Path, stop: threading.Event, **overrides)
     return t
 
 
-def _wait_for(pred, timeout: float = 5.0) -> bool:
+# A hang guard, not a pacing delay: the wait returns the moment the condition holds. The first supervisor pass and the stop
+# after it take well under a second normally, but several seconds when the Windows CI runner stalls (an unrelated test
+# slowed 20 to 40 times in the same run), and 5 s then failed a correct run.
+_HANG_GUARD_S = 30.0
+
+
+def _wait_for(pred, timeout: float = _HANG_GUARD_S) -> bool:
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline:
         if pred():
@@ -548,7 +554,7 @@ def test_run_folded_runs_deploy_recalibration_at_the_first_idle_pass_when_due(
             assert _wait_for(lambda: len(runs) >= 1), "deploy recalibration never ran"
         finally:
             stop.set()
-            t.join(timeout=5.0)
+            t.join(timeout=_HANG_GUARD_S)
     assert not t.is_alive()
     assert runs[0] == persona_dir
 
@@ -572,7 +578,7 @@ def test_run_folded_does_not_run_deploy_recalibration_when_floor_fresh(tmp_path:
             assert _wait_for(lambda: len(probes) >= 2), "due probe never asked"
         finally:
             stop.set()
-            t.join(timeout=5.0)
+            t.join(timeout=_HANG_GUARD_S)
     assert not t.is_alive()
     run.assert_not_called()
 
@@ -631,5 +637,5 @@ def test_run_folded_deploy_recalibration_failure_does_not_block_periodic_loop(
             assert _wait_for(lambda: len(attempts) >= 2), "loop died after a failing run"
         finally:
             stop.set()
-            t.join(timeout=5.0)
+            t.join(timeout=_HANG_GUARD_S)
     assert not t.is_alive(), "supervisor loop did not exit after stop_event"

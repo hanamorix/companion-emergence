@@ -40,7 +40,7 @@ def test_mcp_tools_path_budget_flag_and_graceful(tmp_path, monkeypatch):
 
     persona = tmp_path / "persona"
     persona.mkdir()
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     resp = p.chat(
         [ChatMessage(role="user", content="hi")],
         tools=[{"name": "noop"}],
@@ -92,7 +92,7 @@ def test_chat_with_images_path_budget_flag_and_graceful(tmp_path, monkeypatch):
             ImageBlock(image_sha=sha, media_type="image/png"),
         ),
     )
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     resp = p.chat(
         [msg],
         tools=None,
@@ -112,7 +112,7 @@ def test_streaming_path_budget_flag_and_graceful_over_budget(monkeypatch):
     from brain.bridge.chat import StreamDone
     from brain.bridge.provider import ClaudeCliProvider
 
-    provider = ClaudeCliProvider(model="claude-sonnet-4-6", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="claude-sonnet-4-6", timeout_seconds=60)
 
     # Two partial text deltas then an over-budget result frame.
     partial_lines = [
@@ -174,7 +174,7 @@ def test_generate_path_does_not_get_budget_flag(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     p.generate("hello world")
     assert "--max-budget-usd" not in captured["cmd"]
 
@@ -204,7 +204,7 @@ def test_budget_flag_present_and_error_frame_is_graceful(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(frame), stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     resp = p.chat([ChatMessage(role="user", content="hi")])
     assert "--max-budget-usd" in captured["cmd"]
     # graceful, non-empty, signals the cut-off — not a crash, not empty

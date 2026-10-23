@@ -3,7 +3,7 @@
 R-D1: daily budget exhausted → None, no provider call.
 Fail-soft: provider raises → None, no exception propagated.
 Threshold gate: gap below _GAP_THRESHOLD → None, no provider call.
-Routing: build_self_model_provider forces SELF_MODEL_MODEL (haiku) regardless of
+Routing: build_self_model_provider builds the self-model-articulate job's provider (haiku by default) regardless of
   the persona's configured chat model, mirroring brain/chat/compaction.py's
   build_compaction_provider. The usage log's model= must reflect the model the
   provider actually used, not a disconnected hardcoded label (was: model="haiku"
@@ -37,7 +37,6 @@ from brain.bridge.provider import ClaudeCliProvider
 from brain.self_model.articulate import (
     _DAILY_ARTICULATE_BUDGET,
     _GAP_THRESHOLD,
-    SELF_MODEL_MODEL,
     articulate,
     build_self_model_provider,
 )
@@ -129,32 +128,37 @@ def test_corrupt_budget_file_still_allows_call(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Routing regression: the articulate note must run on SELF_MODEL_MODEL
-# (haiku), not whatever provider/model the caller happens to be threading
-# through (the persona chat provider) — and the usage log must record the
-# model that actually ran.
+# Routing regression: the articulate note must run the self-model-articulate
+# job's model (haiku by default), not whatever provider/model the caller happens
+# to be threading through (the persona chat provider) — and the usage log must
+# record the model that actually ran.
 # ---------------------------------------------------------------------------
 
 
 def test_build_self_model_provider_forces_haiku_regardless_of_chat_model(tmp_path):
-    """build_self_model_provider must carry model_override=SELF_MODEL_MODEL
-    ("haiku") even when the persona's configured chat model is something
-    else (e.g. sonnet) — this is a cheap housekeeping call, not a chat reply,
-    and must not inherit the persona chat model. Mirrors
-    test_provider_factory_model.test_factory_override_beats_config."""
-    (tmp_path / "persona_config.json").write_text(
-        json.dumps({"provider": "claude-cli", "searcher": "noop", "model": "sonnet"})
+    """build_self_model_provider builds the self-model-articulate JOB's provider ("haiku" by
+    default) even when the install's chat model is something else (here Opus) — this is a
+    cheap housekeeping call, not a chat reply, and must not inherit the chat model."""
+    from brain.bridge.model_tier import (
+        TIER_INTERACTIVE_CHAT,
+        TIER_SELF_MODEL_ARTICULATE,
+        set_job_models,
     )
+
+    (tmp_path / "persona_config.json").write_text(
+        json.dumps({"provider": "claude-cli", "searcher": "noop"})
+    )
+    set_job_models({TIER_INTERACTIVE_CHAT: "opus"})
     provider = build_self_model_provider(tmp_path)
     assert isinstance(provider, ClaudeCliProvider)
-    assert SELF_MODEL_MODEL == "haiku"
-    assert provider._model == "haiku"  # noqa: SLF001 — NOT "sonnet", the chat model
+    assert provider._tier == TIER_SELF_MODEL_ARTICULATE  # noqa: SLF001
+    assert provider._cli_model() == "haiku"  # noqa: SLF001 — NOT the chat model
 
 
 class _ModelledProvider:
     """Provider stub that, unlike _CountingProvider, exposes ._model — the
-    attribute real providers (ClaudeCliProvider/OllamaProvider) set from
-    model_override, so the usage-log label can be derived from it."""
+    attribute real providers (ClaudeCliProvider/OllamaProvider) set, so the
+    usage-log label can be derived from it."""
 
     def __init__(self, model: str, *, response: str = "Something shifts.") -> None:
         self._model = model
@@ -194,8 +198,8 @@ def test_usage_log_derives_model_from_provider_not_hardcoded(tmp_path):
 
 def test_usage_log_records_haiku_when_correctly_routed(tmp_path):
     """End-to-end shape of the fix: a provider built via
-    build_self_model_provider (._model == "haiku") logs "haiku"."""
-    provider = _ModelledProvider(SELF_MODEL_MODEL)
+    build_self_model_provider (running "haiku") logs "haiku"."""
+    provider = _ModelledProvider("haiku")
     gap = _gap(magnitude=_GAP_THRESHOLD + 0.5)
     articulate(gap, provider=provider, persona_dir=tmp_path)
 
@@ -205,13 +209,15 @@ def test_usage_log_records_haiku_when_correctly_routed(tmp_path):
 
 def test_usage_log_falls_back_to_self_model_constant_without_model_attr(tmp_path):
     """A provider with no ._model (e.g. FakeProvider in tests) falls back to
-    SELF_MODEL_MODEL rather than an unrelated hardcoded string."""
+    the self-model-articulate job's model rather than an unrelated hardcoded string."""
     provider = _CountingProvider(response="Something shifts.")
     gap = _gap(magnitude=_GAP_THRESHOLD + 0.5)
     articulate(gap, provider=provider, persona_dir=tmp_path)
 
     rows = _read_usage_rows(tmp_path)
-    assert rows[-1]["model"] == SELF_MODEL_MODEL
+    from brain.bridge.model_tier import TIER_SELF_MODEL_ARTICULATE, model_for_tier
+
+    assert rows[-1]["model"] == model_for_tier(TIER_SELF_MODEL_ARTICULATE)
 
 
 # ---------------------------------------------------------------------------

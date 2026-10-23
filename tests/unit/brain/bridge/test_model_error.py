@@ -112,7 +112,7 @@ def test_an_overlong_named_model_is_not_returned():
 
 
 def test_rejected_model_name_only_ever_returns_valid_grammar():
-    from brain.persona_config import is_valid_model
+    from brain.bridge.model_tier import is_valid_model
 
     for text in (SENTENCE.format(model=m) for m in ["a" * 500, "claude-" + "x" * 300, "‮", "../etc"]):
         out = model_error.rejected_model_name(text, None)
@@ -291,49 +291,34 @@ def test_switch_unignores_every_keep_id_and_the_new_id():
     assert [r["model"] for r in model_error.state()] == ["claude-a-1"]
 
 
-def test_activate_unignores_and_rejected_models_is_a_copy():
+def test_activate_unignores_an_id_so_its_rejection_is_recorded():
     model_error.switch("claude-a-1", "sonnet", keep=frozenset())
     model_error.activate(["claude-a-1", "claude-never-seen-9"])
     model_error.note_failure(SENTENCE.format(model="claude-a-1"))
-    rejected = model_error.rejected_models()
-    assert rejected == frozenset({"claude-a-1"})
-    model_error.note_failure(SENTENCE.format(model="claude-b-2"))
-    assert rejected == frozenset({"claude-a-1"})  # a snapshot, not a view
+    assert model_error.is_rejected("claude-a-1")
+    assert not model_error.is_rejected("claude-never-seen-9")
 
 
-def test_activate_and_rejected_models_fail_open(monkeypatch):
+def test_is_rejected_trusts_a_record_only_while_it_is_newer_than_the_given_time():
+    model_error.note_failure(SENTENCE.format(model="claude-a-1"))
+    last = model_error._rejected["claude-a-1"]["last_epoch"]
+    assert model_error.is_rejected("claude-a-1")  # no time given: any record counts
+    assert model_error.is_rejected("claude-a-1", since_epoch=last - 1)  # the file is older than the failure
+    assert not model_error.is_rejected("claude-a-1", since_epoch=last)  # equal: not newer
+    assert not model_error.is_rejected("claude-a-1", since_epoch=last + 1)  # the file was written after
+    assert not model_error.is_rejected("claude-b-2", since_epoch=0.0)  # no record at all
+
+
+def test_a_later_failure_refreshes_the_records_time():
+    model_error.note_failure(SENTENCE.format(model="claude-a-1"))
+    first = model_error._rejected["claude-a-1"]["last_epoch"]
+    model_error._rejected["claude-a-1"]["last_epoch"] = first - 100
+    model_error.note_failure(SENTENCE.format(model="claude-a-1"))
+    assert model_error._rejected["claude-a-1"]["last_epoch"] > first - 100
+
+
+def test_activate_and_is_rejected_fail_open(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(model_error, "_lock", None)
         model_error.activate(["claude-a-1"])
-        assert model_error.rejected_models() == frozenset()
-
-
-def test_tier_unconfirmed_marks_clear_on_a_clean_frame_or_a_confirming_probe(tmp_path):
-    from brain.bridge.usage_log import log_usage
-
-    model_error.note_tier_unconfirmed("claude-haiku-5")
-    model_error.note_tier_unconfirmed("claude-other-1")
-    assert model_error.tier_unconfirmed() == ["claude-haiku-5", "claude-other-1"]
-    assert model_error.tier_unconfirmed(only={"claude-haiku-5"}) == ["claude-haiku-5"]
-    assert model_error.unconfirmed() == []  # a separate list from the chat model's
-    log_usage(tmp_path, call_type="generate", model="haiku", frame={"is_error": False})
-    assert len(model_error.tier_unconfirmed()) == 2
-    log_usage(tmp_path, call_type="generate", model="claude-haiku-5", frame={"is_error": False})
-    assert model_error.tier_unconfirmed() == ["claude-other-1"]
-    model_error.clear_tier_unconfirmed("claude-other-1")
-    assert model_error.tier_unconfirmed() == []
-
-
-def test_tier_unconfirmed_functions_fail_open(monkeypatch):
-    with monkeypatch.context() as m:
-        m.setattr(model_error, "_lock", None)
-        model_error.note_tier_unconfirmed("claude-haiku-5")
-        model_error.clear_tier_unconfirmed("claude-haiku-5")
-        assert model_error.tier_unconfirmed() == []
-
-
-def test_switch_drops_the_old_ids_tier_unconfirmed_mark_like_the_chat_one():
-    model_error.note_tier_unconfirmed("claude-sonnet-5")
-    model_error.note_tier_unconfirmed("claude-haiku-5")
-    model_error.switch("claude-sonnet-5", "sonnet", keep=frozenset())
-    assert model_error.tier_unconfirmed() == ["claude-haiku-5"]
+        assert model_error.is_rejected("claude-a-1") is False

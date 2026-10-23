@@ -1,7 +1,7 @@
 """Dev-facing constants — build-time judgment calls, never user tunables.
 
-Sibling of `brain.tunables` (ops tier, user-facing, overridable via
-`$KINDLED_HOME/tunables.json`) but the opposite half of the fence (I7): a
+Sibling of `brain.tunables` (ops tier, user-facing, editable in
+`$KINDLED_HOME/tunables.toml`) but the opposite half of the fence (I7): a
 value here is EITHER not a runtime behaviour threshold (it exists to make a
 mechanism correct or well-sized — a timeout, a batch budget) OR is a
 behaviour-adjacent knob the owner has explicitly ruled is dev-level, not
@@ -199,3 +199,27 @@ COST_SERIES_WINDOW_S: float = 24 * 60 * 60
 # not the bridge with its other models and caches; the 14.23% rests on one cell (replicate 4).
 RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.14227
 RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.1659
+
+# --- settings-file lock wait (#529) ------------------------------------------
+# How long a writer of $KINDLED_HOME/tunables.toml (the install-wide settings file: the picker, `nell model`, the
+# bridge boot pass `sync_file`, the migrations) waits for the file's cross-process lock before it gives up and does not
+# write (`brain.utils.file_lock.locked_within`). One constant serves the tunables lock and the model migration's own lock.
+# It is DERIVED from constants that already exist, not sampled: the longest the holder itself can keep the lock is
+# R_read + (K + 2) * R_replace, where
+#   R_replace = _REPLACE_RETRY_SLEEP_S * (1 + 2 + ... + (_REPLACE_RETRIES - 1))        brain/health/attempt_heal.py
+#             = 0.05 * 28 = 1.4 s (a replace that keeps failing with PermissionError, Windows)
+#   R_read    = the same sum over json_io._READ_ATTEMPTS = 0.05 * (1 + 2) = 0.15 s (Windows only; 0 elsewhere)
+#   K         = the replaces made under the lock other than the single atomic write: 0. Nothing heals, quarantines or
+#               writes a notice file while `sync_file` or `set_values` holds the lock (the `unreadable` notice is written
+#               after the lock is released).
+#   the "+ 2" = the write's own replace, plus an fsync allowance of one more R_replace: a filesystem operation that is stuck
+#               (a slow disk, an antivirus scan on Windows) is modelled throughout as R_replace, the worst case the code
+#               already tolerates for one replace, so the fsync before the replace adds no new number.
+# 0.15 + 2 * 1.4 = 2.95 s, set to 3.0. Upper bound against the real budgets: the picker request first spends
+# the 30 s model probe (`provider.model_check_timeout_seconds`) and THEN waits for this lock, and the webview cuts a
+# request at about 60 s (see `brain/bridge/server.py`, the model-check comment), so the wait must stay well under 30 s.
+# The test that holds the line (tests/unit/brain/test_locked_within.py) recomputes the bound from the LIVE retry
+# constants, so changing them without re-deriving this one fails.
+SETTINGS_FILE_LOCK_WAIT_S: float = 3.0
+# How often the bounded wait retries the non-blocking lock attempt. A poll costs one open and one flock call.
+SETTINGS_FILE_LOCK_POLL_S: float = 0.02

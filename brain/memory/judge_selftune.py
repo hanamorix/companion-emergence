@@ -82,10 +82,12 @@ JUDGE_TUNE_GATE_HANDFUL_DECISIONS: int = dev_constants.JUDGE_SELFTUNE_GATE_HANDF
 # LoRA actually becomes viable. Bytes (not GB) to match
 # `_read_total_ram_bytes`'s / `_available_ram_headroom_bytes`'s unit.
 JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES: float = tunables.register(
-    "judge_selftune.ram_tier_lora_min_bytes", 16.0 * (1024**3)
+    "judge_selftune.ram_tier_lora_min_bytes", 16.0 * (1024**3),
+    description="Memory, in bytes, a computer needs before the weekly judge retrain uses the lightweight method.",
 )
 JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES: float = tunables.register(
-    "judge_selftune.ram_tier_full_ft_min_bytes", 64.0 * (1024**3)
+    "judge_selftune.ram_tier_full_ft_min_bytes", 64.0 * (1024**3),
+    description="Memory, in bytes, a computer needs before the weekly judge retrain uses the full method.",
 )
 
 # Per-tune-grade memory FOOTPRINT estimates (spec §1 ⚠ cgroup-aware
@@ -97,13 +99,16 @@ JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES: float = tunables.register(
 # the first place — this is what makes it the "always-safe floor" the spec
 # calls for.
 JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES: float = tunables.register(
-    "judge_selftune.footprint_knob_refit_bytes", 256.0 * (1024**2)
+    "judge_selftune.footprint_knob_refit_bytes", 256.0 * (1024**2),
+    description="Memory, in bytes, the simplest weekly judge adjustment is assumed to need.",
 )
 JUDGE_TUNE_FOOTPRINT_LORA_BYTES: float = tunables.register(
-    "judge_selftune.footprint_lora_bytes", 6.0 * (1024**3)
+    "judge_selftune.footprint_lora_bytes", 6.0 * (1024**3),
+    description="Memory, in bytes, the lightweight weekly judge retrain is assumed to need.",
 )
 JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES: float = tunables.register(
-    "judge_selftune.footprint_full_ft_bytes", 24.0 * (1024**3)
+    "judge_selftune.footprint_full_ft_bytes", 24.0 * (1024**3),
+    description="Memory, in bytes, the full weekly judge retrain is assumed to need.",
 )
 
 
@@ -142,8 +147,8 @@ def _read_total_ram_bytes() -> float | None:
 
 def _select_tune_grade_by_ram(total_ram_bytes: float | None) -> str:
     """RAM tier -> tune-grade select (spec §1 table), evaluated against the
-    CURRENT tunable thresholds (re-read every call, so a live tunables.json
-    override takes effect on the very next tick).
+    CURRENT tunable thresholds (re-read every call, so a live tunables.toml
+    value takes effect on the very next tick).
 
     `total_ram_bytes is None` (detection failed / non-Linux) fails toward
     the always-safe floor — knob-refit — never toward a grade that might
