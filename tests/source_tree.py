@@ -37,7 +37,7 @@ def tree_sources(
     substrings (they are tested before the file is read). ``root`` is relative to the repository (``"brain"``,
     ``"scripts"``, ``"app/src"``).
     """
-    return _read(root, tuple(suffixes), tuple(exclude))
+    return _read(Path(root).as_posix(), tuple(suffixes), tuple(exclude))
 
 
 @functools.cache
@@ -60,9 +60,13 @@ def brain_sources() -> Mapping[str, str]:
     return tree_sources("brain", (".py",))
 
 
-@functools.cache
 def tree_asts(root: str) -> Mapping[str, ast.Module]:
     """``{path: parsed module}`` for the Python files under ``root``, parsed from the text of :func:`tree_sources`."""
+    return _parse(Path(root).as_posix())
+
+
+@functools.cache
+def _parse(root: str) -> Mapping[str, ast.Module]:
     return MappingProxyType({rel: ast.parse(text) for rel, text in tree_sources(root, (".py",)).items()})
 
 

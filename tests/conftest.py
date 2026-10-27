@@ -946,6 +946,8 @@ def held_lock() -> Callable[[Path], AbstractContextManager[None]]:
         finally:
             release.set()
             thread.join(10)
+        assert not thread.is_alive(), "the holder thread did not let go of the lock"
+        assert not failure, f"the holder thread failed: {failure[0]!r}"
 
     return _hold
 

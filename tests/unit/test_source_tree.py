@@ -28,6 +28,8 @@ def test_brain_sources_holds_exactly_the_python_files_of_brain() -> None:
 def test_the_entry_points_share_one_cached_copy_and_it_is_read_only() -> None:
     assert source_tree.tree_sources("brain") is source_tree.brain_sources()
     assert source_tree.tree_asts("brain") is source_tree.brain_trees()
+    assert source_tree.tree_sources("brain/") is source_tree.brain_sources()  # another spelling of the same root
+    assert source_tree.tree_asts("./brain") is source_tree.brain_trees()
     with pytest.raises(TypeError):
         source_tree.brain_sources()["brain/x.py"] = ""  # type: ignore[index]
     with pytest.raises(TypeError):
