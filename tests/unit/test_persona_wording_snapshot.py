@@ -96,11 +96,13 @@ def _words(a: str, b: str, context: int = 4) -> str:
 
 def describe_change(key: str, approved: str, current: str) -> str:
     """The diff of one changed text: unified, then word level, and the first differing characters as ``repr``."""
-    unified = "".join(
-        difflib.unified_diff(
-            approved.splitlines(keepends=True), current.splitlines(keepends=True), f"approved {key}", f"current {key}", n=1
-        )
-    )
+    def lines(text: str) -> list[str]:
+        out = text.splitlines(keepends=True)
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"  # otherwise difflib fuses a last line of the old text with the new one
+        return out
+
+    unified = "".join(difflib.unified_diff(lines(approved), lines(current), f"approved {key}", f"current {key}", n=1))
     first = len(os.path.commonprefix([approved, current]))
     where = (
         f"first difference at character {first}: approved {approved[max(0, first - 15) : first + 25]!r}, "
@@ -122,9 +124,16 @@ def differences(approved: dict[str, str], current: dict[str, str]) -> list[str]:
 
 
 def test_persona_wording_matches_the_approved_snapshot() -> None:
-    from tests.snapshot_support import read_sections
+    from tests.snapshot_support import read_sections, unstorable
 
     current = current_wording()
+    problems = unstorable(current)
+    if problems:
+        pytest.fail(
+            "this wording cannot be kept in the snapshot, so it cannot be approved as it is (remove the trailing "
+            "space or the carriage return from the text):\n  " + "\n  ".join(problems),
+            pytrace=False,
+        )
     try:
         approved = read_sections(SNAPSHOT)
     except ValueError as exc:

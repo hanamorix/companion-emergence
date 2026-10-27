@@ -1,8 +1,8 @@
 """N2 (name-recall fix): the add-name tool, item 3 of "Names are added three ways".
 
-Criteria C6 (tool half, S69, S70, S87). The tool's identifier and text are PLACEHOLDERS
-(I10); these tests reach the tool through ``ADD_NAME_TOOL_NAME`` so the owner's rename is
-a one-constant change. Naming: synthetic user = Bob, persona = Canary.
+Criteria C6 (tool half, S69, S70, S87). These tests reach the tool through ``ADD_NAME_TOOL_NAME``
+so the owner's rename is a one-constant change; the approved wording is held by
+tests/unit/test_persona_wording_snapshot.py. Naming: synthetic user = Bob, persona = Canary.
 """
 
 from __future__ import annotations
