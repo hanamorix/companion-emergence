@@ -69,7 +69,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           want="${PACKAGE:-all}"
-          if [ "$EVENT" = "pull_request" ]; then want="notes"; fi
+          if [ "$EVENT" = "pull_request" ]; then want="all"; fi # TEMPORARY (#540 proof): every package's clean pass
           all=()
           skipped=()
           for d in brain/*/; do
@@ -150,8 +150,10 @@ jobs:
       - name: Run mutmut
         env:
           MAX_MINUTES: ${{ inputs.max_minutes }}
+          EVENT: ${{ github.event_name }}
         run: |
           minutes="${MAX_MINUTES:-300}"
+          if [ "$EVENT" = "pull_request" ]; then minutes=25; fi # TEMPORARY (#540 proof)
           if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then echo "::error::max_minutes must be a number"; exit 1; fi
           set +e
           timeout "${minutes}m" .venv/bin/python -m mutmut run
