@@ -23,6 +23,11 @@ name: mutation
 # stops after `max_minutes` (default 300) and the report covers what finished.
 
 on:
+  # TEMPORARY (#540 proof run; removed in the next commit): a workflow file that is not on the default
+  # branch cannot be dispatched, so the first run is a pull_request run that touches this file.
+  pull_request:
+    paths:
+      - .github/workflows/mutation.yml
   schedule:
     - cron: "17 3 * * 0" # Sundays 03:17 UTC
   workflow_dispatch:
@@ -61,8 +66,10 @@ jobs:
         id: pick
         env:
           PACKAGE: ${{ inputs.package }}
+          EVENT: ${{ github.event_name }}
         run: |
           want="${PACKAGE:-all}"
+          if [ "$EVENT" = "pull_request" ]; then want="notes"; fi
           all=()
           skipped=()
           for d in brain/*/; do
