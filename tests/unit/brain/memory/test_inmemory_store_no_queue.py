@@ -150,7 +150,8 @@ def test_every_way_of_changing_the_cwd_queue_errors_the_test_that_did_it_and_nam
 
 def test_reading_the_cwd_queue_is_not_a_write(pytester) -> None:
     pytester.makeconftest(_GUARD_CONFTEST)
-    (pytester.path / "pending_candidates.jsonl").write_text("{}\n", encoding="utf-8")
+    # bytes, not write_text: on Windows a text write turns "\n" into "\r\n" and the inner size check would see 4
+    (pytester.path / "pending_candidates.jsonl").write_bytes(b"{}\n")
     pytester.makepyfile(
         "import os\n"
         "from pathlib import Path\n"

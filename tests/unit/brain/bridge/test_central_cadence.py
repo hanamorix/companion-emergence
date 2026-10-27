@@ -1482,6 +1482,9 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
 
     from brain.chat.session import all_sessions, create_session, reset_registry
 
+    # Caps, not expected durations: every wait below returns as soon as its event happens. The first idle pass opens
+    # the stores and builds the provider on a cold worker, which took over 10 s on a loaded 4-worker Windows runner.
+    cap_s = 60.0
     persona_dir = _persona(tmp_path)
     reset_registry()
     cli_throttle.reset()
@@ -1520,7 +1523,7 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
     )
     try:
         t.start()
-        deadline = _time.monotonic() + 10.0
+        deadline = _time.monotonic() + cap_s
         while _time.monotonic() < deadline and any(
             s.session_id == old.session_id for s in all_sessions()
         ):
@@ -1528,7 +1531,7 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
         assert all(s.session_id != old.session_id for s in all_sessions()), "pre-start session kept"
         new = create_session(persona_dir.name)  # opened after bridge start
         after = len(ticks)
-        deadline = _time.monotonic() + 10.0
+        deadline = _time.monotonic() + cap_s
         while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after it was opened
             _time.sleep(0.02)
         assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
@@ -1537,6 +1540,6 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
         )
     finally:
         stop.set()
-        t.join(timeout=10.0)
+        t.join(timeout=cap_s)
         reset_registry()
     assert not t.is_alive()
