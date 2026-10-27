@@ -505,7 +505,7 @@ def test_the_chat_choice_follows_the_effective_id(persona_dir, model_override) -
 
 
 # ---------------------------------------------------------------------------
-# C38: no import cycle, in the import orders that differ
+# C38: no import cycle, whichever of the distinct import orders comes first
 # ---------------------------------------------------------------------------
 
 # Every fresh interpreter imports all of these; only the module imported FIRST varies.
@@ -523,7 +523,7 @@ _MODULES = [
 # `set_job_models`), and persona_state-first is that sequence plus its own imports (nothing in the chain imports it).
 # tunables-first is the one other order (tunables imports nothing from brain.bridge). So there are two distinct orders
 # today; the third entry is persona_state, the one module the chain does not load. The premise is checked, not assumed:
-# the bridge entries first import the bare package and assert that the chain was loaded by it; if that fails the five
+# the bridge entries first import the bare package and check that the chain was loaded by it; if that fails the five
 # orders are different processes again and the dropped entries (model_tier, provider) must be restored.
 _FIRST = ["brain.bridge.model_error", "brain.bridge.persona_state", "brain.tunables"]
 _PREMISE = (
@@ -533,7 +533,7 @@ _PREMISE = (
     "'brain.tunables') if m not in sys.modules]\n"
     "if _missing:\n"
     "    raise SystemExit(f'importing brain.bridge no longer loads {_missing}, so the import orders are different "
-    "again: restore the first-import entries model_tier and provider')\n"
+    "again: restore the first-import entries of the modules named (model_tier, provider)')\n"
 )
 
 
