@@ -478,8 +478,8 @@ def test_cr6_validator_rejections_are_schema_failures(
 @pytest.mark.parametrize("exc_type", [KeyError])
 @pytest.mark.parametrize("policy", POLICIES)
 def test_cr6_a_validator_bug_is_not_a_schema_failure_and_propagates(tmp_path: Path, policy: str, exc_type) -> None:
-    """Only ValueError/TypeError reject content (the old attempt_heal's rule); a KeyError or AttributeError is the
-    validator's own bug and must not turn a valid file into a default, a restore or a reset."""
+    """Only ValueError/TypeError reject content (the old attempt_heal's rule); a KeyError (AttributeError and RuntimeError
+    are run through HEAL by test_heal_a_validator_bug_propagates_...) is the validator's own bug and must not turn a valid file into a default, a restore or a reset."""
     p = tmp_path / "state.json"
     p.write_text('{"a": 1}')
 
@@ -497,6 +497,9 @@ def test_cr6_a_validator_that_returns_passes_the_data_through(tmp_path: Path) ->
     seen = []
     assert jio.read_json(p, default=dict, validate=seen.append) == {"a": 1}
     assert seen == [{"a": 1}]
+    # HEAL too: an accepted live file is returned as is, with no anomaly and nothing written beside it.
+    healed = jio.read_json_result(p, default=dict, validate=seen.append, recover=jio.Recovery.HEAL)
+    assert healed.data == {"a": 1} and healed.anomaly is None and _listing(tmp_path) == {"state.json": b'{"a": 1}'}
 
 
 def test_cr7_default_policy_never_modifies_the_file(tmp_path: Path) -> None:
