@@ -55,7 +55,7 @@ def _admit(persona: Path, names: list[str], source: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# B1a: admitted from every source, keyed by the raw lower-cased string
+# B1a: admitted from each write path (the gate and reappraiser insert, the tool's add), keyed by the raw lower-cased string
 # --------------------------------------------------------------------------
 
 
@@ -208,7 +208,7 @@ SPELLINGS = ["田中 太郎", "田中  太郎", "田中\t太郎", "田中\n\n太
 
 
 @pytest.mark.parametrize("source", SOURCES)
-def test_s1a_every_spelling_of_the_spacing_is_one_name_from_every_source(tmp_path: Path, source: str) -> None:
+def test_s1a_every_spelling_of_the_spacing_is_one_name_from_each_write_path(tmp_path: Path, source: str) -> None:
     for spelling in SPELLINGS:
         _admit(tmp_path, [spelling], source)
     rows = _rows(tmp_path)
