@@ -508,15 +508,37 @@ def test_the_chat_choice_follows_the_effective_id(persona_dir, model_override) -
 # C38: no import cycle, whichever module is imported first
 # ---------------------------------------------------------------------------
 
-_FIRST = ["brain.bridge.model_error", "brain.bridge.model_tier", "brain.bridge.provider", "brain.bridge.persona_state", "brain.tunables"]
+# Every fresh interpreter imports all of these; only the module imported FIRST varies.
+_MODULES = ["brain.bridge.model_error", "brain.bridge.model_tier", "brain.bridge.provider", "brain.bridge.persona_state", "brain.tunables"]
+# Three first imports are enough, read off the import graph: importing any `brain.bridge.X` first runs
+# `brain/bridge/__init__.py` first, which imports provider, which loads model_error, model_tier and tunables in one
+# fixed order, so model_error-, model_tier-, provider- and persona_state-first are the same load sequence (the cycle
+# between model_error and model_tier is broken by the function-scoped `from brain.bridge import model_error` in
+# model_tier.py `model_for_tier` and `set_job_models`); tunables-first is the one other order (tunables imports nothing from brain.bridge).
+# persona_state stands for "a consumer the chain does not load". The premise is checked, not assumed: the bridge
+# entries first import the bare package and assert that provider was loaded by it; if that fails the five orders are
+# different again.
+_FIRST = ["brain.bridge.model_error", "brain.bridge.persona_state", "brain.tunables"]
+_PREMISE = (
+    "import sys\n"
+    "import brain.bridge\n"
+    "assert 'brain.bridge.provider' in sys.modules, 'importing brain.bridge no longer imports provider, so the import "
+    "orders are different again: restore the first-import entries model_tier and provider'\n"
+)
+
+
+def _import_script(first: str) -> str:
+    """The program a fresh interpreter runs: (for a bridge module, check the premise,) import ``first``, then every other
+    module of ``_MODULES``."""
+    premise = _PREMISE if first.startswith("brain.bridge.") else ""
+    others = [m for m in _MODULES if m != first]
+    return premise + f"import {first}\n" + "".join(f"import {m}\n" for m in others) + "print('ok')\n"
 
 
 @pytest.mark.parametrize("first", _FIRST)
 def test_every_import_order_succeeds_in_a_fresh_interpreter(first, tmp_path) -> None:
-    others = [m for m in _FIRST if m != first]
-    code = f"import {first}\n" + "".join(f"import {m}\n" for m in others) + "print('ok')\n"
     out = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _import_script(first)],
         capture_output=True,
         text=True,
         env={**os.environ, "PYTHONPATH": str(_REPO_ROOT), "KINDLED_HOME": str(tmp_path)},
