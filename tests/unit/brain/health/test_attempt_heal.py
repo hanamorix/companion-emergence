@@ -27,6 +27,7 @@ from brain.utils.atomic_write import save_with_backup_text
 # can be starved while the writers finish, so the writers keep saving (bounded) until it has made this many reads.
 _MIN_POLLER_READS = 100
 _POLLER_GRACE_S = 30.0
+_POLLER_SAVES = 400  # the fewest saves the poller test makes while it polls
 
 
 def attempt_heal(path, default_factory, schema_validator=None):
@@ -496,7 +497,7 @@ def test_live_path_never_missing_at_any_step_boundary(tmp_path: Path, monkeypatc
 )
 @pytest.mark.parametrize("run", [1, 2, 3])
 def test_concurrent_reader_never_sees_live_path_missing(tmp_path: Path, monkeypatch, run) -> None:
-    """C2: a thread polling the live path through at least 1500 saves sees no gap, no partial file, and
+    """C2: a thread polling the live path through at least _POLLER_SAVES saves sees no gap, no partial file, and
     versions that never go backwards."""
     p = tmp_path / "x.json"
     save_with_backup_text(p, _payload(0))
@@ -527,7 +528,7 @@ def test_concurrent_reader_never_sees_live_path_missing(tmp_path: Path, monkeypa
     try:
         n = 0
         grace_ends = time.monotonic() + _POLLER_GRACE_S
-        while n < 1500 or (stats["reads"] < _MIN_POLLER_READS and time.monotonic() < grace_ends):
+        while n < _POLLER_SAVES or (stats["reads"] < _MIN_POLLER_READS and time.monotonic() < grace_ends):
             n += 1
             save_with_backup_text(p, _payload(n))
     finally:

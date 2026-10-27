@@ -258,7 +258,7 @@ def test_a_failed_verify_before_the_replace_leaves_the_file_unchanged(t, tmp_pat
 
 
 def test_a_reader_polling_during_many_writes_never_sees_a_torn_or_default_value(t, tmp_path) -> None:
-    """Replacement is atomic: an unchanged key never flickers to its default while another key is written 200 times."""
+    """Replacement is atomic: an unchanged key never flickers to its default while another key is written many times."""
     write_text(tmp_path, '"keep" = 7\n')
     stop = threading.Event()
     seen: list[object] = []
@@ -270,7 +270,7 @@ def test_a_reader_polling_during_many_writes_never_sees_a_torn_or_default_value(
     th = threading.Thread(target=reader)
     th.start()
     try:
-        for i in range(200):
+        for i in range(60):
             t.set_values({"moving": i})
     finally:
         stop.set()

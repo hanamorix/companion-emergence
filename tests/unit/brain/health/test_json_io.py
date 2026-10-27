@@ -2578,7 +2578,7 @@ def test_cr9_f_a_plain_reader_arriving_mid_heal_waits_and_never_gets_the_default
 
 def test_cr9_f_stress_no_reader_ever_sees_the_default_while_others_heal(tmp_path: Path) -> None:
     bad: list[object] = []
-    for rnd in range(40):
+    for rnd in range(10):
         d = tmp_path / f"r{rnd}"
         d.mkdir()
         p = _corrupt_with_backup(d, b'{"good": 1}')

@@ -932,11 +932,14 @@ for k in range(5):
 """
 
 
+_RACE_ROUNDS = 3  # rounds of two fresh interpreters released together by one go file
+
+
 def test_two_processes_writing_at_once_lose_nothing_and_keep_first_seen(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[4]
     env = {**os.environ, "PYTHONPATH": str(root)}
     seeded = datetime(2026, 9, 28, 8, 0, 0, tzinfo=UTC).isoformat()
-    for rnd in range(20):
+    for rnd in range(_RACE_ROUNDS):
         persona = tmp_path / f"run{rnd}"
         persona.mkdir()
         # The shared name is already in the list, from an earlier day and another

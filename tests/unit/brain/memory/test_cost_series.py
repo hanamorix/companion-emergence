@@ -289,22 +289,38 @@ def test_cs3d_machine_id_is_stable_across_a_fresh_process(real_machine_id: Path)
 
 
 def test_cs3d_two_processes_racing_the_first_creation_end_with_one_id(real_machine_id: Path) -> None:
+    # Each child imports, prints "ready", then busy-spins until the parent writes the go file (a sleep would let the
+    # three wake up to a millisecond apart, longer than the create takes): the three creates start together however
+    # long the interpreters take to import (a fixed start time shared the same instant only when every import beat
+    # it). The spin ends by itself after 60 s so a dead parent leaves no child behind.
     code = (
         "import sys, time\n"
+        "from pathlib import Path\n"
         "from brain.memory import cost_series\n"
-        "while time.time() < float(sys.argv[1]): pass\n"
+        "print('ready', flush=True)\n"
+        "go = Path(sys.argv[1])\n"
+        "give_up = time.monotonic() + 60\n"
+        "while not go.exists() and time.monotonic() < give_up: pass\n"
         "print(cost_series.machine_id())\n"
     )
     import os
-    import time
 
-    go = str(time.time() + 6.0)
+    go = real_machine_id.parent / "go"
     env = {"KINDLED_HOME": str(real_machine_id), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     procs = [
-        subprocess.Popen([sys.executable, "-c", code, go], env=env, stdout=subprocess.PIPE, text=True)
+        subprocess.Popen([sys.executable, "-c", code, str(go)], env=env, stdout=subprocess.PIPE, text=True)
         for _ in range(3)
     ]
-    ids = [p.communicate(timeout=120)[0].strip() for p in procs]
+    try:
+        for p in procs:
+            assert p.stdout is not None and p.stdout.readline().strip() == "ready"
+        go.write_text("go")
+        ids = [p.communicate(timeout=120)[0].strip() for p in procs]
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
     assert len(set(ids)) == 1 and len(ids[0]) == 32
     assert (real_machine_id / "machine_id").read_text() == ids[0]
     assert not list(real_machine_id.glob("*.tmp"))

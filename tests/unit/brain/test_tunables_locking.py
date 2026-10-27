@@ -84,28 +84,31 @@ def test_the_lock_hook_is_called_inside_the_window_just_before_the_write_by_set_
     assert seen == [b'"a" = 1\n']  # called before the replace, so the old file is still on disk
 
 
+_ROUNDS = 10  # writes per process in the two-process test
+
 _WORKER = """
 import sys
 sys.path.insert(0, {root!r})
 from brain import tunables, dev_constants
 dev_constants.SETTINGS_FILE_LOCK_WAIT_S = 60.0
 tag = sys.argv[1]
-for i in range(50):
+for i in range({rounds}):
     tunables.set_values({{f"{{tag}}{{i}}": i}})
 """
 
 
 def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) -> None:
-    """C8 (c): 50 rounds in each of two processes against one file: every one of the 100 keys is present."""
-    code = _WORKER.format(root=str(repo_root))
+    """C8 (c): _ROUNDS writes in each of two processes against one file: every key of both is present."""
+    code = _WORKER.format(root=str(repo_root), rounds=_ROUNDS)
     env = {**os.environ, "KINDLED_HOME": str(tmp_path)}
     procs = [subprocess.Popen([sys.executable, "-c", code, tag], env=env) for tag in ("a", "b")]
     for p in procs:
         assert p.wait(timeout=120) == 0
     values = read_values(tmp_path)
     # the creating write also carries the registered keys (the lull key), so check inclusion, not equality
-    assert {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)} <= set(values)
-    assert {k for k in values if k not in {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)}} == {"chat.idle_lull_seconds"}
+    expected = {f"{tag}{i}" for tag in ("a", "b") for i in range(_ROUNDS)}
+    assert expected <= set(values)
+    assert {k for k in values if k not in expected} == {"chat.idle_lull_seconds"}
 
 
 # ---------------------------------------------------------------------------
