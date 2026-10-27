@@ -1,0 +1,189 @@
+name: mutation
+
+# #540 (b): scheduled mutation testing. The new-tests check in test.yml (job `new-tests-fail-on-base`)
+# stops a PR from adding a test that cannot fail; this run catches what slips through it. mutmut changes
+# the code of one `brain/` subpackage a small step at a time (flips a comparison, drops an argument,
+# changes a constant) and runs the subpackage's unit tests (`tests/unit/brain/<package>`, without the
+# real-model, network, claude-CLI and live-harness tests) against each change. A change no test notices
+# is a SURVIVING mutant: a line the tests execute but do not check.
+#
+# Never a merge gate: it runs weekly and on request, nothing waits for it, and a surviving mutant is a
+# report to read, not a failure. The job fails only when mutmut itself cannot run (the package's tests
+# do not pass under mutmut, or nothing was mutated), so an empty run cannot look green.
+#
+# Coverage: one job per subpackage of `brain/` that has a `tests/unit/brain/<package>` directory. Not
+# covered: the top-level modules of `brain/` (cli.py, paths.py, ...), the subpackages without a unit
+# test directory (the `plan` job lists them in its summary), and tests that live outside
+# `tests/unit/brain/<package>`. mutmut's operators change values, operators, names and arguments; it
+# cannot remove a lock, reorder two statements or delete a whole call, so those mistakes are not
+# generated here.
+#
+# Each job uploads `mutation-report-<package>`: `results.txt` (every mutant and its verdict),
+# `stats.json` (counts), `survivors.diff` (the change made by the first 100 surviving mutants). mutmut
+# stops after `max_minutes` (default 300) and the report covers what finished.
+
+on:
+  schedule:
+    - cron: "17 3 * * 0" # Sundays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "brain subpackage to mutate (for example memory or notes), or all"
+        type: string
+        required: false
+        default: all
+      max_minutes:
+        description: "stop mutating after this many minutes (the report covers what finished)"
+        type: string
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: choose the subpackages
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.pick.outputs.packages }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # The package name reaches the shell as an environment variable (never spliced into the script)
+      # and must be a plain lower-case identifier that names a brain subpackage with unit tests.
+      - name: List the subpackages with unit tests
+        id: pick
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          want="${PACKAGE:-all}"
+          all=()
+          skipped=()
+          for d in brain/*/; do
+            name="$(basename "$d")"
+            [ -f "$d/__init__.py" ] || continue
+            if [ -d "tests/unit/brain/$name" ]; then all+=("$name"); else skipped+=("$name"); fi
+          done
+          if [ "$want" = "all" ]; then
+            chosen=("${all[@]}")
+          else
+            if ! [[ "$want" =~ ^[a-z_]+$ ]]; then echo "::error::'$want' is not a plain package name"; exit 1; fi
+            found=0
+            for n in "${all[@]}"; do if [ "$n" = "$want" ]; then found=1; fi; done
+            if [ "$found" != 1 ]; then echo "::error::'$want' is not a brain subpackage with tests/unit/brain/$want"; exit 1; fi
+            chosen=("$want")
+          fi
+          json="["
+          for n in "${chosen[@]}"; do json="$json\"$n\","; done
+          json="${json%,}]"
+          echo "packages=$json" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Mutation testing plan"
+            echo "- mutating: ${chosen[*]}"
+            echo "- no unit test directory, not mutated: ${skipped[*]:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  mutate:
+    name: mutate brain/${{ matrix.package }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.packages) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies and mutmut
+        run: |
+          uv sync --all-extras
+          uv pip install "mutmut==3.8.0"
+
+      # mutmut copies the source path and `also_copy` into `mutants/` and runs the tests there, so
+      # the top-level directories that tests read (app/, scripts/, docs/, ...) are listed.
+      # mutmut reads setup.cfg when pyproject.toml has no [tool.mutmut] table. `brain` is the source
+      # path so the whole tree is importable; only_mutate narrows what is changed.
+      - name: Write the mutmut config
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          printf '%s\n' \
+            '[mutmut]' \
+            'source_paths =' \
+            '    brain' \
+            'only_mutate =' \
+            "    brain/${PACKAGE}/*" \
+            'also_copy =' \
+            '    app' '    scripts' '    docs' '    examples' '    expressions' '    hooks' '    relay' '    wizard-validation' \
+            '    CHANGELOG.md' '    README.md' '    INSTALL.md' \
+            'pytest_add_cli_args =' \
+            '    -p' '    no:tdd-guard' '    -m' '    not live and not requires_claude_cli and not integration and not requires_network' \
+            'pytest_add_cli_args_test_selection =' \
+            "    tests/unit/brain/${PACKAGE}" \
+            'use_git_change_detection = false' > setup.cfg
+          cat setup.cfg
+
+      - name: Run mutmut
+        env:
+          MAX_MINUTES: ${{ inputs.max_minutes }}
+        run: |
+          minutes="${MAX_MINUTES:-300}"
+          if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then echo "::error::max_minutes must be a number"; exit 1; fi
+          set +e
+          timeout "${minutes}m" .venv/bin/python -m mutmut run
+          rc=$?
+          echo "$rc" > mutmut-exit.txt
+          if [ "$rc" != 0 ] && [ "$rc" != 124 ]; then
+            echo "::error::mutmut run exited $rc (the package's tests do not pass under mutmut, or nothing could be mutated)"
+            exit "$rc"
+          fi
+
+      - name: Write the report
+        if: always()
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          mkdir -p report
+          .venv/bin/python -m mutmut results --all true > report/results.txt 2>&1 || true
+          .venv/bin/python -m mutmut export-cicd-stats || true
+          cp mutants/mutmut-cicd-stats.json report/stats.json 2>/dev/null || true
+          : > report/survivors.diff
+          grep ': survived$' report/results.txt | sed 's/^ *//; s/: survived$//' | head -100 | while read -r name; do
+            .venv/bin/python -m mutmut show "$name" >> report/survivors.diff 2>&1 || true
+            echo >> report/survivors.diff
+          done
+          {
+            echo "### Mutation testing of brain/$PACKAGE"
+            echo
+            echo '```json'
+            cat report/stats.json 2>/dev/null || echo '{}'
+            echo '```'
+            if [ "$(cat mutmut-exit.txt 2>/dev/null)" = "124" ]; then echo; echo "partial: the time limit stopped the run."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          total="$(.venv/bin/python -c "import json,sys; print(json.load(open('report/stats.json'))['total'])" 2>/dev/null || echo 0)"
+          if [ "$total" = "0" ]; then echo "::error::no mutant was run for brain/$PACKAGE"; exit 1; fi
+
+      - name: Upload the mutation report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: mutation-report-${{ matrix.package }}
+          path: report/
+          if-no-files-found: warn

@@ -35,7 +35,7 @@ def _signal_self(sig) -> None:
     os.kill(os.getpid(), sig)
 
 
-@pytest.mark.no_base_failure(reason='#540 test of a test-only helper or fixture that wraps product code which already exists; it has no predecessor and the old code passes it')
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_signal_self_refuses_a_signal_that_would_kill_the_process():
     sig = signal.SIGUSR1
     seen = []
