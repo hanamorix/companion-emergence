@@ -167,21 +167,32 @@ jobs:
           write_config
           cat setup.cfg
           set +e
-          timeout "${minutes}m" .venv/bin/python -m mutmut run 2>&1 | tee mutmut-run.log
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" = 1 ] && grep -q "failed to collect stats" mutmut-run.log; then
-            echo "The first pass on the unmutated copy failed; finding every test that fails there."
-            (cd mutants && MUTANT_UNDER_TEST= ../.venv/bin/python -m pytest -p no:tdd-guard -p no:cacheprovider -q -rf --tb=no \
-              -m "$marker_expr" "tests/unit/brain/${PACKAGE}" 2>&1 | tee ../clean-pass.log)
-            grep '^FAILED ' clean-pass.log | sed 's/^FAILED //; s/ - .*$//' | sort -u > report/excluded-tests.txt
-            echo "excluded: $(wc -l < report/excluded-tests.txt) tests"
-            if [ -s report/excluded-tests.txt ]; then
-              write_config
-              rm -rf mutants
-              timeout "${minutes}m" .venv/bin/python -m mutmut run 2>&1 | tee mutmut-run.log
-              rc=${PIPESTATUS[0]}
-            fi
-          fi
+          : > report/excluded-tests.txt
+          attempt=0
+          while true; do
+            timeout "${minutes}m" .venv/bin/python -m mutmut run 2>&1 | tee mutmut-run.log
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" != 1 ] || ! grep -q "failed to collect stats" mutmut-run.log || [ "$attempt" -ge 6 ]; then break; fi
+            attempt=$((attempt + 1))
+            echo "First pass on the unmutated copy failed (attempt $attempt); collecting the tests that fail there."
+            before="$(wc -l < report/excluded-tests.txt)"
+            {
+              # the tests mutmut's own first pass reported ...
+              grep -a '^FAILED ' mutmut-run.log | sed 's/^FAILED //; s/ - .*$//'
+              # ... and, on the first attempt, every test that fails in a plain full pass of the copy
+              if [ "$attempt" = 1 ]; then
+                (cd mutants && MUTANT_UNDER_TEST= ../.venv/bin/python -m pytest -p no:tdd-guard -p no:cacheprovider -q -rf --tb=no \
+                  -m "$marker_expr" "tests/unit/brain/${PACKAGE}" 2>&1) | grep -a '^FAILED ' | sed 's/^FAILED //; s/ - .*$//'
+              fi
+              cat report/excluded-tests.txt
+            } | sort -u > report/excluded-new.txt
+            mv report/excluded-new.txt report/excluded-tests.txt
+            after="$(wc -l < report/excluded-tests.txt)"
+            echo "excluded so far: $after tests"
+            if [ "$after" = "$before" ]; then break; fi
+            write_config
+            rm -rf mutants
+          done
           echo "$rc" > mutmut-exit.txt
           if [ "$rc" != 0 ] && [ "$rc" != 124 ]; then
             echo "::error::mutmut run exited $rc (the package's tests do not pass under mutmut, or nothing could be mutated)"
