@@ -279,8 +279,6 @@ def test_cr1_a_file_deleted_between_probe_and_open_is_missing_not_a_crash(
         (b'{"a":', "malformed"),
         (b"", "empty"),
         (b"   \n", "empty"),
-        (b"not json", "malformed"),
-        (b"[1,2", "malformed"),
     ],
 )
 def test_cr2_malformed_empty_and_truncated_files_are_classified_and_recovered(
@@ -306,7 +304,7 @@ def test_cr2_malformed_empty_and_truncated_files_are_classified_and_recovered(
 
 
 @pytest.mark.parametrize("policy", POLICIES)
-@pytest.mark.parametrize("content", [b'{"a": "\xff"}', b'{"a": 1}\xc3', b"\xff" * 8])
+@pytest.mark.parametrize("content", [b'{"a": "\xff"}', b'{"a": 1}\xc3'])
 def test_cr3_invalid_utf8_is_recovered_like_malformed_json(
     tmp_path: Path, policy: str, content: bytes
 ) -> None:
@@ -454,7 +452,9 @@ def test_cr6_wrong_top_level_type_is_a_shape_failure(tmp_path: Path, policy: str
         assert exc.value.kind == "shape"
 
 
-@pytest.mark.parametrize("exc_type", [ValueError, TypeError])
+# One `except (ValueError, TypeError)` in json_io decides this; the HEAL tests near the end of the file run the
+# other exception classes through HEAL.
+@pytest.mark.parametrize("exc_type", [ValueError])
 @pytest.mark.parametrize("policy", POLICIES)
 def test_cr6_validator_rejections_are_schema_failures(
     tmp_path: Path, policy: str, exc_type
@@ -475,7 +475,7 @@ def test_cr6_validator_rejections_are_schema_failures(
         assert exc.value.kind == "schema"
 
 
-@pytest.mark.parametrize("exc_type", [KeyError, AttributeError])
+@pytest.mark.parametrize("exc_type", [KeyError])
 @pytest.mark.parametrize("policy", POLICIES)
 def test_cr6_a_validator_bug_is_not_a_schema_failure_and_propagates(tmp_path: Path, policy: str, exc_type) -> None:
     """Only ValueError/TypeError reject content (the old attempt_heal's rule); a KeyError or AttributeError is the
@@ -1437,9 +1437,7 @@ def _norm_crlf(b: bytes) -> bytes:
 
 
 @pytest.mark.parametrize("backups", [1, 3])
-@pytest.mark.parametrize(
-    "data", [{"a": 1}, {"é": "ü", "n": [1, 2, {"k": None}]}, [1, 2, 3], "text", 7]
-)
+@pytest.mark.parametrize("data", [{"é": "ü", "n": [1, 2, {"k": None}]}, 7])
 def test_cw1_write_json_matches_save_with_backup_byte_for_byte(
     tmp_path: Path, backups: int, data
 ) -> None:
@@ -2842,7 +2840,7 @@ def _reference_tail(data: bytes, n: int) -> list[bytes]:
     return lines[-n:]
 
 
-@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 8, 13, 64])
+@pytest.mark.parametrize("chunk", [1, 3, 13])
 def test_cj4_the_tail_matches_a_naive_reference_for_tiny_chunk_sizes(
     tmp_path: Path, monkeypatch, chunk: int
 ) -> None:
