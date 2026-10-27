@@ -172,7 +172,17 @@ def test_group_b_appender_writes_ascii_json_lines(tmp_path: Path, name: str) -> 
     assert all(isinstance(json.loads(line), dict) for line in lines[:-1])
 
 
-@pytest.mark.parametrize("name", sorted(APPENDERS))
+# Every appender goes through `json_io.append_jsonl`, whose torn-tail behaviour is pinned by test_json_io.py's
+# test_ca3_*; four appenders (a plain audit, a model-call error log, a heartbeat log and an archive) show the wiring.
+_TORN_TAIL_APPENDERS = [
+    "files.audit.audit",
+    "detector._call_haiku",
+    "heartbeat._append_log",
+    "consolidation._archive_preimage",
+]
+
+
+@pytest.mark.parametrize("name", _TORN_TAIL_APPENDERS)
 def test_group_b_appender_after_a_torn_tail_loses_only_the_torn_record(tmp_path: Path, name: str) -> None:
     call, rel = APPENDERS[name]
     before = set(tmp_path.rglob("*.jsonl"))

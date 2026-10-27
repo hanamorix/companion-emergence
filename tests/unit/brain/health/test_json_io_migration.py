@@ -1,8 +1,11 @@
-"""The behaviour changes a migrated caller sees (BC1-BC22 of 2-plan-phase2.md), each pinned on a REAL migrated function.
+"""The behaviour changes a migrated caller sees (BC of 2-plan-phase2.md), each pinned on a REAL migrated function.
 
-Test names start with the BC id. Characterization pins (BC2, BC10 and BC11 first halves, BC16, BC19) say so: an
-existing or module test passes through the new call and cannot be red before green. Every other test asserts new
-behaviour and fails against the old code path. Nothing here touches a persona directory.
+Test names start with the BC id. Only the BC pins that no module test repeats are here (BC2, BC3, BC4, BC6, BC7,
+BC10, BC11, BC14, BC15, BC16, BC17, BC19, BC20); BC1, BC5, BC8, BC9, BC12, BC13, BC18, BC21 and BC22 are held by
+test_json_io.py, test_migrated_group_b.py / _c.py / _d.py and test_parse_failures.py. Characterization pins (BC2,
+BC10 and BC11 first halves, BC16, BC19) say so: an existing or module test passes through the new call and cannot be
+red before green. Every other test asserts new behaviour and fails against the old code path. Nothing here touches a
+persona directory.
 """
 
 from __future__ import annotations
@@ -22,35 +25,6 @@ NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
 def _no_temp_left(directory: Path) -> None:
     left = [p.name for p in directory.iterdir() if ".tmp" in p.name or p.name.endswith(".new")]
     assert not left, left
-
-
-def test_bc1_two_threads_saving_one_file_leave_one_whole_file_and_no_temp(tmp_path: Path) -> None:
-    """Deterministic: no read-modify-write count (that races by design); every write is a whole file, the last
-    surviving file is exactly one of the written payloads, and no temp is left behind."""
-    from dataclasses import asdict
-
-    from brain.maker.charge import MakerCharge, _charge_path, save_charge
-
-    errors: list[BaseException] = []
-    written = {n: MakerCharge(charge=float(n), last_tick_ts=None, last_fire_ts=None, prior_soul_count=n) for n in (1, 2)}
-    barrier = threading.Barrier(2)
-
-    def run(n: int) -> None:
-        try:
-            barrier.wait()
-            for _ in range(50):
-                save_charge(tmp_path, written[n])
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(exc)
-
-    threads = [threading.Thread(target=run, args=(n,)) for n in written]
-    [t.start() for t in threads]
-    [t.join() for t in threads]
-    assert not errors
-    path = _charge_path(tmp_path)
-    assert json.loads(path.read_text()) in [asdict(v) for v in written.values()]
-    assert [p.name for p in path.parent.iterdir() if p.is_file()] == [path.name]
-    _no_temp_left(tmp_path)
 
 
 def test_bc2_characterization_fsync_is_preserved_per_site(tmp_path: Path, monkeypatch) -> None:
@@ -103,19 +77,6 @@ def test_bc4_a_nan_in_a_whole_file_state_raises_before_touching_the_file_and_an_
     assert json.loads(log.read_text())["arguments"] == {"x": None}
 
 
-def test_bc5_an_append_after_a_torn_tail_keeps_both_the_old_and_the_new_record(tmp_path: Path) -> None:
-    from brain.engines.consolidation import _archive_preimage
-    from brain.memory.store import Memory
-
-    mem = Memory.create_new(content="a", memory_type="conversation", domain="us", emotions={})
-    _archive_preimage(tmp_path, mem, "s1")
-    path = tmp_path / "consolidation_archive.jsonl"
-    path.write_bytes(path.read_bytes() + b'{"torn": ')  # a crash mid-append
-    _archive_preimage(tmp_path, mem, "s2")
-    good = [json.loads(line) for line in path.read_text().splitlines() if line.strip().endswith("}")]
-    assert [g["merged_from_candidate"] for g in good] == ["s1", "s2"]
-
-
 def test_bc6_a_best_effort_logger_on_an_unwritable_directory_warns_once_and_never_raises(tmp_path: Path, caplog) -> None:
     from brain.bridge.usage_log import log_usage
 
@@ -135,34 +96,6 @@ def test_bc7_a_fail_soft_reader_falls_back_on_invalid_utf8_with_one_warning(tmp_
         state, recovered = load_or_recover(tmp_path)
     assert recovered is True and state.current_gap is None
     assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
-
-
-def test_bc8_a_fail_loud_read_raises_an_error_that_is_both_an_oserror_and_a_valueerror(tmp_path: Path) -> None:
-    from brain.chat.reflection_gate import _load
-
-    (tmp_path / "reflection_state.json").write_bytes(b"{torn")
-    with pytest.raises(Exception) as exc:
-        _load(tmp_path)
-    assert isinstance(exc.value, OSError) and isinstance(exc.value, ValueError)
-
-
-def test_bc9_default_reader_keeps_its_fallback_and_raise_readers_still_raise(tmp_path: Path, caplog) -> None:
-    from brain.bridge.feed import build_monologue_entries
-    from brain.memory.pending import PendingQueue
-    from brain.soul.candidates import list_under_review_memory_ids
-
-    (tmp_path / "monologue_digest.jsonl").mkdir()
-    with caplog.at_level(logging.WARNING):
-        assert build_monologue_entries(tmp_path, limit=5) == []
-    assert caplog.records
-    q = PendingQueue(tmp_path)
-    q.path.mkdir()
-    with pytest.raises(OSError):
-        q.drain()  # truncating after a failed read would lose the queue
-    assert q.path.is_dir()
-    (tmp_path / "soul_candidates.jsonl").mkdir()
-    with pytest.raises(OSError):
-        list_under_review_memory_ids(tmp_path)  # the forgetting pass fails closed on this (#392)
 
 
 def test_bc10_characterization_heal_restores_from_bak1_and_the_live_path_is_never_absent(tmp_path: Path) -> None:
@@ -204,38 +137,6 @@ def test_bc11_a_save_with_verify_restores_bak1_and_waits_for_a_heal_in_progress(
         assert not done.wait(0.3), "a save must wait for the heal lock"
     t.join(5)
     assert done.is_set() and json.loads(path.read_text())
-
-
-def test_bc12_the_budget_files_are_restored_from_the_previous_save_and_still_fail_closed_without_one(tmp_path: Path) -> None:
-    from brain.attunement import budget
-
-    for _ in range(2):
-        budget.consume_call(tmp_path, now=NOW, cap=5)
-    path = budget._budget_path(tmp_path)
-    path.write_bytes(b"{torn")
-    assert budget.get_remaining(tmp_path, now=NOW, cap=5) == 4
-    path.write_bytes(b"{torn")
-    for bak in path.parent.glob("daily_budget.json.bak*"):
-        bak.unlink()
-    assert budget.get_remaining(tmp_path, now=NOW, cap=5) == 0
-
-
-def test_bc13_two_threads_creating_the_same_marker_file_one_wins(tmp_path: Path, monkeypatch) -> None:
-    from brain import app_config
-
-    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
-    results: list[str] = []
-
-    def create(name: str) -> None:
-        app_config.write_if_missing(name)
-        results.append(name)
-
-    threads = [threading.Thread(target=create, args=(n,)) for n in ("a", "b")]
-    [t.start() for t in threads]
-    [t.join() for t in threads]
-    chosen = json.loads((tmp_path / "app_config.json").read_text())["selected_persona"]
-    assert chosen in ("a", "b") and len(results) == 2  # whichever won, the other left it untouched
-    _no_temp_left(tmp_path)
 
 
 def test_bc14_an_own_copy_reader_survives_a_cut_multibyte_line_and_rotation_keeps_the_raw_bytes(tmp_path: Path) -> None:
@@ -309,30 +210,6 @@ def test_bc17_the_new_sidecars_are_ignored_by_the_sweep_and_the_walker(tmp_path:
     assert all(p.exists() for p in sidecars)
 
 
-def test_bc18_parse_failure_rotation_and_append_lose_no_row_under_contention(tmp_path: Path, monkeypatch) -> None:
-    from brain.health import parse_failures as pf
-
-    monkeypatch.setattr(pf, "MAX_BYTES", 2000)
-    threads = [
-        threading.Thread(
-            target=lambda k=k: [
-                pf.record_parse_failure(tmp_path, site=f"t{k}", raw="r" * 50, error="e") for _ in range(30)
-            ]
-        )
-        for k in range(2)
-    ]
-    [t.start() for t in threads]
-    [t.join() for t in threads]
-    import gzip
-
-    total = len((tmp_path / pf.PARSE_FAILURE_LOG).read_text().splitlines())
-    for arch in tmp_path.glob(f"{pf.PARSE_FAILURE_LOG}.*.gz"):
-        total += len(gzip.open(arch, "rt").read().splitlines())
-    assert total <= 60 and total >= 30  # rotation drops only archives beyond the keep window; no torn rows
-    for line in (tmp_path / pf.PARSE_FAILURE_LOG).read_text().splitlines():
-        json.loads(line)
-
-
 def test_bc19_characterization_the_deleted_names_are_undefined() -> None:
     import brain.health.attempt_heal as heal
     import brain.health.jsonl_reader as reader
@@ -364,26 +241,3 @@ def test_bc20_a_former_in_place_writer_is_atomic_and_rides_out_a_transient_permi
     assert load_tick_cadence(tmp_path)["last_run"] == later.isoformat()  # whole file, not torn
     _no_temp_left(tmp_path / "kindled_link")
 
-
-def test_bc21_a_content_mode_read_defaults_on_bad_bytes_but_an_unreadable_file_does_not_reset_the_counter(tmp_path: Path) -> None:
-    from brain.ingest.emotion_backfill import _consume_budget
-
-    path = tmp_path / "emotion_backfill_budget.json"
-    assert _consume_budget(tmp_path, now=NOW, cap=2)
-    path.write_bytes(b"\xff{")
-    assert _consume_budget(tmp_path, now=NOW, cap=2)  # corrupt: starts from an empty counter, as before
-    path.unlink()
-    path.mkdir()
-    with pytest.raises(OSError):
-        _consume_budget(tmp_path, now=NOW, cap=2)
-
-
-def test_bc22_recall_prune_still_counts_and_removes_lines_it_cannot_age(tmp_path: Path, caplog) -> None:
-    from brain.memory import recall_diagnostics as rd
-
-    path = tmp_path / "recall.jsonl"
-    fresh = json.dumps({"ts": NOW.isoformat()})
-    path.write_bytes(f"not json\n[1]\n{fresh}\n".encode())
-    with caplog.at_level(logging.WARNING):
-        assert rd.prune(path, window_days=30, now=NOW) == 2
-    assert path.read_text() == fresh + "\n" and "no readable ts" in caplog.text

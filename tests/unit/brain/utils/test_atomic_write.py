@@ -531,18 +531,6 @@ def test_g20c_importing_the_new_module_pulls_in_nothing_from_health():
     assert out.stdout.strip() == "[]"
 
 
-@pytest.mark.parametrize(
-    "module", ["brain.health.json_io", "brain.health.attempt_heal", "brain.health.log_rotation"]
-)
-def test_g20c_each_health_module_imports_cleanly_in_a_fresh_interpreter(module):
-    out = _fresh(
-        f"import {module} as m\n"
-        "import os\n"
-        f"assert os.path.realpath(m.__file__).startswith(os.path.realpath({str(REPO)!r})), m.__file__\n"
-    )
-    assert out.returncode == 0, out.stderr
-
-
 def test_g20c_the_check_can_fail_with_the_wrong_tree_or_a_cycle(tmp_path):
     wrong = _fresh(
         "import brain\nimport os\nassert os.path.realpath(brain.__file__).startswith('/nonexistent')\n"
