@@ -452,4 +452,3 @@ def test_a_run_that_is_not_abandoned_ends_the_loop_after_one_pass(monkeypatch, t
         _nothing_recorded(loop.store)
     finally:
         loop.finish(thread)
-

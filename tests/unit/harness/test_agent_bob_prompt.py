@@ -14,8 +14,7 @@ Also covers the parent-notify change (Agent-Bob SendMessage-to-orchestrator): G1
 SendMessage names the id), G2 (a SendMessage call at each of the four hand-back sites), G3 (concrete
 id-recovery from own agent-<id>.meta.json->parentAgentId when no id), G4 (notify OFF omits +
 behavior-identical render), G7 (no leftover placeholder), G8 (no stray/banned token), G9 (trip-site
-SendMessage precedes 'Then WAIT' -- the anti-deadlock oracle), G5c (never-wind-down + not-an-AI
-survive), and G6 backward-compat.
+SendMessage precedes 'Then WAIT' -- the anti-deadlock oracle), and G6 backward-compat.
 """
 
 from __future__ import annotations
@@ -319,4 +318,3 @@ def test_notify_trip_sendmessage_precedes_wait() -> None:
         assert ts.index("SendMessage") < ts.index("Then WAIT"), (
             "trip-site SendMessage must precede 'Then WAIT' (no wake-before-wait deadlock)"
         )
-

@@ -123,8 +123,6 @@ def test_c3_2_row_already_missing_at_read_is_skipped(tmp_path):
 
 
 # --------------------------------------------------------------------------- C3.3
-
-
 def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_path):
     """Exercising the recall-block hook enqueues a re-appraise request for
     BOTH a full-inject (full_ids) and a snippet (bump_targets) surfaced

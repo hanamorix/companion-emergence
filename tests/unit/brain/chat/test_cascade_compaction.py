@@ -23,7 +23,6 @@ Also maps to changes/compaction-defects-fix/1.5-criteria.md:
   C-B4a/b/c/f/g  tier-3 replacement/eviction, idempotence-preserved, the
            emergency_fold_24h backstop also evicts, and a degenerate
            all-evicted pass installs cleanly (Bug 4)
-  C-B4d    stale retain-forever docstrings replaced with the replacement model
   C14 (updated)  the two pre-existing gating tests below are updated to the
            owner's replacement model (retired "terminal, re-compacted forever")
 
