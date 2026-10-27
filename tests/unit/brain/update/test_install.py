@@ -57,6 +57,25 @@ BRAIN_OK = {
 }
 
 
+@pytest.fixture
+def fast_install(monkeypatch):
+    """For the tests about WHICH folder an install picks and what it records (stamps, ``current.json``, undo): the
+    brain wheel is unzipped into pip's ``--target`` instead of running pip, and the smoke interpreter is skipped. Real
+    pip and a real smoke interpreter run in ``test_apply_installs_only_the_diff_and_the_brain_then_activates``,
+    ``test_failed_smoke_leaves_the_active_overlay_untouched``, ``test_smoke_*`` and ``test_hash_mismatch_*``. These
+    tests install no dependencies, so a ``-r`` requirements install here is a mistake and fails loudly."""
+
+    def fake_run(cmd):
+        assert "-r" not in cmd, f"a dependency install needs real pip: {cmd}"
+        target = Path(cmd[cmd.index("--target") + 1])
+        with zipfile.ZipFile(cmd[-1]) as z:
+            z.extractall(target)
+
+    monkeypatch.setattr(install, "_pip", lambda: ["pip"])  # the real one needs this Python's bundled pip wheel
+    monkeypatch.setattr(install, "_run", fake_run)
+    monkeypatch.setattr(install, "_smoke", lambda folder, modules, site_dir=None: None)
+
+
 def test_parse_requirements_splits_options_and_pins():
     text = ("--index-url https://pypi.org/simple\n"
             "--extra-index-url https://download.pytorch.org/whl/cpu\n"
@@ -181,6 +200,7 @@ def test_a_bundle_without_the_hook_is_refused(tmp_path):
                              site_dir=site, root=tmp_path / "brain-overlay")
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_reapplying_the_same_commit_reuses_the_folder(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -199,6 +219,7 @@ def test_reapplying_the_same_commit_reuses_the_folder(tmp_path):
     assert marker.exists() and overlay.read_state(root)["active"]["commit"] == "a" * 40
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_reapplying_the_active_commit_keeps_its_confirmation(tmp_path):
     """#335: `nell update` of the commit already active reuses its folder; a build that
     has proven itself stays proven (and keeps its undo), so an unrelated later start
@@ -220,6 +241,7 @@ def test_reapplying_the_active_commit_keeps_its_confirmation(tmp_path):
     assert overlay.read_state(root)["active"] == again
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_failed_swap_keeps_the_active_overlay(tmp_path, monkeypatch):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -253,6 +275,7 @@ def test_failed_swap_keeps_the_active_overlay(tmp_path, monkeypatch):
     assert (root / active["dir"] / "brain").is_dir()
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_a_named_folder_with_a_bad_stamp_is_never_touched(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -279,6 +302,7 @@ def test_a_named_folder_with_a_bad_stamp_is_never_touched(tmp_path):
     assert state["previous"] == entry1
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_fresh_name_never_reuses_a_named_folder(tmp_path, monkeypatch):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -318,6 +342,7 @@ def test_fresh_name_never_reuses_a_named_folder(tmp_path, monkeypatch):
     assert state["previous"] == entry2
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_new_bundle_id_installs_into_a_new_folder(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -340,6 +365,7 @@ def test_new_bundle_id_installs_into_a_new_folder(tmp_path):
     assert overlay.read_state(root)["previous"] == entry1
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_leftover_unnamed_folder_is_replaced(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -363,6 +389,7 @@ def test_leftover_unnamed_folder_is_replaced(tmp_path):
     assert stamp["commit"] == "c" * 40 and stamp["bundle_id"] == "bundle-1"
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_stamp_only_unnamed_folder_is_reinstalled_not_reused(tmp_path):
     """A half-pruned folder (e.g. Windows .pyd locked during prune's rmtree) can keep
     a matching stamp.json with no brain/ under it. Reuse must require the folder be
@@ -391,6 +418,7 @@ def test_stamp_only_unnamed_folder_is_reinstalled_not_reused(tmp_path):
     assert overlay.read_state(root)["active"] == entry
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_redirected_name_that_exists_on_disk_unnamed_is_replaced(tmp_path):
     """Deferred T3: when the canonical name is already named by current.json and the
     counter picks an `-r<n>` name that happens to already exist on disk but isn't
@@ -419,6 +447,7 @@ def test_redirected_name_that_exists_on_disk_unnamed_is_replaced(tmp_path):
     assert not (stray / "junk").exists()
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
     """Spec gap: stamp.json gets an installed_at timestamp (diagnostic only); the
     entry stored in current.json carries no installed_at, so it round-trips
@@ -439,6 +468,7 @@ def test_stamp_carries_installed_at_but_current_json_entry_does_not(tmp_path):
 
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_install_marks_the_new_overlay_unconfirmed_with_its_undo(tmp_path):
     """#335: every install is unproven until the app sees it run; `undo` records how to
     back it out — revert when the release brain was running, rollback when an overlay was."""
@@ -461,6 +491,7 @@ def test_install_marks_the_new_overlay_unconfirmed_with_its_undo(tmp_path):
     assert "confirmed" not in stamp and "undo" not in stamp
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_an_active_overlay_for_another_bundle_does_not_make_undo_a_rollback(tmp_path):
     """That overlay never loads under this bundle, so the release brain was running."""
     finds = tmp_path / "finds"
@@ -495,6 +526,7 @@ def test_missing_requirements_file_is_an_update_error(tmp_path):
     assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_staging_rename_rides_out_a_transient_permission_error(tmp_path, monkeypatch):
     """#302: Windows AV scanning freshly written .pyd files can briefly refuse the
     staging → target rename; a bounded retry keeps the in-app update reliable."""
@@ -523,6 +555,7 @@ def test_staging_rename_rides_out_a_transient_permission_error(tmp_path, monkeyp
     assert overlay.read_state(root)["active"] == entry
 
 
+@pytest.mark.usefixtures("fast_install")
 def test_reapplying_a_commit_never_deletes_its_folder_while_a_process_uses_it(tmp_path):
     """#314 review (ToT): a bridge stays on A, updates go to B then C (prune keeps A
     only because it's in use), then A's commit is applied again. A's folder is not

@@ -664,6 +664,33 @@ def test_c21_a_raising_job_still_advances_its_cadence(tmp_path, stubs, monkeypat
     assert state.next_at == NOW + timedelta(seconds=interval)
 
 
+def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stubs, monkeypatch):
+    """The central function is the fault-isolation wrapper of deploy recalibration (the supervisor-thread test that
+    pinned "the loop survives" is gone). A raising run counts as a completed run (S44), the next due job still runs in
+    the same pass, and the next pass tries the raising job again while it stays due. (Here the due predicate is
+    stubbed true; in production a no-row raise is rate-limited by the job's own retry cadence file.)"""
+    persona_dir = _persona(tmp_path)
+    for k in stubs.work:
+        stubs.work[k] = False
+    stubs.work["deploy_recalibration"] = True
+    filename, _interval = INTERVAL_JOBS["daily_calibration"]
+    _seed(persona_dir, filename, NOW - timedelta(hours=1))  # the job after it in the S55 order is overdue
+    attempts: list[int] = []
+
+    def boom(*_a, **_k):
+        attempts.append(1)
+        raise RuntimeError("simulated deploy recalibration failure")
+
+    monkeypatch.setattr(supervisor, "_run_deploy_recalibration", boom)
+    jobs = [j for j in _real_jobs(persona_dir) if j.name in ("deploy_recalibration", "daily_calibration")]
+    decisions = _pass(persona_dir, jobs)
+    assert ("deploy_recalibration", "completed") in [(d.job, d.action) for d in decisions]
+    assert ("daily_calibration", "completed") in [(d.job, d.action) for d in decisions]
+    assert stubs.order == ["daily_calibration"]
+    _pass(persona_dir, jobs)
+    assert len(attempts) == 2, "a job that stays due is tried again at the next pass"
+
+
 def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch):
     """Self-model keeps its own cadence (S29): a reflect that raises is
     caught by its own handler and backs off (still an advance, S44)."""
@@ -1049,7 +1076,13 @@ def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", NO_INTERVAL_JOBS)
+# The jobs that run at every idle pass while their "has work" predicate holds: the interval-less jobs, and deploy
+# recalibration (due while the stored floor is stale). Kept apart from NO_INTERVAL_JOBS, which other tests read as the
+# set of jobs with no due-predicate of their own.
+_WORK_PREDICATE_JOBS = (*NO_INTERVAL_JOBS, "deploy_recalibration")
+
+
+@pytest.mark.parametrize("name", _WORK_PREDICATE_JOBS)
 def test_c39_no_interval_job_runs_every_idle_pass_while_it_has_work(tmp_path, stubs, name):
     persona_dir = _persona(tmp_path)
     for k in stubs.work:
@@ -1455,13 +1488,16 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
     old = create_session(persona_dir.name)
     old.created_at = datetime.now(UTC) - timedelta(hours=1)
     stop = threading.Event()
+    ticks: list[int] = []  # one per supervisor pass (EventBus drops events when no event loop is bound)
     t = threading.Thread(
         target=supervisor.run_folded,
         args=(stop,),
         kwargs={
             "persona_dir": persona_dir,
             "provider": FakeProvider(),
-            "event_bus": EventBus(),
+            "event_bus": SimpleNamespace(
+                publish=lambda event: ticks.append(1) if event.get("type") == "supervisor_tick" else None
+            ),
             "tick_interval_s": 0.05,
             "heartbeat_interval_s": None,
             "soul_review_interval_s": None,
@@ -1491,7 +1527,11 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
             _time.sleep(0.02)
         assert all(s.session_id != old.session_id for s in all_sessions()), "pre-start session kept"
         new = create_session(persona_dir.name)  # opened after bridge start
-        _time.sleep(0.3)  # several 0.05 s passes
+        after = len(ticks)
+        deadline = _time.monotonic() + 10.0
+        while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after it was opened
+            _time.sleep(0.02)
+        assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
         assert any(s.session_id == new.session_id for s in all_sessions()), (
             "post-start session pruned"
         )

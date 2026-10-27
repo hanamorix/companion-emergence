@@ -13,14 +13,15 @@ gap — an out-of-cycle, startup-fired, idempotent-by-construction call to
 F2a's already-built `floor_calibration.derive_and_persist_floor`.
 
 Mirrors `test_calibration_cadence.py`'s coverage style for the sibling
-`_run_calibration_tick` (direct-function tests for the mechanism, a handful
-of `run_folded`-level tests for the startup wiring + fault isolation).
+`_run_calibration_tick` (direct-function tests for the mechanism). The job's place in the central pass (runs when due,
+not when fresh, a raising run does not stop the pass) is tested in `test_central_cadence.py`
+(`test_c15a_all_17_due_run_in_s55_order_real_table`, `test_c39_..._while_it_has_work[deploy_recalibration]`,
+`test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass`).
 """
 from __future__ import annotations
 
 import tempfile
 import threading
-import time as _time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -252,9 +253,9 @@ def test_deploy_recalibration_does_not_crash_on_a_derivation_failure(monkeypatch
     """Fault isolation (§6, mirroring the daily tick's own floor-derivation
     fault isolation): a `derive_and_persist_floor` failure must not
     propagate out of `_run_deploy_recalibration_check` itself when it
-    would otherwise crash the caller — verified at the `run_folded` level
-    below (that's where this function's own fault-isolation wrapper
-    lives); THIS test pins that the underlying derivation failure is a
+    would otherwise crash the caller — verified at the central-pass level
+    (`test_central_cadence.py::test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass`: the central
+    function's own guard is the fault-isolation wrapper); THIS test pins that the underlying derivation failure is a
     plain exception (no special swallowing inside the function) so the
     caller's try/except is what's actually doing the isolating, not an
     accidental double-catch that would make that wrapper untested."""
@@ -279,7 +280,7 @@ def test_deploy_recalibration_does_not_crash_on_a_derivation_failure(monkeypatch
         else:
             raise AssertionError(
                 "expected the raw derivation failure to propagate out of this function — "
-                "fault isolation belongs to the run_folded call site, see the wiring test below"
+                "fault isolation belongs to the central pass, see test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass"
             )
 
 
@@ -473,40 +474,6 @@ def test_deploy_recalibration_gate_retries_after_the_retry_window_elapses(monkey
 # ---------------------------------------------------------------------------
 
 
-def _run_folded_in_thread(persona_dir: Path, stop: threading.Event, **overrides):
-    from brain.bridge.supervisor import run_folded
-
-    kwargs = {
-        "persona_dir": persona_dir,
-        "provider": FakeProvider(),
-        "event_bus": EventBus(),
-        "tick_interval_s": 0.05,
-        "heartbeat_interval_s": None,
-        "maker_enabled": False,
-        "notes_enabled": False,
-        "kindled_link_enabled": False,
-    }
-    kwargs.update(overrides)
-    t = threading.Thread(target=run_folded, args=(stop,), kwargs=kwargs, daemon=True)
-    t.start()
-    return t
-
-
-# A hang guard, not a pacing delay: the wait returns the moment the condition holds. The first supervisor pass and the stop
-# after it take well under a second normally, but several seconds when the Windows CI runner stalls (an unrelated test
-# slowed 20 to 40 times in the same run), and 5 s then failed a correct run.
-_HANG_GUARD_S = 30.0
-
-
-def _wait_for(pred, timeout: float = _HANG_GUARD_S) -> bool:
-    deadline = _time.monotonic() + timeout
-    while _time.monotonic() < deadline:
-        if pred():
-            return True
-        _time.sleep(0.02)
-    return pred()
-
-
 def test_run_folded_never_runs_deploy_recalibration_at_startup(tmp_path: Path) -> None:
     """C26/C38: a supervisor that stops before its first loop pass neither
     probes nor runs the deploy recalibration, even when the floor is stale."""
@@ -530,56 +497,6 @@ def test_run_folded_never_runs_deploy_recalibration_at_startup(tmp_path: Path) -
         )
 
     due.assert_not_called()
-    run.assert_not_called()
-
-
-def test_run_folded_runs_deploy_recalibration_at_the_first_idle_pass_when_due(
-    tmp_path: Path,
-) -> None:
-    """C38: with the floor stale, the job runs at the first lull — the
-    bridge-start lull included (chat is idle: no message this test)."""
-    persona_dir = _persona_dir(tmp_path)
-    stop = threading.Event()
-    runs: list[Path] = []
-
-    with (
-        patch("brain.bridge.supervisor._deploy_recalibration_due", return_value=True),
-        patch(
-            "brain.bridge.supervisor._run_deploy_recalibration",
-            side_effect=lambda pd: runs.append(pd),
-        ),
-    ):
-        t = _run_folded_in_thread(persona_dir, stop)
-        try:
-            assert _wait_for(lambda: len(runs) >= 1), "deploy recalibration never ran"
-        finally:
-            stop.set()
-            t.join(timeout=_HANG_GUARD_S)
-    assert not t.is_alive()
-    assert runs[0] == persona_dir
-
-
-def test_run_folded_does_not_run_deploy_recalibration_when_floor_fresh(tmp_path: Path) -> None:
-    """C38: with the floor fresh the job is not due — probed, never run."""
-    persona_dir = _persona_dir(tmp_path)
-    stop = threading.Event()
-    probes: list[int] = []
-
-    def _not_due(_pd):
-        probes.append(1)
-        return False
-
-    with (
-        patch("brain.bridge.supervisor._deploy_recalibration_due", side_effect=_not_due),
-        patch("brain.bridge.supervisor._run_deploy_recalibration") as run,
-    ):
-        t = _run_folded_in_thread(persona_dir, stop)
-        try:
-            assert _wait_for(lambda: len(probes) >= 2), "due probe never asked"
-        finally:
-            stop.set()
-            t.join(timeout=_HANG_GUARD_S)
-    assert not t.is_alive()
     run.assert_not_called()
 
 
@@ -611,31 +528,3 @@ def test_run_folded_skips_deploy_recalibration_when_calibration_disabled(tmp_pat
     names = [j.name for j in jobs]
     assert "deploy_recalibration" not in names
     assert "daily_calibration" not in names
-
-
-def test_run_folded_deploy_recalibration_failure_does_not_block_periodic_loop(
-    tmp_path: Path,
-) -> None:
-    """Fault isolation: with the job raising on every run, the supervisor
-    thread keeps looping (it retries at later passes: a raise is a completed
-    run for cadence purposes, S44, but this job has no cadence of its own —
-    its staleness predicate stays true) and exits cleanly on stop."""
-    persona_dir = _persona_dir(tmp_path)
-    stop = threading.Event()
-    attempts: list[int] = []
-
-    def boom(pd):
-        attempts.append(1)
-        raise RuntimeError("simulated deploy recalibration failure")
-
-    with (
-        patch("brain.bridge.supervisor._deploy_recalibration_due", return_value=True),
-        patch("brain.bridge.supervisor._run_deploy_recalibration", side_effect=boom),
-    ):
-        t = _run_folded_in_thread(persona_dir, stop)
-        try:
-            assert _wait_for(lambda: len(attempts) >= 2), "loop died after a failing run"
-        finally:
-            stop.set()
-            t.join(timeout=_HANG_GUARD_S)
-    assert not t.is_alive(), "supervisor loop did not exit after stop_event"
