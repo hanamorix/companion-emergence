@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import traceback
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
@@ -169,26 +170,91 @@ def _reset_cli_throttle() -> Iterator[None]:
     model_error.reset()
 
 
+# --- #375 / #540: the cwd-queue guard, by attribution ------------------------------------------------------------
+#
+# A test that grows ``pending_candidates.jsonl`` in the cwd it started in must error. The repo root is shared by every
+# pytest-xdist worker, so comparing the file's size before and after a test blames whichever test happens to be running
+# when ANOTHER worker's test leaks. An audit hook (PEP 578) sees only the events of its own process, so a write is
+# attributed to the test that was running in the process that wrote it. It is installed once, when this module is
+# imported, and cannot be removed; while no test has a guard registered it returns at once.
+
+_QUEUE_FILE = pending._QUEUE_FILENAME
+_QUEUE_GUARDS: list[tuple[str, list[str]]] = []  # (directory of the guarded queue, offences of the running test)
+_WRITE_FLAGS = sum(getattr(os, name, 0) for name in ("O_WRONLY", "O_RDWR", "O_APPEND", "O_CREAT", "O_TRUNC"))
+
+
+def _queue_offence(event: str, path: str) -> str:
+    """The event and the writer's call site: the five innermost frames outside conftest files, plus the innermost
+    frame of a test module when it is deeper in the stack than those (so the test's own line is never lost)."""
+    try:
+        frames = [f for f in traceback.extract_stack() if Path(f.filename).name != "conftest.py"]
+        shown = frames[-5:]
+        own = next((f for f in reversed(frames) if Path(f.filename).name.startswith("test_")), None)
+        if own is not None and own not in shown:
+            shown.insert(0, own)
+        return f"{event} {path} <- " + " <- ".join(f"{Path(f.filename).name}:{f.lineno} in {f.name}" for f in reversed(shown))
+    except Exception:  # noqa: BLE001 - the offence must be recorded even when its call site cannot be built
+        return f"{event} {path}"
+
+
+def _queue_audit_hook(event: str, args: tuple) -> None:
+    try:
+        if not _QUEUE_GUARDS:
+            return
+        if event == "open":
+            if not args[2] & _WRITE_FLAGS:
+                return
+            candidates = [(args[0], None)]
+        elif event == "os.rename":
+            # an atomic-replace writer targets the queue as the destination; moving it away is a change too
+            candidates = [(args[0], args[2]), (args[1], args[3])]
+        elif event in ("os.remove", "os.truncate"):
+            candidates = [(args[0], args[1] if event == "os.remove" else None)]
+        else:
+            return
+        for candidate, dir_fd in candidates:
+            if isinstance(candidate, int) or dir_fd not in (None, -1):
+                continue  # a descriptor, or a name relative to a directory descriptor (shutil.rmtree): not resolvable here
+            path = os.fsdecode(candidate)
+            if os.path.normcase(os.path.basename(path)) != os.path.normcase(_QUEUE_FILE):
+                continue
+            for directory, offences in tuple(_QUEUE_GUARDS):
+                try:
+                    same = os.path.samefile(os.path.dirname(path) or ".", directory)
+                except OSError:
+                    same = False
+                if same:
+                    offences.append(_queue_offence(event, path))
+    except Exception:  # noqa: BLE001 - an audit hook that raises would fail the code under test, not report it
+        return
+
+
+sys.addaudithook(_queue_audit_hook)
+
+
 @pytest.fixture(autouse=True)
 def _no_cwd_queue_leak() -> Iterator[None]:
-    """Error a test that grows ``pending_candidates.jsonl`` in the cwd it started in (#375).
+    """Error a test that writes ``pending_candidates.jsonl`` in the cwd it started in (#375).
 
     An in-memory MemoryStore used to report the working directory as its persona dir, so 17
     tests appended gated candidates to the repo root on every run, invisibly (it is gitignored)
-    and with later tests able to read the debris back. The path is fixed at setup, so a test
-    that chdirs elsewhere still has its original cwd checked; a file that already exists is
-    fine as long as it does not grow.
+    and with later tests able to read the debris back. The directory is fixed at setup, so a test
+    that chdirs elsewhere still has its original cwd checked; a file that already exists is fine
+    as long as nothing writes, replaces, truncates, removes or moves it. The failure lands at
+    teardown (an immediate raise would be swallowed by code that catches errors) and names the
+    writer's call site. Only writes made by THIS process count: another xdist worker's leak is
+    that worker's test's failure, and a child process a test spawns is not observed.
     """
-    queue = Path.cwd() / pending._QUEUE_FILENAME
-
-    def _size() -> int | None:
-        return queue.stat().st_size if queue.exists() else None
-
-    before = _size()
-    yield
-    after = _size()
-    assert after == before, (
-        f"this test wrote to {queue} ({before} -> {after} bytes): a store with no persona "
+    directory = os.getcwd()
+    offences: list[str] = []
+    record = (directory, offences)
+    _QUEUE_GUARDS.append(record)
+    try:
+        yield
+    finally:
+        _QUEUE_GUARDS[:] = [guard for guard in _QUEUE_GUARDS if guard is not record]  # by identity: equal records may nest
+    assert not offences, (
+        f"this test wrote to {Path(directory) / _QUEUE_FILE}: " + "; ".join(offences) + ". A store with no persona "
         "directory must not enqueue; give it a file-backed store (tmp_path / 'memories.db')"
     )
 
@@ -555,6 +621,23 @@ def _tunables_registry_restore() -> Iterator[None]:
         tunables._descriptions.clear()
         tunables._descriptions.update(saved[1])
         tunables._descriptions.update(kept_desc)
+
+
+@pytest.fixture(autouse=True)
+def _vocabulary_registry_restore() -> Iterator[None]:
+    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary) or trigger the
+    warn-once log of an unregistered emotion; neither may reach the next test, whatever worker runs it (#540). Restored IN
+    PLACE (clear + update), never rebound, like ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the
+    dict and set objects themselves."""
+    from brain.emotion import aggregate, vocabulary
+
+    saved_registry = dict(vocabulary._REGISTRY)
+    saved_warned = set(aggregate._warned_unregistered)
+    yield
+    vocabulary._REGISTRY.clear()
+    vocabulary._REGISTRY.update(saved_registry)
+    aggregate._warned_unregistered.clear()
+    aggregate._warned_unregistered.update(saved_warned)
 
 
 @pytest.fixture(autouse=True)
