@@ -294,7 +294,11 @@ def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
     )
     try:
         # cmd_run prints this line just before it blocks on the lock the running bridge holds.
-        _until(lambda: "waiting for the running bridge" in waiter_err.read_text(), timeout=60)
+        def _waiter_waits() -> bool:
+            assert waiter.poll() is None, f"the second run ended on its own: {waiter_err.read_text()}"
+            return "waiting for the running bridge" in waiter_err.read_text()
+
+        _until(_waiter_waits, timeout=60)
         time.sleep(0.3)  # and it keeps waiting rather than exiting
         assert waiter.poll() is None
         assert b.post("/supervisor/shutdown", {"reason": "app_restart"}).status_code == 202

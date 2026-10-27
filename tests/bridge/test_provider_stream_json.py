@@ -350,7 +350,6 @@ def _stall_proc(lines):
     proc.returncode = 0
     proc.terminate = MagicMock(side_effect=closed.set)
     proc.kill = MagicMock(side_effect=closed.set)
-    proc.closed = closed
     proc.stderr = MagicMock()
     proc.stderr.read.return_value = ""
     return proc

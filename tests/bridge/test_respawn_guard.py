@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,7 +96,10 @@ def test_a_respawn_already_waiting_for_the_lock_checks_again_after_it(pd, gone_p
         out: dict = {}
         t = threading.Thread(target=lambda: out.setdefault("rc", daemon.cmd_run(_run_args("systemd"))), daemon=True)
         t.start()
-        assert waiting.wait(30), "cmd_run never reached the lock wait"
+        deadline = time.monotonic() + 30
+        while not waiting.wait(0.02):
+            assert t.is_alive(), f"cmd_run returned {out.get('rc')} instead of waiting for the lock"
+            assert time.monotonic() < deadline, "cmd_run never reached the lock wait"
         t.join(0.3)
         assert t.is_alive()  # waiting for the lock
         it = _intent(pd, pid=gone_pid, token=f"linux:{pi.boot_id()}:{gone_pid}:1")
