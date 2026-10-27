@@ -26,3 +26,62 @@ def write_snapshot(path: Path, data: dict[str, str]) -> None:
     """Write ``data`` as sorted, indented utf-8 JSON with ``\\n`` line ends on every platform."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+
+
+# --- text sections: a snapshot of long texts that stays readable in a git diff ---------------------------------------------
+
+_BEGIN = "@@@ begin "
+_END = "@@@ end "
+_LINE = "|"
+
+
+def read_sections(path: Path) -> dict[str, str] | None:
+    """The approved texts of a sections file, or ``None`` when there is no file. A malformed file raises ``ValueError``.
+
+    The file is a free header, then sections ``@@@ begin <key>`` ... ``@@@ end <key>`` whose lines each start with ``|``;
+    the text is those lines (the ``|`` removed) joined by ``\\n``, so a trailing newline is a last empty ``|`` line.
+    """
+    if not path.is_file():
+        return None
+    out: dict[str, str] = {}
+    key: str | None = None
+    lines: list[str] = []
+    raw = path.read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+    if raw and raw[-1] == "":
+        raw.pop()
+    for n, line in enumerate(raw, 1):  # not str.splitlines(): that also splits on U+2028 and the like inside a text
+        if key is None:
+            if line.startswith(_BEGIN):
+                key = line[len(_BEGIN) :]
+                if key in out:
+                    raise ValueError(f"{path}:{n}: duplicate section {key!r}")
+                lines = []
+            elif line.startswith(_END) or line.startswith(_LINE):
+                raise ValueError(f"{path}:{n}: text outside a section")
+            continue
+        if line == _END + key:
+            out[key] = "\n".join(lines)
+            key = None
+        elif line.startswith(_LINE):
+            lines.append(line[len(_LINE) :])
+        else:
+            raise ValueError(f"{path}:{n}: a line of section {key!r} does not start with {_LINE!r}")
+    if key is not None:
+        raise ValueError(f"{path}: section {key!r} is not closed")
+    return out
+
+
+def write_sections(path: Path, texts: dict[str, str], header: str = "") -> None:
+    """Write ``texts`` as sections (sorted by key) with ``\\n`` line ends. Refuses what an editor or git would change:
+    a carriage return, a space or tab at the end of a line, a key with a newline."""
+    parts = [header.rstrip("\n") + "\n\n"] if header else []
+    for key in sorted(texts):
+        text = texts[key]
+        if "\n" in key or "\r" in key or "\r" in text:
+            raise ValueError(f"section {key!r}: a carriage return or a newline in the key cannot be stored")
+        for line in text.split("\n"):
+            if line != line.rstrip(" \t"):
+                raise ValueError(f"section {key!r}: a line ends with a space or tab ({line[-20:]!r}), which editors strip")
+        parts.append(f"{_BEGIN}{key}\n" + "".join(f"{_LINE}{line}\n" for line in text.split("\n")) + f"{_END}{key}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(parts), encoding="utf-8", newline="\n")
