@@ -19,32 +19,6 @@ def test_lull_key_is_registered_in_tunables_py_itself() -> None:
         tunables._reset_for_tests()
 
 
-def test_registration_call_site_is_in_tunables_module() -> None:
-    """AST check: the `register("chat.idle_lull_seconds", ...)` call itself
-    lives in brain/tunables.py (not re-exported from elsewhere pretending to
-    register it locally)."""
-    src = tunables.__file__ and __import__("pathlib").Path(tunables.__file__).read_text(
-        encoding="utf-8"
-    )
-    tree = ast.parse(src)
-    found = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else (
-            func.id if isinstance(func, ast.Name) else None
-        )
-        if name != "register":
-            continue
-        if any(
-            isinstance(a, ast.Constant) and a.value == "chat.idle_lull_seconds"
-            for a in node.args
-        ):
-            found = True
-    assert found, "chat.idle_lull_seconds must be registered in tunables.py"
-
-
 def test_module_docstring_fence_names_the_one_allowed_key() -> None:
     doc = tunables.__doc__ or ""
     assert "chat.idle_lull_seconds" in doc
@@ -53,14 +27,13 @@ def test_module_docstring_fence_names_the_one_allowed_key() -> None:
 
 def test_no_second_ops_timing_key_registered_in_tunables_py() -> None:
     """The fence's own claim ("no other ops-timing key may be registered
-    here") checked against the actual file: every tunables.register(...)
-    call site in tunables.py itself is either the lull key or the pre-
-    existing throttle.max_concurrent_background cap (a concurrency cap, not
-    a TIMING value — explicitly carved out by 2-plan §3.1: "it is not an
-    idle value"). Registrations made by OTHER modules (cli_throttle.py,
-    pass2_queue.py before this increment, provider.py's unrelated streaming
-    timeout, etc.) are out of scope for this specific fence, which only
-    binds tunables.py's own module."""
+    here") checked against the actual file: the only tunables.register(...)
+    call site in tunables.py itself is the lull key (which also proves the
+    lull key is registered there, by a call in this module). Registrations
+    made by OTHER modules (cli_throttle.py, pass2_queue.py before this
+    increment, provider.py's unrelated streaming timeout, etc.) are out of
+    scope for this specific fence, which only binds tunables.py's own
+    module."""
     import inspect
 
     src = inspect.getsource(tunables)

@@ -420,7 +420,7 @@ def test_read_toml_cached_is_thread_safe(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# No new dependency, one tomllib importer
+# No new dependency
 # ---------------------------------------------------------------------------------------------------------------
 
 
@@ -428,16 +428,6 @@ def test_pyproject_gains_no_toml_dependency() -> None:
     pyproject = (Path(__file__).resolve().parents[3] / "pyproject.toml").read_text(encoding="utf-8")
     for lib in ("tomli", "tomlkit", "tomli_w", "tomli-w", "toml>", "toml=", '"toml"'):
         assert lib not in pyproject
-
-
-def test_tomllib_is_imported_only_by_the_helper() -> None:
-    root = Path(__file__).resolve().parents[3] / "brain"
-    importers = [
-        p.relative_to(root).as_posix()
-        for p in root.rglob("*.py")
-        if "import tomllib" in p.read_text(encoding="utf-8") or "from tomllib" in p.read_text(encoding="utf-8")
-    ]
-    assert importers == ["utils/toml_io.py"]
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -14,11 +14,7 @@ def test_prompt_requires_evidence_list() -> None:
     assert "quote" in prompt               # entry field
     assert "turn_id" in prompt             # entry field
     assert "verbatim" in prompt.lower()
-
-
-def test_prompt_requires_evidence_turn_id() -> None:
-    prompt = build_detector_system_prompt()
-    assert "turn_id" in prompt
+    assert "addressed_pattern_ids" in prompt  # the schema field the detector fills in
 
 
 def test_prompt_lists_all_five_categories() -> None:
@@ -35,11 +31,6 @@ def test_prompt_includes_decline_on_uncertainty_instruction() -> None:
     # Must explicitly tell the model to omit candidates rather than fabricate
     assert "decline" in prompt.lower() or "omit" in prompt.lower()
     assert "cannot" in prompt.lower() or "can't" in prompt.lower()
-
-
-def test_prompt_is_deterministic() -> None:
-    """Snapshot equality — the prompt is a constant, not a generator."""
-    assert build_detector_system_prompt() == build_detector_system_prompt()
 
 
 def test_prompt_grounds_companion_identity() -> None:

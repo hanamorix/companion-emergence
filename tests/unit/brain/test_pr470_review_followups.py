@@ -446,7 +446,10 @@ def test_find_json_object_block_gives_the_same_result_as_before_on_longer_random
             assert find_json_object_block(text, key) == _reference_find_json_object_block(text, key), (text, key)
 
 
-@pytest.mark.parametrize("unit", ["{", "{ ", 'x {"', "{[", '{"a": {', 'say { "'])
+# Two units stand for the two paths of the scan (`_CAN_OPEN_OBJECT` / `_OBJECT_START` in llm_output.py): a brace that cannot
+# open an object (no skip, one table lookup per start: the quadratic one) and one that opens like `{ "` and never closes (the
+# rest of the text is skipped; guarded by the oracle comparison above, which timing cannot tell apart).
+@pytest.mark.parametrize("unit", ["{ ", 'say { "'])
 def test_find_json_object_block_is_linear_on_a_reply_of_many_unclosed_braces(unit):
     # S2 of the round-4 review: each `{` that failed to decode re-scanned to the end of the text, so 8000 braces took 5 s (the
     # classifier is exposed to a degenerate repetition reply). Growth, not a wall-clock ceiling: four times the text takes

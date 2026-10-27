@@ -22,18 +22,11 @@ _BRAIN_ROOT = Path(brain.__file__).parent
 # ── C4 — MCP-only posture preserved ────────────────────────────────────────
 
 
-def test_read_stays_in_disallowed_builtins() -> None:
-    from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED
+def test_apply_lean_flags_emits_read_in_disallowed_set() -> None:
+    from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED, _apply_lean_flags
 
     assert "Read" in _BUILTIN_TOOLS_DISALLOWED
-    # Shown-able-to-fail: the assertion below fails if Read is removed from the
-    # tuple (verify by a temporary local mutation of _BUILTIN_TOOLS_DISALLOWED).
     assert isinstance(_BUILTIN_TOOLS_DISALLOWED, tuple)
-
-
-def test_apply_lean_flags_emits_read_in_disallowed_set() -> None:
-    from brain.bridge.provider import _apply_lean_flags
-
     cmd: list[str] = []
     _apply_lean_flags(cmd)
     assert "--disallowedTools" in cmd
