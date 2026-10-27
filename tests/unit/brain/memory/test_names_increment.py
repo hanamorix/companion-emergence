@@ -162,7 +162,9 @@ def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
     # Only ratios: absolute wall-clock bounds fail on a busy parallel worker without a regression. The base matcher took
     # 6.0-9.5 s per call here and its cost grows faster than the list (it joins a window for every distinct name length:
     # about 3.2x when the list doubles), which the list-doubling ratio below catches. The ratios stay tight: a bound of
-    # 4x on a doubling could never fail for a quadratic-in-message matcher (4x at most), and 1.5x holds under load.
+    # 4x on a doubling could never fail for a quadratic-in-message matcher (4x at most). The small additive floors carry
+    # the pass on a loaded host (a warm match here takes a few ms), so only a regression costing well above about 10 ms
+    # is caught, which the base matcher (seconds) and any quadratic shape are.
     names, text = _large(shape, 399, 6000)
     known = kn.KnownNames.from_names(names)
     names2, _ = _large(shape, 798, 6000)
