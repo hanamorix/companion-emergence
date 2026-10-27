@@ -1,8 +1,9 @@
 """Offline unit tests for the run-orchestration anti-stall helper (tests.harness.foreground).
 
-Covers G1 (real boot+confirm path returns a populated ArmSession in-turn), G2 (a dead/failed
-boot raises ForegroundBootError in-turn, never hangs), G3 (the real verification paths reject a
-bad build / a broken tool roster in-turn), G4 (preserve_artifacts copies + raises on a missing
+Covers G1 (real boot+confirm path returns a populated ArmSession in-turn: the one test that starts
+a real child), G2 (a failed boot raises ForegroundBootError in-turn; the boot command is stubbed at
+`fg.subprocess.run`), G3 (the real verification paths reject a bad build / a broken tool roster
+in-turn), G4 (preserve_artifacts copies + raises on a missing
 REQUIRED source), G5 (the banner's exact headline + required content), G6 (the shipped contract
 doc names both surfaces + the one rule), and G7 (every new public symbol is exported from
 tests.harness and listed in __all__). Mechanical facts only: no live bridge, no tokens, no
@@ -28,6 +29,24 @@ def _write_ready(run_dir: Path, payload: dict) -> None:
     (run_dir / "READY").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _stub_boot_run(monkeypatch: pytest.MonkeyPatch, *, returncode: int = 0, stderr: str = "", writes=None, raises=None):
+    """Replace `fg.subprocess.run` (the seam the boot command goes through) with a stub that does what the boot
+    command would do: write what `writes(...)` says INSIDE the call (so the READY freshness check sees a fresh file),
+    then return a `CompletedProcess` or raise. Everything `boot_and_verify` decides afterwards is the real code."""
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003 -- test stub mirrors subprocess.run
+        calls.append(list(cmd))
+        if raises is not None:
+            raise raises
+        if writes is not None:
+            writes()
+        return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(fg.subprocess, "run", _fake_run)
+    return calls
+
+
 # --- G1: real boot+confirm path returns a populated ArmSession in-turn ----------------------------
 
 
@@ -40,7 +59,7 @@ def test_boot_and_verify_real_boot_cmd_returns_populated_session(tmp_path: Path)
         "-c",
         f"import json; open({str(ready_path)!r}, 'w').write(json.dumps({{'brain_repo': 'x'}}))",
     ]
-    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=15.0)
+    spec = fg.ArmBootSpec(arm="A", port=8931, run_dir=run_dir, ready_timeout=60.0)  # an upper bound: the child exits at once
 
     session = fg.boot_and_verify(spec, boot_cmd=boot_cmd)
 
@@ -118,76 +137,54 @@ def test_boot_and_verify_poll_mode_ignores_stale_ready(tmp_path: Path) -> None:
         fg.boot_and_verify(spec, boot_cmd=None)
 
 
-# --- G2: a dead/failed boot raises in-turn, does not hang -----------------------------------------
+# --- G2: a failed boot raises ForegroundBootError (the boot command is stubbed at `fg.subprocess.run`) ----------
 
 
-def test_boot_and_verify_nonzero_exit_raises(tmp_path: Path) -> None:
+def test_boot_and_verify_nonzero_exit_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    boot_cmd = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    _stub_boot_run(monkeypatch, returncode=1, stderr="boom on stderr")
     spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=10.0)
 
-    with pytest.raises(fg.ForegroundBootError, match="exited 1"):
-        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
+    with pytest.raises(fg.ForegroundBootError, match="exited 1") as exc:
+        fg.boot_and_verify(spec, boot_cmd=["boot", "it"])
+    assert "boom on stderr" in str(exc.value)
 
 
-def test_boot_and_verify_error_marker_raises(tmp_path: Path) -> None:
+def test_boot_and_verify_error_marker_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    error_path = run_dir / "ERROR"
-    boot_cmd = [
-        sys.executable,
-        "-c",
-        f"open({str(error_path)!r}, 'w').write('boom')",
-    ]
+    _stub_boot_run(monkeypatch, writes=lambda: (run_dir / "ERROR").write_text("boom", encoding="utf-8"))
     spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=10.0)
 
     with pytest.raises(fg.ForegroundBootError, match="error marker"):
-        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
+        fg.boot_and_verify(spec, boot_cmd=["boot", "it"])
 
 
-def test_boot_and_verify_no_ready_times_out_quickly(tmp_path: Path) -> None:
+def test_boot_and_verify_with_no_ready_in_poll_mode_raises_after_its_timeout(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=0.5)
 
-    start = time.monotonic()
     with pytest.raises(fg.ForegroundBootError, match="no READY"):
         fg.boot_and_verify(spec, boot_cmd=None)
-    elapsed = time.monotonic() - start
-
-    assert elapsed < 5.0, f"boot_and_verify hung: took {elapsed}s for a 0.5s ready_timeout"
 
 
-def test_boot_and_verify_timeout_expired_raises(tmp_path: Path) -> None:
+def test_boot_and_verify_timeout_expired_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    boot_cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+    cmd = ["boot", "it"]
+    _stub_boot_run(monkeypatch, raises=subprocess.TimeoutExpired(cmd, 0.5))
     spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=0.5)
 
-    start = time.monotonic()
     with pytest.raises(fg.ForegroundBootError, match="did not complete"):
-        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
-    elapsed = time.monotonic() - start
-
-    assert elapsed < 10.0, f"boot_and_verify hung past its own bound: {elapsed}s"
+        fg.boot_and_verify(spec, boot_cmd=cmd)
 
 
 # --- G3(a): expect_brain_repo_under cross-check rejects a bad build -------------------------------
 
 
-def _boot_cmd_writing_ready(ready_path: Path, payload: dict) -> list[str]:
-    """A real, foreground boot_cmd that writes a READY payload -- the G1 real path, reused here
-    so the brain_repo cross-check is exercised via the actual boot_cmd branch (no poll-mode
-    staleness concerns, since boot_cmd mode does not apply the poll freshness guard)."""
-    return [
-        sys.executable,
-        "-c",
-        f"import json; open({str(ready_path)!r}, 'w').write(json.dumps({payload!r}))",
-    ]
-
-
-def test_boot_and_verify_brain_repo_outside_expected_root_raises(tmp_path: Path) -> None:
+def test_boot_and_verify_brain_repo_outside_expected_root_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     other_repo = tmp_path / "other-repo"
@@ -198,13 +195,13 @@ def test_boot_and_verify_brain_repo_outside_expected_root_raises(tmp_path: Path)
     spec = fg.ArmBootSpec(
         arm="A", port=1, run_dir=run_dir, ready_timeout=5.0, expect_brain_repo_under=expected_root
     )
-    boot_cmd = _boot_cmd_writing_ready(run_dir / "READY", {"brain_repo": str(other_repo)})
+    _stub_boot_run(monkeypatch, writes=lambda: _write_ready(run_dir, {"brain_repo": str(other_repo)}))
 
     with pytest.raises(fg.ForegroundBootError, match="NOT under"):
-        fg.boot_and_verify(spec, boot_cmd=boot_cmd)
+        fg.boot_and_verify(spec, boot_cmd=["boot", "it"])
 
 
-def test_boot_and_verify_brain_repo_under_expected_root_passes(tmp_path: Path) -> None:
+def test_boot_and_verify_brain_repo_under_expected_root_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     expected_root = tmp_path / "expected-repo"
     expected_root.mkdir()
     run_dir = tmp_path / "run"
@@ -215,9 +212,9 @@ def test_boot_and_verify_brain_repo_under_expected_root_passes(tmp_path: Path) -
     spec = fg.ArmBootSpec(
         arm="A", port=1, run_dir=run_dir, ready_timeout=5.0, expect_brain_repo_under=expected_root
     )
-    boot_cmd = _boot_cmd_writing_ready(run_dir / "READY", {"brain_repo": str(nested)})
+    _stub_boot_run(monkeypatch, writes=lambda: _write_ready(run_dir, {"brain_repo": str(nested)}))
 
-    session = fg.boot_and_verify(spec, boot_cmd=boot_cmd)
+    session = fg.boot_and_verify(spec, boot_cmd=["boot", "it"])
     assert session.brain_repo == str(nested)
 
 

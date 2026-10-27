@@ -871,14 +871,14 @@ def _script_run(*args, cwd=None):
     return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd or REPO, env=env, capture_output=True, text=True, timeout=120)
 
 
-def test_k3_exit_codes_of_the_script_as_a_process(tmp_path):
+def test_k3_the_script_process_exits_with_the_verdict_code_and_1_on_a_crash(tmp_path):
+    """The whole exit-code table is asserted in-process (`test_cli_exit_codes_and_skips_non_chat_rows`,
+    `test_cli_from_row_is_one_based_over_chat_rows`, `test_cli_bad_arguments_are_exit_2_...`); what only a process
+    shows is that the script's last line hands `main()`'s verdict to the process (`raise SystemExit(main())`) and
+    that an uncaught exception ends it as exit 1 with its traceback."""
     f = tmp_path / "u.jsonl"
-    cases = [(run(6449, 6449), 0), (run(6449, 6449, 2000), 10), (run(6449), 11)]
-    for rows, code in cases:
-        _write_rows(f, rows)
-        assert _script_run("--cache-break-check", str(f), "--regression-threshold", "0").returncode == code
-    assert _script_run("--cache-break-check", str(f), "--from-row", "x").returncode == 2  # argparse
-    assert _script_run("--cache-break-check", str(tmp_path / "nope.jsonl")).returncode == 2
+    _write_rows(f, run(6449, 6449, 2000))
+    assert _script_run("--cache-break-check", str(f), "--regression-threshold", "0").returncode == 10  # a break
     missing = tmp_path / "missing.json"
     crash = _script_run("--compare", str(missing), str(missing))  # an uncaught FileNotFoundError
     assert crash.returncode == 1 and "FileNotFoundError" in crash.stderr
@@ -1788,8 +1788,8 @@ def test_k3_the_pre_run_error_codes_are_not_verdict_codes(tmp_path, capsys):
 def test_k3_a_malformed_compare_input_is_a_crash_not_a_verdict(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("not json", encoding="utf-8")
-    res = _script_run("--compare", str(bad), str(bad))
-    assert res.returncode == 1 and "JSONDecodeError" in res.stderr
+    with pytest.raises(json.JSONDecodeError):  # as a process this is exit 1, the crash code (see the process test)
+        crw.main(["--compare", str(bad), str(bad)])
 
 
 def test_k2_an_unwritable_temp_dir_is_unmeasured_not_a_late_crash(tmp_path, monkeypatch):

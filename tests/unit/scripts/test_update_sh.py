@@ -349,19 +349,21 @@ def test_the_updater_itself_runs_on_the_release_brain(tmp_path):
     assert "KINDLED_NO_OVERLAY" not in start
 
 
-def test_every_nell_command_the_script_calls_exists_in_the_real_cli():
+def test_every_nell_command_the_script_calls_exists_in_the_real_cli(capsys):
     """The shim answers anything, so check each `"$NELL" <cmd> <action>` call site
     (plan steps AND the failure trap) against the real parser (#285: the script
-    called `nell service stop`, which no nell version has ever had)."""
+    called `nell service stop`, which no nell version has ever had). In this process:
+    `--help` of a real command exits 0 before anything runs, an unknown command or
+    action exits 2."""
+    from brain.cli import main
+
     calls = set(re.findall(r'"\$NELL" ([a-z-]+) ([a-z-]+)', SCRIPT.read_text(encoding="utf-8")))
     assert calls, "no nell call sites found — did the quoting change?"
     for cmd, action in sorted(calls):
-        cp = subprocess.run(
-            [sys.executable, "-c", "import sys; from brain.cli import main; sys.exit(main(sys.argv[1:]))",
-             cmd, action, "--help"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        assert cp.returncode == 0, f"`nell {cmd} {action}` is not a real command:\n{cp.stderr}"
+        with pytest.raises(SystemExit) as exit_info:
+            main([cmd, action, "--help"])
+        err = capsys.readouterr().err
+        assert exit_info.value.code == 0, f"`nell {cmd} {action}` is not a real command (exit {exit_info.value.code}):\n{err}"
 
 
 def test_restart_without_persona_is_refused(tmp_path):

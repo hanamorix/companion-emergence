@@ -110,20 +110,30 @@ def test_live_roster_raises_on_exited_child() -> None:
 def test_live_roster_raises_on_nonhandshaking_child() -> None:
     hang = [sys.executable, "-P", "-c", "import time; time.sleep(60)"]
     with pytest.raises(DropinMismatch, match="did not serve tools/list"):
-        rp._live_roster(hang, timeout=2.0)
+        rp._live_roster(hang, timeout=0.5)
 
 
 # --- C3: passes on a correctly-wired live child; ordering exercised in-process --------------------
 
 
-def test_preflight_passes_on_live_child(tmp_path: Path) -> None:
+def test_preflight_passes_on_live_child(tmp_path: Path, monkeypatch) -> None:
     persona = _seed_persona(tmp_path)
     build = _worktree_build()
+    served: list[set] = []
+    real_live_roster = rp._live_roster
+
+    def spy(*args, **kwargs):
+        roster = real_live_roster(*args, **kwargs)
+        served.append(roster)
+        return roster
+
+    monkeypatch.setattr(rp, "_live_roster", spy)
     # No raise: runs _assert_declared_authoritative THEN the live spawn (the ordering the
-    # un-applied call-site would own — here exercised in-process).
+    # un-applied call-site would own — here exercised in-process), one real MCP child.
     rp.assert_brain_tools_roster(build, persona, timeout=30.0)
-    # Evidence: the served roster equals the declared roster.
-    assert rp._live_roster(rp._child_argv(persona), timeout=30.0) == rp._declared_roster(persona)
+    # Evidence: the live child was really asked, and the roster it served equals the declared roster.
+    assert len(served) == 1 and served[0]
+    assert served[0] == rp._declared_roster(persona)
 
 
 # --- C5: hard-fail on a served-vs-declared roster mismatch ----------------------------------------
