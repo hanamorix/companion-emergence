@@ -38,7 +38,7 @@ from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _drain_pass2_queue(persona_dir, timeout: float = 5.0) -> None:
+def _drain_pass2_queue(persona_dir) -> None:
     # Pass-2 extraction is saved in the persisted pass2_queue (no worker thread,
     # #27). Drain it synchronously: cli_throttle is idle in tests (conftest
     # reset), so drain_pending runs the queued items.
