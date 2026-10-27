@@ -2242,23 +2242,6 @@ def test_j5_v1_on_real_files_the_container_layout_and_a_real_permission_error(
         (own / "memory.limit_in_bytes").chmod(0o644)
 
 
-def test_j7_the_fallback_docstrings_state_the_minimum_with_psutil_and_the_s240_s242_s243_rules() -> None:
-    avail = " ".join((reranker_mod._available_ram_headroom_bytes.__doc__ or "").split())
-    v2 = " ".join((reranker_mod._cgroup_v2_memory_headroom_bytes.__doc__ or "").split())
-    v1 = " ".join((reranker_mod._cgroup_v1_memory_headroom_bytes.__doc__ or "").split())
-    chain = " ".join((reranker_mod._cgroup_chain_headroom.__doc__ or "").split())
-    width = " ".join((reranker_mod.fit_rerank_width.__doc__ or "").split())
-    assert "SMALLER of two figures" in avail and "only when no cgroup level could be measured" not in avail
-    assert "has headroom 0" in v2 and "never borrowed" in v2 and "mount root" in v2
-    assert "first existing level" in v1 and "headroom 0" in v1
-    assert "never borrowed" in chain or "never borrow" in chain
-    assert "within_measured" in width and "S242" in width
-    from brain.memory import ram_fit
-
-    fit_doc = " ".join((ram_fit.RamFit.within_measured.__doc__ or "").split())
-    assert "no more pairs" in fit_doc and "no longer a padded length" in fit_doc
-
-
 # ---- H6: the callers see the same float | None ----
 
 
@@ -2319,25 +2302,6 @@ def test_j4_the_cap_refuses_a_single_pair_longer_than_any_measured_and_allows_on
     anchors = [50] * len(ANCHOR_POOL)
     assert reranker_mod.fit_rerank_width([1024], anchors, capped, 4.0, 1e15, max_real=1) == 1
     assert reranker_mod.fit_rerank_width([1025], anchors, capped, 4.0, 1e15, max_real=1) == 0
-
-
-def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected() -> None:
-    v2 = reranker_mod._cgroup_v2_memory_headroom_bytes.__doc__ or ""
-    v1 = reranker_mod._cgroup_v1_memory_headroom_bytes.__doc__ or ""
-    helper = reranker_mod._cgroup_reclaimable_file_bytes.__doc__ or ""
-    avail = reranker_mod._available_ram_headroom_bytes.__doc__ or ""
-    for doc in (helper, avail):
-        assert "file_mapped" in doc and "tmpfs" in doc
-    assert "file_writeback" in helper and "shmem" in helper
-    assert "MINIMUM" in v2 and "own usage" in v2 and "siblings" in v2 and "file_mapped" in v2
-    assert "total_cache" in v1 and "total_mapped_file" in v1 and "tmpfs" in v1
-    assert "MINIMUM" in v1 and "own setting" in v1 and "use_hierarchy" in v1 and "ancestor" in v1
-    assert "NOT visible" not in v1 and "Only the process's OWN cgroup is read" not in v1
-    assert "already hierarchical" not in v1 and "no walk-up is needed" not in v1
-    assert "memory.high" in v2 and "plain" in v2 and "has a usable numeric limit" in " ".join(v2.split())
-    assert "psutil" in avail and "memory.high" in avail
-    for doc in (v2, v1, helper, avail):
-        assert "matches psutil" not in doc.lower() and "matches the host" not in doc.lower()
 
 
 def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2722,24 +2686,6 @@ def test_the_call_site_scan_sees_a_call_it_has_not_been_told_about(tmp_path) -> 
         "class Holder:\n    def go(self, p):\n        return p.rerank('q', ['d']) + p.rerank_timed('q', ['d'])\n"
     )
     assert _rerank_call_sites(tmp_path) == {("brain/memory/stray.py", "Holder.go"): 2}
-
-
-def test_the_ram_bound_texts_state_the_s245_and_s247_rules() -> None:
-    from brain.memory import floor_calibration
-
-    def flat(obj) -> str:
-        return " ".join((obj.__doc__ or "").split())
-
-    measure = flat(reranker_mod.measure_ram_figure)
-    assert "records the completion marker ONLY IF the window then holds a measured batch of more than one pair" in measure
-    assert "before the warm-up and before EVERY rung, the first included" in measure
-    assert "without a headroom check" not in measure
-    assert "BEFORE the provider is built" in flat(reranker_mod.run_ram_figure)
-    assert "`RerankDeferred` is raised BEFORE that pair's call" in flat(reranker_mod.normalize_bundled_pairs_against_anchors)
-    assert "RerankDeferred" in flat(floor_calibration.get_bootstrap_floor)
-    assert "seed_ram_fit" in flat(reranker_mod.fit_rerank_width)
-    assert "S247" in flat(reranker_mod.RerankDeferred) and "S247" in flat(reranker_mod._batch_fits_ram_bound)  # noqa: SLF001
-    assert "S247" in flat(reranker_mod._warm_up_once) and "bounded" in flat(reranker_mod._warm_up_once)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

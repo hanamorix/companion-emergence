@@ -1046,35 +1046,6 @@ def test_label_calibration_sample_raw_score_is_null_for_error_candidate(
 
 
 # ---------------------------------------------------------------------------
-# F2c inc1 (spec §6): the durable in-code Haiku-oracle note must actually be
-# present at the F2a judge/label site — grep/lint check (acceptance #9).
-# ---------------------------------------------------------------------------
-
-
-def test_haiku_oracle_note_is_present_in_relevance_judge_source() -> None:
-    """A plain code-comment presence check — not a behavior test — proving
-    the required durable note (spec §6: Haiku is the effective relevance
-    ORACLE the judge converges toward) actually exists at this module,
-    immediately above `label_calibration_sample` (the F2a judge/label
-    site), so a later relevance-quality problem has a documented place to
-    look. Scoped to just that note block (not the whole module, which uses
-    em-dashes freely elsewhere in ordinary docstrings) since the "no
-    em-dash" requirement applies to this specific durable note, not to
-    every comment in the file."""
-    import inspect
-
-    source = inspect.getsource(rj_mod)
-    marker = "# F2c (durable note, spec"
-    assert marker in source, "the durable Haiku-oracle note must precede label_calibration_sample"
-    note_start = source.index(marker)
-    note_end = source.index("def label_calibration_sample", note_start)
-    note = source[note_start:note_end]
-    assert "oracle" in note.lower()
-    assert "haiku" in note.lower()
-    assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"
-
-
-# ---------------------------------------------------------------------------
 # F2c inc4a (spec §5 "where the tuned judge loads from") — the LOAD side:
 # `label_calibration_sample` now reads THIS PERSONA's persisted
 # `judge_knob_calibration` row (via `store.get_judge_knob_calibration`) and

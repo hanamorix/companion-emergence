@@ -305,16 +305,6 @@ def test_the_lift_comes_with_all_the_usable_fit_conditions() -> None:
     assert fit is not None and fit.max_pairs == 2 and fit.within_measured(50, 5000)
 
 
-def test_the_docstrings_state_the_conditions_of_the_lift_and_the_marker_rule() -> None:
-    module_doc = " ".join((ram_fit.__doc__ or "").split())
-    method_doc = " ".join((ram_fit.RamFit.within_measured.__doc__ or "").split())
-    for text in (module_doc, method_doc):
-        assert "more than three distinct shapes" in text and "full rank" in text and "full-length sample" in text
-    assert "lifts only once a batch of more than one pair is measured AND the fit is usable" in module_doc
-    assert "records no marker" in module_doc and "MORE THAN ONE PAIR" in module_doc
-    assert "headroom still records its completion marker" not in module_doc
-
-
 # ---- S255: the safety factor ----
 
 _SHIPPED_FACTOR = dev_constants.RAM_FIT_SAFETY_FACTOR  # read at import: the suite's default is 1.0

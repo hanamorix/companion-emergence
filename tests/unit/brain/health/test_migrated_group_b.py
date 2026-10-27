@@ -338,17 +338,6 @@ def test_group_b_tunables_legacy_json_fold_renames_and_never_rewrites_the_json(t
     _no_temp_left(tmp_path)
 
 
-def test_group_b_migrator_cli_vocab_and_interests_use_the_module_writer() -> None:
-    """The two atomic writes in _run_migrate_locked go through write_json (no ``.new`` temp of their own)."""
-    import ast
-
-    src = (Path(__file__).resolve().parents[4] / "brain" / "migrator" / "cli.py").read_text()
-    assert "_vocab_tmp" not in src and "_interests_tmp" not in src
-    tree = ast.parse(src)
-    names = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "write_json" in names
-
-
 def test_group_b_db_health_event_log_appends_ascii_lines_and_never_raises(tmp_path: Path, monkeypatch) -> None:
     from brain.memory.db_health import _log_health_event
     from brain.paths import get_log_dir

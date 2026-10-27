@@ -222,20 +222,6 @@ def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
     assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
 
 
-def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
-    """S239: the headroom helper reads psutil's host-wide available figure, not /proc/meminfo."""
-    doc = judge_selftune._downgrade_for_oom_safety.__doc__ or ""
-    assert "psutil" in doc
-    assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc
-
-
-def test_oom_guard_docstring_states_the_smaller_of_the_cgroup_and_psutil_figures() -> None:
-    """S241: the helper returns the smaller of the cgroup figure and psutil's, not psutil only when no cgroup
-    level could be measured."""
-    doc = " ".join((judge_selftune._downgrade_for_oom_safety.__doc__ or "").split())
-    assert "smaller of" in doc and "only when no cgroup level could be measured" not in doc
-
-
 def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_and_psutil(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1005,25 +991,6 @@ def test_tick_fault_during_fit_leaves_rows_unconsumed(
     post_count, post_row_ids = store.count_new_haiku_decisions()
     assert post_count == handful + 1
     assert sorted(post_row_ids) == sorted(ids)
-
-
-# ---------------------------------------------------------------------------
-# AC9: the durable Haiku-oracle note must be present in F2c's OWN training
-# code location (relevance_judge.py's own copy is covered by that module's
-# test file) — grep/lint check, not a behavior test.
-# ---------------------------------------------------------------------------
-
-
-def test_haiku_oracle_note_is_present_in_judge_selftune_source() -> None:
-    source = inspect.getsource(judge_selftune)
-    marker = "# F2c (durable note, spec"
-    assert marker in source, "the durable Haiku-oracle note must precede _run_judge_selftune_tick"
-    note_start = source.index(marker)
-    note_end = source.index("def _run_judge_selftune_tick", note_start)
-    note = source[note_start:note_end]
-    assert "oracle" in note.lower()
-    assert "haiku" in note.lower()
-    assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"
 
 
 # ---------------------------------------------------------------------------

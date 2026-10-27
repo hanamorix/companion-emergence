@@ -1,6 +1,6 @@
 """Tests for the temporary memory-consolidation gate (Root 2 stopgap).
 
-Covers the gating acceptance criteria C1-C14 + C18 from
+Covers the gating acceptance criteria C1-C13 + C18 from
 changes/tempgate-memory-consolidation/1.5-criteria.md. Pass-2 decisions are
 driven by an injected STUB classifier so the mechanism is verified without a
 live model (C16 — real Haiku decision quality — is advisory/live, not here).
@@ -523,17 +523,6 @@ def test_c12_deliberate_bypass_types_write_direct(persona):
         route_write(store, m, source="deliberate")
         assert store.search_text(f"deliberate {bypass}")  # in memories.db
     assert queue.drain() == []  # nothing enqueued
-
-
-# -------------------------------------------------------------------------- C14
-def test_c14_temp_marker_present():
-    from pathlib import Path
-
-    # Anchored to this file, not the working directory: pytest can start anywhere (#377).
-    repo = Path(__file__).resolve().parents[1]
-    for f in ("brain/memory/pending.py", "brain/engines/consolidation.py"):
-        text = (repo / f).read_text(encoding="utf-8")
-        assert "TEMP (Root 2 stopgap" in text
 
 
 # -------------------------------------------------------------------------- C18

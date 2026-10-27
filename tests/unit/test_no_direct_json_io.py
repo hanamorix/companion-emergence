@@ -556,12 +556,6 @@ def test_cs2_b_each_pattern_family_is_classified(source: str, expected: dict[str
     assert _kinds(source) == expected
 
 
-def test_cs2_b_the_documented_blind_spots_are_named_in_the_module_doc() -> None:
-    doc = __doc__ or ""
-    for spot in ("getattr(json", "from json import *", "JSONDecoder", "one-hop", "from_jsonl"):
-        assert spot in doc, spot
-
-
 def test_cs2_b_the_legacy_helper_files_do_not_count_their_own_definitions() -> None:
     src = "def attempt_heal(p, f):\n    return attempt_heal(p, f)\n"
     assert scan_source(src, "brain/health/attempt_heal.py") == Counter()

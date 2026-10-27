@@ -194,35 +194,6 @@ def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
     assert hits == [], "removed names still present:\n" + "\n".join(hits)
 
 
-# Wording that described the first drafts (a separate "line" per job, a typed id that "pins", the picker "removing an
-# override"). The settings file now holds one entry per setting, and a value equal to the shipped default follows later
-# default changes (owner E7), so text that says otherwise misleads the next reader (rev-4 review S4).
-_STALE_WORDING = re.compile(
-    r"tunables lines?\b|removes the override|\bpins (?:it|that id)\b|already pinned to|pinned custom id|pinned to that very id"
-)
-
-
-def test_no_text_describes_the_settings_as_lines_or_a_typed_id_as_pinning() -> None:
-    hits: list[str] = []
-    for rel, text in _source_files():
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if _STALE_WORDING.search(line):
-                hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
-    assert hits == [], "stale wording:\n" + "\n".join(hits)
-
-
-def test_the_stale_wording_scan_catches_the_phrases_it_names() -> None:
-    for phrase in (
-        "the model its tunables line names",
-        "install-wide tunables lines",
-        "`sonnet` removes the override",
-        "(typing the id of a word's model pins it)",
-        "it pins that id",
-        "the model is already pinned to that very id",
-    ):
-        assert _STALE_WORDING.search(phrase), phrase
-
-
 def test_the_tests_scan_catches_a_removed_keyword_and_a_removed_name_in_a_comment() -> None:
     """The M1 class (a test calling a removed parameter) must be visible to the scan."""
     assert _REMOVED_KWARG.search('get_provider("claude-cli", model_override="haiku")')

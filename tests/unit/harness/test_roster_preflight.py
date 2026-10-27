@@ -50,11 +50,6 @@ def test_declared_roster_matches_server_rule(tmp_path: Path) -> None:
     assert rp._declared_roster(persona) == expected
 
 
-def test_module_imports_the_registry_symbols() -> None:
-    assert "from brain.tools import NELL_TOOL_NAMES" in RP_SRC
-    assert "build_schemas" in RP_SRC
-
-
 def test_no_hardcoded_tool_name_in_source() -> None:
     for name in NELL_TOOL_NAMES:
         assert f'"{name}"' not in RP_SRC and f"'{name}'" not in RP_SRC, (

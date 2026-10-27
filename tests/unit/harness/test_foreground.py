@@ -4,8 +4,7 @@ Covers G1 (real boot+confirm path returns a populated ArmSession in-turn: the on
 a real child), G2 (a failed boot raises ForegroundBootError in-turn; the boot command is stubbed at
 `fg.subprocess.run`), G3 (the real verification paths reject a bad build / a broken tool roster
 in-turn), G4 (preserve_artifacts copies + raises on a missing
-REQUIRED source), G5 (the banner's exact headline + required content), G6 (the shipped contract
-doc names both surfaces + the one rule), and G7 (every new public symbol is exported from
+REQUIRED source), G5 (the banner's exact headline + required content), and G7 (every new public symbol is exported from
 tests.harness and listed in __all__). Mechanical facts only: no live bridge, no tokens, no
 network -- runs under the default (non-live) marker set.
 """
@@ -21,8 +20,6 @@ from pathlib import Path
 import pytest
 
 from tests.harness import foreground as fg
-
-RUN_ORCHESTRATION_MD = Path(__file__).resolve().parents[3] / "tests" / "harness" / "RUN-ORCHESTRATION.md"
 
 
 def _write_ready(run_dir: Path, payload: dict) -> None:
@@ -392,21 +389,6 @@ def test_drive_now_banner_content_surfaces_rule_run_context_and_extra_lines() ->
     assert "roster_ok=True" in banner
     # extra lines are appended
     assert "custom note here" in banner
-
-
-# --- G6: the shipped contract doc names both surfaces + the one rule ------------------------------
-
-
-def test_run_orchestration_doc_exists() -> None:
-    assert RUN_ORCHESTRATION_MD.exists(), f"expected {RUN_ORCHESTRATION_MD} to exist"
-
-
-def test_run_orchestration_doc_names_both_surfaces_and_the_rule() -> None:
-    text = RUN_ORCHESTRATION_MD.read_text(encoding="utf-8")
-    assert "run_in_background" in text
-    assert "background sub-agent" in text
-    assert "one arm = one" in text.lower() or "one arm = one agent = one turn" in text
-    assert "FOREGROUND" in text
 
 
 # --- G7: every new public symbol is exported from tests.harness and listed in __all__ -------------

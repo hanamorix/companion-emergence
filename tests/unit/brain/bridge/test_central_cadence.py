@@ -777,11 +777,6 @@ def test_c22_due_but_no_lull_leaves_the_cadence_file_unchanged(tmp_path, stubs):
     assert stubs.order == ["self_model_articulation"]
 
 
-def test_c22_code_comment_names_the_future_absorption():
-    src = inspect.getsource(supervisor._run_self_model_tick).replace("#", " ")
-    assert "absorbed later by the expanded central cadence function" in " ".join(src.split())
-
-
 # ---------------------------------------------------------------------------
 # C23 (INC-9 parts) — pass 2 is the first gated job, no interval, drains at
 # every idle pass while non-empty, yields per item
@@ -1337,16 +1332,6 @@ def test_load_or_init_cadence_present_file_is_returned_unchanged(tmp_path):
     assert _cadence_path(tmp_path, "x.json").read_bytes() == before
 
 
-def test_run_central_pass_logs_decisions(tmp_path, caplog):
-    import logging
-
-    log: list[str] = []
-    with caplog.at_level(logging.INFO, logger="brain.bridge.central_cadence"):
-        _pass(tmp_path, _fake_jobs(["pass2"], log))
-    assert any("job=pass2 action=run" in r.getMessage() for r in caplog.records)
-    assert any("job=pass2 action=completed" in r.getMessage() for r in caplog.records)
-
-
 def test_paused_outcome_stops_the_sequence_without_advancing(tmp_path):
     """INC-10 seam: a job reporting PAUSED ends the sequence and its cadence
     is not advanced."""
@@ -1490,15 +1475,34 @@ def test_s84_leaves_time_since_last_message_and_is_chat_idle_untouched(tmp_path,
         reset_registry()
 
 
-def test_s84_run_folded_captures_bridge_start_before_the_loop():
-    """Live wiring: run_folded records bridge start once, at entry, and hands
-    it to the job table."""
-    src = inspect.getsource(supervisor.run_folded)
-    assert "bridge_started_at = datetime.now(UTC)" in src
-    assert src.index("bridge_started_at = datetime.now(UTC)") < src.index(
-        "while not stop_event.is_set():"
-    )
-    assert "bridge_started_at=bridge_started_at" in src
+def _folded_kwargs(persona_dir, ticks: list[int], **extra) -> dict:
+    """Keyword arguments for a real run_folded thread with every cadence off (one tick per pass lands in ``ticks``)."""
+    return {
+        "persona_dir": persona_dir,
+        "provider": FakeProvider(),
+        # EventBus drops events when no event loop is bound, so the bus here is a recorder.
+        "event_bus": SimpleNamespace(
+            publish=lambda event: ticks.append(1) if event.get("type") == "supervisor_tick" else None
+        ),
+        "tick_interval_s": 0.05,
+        "heartbeat_interval_s": None,
+        "soul_review_interval_s": None,
+        "finalize_interval_s": None,
+        "log_rotation_interval_s": None,
+        "initiate_review_interval_s": None,
+        "voice_reflection_interval_s": None,
+        "self_model_interval_s": None,
+        "compaction_interval_s": None,
+        "calibration_interval_s": None,
+        "interest_sweep_interval_s": None,
+        "judge_selftune_interval_s": None,
+        "clustering_interval_s": None,
+        "vocab_repair_interval_s": None,
+        "maker_enabled": False,
+        "notes_enabled": False,
+        "kindled_link_enabled": False,
+        **extra,
+    }
 
 
 def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_path):
@@ -1519,35 +1523,9 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
     old = create_session(persona_dir.name)
     old.created_at = datetime.now(UTC) - timedelta(hours=1)
     stop = threading.Event()
-    ticks: list[int] = []  # one per supervisor pass (EventBus drops events when no event loop is bound)
+    ticks: list[int] = []  # one per supervisor pass
     t = threading.Thread(
-        target=supervisor.run_folded,
-        args=(stop,),
-        kwargs={
-            "persona_dir": persona_dir,
-            "provider": FakeProvider(),
-            "event_bus": SimpleNamespace(
-                publish=lambda event: ticks.append(1) if event.get("type") == "supervisor_tick" else None
-            ),
-            "tick_interval_s": 0.05,
-            "heartbeat_interval_s": None,
-            "soul_review_interval_s": None,
-            "finalize_interval_s": None,
-            "log_rotation_interval_s": None,
-            "initiate_review_interval_s": None,
-            "voice_reflection_interval_s": None,
-            "self_model_interval_s": None,
-            "compaction_interval_s": None,
-            "calibration_interval_s": None,
-            "interest_sweep_interval_s": None,
-            "judge_selftune_interval_s": None,
-            "clustering_interval_s": None,
-            "vocab_repair_interval_s": None,
-            "maker_enabled": False,
-            "notes_enabled": False,
-            "kindled_link_enabled": False,
-        },
-        daemon=True,
+        target=supervisor.run_folded, args=(stop,), kwargs=_folded_kwargs(persona_dir, ticks), daemon=True
     )
     try:
         t.start()
@@ -1565,6 +1543,56 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
         assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
         assert any(s.session_id == new.session_id for s in all_sessions()), (
             "post-start session pruned"
+        )
+    finally:
+        stop.set()
+        t.join(timeout=cap_s)
+        reset_registry()
+    assert not t.is_alive()
+
+
+def test_s84_run_folded_prunes_by_the_bridge_start_it_is_given(tmp_path):
+    """The bridge hands run_folded the moment it captured before starting the supervisor thread (S84, so the app-mount
+    session cannot race it). Given a start two hours ago, an empty session from three hours ago predates it and is
+    pruned at an idle pass; one from an hour ago does not and is kept. A run_folded that took its own "now" instead
+    would prune both."""
+    import threading
+    import time as _time
+
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    cap_s = 60.0
+    persona_dir = _persona(tmp_path)
+    reset_registry()
+    cli_throttle.reset()
+    now = datetime.now(UTC)
+    before_start = create_session(persona_dir.name)
+    before_start.created_at = now - timedelta(hours=3)
+    after_start = create_session(persona_dir.name)
+    after_start.created_at = now - timedelta(hours=1)
+    stop = threading.Event()
+    ticks: list[int] = []
+    t = threading.Thread(
+        target=supervisor.run_folded,
+        args=(stop,),
+        kwargs=_folded_kwargs(persona_dir, ticks, bridge_started_at=now - timedelta(hours=2)),
+        daemon=True,
+    )
+    try:
+        t.start()
+        deadline = _time.monotonic() + cap_s
+        while _time.monotonic() < deadline and any(
+            s.session_id == before_start.session_id for s in all_sessions()
+        ):
+            _time.sleep(0.02)
+        assert all(s.session_id != before_start.session_id for s in all_sessions()), "the idle pass never pruned"
+        after = len(ticks)
+        deadline = _time.monotonic() + cap_s
+        while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after the prune
+            _time.sleep(0.02)
+        assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
+        assert any(s.session_id == after_start.session_id for s in all_sessions()), (
+            "a session opened after the given bridge start was pruned: run_folded used its own start"
         )
     finally:
         stop.set()

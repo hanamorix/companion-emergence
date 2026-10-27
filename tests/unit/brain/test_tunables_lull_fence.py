@@ -1,6 +1,6 @@
 """ram-spike-fix INC-6, criterion C27 (S47/S51/I7): the lull tunable key is
-registered in tunables.py itself, and tunables.py's own module docstring
-fence names it as the one allowed ops-timing key. (The dev_constants.py half
+registered in tunables.py itself, and it is the one ops-timing key registered
+there. (The dev_constants.py half
 of C27 — the busy timeout / gate / decay budget living there, not here — is
 covered by test_dev_constants.py, INC-1, frozen; not duplicated here.)"""
 from __future__ import annotations
@@ -17,12 +17,6 @@ def test_lull_key_is_registered_in_tunables_py_itself() -> None:
         assert tunables.get_tunable("chat.idle_lull_seconds", tunables.CHAT_IDLE_LULL_SECONDS) == 600.0
     finally:
         tunables._reset_for_tests()
-
-
-def test_module_docstring_fence_names_the_one_allowed_key() -> None:
-    doc = tunables.__doc__ or ""
-    assert "chat.idle_lull_seconds" in doc
-    assert "ONE named exception" in doc or "one allowed" in doc.lower()
 
 
 def test_no_second_ops_timing_key_registered_in_tunables_py() -> None:

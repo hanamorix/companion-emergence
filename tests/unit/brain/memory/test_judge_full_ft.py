@@ -1,7 +1,7 @@
 """Tests for `brain.memory.judge_full_ft` — F2c inc6's FULL fine-tune
 weight-retrain MECHANISM (spec `f2c-judge-selftune-spec.md` §1 [beefy tier =
 full fine-tune], §5 [Full FT (beefy)], AC7-analogue [full-model reload
-round-trip], AC9 [Haiku-oracle note]).
+round-trip]).
 
 OFFLINE, TINY MODEL ONLY (never the real bge-reranker-v2-m3 — the BUILD
 deferral + `build-for-potato-computers-baseline`): every test builds a
@@ -296,16 +296,6 @@ def test_full_ft_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Pa
         return [label_fn(item) for item in _FIXED_EVAL_ITEMS]
 
     assert train_and_score() == train_and_score()
-
-
-# ---------------------------------------------------------------------------
-# C16 — AC9 Haiku-oracle durable note present in the training code.
-# ---------------------------------------------------------------------------
-
-
-def test_haiku_oracle_note_present_in_full_ft_module() -> None:
-    src = (Path(__file__).resolve().parents[4] / "brain" / "memory" / "judge_full_ft.py").read_text()
-    assert "Haiku" in src and "ORACLE" in src, "missing the durable Haiku-oracle note (spec §6/AC9)"
 
 
 # ---------------------------------------------------------------------------

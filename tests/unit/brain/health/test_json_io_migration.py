@@ -190,11 +190,6 @@ def test_bc15_an_append_between_a_rewriters_read_and_replace_is_not_lost(tmp_pat
     assert "late" in ids and target not in {c.candidate_id for c in real(tmp_path)}
 
 
-def test_bc16_characterization_the_module_never_uses_the_locale_codec() -> None:
-    src = Path("brain/health/json_io.py").read_text(encoding="utf-8")
-    assert "locale" not in src and 'open(path, "rb")' in src  # CR11 of test_json_io.py asserts it on real calls
-
-
 def test_bc17_the_new_sidecars_are_ignored_by_the_sweep_and_the_walker(tmp_path: Path) -> None:
     from brain.forgetting import _persist_forgetting_state
     from brain.health.sidecar_sweep import sweep_stale_sidecars

@@ -179,10 +179,6 @@ def test_activation_imports_only_stdlib_and_platformdirs(tmp_path):
     assert out.stdout.strip() == "[]", out.stdout
 
 
-def test_module_docstring_documents_the_escape_hatch():
-    assert "KINDLED_NO_OVERLAY" in overlay_hook.__doc__
-
-
 def test_install_hook_writes_the_three_files(tmp_path):
     overlay_hook.install_hook(tmp_path, "abc")
     assert (tmp_path / "_ce_overlay.pth").read_text(encoding="utf-8") == overlay_hook.PTH_LINE

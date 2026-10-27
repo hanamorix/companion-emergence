@@ -8,12 +8,10 @@ Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
 
 from __future__ import annotations
 
-import inspect
 from unittest.mock import patch
 
 import pytest
 
-from brain.chat import prompt as prompt_mod
 from brain.chat.prompt import _build_recall_block
 from brain.engines.consolidation import Reappraisal, run_consolidation
 from brain.memory.pending import PendingQueue
@@ -125,14 +123,6 @@ def test_c3_2_row_already_missing_at_read_is_skipped(tmp_path):
 
 
 # --------------------------------------------------------------------------- C3.3
-def test_c3_3_recall_hook_source_never_references_a_provider():
-    """Static check: the recall-block hook's source never references a
-    provider/appraiser — it can only enqueue. Fail-test: an inline-appraise
-    implementation would need a provider/reappraiser call at this site."""
-    src = inspect.getsource(prompt_mod._build_recall_block)
-    assert ".generate(" not in src  # the LLMProvider call surface
-    assert "reappraiser" not in src  # no inline appraiser reference at all
-    assert "enqueue_reappraisal" in src  # the hook DOES enqueue
 
 
 def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_path):

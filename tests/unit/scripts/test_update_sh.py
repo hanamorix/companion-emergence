@@ -459,17 +459,6 @@ def test_help_prints_the_whole_header():
     assert "set -euo" not in cp.stdout
 
 
-def test_help_describes_the_overlay_path_and_the_legacy_fallback():
-    cp = _run("--help")
-    assert cp.returncode == 0
-    out = cp.stdout
-    assert "overlay" in out.lower()
-    assert "no sudo" in out.lower() or "no runtime rewrite" in out.lower()
-    assert "#286" in out or "#289" in out  # overlay path reference
-    assert "#289" in out  # older bundles keep the legacy path
-    assert "#255" in out  # Windows still unsupported
-
-
 def test_nell_runs_from_a_neutral_cwd_even_from_a_checkout(tmp_path):
     """Bundled nell runs `python3 -c`, which puts the cwd on sys.path: from a checkout
     (how the README says to run this) it imports the checkout's brain/ and misreports

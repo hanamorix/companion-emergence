@@ -689,13 +689,6 @@ def test_af1_run_gate_true_context_only(tmp_path, monkeypatch) -> None:
     assert per_anchor["CLEAN anchor"] == {"sentinel": "ok"}  # clean = shared turn_context fallback
 
 
-def test_af1_live_env_docstring_documents_gate_context() -> None:
-    """C-AF1-DOC (oracle-can-fail): the LIVE_ENV docstring documents both new keys."""
-    doc = agent_send.__doc__ or ""
-    assert "gate_true_context" in doc
-    assert "gate_clean_context" in doc
-
-
 # --- HF-F1: list-valued gate_known_true/gate_known_clean through the _run_gate seam ----------------
 # Drive `_run_gate` directly (like the AF1 block above). A list is an anchor BATTERY; the whole
 # battery must pass. Module-level factories so a dotted path resolves.

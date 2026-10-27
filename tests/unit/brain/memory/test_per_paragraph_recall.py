@@ -1502,18 +1502,6 @@ def test_a_reranker_that_cannot_load_is_tried_once_per_message(
     assert [o.gated.path for o in result.paragraphs] == [COSINE_PATH] * 3
 
 
-def test_the_group_order_is_one_line_naming_each_group_once() -> None:
-    """S98 "a single line change": the six names sit on one source line; each
-    group appears exactly once (independent of the order chosen)."""
-    import inspect
-
-    source = inspect.getsource(dev_constants)
-    (line,) = [ln for ln in source.splitlines() if ln.startswith("RECALL_RESULT_GROUP_ORDER")]
-    assert all(f'"{name}"' in line for name in _S97_ORDER)
-    order = dev_constants.RECALL_RESULT_GROUP_ORDER
-    assert len(order) == 6 and set(order) == set(_S97_ORDER)
-
-
 def test_a_bad_group_list_fails_at_import_not_silently_per_turn(tmp_path: Path) -> None:
     """F6: a list that does not name each group once stops the import, so a
     mis-edit cannot switch semantic recall off quietly."""

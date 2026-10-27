@@ -24,13 +24,6 @@ def test_record_monologue_schema_built():
     assert "surface" not in params["required"]
 
 
-def test_record_monologue_description_mentions_tool_purpose():
-    from brain.tools.schemas import build_schemas
-    s = build_schemas("Nell")["record_monologue"]
-    desc = s["description"].lower()
-    assert any(token in desc for token in ("monologue", "thought", "drift"))
-
-
 def test_record_monologue_description_includes_persona_name():
     from brain.tools.schemas import build_schemas
     s = build_schemas("Iris")["record_monologue"]

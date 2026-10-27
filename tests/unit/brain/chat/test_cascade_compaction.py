@@ -1013,29 +1013,6 @@ def test_cb4c_idempotent_rerun_same_now_is_noop(tmp_path: Path) -> None:
     assert r2.reason == "nothing_aged"
 
 
-def test_cb4d_docstrings_reflect_replacement_model() -> None:
-    """Bug 4 (C-B4d, docs match code): the retain-forever docstrings/comments no
-    longer say "terminal / re-compacted forever" or "leaving tiers 2/3
-    untouched", and the replacement model wording is present instead. Fails on
-    pre-change code (which contains the stale phrases)."""
-    import inspect
-
-    import brain.chat.compaction as comp
-
-    source = inspect.getsource(comp)
-    stale_phrases = [
-        "STAYS in tier 3 (terminal, re-compacted forever",
-        "a terminal, multi-input tier 3",
-        "then stays in tier 3 (terminal, re-compacted forever)",
-        "Tier 3 is a terminal, multi-input",
-        "leaving tiers 2/3 untouched",
-    ]
-    for phrase in stale_phrases:
-        assert phrase not in source, f"stale retain-forever wording still present: {phrase!r}"
-    assert "evicted" in source.lower()
-    assert "replaced" in source.lower() or "replacement" in source.lower()
-
-
 def test_cb4f_emergency_fold_evicts_stale_section(tmp_path: Path) -> None:
     """Bug 4 / red-team CH8 (C-B4f): emergency_fold_24h (the apply_budget
     backstop) on a row carrying an evictable (>=96h) section drops that

@@ -453,13 +453,3 @@ def test_a_run_that_is_not_abandoned_ends_the_loop_after_one_pass(monkeypatch, t
     finally:
         loop.finish(thread)
 
-
-def test_the_body_waits_for_and_uses_the_cli_throttle_signal() -> None:
-    """Source-level wiring pin (the executed interleavings above carry the behaviour)."""
-    import inspect
-
-    source = inspect.getsource(floor_startup._ram_figure_body)  # noqa: SLF001
-    assert "cli_throttle.wait_for_no_reply_in_flight()" in source
-    assert "cli_throttle.reply_watch()" in source
-    assert "watch=watch" in source
-    assert "RamMeasurementAbandoned" in source

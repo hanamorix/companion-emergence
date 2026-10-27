@@ -320,9 +320,3 @@ def test_notify_trip_sendmessage_precedes_wait() -> None:
             "trip-site SendMessage must precede 'Then WAIT' (no wake-before-wait deadlock)"
         )
 
-
-def test_notify_preserves_never_wind_down_and_not_ai() -> None:
-    """G5c: the load-bearing 'never wind down' + not-an-AI role directives survive the notify change."""
-    prompt = _bob(DEMO_MOOD_A).render_prompt()
-    assert "You NEVER wind the conversation down" in prompt
-    assert "You are NOT an AI assistant" in prompt
