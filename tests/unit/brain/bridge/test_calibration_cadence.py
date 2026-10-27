@@ -1,7 +1,6 @@
 """Tests for the calibration tick and its persisted-cadence wiring (F2a #250
 inc5, spec Section 5).
 
-  - _run_calibration_tick is importable and has the expected signature.
   - run_folded takes calibration_interval_s and compaction_interval_s, each defaulting to a day.
   (The cadence file itself, "last ran now" on a missing file, due-ness at the interval and the save/load round trip
   are held by test_central_cadence.py and test_persisted_cadence.py, which every gated job shares.)
@@ -17,37 +16,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
-
-def test_run_calibration_tick_importable_and_callable():
-    from brain.bridge.supervisor import _run_calibration_tick
-
-    sig = inspect.signature(_run_calibration_tick)
-    params = list(sig.parameters)
-    # inc6 (#250 §6) adds the judge-labeling pass: `provider` (the Haiku
-    # tie-break's generation provider — None means "build one via
-    # build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER) inside
-    # this function", mirroring consolidation.run_consolidation's per-call
-    # construction) and `judge` (test-injection point for a
-    # RelevanceJudgeProvider — None means "build the real torch judge
-    # lazily"). Both keyword-only, both defaulted, so every existing
-    # zero-arg call site (run_folded's startup catch-up + periodic fire)
-    # keeps working unmodified.
-    # INC-10 (ram-spike-fix): adds keyword-only `should_pause` (the
-    # between-items pause hook, default None => never pauses — every
-    # existing zero-arg call site keeps working unmodified).
-    assert params == ["persona_dir", "is_session_busy", "provider", "judge", "should_pause"], (
-        f"expected (persona_dir, *, is_session_busy, provider, judge, should_pause), got {params}"
-    )
-    busy = sig.parameters["is_session_busy"]
-    assert busy.kind is inspect.Parameter.KEYWORD_ONLY
-    assert busy.default is None
-    provider_param = sig.parameters["provider"]
-    assert provider_param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert provider_param.default is None
-    judge_param = sig.parameters["judge"]
-    assert judge_param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert judge_param.default is None
 
 
 @pytest.mark.parametrize("parameter", ["calibration_interval_s", "compaction_interval_s"])

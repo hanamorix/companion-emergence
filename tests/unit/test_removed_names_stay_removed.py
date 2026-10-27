@@ -338,6 +338,19 @@ REMOVED: tuple[Removed, ...] = (
         scope=("brain/bridge/server.py",),
     ),
     Removed(
+        names=("busy_timeout = 5000",),
+        why="the memories.db open sequence and the other stores' busy timeout come from brain/utils/sqlite_open.py and dev_constants, not a written-out 5000; brain/initiate/resonance.py still has its own literal and a store is added here in the commit that migrates it (#465 C9)",
+        ref="25004f83 refactor: open WorksStore through the shared SQLite helper (#465 C9)",
+        scope=(
+            "brain/memory/hebbian.py",
+            "brain/soul/store.py",
+            "brain/kindled_link/store.py",
+            "brain/memory/store.py",
+            "brain/works/store.py",
+            "brain/memory/embedding_matrix.py",
+        ),
+    ),
+    Removed(
         names=("_chat_with_images", "_message_has_image", "_build_stream_json_user_message"),
         why="the image/text builder fork was dissolved; shared files route through read_file (P0 image-tool route)",
         ref="634cf0b3 feat(files): P0 image-tool route",

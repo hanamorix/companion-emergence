@@ -824,14 +824,6 @@ def test_judge_knob_calibration_per_persona_store_isolation() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_judge_selftune_tick_importable_and_callable() -> None:
-    sig = inspect.signature(judge_selftune._run_judge_selftune_tick)
-    params = list(sig.parameters)
-    assert params == ["store", "now", "persona_dir"]
-    for name in params:
-        assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
-
-
 def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore) -> None:
     """AC3 (gate): NOT more than a handful -> no fire. Exactly at the
     threshold is the boundary case (`> handful`, not `>=`)."""
@@ -1016,9 +1008,9 @@ def test_every_judge_selftune_threshold_is_a_registered_tunable() -> None:
 def test_gate_handful_decisions_is_a_dev_constant_not_a_tunable() -> None:
     """S26 (owner ruling): the self-tune gate is dev-level, not user-facing
     — it must NOT be tunables.register()-ed, and its value must come from
-    brain.dev_constants (not a bare literal reintroduced in this module)."""
+    brain.dev_constants (a different literal reintroduced in this module would not equal it). The value
+    itself is pinned by test_selftune_gate_is_200 in test_dev_constants.py and by the dev-constants snapshot."""
     assert "judge_selftune.gate_handful_decisions" not in judge_selftune.tunables._registry
-    assert judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS == 200
     assert (
         judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
         == dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS

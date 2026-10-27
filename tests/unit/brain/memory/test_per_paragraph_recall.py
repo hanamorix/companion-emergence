@@ -1041,10 +1041,6 @@ _S97_ORDER = (
 )
 
 
-def test_the_group_order_is_one_list_in_dev_constants_in_the_s97_order() -> None:
-    assert dev_constants.RECALL_RESULT_GROUP_ORDER == _S97_ORDER
-
-
 def _six(store: MemoryStore | None = None):
     labels = {
         RERANKED_GENUINE: ("rg", "event"),

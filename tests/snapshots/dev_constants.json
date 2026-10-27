@@ -1,0 +1,20 @@
+{
+  "COST_SERIES_WINDOW_S": "86400",
+  "HEARTBEAT_DECAY_BATCH_BUDGET_S": "1.0",
+  "JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS": "200",
+  "KNOWN_NAMES_DB_FILENAME": "'known_names.db'",
+  "MEMORIES_DB_BUSY_TIMEOUT_S": "30.0",
+  "MONOLOGUE_FAMILY_TYPES": "frozenset({'monologue', 'monologue_emotion', 'monologue_soul_candidate', 'monologue_trace'})",
+  "PASS2_NOBRIDGE_DRAIN_BUDGET_S": "20.0",
+  "RAM_FIT_LARGEST_UNDERESTIMATE": "0.14227",
+  "RAM_FIT_SAFETY_FACTOR": "1.1658680470544345",
+  "RECALL_DIAGNOSTICS_LOG_FILENAME": "'recall_diagnostics.log.jsonl'",
+  "RECALL_RESULT_GROUP_ORDER": "('reranked_genuine', 'reranked_family', 'cosine_genuine', 'keyword_genuine', 'cosine_family', 'keyword_family')",
+  "RERANK_MIN_REAL_CANDIDATES": "5",
+  "SEARCH_BRIDGE_TIMEOUT_S": "45.0",
+  "SETTINGS_FILE_LOCK_POLL_S": "0.02",
+  "SETTINGS_FILE_LOCK_WAIT_S": "3.0",
+  "SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS": "3",
+  "SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S": "0.1",
+  "SQLITE_STORE_BUSY_TIMEOUT_S": "5.0"
+}

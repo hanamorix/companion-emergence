@@ -1002,6 +1002,5 @@ def test_known_names_does_not_import_the_chat_layer() -> None:
     assert out.returncode == 0, out.stdout + out.stderr
 
 
-def test_the_file_name_is_a_dev_constant() -> None:
-    assert dev_constants.KNOWN_NAMES_DB_FILENAME == "known_names.db"
-    assert kn.known_names_path("/x/persona") == Path("/x/persona/known_names.db")
+def test_known_names_path_joins_the_persona_dir_and_the_file_name() -> None:
+    assert kn.known_names_path("/x/persona") == Path("/x/persona") / dev_constants.KNOWN_NAMES_DB_FILENAME

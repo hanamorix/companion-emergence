@@ -230,10 +230,7 @@ def test_the_allowlist_is_empty_and_any_entry_has_a_reason() -> None:
         "an allowlist entry needs a reason line"
     )
     assert ALLOWLIST == {}, "the helper replaces the readers; nothing is grandfathered"
-
-
-def test_the_helper_is_the_only_exemption() -> None:
-    assert EXEMPT == {"brain/utils/toml_io.py"}
+    assert EXEMPT == {"brain/utils/toml_io.py"}, "the helper is the only exemption"
 
 
 # ---------------------------------------------------------------------------------------------------------------

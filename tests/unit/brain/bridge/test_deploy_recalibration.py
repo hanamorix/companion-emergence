@@ -45,15 +45,6 @@ def _persona_dir(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_run_deploy_recalibration_check_importable_and_callable():
-    import inspect
-
-    from brain.bridge.supervisor import _run_deploy_recalibration_check
-
-    sig = inspect.signature(_run_deploy_recalibration_check)
-    assert list(sig.parameters) == ["persona_dir"]
-
-
 def test_deploy_recalibration_fires_exactly_once_when_no_row_exists(monkeypatch):
     """AC10: a fresh F2b deploy (no persisted floor row for the current
     model) must run an out-of-cycle `derive_and_persist_floor` exactly

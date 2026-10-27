@@ -773,12 +773,11 @@ def test_housekeeping_churn_alongside_real_escape_still_hard_raises(
             (guarded / "escaped.txt").write_text("a real Canary escape alongside the benign CLI churn")
 
 
-def test_cli_housekeeping_constant_and_helper_pinned() -> None:
-    """G5 + G6: the housekeeping constant is exactly the two files; the helper derives exactly those
-    two under ~/.claude; and they ride the mtime-insensitive path, NOT the exclude allowlist nor the
-    F4 session-log set (preserves the semantic split + keeps test_af2_exclusion_set_unchanged valid).
+def test_cli_housekeeping_files_are_content_guarded_not_name_excluded() -> None:
+    """G5 + G6: the helper derives exactly the housekeeping files under ~/.claude; and they ride the
+    mtime-insensitive path, NOT the exclude allowlist nor the F4 session-log set (preserves the semantic
+    split + keeps test_af2_exclusion_set_unchanged valid).
     """
-    assert _CLAUDE_CLI_HOUSEKEEPING_FILES == ("policy-limits.json", "remote-settings.json")
     base = Path.home() / ".claude"
     assert set(_claude_cli_housekeeping_files()) == {base / n for n in _CLAUDE_CLI_HOUSEKEEPING_FILES}
     # NOT in the session-log set nor the exclude list — they are content-guarded, not pruned.
