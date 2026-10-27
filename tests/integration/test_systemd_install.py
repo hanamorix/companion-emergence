@@ -27,7 +27,9 @@ start, a fail-safe systemd timer that removes the unit after a delay even if thi
 killed, and the same sweep again at the end.
 
 NEVER run this module against a machine whose real user units matter without that guard: it
-installs a real unit under ``~/.config/systemd/user``. Run it only deliberately, and check
+installs a real unit under ``~/.config/systemd/user``. It therefore runs only on GitHub Actions
+(``GITHUB_ACTIONS=true``) or when you opt in with ``KINDLED_ALLOW_REAL_SERVICE_INSTALL=1``; anywhere
+else every test here skips before the sweep, the fail-safe or the install. When you do opt in, check
 ``systemctl --user list-units 'companion-emergence-*'`` before and after.
 """
 
@@ -41,7 +43,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.integration.systemd_cleanup import FailsafeNotArmedError, unit_guard
+from tests.integration.systemd_cleanup import (
+    FailsafeNotArmedError,
+    real_install_blocked_reason,
+    unit_guard,
+)
 
 # The entire module is Linux-only.
 pytestmark = pytest.mark.skipif(
@@ -52,7 +58,10 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _systemd_unit_guard():
-    """Sweep a leftover unit, arm the fail-safe timer, and always clean up (#454). Skipped hosts never reach the install."""
+    """Opt-in gate, then sweep a leftover unit, arm the fail-safe timer, and always clean up (#454). Skipped hosts never reach the install."""
+    blocked = real_install_blocked_reason()
+    if blocked is not None:
+        pytest.skip(blocked)
     if sys.platform != "linux" or not _systemd_user_available():
         yield
         return

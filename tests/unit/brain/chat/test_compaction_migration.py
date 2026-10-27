@@ -2,11 +2,9 @@
 
 Maps to changes/compaction-backlog-migration/1.5-criteria.md (C-M1..C-M12).
 
-The headline fixture was a real 328-turn chatlog copy at
-``~/Downloads/30cd3047-3d47-45b9-a48f-e27f9f2a9bee.jsonl`` (buffer format) that was
-never committed, so the three headline tests skipped everywhere (#363). They now run
-on a synthetic chatlog of the same size and shape, and still use the real copy when
-a machine has it.
+The headline fixture was once a real 328-turn chatlog copy (buffer format) that was
+never committed, so the three headline tests skipped everywhere (#363). They run on a
+synthetic chatlog of the same size and shape and read no real user file.
 """
 
 from __future__ import annotations
@@ -23,7 +21,6 @@ from brain.chat.compaction import CompactionResult, compact_conversation
 from brain.chat.compaction_migration import _marker_path, run_backlog_migration
 from brain.ingest.buffer import read_archive, read_session, write_cursor
 
-FIXTURE = Path.home() / "Downloads" / "30cd3047-3d47-45b9-a48f-e27f9f2a9bee.jsonl"
 FIXTURE_SID = "30cd3047-3d47-45b9-a48f-e27f9f2a9bee"
 
 
@@ -63,13 +60,8 @@ def _synthetic_chatlog() -> list[dict]:
 
 
 def _load_fixture(persona_dir: Path) -> list[dict]:
-    """Copy the chatlog (real when present, else synthetic) into
-    active_conversations/, cursor at the last ts."""
-    if FIXTURE.exists():
-        rows = [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines()
-                if line.strip()]
-    else:
-        rows = _synthetic_chatlog()
+    """Write the synthetic chatlog into active_conversations/, cursor at the last ts."""
+    rows = _synthetic_chatlog()
     dest_dir = persona_dir / "active_conversations"
     dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / f"{FIXTURE_SID}.jsonl").write_text(

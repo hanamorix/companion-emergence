@@ -102,8 +102,6 @@ def _reply(importance=6, names=(), not_names=()):
 # N18 (prompt half): byte-exact wording and the registered templates
 # --------------------------------------------------------------------------
 
-_WORDING = Path.home() / ".claude/plans/name-recall-fix-wording.md"
-
 REAPPRAISER_PROMPT = (
     "You judge how important a kindled's memory is, on a 0-10 scale, based on its content right now "
     "(not on how often it has been recalled). Re-evaluate a completed or past-due event (an appointment "

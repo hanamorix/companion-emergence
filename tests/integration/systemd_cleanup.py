@@ -15,9 +15,10 @@ tests all of it against a fake `systemctl` and a throwaway directory, without to
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -29,6 +30,24 @@ FAILSAFE_DELAY_S = 300
 _STEP_TIMEOUT_S = 15
 
 Runner = Callable[..., subprocess.CompletedProcess]
+
+ALLOW_REAL_INSTALL_ENV = "KINDLED_ALLOW_REAL_SERVICE_INSTALL"
+
+
+def real_install_blocked_reason(environ: Mapping[str, str] | None = None) -> str | None:
+    """None when this process may install the real test unit, else the reason to skip.
+
+    Allowed on GitHub Actions (``GITHUB_ACTIONS == "true"``) or when the developer opts in with
+    ``KINDLED_ALLOW_REAL_SERVICE_INSTALL=1``. A bare ``pytest`` on a developer box that has a reachable user systemd must not install
+    a real unit under ``~/.config/systemd/user`` by accident.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get("GITHUB_ACTIONS") == "true" or environ.get(ALLOW_REAL_INSTALL_ENV) == "1":
+        return None
+    return (
+        "installs a real systemd --user unit under ~/.config/systemd/user: runs only on GitHub Actions "
+        f"(GITHUB_ACTIONS=true) or with {ALLOW_REAL_INSTALL_ENV}=1"
+    )
 
 
 def unit_directory() -> Path:

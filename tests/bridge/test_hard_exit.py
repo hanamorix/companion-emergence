@@ -15,12 +15,13 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import psutil
 import pytest
 
-from brain.bridge import cli_throttle, shutdown_progress, state_file
+from brain.bridge import shutdown_progress, state_file
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree; Windows leg in CI")
 
@@ -145,25 +146,58 @@ def test_hard_exit_still_exits_0_when_the_record_write_raises(tmp_path, reap):
     assert _gone(int(child)) and _gone(int(grand))
 
 
+class _Released(BaseException):
+    """Raised out of the abandon gate's sleep to end a worker that is held there, so it can be joined without ever
+    passing the gate. A BaseException so no broad ``except Exception`` in the provider can swallow it."""
+
+
 @pytest.mark.parametrize("site", ["generate", "chat"])
-def test_while_abandoning_no_claude_is_spawned(site):
-    """C14 (f): a call attempted after the abandoning flag spawns nothing (it blocks until the process exits)."""
+def test_while_abandoning_no_claude_is_spawned(site, monkeypatch):
+    """C14 (f): a call attempted after the abandoning flag spawns nothing (it blocks until the process exits).
+
+    The worker is proved to be INSIDE the gate (its sleep ran) before anything is asserted, and it leaves the gate only
+    through an exception the test raises from that sleep. It is joined while the flag and the subprocess mocks are still
+    in place, so it can never pass the gate and reach a real ``claude`` spawn, even when an assertion fails first."""
     from brain.bridge.provider import ChatMessage, ClaudeCliProvider
 
-    cli_throttle.reset()
+    reached = threading.Event()
+    release = threading.Event()
+    outcome: list[object] = []
+
+    def gate_sleep(_seconds):
+        reached.set()
+        if release.wait(0.05):
+            raise _Released
+
+    monkeypatch.setattr(shutdown_progress, "time", SimpleNamespace(sleep=gate_sleep))
+
+    def call():
+        try:
+            if site == "generate":
+                ClaudeCliProvider().generate("hi")
+            else:
+                ClaudeCliProvider().chat([ChatMessage(role="user", content="hi")])
+            outcome.append("returned")
+        except _Released:
+            outcome.append("released")
+        except BaseException as exc:  # noqa: BLE001 - recorded, then asserted on below
+            outcome.append(exc)
+
     shutdown_progress.abandoning.set()
     try:
         with mock.patch.object(subprocess, "run") as run, mock.patch.object(subprocess, "Popen") as popen:
-            def call():
-                if site == "generate":
-                    ClaudeCliProvider().generate("hi")
-                else:
-                    ClaudeCliProvider().chat([ChatMessage(role="user", content="hi")])
-
             t = threading.Thread(target=call, daemon=True)
             t.start()
-            t.join(0.5)
-            assert t.is_alive()  # blocked at the gate, not returned and not raised
+            try:
+                assert reached.wait(10), "the call never reached the abandon gate"
+                t.join(0.5)
+                assert t.is_alive()  # blocked at the gate, not returned and not raised
+                assert not run.called and not popen.called
+            finally:
+                release.set()
+                t.join(10)
+            assert not t.is_alive()
+            assert outcome == ["released"], outcome  # it left the gate only through the test's release
             assert not run.called and not popen.called
     finally:
         shutdown_progress.abandoning.clear()
