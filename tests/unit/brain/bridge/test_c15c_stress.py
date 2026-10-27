@@ -34,10 +34,12 @@ rows, a `supervisor_tick` (only "the loop iterates"), and no exception swallowed
 by the loop's own loggers. The writer thread is held to the same standard (no
 error, alive, joined, at least one successful `bump_recall`). The persona is
 seeded with a felt-time age so the first forgetting pass is not the cold-start
-all-exempt no-op. The whole body is `_stress_body`; the default-suite tests at
-the bottom run the same body against stand-in loops (no-op, crash, ignores
+all-exempt no-op. The whole body is `_stress_body`; the stand-in tests at the
+bottom run the same body against stand-in loops (no-op, crash, ignores
 stop, silent, ticks only, ...) and require the matching failure, so every new
-assertion is proven able to fail, and deleting one fails the default suite.
+assertion is proven able to fail, and deleting one fails them. The stand-in
+tests are opt-in too (#540): the main matrix does not run them (10-20 s of
+wall time per run), the python-313-bridge job does.
 """
 from __future__ import annotations
 
@@ -61,6 +63,13 @@ from brain.bridge import cli_throttle, job_progress
 from brain.bridge.events import EventBus
 from brain.felt_time.state import FeltTimeState, load_or_recover, persist
 
+# Opt-in (#421, #540): the 60 s test and the stand-in tests that prove its assertions can fail run only where
+# KINDLED_RUN_STRESS=1, which test.yml's python-313-bridge job sets. The main matrix does not run them.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("KINDLED_RUN_STRESS") != "1",
+    reason="stress test and its stand-ins, opt-in: set KINDLED_RUN_STRESS=1 (run by test.yml's python-313-bridge job; #421)",
+)
+
 _FIXTURE_ENV = os.environ.get("KINDLED_F_BOB20K")
 
 
@@ -68,7 +77,7 @@ def _build_synthetic_bob20k(db_path: Path, n: int = 20_000) -> None:
     """20k memories spread over a year with nonzero emotions, so the
     heartbeat's batched decay and the forgetting pass both have real work
     on every row, as they did on F-bob20k. (`n` is only lowered by the
-    default-suite stand-in tests, which need a database but not its size.)"""
+    stand-in tests, which need a database but not its size.)"""
     from brain.memory.store import Memory, MemoryStore
 
     now = datetime.now(UTC)
@@ -446,7 +455,7 @@ def _stress_body(
 ) -> _StressResult:
     """The whole stress test, with the loop injectable: set up the persona,
     run the window, assert. The opt-in test calls it with the real
-    `run_folded`; the default-suite tests call it with stand-in loops."""
+    `run_folded`; the stand-in tests call it with stand-in loops."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     (persona_dir / "active_conversations").mkdir()
@@ -507,10 +516,6 @@ def _stress_body(
 
 
 @pytest.mark.xdist_group("stress")  # opt-in 60 s run: its own group name under --dist loadgroup (PLAN I1d); the 3.13 bridge job that sets the opt-in runs without -n
-@pytest.mark.skipif(
-    os.environ.get("KINDLED_RUN_STRESS") != "1",
-    reason="60s stress test, opt-in: set KINDLED_RUN_STRESS=1 (run by test.yml's python-313-bridge job; #421)",
-)
 def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_errors(
     tmp_path: Path,
 ) -> None:
@@ -537,7 +542,7 @@ def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_error
 
 
 # ---------------------------------------------------------------------------
-# Default-suite tests (no env gate, 5-row database, ~0.3 s windows).
+# Stand-in tests (5-row database, ~0.3 s windows; gated like the 60 s test, see `pytestmark`).
 #
 # They run the SAME `_stress_body` the opt-in test runs, with a stand-in for
 # `run_folded` (and sometimes for the writer), and require the failure each new

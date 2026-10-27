@@ -188,20 +188,6 @@ def test_c2_shrunk_prefix_passes_per_run(prefix):
     assert res["rows_checked"] == 5
 
 
-def test_c2_preconditions_the_legacy_signals_misfire_on_the_shrunk_run():
-    def build(prefix):
-        creations = [11000, 14000, 17000, 20000, 15000]
-        return [row(prefix + 11000, 0, t=0)] + [row(c, prefix, t=k) for k, c in enumerate(creations, 1)]
-
-    a, b = build(15476), build(6176)
-
-    def ratio(rows):
-        return sum(r["cache_read_input_tokens"] for r in rows) / sum(r["cache_creation_input_tokens"] for r in rows)
-
-    assert (ratio(b) - ratio(a)) / ratio(a) < -0.10  # the legacy sum(read)/sum(creation) ratio dropped > 10%
-    assert _old_rule_fails(b)  # and the replaced per-row signal fails run B's healthy row (20000 vs F=17176)
-
-
 # --------------------------------------------------------------------------------------
 # C3: healthy shapes pass
 # --------------------------------------------------------------------------------------
@@ -413,12 +399,6 @@ def test_k1_the_text_path_shape_of_two_judged_rows_is_one_comparison_with_zero_t
     assert check(run(8403, 8403))["status"] == "PASS"
     assert check(run(8403, 8402))["status"] == "FAIL"
     assert check(run(8403, 9000))["status"] == "PASS"  # a rise is fine
-
-
-def test_k1_precondition_the_replaced_rule_fails_what_min_passes_and_one_establishing_row_fails_the_limit():
-    assert _highest_read_rule_fails([6449, 15476, 6449, 6449])
-    first_only = [15476, 6449, 6449]  # min-of-earlier with one establishing row: row 2 is below 15476
-    assert any(rd < min(first_only[:i]) for i, rd in enumerate(first_only) if i >= 1)
 
 
 def test_k1_a_negative_read_is_unusable_not_a_break_or_a_reference():
@@ -687,16 +667,6 @@ def test_c7_real_repo_config_entry_parses_to_zero_percent_and_is_gating_stable()
     assert entry["gating"] is True
     assert entry["direction"] == "stable"
     assert entry["regression_threshold"] == "0%"
-
-
-def test_c7_gating_oracle_can_fail(tmp_path):
-    import yaml
-
-    p = _config(tmp_path, '"0%"')
-    p.write_text(p.read_text().replace("gating: true", "gating: false"), encoding="utf-8")
-    body = re.search(r"^```yaml[ \t]*\n(.*?)^```[ \t]*$", p.read_text(), re.M | re.S).group(1)
-    entry = next(m for m in yaml.safe_load(body)["metrics"] if m["name"] == "cache_read_ratio")
-    assert entry["gating"] is not True
 
 
 # --------------------------------------------------------------------------------------

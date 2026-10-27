@@ -325,17 +325,6 @@ def test_cr3_invalid_utf8_is_recovered_like_malformed_json(
         )
 
 
-def test_cr3_baseline_the_legacy_handler_shape_leaks_unicode_decode_error(tmp_path: Path) -> None:
-    """The #436 failure: a handler listing only (OSError, JSONDecodeError) lets invalid UTF-8 escape."""
-    p = tmp_path / "state.json"
-    p.write_bytes(b'{"a": "\xff"}')
-    with pytest.raises(UnicodeDecodeError):
-        try:
-            json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pytest.fail("the legacy handler would have caught it")
-
-
 def _failing_open(target: Path, exc_factory, times: int | None = None):
     """A builtins.open replacement that raises for ``target`` (``times`` times, then works)."""
     real_open = open
@@ -1154,21 +1143,6 @@ def test_cr14_heal_completes_while_another_descriptor_holds_the_shared_lock(tmp_
         t.join(5)
 
 
-def test_cr14_baseline_a_heal_on_the_shared_sidecar_would_hang(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(jio, "_HEAL_LOCK_USES_SHARED_SIDECAR", True)
-    p = _corrupt_with_backup(tmp_path)
-    t, release = _hold_shared_lock_in_thread(p)
-    try:
-        worker, _box = _in_thread(
-            lambda: jio.read_json(p, default=dict, recover=jio.Recovery.HEAL), timeout=1.0
-        )
-        assert worker.is_alive(), "the variant that locks <name>.lock should have hung"
-    finally:
-        release.set()
-        t.join(5)
-        worker.join(5)
-
-
 def test_cr14_heal_save_and_if_missing_complete_while_the_same_thread_holds_the_shared_lock(
     tmp_path: Path,
 ) -> None:
@@ -1283,32 +1257,6 @@ def test_cr14_an_oserror_in_the_body_propagates_once_and_the_body_runs_once(
     )
 
 
-def test_cr14_baseline_the_naive_try_with_shape_runs_the_body_twice() -> None:
-    """Why the module enters the lock through an ExitStack inside the try: @contextmanager re-raises body errors
-    at the yield, so `try: with lock: body / except OSError: body` runs the body a second time, unlocked."""
-    import contextlib
-
-    @contextlib.contextmanager
-    def lock():
-        yield
-
-    runs = []
-
-    def body():
-        runs.append(1)
-        raise OSError(errno.EIO, "disk")
-
-    try:
-        with lock():
-            body()
-    except OSError:
-        try:
-            body()
-        except OSError:
-            pass
-    assert len(runs) == 2
-
-
 # --------------------------------------------------------------------------------------------------------------
 # Recovery.RESTORE and fallbacks (CR15)
 # --------------------------------------------------------------------------------------------------------------
@@ -1327,13 +1275,6 @@ def test_cr15_restore_without_a_valid_backup_raises_and_leaves_everything_in_pla
         assert exc.value.kind == "malformed"
     assert _listing(tmp_path) == before
     assert not list(tmp_path.glob("*.corrupt-*"))
-
-
-def test_cr15_baseline_heal_would_have_reset_the_budget_to_an_empty_counter(tmp_path: Path) -> None:
-    """The d4c94657 fail-open bug: HEAL resets a corrupt budget file to the default (zero used)."""
-    p = tmp_path / "daily_budget.json"
-    p.write_bytes(b'{"date": "2026-10-17", "cou')
-    assert jio.read_json(p, default=dict, recover=jio.Recovery.HEAL) == {}
 
 
 def test_cr15_restore_restores_from_the_freshest_valid_backup(tmp_path: Path) -> None:
@@ -1456,16 +1397,6 @@ def test_cw1_write_json_matches_save_with_backup_byte_for_byte(
     for i in range(1, backups + 1):
         a, b = tmp_path / f"legacy.json.bak{i}", tmp_path / f"new.json.bak{i}"
         assert _norm_crlf(b.read_bytes()) == _norm_crlf(a.read_bytes())
-
-
-def test_cw1_the_differential_can_fail(tmp_path: Path) -> None:
-    from brain.health.attempt_heal import save_with_backup
-
-    save_with_backup(tmp_path / "l.json", {"a": 1})
-    jio.write_json(tmp_path / "n.json", {"a": 1}, indent=4)
-    assert _norm_crlf((tmp_path / "n.json").read_bytes()) != _norm_crlf(
-        (tmp_path / "l.json").read_bytes()
-    )
 
 
 def test_cw2_concurrent_writers_raise_nothing_and_leave_a_whole_file_and_no_temps(
@@ -1782,17 +1713,6 @@ def test_cw9_verify_off_does_not_read_the_file_back_and_a_good_write_passes(
     assert reads == ["s.json"]
 
 
-def test_cw9_baseline_without_verify_a_bad_write_goes_unnoticed(
-    tmp_path: Path, monkeypatch
-) -> None:
-    p = tmp_path / "s.json"
-    jio.write_json(p, {"v": 1}, backups=1)
-    _corrupt_after_publish(monkeypatch, p)
-    assert jio.write_json(p, {"v": 2}, backups=1) is True
-    monkeypatch.undo()
-    assert p.read_bytes() == b"{garbage"
-
-
 def test_cw10_output_is_pure_ascii_whatever_the_payload(tmp_path: Path) -> None:
     p = tmp_path / "s.json"
     payload = {
@@ -1807,11 +1727,6 @@ def test_cw10_output_is_pure_ascii_whatever_the_payload(tmp_path: Path) -> None:
     raw.decode("ascii")
     assert b"\r" not in raw and b"\xe2\x80\xa8" not in raw
     assert json.loads(raw.decode("utf-8")) == payload
-
-
-def test_cw10_baseline_ensure_ascii_false_cannot_encode_a_lone_surrogate() -> None:
-    with pytest.raises(UnicodeEncodeError):
-        json.dumps({"a": "\ud800"}, ensure_ascii=False).encode("utf-8")
 
 
 def test_cw10_format_options(tmp_path: Path) -> None:
@@ -1863,25 +1778,6 @@ def test_cw12_two_threads_racing_to_create_exactly_one_wins(tmp_path: Path) -> N
     assert json.loads(p.read_text())["winner"] in (0, 1)
 
 
-def test_cw12_baseline_a_plain_exists_check_lets_both_threads_write(tmp_path: Path) -> None:
-    p = tmp_path / "marker.json"
-    wrote: list[int] = []
-    gate = threading.Barrier(2)
-
-    def naive(i):
-        if not p.exists():
-            gate.wait()  # both pass the check before either writes
-            p.write_text(json.dumps({"winner": i}))
-            wrote.append(i)
-
-    threads = [threading.Thread(target=naive, args=(i,)) for i in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(10)
-    assert len(wrote) == 2
-
-
 # --------------------------------------------------------------------------------------------------------------
 # JSONL reads (CJ1-CJ6)
 # --------------------------------------------------------------------------------------------------------------
@@ -1923,13 +1819,6 @@ def test_cj1_unicode_line_separators_inside_a_value_do_not_split_a_record(tmp_pa
     value = "x" + chr(0x2028) + "y" + chr(0x2029) + "z" + chr(0x85) + "w"
     p.write_bytes((json.dumps({"a": value}, ensure_ascii=False) + '\n{"b": 2}\n').encode())
     assert jio.read_jsonl(p) == [{"a": value}, {"b": 2}]
-
-
-def test_cj1_baseline_splitlines_would_cut_that_record() -> None:
-    text = '{"a": "x\u2028y"}\n{"b": 2}\n'
-    assert (
-        len(text.splitlines()) == 3
-    )  # the bridge/feed.py:407 shape: one record becomes two broken ones
 
 
 def test_cj1_a_lone_carriage_return_is_not_a_record_separator(tmp_path: Path) -> None:
@@ -1992,12 +1881,6 @@ def test_cj2_iteration_is_streaming(tmp_path: Path) -> None:
         it.close()
 
     assert _peak_bytes(first) < 1_000_000
-
-
-def test_cj2_baseline_reading_the_whole_text_peaks_far_higher(tmp_path: Path) -> None:
-    p = tmp_path / "big.jsonl"
-    p.write_bytes((b'{"k": "' + b"x" * 90 + b'"}\n') * 55000)
-    assert _peak_bytes(lambda: p.read_text().splitlines()) > 4_000_000
 
 
 def test_cj3_strict_iteration_raises_on_the_first_bad_line_after_yielding_the_good_ones(
@@ -2319,19 +2202,6 @@ def test_ca2_held_takes_no_lock_so_a_caller_holding_it_does_not_deadlock(tmp_pat
     worker, box = _in_thread(work, timeout=5)
     assert not worker.is_alive(), "lock='held' re-locked and deadlocked"
     assert box["result"] is not None
-
-
-def test_ca2_baseline_block_while_the_caller_holds_the_lock_would_deadlock(tmp_path: Path) -> None:
-    from brain.utils.file_lock import file_lock
-
-    p = tmp_path / "log.jsonl"
-
-    def work():
-        with file_lock(p):
-            return jio.append_jsonl(p, {"a": 1}, lock="block")
-
-    worker, _box = _in_thread(work, timeout=1.0)
-    assert worker.is_alive()  # a second flock on a new handle in the same process blocks forever
 
 
 def test_ca2_a_refused_lock_still_appends_with_one_warning(

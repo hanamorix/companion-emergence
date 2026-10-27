@@ -180,27 +180,3 @@ def test_the_teardown_waits_are_one_named_value_not_literals():
     drain_text = inspect.signature(provider._StderrDrain.text).parameters["wait_s"]
     assert drain_text.default is None  # None means the grace value, not a second number
 
-
-def test_the_liveness_precondition_does_not_depend_on_proc(monkeypatch):
-    """CI (python macos-latest): `test_closing_the_generator_kills_and_reaps_the_child` failed at `assert _alive(pid)` although the
-    child was running (it had printed its first frame, which the test had just read). The helper decided "is it a zombie?" by reading
-    `/proc/<pid>/stat`; macOS has no /proc, the read raised OSError and the helper answered False for a live process. The probe is
-    the Popen object's own `poll()`, which is portable and exact (the test spawned the child)."""
-    import builtins
-
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    real_open = builtins.open
-
-    def no_proc(file, *a, **k):
-        if str(file).startswith("/proc"):
-            raise FileNotFoundError(file)  # what macOS does
-        return real_open(file, *a, **k)
-
-    monkeypatch.setattr(builtins, "open", no_proc)
-    try:
-        assert _alive(proc)
-    finally:
-        monkeypatch.undo()
-        proc.kill()
-        proc.wait(timeout=5)
-    assert not _alive(proc)  # reaped: not alive

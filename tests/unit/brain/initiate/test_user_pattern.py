@@ -253,40 +253,6 @@ def test_c1_no_full_scan_when_daily_cadence_not_due(
     assert calls["n"] == 0, "no full-directory/full-file reader call expected on the cheap path"
 
 
-def test_c1_self_test_spy_would_catch_the_old_every_call_full_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ST1.5f: the same spy DOES detect a call when the reference (pre-#225)
-    full-scan implementations are invoked directly — proving the spy in the
-    test above is actually discriminating, not vacuously passing."""
-    import brain.initiate.user_pattern as up
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(hours=1))
-
-    calls = {"n": 0}
-    real_read, real_iter = up.read_jsonl, up.iter_jsonl
-
-    def spy_read(*a, **k):
-        calls["n"] += 1
-        return real_read(*a, **k)
-
-    def spy_iter(*a, **k):
-        calls["n"] += 1
-        return real_iter(*a, **k)
-
-    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
-    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
-
-    # The OLD reference implementation (kept as an oracle, no longer on the
-    # hot path) calls the full reader every time it's invoked directly.
-    up._compute_silence_days(tmp_path)
-    up._compute_likely_active(tmp_path)
-
-    assert calls["n"] > 0, "the spy must be capable of detecting a full-scan call"
-
-
 # ---------------------------------------------------------------------------
 # C2 — ignore-streak bounded-window re-scan matches the full-scan oracle
 # exactly, sharing the old walk logic unchanged

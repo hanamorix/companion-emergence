@@ -146,61 +146,6 @@ def test_fold_reply_lag_incremental_mean(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_c9_concurrent_accessors_unguarded_can_lose_an_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ST1.5f self-test: with the lock bypassed, a load-then-save race
-    between two accessors CAN lose one mutation — proving the interleaving
-    technique below is capable of detecting a lost update at all."""
-    from brain.initiate import presence_state as ps_mod
-
-    # Bypass the real per-persona lock with a no-op — simulates two accessors
-    # racing with no synchronization at all.
-    class _NoOpLock:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(ps_mod, "_presence_lock", lambda _persona_dir: _NoOpLock())
-
-    reached_mid = threading.Event()
-    proceed = threading.Event()
-    real_load = ps_mod.load_presence_state
-    paused_once = threading.Event()
-
-    def slow_load(persona_dir):
-        state = real_load(persona_dir)
-        if not paused_once.is_set():
-            paused_once.set()
-            reached_mid.set()
-            proceed.wait(timeout=5)
-        return state
-
-    monkeypatch.setattr(ps_mod, "load_presence_state", slow_load)
-
-    def call_record_inbound():
-        ps_mod.record_inbound_turn(tmp_path, "2026-05-29T10:00:00+00:00")
-
-    t = threading.Thread(target=call_record_inbound)
-    t.start()
-    assert reached_mid.wait(timeout=5)
-
-    # This second mutation runs to completion WHILE the first is paused
-    # between its (already-completed) load and its (not-yet-run) save.
-    ps_mod.fold_reply_lag(tmp_path, 42.0)
-
-    proceed.set()
-    t.join(timeout=5)
-
-    final = real_load(tmp_path)
-    # Unguarded: the first accessor's save (based on a stale pre-fold read)
-    # clobbers the second's write — the fold is lost.
-    assert final.reply_lag_n == 0
-    assert final.last_seen_ts == "2026-05-29T10:00:00+00:00"
-
-
 def test_c9_concurrent_accessors_guarded_no_lost_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

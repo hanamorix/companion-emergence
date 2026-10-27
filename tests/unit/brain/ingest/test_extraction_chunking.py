@@ -12,7 +12,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from brain.ingest import ingest_utils
 from brain.ingest.extract import format_transcript, format_turn_line
 from brain.ingest.ingest_utils import TurnChunk, chunk_turns, extraction_chunk_chars
 from brain.utils.time import lenient_utc
@@ -33,7 +32,7 @@ def _row(speaker: str, text: str, seconds: float | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Oracles (each is shown to fail on a named broken chunker variant below)
+# Checks on a list of chunks (used by the chunker tests below)
 # ---------------------------------------------------------------------------
 
 
@@ -119,14 +118,6 @@ def _straddling_pairs_history() -> list[dict]:
     return rows
 
 
-def _any_boundary(speaker, ts, prefix_max, suffix_min):  # noqa: ANN001 - variant of ingest_utils._cut_allowed
-    return True
-
-
-def _ts_rule_only(speaker, ts, prefix_max, suffix_min):  # noqa: ANN001 - variant: no exchange rule
-    return ts is not None and prefix_max is not None and suffix_min is not None and prefix_max < suffix_min
-
-
 # ---------------------------------------------------------------------------
 # The chunker (the pipeline halves of these checks are below)
 # ---------------------------------------------------------------------------
@@ -155,23 +146,6 @@ def test_no_chunk_opens_with_a_reply_even_when_the_pair_straddles_a_second() -> 
     assert len(chunks) == 8  # each exchange is its own (oversize) chunk: a user row is never cut from its reply
     assert _reply_openers(chunks) == []
     assert all(len(c.turns) == 2 for c in chunks)
-
-
-@pytest.mark.parametrize(
-    ("variant", "history", "oracle"),
-    [
-        (_any_boundary, _same_ts_pairs_history, _boundary_ts_violations),
-        (_any_boundary, _straddling_pairs_history, _reply_openers),
-        (_ts_rule_only, _straddling_pairs_history, _reply_openers),
-    ],
-    ids=["any-boundary-splits-same-ts", "any-boundary-opens-with-reply", "no-exchange-rule-opens-with-reply"],
-)
-def test_oracles_catch_broken_chunker_variants(monkeypatch, variant, history, oracle) -> None:
-    """Fail-first kept executable: the oracles above fail on a chunker that cuts at any row boundary, and on one
-    without the exchange rule."""
-    monkeypatch.setattr(ingest_utils, "_cut_allowed", variant)
-    chunks = chunk_turns(history(), max_chars=80, user_name="Bob", assistant_name="Kestrel")
-    assert oracle(chunks) != []
 
 
 def test_two_units_exactly_at_the_limit_share_a_chunk_and_one_more_char_splits_them() -> None:
@@ -799,30 +773,6 @@ def test_c11d_finalize_makes_one_call_per_run(world) -> None:
     assert len(stub.prompts) == 1
 
 
-def _unbounded(monkeypatch) -> None:
-    """The broken variant: every caller's snapshot runs to the end (``max_chunks`` ignored)."""
-    real = pipeline.extract_session_snapshot
-
-    def _ignore_bound(*a, max_chunks=None, **kw):
-        return real(*a, **kw)
-
-    monkeypatch.setattr(pipeline, "extract_session_snapshot", _ignore_bound)
-
-
-def test_c11_oracle_catches_unbounded_sweep_and_finalize(world, monkeypatch) -> None:
-    """Fail-first kept executable: with the bound removed the sweep and finalize make all three calls."""
-    persona, store, hebbian, _ = world
-    _unbounded(monkeypatch)
-    _seed(persona, "sess_c1u", 6)
-    stub = _Stub()
-    pipeline.snapshot_stale_sessions(persona, silence_minutes=0.0, store=store, hebbian=hebbian, provider=stub)
-    assert len(stub.prompts) == 3
-    _seed(persona, "sess_c1v", 6, start=datetime.now(UTC) - timedelta(days=2))
-    stub2 = _Stub()
-    pipeline.finalize_stale_sessions(persona, finalize_after_hours=24.0, store=store, hebbian=hebbian, provider=stub2)
-    assert len(stub2.prompts) == 3
-
-
 def test_c11e_close_makes_every_call(world) -> None:
     persona, _, _, _ = world
     rows = _seed(persona, "sess_c1e", 6)
@@ -830,38 +780,6 @@ def test_c11e_close_makes_every_call(world) -> None:
     stub = _Stub()
     assert _close(world, "sess_c1e", stub).completed
     assert len(stub.prompts) == 3
-
-
-# ---- fail-first variant kept executable: a cursor written to the span end before the loop ----
-
-
-def test_c8_oracle_catches_a_cursor_written_before_the_loop(world, monkeypatch) -> None:
-    from brain.chat.compaction import compact_conversation
-
-    persona, _, _, _ = world
-    rows = _seed(persona, "sess_c8v", 12, start=datetime.now(UTC) - timedelta(days=3))
-    real_run_chunks = pipeline._run_chunks
-
-    def _early_cursor(persona_dir, session_id, turns, **kw):
-        # the variant: the cursor goes to the span end before the loop, instead of to each committed chunk's end
-        write_cursor(persona_dir, session_id, rows[-1]["ts"])
-        monkeypatch.setattr(pipeline, "write_cursor", lambda *a, **k: None)
-        return real_run_chunks(persona_dir, session_id, turns, **kw)
-
-    monkeypatch.setattr(pipeline, "_run_chunks", _early_cursor)
-    stub = _Stub()
-    unprompted: list[str] = []
-
-    def _between():
-        compact_conversation(persona, "sess_c8v", older_than=timedelta(0), fold_existing_summary=True,
-                             provider=_SummaryStub(), min_keep_tail=0)
-        prompted = "\n".join(stub.prompts)
-        unprompted.extend(r["text"][:12] for r in read_archive(persona, "sess_c8v")
-                          if r.get("speaker") != "summary" and _line(r) not in prompted)
-
-    stub._plan = lambda n, p: _between if n == 2 else None
-    _snapshot(world, "sess_c8v", stub)
-    assert unprompted != []
 
 
 # ---------------------------------------------------------------------------

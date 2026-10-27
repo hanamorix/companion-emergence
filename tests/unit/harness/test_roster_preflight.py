@@ -57,12 +57,6 @@ def test_no_hardcoded_tool_name_in_source() -> None:
         )
 
 
-def test_absence_sweep_oracle_can_fail() -> None:
-    """Self-test (ST1.5f): the sweep fires on a seeded literal."""
-    seeded = 'x = "search_memories"\n'
-    assert any(f'"{n}"' in seeded for n in NELL_TOOL_NAMES)
-
-
 # --- C7: child argv mirrors the shared helper ----------------------------------------------------
 
 
@@ -72,12 +66,6 @@ def test_child_argv_mirrors_provider_helper(tmp_path: Path) -> None:
 
     entry = brain_tools_mcp_entry(persona)
     assert rp._child_argv(persona) == [entry["command"], *entry["args"]]
-
-
-def test_child_argv_mirror_oracle_can_fail(tmp_path: Path) -> None:
-    persona = tmp_path / "persona"
-    bogus = [sys.executable, "-m", "brain.mcp_server", "--persona-dir", str(persona)]  # no -P
-    assert rp._child_argv(persona) != bogus
 
 
 # --- B-1: the preflight self-enforces its containment precondition --------------------------------

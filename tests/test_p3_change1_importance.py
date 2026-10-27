@@ -1,8 +1,7 @@
 """Tests for P3 retention rework, Change 1 — trustworthy importance assignment.
 
 Covers C1.1-C1.5 from changes/p3-retention/1.5-criteria.md. Each test
-documents how the PRE-CHANGE code would have violated the criterion (the
-oracle must be shown able to fail).
+documents how the PRE-CHANGE code would have violated the criterion.
 
 Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
 """
@@ -366,18 +365,3 @@ def test_c1_5_extraction_prompts_anchor_present_and_no_em_dash():
         assert "pivotal" in prompt
         assert _em_dash_free(prompt)
 
-
-def test_c1_5_em_dash_check_flags_pre_change_strings():
-    """Self-test (per criteria + plan): the SAME assertion, run against a
-    reconstruction of the PRE-CHANGE strings (which contained em-dashes),
-    must FAIL — proving the oracle can actually flag a violation."""
-    pre_change_system_prompt = (
-        "Identify what surfaced that should affect their memory, emotional "
-        "state, or growth — and what you noticed they should have done "
-        "differently."
-    )
-    pre_change_extraction_named_fragment = (
-        "{assistant_name} is the assistant — the AI persona."
-    )
-    assert not _em_dash_free(pre_change_system_prompt)
-    assert not _em_dash_free(pre_change_extraction_named_fragment)

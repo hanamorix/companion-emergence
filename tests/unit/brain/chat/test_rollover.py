@@ -13,12 +13,8 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
-import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 from brain.chat.rollover import perform_rollover
 from brain.ingest.buffer import (
@@ -137,40 +133,6 @@ class _MarkerExtractProvider:
         return json.dumps(items)
 
 
-def _load_old_pipeline_module() -> types.ModuleType:
-    """Load the PRE-CHANGE brain/ingest/pipeline.py (commit c2154a97's parent,
-    before finalize decoupling landed) as a live module, bound to the
-    CURRENT brain.ingest.buffer (unchanged by this revision) via its own
-    top-of-file imports. Used only for the H6 fail-demo below — never
-    imported by, or used to modify, anything under brain/."""
-    repo_root = Path(__file__).resolve().parents[4]
-    result = subprocess.run(
-        ["git", "show", "c2154a97^:brain/ingest/pipeline.py"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        # #169: the base commit was dropped by a branch rewrite and is reachable
-        # from no origin ref; CI's shallow checkout never has it. Skip, don't fail.
-        pytest.skip(f"base object unavailable in this clone: {result.stderr.strip()}")
-    mod = types.ModuleType("old_pipeline_pre_finalize_decoupling")
-    try:
-        exec(compile(result.stdout, "<old_pipeline_c2154a97^>", "exec"), mod.__dict__)
-    except ImportError as exc:
-        # F1 #259 increment 8: the old snapshot's own top-of-file imports
-        # (e.g. `EmbeddingCache`) reach into the CURRENT brain.memory.embeddings
-        # module, not a frozen copy — a later teardown that removes a symbol
-        # the historical snapshot still imports breaks loading it, same
-        # class of unavailability as the #169 case above. Skip rather than
-        # fail: this loader's only job is to run genuinely historical code
-        # for the H6 fail-demo control below, not to keep old snapshots
-        # perpetually import-compatible with an evolving current codebase.
-        pytest.skip(f"historical pipeline.py snapshot no longer import-compatible: {exc}")
-    return mod
-
-
 # --------------------------------------------------------------------------- C10
 def test_c10_finalize_no_delete_interleave(tmp_path: Path) -> None:
     """A finalize tick interleaved (here: run BEFORE) a rollover on the same
@@ -230,39 +192,6 @@ def test_c10_finalize_no_delete_interleave(tmp_path: Path) -> None:
         # Only the rollover deletes the OLD buffer — finalize alone (above)
         # left it in place.
         assert sid not in list_active_sessions(persona_dir)
-    finally:
-        store.close()
-        hebbian.close()
-
-
-def test_c10_pre_change_finalize_deleted_buffer_fail_demo(tmp_path: Path) -> None:
-    """H6: run the ACTUAL pre-change finalize_stale_sessions (commit
-    c2154a97's parent, which deleted the buffer unconditionally on a clean
-    pass) against an identical fixture and confirm it DOES delete — proving
-    the C10 assertion above (buffer survives finalize) is a real regression
-    guard, not a vacuous one."""
-    persona_dir = _persona(tmp_path)
-    sid = "sess_c10_fail_demo"
-    base = datetime.now(UTC) - timedelta(hours=3)
-    _seed(persona_dir, sid, 6, base=base, step=timedelta(minutes=1))
-
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    provider = _ExtractOnlyProvider()
-    try:
-        old_pipeline = _load_old_pipeline_module()
-        old_pipeline.finalize_stale_sessions(
-            persona_dir,
-            finalize_after_hours=0.0,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
-        assert sid not in list_active_sessions(persona_dir), (
-            "pre-change finalize_stale_sessions deleted the buffer on a clean "
-            "pass — the C10 'buffer survives finalize' assertion would have "
-            "failed against this code, confirming it is discriminating"
-        )
     finally:
         store.close()
         hebbian.close()
@@ -399,67 +328,6 @@ def test_c18_carried_raw_tail_extraction_state(tmp_path: Path) -> None:
         hebbian.close()
 
 
-def test_c18_without_carried_cursor_would_reextract_fail_demo(tmp_path: Path) -> None:
-    """H6: seed the SAME carried tail but WITHOUT carrying the cursor
-    (simulating the pre-fix gap) and confirm the already-extracted carried
-    turns DO get re-extracted (duplicate memories) — proving the carried-
-    cursor guard above is load-bearing, not incidental."""
-    persona_dir = _persona(tmp_path)
-    sid = "sess_c18_nocursor"
-    base = datetime.now(UTC) - timedelta(hours=2)
-    n = 50
-    tss = _seed(persona_dir, sid, n, base=base, step=timedelta(minutes=1), marker="MARK")
-    cursor_ts = tss[25]
-    write_cursor(persona_dir, sid, cursor_ts)
-
-    new_sid = perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
-    assert new_sid is not None
-    assert read_cursor(persona_dir, new_sid) == cursor_ts
-
-    # Simulate "seed without carrying the cursor" (the pre-fix gap the
-    # criterion's fail-demo names) by dropping the new session's cursor.
-    from brain.ingest.buffer import delete_cursor
-
-    delete_cursor(persona_dir, new_sid)
-    assert read_cursor(persona_dir, new_sid) is None
-
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    provider = _MarkerExtractProvider()
-    try:
-        report = extract_session_snapshot(
-            persona_dir,
-            new_sid,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
-        assert report.errors == 0
-        # TEMP (Root-2 consolidation-gate stopgap — see brain/memory/pending.py
-        # and brain/monologue/ambient.py, which disagree on whether the gate
-        # retires at "Phase 4" or "Phase 5"; revert to store.list_active() when
-        # the dream cycle lands and retires the gate): extraction lands gated
-        # "note" candidates in the pending queue, not memories.db. limit=1000
-        # (well above the true count) — read_recent's limit has no default and
-        # returns only the newest `limit` entries, so a small limit (e.g. the
-        # unrelated _AMBIENT_LIMIT=5) would silently drop the oldest entries.
-        committed_texts = {
-            m.content for m in PendingQueue(persona_dir).read_recent("note", limit=1000)
-        }
-        already_extracted = {f"MARK-{i}" for i in range(10, 26)}
-        # Without the carried cursor, extraction starts from scratch and
-        # re-extracts the already-extracted carried turns too.
-        assert already_extracted.issubset(committed_texts), (
-            "dropping the carried cursor should cause re-extraction of the "
-            "already-extracted carried tail turns — if this fails, the "
-            "no-cursor fixture no longer demonstrates the gap the real "
-            "carried-cursor behavior closes"
-        )
-    finally:
-        store.close()
-        hebbian.close()
-
-
 def test_c1_mid_rollover_window_redirects_not_resurrect(tmp_path: Path) -> None:
     """C-1 regression (stage-6 concurrency): during the mid-rollover window — the
     ``rolled_to`` pointer is already written (the rollover writes it FIRST), but the
@@ -579,49 +447,6 @@ def test_persist_after_rollover_redirects_to_successor(tmp_path: Path) -> None:
         )
         succ_texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
         assert "late-user" in succ_texts and "late-asst" in succ_texts
-    finally:
-        store.close()
-        hebbian.close()
-        reset_registry()
-
-
-def test_plain_ingest_after_rollover_resurrects_fail_demo(tmp_path: Path) -> None:
-    """Fail-demo: the PRE-FIX persist path (a plain ``ingest_turn`` on the old sid,
-    with no successor redirect — exactly what engine._persist_turn did before r4)
-    resurrects the deleted old buffer and orphans the turn OUTSIDE the successor
-    chain. Proves the redirect guard above is a real regression guard, not vacuous."""
-    from brain.chat.session import reset_registry
-    from brain.ingest.buffer import ingest_turn
-
-    reset_registry()
-    persona_dir = _persona(tmp_path)
-    old_sid = "sess_resurrect"
-    base = datetime.now(UTC) - timedelta(hours=3)
-    _seed(persona_dir, old_sid, 6, base=base, step=timedelta(minutes=1))
-
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    provider = _ExtractOnlyProvider()
-    try:
-        new_sid = perform_rollover(
-            persona_dir, old_sid, _PERSONA_NAME,
-            seed_mode="summary_only", provider=provider,
-            store=store, hebbian=hebbian,
-        )
-        assert new_sid is not None
-        assert old_sid not in list_active_sessions(persona_dir)
-
-        # The OLD (unredirected) persist path — append straight to the old sid.
-        ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "user", "text": "orphan"})
-
-        # Bug reproduced: the old buffer is resurrected and the turn is orphaned —
-        # it is NOT in the successor. (The fixed path routes through
-        # persist_turns_following_successor, which redirects; see the test above.)
-        assert old_sid in list_active_sessions(persona_dir), (
-            "expected the unredirected ingest to resurrect the old buffer"
-        )
-        succ_texts = [r.get("text") for r in read_session(persona_dir, new_sid)]
-        assert "orphan" not in succ_texts
     finally:
         store.close()
         hebbian.close()

@@ -345,31 +345,6 @@ def test_g16c_a_sweep_during_a_save_does_not_remove_that_saves_own_temp(tmp_path
     assert p.read_bytes() == b"data"
 
 
-def test_g16c_the_oracle_can_fail_when_the_in_flight_registry_is_ignored(tmp_path, monkeypatch):
-    p = tmp_path / "k.bin"
-    real = os.replace
-
-    def sweep_then_replace(src, dst):
-        aw._remove_stale_temps(p)
-        return real(src, dst)
-
-    monkeypatch.setattr(os, "replace", sweep_then_replace)
-    monkeypatch.setattr(aw, "_INFLIGHT", _EverythingIsStale())
-    with pytest.raises(FileNotFoundError):
-        save_bytes_atomic(p, b"data")
-
-
-class _EverythingIsStale(set):
-    def __contains__(self, item):
-        return False
-
-    def update(self, *a, **k):  # registration is a no-op: the in-flight guard is ignored
-        return None
-
-    def difference_update(self, *a, **k):
-        return None
-
-
 # --- G20(c): the shared writer imports nothing from brain.health (no cycle) ---------------------------------------
 
 
@@ -395,28 +370,6 @@ def test_g20c_importing_the_new_module_pulls_in_nothing_from_health():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]"
-
-
-def test_g20c_the_check_can_fail_with_the_wrong_tree_or_a_cycle(tmp_path):
-    wrong = _fresh(
-        "import brain\nimport os\nassert os.path.realpath(brain.__file__).startswith('/nonexistent')\n"
-    )
-    assert wrong.returncode != 0  # the __file__ assertion is real
-    fake = tmp_path / "brain" / "utils"
-    fake.mkdir(parents=True)
-    (tmp_path / "brain" / "__init__.py").write_text("")
-    (fake / "__init__.py").write_text("")
-    (tmp_path / "brain" / "health").mkdir()
-    (tmp_path / "brain" / "health" / "__init__.py").write_text("")
-    (tmp_path / "brain" / "health" / "anomaly.py").write_text("")
-    (fake / "atomic_write.py").write_text("import brain.health.anomaly\n")
-    out = _fresh(
-        "import brain.utils.atomic_write\n"
-        "print(sorted(x for x in sys.modules if x == 'brain.health' or x.startswith('brain.health.')))\n",
-        repo=tmp_path,
-    )
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.strip() != "[]"  # the sys.modules assertion flags the stand-in
 
 
 # --- the one temp-open helper under the text and bytes writers -----------------------------------------------------

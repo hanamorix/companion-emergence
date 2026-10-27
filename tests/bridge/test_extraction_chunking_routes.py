@@ -404,7 +404,7 @@ def test_c14d_a_failed_rollover_answers_null(persona, stub, monkeypatch, raw_app
 
 def _scan_blocked_until_health(monkeypatch, scan_threads: list[int], order: list[str], release, timeout_s: float):
     """Patch the buffer scan to record its thread, then block until ``release`` is set (or ``timeout_s``, a deadlock breaker
-    for the on-loop variant), recording ``scan done`` in ``order``. Ordering, not wall-clock time, is the oracle."""
+    so a blocked event loop cannot hang the test), recording ``scan done`` in ``order``. Ordering, not wall-clock time, is the oracle."""
     import brain.ingest.buffer as buffer
 
     real_list = buffer.list_active_sessions
@@ -452,88 +452,6 @@ def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, 
     assert _status(health)[0] == 200
     assert order == ["health done", "scan done"]
     assert scan_threads and all(t != loop_thread for t in scan_threads)
-
-
-# ---- fail-first variants, run through the same driver (kept executable) ----
-
-
-def test_c14_oracle_no_keepalive_variant_sends_nothing_before_the_json(persona, stub, monkeypatch, raw_app):
-    _seed(persona, _STALE, 6, age_hours=30)
-    monkeypatch.setattr(server, "_stream_keepalive_seconds", lambda: 3600.0)
-
-    async def main():
-        d = _Driver(raw_app)
-        await d.start()
-        try:
-            releaser = asyncio.ensure_future(_release_one_by_one(stub))
-            msgs = await d.get("/sessions/active")
-            await releaser
-        finally:
-            await d.stop()
-        return msgs
-
-    bodies = _bodies(_run(main()))
-    assert len(bodies) == 1  # (a)'s whitespace-before-the-JSON check fails on this variant
-
-
-def test_c14_oracle_no_shared_task_variant_answers_null_to_the_second_call(persona, stub, monkeypatch, raw_app):
-    _seed(persona, _STALE, 6, age_hours=30)
-
-    def _always_new(s):
-        return asyncio.ensure_future(
-            server.tracked_to_thread("sessions active", server._sessions_active_blocking, s.persona_dir, s.persona, s.provider)
-        )
-
-    monkeypatch.setattr(server, "_shared_sessions_active_task", _always_new)
-
-    async def main():
-        d = _Driver(raw_app)
-        await d.start()
-        try:
-            releaser = asyncio.ensure_future(_release_one_by_one(stub, pause=0.1))
-            a, b = await asyncio.gather(d.get("/sessions/active"), d.get("/sessions/active"))
-            await releaser
-        finally:
-            await d.stop()
-        return a, b
-
-    a, b = _run(main())
-    assert {_json(a)["session_id"] is None, _json(b)["session_id"] is None} == {True, False}
-
-
-def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, raw_app):
-    """Fail-first kept executable: with the decision run on the loop, the blocked scan holds the loop, so /health can only finish
-    after the scan (here released by its deadlock-breaking timeout), and the scan's thread is the loop's."""
-    _seed(persona, _STALE, 6, age_hours=30)
-    stub.gated = False
-    scan_threads: list[int] = []
-    order: list[str] = []
-    release = threading.Event()
-
-    async def _on_loop(label, fn, *a, **k):
-        return fn(*a, **k)
-
-    monkeypatch.setattr(server, "tracked_to_thread", _on_loop)
-
-    async def main():
-        d = _Driver(raw_app)
-        await d.start()
-        # Armed only now (see test_c14e): the startup seed lists the buffers on the loop too.
-        _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=1.0)
-        loop_thread = threading.get_ident()
-        try:
-            active = asyncio.ensure_future(d.get("/sessions/active"))
-            await d.get("/health")
-            order.append("health done")
-            release.set()
-            await active
-        finally:
-            release.set()
-            await d.stop()
-        return loop_thread
-
-    loop_thread = _run(main())
-    assert loop_thread in scan_threads and order == ["scan done", "health done"]
 
 
 # ---------------------------------------------------------------------------

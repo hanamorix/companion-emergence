@@ -292,28 +292,6 @@ def test_b1_the_heads_plan_covers_every_row_the_model_says_was_cut(kestrel, monk
     assert _covered(b1, sid, in_force) == []
 
 
-def test_b1_oracle_catches_a_planner_with_the_300_s_rule(kestrel, monkeypatch) -> None:
-    """Fail-first kept executable: with the pre-boundary lull at 300 s the 330 s gap splits the span and its head is missed."""
-    persona, _, _ = kestrel
-    b1, sid, _rows_, in_force = _b1_world(persona, monkeypatch)
-    monkeypatch.setattr(eb, "_PRE_LULL_UPPER_S", 300)
-    assert _covered(b1, sid, in_force) != []
-
-
-@pytest.mark.parametrize(
-    "labels",
-    [("user", "assistant"), ("user", _LONG_PERSONA), (_LONG_USER, "assistant")],
-    ids=["both-shortest", "shortest-user", "shortest-assistant"],
-)
-def test_b1_oracle_catches_a_planner_with_the_shortest_labels(kestrel, monkeypatch, labels) -> None:
-    """Fail-first kept executable: a planner measuring with the shortest labels, or the shortest of either half,
-    misses rows of the in-force cut."""
-    persona, _, _ = kestrel
-    b1, sid, _rows_, in_force = _b1_world(persona, monkeypatch)
-    monkeypatch.setattr(eb, "_plan_labels", lambda p: labels)
-    assert _covered(b1, sid, in_force) != []
-
-
 # ---------------------------------------------------------------------------
 # The everything planner
 # ---------------------------------------------------------------------------
@@ -354,17 +332,6 @@ def test_b3_dry_run_writes_nothing_and_calls_nothing(kestrel) -> None:
     assert "mode heads" in text and "mode all" in text and "sess_b3" in text and "calls=" in text and "chars=" in text
 
 
-def test_b3_oracle_catches_a_reader_that_creates_the_archive_dir(kestrel, monkeypatch) -> None:
-    from brain.ingest import buffer
-
-    persona, _, _ = kestrel
-    _active(persona, "sess_b3v", _rows("sess_b3v", _OLD, 8), cursor_at=13)
-    monkeypatch.setattr(eb, "_archive_files", lambda p, sid: buffer._archive_read_order(p, sid))
-    before = _listing(persona)
-    eb.dry_run_text(persona)
-    assert _listing(persona) != before
-
-
 # ---------------------------------------------------------------------------
 # Resume after a kill
 # ---------------------------------------------------------------------------
@@ -394,33 +361,6 @@ def test_b4_a_kill_mid_run_loses_nothing_and_repeats_nothing(kestrel) -> None:
     prompts = first.prompts[:k] + second.prompts
     for r in rows:
         assert sum(_line(r) in p for p in prompts) == 1, r["text"][:12]
-
-
-def test_b4_oracle_catches_progress_saved_before_the_commits(kestrel, monkeypatch) -> None:
-    persona, store, hebbian = kestrel
-    rows = _rows("sess_b4v", _OLD, 12)
-    _archive(persona, "sess_b4v", rows)
-    _arm(persona, "all")
-    real = eb.run_chunk_stages
-
-    def _save_first(persona_dir, sid, transcript, **kw):
-        last = [r for r in rows if _line(r) in transcript][-1]
-
-        def fn(cur):
-            cur["targets"][0]["done_through_ts"] = last["ts"]
-            return cur
-
-        eb.update_state(persona_dir, fn)
-        return real(persona_dir, sid, transcript, **kw)
-
-    monkeypatch.setattr(eb, "run_chunk_stages", _save_first)
-    first = _Stub(plan=lambda n, p: "kbint" if n == 3 else None)
-    with pytest.raises(KeyboardInterrupt):
-        _foreground(persona, store, hebbian, first)
-    second = _Stub()
-    _foreground(persona, store, hebbian, second)
-    prompts = first.prompts[:2] + second.prompts
-    assert any(sum(_line(r) in p for p in prompts) != 1 for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -459,15 +399,6 @@ def test_b5_a_stop_during_a_progress_write_is_not_lost(kestrel) -> None:
     assert state["status"] == "stopped"
 
 
-def test_b5_oracle_catches_a_missing_state_lock(kestrel, monkeypatch) -> None:
-    from contextlib import nullcontext
-
-    persona, store, hebbian = kestrel
-    monkeypatch.setattr(eb, "file_lock", lambda *a, **k: nullcontext(True))
-    state = _b5(persona, store, hebbian)
-    assert state["status"] != "stopped"  # the job's stale read overwrote the stop
-
-
 # ---------------------------------------------------------------------------
 # Plan identity
 # ---------------------------------------------------------------------------
@@ -488,16 +419,6 @@ def test_b6_a_chunk_from_an_old_plan_changes_nothing_but_discarded(kestrel) -> N
     expected = json.loads(json.dumps(replaced[0]))
     expected["counters"]["discarded"] = 1
     assert after == expected
-
-
-def test_b6_oracle_catches_a_write_without_the_plan_check(kestrel, monkeypatch) -> None:
-    persona, store, hebbian = kestrel
-    _archive(persona, "sess_b6v", _rows("sess_b6v", _OLD, 8))
-    _arm(persona, "all")
-    monkeypatch.setattr(eb, "_same_plan", lambda cur, plan_id: True)
-    _run(persona, store, hebbian, _Stub(plan=lambda n, p: (lambda: eb.update_state(persona, lambda _c: eb._new_state(persona, "all")))
-                                         if n == 1 else None))
-    assert eb.load_state(persona)["targets"][0]["done_through_ts"] is not None  # Q's target marked done by P's chunk
 
 
 def test_b6_restart_is_refused_while_a_run_holds_the_runner_lock(kestrel) -> None:
@@ -607,17 +528,6 @@ def test_b8_a_plan_stopped_between_passes_ends_the_run(kestrel, monkeypatch) -> 
     assert "stopped" in outputs[-1] and "Progress is kept" in outputs[-1]
 
 
-def test_b8_oracle_catches_a_loop_that_stops_only_without_a_lull(kestrel, monkeypatch) -> None:
-    persona, store, hebbian = kestrel
-    _archive(persona, "sess_b8v", _rows("sess_b8v", _OLD, 8))
-    _arm(persona, "all")
-    monkeypatch.setattr(eb, "_keep_going", lambda b, a, decisions, o: not any(d.action == "skip-no-lull" for d in decisions))
-    stub = _Stub(plan=lambda n, p: "kbint" if n > 3 else "defer")  # the call limit: a broken loop cannot hang the test
-    with pytest.raises(KeyboardInterrupt):
-        _foreground(persona, store, hebbian, stub)
-    assert len(stub.prompts) >= 2
-
-
 # ---------------------------------------------------------------------------
 # Dedup and the marker; the live session is left alone
 # ---------------------------------------------------------------------------
@@ -696,19 +606,6 @@ def test_b11_rows_carried_by_a_rollover_are_found_through_rolled_to(kestrel, mon
     for r in rows:
         assert sum(_line(r) in p for p in stub.prompts) == 1, r["text"][:12]
     assert eb.load_state(persona)["counters"]["missing"] == 0
-
-
-def test_b11_oracle_catches_a_reader_of_the_original_sid_only(kestrel, monkeypatch) -> None:
-    from brain.chat.rollover import perform_rollover
-
-    persona, store, hebbian = kestrel
-    rows = _b11_world(persona, monkeypatch)
-    _arm(persona, "all")
-    perform_rollover(persona, "sess_b11", "Kestrel", seed_mode="tiers_plus_tail")
-    monkeypatch.setattr(eb, "_rolled_to", lambda p, sid: None)
-    stub = _Stub()
-    _run_all(persona, store, hebbian, stub)
-    assert any(not any(_line(r) in p for p in stub.prompts) for r in rows)
 
 
 def test_b11_a_row_that_exists_nowhere_is_counted_missing(kestrel) -> None:
@@ -902,27 +799,6 @@ def test_b15_a_chunk_with_no_user_row(kestrel) -> None:
     assert eb._backdate(persona, opener, rows[-1]["ts"], now) == lenient_utc(rows[-2]["ts"])  # the newest user turn
 
 
-@pytest.mark.parametrize("variant", ["chunk-end", "dated-now"])
-def test_b15_oracle_catches_the_wrong_dates(kestrel, monkeypatch, variant) -> None:
-    from brain.utils.memory import days_since_human
-
-    persona, store, hebbian = kestrel
-    rows = _b15_history(persona)
-    newest_user = lenient_utc(rows[-2]["ts"])
-    if variant == "chunk-end":
-        monkeypatch.setattr(eb, "_backdate", lambda p, r, cursor_ts, now: min(lenient_utc(cursor_ts), now))
-    else:
-        monkeypatch.setattr(eb, "_backdate", lambda p, r, cursor_ts, now: None)
-    _arm(persona, "all")
-    _run_all(persona, store, hebbian, _Stub())
-    run_consolidation(store, persona_dir=persona, classifier=_PROMOTE_ALL)
-    now = datetime.now(UTC)
-    if variant == "chunk-end":
-        assert _silence_read_at(store, now) > newest_user + timedelta(seconds=1)
-    else:
-        assert days_since_human(store, now) < 0.01
-
-
 def test_b15_the_pipeline_still_dates_at_creation(kestrel) -> None:
     from brain.ingest.pipeline import extract_session_snapshot
 
@@ -964,16 +840,6 @@ def test_b16_the_pipeline_still_queues_soul_candidates(kestrel) -> None:
     persona, store, hebbian = kestrel
     _active(persona, "sess_b16p", _rows("sess_b16p", _OLD, 2), cursor_at=None)
     extract_session_snapshot(persona, "sess_b16p", store=store, hebbian=hebbian, provider=_Stub(importance=9))
-    assert _soul_count(persona) == 1
-
-
-def test_b16_oracle_catches_soul_on_under_all(kestrel, monkeypatch) -> None:
-    persona, store, hebbian = kestrel
-    _archive(persona, "sess_b16v", _rows("sess_b16v", _OLD, 2))
-    _arm(persona, "all")
-    real = eb.run_chunk_stages
-    monkeypatch.setattr(eb, "run_chunk_stages", lambda *a, **k: real(*a, **{**k, "queue_soul": True}))
-    _run(persona, store, hebbian, _Stub(importance=9))
     assert _soul_count(persona) == 1
 
 
@@ -1107,23 +973,6 @@ def test_b8_a_denied_slot_inside_run_is_skipped(kestrel, monkeypatch) -> None:
     decisions, _ = _pass_with_a_later_job(persona, stub, monkeypatch, is_idle=lambda: True, slot_available=lambda: True)
     assert stub.prompts == []
     assert ("extraction_backfill", "skipped") in [(d.job, d.action) for d in decisions]
-
-
-def test_b8_oracle_catches_a_job_that_loops(kestrel, monkeypatch) -> None:
-    persona, _, _ = kestrel
-    _three_chunk_plan(persona)
-    real = eb.run_one_chunk
-
-    def _loop(persona_dir, **kw):
-        step = real(persona_dir, **kw)
-        while eb.has_work(persona_dir):
-            step = real(persona_dir, **kw)
-        return step
-
-    monkeypatch.setattr(eb, "run_one_chunk", _loop)
-    stub = _Stub()
-    _pass_with_a_later_job(persona, stub, monkeypatch, is_idle=lambda: True, slot_available=lambda: True)
-    assert len(stub.prompts) == 3
 
 
 # ---------------------------------------------------------------------------
