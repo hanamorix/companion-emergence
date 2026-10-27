@@ -123,41 +123,65 @@ jobs:
           uv sync --all-extras
           uv pip install "mutmut==3.8.0"
 
-      # mutmut copies the source path and `also_copy` into `mutants/` and runs the tests there, so
-      # the top-level directories that tests read (app/, scripts/, docs/, ...) are listed.
-      # mutmut reads setup.cfg when pyproject.toml has no [tool.mutmut] table. `brain` is the source
-      # path so the whole tree is importable; only_mutate narrows what is changed.
-      - name: Write the mutmut config
-        env:
-          PACKAGE: ${{ matrix.package }}
-        run: |
-          printf '%s\n' \
-            '[mutmut]' \
-            'source_paths =' \
-            '    brain' \
-            'only_mutate =' \
-            "    brain/${PACKAGE}/*" \
-            'also_copy =' \
-            '    app' '    scripts' '    docs' '    examples' '    expressions' '    hooks' '    relay' '    wizard-validation' \
-            '    CHANGELOG.md' '    README.md' '    INSTALL.md' \
-            'pytest_add_cli_args =' \
-            '    -p' '    no:tdd-guard' '    -m' '    not live and not requires_claude_cli and not integration and not requires_network' \
-            'pytest_add_cli_args_test_selection =' \
-            "    tests/unit/brain/${PACKAGE}" \
-            'use_git_change_detection = false' > setup.cfg
-          cat setup.cfg
-
+      # mutmut copies the source path and `also_copy` into `mutants/` and runs the tests there, so the
+      # top-level directories that tests read (app/, scripts/, docs/, ...) are listed. mutmut reads
+      # setup.cfg when pyproject.toml has no [tool.mutmut] table. `brain` is the source path so the whole
+      # tree is importable; only_mutate narrows what is changed.
+      #
+      # mutmut first runs the package's tests once on the unmutated copy and stops at the first failure.
+      # Some tests cannot pass there: they read the text of brain/ (which holds mutmut's trampolines in
+      # the copy) or depend on the repository layout. When that first pass fails, the tests that fail in
+      # a full pass of the copy are listed in report/excluded-tests.txt, deselected, and mutmut starts
+      # again. A test that fails on unmutated code could only "kill" a mutant by accident.
       - name: Run mutmut
         env:
+          PACKAGE: ${{ matrix.package }}
           MAX_MINUTES: ${{ inputs.max_minutes }}
           EVENT: ${{ github.event_name }}
         run: |
           minutes="${MAX_MINUTES:-300}"
           if [ "$EVENT" = "pull_request" ]; then minutes=25; fi # TEMPORARY (#540 proof)
           if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then echo "::error::max_minutes must be a number"; exit 1; fi
+          mkdir -p report
+          marker_expr='not live and not requires_claude_cli and not integration and not requires_network'
+          write_config() {
+            printf '%s\n' \
+              '[mutmut]' \
+              'source_paths =' \
+              '    brain' \
+              'only_mutate =' \
+              "    brain/${PACKAGE}/*" \
+              'also_copy =' \
+              '    app' '    scripts' '    docs' '    examples' '    expressions' '    hooks' '    relay' '    wizard-validation' \
+              '    CHANGELOG.md' '    README.md' '    INSTALL.md' \
+              'pytest_add_cli_args =' \
+              '    -p' '    no:tdd-guard' '    -m' "    ${marker_expr}" > setup.cfg
+            if [ -s report/excluded-tests.txt ]; then
+              while read -r id; do printf '    --deselect\n    %s\n' "$id" >> setup.cfg; done < report/excluded-tests.txt
+            fi
+            printf '%s\n' \
+              'pytest_add_cli_args_test_selection =' \
+              "    tests/unit/brain/${PACKAGE}" \
+              'use_git_change_detection = false' >> setup.cfg
+          }
+          write_config
+          cat setup.cfg
           set +e
-          timeout "${minutes}m" .venv/bin/python -m mutmut run
-          rc=$?
+          timeout "${minutes}m" .venv/bin/python -m mutmut run 2>&1 | tee mutmut-run.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" = 1 ] && grep -q "failed to collect stats" mutmut-run.log; then
+            echo "The first pass on the unmutated copy failed; finding every test that fails there."
+            (cd mutants && MUTANT_UNDER_TEST= ../.venv/bin/python -m pytest -p no:tdd-guard -p no:cacheprovider -q -rf --tb=no \
+              -m "$marker_expr" "tests/unit/brain/${PACKAGE}" 2>&1 | tee ../clean-pass.log)
+            grep '^FAILED ' clean-pass.log | sed 's/^FAILED //; s/ - .*$//' | sort -u > report/excluded-tests.txt
+            echo "excluded: $(wc -l < report/excluded-tests.txt) tests"
+            if [ -s report/excluded-tests.txt ]; then
+              write_config
+              rm -rf mutants
+              timeout "${minutes}m" .venv/bin/python -m mutmut run 2>&1 | tee mutmut-run.log
+              rc=${PIPESTATUS[0]}
+            fi
+          fi
           echo "$rc" > mutmut-exit.txt
           if [ "$rc" != 0 ] && [ "$rc" != 124 ]; then
             echo "::error::mutmut run exited $rc (the package's tests do not pass under mutmut, or nothing could be mutated)"
@@ -185,6 +209,7 @@ jobs:
             cat report/stats.json 2>/dev/null || echo '{}'
             echo '```'
             if [ "$(cat mutmut-exit.txt 2>/dev/null)" = "124" ]; then echo; echo "partial: the time limit stopped the run."; fi
+            if [ -s report/excluded-tests.txt ]; then echo; echo "excluded (they fail on the unmutated copy): $(wc -l < report/excluded-tests.txt) tests, listed in excluded-tests.txt"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           total="$(.venv/bin/python -c "import json,sys; print(json.load(open('report/stats.json'))['total'])" 2>/dev/null || echo 0)"
           if [ "$total" = "0" ]; then echo "::error::no mutant was run for brain/$PACKAGE"; exit 1; fi
