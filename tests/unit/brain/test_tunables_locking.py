@@ -113,18 +113,18 @@ def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) 
 # ---------------------------------------------------------------------------
 
 
-def test_set_values_on_a_wedged_lock_raises_and_leaves_the_file(t, tmp_path, wedged_lock, monkeypatch) -> None:
+def test_set_values_on_a_wedged_lock_raises_and_leaves_the_file(t, tmp_path, held_lock, monkeypatch) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     write_text(tmp_path, '"a" = 1\n')
     before = _file(tmp_path).read_bytes()
-    with wedged_lock(_file(tmp_path)), pytest.raises(t.TunablesWriteError):
+    with held_lock(_file(tmp_path)), pytest.raises(t.TunablesWriteError):
         t.set_values({"a": 2})
     assert _file(tmp_path).read_bytes() == before
 
 
-def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, wedged_lock, monkeypatch, caplog) -> None:
+def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, held_lock, monkeypatch, caplog) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
@@ -132,7 +132,7 @@ def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, wedged_
     write_text(tmp_path, '"a" = 1\n')
     before = _file(tmp_path).read_bytes()
     stamp = _file(tmp_path).stat().st_mtime_ns
-    with wedged_lock(_file(tmp_path)), caplog.at_level("WARNING"):
+    with held_lock(_file(tmp_path)), caplog.at_level("WARNING"):
         t.sync_file()
     assert _file(tmp_path).read_bytes() == before
     assert _file(tmp_path).stat().st_mtime_ns == stamp

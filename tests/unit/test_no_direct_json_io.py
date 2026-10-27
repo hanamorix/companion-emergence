@@ -332,8 +332,9 @@ class _FileScan(ast.NodeVisitor):
         return False
 
 
-def scan_source(source: str, rel: str) -> Counter[str]:
-    tree = ast.parse(source)
+def scan_source(source: str, rel: str, tree: ast.Module | None = None) -> Counter[str]:
+    """The counts for one module; pass ``tree`` (parsed from ``source``) to skip parsing it again."""
+    tree = ast.parse(source) if tree is None else tree
     scanner = _FileScan(source.splitlines(), rel not in SKIP_LEGACY_IN)
     scanner.visit(tree)
     return scanner.counts
@@ -346,6 +347,24 @@ def scan(root: Path) -> dict[str, Counter[str]]:
         if rel in SKIP_FILES or "__pycache__" in path.parts:
             continue
         counts = scan_source(path.read_text(encoding="utf-8"), rel)
+        if counts:
+            out[rel] = counts
+    return out
+
+
+def scan_repo() -> dict[str, Counter[str]]:
+    """``scan`` of this repository, from the process-wide parsed copy of ``brain/`` (tests/source_tree.py)."""
+    from tests.source_tree import (  # imported here: this file also runs as a script
+        brain_sources,
+        brain_trees,
+    )
+
+    trees = brain_trees()
+    out: dict[str, Counter[str]] = {}
+    for rel, source in brain_sources().items():
+        if rel in SKIP_FILES:
+            continue
+        counts = scan_source(source, rel, trees[rel])
         if counts:
             out[rel] = counts
     return out
@@ -439,7 +458,7 @@ def format_observed(observed: dict[str, Counter[str]]) -> str:
 
 def test_cs2_a_the_tree_matches_the_allowlist() -> None:
     allow = parse_allowlist(ALLOWLIST.read_text(encoding="utf-8"))
-    errors, warns = compare(REPO, scan(REPO), allow)
+    errors, warns = compare(REPO, scan_repo(), allow)
     _emit(warns)
     assert not errors, "\n".join(errors)
 
@@ -738,13 +757,11 @@ def _defs(path: Path) -> dict[str, ast.AST]:
 
 
 def test_pc2_legacy_names_are_undefined_and_kept_helpers_are_exact() -> None:
-    for path in sorted((REPO / "brain").rglob("*.py")):
-        defined = {
-            n.name
-            for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        assert not (defined & _DELETED_LEGACY_NAMES), (path, defined & _DELETED_LEGACY_NAMES)
+    from tests.source_tree import brain_sources, brain_trees
+
+    for rel, tree in brain_trees().items():
+        defined = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        assert not (defined & _DELETED_LEGACY_NAMES), (rel, defined & _DELETED_LEGACY_NAMES)
     heal = REPO / "brain" / "health" / "attempt_heal.py"
     swb = _defs(heal)["save_with_backup"]
     assert ast.dump(swb) == ast.dump(ast.parse(_KEPT_SAVE_WITH_BACKUP).body[0]), "save_with_backup must stay byte-identical"
@@ -752,11 +769,9 @@ def test_pc2_legacy_names_are_undefined_and_kept_helpers_are_exact() -> None:
     assert set(reader) == {"JsonlLineError", "_parse_lines", "iter_jsonl_skipping_corrupt"}
     # The only brain modules that still call the kept helpers are the held felt-time files.
     importers = set()
-    for path in sorted((REPO / "brain").rglob("*.py")):
-        rel = path.relative_to(REPO).as_posix()
+    for rel, text in brain_sources().items():
         if rel in ("brain/health/attempt_heal.py", "brain/health/jsonl_reader.py", "brain/health/json_io.py"):
             continue
-        text = path.read_text(encoding="utf-8")
         if re.search(r"import[^\n]*\b(save_with_backup|iter_jsonl_skipping_corrupt)\b", text):
             importers.add(rel)
     assert importers == {
@@ -786,11 +801,9 @@ def test_cs2_h_the_allowlist_end_state_has_only_not_file_io_and_held_entries() -
         "brain/felt_time/weather_shift.py",
         "brain/health/attempt_heal.py",
     }, held
-    marked = {
-        p.relative_to(REPO).as_posix()
-        for p in (REPO / "brain").rglob("*.py")
-        if "# json-io: ok --" in p.read_text(encoding="utf-8")
-    }
+    from tests.source_tree import brain_sources
+
+    marked = {rel for rel, text in brain_sources().items() if "# json-io: ok --" in text}
     assert marked == {
         "brain/cli.py",
         "brain/health/log_rotation.py",

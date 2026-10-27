@@ -45,6 +45,7 @@ from brain.bridge.model_tier import (
     shipped_default,
 )
 from brain.bridge.provider import ClaudeCliProvider
+from tests.source_tree import brain_sources, tree_sources
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -146,15 +147,14 @@ _LEGACY_OWNERS = ("brain/persona_config.py", "brain/model_migration.py")
 
 
 def _source_files():
+    """``(path relative to the repository, text)`` of the product source: brain, the app, scripts (read once per process)."""
     for root, suffixes in (
-        (_REPO_ROOT / "brain", (".py",)),
-        (_REPO_ROOT / "app" / "src", (".ts", ".tsx")),
-        (_REPO_ROOT / "app" / "src-tauri" / "src", (".rs",)),
-        (_REPO_ROOT / "scripts", (".py", ".sh")),
+        ("brain", (".py",)),
+        ("app/src", (".ts", ".tsx")),
+        ("app/src-tauri/src", (".rs",)),
+        ("scripts", (".py", ".sh")),
     ):
-        for path in sorted(root.rglob("*")):
-            if path.is_file() and path.suffix in suffixes and "node_modules" not in path.parts:
-                yield path
+        yield from tree_sources(root, suffixes, ("node_modules",)).items()
 
 
 # Tests that name removed identifiers ON PURPOSE (to assert they are gone, or to feed the guard a violating fixture).
@@ -180,9 +180,8 @@ def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
     test_pattern = re.compile(r"(?<![\w])(" + "|".join(map(re.escape, names)) + r")(?![\w])")
     legacy = re.compile(r"(?<![\w])(" + "|".join(_LEGACY_KEYS) + r")(?![\w])")
     hits: list[str] = []
-    for path in _source_files():
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for rel, text in _source_files():
+        for lineno, line in enumerate(text.splitlines(), 1):
             if pattern.search(line):
                 hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
             if legacy.search(line) and rel not in _LEGACY_OWNERS:
@@ -205,9 +204,8 @@ _STALE_WORDING = re.compile(
 
 def test_no_text_describes_the_settings_as_lines_or_a_typed_id_as_pinning() -> None:
     hits: list[str] = []
-    for path in _source_files():
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for rel, text in _source_files():
+        for lineno, line in enumerate(text.splitlines(), 1):
             if _STALE_WORDING.search(line):
                 hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
     assert hits == [], "stale wording:\n" + "\n".join(hits)
@@ -526,9 +524,8 @@ def test_only_set_job_models_writes_model_keys() -> None:
     import ast
 
     offenders = []
-    for path in sorted((_REPO_ROOT / "brain").rglob("*.py")):
-        rel = path.relative_to(_REPO_ROOT / "brain").as_posix()
-        text = path.read_text(encoding="utf-8")
+    for full, text in brain_sources().items():
+        rel = full.removeprefix("brain/")
         if rel in ("tunables.py", "bridge/model_tier.py") or "set_values(" not in text:
             continue
         # tunables_migration.py folds an old file of arbitrary keys and names none of them (key-agnostic): its ONE function

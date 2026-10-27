@@ -298,13 +298,13 @@ def test_a_damaged_settings_file_prints_the_reason_and_the_path_and_exits_non_ze
     assert _run(["clear-tier", "compaction"]) == 1
 
 
-def test_a_wedged_lock_makes_the_command_fail_without_writing(wedged_lock, monkeypatch, capsys) -> None:
+def test_a_wedged_lock_makes_the_command_fail_without_writing(held_lock, monkeypatch, capsys) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     tunables.set_values({"other.key": 1})
     before = _PATH().read_bytes()
-    with wedged_lock(_PATH()):
+    with held_lock(_PATH()):
         assert _run(["set-tier", "compaction", "claude-haiku-4-5"]) == 1
     assert _PATH().read_bytes() == before
     assert "could not lock" in capsys.readouterr().err

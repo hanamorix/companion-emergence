@@ -146,9 +146,9 @@ def _enclosing_functions(tree: ast.Module) -> dict[int, ast.AST | None]:
     return owner
 
 
-def scan_source(source: str) -> list[str]:
-    """The violations (one short text each) found in one module's source."""
-    tree = ast.parse(source)
+def scan_source(source: str, tree: ast.Module | None = None) -> list[str]:
+    """The violations (one short text each) found in one module's source (``tree``: its parse, to skip parsing again)."""
+    tree = ast.parse(source) if tree is None else tree
     module = _module_constants(tree)
     owner = _enclosing_functions(tree)
     found: list[str] = []
@@ -196,13 +196,29 @@ def scan_tree(root: Path) -> dict[str, list[str]]:
     return out
 
 
+def scan_repo() -> dict[str, list[str]]:
+    """``scan_tree`` of this repository, from the process-wide parsed copy of its source (tests/source_tree.py)."""
+    from tests.source_tree import tree_asts, tree_sources
+
+    out: dict[str, list[str]] = {}
+    for sub in SCAN_DIRS:
+        trees = tree_asts(sub)
+        for rel, source in tree_sources(sub).items():
+            if rel in EXEMPT or rel in ALLOWLIST:
+                continue
+            hits = scan_source(source, trees[rel])
+            if hits:
+                out[rel] = hits
+    return out
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # The product tree
 # ---------------------------------------------------------------------------------------------------------------
 
 
 def test_no_toml_io_outside_the_helper() -> None:
-    offenders = scan_tree(REPO)
+    offenders = scan_repo()
     assert not offenders, (
         "TOML is read and written only through brain/utils/toml_io.py; offenders:\n"
         + "\n".join(f"  {rel}: {', '.join(hits)}" for rel, hits in offenders.items())

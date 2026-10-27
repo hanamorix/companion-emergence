@@ -24,8 +24,7 @@ from brain.memory.name_rules import (
 )
 from brain.memory.relevance import lead_with_names, names_in, rank_name_hits
 from brain.memory.store import FtsPhrases, Memory, MemoryStore
-
-_REPO = Path(__file__).resolve().parents[4]
+from tests.source_tree import brain_trees
 
 
 def _known(*names: str) -> kn.KnownNames:
@@ -247,13 +246,15 @@ def test_n5_the_matcher_calls_the_shared_rules_through_its_namespace(monkeypatch
 def test_n5_no_private_copy_of_the_shared_rules() -> None:
     shared = {"is_stopword_name", "stopword_name_occurrence_ok", "followed_by_apostrophe_t",
               "contraction_stems"}
-    for folder in ("brain/memory", "brain/engines", "brain/tools", "brain/chat"):
-        for path in (_REPO / folder).rglob("*.py"):
-            if path.name == "name_rules.py":
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-            assert not (defined & shared), (path, defined & shared)
+    folders = ("brain/memory/", "brain/engines/", "brain/tools/", "brain/chat/")
+    scanned = 0
+    for rel, tree in brain_trees().items():
+        if not rel.startswith(folders) or rel.rsplit("/", 1)[-1] == "name_rules.py":
+            continue
+        scanned += 1
+        defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        assert not (defined & shared), (rel, defined & shared)
+    assert scanned > 20, "the folder filter matched (almost) no file, so nothing was checked"
 
 
 # --------------------------------------------------------------------------

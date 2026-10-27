@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.tunables_file import register_calls, register_calls_in_source
+from tests.tunables_file import register_calls, register_calls_in_source, repo_register_calls
 
 REPO = Path(__file__).resolve().parents[3]
 BRAIN = REPO / "brain"
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.xdist_group("tunables-probe")
 
 def _register_calls() -> list[tuple[str, int, ast.Call]]:
     """Every call of ``brain.tunables.register`` under brain/, however the module or the function was imported (rev-4 S7)."""
-    return register_calls(REPO)
+    return list(repo_register_calls())
 
 
 def _has_description(call: ast.Call) -> bool:

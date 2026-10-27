@@ -29,6 +29,7 @@ from brain.bridge import supervisor
 from brain.bridge.central_cadence import JobOutcome
 from brain.memory import cost_series
 from brain.memory.store import MemoryStore
+from tests.source_tree import brain_sources, brain_trees
 from tests.unit.brain.bridge.test_central_cadence import (
     _denying_slot,
     _granting_slot,
@@ -1065,7 +1066,7 @@ def test_s179_a_reranking_turn_and_the_recording_of_its_cost_touch_no_verdict(
 def test_s179_only_the_lull_job_entry_points_touch_the_verdict() -> None:
     """A2g: nothing on the reply path (`rerank_for_recall` and the callers of the rerank) writes
     or deletes a verdict: the verdict helpers are called only from the due check and the job."""
-    tree = ast.parse((_REPO / "brain/memory/reranker.py").read_text(encoding="utf-8"))
+    tree = brain_trees()["brain/memory/reranker.py"]
     names = {"_remember_too_long", "_too_long_remembered", "_end_verdict", "_load_saved_verdict"}
     callers: dict[str, set[str]] = {n: set() for n in names}
     for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
@@ -1098,12 +1099,12 @@ def test_s179_only_the_lull_job_entry_points_touch_the_verdict() -> None:
     ]
     assert not [c for c in module_level if getattr(c.func, "attr", getattr(c.func, "id", "")) in {*storage, *names}]
     definers = {"reranker.py", "cost_series.py", "store.py"}  # the helpers and the storage methods they use
-    for path in (_REPO / "brain").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if path.name != "reranker.py":
-            assert not any(n in text for n in names), path
-        if path.name not in definers:
-            assert not any(n in text for n in ("save_verdict", "clear_verdict", "save_cost_verdict")), path
+    for rel, text in brain_sources().items():
+        name = rel.rsplit("/", 1)[-1]
+        if name != "reranker.py":
+            assert not any(n in text for n in names), rel
+        if name not in definers:
+            assert not any(n in text for n in ("save_verdict", "clear_verdict", "save_cost_verdict")), rel
 
 
 # ---------------------------------------------------------------------------
@@ -1214,11 +1215,10 @@ def test_c16d_a_raising_compaction_job_propagates(tmp_path, monkeypatch: pytest.
 
 def test_c16d_nothing_starts_a_new_period_any_more() -> None:
     """S146 supersedes S101's reset at the compaction tick."""
-    for path in sorted((_REPO / "brain").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for rel, tree in brain_trees().items():
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                assert node.func.attr != "start_new_period", path
+                assert node.func.attr != "start_new_period", rel
 
 
 # ---------------------------------------------------------------------------

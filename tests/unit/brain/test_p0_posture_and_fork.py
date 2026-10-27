@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import brain
+from tests.source_tree import brain_sources
 
 _BRAIN_ROOT = Path(brain.__file__).parent
 
@@ -54,17 +55,12 @@ _REMOVED_TRANSPORT_SYMBOLS = (
 )
 
 
-def _brain_py_files() -> list[Path]:
-    return [p for p in _BRAIN_ROOT.rglob("*.py") if "__pycache__" not in p.parts]
-
-
 def test_removed_transport_symbols_absent_from_source() -> None:
     offenders: dict[str, list[str]] = {}
-    for path in _brain_py_files():
-        text = path.read_text(encoding="utf-8")
+    for rel, text in brain_sources().items():
         for sym in _REMOVED_TRANSPORT_SYMBOLS:
             if sym in text:
-                offenders.setdefault(str(path.relative_to(_BRAIN_ROOT)), []).append(sym)
+                offenders.setdefault(rel.removeprefix("brain/"), []).append(sym)
     assert not offenders, f"removed transport symbols still present: {offenders}"
 
 

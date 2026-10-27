@@ -36,6 +36,7 @@ from brain.memory.reranker import (
     normalize_bundled_pairs_against_anchors,
 )
 from brain.memory.store import MemoryStore
+from tests.source_tree import brain_sources, brain_trees
 
 # ---------------------------------------------------------------------------
 # FakeRerankerProvider — scriptable, offline
@@ -2360,11 +2361,8 @@ def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected(
 
 
 def test_g12_no_text_in_brain_still_calls_inactive_file_the_reclaimable_term(tmp_path) -> None:
-    from pathlib import Path
-
-    root = Path(reranker_mod.__file__).resolve().parents[1]
-    assert (root / "memory" / "reranker.py").is_file()
-    assert _py_files_mentioning(root, "inactive_file") == []
+    assert "brain/memory/reranker.py" in brain_sources()
+    assert [rel for rel, text in brain_sources().items() if "inactive_file" in text] == []
     # the sweep can fail: it flags a known-bad file placed in a directory it walks
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "stale.py").write_text('"""reclaimable = memory.stat inactive_file"""\n', encoding="utf-8")
@@ -2737,16 +2735,22 @@ class _RerankCallFinder(_ast.NodeVisitor):
 
 
 def _rerank_call_sites(root=None) -> dict[tuple[str, str], int]:
-    """(file, enclosing function) -> how many `.rerank(` / `.rerank_timed(` calls it holds."""
-    import pathlib
+    """(file, enclosing function) -> how many `.rerank(` / `.rerank_timed(` calls it holds.
 
-    root = pathlib.Path(__file__).resolve().parents[4] if root is None else root
+    ``root`` None scans this repository's brain/ from the process-wide parsed copy; a path scans ``root / "brain"``."""
+    if root is None:
+        modules = brain_trees().items()
+    else:
+        modules = (
+            (path.relative_to(root).as_posix(), _ast.parse(path.read_text(encoding="utf-8")))
+            for path in sorted((root / "brain").rglob("*.py"))
+        )
     found: dict[tuple[str, str], int] = {}
-    for path in sorted((root / "brain").rglob("*.py")):
+    for rel, tree in modules:
         finder = _RerankCallFinder()
-        finder.visit(_ast.parse(path.read_text(encoding="utf-8")))
+        finder.visit(tree)
         for scope in finder.scopes:
-            key = (path.relative_to(root).as_posix(), scope)
+            key = (rel, scope)
             found[key] = found.get(key, 0) + 1
     return found
 

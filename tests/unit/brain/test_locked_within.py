@@ -21,6 +21,30 @@ def test_timeout_raises_and_the_body_never_runs(tmp_path: Path, wedged_lock) -> 
     assert ran == []
 
 
+def test_held_lock_contends_with_a_second_acquirer_in_the_same_process_and_releases(tmp_path: Path, held_lock) -> None:
+    """The in-process holder is a real contender (each ``file_lock`` opens its own descriptor), and it lets go on exit."""
+    target = tmp_path / "data.json"
+    with held_lock(target):
+        with file_lock(target, blocking=False) as acquired:
+            assert acquired is False
+        with pytest.raises(TimeoutError), locked_within(target, 0.2):
+            pytest.fail("the body must not run while the lock is held")  # pragma: no cover
+    with file_lock(target, blocking=False) as acquired:
+        assert acquired is True
+
+
+def test_held_lock_releases_when_the_body_raises(tmp_path: Path, held_lock) -> None:
+    target = tmp_path / "data.json"
+
+    class BoomError(Exception):
+        pass
+
+    with pytest.raises(BoomError), held_lock(target):
+        raise BoomError
+    with file_lock(target, blocking=False) as acquired:
+        assert acquired is True
+
+
 def test_success_enters_the_body_exactly_once(tmp_path: Path) -> None:
     """C42 (b)."""
     target = tmp_path / "data.json"

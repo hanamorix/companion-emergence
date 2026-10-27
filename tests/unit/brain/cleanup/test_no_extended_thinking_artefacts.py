@@ -8,9 +8,7 @@ of the dead tokens reappear in production code.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
+from tests.source_tree import tree_sources
 
 FORBIDDEN_TOKENS = (
     "thinking_budget_tokens",
@@ -23,10 +21,9 @@ FORBIDDEN_TOKENS = (
     "/persona/config/thinking",
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-
 INCLUDE_DIRS = ("brain", "app/src")
 
+# Matched against each file's path relative to the repository.
 EXCLUDE_SUBSTRINGS = (
     "node_modules",
     ".pyc",
@@ -42,35 +39,14 @@ EXCLUDE_SUBSTRINGS = (
 SOURCE_EXTENSIONS = (".py", ".ts", ".tsx", ".rs", ".json")
 
 
-def _walk_source_files():
+def test_no_forbidden_token_in_source():
+    """No forbidden token appears in the source files under brain/ or app/src/ (one pass over the tree for all tokens)."""
+    hits: dict[str, list[str]] = {}
     for root_name in INCLUDE_DIRS:
-        root = PROJECT_ROOT / root_name
-        if not root.exists():
-            continue
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            path_str = str(path)
-            if any(s in path_str for s in EXCLUDE_SUBSTRINGS):
-                continue
-            if path.suffix not in SOURCE_EXTENSIONS:
-                continue
-            yield path
-
-
-@pytest.mark.parametrize("token", FORBIDDEN_TOKENS)
-def test_no_forbidden_token_in_source(token: str):
-    """Each forbidden token must not appear in tracked source files under brain/ or app/src/."""
-    hits: list[str] = []
-    for path in _walk_source_files():
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if token in text:
-            hits.append(str(path.relative_to(PROJECT_ROOT)))
-    assert not hits, (
-        f"Forbidden v0.0.25-era token {token!r} found in:\n  "
-        + "\n  ".join(hits)
-        + "\nThese paths must not reintroduce extended-thinking plumbing."
+        for rel, text in tree_sources(root_name, SOURCE_EXTENSIONS, EXCLUDE_SUBSTRINGS).items():
+            for token in FORBIDDEN_TOKENS:
+                if token in text:
+                    hits.setdefault(token, []).append(rel)
+    assert not hits, "Forbidden v0.0.25-era tokens found (these paths must not reintroduce extended-thinking plumbing):\n" + "\n".join(
+        f"  {token!r} in {', '.join(paths)}" for token, paths in hits.items()
     )

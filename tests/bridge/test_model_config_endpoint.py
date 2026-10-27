@@ -174,12 +174,12 @@ def test_a_damaged_settings_file_answers_500_and_is_not_touched(tmp_path) -> Non
     assert tunables._file_path().read_text() == '# mine\na = 1\nb = = 2\n'
 
 
-def test_a_wedged_lock_answers_500_and_writes_nothing(tmp_path, wedged_lock, monkeypatch) -> None:
+def test_a_wedged_lock_answers_500_and_writes_nothing(tmp_path, held_lock, monkeypatch) -> None:
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     client, _ = _make_client(tmp_path)
     with client:
         before = tunables._file_path().read_bytes()
-        with wedged_lock(tunables._file_path()):
+        with held_lock(tunables._file_path()):
             r = _post(client, "haiku")
         assert tunables._file_path().read_bytes() == before
     assert r.status_code == 500 and r.json()["error"] == "tunables_unwritable"

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -884,8 +885,9 @@ with file_lock(Path(sys.argv[1])):
 def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None]]:
     """Hold ``file_lock(path)`` in ANOTHER process for the length of a ``with`` block (a wedged lock holder).
 
-    Used by the lock-timeout tests: the holder never releases until the block ends, so a bounded wait must give up
-    and a caller must not write.
+    The holder never releases until the block ends, so a bounded wait must give up and a caller must not write. This
+    form starts an interpreter, so only the test that needs the lock held by another PROCESS uses it
+    (``test_locked_within.py::test_timeout_raises_and_the_body_never_runs``); the rest use ``held_lock``.
     """
 
     @contextmanager
@@ -905,6 +907,45 @@ def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None
             if proc.stdin is not None:
                 proc.stdin.close()
             proc.wait(timeout=20)
+
+    return _hold
+
+
+@pytest.fixture
+def held_lock() -> Callable[[Path], AbstractContextManager[None]]:
+    """Hold ``file_lock(path)`` on a thread of THIS process for the length of a ``with`` block (a wedged lock holder).
+
+    The cheap form of ``wedged_lock``: ``file_lock`` opens its own descriptor (``flock`` on POSIX, ``msvcrt.locking`` on its
+    own handle on Windows), so a second ``file_lock`` of the same path contends with the holder even inside one process, and
+    a test that asserts "a bounded wait gives up and nothing is written" needs no interpreter start. The holder never
+    releases until the block ends. Only a test about the lock crossing a process boundary needs ``wedged_lock``.
+    """
+    from brain.utils.file_lock import file_lock
+
+    @contextmanager
+    def _hold(path: Path) -> Iterator[None]:
+        held = threading.Event()
+        release = threading.Event()
+        failure: list[BaseException] = []
+
+        def _holder() -> None:
+            try:
+                with file_lock(path):
+                    held.set()
+                    release.wait(60)
+            except BaseException as exc:  # reported by the test thread below, not lost on a daemon thread
+                failure.append(exc)
+                held.set()
+
+        thread = threading.Thread(target=_holder, name="held-lock", daemon=True)
+        thread.start()
+        try:
+            assert held.wait(10), "the holder thread never took the lock"
+            assert not failure, f"the holder thread could not take the lock: {failure[0]!r}"
+            yield
+        finally:
+            release.set()
+            thread.join(10)
 
     return _hold
 

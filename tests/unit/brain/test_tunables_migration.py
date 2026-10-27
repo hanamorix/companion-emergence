@@ -63,7 +63,7 @@ def test_the_old_values_become_entries_and_every_other_key_gets_its_default(t, t
     assert len(_renamed(tmp_path)) == 1
 
 
-def test_a_second_start_does_nothing_no_lock_no_write(t, tmp_path, wedged_lock, monkeypatch) -> None:
+def test_a_second_start_does_nothing_no_lock_no_write(t, tmp_path, held_lock, monkeypatch) -> None:
     from brain import dev_constants
 
     _write_legacy(tmp_path, {"a.one": 5.0})
@@ -71,7 +71,7 @@ def test_a_second_start_does_nothing_no_lock_no_write(t, tmp_path, wedged_lock, 
     path = tmp_path / FILE_NAME
     before, mtime = path.read_bytes(), path.stat().st_mtime_ns
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.2)
-    with wedged_lock(path):  # a second start that took the lock would time out and log
+    with held_lock(path):  # a second start that took the lock would time out and log
         migrate_legacy_json(tmp_path, complete_registry=True)
     assert path.read_bytes() == before and path.stat().st_mtime_ns == mtime
 
@@ -205,13 +205,13 @@ def test_a_wrong_typed_value_is_copied_and_the_reader_ignores_it(t, tmp_path) ->
 # ---------------------------------------------------------------------------
 
 
-def test_a_lock_timeout_leaves_both_files_as_they_were_and_the_next_start_retries(t, tmp_path, wedged_lock, monkeypatch) -> None:
+def test_a_lock_timeout_leaves_both_files_as_they_were_and_the_next_start_retries(t, tmp_path, held_lock, monkeypatch) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     legacy = _write_legacy(tmp_path, {"a.one": 5.0})
     before = legacy.read_bytes()
-    with wedged_lock(tmp_path / FILE_NAME):
+    with held_lock(tmp_path / FILE_NAME):
         migrate_legacy_json(tmp_path, complete_registry=True)
     assert legacy.read_bytes() == before and not _renamed(tmp_path)
     assert not (tmp_path / FILE_NAME).exists()
@@ -352,13 +352,13 @@ def test_the_migration_never_raises_into_startup(t, tmp_path, monkeypatch) -> No
     assert (tmp_path / LEGACY).exists()
 
 
-def test_the_pre_check_is_one_exists_call_and_takes_no_lock(t, tmp_path, wedged_lock, monkeypatch) -> None:
+def test_the_pre_check_is_one_exists_call_and_takes_no_lock(t, tmp_path, held_lock, monkeypatch) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.2)
     write_text(tmp_path, '"a.one" = 1.0\n')
     before = (tmp_path / FILE_NAME).stat().st_mtime_ns
-    with wedged_lock(tmp_path / FILE_NAME):
+    with held_lock(tmp_path / FILE_NAME):
         migrate_legacy_json(tmp_path, complete_registry=True)
     assert (tmp_path / FILE_NAME).stat().st_mtime_ns == before
 
