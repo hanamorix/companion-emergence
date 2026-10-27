@@ -124,9 +124,9 @@ def test_compute_likely_active_peak_hour_true_offpeak_false(tmp_path: Path) -> N
 
     # Inject _now at UTC 02:00 — 12 hours away, that bucket has 0 turns
     now_off = datetime(2026, 1, 15, 2, 0, 0, tzinfo=UTC)
-    # Guard: confirm these map to different local hours (always true since 12h apart)
-    if now_off.astimezone().hour != now_peak.astimezone().hour:
-        assert _compute_likely_active(tmp_path, _now=now_off) is False
+    # The code buckets by the host's local hour; two instants 12 h apart never share one, in any zone.
+    assert now_off.astimezone().hour != now_peak.astimezone().hour
+    assert _compute_likely_active(tmp_path, _now=now_off) is False
 
 
 def test_compute_response_lag_p50_no_file_returns_none(tmp_path: Path) -> None:
@@ -814,8 +814,8 @@ def test_c5_likely_active_flips_across_hour_boundary_without_a_new_recompute(
     assert presence_peak.likely_active is True
 
     now_off = now_peak + timedelta(hours=12)  # well within the 24h cadence -> NOT due
-    if now_off.astimezone().hour == now_peak.astimezone().hour:
-        pytest.skip("12h-apart hours coincide on this host's local zone")
+    # The code buckets by the host's local hour; two instants 12 h apart never share one, in any zone.
+    assert now_off.astimezone().hour != now_peak.astimezone().hour
     presence_off = compute_user_presence(tmp_path, _now=now_off)
     assert presence_off.likely_active is False, (
         "classification must reflect the CURRENT hour, not a boolean frozen "

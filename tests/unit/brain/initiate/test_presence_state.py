@@ -255,7 +255,6 @@ def test_c9_presence_lock_not_held_across_a_scan(tmp_path: Path) -> None:
     lock = _presence_lock(tmp_path)
     lock.acquire()
     try:
-        started = time.monotonic()
 
         def call_record_inbound():
             record_inbound_turn(tmp_path, "2026-05-29T10:00:00+00:00")
@@ -263,17 +262,15 @@ def test_c9_presence_lock_not_held_across_a_scan(tmp_path: Path) -> None:
         t = threading.Thread(target=call_record_inbound)
         t.start()
         time.sleep(0.05)
-        # The hook must still be blocked (lock held) — this doesn't assert
-        # the API's design directly, but the release-and-join below bounds
-        # how long it took once released.
+        # The hook is blocked while the lock is held; the release-and-join below shows it finishes once released.
+        assert t.is_alive()
     finally:
         lock.release()
+    # Releasing a lock that was ONLY ever meant to guard a tiny read-merge-write
+    # must let the waiter finish: a waiter still alive 5 s after the release is
+    # stuck (for example on a conversation-history scan), however slow the host.
     t.join(timeout=5)
-    elapsed = time.monotonic() - started
-    # A coarse bound: releasing a lock that was ONLY ever meant to guard a
-    # tiny read-merge-write must let the waiter finish near-instantly, not
-    # anywhere near the duration of a real conversation-history scan.
-    assert elapsed < 1.0
+    assert not t.is_alive()
 
 
 # ---------------------------------------------------------------------------

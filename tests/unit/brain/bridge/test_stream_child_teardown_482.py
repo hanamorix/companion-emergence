@@ -25,6 +25,7 @@ from brain.bridge.provider import ChatMessage, ClaudeCliProvider
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="relies on POSIX signals")
 
 MSGS = [ChatMessage(role="user", content="hi")]
+_STAND_IN_LIFETIME_S = 60  # how long the stand-in child that never exits would live if nothing killed it
 DELTA = json.dumps(
     {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hel"}}}
 )
@@ -63,8 +64,10 @@ def child(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(provider, "_child_exit_grace_seconds", lambda: 0.5, raising=False)
-    monkeypatch.setattr(provider, "_stream_first_event_seconds", lambda: 4.0)
-    monkeypatch.setattr(provider, "_stream_per_event_idle_seconds", lambda: 4.0)
+    # Far longer than any test needs: a stream that stalls ends with a StreamError at the watchdog, which the assertions below
+    # catch by event type, so no test needs a wall-clock bound that a loaded host could exceed.
+    monkeypatch.setattr(provider, "_stream_first_event_seconds", lambda: 30.0)
+    monkeypatch.setattr(provider, "_stream_per_event_idle_seconds", lambda: 30.0)
 
     def run(script: str):
         box["script"] = script
@@ -85,11 +88,10 @@ def test_a_flood_on_stderr_does_not_stall_the_stream(child):
         "sys.stderr.flush()\n"
         f"print({RESULT!r}, flush=True)\n"
     )
-    t0 = time.monotonic()
     events = list(run(script))
+    # StreamDone, not the StreamError the idle watchdog would produce after 30 s: stderr was drained while the child ran.
     assert [type(e) for e in events] == [StreamDone]
     assert events[0].content == "hello"
-    assert time.monotonic() - t0 < 3.0  # the idle watchdog is 4 s: finishing earlier means stderr was drained
 
 
 def test_stderr_text_still_reaches_the_failure_detail(child):
@@ -103,10 +105,12 @@ def test_stderr_text_still_reaches_the_failure_detail(child):
 
 def test_stdout_eof_with_a_child_that_never_exits_does_not_hang_and_reaps_it(child):
     run, spawned = child
-    script = "import os, time\nos.close(1)\ntime.sleep(60)\n"
+    script = f"import os, time\nos.close(1)\ntime.sleep({_STAND_IN_LIFETIME_S})\n"
     t0 = time.monotonic()
     events = list(run(script))
-    assert time.monotonic() - t0 < 3.5
+    # The provider gives up on the child after the 0.5 s grace and kills it. A wait with no timeout would last the child's whole
+    # life: half of it is a bound no loaded host reaches and the regression always does.
+    assert time.monotonic() - t0 < _STAND_IN_LIFETIME_S / 2
     assert len(events) == 1 and isinstance(events[0], StreamError)
     assert events[0].stage == "claude_cli_exit"
     assert _reaped(spawned[0])

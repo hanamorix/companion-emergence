@@ -392,11 +392,12 @@ def test_n15_n30_a_rejected_name_is_refused_by_the_gate_and_the_reappraiser(pers
 
 
 def test_n19_the_escape_is_linear_on_a_long_whitespace_run():
-    # Code review F2: two adjacent \s* runs were quadratic (about 1 s on 20,000 spaces).
+    # Code review F2: two adjacent \s* runs were quadratic (about 1 s on 20,000 spaces, so about 100 s on 200,000). The
+    # linear escape takes milliseconds on 200,000, so the 5 s bound sits far above it and far below the quadratic cost.
     import time
 
-    text = "<" + " " * 20000 + "and then </memory>"
+    text = "<" + " " * 200_000 + "and then </memory>"
     t0 = time.perf_counter()
     out = cons._escape_tag(text, "memory")
-    assert time.perf_counter() - t0 < 0.2
+    assert time.perf_counter() - t0 < 5.0
     assert out.endswith("&lt;/memory>")

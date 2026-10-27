@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from brain.attunement.schemas import (
     SCHEMA_VERSION,
     CurrentRead,
@@ -635,20 +637,32 @@ def test_five_words_fires_pass2(tmp_path: Path):
 # Scenario 6: budget exhausted — cap reached → defer, detector not called
 # ---------------------------------------------------------------------------
 
-def _exhaust_budget(persona_dir: Path) -> None:
-    """Seed the daily budget file at the cap so the next consume_call returns False."""
+def _exhaust_budget(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seed the daily budget file at the cap so the turn finds no budget left and defers.
+
+    The turn's budget check (`get_remaining`) and charge (`consume_call`) are pinned to a fixed instant, and the file is
+    seeded with that instant's local date, so a run that crosses local midnight between the seed and the turn cannot see
+    a new day (which would reset the count)."""
     from datetime import UTC, datetime
 
+    from brain.attunement.budget import _today_local_str, consume_call, get_remaining
     from brain.attunement.schemas import DAILY_BUDGET_DEFAULT
+
+    fixed_now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    for name, real in (("_attunement_consume_call", consume_call), ("_attunement_budget_remaining", get_remaining)):
+        monkeypatch.setattr(
+            f"brain.chat.tool_loop.{name}",
+            lambda persona_dir, *, now, cap=DAILY_BUDGET_DEFAULT, _real=real: _real(persona_dir, now=fixed_now, cap=cap),
+        )
 
     budget_dir = persona_dir / "attunement"
     budget_dir.mkdir(parents=True, exist_ok=True)
-    today = datetime.now(UTC).astimezone().strftime("%Y-%m-%d")
+    today = _today_local_str(fixed_now)
     budget_path = budget_dir / "daily_budget.json"
     budget_path.write_text(json.dumps({"date": today, "count": DAILY_BUDGET_DEFAULT}))
 
 
-def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path):
+def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """When daily budget is fully consumed, run_detector is never called."""
     from brain.chat.tool_loop import run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
@@ -657,7 +671,7 @@ def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path):
     persona_dir = tmp_path / "personas" / "nell"
     persona_dir.mkdir(parents=True)
 
-    _exhaust_budget(persona_dir)
+    _exhaust_budget(persona_dir, monkeypatch)
 
     provider = _SubstantiveProvider()
     store = MemoryStore(persona_dir / "memories.db")
@@ -685,7 +699,7 @@ def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path):
     assert not (persona_dir / "attunement" / "current_read.json").exists()
 
 
-def test_budget_exhausted_does_not_write_error_log(tmp_path: Path):
+def test_budget_exhausted_does_not_write_error_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Budget cap hit is a clean defer — no attunement_errors.jsonl entry."""
     from brain.chat.tool_loop import run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
@@ -694,7 +708,7 @@ def test_budget_exhausted_does_not_write_error_log(tmp_path: Path):
     persona_dir = tmp_path / "personas" / "nell"
     persona_dir.mkdir(parents=True)
 
-    _exhaust_budget(persona_dir)
+    _exhaust_budget(persona_dir, monkeypatch)
 
     provider = _SubstantiveProvider()
     store = MemoryStore(persona_dir / "memories.db")

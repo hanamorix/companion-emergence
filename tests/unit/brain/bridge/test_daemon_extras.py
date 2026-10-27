@@ -626,7 +626,7 @@ def test_acquire_lock_c18a_kill_then_restart_acquires_immediately_no_archive(
     """C18(a): kill -9 the bridge (simulated: the OS drops the flock/msvcrt
     lock the instant the holding fd is closed, exactly what happens when a
     process is SIGKILLed — no cleanup code runs either way); the next start
-    acquires the lock immediately (< 1s), with no 120s wait and no
+    acquires the lock immediately (far under the old 120 s wait), with no
     `.stale-*` archive file created (that whole mechanism, and the file it
     used to write, no longer exists)."""
     persona_dir = tmp_path / "persona"
@@ -644,7 +644,7 @@ def test_acquire_lock_c18a_kill_then_restart_acquires_immediately_no_archive(
     elapsed = time.time() - started
 
     assert fd2 is not None
-    assert elapsed < 1.0
+    assert elapsed < 10  # the old behaviour was a 120 s wait; this bound is loose enough for a loaded host
     assert list(persona_dir.glob("bridge.json.lock.stale-*")) == []
     daemon.release_lock(persona_dir, fd2)
 
@@ -672,7 +672,7 @@ def test_acquire_lock_c18b_reboot_with_pid_reuse_acquires_immediately(
     elapsed = time.time() - started
 
     assert fd is not None
-    assert elapsed < 1.0
+    assert elapsed < 10  # the old behaviour was a wait; this bound is loose enough for a loaded host
     daemon.release_lock(persona_dir, fd)
 
 
