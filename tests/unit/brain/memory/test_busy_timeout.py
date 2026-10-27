@@ -21,14 +21,15 @@ but failed on macOS (`DID NOT RAISE OperationalError`): under CI scheduling
 jitter, the gap between the holder thread actually acquiring its lock and
 the waiter issuing its statement (or the holder's own remaining hold time by
 the time the waiter got CPU) could eat most of that 1.0s margin. The fix
-removes the margin altogether for the short-timeout case (an explicit 0.2s timeout
-against a holder that holds until the test releases it, so no jitter can close
-the gap) and moves the lock holder into its own OS
+moves the lock holder into its own OS
 PROCESS (a `python -c` subprocess), synchronized via a ready-file the
 subprocess writes only AFTER it has actually acquired the write transaction
 — removing any same-process thread-scheduling/GIL ambiguity about when the
-lock is really held. The mechanism under test (sqlite's busy_timeout) is
-identical; only the hold and the isolation are different, and the
+lock is really held. A later change (#540) took the margin out of the
+short-timeout test altogether: its holder holds until the test releases it
+(a release file), against an explicit 0.2s timeout. The mechanism under test
+(sqlite's busy_timeout) is identical; only the hold and the isolation are
+different, and the
 oracle still fails against a too-short timeout and passes against
 `MemoryStore`'s real (30s) one.
 
