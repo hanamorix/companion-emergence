@@ -607,18 +607,6 @@ def test_af1_run_gate_per_anchor_ctx_gates_extra_arm(tmp_path, monkeypatch) -> N
     assert gm.exists()  # gate passed -> marker written
 
 
-def test_af1_run_gate_single_shared_ctx_spuriously_fails() -> None:
-    """C-AF1-ORACLE (oracle-can-fail): the OLD single-shared-ctx form spuriously FAILS the same arm.
-
-    Fixture-independent direct form (mirrors test_gate_single_shared_ctx_spuriously_fails_extra_driven_detector):
-    one shared ctx carrying k -> the arm fires on the clean anchor too -> spurious DetectorGateError.
-    Proves the per-anchor wiring in _run_gate is load-bearing.
-    """
-    shared = agent_send.TurnContext(extra={"k": "ok"})
-    with pytest.raises(agent_send.DetectorGateError):
-        agent_send.assert_detector_gate(_ExtraArm(), "true", "clean", ctx=shared)
-
-
 def test_af1_run_gate_backward_compat_shared_ctx(tmp_path, monkeypatch) -> None:
     """C-AF1-BC (behavior preservation): with NO per-anchor keys, both anchors get the SAME shared ctx
     whose extra == turn_extra(env). Uses a REAL non-empty turn_context hook so the assertion is

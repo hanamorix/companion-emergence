@@ -376,26 +376,21 @@ def test_drive_now_banner_first_line_is_exact_headline(tmp_path: Path) -> None:
     assert first_line == "▶ DRIVE NOW, IN THIS SAME TURN — do not end your turn to wait"
 
 
-def test_drive_now_banner_names_both_surfaces_and_the_rule() -> None:
-    banner = fg.drive_now_banner(arm="A", port=8931, run_dir="/tmp/run")
+def test_drive_now_banner_content_surfaces_rule_run_context_and_extra_lines() -> None:
+    banner = fg.drive_now_banner(
+        arm="my-arm", port=9999, run_dir="/tmp/xyz", roster_ok=True, extra_lines=["custom note here"]
+    )
+    # both surfaces and the one rule
     assert "run_in_background" in banner
     assert "background sub-agent" in banner
     assert "one arm = one turn" in banner
     assert "foreground" in banner.lower()
-
-
-def test_drive_now_banner_includes_run_context_and_roster_ok() -> None:
-    banner = fg.drive_now_banner(arm="my-arm", port=9999, run_dir="/tmp/xyz", roster_ok=True)
+    # the run context and the roster state
     assert "my-arm" in banner
     assert "9999" in banner
     assert "/tmp/xyz" in banner
     assert "roster_ok=True" in banner
-
-
-def test_drive_now_banner_extra_lines_appended() -> None:
-    banner = fg.drive_now_banner(
-        arm="A", port=1, run_dir="/tmp/run", extra_lines=["custom note here"]
-    )
+    # extra lines are appended
     assert "custom note here" in banner
 
 

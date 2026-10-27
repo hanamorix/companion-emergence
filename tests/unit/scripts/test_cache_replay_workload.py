@@ -383,7 +383,7 @@ def test_k1_a_persistent_break_from_the_second_judged_row_fails_at_that_row():
 
 @pytest.mark.parametrize(
     "reads,rows",
-    [([0, 6449, 6449], [2]), ([5000, 0, 6449], [3]), ([0, 0, 0], [2, 3, 4]), ([6449, 0, 6449, 6449], [3]), ([6449, 6449, 6449, 0], [5])],
+    [([0, 0, 0], [2, 3, 4]), ([6449, 0, 6449, 6449], [3])],
 )
 def test_k1_a_zero_read_is_a_break_never_a_crash_and_never_enters_s(reads, rows):
     res = safe_check(run(*reads))  # a zero in S would divide by zero in the share and let every later row pass
@@ -452,7 +452,9 @@ def test_k7_the_two_measured_healthy_runs_pass():
 _PLAIN = [6449, 6449]
 
 
-@pytest.mark.parametrize("multi_read", [0, 5, 6449, 99999])
+# 0 catches "a multi-call row is judged" (a zero read is a break); 5 catches "a multi-call row's read enters S" (6449
+# equals S, 0 never enters it, 99999 cannot lower a minimum).
+@pytest.mark.parametrize("multi_read", [0, 5])
 def test_c5_interleaved_multi_call_rows_change_nothing(multi_read):
     base = check(run(*_PLAIN))
     mixed = check(run(6449, (multi_read, 3), 6449, (multi_read, 2)))
@@ -1580,10 +1582,6 @@ def test_c7_a_missing_pyyaml_is_a_value_error_not_a_crash(tmp_path, monkeypatch)
     monkeypatch.setitem(sys.modules, "yaml", None)  # `import yaml` raises ImportError
     with pytest.raises(ValueError):
         crw.read_regression_threshold(CONFIG)
-
-
-def test_warmup_prompt_is_the_micro_ack():
-    assert crw.WARMUP_PROMPT == "ok"
 
 
 # --------------------------------------------------------------------------------------

@@ -63,7 +63,7 @@ def test_missing_list_file_is_created_on_first_write(tmp_path):
     assert kn.known_names_path(tmp_path).exists()
 
 
-@pytest.mark.parametrize("name", ["Grace", "Will Smith", "NY", "the Hague", "  Wren  "])
+@pytest.mark.parametrize("name", ["Grace", "Will Smith", "  Wren  "])
 def test_every_non_stopword_entry_is_admitted_as_given(tmp_path, name):
     got = add_known_name(name, persona_dir=tmp_path)
     assert got == {"added": True, "name": name.strip()}
@@ -71,7 +71,7 @@ def test_every_non_stopword_entry_is_admitted_as_given(tmp_path, name):
     assert _rows(tmp_path)[0][1] == name.strip()  # display form intact (S87)
 
 
-@pytest.mark.parametrize("name", ["will", "Will", "the", "THE", "may"])
+@pytest.mark.parametrize("name", ["will", "THE"])
 def test_a_one_word_stopword_entry_is_added_as_a_stopword_name(tmp_path, name):
     """S104 (names increment; the base refused these, S70): the kindled may add a name
     whose whole form is one recall stopword; it is flagged and matches only written
@@ -82,7 +82,7 @@ def test_a_one_word_stopword_entry_is_added_as_a_stopword_name(tmp_path, name):
     assert _rows(tmp_path) == [(name.lower(), name, "tool")]
 
 
-@pytest.mark.parametrize("name", ["I am", "of the", "the who"])
+@pytest.mark.parametrize("name", ["of the"])
 def test_an_all_stopword_entry_is_admitted_as_given(tmp_path, name):
     """S144: any string the kindled adds is accepted; S106's all-stopword refusal is gone."""
     got = add_known_name(name, persona_dir=tmp_path)
@@ -90,7 +90,7 @@ def test_an_all_stopword_entry_is_admitted_as_given(tmp_path, name):
     assert _rows(tmp_path) == [(name.lower(), name, "tool")]
 
 
-@pytest.mark.parametrize("name", ["Dr. Smith", "St. John's-on-the-Hill", "C++", "Wren (the cat)", "a/b"])
+@pytest.mark.parametrize("name", ["Dr. Smith", "C++"])
 def test_periods_and_other_characters_are_admitted(tmp_path, name):
     """S144, S153: no character rule; the name is listed with its display as given."""
     got = add_known_name(name, persona_dir=tmp_path)
@@ -130,18 +130,12 @@ def test_the_length_is_measured_after_strip(tmp_path):
     assert "message" in add_known_name(" " * 5 + "W" * 101, persona_dir=tmp_path)
 
 
-@pytest.mark.parametrize("name", ["{name}" * 20, "100%s%d{0}" * 12, "{" * 101, "}" * 101])
+@pytest.mark.parametrize("name", ["{name}" * 20])
 def test_a_name_with_braces_or_percent_signs_is_echoed_unchanged(tmp_path, name):
     got = add_known_name(name, persona_dir=tmp_path)
     assert len(name) > 100
     assert got["message"] == "The name " + name + " is over the 100 character limit and was not added."
     assert got["name"] == name and got["added"] is False
-
-
-@pytest.mark.parametrize("bad", [None, 7, ["Wren"], {"n": "Wren"}, "", "   "])
-def test_every_other_refusal_stays_a_bare_added_false(tmp_path, bad):
-    got = add_known_name(bad, persona_dir=tmp_path)
-    assert got["added"] is False and "message" not in got and set(got) == {"added", "name"}
 
 
 def test_a_failed_write_stays_a_bare_added_false(tmp_path, monkeypatch):

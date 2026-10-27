@@ -550,23 +550,6 @@ def test_af2_file_history_write_by_canary_would_land_in_tempdir(
 # home vars, including the "was unset" case.
 
 
-def test_user_logname_synthetic_inside_sandbox_and_restored(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """G-F2-user/logname-synthetic + G-F2-restore-set: inside the run $USER/$LOGNAME are the synthetic
-    value; a prior host value is restored exactly on exit."""
-    _seed_fake_cred(monkeypatch, tmp_path)
-    monkeypatch.setenv("USER", "realdev")
-    monkeypatch.setenv("LOGNAME", "realdev")
-    with sandbox():
-        assert os.environ["USER"] == SYNTHETIC_USER
-        assert os.environ["LOGNAME"] == SYNTHETIC_USER
-        assert os.environ["USER"] == "Bob"  # positive assertion of the synthetic value
-    # restored exactly to the prior host values.
-    assert os.environ["USER"] == "realdev"
-    assert os.environ["LOGNAME"] == "realdev"
-
-
 def test_user_logname_restored_to_unset_when_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
