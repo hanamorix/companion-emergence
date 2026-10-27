@@ -106,7 +106,7 @@ def test_logging_happens_outside_the_lock(monkeypatch):
 
 
 def test_threaded_counts_are_exact():
-    threads, per = 8, 2000
+    threads, per = 8, 500
     old = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
     try:

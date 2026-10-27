@@ -482,7 +482,10 @@ def test_g20b_no_module_reaches_a_moved_writer_through_attempt_heal():
     for path in _py_files():
         if path == Path(__file__).resolve():
             continue  # this file names the offenders in its own table below
-        found = backdoor_findings(path.read_text(encoding="utf-8"), moved)
+        source = path.read_text(encoding="utf-8")
+        if "attempt_heal" not in source:
+            continue  # every way of reaching it (import, alias, attribute, dotted string) names the module: skip the parse
+        found = backdoor_findings(source, moved)
         if found:
             offenders[path.relative_to(REPO).as_posix()] = found
     assert offenders == {}

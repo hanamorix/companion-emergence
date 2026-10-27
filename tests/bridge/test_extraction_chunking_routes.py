@@ -425,13 +425,13 @@ def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, 
     scan_threads: list[int] = []
     order: list[str] = []
     release = threading.Event()
-    _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=30)
 
     async def main():
         d = _Driver(raw_app)
         await d.start()
-        scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
-        order.clear()
+        # Armed only now: the lifespan's own idle-anchor seed lists the buffers at startup, on the loop, and a scan
+        # blocked from the start would hold that startup until its deadlock-breaking timeout.
+        _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=30)
         loop_thread = threading.get_ident()
         try:
             active = asyncio.ensure_future(d.get("/sessions/active"))
@@ -509,7 +509,6 @@ def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, ra
     scan_threads: list[int] = []
     order: list[str] = []
     release = threading.Event()
-    _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=1.0)
 
     async def _on_loop(label, fn, *a, **k):
         return fn(*a, **k)
@@ -519,8 +518,8 @@ def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, ra
     async def main():
         d = _Driver(raw_app)
         await d.start()
-        scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
-        order.clear()
+        # Armed only now (see test_c14e): the startup seed lists the buffers on the loop too.
+        _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=1.0)
         loop_thread = threading.get_ident()
         try:
             active = asyncio.ensure_future(d.get("/sessions/active"))

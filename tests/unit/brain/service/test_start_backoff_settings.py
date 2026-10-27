@@ -177,7 +177,7 @@ def test_cmd_run_never_refreshes_the_task_from_inside_a_running_instance(tmp_pat
     replacing its own definition); the refresh belongs to the paths that run outside any instance."""
     from types import SimpleNamespace
 
-    from brain.bridge import daemon
+    from brain.bridge import daemon, start_backoff
 
     pd = tmp_path / "home" / "personas" / "nell"
     pd.mkdir(parents=True)
@@ -192,6 +192,9 @@ def test_cmd_run_never_refreshes_the_task_from_inside_a_running_instance(tmp_pat
     ran: list[int] = []
     monkeypatch.setattr("brain.bridge.runner.run_bridge_foreground", lambda p, **kw: ran.append(1) or 0)
     for origin in ("systemd", "launchd", "cli", "task-scheduler"):
+        # Each run notes itself as an unproven start (the stubbed bridge never proves it healthy); the next service
+        # origin would then wait out the start back-off ladder (30 s, then 60 s): this test is not about the ladder.
+        start_backoff.reset(pd)
         assert daemon.cmd_run(SimpleNamespace(persona="nell", idle_shutdown=0, client_origin=origin)) == 0
     assert ran == [1, 1, 1, 1]
 
