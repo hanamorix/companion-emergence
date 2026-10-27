@@ -1,13 +1,24 @@
 """Unit tests for brain/body/state.py — compute_body_state pure function.
 
 Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
+
+Spec section 7 (inviolate property 4): "compute_body_state blocks chat composition because it's slow: pure function,
+sub-ms. No I/O. No LLM call." The spec asked for a timing test; a wall-clock budget on a pure function cannot fail and
+flakes under load (removed in #540), so the property is held structurally by the last two tests: the module imports only
+pure modules and calls nothing that does I/O (static, branch-independent), and running the function over every band
+boundary fires no I/O audit event (behaviour). The inputs the caller reads (store rows, session hours, words) are the
+caller's; they are outside the property.
 """
 
 from __future__ import annotations
 
+import ast
+import sys
+import threading
 from datetime import UTC, datetime
 
 from brain.body.state import BodyState, compute_body_state
+from tests.source_tree import brain_trees
 
 
 def _now() -> datetime:
@@ -328,3 +339,92 @@ def test_body_emotions_dict_includes_all_six_with_zero_default():
     assert bs.body_emotions["arousal"] == 5.0
     assert bs.body_emotions["desire"] == 0.0
     assert bs.body_emotions["climax"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Spec section 7, inviolate property 4: compute_body_state does no I/O and makes no LLM call
+# ---------------------------------------------------------------------------
+
+_STATE_FILE = "brain/body/state.py"
+# What the module may import: nothing that reaches a file, a socket, a process, a database, a clock-wait or a model.
+_PURE_MODULES = frozenset({"__future__", "collections.abc", "dataclasses", "datetime", "typing"})
+# A brain module may be added here only after checking that it does no I/O; it is then scanned by the same rule.
+_PURE_BRAIN_MODULES: tuple[str, ...] = ()
+_FORBIDDEN_CALLS = frozenset({"__import__", "open", "input", "exec", "eval", "compile", "print"})
+
+
+def impure_findings(tree: ast.AST, allowed: frozenset[str]) -> list[str]:
+    """Every import outside ``allowed`` (anywhere in the file, relative imports included) and every call of a builtin
+    that reads, writes or runs code, as ``line N: what``."""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [f"line {node.lineno}: import {a.name}" for a in node.names if a.name not in allowed]
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            if node.level or module not in allowed:
+                found.append(f"line {node.lineno}: from {module} import ...")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _FORBIDDEN_CALLS:
+            found.append(f"line {node.lineno}: call of {node.func.id}()")
+    return found
+
+
+def test_the_body_state_module_imports_only_pure_modules_and_calls_no_io() -> None:
+    trees = brain_trees()
+    assert _STATE_FILE in trees, f"{_STATE_FILE} moved: point this guard at the module that holds compute_body_state"
+    assert compute_body_state.__module__ == "brain.body.state", "compute_body_state moved out of the guarded module"
+    allowed = _PURE_MODULES | set(_PURE_BRAIN_MODULES)
+    scanned = [_STATE_FILE] + [m.replace(".", "/") + ".py" for m in _PURE_BRAIN_MODULES]
+    problems = [
+        f"{rel}: {finding}"
+        for rel in scanned
+        for finding in impure_findings(trees[rel], allowed)
+    ]
+    assert not problems, (
+        "compute_body_state must stay a pure function (body spec section 7, property 4: it must not block chat "
+        "composition: no I/O, no LLM call). Read the inputs in the caller and pass them in:\n  " + "\n  ".join(problems)
+    )
+
+
+_AUDIT: dict = {"installed": False, "on": False, "thread": 0, "events": []}
+_IO_EVENTS = (
+    "open", "socket.", "subprocess.", "sqlite3.", "os.", "shutil.", "time.sleep", "urllib.", "http.", "ssl.", "glob.",
+    "tempfile.", "ctypes.", "import", "exec", "compile", "fcntl.", "mmap.",
+)  # fmt: skip
+
+
+def _audit_hook(event: str, args: tuple) -> None:
+    if _AUDIT["on"] and threading.get_ident() == _AUDIT["thread"] and event.startswith(_IO_EVENTS):
+        _AUDIT["events"].append(event)
+
+
+def test_compute_body_state_raises_no_io_audit_event() -> None:
+    if not _AUDIT["installed"]:  # an audit hook cannot be removed, so it is installed once, here, and inert otherwise
+        sys.addaudithook(_audit_hook)
+        _AUDIT["installed"] = True
+    grid = [
+        (
+            dict.fromkeys(("love", "joy", "grief", "peace", "belonging", "arousal", "desire", *extra), level),
+            hours,
+            words,
+            days,
+        )
+        for level in (0.0, 5.0, 8.0)
+        for extra in ((), ("climax", "touch_hunger", "comfort_seeking", "rest_need"))
+        for hours in (0.0, 0.5, 1.5, 2.5, 3.5)
+        for words in (0, 5000)
+        for days in (0.0, 40.0)
+    ]
+    now = _now()
+    _AUDIT.update(events=[], thread=threading.get_ident(), on=True)
+    try:
+        for emotions, hours, words, days in grid:
+            compute_body_state(
+                emotions=emotions, session_hours=hours, words_written=words, days_since_contact=days, now=now
+            )
+    finally:
+        _AUDIT["on"] = False
+    assert _AUDIT["events"] == [], (
+        "compute_body_state did I/O (body spec section 7, property 4: it must not block chat composition): "
+        f"{sorted(set(_AUDIT['events']))}"
+    )
