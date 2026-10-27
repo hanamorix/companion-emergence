@@ -225,6 +225,7 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
 
 def _pytest(py: str, cwd: Path, env_extra: Mapping[str, str], args: Sequence[str]) -> subprocess.CompletedProcess:
     env = {**os.environ, **env_extra}
+    env["PYTEST_ADDOPTS"] = ""  # the output format is parsed below: no inherited -q/-qq/-p/-n
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(cwd), env_extra.get("NTFOB_PLUGIN_DIR", ""), env.get("PYTHONPATH", "")]))
     return subprocess.run(
         [py, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:tdd-guard", *args],
@@ -251,9 +252,11 @@ def _collect(py: str, cwd: Path, files: Sequence[str], expr: str, plugin_dir: st
     allowed = (0, 5, 1, 2) if tolerate_import_errors else (0, 5)
     if res.returncode not in allowed:
         raise CheckError(f"collecting in {cwd.name} exited {res.returncode}:\n{(res.stdout + res.stderr)[-1500:]}")
+    if res.returncode in (1, 2) and not re.search(r"^ERROR |\d+ errors?\b", res.stdout, re.M):
+        raise CheckError(f"collecting in {cwd.name} exited {res.returncode} without a collection error:\n{(res.stdout + res.stderr)[-1500:]}")
     ids = parse_collected(res.stdout)
     printed = collected_count(res.stdout)
-    if res.returncode == 0 and printed is not None and printed != len(ids):
+    if res.returncode == 0 and printed != len(ids):
         raise CheckError(f"collecting in {cwd.name}: pytest reported {printed} tests, {len(ids)} ids were read from its output")
     return ids
 
@@ -363,7 +366,8 @@ def _judge_pr(py, repo, base, head, workers, expr, files, renamed, entries, scra
     called = [o for reps in canary_res.values() for when, o in reps if when == "call"]
     if canary_run.returncode != 0 or "passed" not in called or bad:
         print(f"CANARY FAILED: {canary} does not pass against the base product code with the head tests' setup "
-              f"(failed: {bad[:5]}). The base code cannot run the head conftest, so the check cannot judge this PR.")
+              f"(exit {canary_run.returncode}, failed: {bad[:5]}). The base code cannot run the head conftest, so the check "
+              f"cannot judge this PR.\n{(canary_run.stdout + canary_run.stderr)[-1200:]}")
         return 1
 
     collectable = set(_collect(py, head_tree, files, expr, str(plugin_dir), tolerate_import_errors=True))

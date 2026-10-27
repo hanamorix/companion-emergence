@@ -35,7 +35,7 @@ def _signal_self(sig) -> None:
     os.kill(os.getpid(), sig)
 
 
-@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.no_base_failure(reason='#540 test of a test-only helper or fixture that wraps product code which already exists; it has no predecessor and the old code passes it')
 def test_signal_self_refuses_a_signal_that_would_kill_the_process():
     sig = signal.SIGUSR1
     seen = []

@@ -166,7 +166,7 @@ def _run_script(repo: Path, base: str, tmp_path: Path) -> tuple[subprocess.Compl
     done = subprocess.run(
         [sys.executable, str(REPO / "scripts" / "new_tests_fail_on_base.py"), "--base", base, "--repo", str(repo), "--workers", "1"],
         cwd=tmp_path,
-        env={**os.environ, "TMPDIR": str(scratch), "TEMP": str(scratch), "TMP": str(scratch)},
+        env={**os.environ, "TMPDIR": str(scratch), "TEMP": str(scratch), "TMP": str(scratch), "PYTEST_ADDOPTS": "-qq"},  # must not be inherited
         capture_output=True,
         text=True,
         check=False,
