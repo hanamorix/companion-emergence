@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import subprocess
-import sys
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -400,38 +399,10 @@ def test_c10b_one_transaction_per_batch_and_schema_unchanged(
 # succeeds after waiting (no "database is locked"), bounded ~ the budget.
 # ---------------------------------------------------------------------------
 
-_HOLDER_SCRIPT = """
-import json, sqlite3, sys, time
-db_path, ready_path, hold_seconds, memory_id, emotions_json = sys.argv[1:6]
-hold_seconds = float(hold_seconds)
-conn = sqlite3.connect(db_path, timeout=30.0)
-conn.execute("PRAGMA busy_timeout = 30000")
-conn.execute("BEGIN IMMEDIATE")
-# Same SQL shape MemoryStore.update_emotions_batch issues for one row.
-conn.execute(
-    "UPDATE memories SET emotions_json = ?, "
-    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-    (emotions_json, 9.0, memory_id),
-)
-with open(ready_path, "w") as f:
-    f.write("1")
-time.sleep(hold_seconds)
-conn.commit()
-conn.close()
-"""
-
-_HOLD_SECONDS = 2.0
+# The busy timeout must outlast a decay batch (its budget is HEARTBEAT_DECAY_BATCH_BUDGET_S), so the holder keeps the
+# transaction open a little longer than that budget.
+_HOLD_SECONDS = dev_constants.HEARTBEAT_DECAY_BATCH_BUDGET_S + 0.2
 _READY_WAIT_TIMEOUT_S = 15.0
-
-
-def _wait_for_ready(ready_path: Path, holder: subprocess.Popen) -> None:
-    deadline = time.monotonic() + _READY_WAIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if ready_path.exists():
-            return
-        assert holder.poll() is None, "holder exited before signaling readiness"
-        time.sleep(0.02)
-    raise AssertionError("holder never signaled readiness")
 
 
 def test_c17_chat_write_waits_for_open_decay_batch_then_succeeds(tmp_path: Path) -> None:
@@ -440,45 +411,57 @@ def test_c17_chat_write_waits_for_open_decay_batch_then_succeeds(tmp_path: Path)
     try:
         m = _seed_memory(store, tenderness=5.0)
     finally:
-        store.close()  # release before the holder subprocess opens its own connection
+        store.close()  # release before the holder opens its own connection
 
-    ready_path = tmp_path / "holder.ready"
-    holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            _HOLDER_SCRIPT,
-            str(db_path),
-            str(ready_path),
-            str(_HOLD_SECONDS),
-            m.id,
-            json.dumps({"love": 9.0, "tenderness": 4.0}),
-        ]
-    )
-    try:
-        _wait_for_ready(ready_path, holder)
+    waiter_store = MemoryStore(db_path)  # opened first: opening runs integrity checks and must not eat the hold
+    ready = threading.Event()
+    holder_errors: list[BaseException] = []
 
-        waiter_store = MemoryStore(db_path)
+    def hold() -> None:
+        # Opened, held and released in this one thread (a sqlite3 connection is bound to its creating thread).
         try:
-            start = time.monotonic()
-            # A plain chat-path write on ANOTHER connection while the
-            # holder's transaction (standing in for an open decay batch) is
-            # still uncommitted — must succeed after waiting, not raise.
-            waiter_store.update(m.id, importance=7.0)
-            elapsed = time.monotonic() - start
-        finally:
-            waiter_store.close()
+            conn = sqlite3.connect(db_path, timeout=30.0)
+            try:
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("BEGIN IMMEDIATE")
+                # Same SQL shape MemoryStore.update_emotions_batch issues for one row.
+                conn.execute(
+                    "UPDATE memories SET emotions_json = ?, "
+                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
+                    (json.dumps({"love": 9.0, "tenderness": 4.0}), 9.0, m.id),
+                )
+                ready.set()
+                time.sleep(_HOLD_SECONDS)
+                conn.commit()
+            finally:
+                conn.close()
+        except BaseException as exc:  # noqa: BLE001 - handed to the main thread, which reports it
+            holder_errors.append(exc)
+            ready.set()
 
-        assert elapsed >= _HOLD_SECONDS * 0.5, (
-            "should have actually waited for the holder, not raced past it"
-        )
-        assert elapsed <= dev_constants.HEARTBEAT_DECAY_BATCH_BUDGET_S * 2 + 5.0, (
-            "wait must be bounded — roughly the batch time budget, not the "
-            "old 5s sqlite3 default's failure mode"
-        )
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    try:
+        assert ready.wait(_READY_WAIT_TIMEOUT_S), "holder never signaled readiness"
+        assert not holder_errors, f"the holder failed: {holder_errors[0]!r}"
+        start = time.monotonic()
+        # A plain chat-path write on ANOTHER connection while the holder's transaction (standing in for an open
+        # decay batch) is still uncommitted: it must succeed after waiting, not raise.
+        waiter_store.update(m.id, importance=7.0)
+        elapsed = time.monotonic() - start
     finally:
-        returncode = holder.wait(timeout=_HOLD_SECONDS + 10.0)
-        assert returncode == 0
+        waiter_store.close()
+        holder.join(timeout=_HOLD_SECONDS + 10.0)
+
+    assert not holder.is_alive()
+    assert not holder_errors, f"the holder failed: {holder_errors[0]!r}"
+    assert elapsed >= _HOLD_SECONDS * 0.5, (
+        "should have actually waited for the holder, not raced past it"
+    )
+    assert elapsed <= dev_constants.HEARTBEAT_DECAY_BATCH_BUDGET_S * 2 + 5.0, (
+        "wait must be bounded — roughly the batch time budget, not the "
+        "old 5s sqlite3 default's failure mode"
+    )
 
 
 # ---------------------------------------------------------------------------

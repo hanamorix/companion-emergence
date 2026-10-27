@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
+from brain.chat import pass2_queue
 
 
 class _Pass2Provider:
@@ -113,10 +113,9 @@ def test_pass2_fires_after_record_monologue(tmp_path: Path, monkeypatch):
             hebbian=hebbian,
             persona_dir=persona_dir,
         )
-        # Pass 2 now flows through the in-process pass2_queue (single worker, #27);
+        # Pass 2 work is saved in the persisted pass2_queue (no worker thread, #27);
         # drain it here (store still open) so the extraction's provider call lands.
         from brain.bridge import cli_throttle
-        from brain.chat import pass2_queue
 
         cli_throttle.reset()
         pass2_queue.drain_pending(persona_dir)
@@ -170,7 +169,7 @@ def test_pass2_skipped_when_record_monologue_not_called(tmp_path: Path):
         store.close()
         hebbian.close()
 
-    time.sleep(0.2)
+    assert pass2_queue._queue_size(persona_dir) == 0  # nothing queued for a trivial turn
     assert provider.generate_calls == 0
     assert not (persona_dir / "monologue_digest.jsonl").exists()
 
@@ -227,5 +226,5 @@ def test_pass2_skipped_when_monologue_rejected(tmp_path: Path):
         store.close()
         hebbian.close()
 
-    time.sleep(0.2)
+    assert pass2_queue._queue_size(persona_dir) == 0  # a rejected capture queues no pass 2
     assert provider.generate_calls == 0  # No pass-2 spawn

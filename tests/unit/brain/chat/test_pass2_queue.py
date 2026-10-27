@@ -15,7 +15,6 @@ INC-8-specific persistence/lock/at-least-once tests below.
 from __future__ import annotations
 
 import logging
-import time
 
 from brain.bridge import cli_throttle
 from brain.chat import pass2_queue
@@ -179,7 +178,6 @@ class TestNoWorkerThread:
         _records, make = _make_recorder()
         for label in ("a", "b", "c"):
             pass2_queue.enqueue(make(label), persona_dir=tmp_path)
-        time.sleep(0.05)
         after = threading.enumerate()
         assert {t.ident for t in after} <= before, "enqueue() started a thread"
         assert not any(t.name == "pass2-queue-worker" for t in after)

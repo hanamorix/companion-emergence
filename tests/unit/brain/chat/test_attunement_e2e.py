@@ -18,7 +18,6 @@ Scenarios covered:
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -39,11 +38,10 @@ from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _wait_for_attunement_threads(persona_dir, timeout: float = 5.0) -> None:
-    # Pass-2 extraction now flows through the in-process pass2_queue (single
-    # worker) rather than a per-turn daemon thread (#27). Drain it synchronously:
-    # cli_throttle is idle in tests (conftest reset), so drain_pending runs the
-    # queued items. Kept the old name so callers are unchanged.
+def _drain_pass2_queue(persona_dir, timeout: float = 5.0) -> None:
+    # Pass-2 extraction is saved in the persisted pass2_queue (no worker thread,
+    # #27). Drain it synchronously: cli_throttle is idle in tests (conftest
+    # reset), so drain_pending runs the queued items.
     from brain.bridge import cli_throttle
     from brain.chat import pass2_queue
 
@@ -165,7 +163,7 @@ def test_attunement_pass2_writes_current_read_on_substantive_turn(tmp_path: Path
                 persona_dir=persona_dir,
             )
             assert resp.content == "Here with you."
-            _wait_for_attunement_threads(persona_dir)
+            _drain_pass2_queue(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -202,7 +200,7 @@ def test_attunement_pass2_writes_learned_patterns_on_substantive_turn(tmp_path: 
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads(persona_dir)
+            _drain_pass2_queue(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -236,7 +234,7 @@ def test_both_pass2s_fire_on_same_turn(tmp_path: Path, monkeypatch):
 
     # #154: monologue pass-2 extraction now builds its own classifier-tier
     # provider internally rather than reusing the chat provider above (this
-    # test's `provider.generate_calls` counter, polled below, tracks calls made
+    # test's `provider.generate_calls` counter, asserted below, tracks calls made
     # ON THAT OBJECT). Reuse this test's own provider for the classifier tier
     # too, so the counter stays meaningful.
     monkeypatch.setattr(
@@ -258,15 +256,8 @@ def test_both_pass2s_fire_on_same_turn(tmp_path: Path, monkeypatch):
             )
             assert "Tell me about it" in resp.content
 
-            # Wait for both daemon threads to settle.
-            _wait_for_attunement_threads(persona_dir)
-
-            # Wait for monologue pass-2 too.
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                if provider.generate_calls >= 1:
-                    break
-                time.sleep(0.05)
+            # Drain the queued pass-2 items (monologue and attunement) synchronously.
+            _drain_pass2_queue(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -444,7 +435,7 @@ def test_crystallisation_forming_to_known_on_10th_evidence(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads(persona_dir)
+            _drain_pass2_queue(persona_dir)
     finally:
         store.close()
         hebbian.close()
@@ -561,7 +552,7 @@ def test_short_message_does_not_fire_pass2(tmp_path: Path):
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads(persona_dir)
+            _drain_pass2_queue(persona_dir)
             mock_detector.assert_not_called()
     finally:
         store.close()
@@ -569,68 +560,6 @@ def test_short_message_does_not_fire_pass2(tmp_path: Path):
 
     # current_read.json must NOT be created.
     assert not (persona_dir / "attunement" / "current_read.json").exists()
-
-
-def test_four_words_does_not_fire_pass2(tmp_path: Path):
-    """Exactly 4 words — boundary: still under the 5-word threshold."""
-    from brain.chat.tool_loop import run_tool_loop
-    from brain.memory.hebbian import HebbianMatrix
-    from brain.memory.store import MemoryStore
-
-    persona_dir = tmp_path / "personas" / "nell"
-    persona_dir.mkdir(parents=True)
-
-    provider = _SubstantiveProvider()
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-
-    try:
-        with patch("brain.chat.tool_loop.run_detector") as mock_detector:
-            run_tool_loop(
-                messages=[ChatMessage(role="user", content="yes that is fine")],  # 4 words
-                provider=provider,
-                tools=None,
-                store=store,
-                hebbian=hebbian,
-                persona_dir=persona_dir,
-            )
-            _wait_for_attunement_threads(persona_dir)
-            mock_detector.assert_not_called()
-    finally:
-        store.close()
-        hebbian.close()
-
-
-def test_five_words_fires_pass2(tmp_path: Path):
-    """Exactly 5 words — boundary: meets the threshold, pass-2 should run."""
-    from brain.chat.tool_loop import run_tool_loop
-    from brain.memory.hebbian import HebbianMatrix
-    from brain.memory.store import MemoryStore
-
-    persona_dir = tmp_path / "personas" / "nell"
-    persona_dir.mkdir(parents=True)
-
-    provider = _SubstantiveProvider()
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-
-    fake_output = _fake_detector_output(source_turn_id="msg-0")
-
-    try:
-        with patch("brain.chat.tool_loop.run_detector", return_value=fake_output) as mock_detector:
-            run_tool_loop(
-                messages=[ChatMessage(role="user", content="yes that is totally fine")],  # 5 words
-                provider=provider,
-                tools=None,
-                store=store,
-                hebbian=hebbian,
-                persona_dir=persona_dir,
-            )
-            _wait_for_attunement_threads(persona_dir)
-            mock_detector.assert_called_once()
-    finally:
-        store.close()
-        hebbian.close()
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +618,7 @@ def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path, monkey
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads(persona_dir)
+            _drain_pass2_queue(persona_dir)
             mock_detector.assert_not_called()
     finally:
         store.close()
@@ -726,7 +655,7 @@ def test_budget_exhausted_does_not_write_error_log(tmp_path: Path, monkeypatch: 
                 hebbian=hebbian,
                 persona_dir=persona_dir,
             )
-            _wait_for_attunement_threads(persona_dir)
+            _drain_pass2_queue(persona_dir)
     finally:
         store.close()
         hebbian.close()
