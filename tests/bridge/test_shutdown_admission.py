@@ -161,15 +161,15 @@ def test_the_stop_waits_for_a_running_worker_without_a_time_limit(persona_dir: P
     """C10 (in-process half): the lifespan ends only once every counted task has ended (no 30 s / 180 s cap)."""
     ctrl = _controller(persona_dir)
     handle_box: dict = {}
-    registered = threading.Event()  # set once the stub task is counted (or the client thread failed before that)
+    registered = threading.Event()  # set once the task is counted and the stop has begun (or the client thread failed)
     exited = threading.Event()
 
     def run_client():
         try:
             with _client(persona_dir, ctrl):
                 handle_box["h"] = shutdown_progress.registry.register("stub task")
-                registered.set()
                 ctrl.begin_stop("user_stop")
+                registered.set()
             exited.set()
         except BaseException as exc:  # noqa: BLE001 - handed to the main thread, which reports it
             handle_box["error"] = exc
@@ -181,7 +181,7 @@ def test_the_stop_waits_for_a_running_worker_without_a_time_limit(persona_dir: P
     assert "error" not in handle_box, f"the client thread failed: {handle_box.get('error')!r}"
     assert not exited.wait(1.0), "the lifespan ended while a task was still running"
     shutdown_progress.registry.unregister(handle_box["h"])
-    assert exited.wait(30)
+    assert exited.wait(30), f"the lifespan never ended once the task was released (client error: {handle_box.get('error')!r})"
     assert shutdown_progress.registry.sealed
 
 
