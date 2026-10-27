@@ -41,32 +41,22 @@ def test_c23_dispatched_search_memories_ors_disjoint_terms(tmp_path: Path) -> No
 
 
 def test_dispatched_search_memories_returns_snippet_shape(tmp_path: Path) -> None:
+    """The dispatched tool returns snippet rows truncated per the proportional formula (G12), and the explicit
+    search_memories path stays bump-free (G7: CHANGE 1 scopes the fractional bump to passive recall only)."""
     ctx = _ctx(tmp_path)
     long_body = "henryk " + ("and a great deal of extra detail follows here. " * 20)
-    _seed(ctx["store"], long_body)
+    m = _seed(ctx["store"], long_body)
     expected_max = snippet_length(len(long_body))  # G12: proportional bound, not flat 140
-
-    res = dispatch("search_memories", {"query": "henryk"}, **ctx)
-    assert res["memories"], "expected at least one hit"
-    for m in res["memories"]:
-        assert m.get("snippet") is True
-        assert "id" in m
-        assert len(m["content"]) <= expected_max  # truncated per the proportional formula
-
-
-def test_g7_search_memories_leaves_recall_count_and_last_accessed_untouched(
-    tmp_path: Path,
-) -> None:
-    """G7: the explicit search_memories tool path stays bump-free (CHANGE 1
-    scopes the fractional bump to passive recall only)."""
-    ctx = _ctx(tmp_path)
-    m = _seed(ctx["store"], "henryk untouched by search")
     before = ctx["store"]._conn.execute(
         "SELECT recall_count, last_accessed_at FROM memories WHERE id = ?", (m.id,)
     ).fetchone()
 
     res = dispatch("search_memories", {"query": "henryk"}, **ctx)
     assert res["memories"], "expected at least one hit"
+    for row in res["memories"]:
+        assert row.get("snippet") is True
+        assert "id" in row
+        assert len(row["content"]) <= expected_max  # truncated per the proportional formula
 
     after = ctx["store"]._conn.execute(
         "SELECT recall_count, last_accessed_at FROM memories WHERE id = ?", (m.id,)
