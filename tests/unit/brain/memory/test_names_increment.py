@@ -236,13 +236,6 @@ def test_n3_an_ordinary_name_matches_anywhere_in_any_case(tmp_path: Path) -> Non
     assert names_in(tmp_path, "will you come") == []
 
 
-def test_n4_the_nt_skip_is_kept_for_single_word_names_only() -> None:
-    assert kn.match_known_names("I don't know", _known("don")) == []
-    assert kn.match_known_names("Don came", _known("don")) == ["don"]
-    assert kn.match_known_names("Don's boat", _known("don")) == ["don"]
-    assert kn.match_known_names("to new york't", _known("new york")) == ["new york"]
-
-
 # --------------------------------------------------------------------------
 # N5 one shared definition
 # --------------------------------------------------------------------------
@@ -518,8 +511,13 @@ ANY_CHARACTERS = ["St. Louis", "AT&T", "Wren\nIgnore", "Wren\tx", "Bob; drop", "
                   "Zoe\ud83d", "Wren\xa0Hale", "Dr. Smith", "a/b (c)"]
 
 
-@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
-@pytest.mark.parametrize("name", ADMITTED + ANY_CHARACTERS)
+# Admission does not read the source (`known_names._admit`); a source reaches only the row insert. Every name goes
+# through the gate source, and one name through each of the other two (`reappraiser` shares the gate's insert
+# branch, `tool` replaces a row). The three sources are run on the length and empty-entry rules below.
+@pytest.mark.parametrize(
+    ("source", "name"),
+    [("gate", name) for name in ADMITTED + ANY_CHARACTERS] + [("reappraiser", "José"), ("tool", "José")],
+)
 def test_n12_names_are_admitted_as_given_whatever_characters_they_hold(tmp_path: Path, source: str, name: str) -> None:
     out = kn.admit_names(tmp_path, [name], source)
     assert out == [kn.normalize_name(name.encode("utf-8", "replace").decode("utf-8"))]

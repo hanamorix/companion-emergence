@@ -639,8 +639,17 @@ def test_s75_the_recorded_sample_is_in_tokens(clock: _Clock) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pool", [0, 1, 4, 5, 6, 9, 30, 60])
-@pytest.mark.parametrize("seed_rate", [None, 1e-7, 1e-3, 1.0])
+# Pools below the minimum return before any cost is read (so one seed rate each); from 5 up, the seed rate sets the
+# width: 1.0 fits fewer than 5 (no rerank), 1e-3 a few more than 5, and (60, 1e-7) is the one case that hits both the
+# 50-document cap and the 8-anchor cap.
+_C2C_CASES = (
+    [(0, None), (4, None)]
+    + [(pool, rate) for pool in (5, 6, 9, 60) for rate in (None, 1e-3, 1.0)]
+    + [(60, 1e-7)]
+)
+
+
+@pytest.mark.parametrize(("pool", "seed_rate"), _C2C_CASES)
 def test_c2c_every_rerank_has_five_real_and_two_anchors_and_is_normalized(
     clock: _Clock, pool: int, seed_rate: float | None
 ) -> None:

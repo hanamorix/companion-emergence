@@ -905,8 +905,14 @@ def test_g3_the_clamps_hold_at_an_ancestor_level(monkeypatch: pytest.MonkeyPatch
 _BAD_VALUES = ["abc", "-5", "+5", "1_000", "nan", "inf", "infinity", "", "²", "9" * 400, "1.5"]
 
 
-@pytest.mark.parametrize("key", _V2_KEYS)
-@pytest.mark.parametrize("raw", [*_BAD_VALUES, _REMOVE])
+# One loop and one parser serve all five lines (`_cgroup_reclaimable_file_bytes`), so the whole value grid runs on the
+# first line and two representative degrades (junk text, a missing line) on each of the others.
+_G4_CASES = [("file", raw) for raw in [*_BAD_VALUES, _REMOVE]] + [
+    (key, raw) for key in _V2_KEYS[1:] for raw in ("abc", _REMOVE)
+]
+
+
+@pytest.mark.parametrize(("key", "raw"), _G4_CASES)
 def test_g4_any_unusable_page_cache_line_subtracts_nothing(monkeypatch: pytest.MonkeyPatch, key: str, raw: object) -> None:
     """Every degrade input, on any ONE of the five lines, gives limit - current (5.0 GB): never None, never a raise."""
     _use_files(monkeypatch, _one_level(_stat(override={key: raw})))
@@ -1293,8 +1299,11 @@ def test_g11_v1_clamps_and_floors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 0.0
 
 
-@pytest.mark.parametrize("key", _V1_KEYS)
-@pytest.mark.parametrize("raw", [*_BAD_VALUES, _REMOVE])
+# The v1 lines go through the same loop and parser as the v2 ones (the value grid is test_g4_ and test_h2_), so each
+# of the five v1 lines gets the junk-text and the missing-line degrade.
+@pytest.mark.parametrize(
+    ("key", "raw"), [(key, raw) for key in _V1_KEYS for raw in ("abc", _REMOVE)]
+)
 def test_g11_v1_any_unusable_page_cache_line_subtracts_nothing(
     monkeypatch: pytest.MonkeyPatch, key: str, raw: object
 ) -> None:
