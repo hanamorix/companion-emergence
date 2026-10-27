@@ -2,7 +2,7 @@
 registered in tunables.py itself, and it is the one ops-timing key registered
 there. (The dev_constants.py half
 of C27 — the busy timeout / gate / decay budget living there, not here — is
-covered by test_dev_constants.py, INC-1, frozen; not duplicated here.)"""
+held by test_dev_constants.py (the gate and the fence) and test_dev_constants_snapshot.py (every value); not duplicated here.)"""
 from __future__ import annotations
 
 import ast

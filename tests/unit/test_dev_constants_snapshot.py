@@ -9,16 +9,17 @@ and fails, naming each constant that changed, was added or was removed. A delibe
 
 Constants are compared as canonical text (``repr`` of numbers and strings, items of sets sorted), so ``5`` and ``5.0``
 are different values. The values come from a private copy of the file loaded from its path, because the suite patches
-some of them in ``tests/conftest.py`` (the RAM fit safety factor is 1.0 inside a test). The names come from the module's
-top-level assignments, so an import in the file is never mistaken for a constant.
+some of them in ``tests/conftest.py`` (the RAM fit safety factor is 1.0 inside a test). The names are the public names
+that copy ends up with, so a constant defined by unpacking, in an ``if`` or in a ``try`` is covered too; modules,
+functions, classes and the ``__future__`` feature flag are not constants.
 """
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import sys
 from pathlib import Path
+from types import FunctionType, ModuleType
 from typing import Any
 
 import pytest
@@ -44,15 +45,6 @@ def canonical(value: Any) -> str:
     raise TypeError(f"a {type(value).__name__} cannot be snapshotted: teach canonical() about it on purpose")
 
 
-def constant_names(source: str) -> list[str]:
-    """The public names assigned at the top level of the module (imports and underscore names are not constants)."""
-    names: list[str] = []
-    for node in ast.parse(source).body:
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
-        names += [t.id for t in targets if isinstance(t, ast.Name) and not t.id.startswith("_")]
-    return sorted(set(names))
-
-
 def current_constants(path: Path = SOURCE) -> dict[str, str]:
     """``{name: canonical text}`` of the file's constants, read from a private copy of the module."""
     spec = importlib.util.spec_from_file_location("_dev_constants_pristine", path)
@@ -60,12 +52,14 @@ def current_constants(path: Path = SOURCE) -> dict[str, str]:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     out: dict[str, str] = {}
-    for name in constant_names(path.read_text(encoding="utf-8")):
+    for name, value in vars(module).items():
+        if name.startswith("_") or isinstance(value, (ModuleType, FunctionType, type)) or type(value).__module__ == "__future__":
+            continue
         try:
-            out[name] = canonical(getattr(module, name))
+            out[name] = canonical(value)
         except TypeError as exc:
             raise TypeError(f"dev constant {name}: {exc}") from exc
-    return out
+    return dict(sorted(out.items()))
 
 
 def differences(approved: dict[str, str], current: dict[str, str]) -> list[str]:

@@ -43,4 +43,3 @@ def test_dev_constants_module_never_touches_tunables() -> None:
     assert "from brain import tunables" not in code_only
     assert ".register(" not in code_only
     assert ".get_tunable(" not in code_only
-
