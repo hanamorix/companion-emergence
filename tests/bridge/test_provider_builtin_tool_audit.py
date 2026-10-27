@@ -1677,8 +1677,9 @@ def test_forced_final_pass_runs_the_json_text_branch_and_writes_nothing(tmp_path
     sys.platform == "win32",
     reason="CreateProcess finds only claude.exe, so a script on PATH is not launchable (ledger A2)",
 )
-@pytest.mark.parametrize("tools", [True, False], ids=["tools-branch", "text-branch"])
-def test_real_subprocess_timeout_audits_what_the_killed_cli_had_printed(tmp_path, monkeypatch, tools):
+def test_real_subprocess_timeout_audits_what_the_killed_cli_had_printed(tmp_path, monkeypatch):
+    """One real process (the tools branch). Both branches share ``_run_blocking_cli_inner``, and the synthetic
+    ``test_timeout_partial_stdout_of_any_type_is_decoded_and_audited`` covers every stdout type on both."""
     printed = "".join(
         json.dumps(f) + "\n"
         for f in (
@@ -1707,7 +1708,7 @@ def test_real_subprocess_timeout_audits_what_the_killed_cli_had_printed(tmp_path
     with pytest.raises(ProviderError) as excinfo:
         provider.chat(
             [ChatMessage(role="user", content="hi")],
-            tools=_TOOLS if tools else None,
+            tools=_TOOLS,
             options={"persona_dir": str(persona_dir)},
         )
 
