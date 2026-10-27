@@ -773,6 +773,7 @@ def test_housekeeping_churn_alongside_real_escape_still_hard_raises(
             (guarded / "escaped.txt").write_text("a real Canary escape alongside the benign CLI churn")
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_cli_housekeeping_files_are_content_guarded_not_name_excluded() -> None:
     """G5 + G6: the helper derives exactly the housekeeping files under ~/.claude; and they ride the
     mtime-insensitive path, NOT the exclude allowlist nor the F4 session-log set (preserves the semantic

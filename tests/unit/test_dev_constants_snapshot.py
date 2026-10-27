@@ -74,6 +74,7 @@ def differences(approved: dict[str, str], current: dict[str, str]) -> list[str]:
     return lines
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_dev_constants_match_the_approved_snapshot() -> None:
     from tests.snapshot_support import read_snapshot
 

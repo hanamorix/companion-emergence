@@ -35,6 +35,7 @@ def _signal_self(sig) -> None:
     os.kill(os.getpid(), sig)
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_signal_self_refuses_a_signal_that_would_kill_the_process():
     sig = signal.SIGUSR1
     seen = []
@@ -202,6 +203,7 @@ def test_own_kill_freezes_kills_the_bridge_first_then_the_tree_and_commits(tmp_p
 
 # One handler is installed on all three stop signals in one loop (kill.py), so the signal is not a branch: each
 # signal runs once, and both code positions run.
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(
     ("sig", "when"),
     [("SIGTERM", "before_bridge_kill"), ("SIGHUP", "after_bridge_suspend"), ("SIGINT", "before_bridge_kill")],
@@ -373,6 +375,7 @@ def test_owned_bridge_ignoring_the_request_gets_the_manager_then_the_helper_kill
     assert b.all_gone()
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(("sig", "when"), [("SIGTERM", "hard_exit_wait"), ("SIGINT", "manager")])
 def test_a_signal_during_the_wait_or_the_manager_call_freezes_nothing_and_deletes_the_intent(
     tmp_path, fake, owned, monkeypatch, sig, when

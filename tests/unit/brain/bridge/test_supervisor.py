@@ -1203,6 +1203,7 @@ def _job_names(persona_dir: Path, **intervals: float | None) -> list[str]:
     return [j.name for j in jobs]
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 @pytest.mark.parametrize(
     "job, knob",
     [
@@ -1220,6 +1221,7 @@ def test_a_gated_job_is_in_the_table_exactly_when_its_interval_is_not_none(
     assert job in _job_names(persona_dir, **{knob: interval}), "a number (zero included) must put the job in"
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_run_folded_hands_every_interval_to_the_job_table_unchanged(tmp_path: Path) -> None:
     """The arguments of run_folded reach the table builder as given (None included: no ``x or default``), and the
     defaults leave the calibration and sweep jobs on. The supervisor thread tests this replaces ran with the defaults,

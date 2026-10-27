@@ -864,6 +864,7 @@ def _script_run(*args, cwd=None):
     return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd or REPO, env=env, capture_output=True, text=True, timeout=120)
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_k3_the_script_process_exits_with_the_verdict_code_and_1_on_a_crash(tmp_path):
     """The whole exit-code table is asserted in-process (`test_cli_exit_codes_and_skips_non_chat_rows`,
     `test_cli_from_row_is_one_based_over_chat_rows`, `test_cli_bad_arguments_are_exit_2_...`); what only a process

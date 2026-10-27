@@ -196,6 +196,7 @@ def test_http_stop_reasons(tmp_path, bridges, reason):
     assert b.record().stop_reason == (reason or "manual_restart")
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_sigterm_stop_marks_stopping_and_exits_0(tmp_path, bridges):
     """C11 (SIGTERM leg), C13 (OS signal), C15 (SIGTERM). The monitor polls every 0.1 s; the mark must show within 3 s
     (30 polls), a bound a loaded host meets and a handler that never marks "stopping" misses."""

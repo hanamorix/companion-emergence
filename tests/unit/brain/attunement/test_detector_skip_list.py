@@ -41,6 +41,7 @@ def test_runs_with_whitespace_only_message_treated_as_empty():
     ) is False
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(("message", "runs"), [("yes that is fine", False), ("yes that is totally fine", True)])
 def test_the_word_count_boundary_is_five(message: str, runs: bool):
     """4 words skip, 5 words run (the call site honouring this default is pinned in test_attunement_pass2_spawn.py)."""

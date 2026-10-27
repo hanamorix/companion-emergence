@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from tests.source_tree import REPO, tree_asts, tree_sources
 
 _SUFFIXES = (".py", ".toml", ".json", ".ts", ".tsx", ".rs")
@@ -577,6 +579,7 @@ def _scanned_texts() -> dict[str, str]:
     return texts
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_removed_names_stay_removed() -> None:
     """Nothing listed in ``REMOVED`` has come back; a failure names each name, where it reappeared and why it was removed."""
     texts = _scanned_texts()

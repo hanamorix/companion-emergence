@@ -121,6 +121,7 @@ tdd_guard_project_root = "the project root"
 # modules raise it for themselves with @pytest.mark.timeout(3600).
 timeout = 600
 markers = [
+    "no_base_failure(reason): a new test that passes on the code the PR started from by design (a refactor guard, test infrastructure); exempt from the new-tests-must-fail-on-base check (#540, CONTRIBUTING.md). The reason is mandatory.",
     "unit: unit tests",
     "integration: integration tests (deselect with '-m \"not integration\"')",
     "requires_claude_cli: marks tests that require the claude CLI to be on PATH",

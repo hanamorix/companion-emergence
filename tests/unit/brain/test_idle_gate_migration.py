@@ -216,6 +216,7 @@ def test_enumerated_caller_still_routes_through_cli_throttle_no_min_idle(relpath
     )
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_the_central_pass_asks_is_chat_idle_by_default() -> None:
     """The supervisor calls ``central_cadence.run_central_pass`` without an ``is_idle`` argument, so the idle gate
     every gated job (the session snapshot/prune included) waits on is the function's default, which must be

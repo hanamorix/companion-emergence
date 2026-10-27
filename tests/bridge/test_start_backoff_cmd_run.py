@@ -92,6 +92,7 @@ def _fake_run(monkeypatch, *, rc: int = 0, on_run=None) -> list[float]:
 
 # The ladder itself is test_start_backoff.py's; here every service origin waits the first step and one origin each
 # step after it (cmd_run has no per-origin ladder: the per-origin extras are stubbed by the `pd` fixture).
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(
     ("origin", "starts", "step"),
     [(origin, 1, 30) for origin in SERVICE_ORIGINS] + [("systemd", 2, 60), ("systemd", 3, 300), ("systemd", 4, 600)],

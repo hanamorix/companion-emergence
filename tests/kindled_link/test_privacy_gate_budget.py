@@ -38,6 +38,7 @@ def test_m10_floor_is_exclusive_below():
     assert out.action == "revise"
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize("action", ["hold", "revise", "end_or_pause"])
 @pytest.mark.parametrize("budget", [0.0, 0.1, 1.0])
 def test_m10_never_loosens_non_send(action, budget):

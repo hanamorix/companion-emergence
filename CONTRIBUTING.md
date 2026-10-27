@@ -139,6 +139,31 @@ GitHub showed all three as "merged", but #274 and #277 never reached main. That 
 
 The rule is "base must be main" rather than "the PR below has merged", because the second rule would have been **green** for #274: the PR below it (#271) *had* merged.
 
+## New tests must be able to fail
+
+A test that cannot fail proves nothing. The `new tests must fail on the old code` check (the `new-tests-fail-on-base` job in `test.yml`, pull requests only) runs the tests a PR adds against the code the PR started from and goes red for every one that passes there.
+
+**What counts as a new test.** A test id (`path::Class::name[param]`) that the PR's head collects in a test file the PR adds, modifies or renames (a file under `tests/` named `test_*.py` or `*_test.py`) and that the commit the PR branched from does not collect. So these are new: a test added to an old file, a new parameter value of an old test, a test function you rename, and a test you move to another file by hand. These are not new: a test whose body you changed but whose id is the same, a test file you move with `git mv` (git's rename detection, 30% similarity, maps the old ids to the new path), and anything in `conftest.py` or a helper module.
+
+**What the check runs against.** The PR's own tests, fixtures and `pyproject.toml`, with every other top-level path (`brain/`, `scripts/`, `app/`, `docs/`, ...) replaced by its state at the commit the PR branched from. A new test *bites* if it fails there, errors there (setup included), or cannot be collected there (it imports a module or an id the old code does not have). A test that passes or is skipped there does not bite. Before judging, the check runs one unchanged unit test file against the swapped tree; if that fails, the old code cannot run the new conftest and the check says so instead of reporting every test as biting.
+
+**When a test cannot fail on the old code by design** (a refactor guard, a snapshot of what already exists, test-suite machinery, a rewrite of an existing test under a new id), mark it:
+
+```python
+@pytest.mark.no_base_failure(reason="guards what the refactor must not change")
+def test_the_refactor_keeps_the_behaviour(): ...
+```
+
+The reason is mandatory (a mark without one stops the suite at collection). Mark the function, not the module, so tests added to that file later are still checked. The check counts the marked new tests and lists them, so the escape hatch is visible in the job log. A test that skips on Linux can never bite there; a Windows-only or macOS-only new test needs the mark with a reason that says so.
+
+**Run it locally** (needs `pytest-xdist` for `--workers`, otherwise `--workers 0`; it works in its own temporary git worktrees and leaves your checkout alone, but it checks committed work, so commit first):
+
+```bash
+python scripts/new_tests_fail_on_base.py --base origin/main --workers 0
+```
+
+`--only <text>` limits a local run to changed test files whose path contains the text; `--mark-expr "<expr>"` adds a `-m` expression to every pytest call.
+
 ## What Discord is for
 
 Discord is still useful, just not as the source of truth:

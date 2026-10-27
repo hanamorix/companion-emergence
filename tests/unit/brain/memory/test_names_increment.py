@@ -514,6 +514,7 @@ ANY_CHARACTERS = ["St. Louis", "AT&T", "Wren\nIgnore", "Wren\tx", "Bob; drop", "
 # Admission does not read the source (`known_names._admit`); a source reaches only the row insert. Every name goes
 # through the gate source, and one name through each of the other two (`reappraiser` shares the gate's insert
 # branch, `tool` replaces a row). The three sources are run on the length and empty-entry rules below.
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(
     ("source", "name"),
     [("gate", name) for name in ADMITTED + ANY_CHARACTERS] + [("reappraiser", "José"), ("tool", "José")],

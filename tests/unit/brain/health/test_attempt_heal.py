@@ -223,6 +223,7 @@ def test_live_path_never_missing_at_any_step_boundary(tmp_path: Path, monkeypatc
     assert _version(p) == 6 and _version(d / "x.json.bak1") == 5
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.skipif(
     os.name == "nt",
     reason="a reader holding the file open without FILE_SHARE_DELETE makes any replace fail on "
@@ -744,6 +745,7 @@ def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
         _version(tmp_path / f"x.json.bak{i}")  # each backup is a complete version
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.skipif(
     os.name == "nt",
     reason="on Windows a writer copying the live file makes another writer's replace wait on "

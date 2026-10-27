@@ -21,6 +21,7 @@ def test_timeout_raises_and_the_body_never_runs(tmp_path: Path, wedged_lock) -> 
     assert ran == []
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_held_lock_contends_with_a_second_acquirer_in_the_same_process_and_releases(tmp_path: Path, held_lock) -> None:
     """The in-process holder is a real contender (each ``file_lock`` opens its own descriptor), and it lets go on exit."""
     target = tmp_path / "data.json"
@@ -33,6 +34,7 @@ def test_held_lock_contends_with_a_second_acquirer_in_the_same_process_and_relea
         assert acquired is True
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_held_lock_releases_when_the_body_raises(tmp_path: Path, held_lock) -> None:
     target = tmp_path / "data.json"
 

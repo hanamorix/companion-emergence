@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
 from brain.bridge.chat import ChatMessage
 from brain.bridge.provider import _MAX_TURN_BUDGET_USD, ClaudeCliProvider
 
@@ -52,6 +54,7 @@ def test_mcp_tools_path_budget_flag_and_graceful(tmp_path, monkeypatch):
     assert "limit" in resp.content.lower() or "continue" in resp.content.lower()
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_chat_with_a_persona_dir_and_an_image_message_budget_flag_and_graceful(tmp_path, monkeypatch):
     """The text path with a persona dir (stream-json output, no tools), for a message that carries an image: the
     image transport is gone, the image is flattened into the text, and the flag is present with the over-budget

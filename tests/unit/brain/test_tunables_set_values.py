@@ -321,6 +321,7 @@ def test_same_size_replacement_with_identical_mtime_ns_is_seen_through_the_inode
     assert t.get_tunable("a", 0) == 2
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_a_second_process_sees_a_write_made_after_it_started(t, tmp_path, repo_root) -> None:
     # The child polls for up to 20 s and stops at the first sight of the value, so the deadline only matters when the write
     # is never seen; it is long so that a loaded host (a slow interpreter start) cannot miss it.

@@ -14,6 +14,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = textwrap.dedent(
     """
     import sys
@@ -78,6 +80,7 @@ _SCRIPT = textwrap.dedent(
 )
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_judge_modules_stay_torch_free() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     proc = subprocess.run(

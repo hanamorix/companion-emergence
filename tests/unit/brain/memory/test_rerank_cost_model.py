@@ -630,6 +630,7 @@ _C2C_CASES = (
 )
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(("pool", "seed_rate"), _C2C_CASES)
 def test_c2c_every_rerank_has_five_real_and_two_anchors_and_is_normalized(
     clock: _Clock, pool: int, seed_rate: float | None

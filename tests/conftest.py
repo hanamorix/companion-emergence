@@ -23,6 +23,15 @@ from brain.memory import pending
 pytest_plugins = ["pytester"]
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Refuse a ``no_base_failure`` mark that gives no reason (see ``tests/no_base_failure.py``)."""
+    from tests.no_base_failure import marker_problems
+
+    problems = marker_problems(items)
+    if problems:
+        raise pytest.UsageError("\n".join(problems))
+
+
 @functools.cache
 def _symlinks_available() -> bool:
     """Probe once per session whether this host lets us create a symlink (#262).

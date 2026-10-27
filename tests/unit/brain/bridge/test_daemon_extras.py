@@ -1153,6 +1153,7 @@ def _pin_daemon_posix(monkeypatch: pytest.MonkeyPatch, kill) -> None:
     _scoped_daemon_module(monkeypatch, "os", name="posix", kill=kill)
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_a_scoped_daemon_patch_leaves_the_real_time_and_os_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     """The point of ``_scoped_daemon_module``: the daemon sees the fakes, nothing else does."""
     real = (time.time, time.sleep, os.kill, os.name)

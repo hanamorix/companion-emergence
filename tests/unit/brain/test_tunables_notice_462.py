@@ -263,6 +263,7 @@ def test_a_marker_write_that_hits_a_programming_error_is_not_swallowed(tunables,
         tunables._write_marker({"kind": "unreadable"})
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_an_old_notice_marker_kind_is_never_reported(tunables):
     marker = Path(tunables._notice_path())
     marker.parent.mkdir(parents=True, exist_ok=True)

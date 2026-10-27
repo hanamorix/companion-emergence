@@ -207,6 +207,7 @@ def test_b1f_a_name_with_an_ascii_word_keeps_its_normalized_key(given: str, key:
 SPELLINGS = ["田中 太郎", "田中  太郎", "田中\t太郎", "田中\n\n太郎", "田中\u00a0太郎", "田中\u3000太郎", "  田中   太郎  "]
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize("source", SOURCES)
 def test_s1a_every_spelling_of_the_spacing_is_one_name_from_each_write_path(tmp_path: Path, source: str) -> None:
     for spelling in SPELLINGS:

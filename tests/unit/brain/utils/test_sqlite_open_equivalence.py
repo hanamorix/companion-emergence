@@ -758,6 +758,7 @@ def test_c10_integrity_cadence_signatures_are_unchanged() -> None:
     assert "integrity_check" not in inspect.signature(SoulStore.__init__).parameters
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_the_path_token_normalisation_handles_windows_paths(tmp_path) -> None:
     rec = Recorder(str(tmp_path))
     assert rec.norm(f"oops at {tmp_path}/x.db") == "oops at <TMP>/x.db"
@@ -769,6 +770,7 @@ def test_the_path_token_normalisation_handles_windows_paths(tmp_path) -> None:
     )
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_the_trace_keeps_policy_pragmas_and_drops_schema_work() -> None:
     from types import SimpleNamespace
 

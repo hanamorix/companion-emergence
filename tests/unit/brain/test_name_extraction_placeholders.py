@@ -35,12 +35,14 @@ _LIVE_TEXTS = {
 }
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 @pytest.mark.parametrize("text", list(_LIVE_TEXTS.values()), ids=list(_LIVE_TEXTS))
 def test_no_em_dash_or_llm_tell(text):
     for tell in _TELLS:
         assert tell not in text.lower(), tell
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_app_job_descriptors_carry_the_three_final_labels():
     """Wording file section 4 (two labels) and section 8 (`rerank_width_remeasure`, final):
     each label is present at its site."""

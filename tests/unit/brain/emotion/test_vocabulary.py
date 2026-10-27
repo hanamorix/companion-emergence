@@ -157,6 +157,7 @@ _BODY_EMOTIONS = [
 ]
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_baseline_includes_the_body_emotions():
     from brain.emotion.vocabulary import get
 

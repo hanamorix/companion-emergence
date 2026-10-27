@@ -1673,6 +1673,7 @@ def test_forced_final_pass_runs_the_json_text_branch_and_writes_nothing(tmp_path
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="CreateProcess finds only claude.exe, so a script on PATH is not launchable (ledger A2)",

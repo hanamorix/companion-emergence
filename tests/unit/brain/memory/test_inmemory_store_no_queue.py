@@ -109,6 +109,7 @@ def test_innocent():
 '''
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_another_process_growing_the_cwd_queue_does_not_fail_an_innocent_test(pytester) -> None:
     """Under xdist the repo root is shared by every worker: a leak made by another process is not this test's."""
     pytester.makeconftest(_GUARD_CONFTEST)
@@ -116,6 +117,7 @@ def test_another_process_growing_the_cwd_queue_does_not_fail_an_innocent_test(py
     pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1)
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_the_previous_size_check_fails_an_innocent_test_on_the_same_foreign_write(pytester) -> None:
     """Control arm: the scenario above really is one the size comparison got wrong."""
     pytester.makeconftest(_SIZE_CHECK_CONFTEST)
@@ -137,6 +139,7 @@ _LEAKS = {
 }
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 @pytest.mark.parametrize("kind", sorted(_LEAKS))
 def test_every_way_of_changing_the_cwd_queue_errors_the_test_that_did_it_and_names_the_call_site(pytester, kind) -> None:
     pytester.makeconftest(_GUARD_CONFTEST)
@@ -148,6 +151,7 @@ def test_every_way_of_changing_the_cwd_queue_errors_the_test_that_did_it_and_nam
     result.stdout.fnmatch_lines(["*pending_candidates.jsonl*", "*test_leaks.py:[0-9]* in test_leaks*"])
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_reading_the_cwd_queue_is_not_a_write(pytester) -> None:
     pytester.makeconftest(_GUARD_CONFTEST)
     # bytes, not write_text: on Windows a text write turns "\n" into "\r\n" and the inner size check would see 4
@@ -164,6 +168,7 @@ def test_reading_the_cwd_queue_is_not_a_write(pytester) -> None:
     pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1)
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_a_same_named_file_in_another_directory_is_not_the_cwd_queue(pytester) -> None:
     """`shutil.rmtree` unlinks by bare name relative to a directory descriptor; a TemporaryDirectory holding its own
     `pending_candidates.jsonl` (a test that chdirs into it) is not the queue of the cwd the test started in."""

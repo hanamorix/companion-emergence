@@ -1002,5 +1002,6 @@ def test_known_names_does_not_import_the_chat_layer() -> None:
     assert out.returncode == 0, out.stdout + out.stderr
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_known_names_path_joins_the_persona_dir_and_the_file_name() -> None:
     assert kn.known_names_path("/x/persona") == Path("/x/persona") / dev_constants.KNOWN_NAMES_DB_FILENAME

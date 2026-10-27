@@ -180,6 +180,7 @@ def test_the_integration_fixture_skips_when_the_failsafe_cannot_be_armed():
     assert "skip" in names
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 @pytest.mark.parametrize(
     ("environ", "allowed"),
     [
@@ -202,6 +203,7 @@ def test_a_real_unit_install_needs_github_actions_or_an_explicit_opt_in(environ,
         assert "GITHUB_ACTIONS" in reason and sc.ALLOW_REAL_INSTALL_ENV in reason
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_the_integration_fixture_checks_the_opt_in_before_anything_touches_systemd():
     """The skip must come before the sweep, the fail-safe and the install: the first statements of the autouse fixture call the
     opt-in check and skip, ahead of `unit_guard` and the `systemctl` availability probe."""

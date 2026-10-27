@@ -364,6 +364,7 @@ def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     assert (decisions[-1].job, decisions[-1].action) == (GATED_JOB_ORDER[j], "skip-no-lull")
 
 
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
 def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tmp_path, stubs, monkeypatch):
     """The real emotion_backfill job hands the backfill a provider built for the background-classifier tier
     (the behaviour the source-text check in test_emotion_backfill_model_tier.py pins by reading supervisor.py)."""
@@ -692,6 +693,7 @@ def test_c21_a_raising_job_still_advances_its_cadence(tmp_path, stubs, monkeypat
     assert state.next_at == NOW + timedelta(seconds=interval)
 
 
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
 def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stubs, monkeypatch):
     """The central function is the fault-isolation wrapper of deploy recalibration (the supervisor-thread test that
     pinned "the loop survives" is gone). A raising run counts as a completed run (S44), the next due job still runs in
@@ -1105,6 +1107,7 @@ def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(
 _WORK_PREDICATE_JOBS = (*NO_INTERVAL_JOBS, "deploy_recalibration")
 
 
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
 @pytest.mark.parametrize("name", _WORK_PREDICATE_JOBS)
 def test_c39_no_interval_job_runs_every_idle_pass_while_it_has_work(tmp_path, stubs, name):
     persona_dir = _persona(tmp_path)
@@ -1551,6 +1554,7 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
     assert not t.is_alive()
 
 
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
 def test_s84_run_folded_prunes_by_the_bridge_start_it_is_given(tmp_path):
     """The bridge hands run_folded the moment it captured before starting the supervisor thread (S84, so the app-mount
     session cannot race it). Given a start two hours ago, an empty session from three hours ago predates it and is

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize("parameter", ["calibration_interval_s", "compaction_interval_s"])
 def test_run_folded_defaults_the_calibration_and_compaction_intervals_to_a_day(parameter):
     from brain.bridge.supervisor import run_folded

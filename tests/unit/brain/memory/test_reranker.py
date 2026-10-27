@@ -887,6 +887,7 @@ _G4_CASES = [("file", raw) for raw in [*_BAD_VALUES, _REMOVE]] + [
 ]
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(("key", "raw"), _G4_CASES)
 def test_g4_any_unusable_page_cache_line_subtracts_nothing(monkeypatch: pytest.MonkeyPatch, key: str, raw: object) -> None:
     """Every degrade input, on any ONE of the five lines, gives limit - current (5.0 GB): never None, never a raise."""
@@ -1276,6 +1277,7 @@ def test_g11_v1_clamps_and_floors(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # The v1 lines go through the same loop and parser as the v2 ones (the value grid is test_g4_ and test_h2_), so each
 # of the five v1 lines gets the junk-text and the missing-line degrade.
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(
     ("key", "raw"), [(key, raw) for key in _V1_KEYS for raw in ("abc", _REMOVE)]
 )

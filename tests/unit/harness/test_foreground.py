@@ -158,6 +158,7 @@ def test_boot_and_verify_error_marker_raises(tmp_path: Path, monkeypatch: pytest
         fg.boot_and_verify(spec, boot_cmd=["boot", "it"])
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_boot_and_verify_with_no_ready_in_poll_mode_raises_after_its_timeout(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -373,6 +374,7 @@ def test_drive_now_banner_first_line_is_exact_headline(tmp_path: Path) -> None:
     assert first_line == "▶ DRIVE NOW, IN THIS SAME TURN — do not end your turn to wait"
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_drive_now_banner_content_surfaces_rule_run_context_and_extra_lines() -> None:
     banner = fg.drive_now_banner(
         arm="my-arm", port=9999, run_dir="/tmp/xyz", roster_ok=True, extra_lines=["custom note here"]

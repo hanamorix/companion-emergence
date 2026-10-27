@@ -98,6 +98,7 @@ def test_unload_platformdirs_drops_it_from_sys_modules(monkeypatch):
     _unload_platformdirs_with_fakes(monkeypatch)
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 def test_the_unload_test_leaves_the_real_platformdirs_in_sys_modules():
     """The unload test must not take the real module away from later tests in the same worker
     (xdist runs many tests per process): every platformdirs entry present before is the same

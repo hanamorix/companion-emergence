@@ -40,6 +40,7 @@ def test_spawn_skips_when_buffer_empty(tmp_path: Path):
         mock_detector.assert_not_called()
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize(("message", "queued"), [("yes that is fine", 0), ("yes that is totally fine", 1)])
 def test_the_spawn_gate_is_five_words(tmp_path: Path, message: str, queued: int):
     """The call site honours the five-word default (the boundary rule itself is in test_detector_skip_list.py):

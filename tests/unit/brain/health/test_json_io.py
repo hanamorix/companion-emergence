@@ -727,6 +727,7 @@ class _OpenSpy:
         monkeypatch.setattr(gz, "open", check("gzip.open", gz.open))
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_cr11_baseline_the_spy_flags_a_locale_codec_writer_and_the_migrated_ones_are_clean(
     tmp_path: Path, monkeypatch
 ) -> None:

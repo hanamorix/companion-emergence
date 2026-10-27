@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from brain.chat.prompt import _RECALL_STOPWORDS, _extract_recall_tokens, _legacy_capped_tokens
 from tests.memory.recall_eval import (
     COMMON_STORE_FRACTION,
@@ -130,6 +132,7 @@ def test_g5_gold_f1_meets_floor() -> None:
 LATENCY_BUDGET_MS = 10.0
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 def test_g6_selection_latency_stays_within_the_budget() -> None:
     store, _ = seed_store(COMMON_STORE_FRACTION)
     try:

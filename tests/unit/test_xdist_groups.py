@@ -61,6 +61,7 @@ def _module_marks(tree: ast.Module) -> list[ast.AST]:
     return marks
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 @pytest.mark.parametrize("rel", sorted(MODULE_GROUPS))
 def test_a_module_that_shares_a_resource_is_in_its_xdist_group(rel: str) -> None:
     group, shared = MODULE_GROUPS[rel]
@@ -70,6 +71,7 @@ def test_a_module_that_shares_a_resource_is_in_its_xdist_group(rel: str) -> None
     )
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 @pytest.mark.parametrize("rel", sorted(FUNCTION_GROUPS))
 def test_a_function_that_needs_its_own_group_carries_the_mark(rel: str) -> None:
     name, group = FUNCTION_GROUPS[rel]
@@ -81,6 +83,7 @@ def test_a_function_that_needs_its_own_group_carries_the_mark(rel: str) -> None:
     )
 
 
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
 @pytest.mark.parametrize("rel", ONE_TORCH_THREAD)
 def test_a_torch_training_module_runs_on_one_torch_thread(rel: str) -> None:
     tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))

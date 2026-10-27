@@ -893,6 +893,7 @@ def _production_series():
     ]
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize("which", range(6))
 def test_cs1_each_production_series_counts_a_sample_for_exactly_the_window(
     store: MemoryStore, clock: Clock, which: int
@@ -954,6 +955,7 @@ def test_cs6e_window_counts_also_reads_the_database_before_the_buffer(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize("which", range(6))
 def test_cs1b_each_production_series_counts_only_the_later_samples_when_the_earlier_age_out(
     store: MemoryStore, clock: Clock, which: int

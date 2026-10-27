@@ -17,6 +17,8 @@ import sys
 import threading
 from datetime import UTC, datetime
 
+import pytest
+
 from brain.body.state import BodyState, compute_body_state
 from tests.source_tree import brain_trees
 
@@ -369,6 +371,7 @@ def impure_findings(tree: ast.AST, allowed: frozenset[str]) -> list[str]:
     return found
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_the_body_state_module_imports_only_pure_modules_and_calls_no_io() -> None:
     trees = brain_trees()
     assert _STATE_FILE in trees, f"{_STATE_FILE} moved: point this guard at the module that holds compute_body_state"
@@ -399,6 +402,7 @@ def _audit_hook(event: str, args: tuple) -> None:
         _AUDIT["events"].append(event)
 
 
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_compute_body_state_raises_no_io_audit_event() -> None:
     if not _AUDIT["installed"]:  # an audit hook cannot be removed, so it is installed once, here, and inert otherwise
         sys.addaudithook(_audit_hook)
