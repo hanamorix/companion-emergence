@@ -132,7 +132,7 @@ def test_real_embedding_model_batch_matches_single_embeds_within_1e_5(provider) 
         )
 
 
-@pytest.mark.no_base_failure(reason='moved unchanged from the deleted tests/unit/brain/memory/test_embedding_tokens_real.py (#540, J9) to share one embedder load; the id is new but the test is not')
+@pytest.mark.no_base_failure(reason='moved from the deleted tests/unit/brain/memory/test_embedding_tokens_real.py (#540, J9) to share one embedder load, with one added line that resets the session first; the id is new but the check is the same')
 def test_c18_real_ensure_loaded_builds_the_session_once(provider) -> None:
     inner = provider._inner_model()
     inner.model = None  # not built yet, whichever test ran first: ensure_loaded must build it

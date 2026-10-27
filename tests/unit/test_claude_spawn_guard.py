@@ -11,10 +11,12 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
+import tests.claude_spawn_guard as guard
 from tests.claude_spawn_guard import enabled, violation
 
 REPO = Path(__file__).resolve().parents[2]
@@ -206,3 +208,104 @@ def test_a_fake_claude_by_explicit_path_or_first_on_the_path_is_allowed(
 ) -> None:
     result = _run_inner(pytester, monkeypatch, guard=True, source=_FAKE_PLANTS)
     result.assert_outcomes(passed=2)
+
+
+_THREAD_PLANTS = """
+import subprocess
+import threading
+
+_go = threading.Event()
+_done = threading.Event()
+_errors = []
+
+
+def _spawn_when_told():
+    _go.wait(10)
+    try:
+        subprocess.run(["claude"], env={"PATH": ""}, check=False)
+    except Exception as exc:  # noqa: BLE001
+        _errors.append(type(exc).__name__)
+    _done.set()
+
+
+# started at import time, so it already runs when the first test begins
+threading.Thread(target=_spawn_when_told, daemon=True).start()
+
+
+def test_a_thread_that_predates_the_test_is_not_blamed():
+    _go.set()
+    assert _done.wait(10)
+    assert _errors == ["FileNotFoundError"]
+
+
+def test_a_thread_started_by_the_test_is_blamed():
+    errors = []
+
+    def spawn():
+        try:
+            subprocess.run(["claude"], env={"PATH": ""}, check=False)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(type(exc).__name__)
+
+    thread = threading.Thread(target=spawn)
+    thread.start()
+    thread.join(10)
+    assert errors == ["RuntimeError"]
+"""
+
+
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
+def test_a_spawn_from_a_thread_that_predates_the_test_is_not_blamed_on_it(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _run_inner(pytester, monkeypatch, guard=True, source=_THREAD_PLANTS)
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(["ERROR *::test_a_thread_started_by_the_test_is_blamed*"])
+
+
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake is a /bin/sh script")
+def test_a_fake_under_pytests_base_temp_is_allowed_even_when_the_system_temp_is_elsewhere(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--basetemp` can sit outside tempfile.gettempdir(): the base temp the fixture registers is the second allowed root."""
+    system_temp = tmp_path / "system-temp"
+    system_temp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(system_temp))
+    monkeypatch.setenv("TEMP", str(system_temp))
+    monkeypatch.setenv("TMP", str(system_temp))
+    monkeypatch.setenv("PYTHONPATH", str(REPO))
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("KINDLED_GUARD_CLAUDE", "1")
+    pytester.makeini(_INNER_INI)
+    pytester.makeconftest(_INNER_CONFTEST)
+    pytester.makepyfile(_FAKE_PLANTS)
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:tdd-guard", f"--basetemp={tmp_path / 'base'}")
+    result.assert_outcomes(passed=2)
+
+
+def _fake_record(name: str):
+    return guard._Record(nodeid=name, thread=threading.get_ident(), threads_before=frozenset())
+
+
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
+def test_the_innermost_active_test_is_blamed_and_an_analysis_bug_never_breaks_a_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer, inner = _fake_record("outer"), _fake_record("inner")
+    guard._ACTIVE.extend([outer, inner])
+    try:
+        monkeypatch.setattr(guard, "violation", lambda *a, **k: "it spawns claude")
+        with pytest.raises(RuntimeError, match="inner: it spawns claude"):
+            guard._audit("subprocess.Popen", ("claude", ["claude"], None, None))
+        assert inner.violations and not outer.violations
+
+        def broken(*_a, **_k):
+            raise ValueError("analysis bug")
+
+        monkeypatch.setattr(guard, "violation", broken)
+        guard._audit("subprocess.Popen", ("claude", ["claude"], None, None))  # must not raise
+        assert len(inner.violations) == 1
+    finally:
+        guard._ACTIVE.remove(outer)
+        guard._ACTIVE.remove(inner)

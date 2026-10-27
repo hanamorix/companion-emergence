@@ -7,7 +7,7 @@ the attempt into a loud failure of that test, with the three ways out in the mes
 `claude` under the test's tmp_path, or mark the test `@pytest.mark.requires_claude_cli`.
 
 What counts as an attempt: a `subprocess.Popen` (so `subprocess.run`, `check_output` and asyncio subprocesses too) whose
-program is the bare name `claude` (case-insensitive, `.exe`/`.cmd`/`.bat` stripped on Windows). A spawn by explicit
+program is the bare name `claude` (case-insensitive, `.exe`/`.cmd`/`.bat` stripped on every platform). A spawn by explicit
 path is never blocked. A bare name is allowed only when it resolves, on the PATH of the env passed to the call (else the
 process PATH), to a file under the system temp directory or pytest's base temp (a fake the test wrote). A bare name that
 resolves to nothing is an attempt: the test relies on the spawn failing.
@@ -15,7 +15,8 @@ resolves to nothing is an attempt: the test relies on the spawn failing.
 Where it applies: when `GITHUB_ACTIONS` is set (CI), or `KINDLED_GUARD_CLAUDE` is set (to try it locally), for every test
 without the `requires_claude_cli` marker. A patched `subprocess.Popen` raises no audit event, so mocks are untouched by
 construction. Limits: a spawn made by a child process of the test, or by a module- or session-scoped fixture, or by a
-thread that was already running when the test began, is not seen or not blamed on the test.
+thread that was already running when the test began, is not seen or not blamed on the test; `shell=True`, `os.system`
+and `os.posix_spawn` are not seen either (brain/ uses none of them for `claude`).
 
 Mechanism: one `sys.addaudithook` (cannot be removed; inert while no guarded test is running), a stack of active records
 (the innermost test is blamed), and an autouse fixture that fails the test at teardown when the spawn error was swallowed.
@@ -38,7 +39,8 @@ import pytest
 _SUFFIXES = (".exe", ".cmd", ".bat")
 
 HELP = (
-    "this test starts a real `claude` (the CLI is not installed on CI, so the spawn can only fail). Patch the spawn "
+    "this test starts a real `claude` (CI has no such CLI, so there the spawn can only fail; on a machine that has it, it "
+    "would spend tokens). Patch the spawn "
     "(monkeypatch subprocess.Popen or the provider's spawn helper), put a fake `claude` script under tmp_path and spawn it "
     "by explicit path or put its directory first on PATH, or mark the test @pytest.mark.requires_claude_cli."
 )
@@ -87,7 +89,6 @@ def violation(
     argv: Any,
     env: Mapping[str, str] | None,
     temp_roots: Iterable[str],
-    environ: Mapping[str, str] | None = None,
 ) -> str | None:
     """Why this Popen event is an attempt to start the real `claude`, or None."""
     program = _program(executable, argv)
@@ -99,7 +100,7 @@ def violation(
             name = name[: -len(suffix)]
     if name != "claude":
         return None
-    found = shutil.which(program, path=_path_of(env, os.environ if environ is None else environ))
+    found = shutil.which(program, path=_path_of(env, os.environ))
     if found is None:
         return f"it spawns `{program}` by name and no such program exists on the PATH of the call"
     real = _norm(found)

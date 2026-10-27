@@ -19,15 +19,11 @@ name: mutation
 # generated here.
 #
 # Each job uploads `mutation-report-<package>`: `results.txt` (every mutant and its verdict),
-# `stats.json` (counts), `survivors.diff` (the change made by the first 100 surviving mutants). mutmut
+# `stats.json` (counts), `survivors.diff` (the change made by the first 100 surviving mutants),
+# `excluded-tests.txt` (tests deselected because they fail on the unmutated copy, if any). mutmut
 # stops after `max_minutes` (default 300) and the report covers what finished.
 
 on:
-  # TEMPORARY (#540 proof run; removed in the next commit): a workflow file that is not on the default
-  # branch cannot be dispatched, so the first run is a pull_request run that touches this file.
-  pull_request:
-    paths:
-      - .github/workflows/mutation.yml
   schedule:
     - cron: "17 3 * * 0" # Sundays 03:17 UTC
   workflow_dispatch:
@@ -66,10 +62,8 @@ jobs:
         id: pick
         env:
           PACKAGE: ${{ inputs.package }}
-          EVENT: ${{ github.event_name }}
         run: |
           want="${PACKAGE:-all}"
-          if [ "$EVENT" = "pull_request" ]; then want="all"; fi # TEMPORARY (#540 proof): every package's clean pass
           all=()
           skipped=()
           for d in brain/*/; do
@@ -128,19 +122,20 @@ jobs:
       # setup.cfg when pyproject.toml has no [tool.mutmut] table. `brain` is the source path so the whole
       # tree is importable; only_mutate narrows what is changed.
       #
-      # mutmut first runs the package's tests once on the unmutated copy and stops at the first failure.
-      # Some tests cannot pass there: they read the text of brain/ (which holds mutmut's trampolines in
-      # the copy) or depend on the repository layout. When that first pass fails, the tests that fail in
-      # a full pass of the copy are listed in report/excluded-tests.txt, deselected, and mutmut starts
-      # again. A test that fails on unmutated code could only "kill" a mutant by accident.
+      # mutmut first runs the package's tests once on the unmutated copy and stops at the first failure
+      # (it runs pytest with -x). Some tests cannot pass there: they read the text of brain/ (which holds
+      # mutmut's trampolines in the copy), depend on the repository layout, or look at what is imported
+      # (mutmut itself is in the process). When that first pass fails, the failing tests are listed in
+      # report/excluded-tests.txt (the test mutmut reported, plus on the first retry every test that fails
+      # in a plain full pass of the copy), deselected, and mutmut starts again; at most 6 retries (each
+      # mutmut pass reports one failure, so a package with more order-dependent failures than that ends
+      # red and says so). A test that fails on unmutated code could only "kill" a mutant by accident.
       - name: Run mutmut
         env:
           PACKAGE: ${{ matrix.package }}
           MAX_MINUTES: ${{ inputs.max_minutes }}
-          EVENT: ${{ github.event_name }}
         run: |
           minutes="${MAX_MINUTES:-300}"
-          if [ "$EVENT" = "pull_request" ]; then minutes=25; fi # TEMPORARY (#540 proof)
           if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then echo "::error::max_minutes must be a number"; exit 1; fi
           mkdir -p report
           marker_expr='not live and not requires_claude_cli and not integration and not requires_network'
