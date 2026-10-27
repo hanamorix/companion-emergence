@@ -3,11 +3,11 @@
 Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
 
 Spec section 7 (inviolate property 4): "compute_body_state blocks chat composition because it's slow: pure function,
-sub-ms. No I/O. No LLM call." The spec asked for a timing test; a wall-clock budget on a pure function cannot fail and
-flakes under load (removed in #540), so the property is held structurally by the last two tests: the module imports only
-pure modules and calls nothing that does I/O (static, branch-independent), and running the function over every band
-boundary fires no I/O audit event (behaviour). The inputs the caller reads (store rows, session hours, words) are the
-caller's; they are outside the property.
+sub-ms. No I/O. No LLM call." The spec asked for a timing test; a wall-clock budget cannot tell a fast I/O call from a
+pure one and flakes under load (removed in #540), so the property is held structurally by the last two tests: the
+module imports only pure modules and calls nothing that does I/O (static, branch-independent), and running the
+function over a grid that reaches every branch of both projections fires no I/O audit event (behaviour). The inputs
+the caller reads (store rows, session hours, words) are the caller's; they are outside the property.
 """
 
 from __future__ import annotations
@@ -382,7 +382,8 @@ def test_the_body_state_module_imports_only_pure_modules_and_calls_no_io() -> No
     ]
     assert not problems, (
         "compute_body_state must stay a pure function (body spec section 7, property 4: it must not block chat "
-        "composition: no I/O, no LLM call). Read the inputs in the caller and pass them in:\n  " + "\n  ".join(problems)
+        "composition: no I/O, no LLM call). Read the inputs in the caller and pass them in; a pure standard-library "
+        "module (math, re, enum) may be added to _PURE_MODULES after checking it:\n  " + "\n  ".join(problems)
     )
 
 
@@ -402,20 +403,28 @@ def test_compute_body_state_raises_no_io_audit_event() -> None:
     if not _AUDIT["installed"]:  # an audit hook cannot be removed, so it is installed once, here, and inert otherwise
         sys.addaudithook(_audit_hook)
         _AUDIT["installed"] = True
+    every = (
+        "love", "joy", "grief", "peace", "belonging", "arousal", "desire", "climax", "touch_hunger", "comfort_seeking",
+        "rest_need", "body_grief",
+    )  # fmt: skip
+    emotions_grid = [
+        {},
+        *(dict.fromkeys(every, level) for level in (5.0, 7.0, 8.0)),  # every threshold of both projections, and > 6 loud
+        {"peace": 8.0},
+        {"body_grief": 7.0, "touch_hunger": 7.0},
+        {"rest_need": 7.0},
+    ]
     grid = [
-        (
-            dict.fromkeys(("love", "joy", "grief", "peace", "belonging", "arousal", "desire", *extra), level),
-            hours,
-            words,
-            days,
-        )
-        for level in (0.0, 5.0, 8.0)
-        for extra in ((), ("climax", "touch_hunger", "comfort_seeking", "rest_need"))
-        for hours in (0.0, 0.5, 1.5, 2.5, 3.5)
+        (emotions, hours, words, days)
+        for emotions in emotions_grid
+        for hours in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)  # both sides of 60, 120 and 180 minutes
         for words in (0, 5000)
-        for days in (0.0, 40.0)
+        for days in (0.0, 3.0, 5.0, 7.0, 40.0)  # both sides of 3 and 7 days
     ]
     now = _now()
+    # One call first, outside the window: a tracer in this thread (coverage) reads and compiles state.py the first time
+    # it sees it, which is not the function's own I/O.
+    compute_body_state(emotions={}, session_hours=0.0, words_written=0, days_since_contact=0.0, now=now)
     _AUDIT.update(events=[], thread=threading.get_ident(), on=True)
     try:
         for emotions, hours, words, days in grid:
