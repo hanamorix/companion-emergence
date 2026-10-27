@@ -1,32 +1,31 @@
-"""C9: the open sequence of the five SQLite stores, pinned statement for statement.
+"""C9: the open sequence of the five SQLite stores, pinned pragma for pragma.
 
 Probe: `sqlite3.connect` is wrapped so every connection is a `sqlite3.Connection`
 subclass that records, in order, every statement it runs (through
 `set_trace_callback`, which sees `execute`, `executescript` and cursors alike)
-plus `<commit>` and `<close>` markers. The connect arguments and the number of
-connect calls are recorded as well. Each store is opened on a fresh file (and on
-`:memory:` where the store allows it) and the recording is compared with
-GOLDEN, a set of literals captured from the unmodified stores (base f9f18bd3,
-before the helper existed; main merged at a17ab2e6 changed no store open
-sequence). The same file runs unchanged against the refactored stores.
+plus `<commit>` and `<close>` markers. `Recorder.trace()` keeps from that only the policy
+pragmas (`integrity_check`, `journal_mode`, `busy_timeout`, `foreign_keys`, ...) in order
+and `<close>`: schema statements (DDL, introspection pragmas, migration steps and the
+commits after them) follow the schema, which changes with every column or table, and are
+not the open sequence (#527). The connect arguments and the number of connect calls are
+recorded as well. Each store is opened on a fresh file (and on `:memory:` where the
+store allows it) and the recording is compared with GOLDEN, a set of literals captured
+from the unmodified stores (base f9f18bd3, before the helper existed; main merged at
+a17ab2e6 changed no store open sequence), schema statements removed. The same file runs
+unchanged against the refactored stores.
+
+A schema change needs no refresh of GOLDEN. A legitimate change to GOLDEN is a change to a
+connect argument, a policy pragma or their order.
 
 Failure paths: a failed open now closes its connection (spec B3, #496), which
 base did not. So on a failure path the golden holds the statement list with the
 `<close>` markers removed, and the closure itself is asserted separately.
 
-Left out of the recording, because they come from SQLite and not from the store: the
-one-line "-- <SQL>" statements SQLite reports for its own FTS5 bookkeeping (see
-SQLITE_OWN_STATEMENT; the set differs between SQLite builds). Paths are recorded with a
-token for the tmp dir and forward slashes, so Windows runs match.
-
-Statements longer than ABBREV characters (the schema DDL) are kept as their
-first 40 characters, the length and a sha1 prefix of the whitespace-collapsed
-text, so the golden stays readable and a one-character change still shows.
+Paths are recorded with a token for the tmp dir and forward slashes, so Windows runs match.
 """
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import logging
 import re
@@ -37,19 +36,19 @@ import pytest
 
 from brain import dev_constants
 
-ABBREV = 80
-PREFIX = 40
-# SQLite itself reports some statements it runs for its own purposes (the shadow-table
-# writes behind an FTS5 table, `PRAGMA data_version`, a `SELECT` of the FTS5 config) to
-# the trace callback as ONE line that starts with "-- " and a SQL keyword. Which of them
-# appear depends on the SQLite build (observed: this machine's 3.46.1 reports a
-# `-- PRAGMA 'main'.data_version` that the SQLite on the CI runners does not). They are
-# not statements the store issued, so they are left out. A statement of the store's own
-# that starts with a comment (the schema DDL) always has the comment on its own line,
-# so it is several lines and never matches.
-SQLITE_OWN_STATEMENT = re.compile(
-    r"-- (?:CREATE|DROP|ALTER|INSERT|REPLACE|DELETE|UPDATE|SELECT|PRAGMA|BEGIN|COMMIT|"
-    r"ROLLBACK|SAVEPOINT|RELEASE) [^\n]*"
+# Pragmas that read or version the schema; a migration issues them once per table or column.
+SCHEMA_PRAGMAS = frozenset(
+    {
+        "table_info",
+        "table_xinfo",
+        "table_list",
+        "index_list",
+        "index_info",
+        "index_xinfo",
+        "foreign_key_list",
+        "schema_version",
+        "user_version",
+    }
 )
 CLOSE = "<close>"
 COMMIT = "<commit>"
@@ -126,21 +125,40 @@ class Recorder:
         return re.sub(r"<TMP>[^\s:'\"]*", lambda m: m.group(0).replace("\\", "/"), text)
 
     def trace(self, conn, *, keep_close: bool = True) -> list[str]:
+        """The policy statements one connection ran: its pragmas (in order) and `<close>`.
+
+        Schema work is not part of the open sequence, so a PR that adds a column or a table
+        must not change it (#527): after dropping leading whitespace and `--` comment lines,
+        only `PRAGMA` items are kept (case-insensitively), minus the introspection and
+        versioning pragmas a migration issues once per table or column. That also drops
+        SQLite's own one-line `-- ...` bookkeeping statements, which differ between builds."""
         out = []
         for item in conn.trace:
-            if item == CLOSE and not keep_close:
+            if item == CLOSE:
+                if keep_close:
+                    out.append(item)
                 continue
-            if SQLITE_OWN_STATEMENT.fullmatch(item):
-                continue
-            out.append(self.abbrev(item))
+            if item == COMMIT:
+                continue  # a migration commits after each step: placement follows the schema, not the policy
+            kept = _policy_pragma(item)
+            if kept is not None:
+                out.append(self.norm(kept))
         return out
 
-    def abbrev(self, stmt: str) -> str:
-        text = " ".join(self.norm(stmt).split())
-        if len(text) <= ABBREV:
-            return text
-        digest = hashlib.sha1(text.encode()).hexdigest()[:12]
-        return f"{text[:PREFIX]}...[{len(text)}:{digest}]"
+
+def _policy_pragma(item: str) -> str | None:
+    """`item` with leading whitespace and comment lines removed and whitespace collapsed, if it is a policy
+    pragma; None for anything else (schema statements, DML, introspection pragmas, SQLite's own lines)."""
+    lines = item.strip().splitlines()
+    while lines and (not lines[0].strip() or lines[0].lstrip().startswith("--")):
+        lines.pop(0)
+    text = " ".join(" ".join(lines).split())
+    if not text.upper().startswith("PRAGMA"):
+        return None
+    name = re.match(r"PRAGMA\s+(?:\w+\.)?(\w+)", text, re.IGNORECASE)
+    if name is None or name.group(1).lower() in SCHEMA_PRAGMAS:
+        return None
+    return text
 
 
 def _connection_class(rec: Recorder):
@@ -256,11 +274,12 @@ def open_store(kind, path, integrity, rec_getter):
     return rec, store._conn, None
 
 
-def snapshot(rec: Recorder, conn, error, *, failure: bool) -> dict:
+def snapshot(rec: Recorder, conn, error, *, failure: bool, unordered: bool = False) -> dict:
+    """What the probe saw. `unordered` (works only, spec B1): its `_connect` pragmas are compared as a set."""
     traces = []
     for c in rec.conns:
         t = rec.trace(c, keep_close=not failure)
-        traces.append(sorted(t) if _is_pragma_set(t) else t)
+        traces.append(sorted(t) if unordered and all(s.startswith("PRAGMA") for s in t) else t)
     snap = {
         "connects": rec.connects,
         "traces": traces,
@@ -275,13 +294,6 @@ def snapshot(rec: Recorder, conn, error, *, failure: bool) -> dict:
             "isolation_level": conn.isolation_level,
         }
     return snap
-
-
-def _is_pragma_set(trace: list[str]) -> bool:
-    """A works `_connect` trace: only pragmas, compared as a set (spec B1)."""
-    return bool(trace) and all(
-        s.startswith("PRAGMA") and not s.startswith("PRAGMA integrity_check") for s in trace
-    )
 
 
 def run_case(kind, target, integrity, tmp_path, monkeypatch, *, configure=None, prepare=None):
@@ -302,14 +314,14 @@ def run_case(kind, target, integrity, tmp_path, monkeypatch, *, configure=None, 
 def success_snapshot(kind, target, integrity, tmp_path, monkeypatch) -> dict:
     rec, conn, error = run_case(kind, target, integrity, tmp_path, monkeypatch)
     assert error is None, error
-    return snapshot(rec, conn, error, failure=False)
+    return snapshot(rec, conn, error, failure=False, unordered=kind == "works")
 
 
 def failure_snapshot(kind, tmp_path, monkeypatch, configure, prepare=None):
     rec, conn, error = run_case(
         kind, "file", True, tmp_path, monkeypatch, configure=configure, prepare=prepare
     )
-    return rec, conn, error, snapshot(rec, conn, error, failure=True)
+    return rec, conn, error, snapshot(rec, conn, error, failure=True, unordered=kind == "works")
 
 
 def _not_sqlite(path: str) -> None:
@@ -329,675 +341,229 @@ def _case_id(case) -> str:
 
 
 # --------------------------------------------------------------------------
-# GOLDEN: golden captured from base f9f18bd3 before the refactor (the unmodified
-# stores), pasted as literals
+# GOLDEN: what each store's open ran, as captured from base f9f18bd3 (the unmodified
+# stores) with the schema statements left out (#527), pasted as literals. A schema
+# change does not touch it; a change to the connect arguments, the policy pragmas or
+# their order does, and then the new value is a deliberate decision.
 # --------------------------------------------------------------------------
 
-GOLDEN: dict[str, dict] = {
-    "open:memory:file:True": {
-        "connects": [{"args": ["<TMP>/memory.db"], "kwargs": {"timeout": 30.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 30000",
-                "CREATE TABLE IF NOT EXISTS memories ( id...[654:214cc88e1235]",
-                "CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);",
-                "-- F1 (#259): per-cluster centroid vecto...[774:bff0f089e1be]",
-                "-- F2a (#250 inc4): real-query calibrati...[6590:5dc5a9416ee5]",
-                "CREATE INDEX IF NOT EXISTS idx_calibrati...[89:a7d78ad56dc4]",
-                '-- F2c inc8 (spec §3 "Retention vs the w...[1021:7f26758bffe7]',
-                "-- F2a (#250 inc7): the DB-adaptive abst...[3015:758e9b06ee34]",
-                "-- Name-recall fix R2 (spec §2, S18/S25/...[1070:64d11328530c]",
-                "-- Cost series (name-recall fix S146, S1...[1096:a776bf830e8c]",
-                "CREATE INDEX IF NOT EXISTS idx_cost_seri...[123:bcf7da8b11ed]",
-                "CREATE TABLE IF NOT EXISTS cost_series_c...[277:953edfb5b3d6]",
-                "-- `cost_series_verdicts` (S179): the S1...[742:17ce257dfdfa]",
-                "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
-                "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
-                "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
-                "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[263:f018e7f9b61c]",
-                "PRAGMA table_info(memories)",
-                "PRAGMA table_info(calibration_log)",
-                "PRAGMA table_info(reranker_floor_calibration)",
-                "CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 30000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:memory:file:False": {
-        "connects": [{"args": ["<TMP>/memory.db"], "kwargs": {"timeout": 30.0}}],
-        "traces": [
-            [
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 30000",
-                "CREATE TABLE IF NOT EXISTS memories ( id...[654:214cc88e1235]",
-                "CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);",
-                "-- F1 (#259): per-cluster centroid vecto...[774:bff0f089e1be]",
-                "-- F2a (#250 inc4): real-query calibrati...[6590:5dc5a9416ee5]",
-                "CREATE INDEX IF NOT EXISTS idx_calibrati...[89:a7d78ad56dc4]",
-                '-- F2c inc8 (spec §3 "Retention vs the w...[1021:7f26758bffe7]',
-                "-- F2a (#250 inc7): the DB-adaptive abst...[3015:758e9b06ee34]",
-                "-- Name-recall fix R2 (spec §2, S18/S25/...[1070:64d11328530c]",
-                "-- Cost series (name-recall fix S146, S1...[1096:a776bf830e8c]",
-                "CREATE INDEX IF NOT EXISTS idx_cost_seri...[123:bcf7da8b11ed]",
-                "CREATE TABLE IF NOT EXISTS cost_series_c...[277:953edfb5b3d6]",
-                "-- `cost_series_verdicts` (S179): the S1...[742:17ce257dfdfa]",
-                "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
-                "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
-                "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
-                "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[263:f018e7f9b61c]",
-                "PRAGMA table_info(memories)",
-                "PRAGMA table_info(calibration_log)",
-                "PRAGMA table_info(reranker_floor_calibration)",
-                "CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 30000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:memory:memory:True": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 30.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 30000",
-                "CREATE TABLE IF NOT EXISTS memories ( id...[654:214cc88e1235]",
-                "CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);",
-                "-- F1 (#259): per-cluster centroid vecto...[774:bff0f089e1be]",
-                "-- F2a (#250 inc4): real-query calibrati...[6590:5dc5a9416ee5]",
-                "CREATE INDEX IF NOT EXISTS idx_calibrati...[89:a7d78ad56dc4]",
-                '-- F2c inc8 (spec §3 "Retention vs the w...[1021:7f26758bffe7]',
-                "-- F2a (#250 inc7): the DB-adaptive abst...[3015:758e9b06ee34]",
-                "-- Name-recall fix R2 (spec §2, S18/S25/...[1070:64d11328530c]",
-                "-- Cost series (name-recall fix S146, S1...[1096:a776bf830e8c]",
-                "CREATE INDEX IF NOT EXISTS idx_cost_seri...[123:bcf7da8b11ed]",
-                "CREATE TABLE IF NOT EXISTS cost_series_c...[277:953edfb5b3d6]",
-                "-- `cost_series_verdicts` (S179): the S1...[742:17ce257dfdfa]",
-                "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
-                "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
-                "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
-                "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[263:f018e7f9b61c]",
-                "PRAGMA table_info(memories)",
-                "PRAGMA table_info(calibration_log)",
-                "PRAGMA table_info(reranker_floor_calibration)",
-                "CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 30000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:memory:memory:False": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 30.0}}],
-        "traces": [
-            [
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 30000",
-                "CREATE TABLE IF NOT EXISTS memories ( id...[654:214cc88e1235]",
-                "CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);",
-                "-- F1 (#259): per-cluster centroid vecto...[774:bff0f089e1be]",
-                "-- F2a (#250 inc4): real-query calibrati...[6590:5dc5a9416ee5]",
-                "CREATE INDEX IF NOT EXISTS idx_calibrati...[89:a7d78ad56dc4]",
-                '-- F2c inc8 (spec §3 "Retention vs the w...[1021:7f26758bffe7]',
-                "-- F2a (#250 inc7): the DB-adaptive abst...[3015:758e9b06ee34]",
-                "-- Name-recall fix R2 (spec §2, S18/S25/...[1070:64d11328530c]",
-                "-- Cost series (name-recall fix S146, S1...[1096:a776bf830e8c]",
-                "CREATE INDEX IF NOT EXISTS idx_cost_seri...[123:bcf7da8b11ed]",
-                "CREATE TABLE IF NOT EXISTS cost_series_c...[277:953edfb5b3d6]",
-                "-- `cost_series_verdicts` (S179): the S1...[742:17ce257dfdfa]",
-                "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
-                "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
-                "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
-                "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[263:f018e7f9b61c]",
-                "PRAGMA table_info(memories)",
-                "PRAGMA table_info(calibration_log)",
-                "PRAGMA table_info(reranker_floor_calibration)",
-                "CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 30000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:soul:file:True": {
-        "connects": [{"args": ["<TMP>/soul.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS crystallizati...[348:b11f8f297aff]",
-                "CREATE INDEX IF NOT EXISTS idx_crystal_revoked ON crystallizations(revoked_at);",
-                "CREATE INDEX IF NOT EXISTS idx_crystal_c...[84:a93c914e8614]",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:soul:memory:True": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS crystallizati...[348:b11f8f297aff]",
-                "CREATE INDEX IF NOT EXISTS idx_crystal_revoked ON crystallizations(revoked_at);",
-                "CREATE INDEX IF NOT EXISTS idx_crystal_c...[84:a93c914e8614]",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:hebbian:file:True": {
-        "connects": [{"args": ["<TMP>/hebbian.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS hebbian_edges...[222:96a0de2b7939]",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_a ON hebbian_edges(memory_a);",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_b ON hebbian_edges(memory_b);",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "None",
-            "isolation_level": "",
-        },
-    },
-    "open:hebbian:file:False": {
-        "connects": [{"args": ["<TMP>/hebbian.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS hebbian_edges...[222:96a0de2b7939]",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_a ON hebbian_edges(memory_a);",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_b ON hebbian_edges(memory_b);",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "None",
-            "isolation_level": "",
-        },
-    },
-    "open:hebbian:memory:True": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS hebbian_edges...[222:96a0de2b7939]",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_a ON hebbian_edges(memory_a);",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_b ON hebbian_edges(memory_b);",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "None",
-            "isolation_level": "",
-        },
-    },
-    "open:hebbian:memory:False": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS hebbian_edges...[222:96a0de2b7939]",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_a ON hebbian_edges(memory_a);",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_b ON hebbian_edges(memory_b);",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "None",
-            "isolation_level": "",
-        },
-    },
-    "open:kindled:file:True": {
-        "connects": [{"args": ["<TMP>/kindled.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS peers ( peer_...[234:151307d17705]",
-                "CREATE TABLE IF NOT EXISTS consumed_invi...[102:268a03589040]",
-                "CREATE TABLE IF NOT EXISTS seq_high_wate...[158:f4797bf2ab58]",
-                "CREATE TABLE IF NOT EXISTS sessions ( pe...[257:b9ddcfee76ec]",
-                "CREATE TABLE IF NOT EXISTS peer_counters...[167:a5b0207ce990]",
-                "CREATE TABLE IF NOT EXISTS outbound_draf...[209:5a08b6aaf09d]",
-                "CREATE TABLE IF NOT EXISTS transcript ( ...[241:9ea8e7bdf663]",
-                "CREATE TABLE IF NOT EXISTS disclosure_bu...[122:8aeb0e5c44bb]",
-                "CREATE TABLE IF NOT EXISTS relationship_...[276:ca5d525e8c81]",
-                "CREATE TABLE IF NOT EXISTS peer_emotion_...[129:bb0e63259374]",
-                "CREATE TABLE IF NOT EXISTS local_identit...[88:c944b0a7d24e]",
-                "CREATE TABLE IF NOT EXISTS outbound_seq ...[149:63da61eeb1ea]",
-                "CREATE TABLE IF NOT EXISTS pending_hands...[239:4eb923f0b9e8]",
-                "CREATE TABLE IF NOT EXISTS session_keys ...[230:82d1f598c53c]",
-                "CREATE TABLE IF NOT EXISTS pending_rotat...[135:2f740091a6b9]",
-                "PRAGMA table_info(peers)",
-                "PRAGMA table_info(peers)",
-                "ALTER TABLE peers ADD COLUMN previous_identity_pub TEXT",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:kindled:file:False": {
-        "connects": [{"args": ["<TMP>/kindled.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS peers ( peer_...[234:151307d17705]",
-                "CREATE TABLE IF NOT EXISTS consumed_invi...[102:268a03589040]",
-                "CREATE TABLE IF NOT EXISTS seq_high_wate...[158:f4797bf2ab58]",
-                "CREATE TABLE IF NOT EXISTS sessions ( pe...[257:b9ddcfee76ec]",
-                "CREATE TABLE IF NOT EXISTS peer_counters...[167:a5b0207ce990]",
-                "CREATE TABLE IF NOT EXISTS outbound_draf...[209:5a08b6aaf09d]",
-                "CREATE TABLE IF NOT EXISTS transcript ( ...[241:9ea8e7bdf663]",
-                "CREATE TABLE IF NOT EXISTS disclosure_bu...[122:8aeb0e5c44bb]",
-                "CREATE TABLE IF NOT EXISTS relationship_...[276:ca5d525e8c81]",
-                "CREATE TABLE IF NOT EXISTS peer_emotion_...[129:bb0e63259374]",
-                "CREATE TABLE IF NOT EXISTS local_identit...[88:c944b0a7d24e]",
-                "CREATE TABLE IF NOT EXISTS outbound_seq ...[149:63da61eeb1ea]",
-                "CREATE TABLE IF NOT EXISTS pending_hands...[239:4eb923f0b9e8]",
-                "CREATE TABLE IF NOT EXISTS session_keys ...[230:82d1f598c53c]",
-                "CREATE TABLE IF NOT EXISTS pending_rotat...[135:2f740091a6b9]",
-                "PRAGMA table_info(peers)",
-                "PRAGMA table_info(peers)",
-                "ALTER TABLE peers ADD COLUMN previous_identity_pub TEXT",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:kindled:memory:True": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS peers ( peer_...[234:151307d17705]",
-                "CREATE TABLE IF NOT EXISTS consumed_invi...[102:268a03589040]",
-                "CREATE TABLE IF NOT EXISTS seq_high_wate...[158:f4797bf2ab58]",
-                "CREATE TABLE IF NOT EXISTS sessions ( pe...[257:b9ddcfee76ec]",
-                "CREATE TABLE IF NOT EXISTS peer_counters...[167:a5b0207ce990]",
-                "CREATE TABLE IF NOT EXISTS outbound_draf...[209:5a08b6aaf09d]",
-                "CREATE TABLE IF NOT EXISTS transcript ( ...[241:9ea8e7bdf663]",
-                "CREATE TABLE IF NOT EXISTS disclosure_bu...[122:8aeb0e5c44bb]",
-                "CREATE TABLE IF NOT EXISTS relationship_...[276:ca5d525e8c81]",
-                "CREATE TABLE IF NOT EXISTS peer_emotion_...[129:bb0e63259374]",
-                "CREATE TABLE IF NOT EXISTS local_identit...[88:c944b0a7d24e]",
-                "CREATE TABLE IF NOT EXISTS outbound_seq ...[149:63da61eeb1ea]",
-                "CREATE TABLE IF NOT EXISTS pending_hands...[239:4eb923f0b9e8]",
-                "CREATE TABLE IF NOT EXISTS session_keys ...[230:82d1f598c53c]",
-                "CREATE TABLE IF NOT EXISTS pending_rotat...[135:2f740091a6b9]",
-                "PRAGMA table_info(peers)",
-                "PRAGMA table_info(peers)",
-                "ALTER TABLE peers ADD COLUMN previous_identity_pub TEXT",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:kindled:memory:False": {
-        "connects": [{"args": [":memory:"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS peers ( peer_...[234:151307d17705]",
-                "CREATE TABLE IF NOT EXISTS consumed_invi...[102:268a03589040]",
-                "CREATE TABLE IF NOT EXISTS seq_high_wate...[158:f4797bf2ab58]",
-                "CREATE TABLE IF NOT EXISTS sessions ( pe...[257:b9ddcfee76ec]",
-                "CREATE TABLE IF NOT EXISTS peer_counters...[167:a5b0207ce990]",
-                "CREATE TABLE IF NOT EXISTS outbound_draf...[209:5a08b6aaf09d]",
-                "CREATE TABLE IF NOT EXISTS transcript ( ...[241:9ea8e7bdf663]",
-                "CREATE TABLE IF NOT EXISTS disclosure_bu...[122:8aeb0e5c44bb]",
-                "CREATE TABLE IF NOT EXISTS relationship_...[276:ca5d525e8c81]",
-                "CREATE TABLE IF NOT EXISTS peer_emotion_...[129:bb0e63259374]",
-                "CREATE TABLE IF NOT EXISTS local_identit...[88:c944b0a7d24e]",
-                "CREATE TABLE IF NOT EXISTS outbound_seq ...[149:63da61eeb1ea]",
-                "CREATE TABLE IF NOT EXISTS pending_hands...[239:4eb923f0b9e8]",
-                "CREATE TABLE IF NOT EXISTS session_keys ...[230:82d1f598c53c]",
-                "CREATE TABLE IF NOT EXISTS pending_rotat...[135:2f740091a6b9]",
-                "PRAGMA table_info(peers)",
-                "PRAGMA table_info(peers)",
-                "ALTER TABLE peers ADD COLUMN previous_identity_pub TEXT",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "memory",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "open:works:file:None": {
-        "connects": [{"args": ["<TMP>/works.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            ["PRAGMA busy_timeout = 5000", "PRAGMA foreign_keys = ON", "PRAGMA journal_mode = WAL"]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "wal",
-            "busy_timeout": 5000,
-            "foreign_keys": 1,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "notsqlite:memory": {
-        "connects": [{"args": ["<TMP>/memory.db"], "kwargs": {"timeout": 30.0}}],
-        "traces": [[]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/memory.db: file is not a database",
-        ],
-    },
-    "notok:memory": {
-        "connects": [{"args": ["<TMP>/memory.db"], "kwargs": {"timeout": 30.0}}],
-        "traces": [["PRAGMA integrity_check"]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/memory.db: *** in database main ***; row 1 missing",
-        ],
-    },
-    "notsqlite:soul": {
-        "connects": [{"args": ["<TMP>/soul.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [[]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/soul.db: file is not a database",
-        ],
-    },
-    "notok:soul": {
-        "connects": [{"args": ["<TMP>/soul.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [["PRAGMA integrity_check"]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/soul.db: *** in database main ***; row 1 missing",
-        ],
-    },
-    "notsqlite:hebbian": {
-        "connects": [{"args": ["<TMP>/hebbian.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [[]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/hebbian.db: file is not a database",
-        ],
-    },
-    "notok:hebbian": {
-        "connects": [{"args": ["<TMP>/hebbian.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [["PRAGMA integrity_check"]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/hebbian.db: *** in database main ***; row 1 missing",
-        ],
-    },
-    "notsqlite:kindled": {
-        "connects": [{"args": ["<TMP>/kindled.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [[]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/kindled.db: file is not a database",
-        ],
-    },
-    "notok:kindled": {
-        "connects": [{"args": ["<TMP>/kindled.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [["PRAGMA integrity_check"]],
-        "error": [
-            "BrainIntegrityError",
-            "integrity check failed for <TMP>/kindled.db: *** in database main ***; row 1 missing",
-        ],
-    },
-    "walfail:memory": {
-        "connects": [{"args": ["<TMP>/memory.db"], "kwargs": {"timeout": 30.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 30000",
-                "CREATE TABLE IF NOT EXISTS memories ( id...[654:214cc88e1235]",
-                "CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);",
-                "CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);",
-                "-- F1 (#259): per-cluster centroid vecto...[774:bff0f089e1be]",
-                "-- F2a (#250 inc4): real-query calibrati...[6590:5dc5a9416ee5]",
-                "CREATE INDEX IF NOT EXISTS idx_calibrati...[89:a7d78ad56dc4]",
-                '-- F2c inc8 (spec §3 "Retention vs the w...[1021:7f26758bffe7]',
-                "-- F2a (#250 inc7): the DB-adaptive abst...[3015:758e9b06ee34]",
-                "-- Name-recall fix R2 (spec §2, S18/S25/...[1070:64d11328530c]",
-                "-- Cost series (name-recall fix S146, S1...[1096:a776bf830e8c]",
-                "CREATE INDEX IF NOT EXISTS idx_cost_seri...[123:bcf7da8b11ed]",
-                "CREATE TABLE IF NOT EXISTS cost_series_c...[277:953edfb5b3d6]",
-                "-- `cost_series_verdicts` (S179): the S1...[742:17ce257dfdfa]",
-                "-- F2c (inc2, red-team fix F-1, spec §2)...[1709:9d93cce1c961]",
-                "-- F2c (inc3, spec §5): per-persona JUDG...[2257:d0a743b01608]",
-                "-- External-content FTS5 shadow index (P...[346:8186965c720b]",
-                "-- Tier-1 passive-recall salience: zero-...[421:6025bc9f6f82]",
-                "-- Schema-level sync triggers: they live...[371:0d99e5f474c0]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[178:486cd7592085]",
-                "CREATE TRIGGER IF NOT EXISTS memories_ft...[263:f018e7f9b61c]",
-                "PRAGMA table_info(memories)",
-                "PRAGMA table_info(calibration_log)",
-                "PRAGMA table_info(reranker_floor_calibration)",
-                "CREATE INDEX IF NOT EXISTS idx_memories_state ON memories(state)",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "delete",
-            "busy_timeout": 30000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "walfail:soul": {
-        "connects": [{"args": ["<TMP>/soul.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS crystallizati...[348:b11f8f297aff]",
-                "CREATE INDEX IF NOT EXISTS idx_crystal_revoked ON crystallizations(revoked_at);",
-                "CREATE INDEX IF NOT EXISTS idx_crystal_c...[84:a93c914e8614]",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "delete",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "walfail:hebbian": {
-        "connects": [{"args": ["<TMP>/hebbian.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS hebbian_edges...[222:96a0de2b7939]",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_a ON hebbian_edges(memory_a);",
-                "CREATE INDEX IF NOT EXISTS idx_hebbian_b ON hebbian_edges(memory_b);",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "delete",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "None",
-            "isolation_level": "",
-        },
-    },
-    "walfail:kindled": {
-        "connects": [{"args": ["<TMP>/kindled.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [
-            [
-                "PRAGMA integrity_check",
-                "PRAGMA journal_mode = WAL",
-                "PRAGMA busy_timeout = 5000",
-                "CREATE TABLE IF NOT EXISTS peers ( peer_...[234:151307d17705]",
-                "CREATE TABLE IF NOT EXISTS consumed_invi...[102:268a03589040]",
-                "CREATE TABLE IF NOT EXISTS seq_high_wate...[158:f4797bf2ab58]",
-                "CREATE TABLE IF NOT EXISTS sessions ( pe...[257:b9ddcfee76ec]",
-                "CREATE TABLE IF NOT EXISTS peer_counters...[167:a5b0207ce990]",
-                "CREATE TABLE IF NOT EXISTS outbound_draf...[209:5a08b6aaf09d]",
-                "CREATE TABLE IF NOT EXISTS transcript ( ...[241:9ea8e7bdf663]",
-                "CREATE TABLE IF NOT EXISTS disclosure_bu...[122:8aeb0e5c44bb]",
-                "CREATE TABLE IF NOT EXISTS relationship_...[276:ca5d525e8c81]",
-                "CREATE TABLE IF NOT EXISTS peer_emotion_...[129:bb0e63259374]",
-                "CREATE TABLE IF NOT EXISTS local_identit...[88:c944b0a7d24e]",
-                "CREATE TABLE IF NOT EXISTS outbound_seq ...[149:63da61eeb1ea]",
-                "CREATE TABLE IF NOT EXISTS pending_hands...[239:4eb923f0b9e8]",
-                "CREATE TABLE IF NOT EXISTS session_keys ...[230:82d1f598c53c]",
-                "CREATE TABLE IF NOT EXISTS pending_rotat...[135:2f740091a6b9]",
-                "PRAGMA table_info(peers)",
-                "PRAGMA table_info(peers)",
-                "ALTER TABLE peers ADD COLUMN previous_identity_pub TEXT",
-                "<commit>",
-            ]
-        ],
-        "error": None,
-        "end_state": {
-            "journal_mode": "delete",
-            "busy_timeout": 5000,
-            "foreign_keys": 0,
-            "row_factory": "Row",
-            "isolation_level": "",
-        },
-    },
-    "walfail:works": {
-        "connects": [{"args": ["<TMP>/works.db"], "kwargs": {"timeout": 5.0}}],
-        "traces": [["PRAGMA journal_mode = WAL"]],
-        "error": ["OperationalError", "WAL not available"],
-    },
-}
+GOLDEN: dict[str, dict] = {'open:memory:file:True': {'connects': [{'args': ['<TMP>/memory.db'], 'kwargs': {'timeout': 30.0}}],
+                           'traces': [['PRAGMA integrity_check',
+                                       'PRAGMA journal_mode = WAL',
+                                       'PRAGMA busy_timeout = 30000']],
+                           'error': None,
+                           'end_state': {'journal_mode': 'wal',
+                                         'busy_timeout': 30000,
+                                         'foreign_keys': 0,
+                                         'row_factory': 'Row',
+                                         'isolation_level': ''}},
+ 'open:memory:file:False': {'connects': [{'args': ['<TMP>/memory.db'], 'kwargs': {'timeout': 30.0}}],
+                            'traces': [['PRAGMA journal_mode = WAL', 'PRAGMA busy_timeout = 30000']],
+                            'error': None,
+                            'end_state': {'journal_mode': 'wal',
+                                          'busy_timeout': 30000,
+                                          'foreign_keys': 0,
+                                          'row_factory': 'Row',
+                                          'isolation_level': ''}},
+ 'open:memory:memory:True': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 30.0}}],
+                             'traces': [['PRAGMA integrity_check',
+                                         'PRAGMA journal_mode = WAL',
+                                         'PRAGMA busy_timeout = 30000']],
+                             'error': None,
+                             'end_state': {'journal_mode': 'memory',
+                                           'busy_timeout': 30000,
+                                           'foreign_keys': 0,
+                                           'row_factory': 'Row',
+                                           'isolation_level': ''}},
+ 'open:memory:memory:False': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 30.0}}],
+                              'traces': [['PRAGMA journal_mode = WAL', 'PRAGMA busy_timeout = 30000']],
+                              'error': None,
+                              'end_state': {'journal_mode': 'memory',
+                                            'busy_timeout': 30000,
+                                            'foreign_keys': 0,
+                                            'row_factory': 'Row',
+                                            'isolation_level': ''}},
+ 'open:soul:file:True': {'connects': [{'args': ['<TMP>/soul.db'], 'kwargs': {'timeout': 5.0}}],
+                         'traces': [['PRAGMA integrity_check',
+                                     'PRAGMA journal_mode = WAL',
+                                     'PRAGMA busy_timeout = 5000']],
+                         'error': None,
+                         'end_state': {'journal_mode': 'wal',
+                                       'busy_timeout': 5000,
+                                       'foreign_keys': 0,
+                                       'row_factory': 'Row',
+                                       'isolation_level': ''}},
+ 'open:soul:memory:True': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 5.0}}],
+                           'traces': [['PRAGMA integrity_check',
+                                       'PRAGMA journal_mode = WAL',
+                                       'PRAGMA busy_timeout = 5000']],
+                           'error': None,
+                           'end_state': {'journal_mode': 'memory',
+                                         'busy_timeout': 5000,
+                                         'foreign_keys': 0,
+                                         'row_factory': 'Row',
+                                         'isolation_level': ''}},
+ 'open:hebbian:file:True': {'connects': [{'args': ['<TMP>/hebbian.db'], 'kwargs': {'timeout': 5.0}}],
+                            'traces': [['PRAGMA integrity_check',
+                                        'PRAGMA journal_mode = WAL',
+                                        'PRAGMA busy_timeout = 5000']],
+                            'error': None,
+                            'end_state': {'journal_mode': 'wal',
+                                          'busy_timeout': 5000,
+                                          'foreign_keys': 0,
+                                          'row_factory': 'None',
+                                          'isolation_level': ''}},
+ 'open:hebbian:file:False': {'connects': [{'args': ['<TMP>/hebbian.db'], 'kwargs': {'timeout': 5.0}}],
+                             'traces': [['PRAGMA journal_mode = WAL', 'PRAGMA busy_timeout = 5000']],
+                             'error': None,
+                             'end_state': {'journal_mode': 'wal',
+                                           'busy_timeout': 5000,
+                                           'foreign_keys': 0,
+                                           'row_factory': 'None',
+                                           'isolation_level': ''}},
+ 'open:hebbian:memory:True': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 5.0}}],
+                              'traces': [['PRAGMA integrity_check',
+                                          'PRAGMA journal_mode = WAL',
+                                          'PRAGMA busy_timeout = 5000']],
+                              'error': None,
+                              'end_state': {'journal_mode': 'memory',
+                                            'busy_timeout': 5000,
+                                            'foreign_keys': 0,
+                                            'row_factory': 'None',
+                                            'isolation_level': ''}},
+ 'open:hebbian:memory:False': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 5.0}}],
+                               'traces': [['PRAGMA journal_mode = WAL', 'PRAGMA busy_timeout = 5000']],
+                               'error': None,
+                               'end_state': {'journal_mode': 'memory',
+                                             'busy_timeout': 5000,
+                                             'foreign_keys': 0,
+                                             'row_factory': 'None',
+                                             'isolation_level': ''}},
+ 'open:kindled:file:True': {'connects': [{'args': ['<TMP>/kindled.db'], 'kwargs': {'timeout': 5.0}}],
+                            'traces': [['PRAGMA integrity_check',
+                                        'PRAGMA journal_mode = WAL',
+                                        'PRAGMA busy_timeout = 5000']],
+                            'error': None,
+                            'end_state': {'journal_mode': 'wal',
+                                          'busy_timeout': 5000,
+                                          'foreign_keys': 0,
+                                          'row_factory': 'Row',
+                                          'isolation_level': ''}},
+ 'open:kindled:file:False': {'connects': [{'args': ['<TMP>/kindled.db'], 'kwargs': {'timeout': 5.0}}],
+                             'traces': [['PRAGMA journal_mode = WAL', 'PRAGMA busy_timeout = 5000']],
+                             'error': None,
+                             'end_state': {'journal_mode': 'wal',
+                                           'busy_timeout': 5000,
+                                           'foreign_keys': 0,
+                                           'row_factory': 'Row',
+                                           'isolation_level': ''}},
+ 'open:kindled:memory:True': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 5.0}}],
+                              'traces': [['PRAGMA integrity_check',
+                                          'PRAGMA journal_mode = WAL',
+                                          'PRAGMA busy_timeout = 5000']],
+                              'error': None,
+                              'end_state': {'journal_mode': 'memory',
+                                            'busy_timeout': 5000,
+                                            'foreign_keys': 0,
+                                            'row_factory': 'Row',
+                                            'isolation_level': ''}},
+ 'open:kindled:memory:False': {'connects': [{'args': [':memory:'], 'kwargs': {'timeout': 5.0}}],
+                               'traces': [['PRAGMA journal_mode = WAL', 'PRAGMA busy_timeout = 5000']],
+                               'error': None,
+                               'end_state': {'journal_mode': 'memory',
+                                             'busy_timeout': 5000,
+                                             'foreign_keys': 0,
+                                             'row_factory': 'Row',
+                                             'isolation_level': ''}},
+ 'open:works:file:None': {'connects': [{'args': ['<TMP>/works.db'], 'kwargs': {'timeout': 5.0}}],
+                          'traces': [['PRAGMA busy_timeout = 5000',
+                                      'PRAGMA foreign_keys = ON',
+                                      'PRAGMA journal_mode = WAL']],
+                          'error': None,
+                          'end_state': {'journal_mode': 'wal',
+                                        'busy_timeout': 5000,
+                                        'foreign_keys': 1,
+                                        'row_factory': 'Row',
+                                        'isolation_level': ''}},
+ 'notsqlite:memory': {'connects': [{'args': ['<TMP>/memory.db'], 'kwargs': {'timeout': 30.0}}],
+                      'traces': [[]],
+                      'error': ['BrainIntegrityError',
+                                'integrity check failed for <TMP>/memory.db: file is not a database']},
+ 'notok:memory': {'connects': [{'args': ['<TMP>/memory.db'], 'kwargs': {'timeout': 30.0}}],
+                  'traces': [['PRAGMA integrity_check']],
+                  'error': ['BrainIntegrityError',
+                            'integrity check failed for <TMP>/memory.db: *** in database main ***; row 1 '
+                            'missing']},
+ 'notsqlite:soul': {'connects': [{'args': ['<TMP>/soul.db'], 'kwargs': {'timeout': 5.0}}],
+                    'traces': [[]],
+                    'error': ['BrainIntegrityError',
+                              'integrity check failed for <TMP>/soul.db: file is not a database']},
+ 'notok:soul': {'connects': [{'args': ['<TMP>/soul.db'], 'kwargs': {'timeout': 5.0}}],
+                'traces': [['PRAGMA integrity_check']],
+                'error': ['BrainIntegrityError',
+                          'integrity check failed for <TMP>/soul.db: *** in database main ***; row 1 '
+                          'missing']},
+ 'notsqlite:hebbian': {'connects': [{'args': ['<TMP>/hebbian.db'], 'kwargs': {'timeout': 5.0}}],
+                       'traces': [[]],
+                       'error': ['BrainIntegrityError',
+                                 'integrity check failed for <TMP>/hebbian.db: file is not a database']},
+ 'notok:hebbian': {'connects': [{'args': ['<TMP>/hebbian.db'], 'kwargs': {'timeout': 5.0}}],
+                   'traces': [['PRAGMA integrity_check']],
+                   'error': ['BrainIntegrityError',
+                             'integrity check failed for <TMP>/hebbian.db: *** in database main ***; row 1 '
+                             'missing']},
+ 'notsqlite:kindled': {'connects': [{'args': ['<TMP>/kindled.db'], 'kwargs': {'timeout': 5.0}}],
+                       'traces': [[]],
+                       'error': ['BrainIntegrityError',
+                                 'integrity check failed for <TMP>/kindled.db: file is not a database']},
+ 'notok:kindled': {'connects': [{'args': ['<TMP>/kindled.db'], 'kwargs': {'timeout': 5.0}}],
+                   'traces': [['PRAGMA integrity_check']],
+                   'error': ['BrainIntegrityError',
+                             'integrity check failed for <TMP>/kindled.db: *** in database main ***; row 1 '
+                             'missing']},
+ 'walfail:memory': {'connects': [{'args': ['<TMP>/memory.db'], 'kwargs': {'timeout': 30.0}}],
+                    'traces': [['PRAGMA integrity_check',
+                                'PRAGMA journal_mode = WAL',
+                                'PRAGMA busy_timeout = 30000']],
+                    'error': None,
+                    'end_state': {'journal_mode': 'delete',
+                                  'busy_timeout': 30000,
+                                  'foreign_keys': 0,
+                                  'row_factory': 'Row',
+                                  'isolation_level': ''}},
+ 'walfail:soul': {'connects': [{'args': ['<TMP>/soul.db'], 'kwargs': {'timeout': 5.0}}],
+                  'traces': [['PRAGMA integrity_check',
+                              'PRAGMA journal_mode = WAL',
+                              'PRAGMA busy_timeout = 5000']],
+                  'error': None,
+                  'end_state': {'journal_mode': 'delete',
+                                'busy_timeout': 5000,
+                                'foreign_keys': 0,
+                                'row_factory': 'Row',
+                                'isolation_level': ''}},
+ 'walfail:hebbian': {'connects': [{'args': ['<TMP>/hebbian.db'], 'kwargs': {'timeout': 5.0}}],
+                     'traces': [['PRAGMA integrity_check',
+                                 'PRAGMA journal_mode = WAL',
+                                 'PRAGMA busy_timeout = 5000']],
+                     'error': None,
+                     'end_state': {'journal_mode': 'delete',
+                                   'busy_timeout': 5000,
+                                   'foreign_keys': 0,
+                                   'row_factory': 'None',
+                                   'isolation_level': ''}},
+ 'walfail:kindled': {'connects': [{'args': ['<TMP>/kindled.db'], 'kwargs': {'timeout': 5.0}}],
+                     'traces': [['PRAGMA integrity_check',
+                                 'PRAGMA journal_mode = WAL',
+                                 'PRAGMA busy_timeout = 5000']],
+                     'error': None,
+                     'end_state': {'journal_mode': 'delete',
+                                   'busy_timeout': 5000,
+                                   'foreign_keys': 0,
+                                   'row_factory': 'Row',
+                                   'isolation_level': ''}},
+ 'walfail:works': {'connects': [{'args': ['<TMP>/works.db'], 'kwargs': {'timeout': 5.0}}],
+                   'traces': [['PRAGMA journal_mode = WAL']],
+                   'error': ['OperationalError', 'WAL not available']}}
 
 # --------------------------------------------------------------------------
 # Tests
@@ -1084,7 +650,7 @@ def test_c10_integrity_cadence_signatures_are_unchanged() -> None:
     assert "integrity_check" not in inspect.signature(SoulStore.__init__).parameters
 
 
-def test_the_path_token_normalisation_is_not_vacuous(tmp_path) -> None:
+def test_the_path_token_normalisation_handles_windows_paths(tmp_path) -> None:
     rec = Recorder(str(tmp_path))
     assert rec.norm(f"oops at {tmp_path}/x.db") == "oops at <TMP>/x.db"
     windows = Recorder("C:\\Users\\ci\\tmp")
@@ -1093,20 +659,36 @@ def test_the_path_token_normalisation_is_not_vacuous(tmp_path) -> None:
         windows.norm("integrity check failed for C:\\Users\\ci\\tmp\\a.db: not a database")
         == "integrity check failed for <TMP>/a.db: not a database"
     )
-    assert re.fullmatch(r".{40}\.\.\.\[\d+:[0-9a-f]{12}\]", rec.abbrev("x" * 300))
 
 
-def test_sqlite_own_trace_lines_are_dropped_and_the_stores_own_are_not() -> None:
-    own = [
-        "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
-        "-- PRAGMA 'main'.data_version",
-        "-- SELECT k, v FROM 'main'.'memories_fts_config'",
-        "-- CREATE TABLE 'main'.'memories_fts_data'(id INTEGER PRIMARY KEY, block BLOB)",
-    ]
-    theirs = [
-        "-- F1 (#259): per-cluster centroids\nCREATE TABLE IF NOT EXISTS t (x)",
+def test_the_trace_keeps_policy_pragmas_and_drops_schema_work() -> None:
+    from types import SimpleNamespace
+
+    conn = SimpleNamespace(
+        trace=[
+            "PRAGMA integrity_check",
+            "\nCREATE TABLE a(x);",
+            "create index idx on a(x)",
+            "-- REPLACE INTO 'main'.'memories_fts_data'(id, block) VALUES(?,?)",
+            "-- PRAGMA 'main'.data_version",
+            "\n-- why\npragma foreign_keys = ON;",
+            "PRAGMA table_info(a)",
+            "PRAGMA main.index_list(a)",
+            "PRAGMA user_version = 3",
+            "PRAGMA synchronous = FULL",
+            "ALTER TABLE a ADD COLUMN y",
+            "UPDATE a SET x = 1",
+            COMMIT,
+            "PRAGMA journal_mode = WAL",
+            CLOSE,
+        ]
+    )
+    rec = Recorder("/tmp/x")
+    assert rec.trace(conn) == [
+        "PRAGMA integrity_check",
+        "pragma foreign_keys = ON;",
+        "PRAGMA synchronous = FULL",
         "PRAGMA journal_mode = WAL",
-        "CREATE INDEX IF NOT EXISTS idx ON t(x);",
+        CLOSE,
     ]
-    assert all(SQLITE_OWN_STATEMENT.fullmatch(s) for s in own)
-    assert not any(SQLITE_OWN_STATEMENT.fullmatch(s) for s in theirs)
+    assert rec.trace(conn, keep_close=False)[-1] == "PRAGMA journal_mode = WAL"
