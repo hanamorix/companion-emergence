@@ -443,8 +443,13 @@ REMOVED: tuple[Removed, ...] = (
             re.compile(rf"attempt_heal\s*\.\s*({_MOVED_ALTERNATION})\b"),
             re.compile(rf"from\s+brain\.health\.attempt_heal\s+import\s+[^(\n]*\b({_MOVED_ALTERNATION})\b"),
             re.compile(rf"from\s+brain\.health\.attempt_heal\s+import\s*\([^)]*\b({_MOVED_ALTERNATION})\b"),
+            re.compile(rf"from\s+brain\.health\.attempt_heal\s+import\s+[^(\n]*\\\s*\n[^\n]*\b({_MOVED_ALTERNATION})\b"),
+            re.compile(r"from\s+brain\.health\.attempt_heal\s+import\s+\*"),
+            # An alias would hide the dotted route above: attempt_heal is imported under its own name or not at all.
+            re.compile(r"import\s+brain\.health\.attempt_heal\s+as\b"),
+            re.compile(r"from\s+brain\.health\s+import\s+[^\n]*\battempt_heal\s+as\b"),
         ),
-        why="no module reaches a moved writer through attempt_heal, by import or by dotted name (#465, G20b)",
+        why="no module reaches a moved writer through attempt_heal: no import of one, no dotted name, no star import, no alias of the module (#465, G20b)",
         ref=_ATOMIC_REF,
     ),
 )
@@ -564,7 +569,7 @@ def test_removed_names_stay_removed() -> None:
     texts = _scanned_texts()
     assert "brain/tunables.py" in texts and "app/src/App.tsx" in texts, "the scan did not read the source tree"
     # The consolidation entry is a regex over this section header; if the header is renamed the regex would match nothing.
-    assert "[engines.consolidation]" in texts["brain/prompt_strings.toml"], "update the consolidation-section entry of REMOVED"
+    assert "[engines.consolidation]" in texts.get("brain/prompt_strings.toml", ""), "update the consolidation-section entry of REMOVED"
     problems = find_reappeared(REMOVED, texts, dict(tree_asts("brain")), REPO)
     assert not problems, (
         "Removed code has reappeared. If it is intended, delete its line from REMOVED in tests/unit/test_removed_names_stay_removed.py; "
