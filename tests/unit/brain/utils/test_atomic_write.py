@@ -348,15 +348,15 @@ def test_g16c_a_sweep_during_a_save_does_not_remove_that_saves_own_temp(tmp_path
 # --- G20(c): the shared writer imports nothing from brain.health (no cycle) ---------------------------------------
 
 
-def _fresh(code: str, repo: Path = REPO) -> subprocess.CompletedProcess:
-    """Run `code` in a fresh interpreter with `repo` first on sys.path (the venv's `brain` is an editable install of
+def _fresh(code: str) -> subprocess.CompletedProcess:
+    """Run `code` in a fresh interpreter with this checkout first on sys.path (the venv's `brain` is an editable install of
     another checkout, and -I would ignore PYTHONPATH, so the path is inserted explicitly)."""
-    prelude = f"import sys\nsys.path.insert(0, {str(repo)!r})\n"
+    prelude = f"import sys\nsys.path.insert(0, {str(REPO)!r})\n"
     return subprocess.run(
         [sys.executable, "-c", prelude + code],
         capture_output=True,
         text=True,
-        cwd=str(repo),
+        cwd=str(REPO),
         timeout=120,
     )
 

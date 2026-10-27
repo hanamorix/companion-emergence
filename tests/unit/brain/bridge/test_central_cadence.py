@@ -367,7 +367,7 @@ def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
 @pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
 def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tmp_path, stubs, monkeypatch):
     """The real emotion_backfill job hands the backfill a provider built for the background-classifier tier
-    (the behaviour the source-text check in test_emotion_backfill_model_tier.py pins by reading supervisor.py)."""
+    (#154: the backfill used to receive the bare shared provider)."""
     from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
 
     persona_dir = _persona(tmp_path)

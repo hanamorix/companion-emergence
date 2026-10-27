@@ -162,7 +162,7 @@ def test_c10_finalize_no_delete_interleave(tmp_path: Path) -> None:
         assert provider.extract_calls == 1
         # Extraction ran (a memory landed) AND the buffer was NOT deleted —
         # this is the exact assertion that fails against the pre-change
-        # finalize (see test_c10_pre_change_finalize_deleted_buffer_fail_demo).
+        # finalize (which deleted the buffer here, before finalize was decoupled from the rollover).
         assert sid in list_active_sessions(persona_dir)
         assert read_cursor(persona_dir, sid) is not None
         # TEMP (Root-2 consolidation-gate stopgap — see brain/memory/pending.py

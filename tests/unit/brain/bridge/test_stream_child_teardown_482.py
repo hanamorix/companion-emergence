@@ -179,4 +179,3 @@ def test_the_teardown_waits_are_one_named_value_not_literals():
     assert literal_timeouts == [], literal_timeouts
     drain_text = inspect.signature(provider._StderrDrain.text).parameters["wait_s"]
     assert drain_text.default is None  # None means the grace value, not a second number
-

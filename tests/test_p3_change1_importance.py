@@ -364,4 +364,3 @@ def test_c1_5_extraction_prompts_anchor_present_and_no_em_dash():
         assert "rubric" in prompt
         assert "pivotal" in prompt
         assert _em_dash_free(prompt)
-
