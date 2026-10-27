@@ -240,4 +240,3 @@ def test_bc20_a_former_in_place_writer_is_atomic_and_rides_out_a_transient_permi
     save_tick_cadence(tmp_path, later)
     assert load_tick_cadence(tmp_path)["last_run"] == later.isoformat()  # whole file, not torn
     _no_temp_left(tmp_path / "kindled_link")
-
