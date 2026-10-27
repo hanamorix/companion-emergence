@@ -20,7 +20,7 @@ from brain.bridge.model_tier import TIER_RERANKER, model_for_tier
 from brain.memory.reranker import surviving_pair_token_lengths
 from brain.paths import get_cache_dir
 
-pytestmark = [pytest.mark.requires_models, pytest.mark.integration]
+pytestmark = [pytest.mark.requires_models, pytest.mark.integration, pytest.mark.xdist_group("hf-cache")]
 
 _TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "config.json", "special_tokens_map.json"]
 

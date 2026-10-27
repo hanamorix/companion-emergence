@@ -22,7 +22,7 @@ import pytest
 from tests.harness import ingest_version
 
 # #540: the network install of a drop-in can legitimately outlast the default per-test timeout in pyproject.toml.
-pytestmark = [pytest.mark.integration, pytest.mark.timeout(3600)]
+pytestmark = [pytest.mark.integration, pytest.mark.timeout(3600), pytest.mark.xdist_group("network-install")]
 
 
 def _worktree_root() -> Path:

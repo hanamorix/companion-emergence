@@ -506,6 +506,7 @@ def _stress_body(
     return result
 
 
+@pytest.mark.xdist_group("stress")  # opt-in 60 s run: its own group name under --dist loadgroup (PLAN I1d); the 3.13 bridge job that sets the opt-in runs without -n
 @pytest.mark.skipif(
     os.environ.get("KINDLED_RUN_STRESS") != "1",
     reason="60s stress test, opt-in: set KINDLED_RUN_STRESS=1 (run by test.yml's python-313-bridge job; #421)",

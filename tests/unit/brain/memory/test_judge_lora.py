@@ -41,6 +41,9 @@ from brain.memory.judge_lora import (
     build_lora_retrain_fn,
 )
 
+# Trains tiny models: one xdist worker at a time (--dist loadgroup), each on a single torch thread (#540).
+pytestmark = [pytest.mark.xdist_group("torch-training"), pytest.mark.usefixtures("one_torch_thread")]
+
 # ---------------------------------------------------------------------------
 # Shared fixture: a from-scratch tiny GPT2-for-sequence-classification model
 # + tokenizer, built and saved to disk once per test session.

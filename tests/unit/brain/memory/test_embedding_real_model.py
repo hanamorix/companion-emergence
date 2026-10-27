@@ -43,7 +43,7 @@ from brain.bridge.model_tier import MODEL_EMBEDDING, MODEL_EMBEDDING_DIM
 from brain.memory.embeddings import build_embedding_provider
 
 # #540: a real-model download/load can legitimately outlast the default per-test timeout in pyproject.toml.
-pytestmark = [pytest.mark.requires_network, pytest.mark.integration, pytest.mark.timeout(3600)]
+pytestmark = [pytest.mark.requires_network, pytest.mark.integration, pytest.mark.timeout(3600), pytest.mark.xdist_group("hf-cache")]
 
 
 def test_real_embedding_model_loads_and_embeds_without_external_data_escape_error() -> None:

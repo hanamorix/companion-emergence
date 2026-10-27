@@ -46,6 +46,23 @@ def requires_symlinks() -> None:
         pytest.skip("os.symlink needs an elevated shell or Developer Mode on Windows")
 
 
+@pytest.fixture(scope="module")
+def one_torch_thread() -> Iterator[None]:
+    """Run a torch-training module on one intra-op thread, then put the previous setting back.
+
+    Under pytest-xdist the worker that trains runs beside other busy workers; torch's default (one intra-op thread per
+    core) would make it compete with all of them for the CPU, including with the timing-sensitive tests. The tiny
+    models here gain nothing from more threads. Used via ``pytestmark = pytest.mark.usefixtures("one_torch_thread")``."""
+    import torch
+
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
 # The REAL per-user directories, captured at import (before any test patches the platform directories), for the #488 isolation test.
 from brain import paths as _paths_module  # noqa: E402
 

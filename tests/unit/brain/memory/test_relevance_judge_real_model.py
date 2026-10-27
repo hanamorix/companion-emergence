@@ -41,7 +41,7 @@ from brain.memory.relevance_judge import (
 )
 
 # #540: a real-model download/load can legitimately outlast the default per-test timeout in pyproject.toml.
-pytestmark = [pytest.mark.requires_network, pytest.mark.integration, pytest.mark.timeout(3600)]
+pytestmark = [pytest.mark.requires_network, pytest.mark.integration, pytest.mark.timeout(3600), pytest.mark.xdist_group("hf-cache")]
 
 _MODEL_ID = "BAAI/bge-reranker-v2-m3"
 

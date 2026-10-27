@@ -26,6 +26,10 @@ BRAIN = REPO / "brain"
 LLM_TELLS = ("delve", "tapestry", "testament", "seamless", "leverage", "utilize", "pivotal", "realm", "embark", "elevate", "unlock", "not just")
 MODEL_ID = re.compile(r"claude-[a-z0-9.-]*\d")
 
+# The module-scoped `probe` fixture starts a fresh interpreter that imports every brain module: run the module on one
+# xdist worker (--dist loadgroup) so that happens once, not once per worker (#540).
+pytestmark = pytest.mark.xdist_group("tunables-probe")
+
 
 def _register_calls() -> list[tuple[str, int, ast.Call]]:
     """Every call of ``brain.tunables.register`` under brain/, however the module or the function was imported (rev-4 S7)."""

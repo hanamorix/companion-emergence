@@ -50,10 +50,11 @@ from tests.integration.systemd_cleanup import (
 )
 
 # The entire module is Linux-only.
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="systemd integration test is Linux-only",
-)
+# One fixed unit name in the one real user manager: run on one xdist worker (--dist loadgroup).
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "linux", reason="systemd integration test is Linux-only"),
+    pytest.mark.xdist_group("systemd"),
+]
 
 
 @pytest.fixture(autouse=True)

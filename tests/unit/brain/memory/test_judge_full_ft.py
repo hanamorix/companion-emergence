@@ -27,6 +27,9 @@ import pytest
 from brain.memory.judge_eval import RollbackHandle, run_champion_challenger
 from brain.memory.judge_full_ft import build_full_ft_retrain_fn, load_full_scorer
 
+# Trains tiny models: one xdist worker at a time (--dist loadgroup), each on a single torch thread (#540).
+pytestmark = [pytest.mark.xdist_group("torch-training"), pytest.mark.usefixtures("one_torch_thread")]
+
 _VOCAB_WORDS = [
     "dog", "cat", "apple", "banana", "music", "science", "weather",
     "the", "a", "is", "great", "bad", "loud", "quiet", "red", "blue",
