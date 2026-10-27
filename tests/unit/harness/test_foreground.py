@@ -33,10 +33,10 @@ def _stub_boot_run(monkeypatch: pytest.MonkeyPatch, *, returncode: int = 0, stde
     """Replace `fg.subprocess.run` (the seam the boot command goes through) with a stub that does what the boot
     command would do: write what `writes(...)` says INSIDE the call (so the READY freshness check sees a fresh file),
     then return a `CompletedProcess` or raise. Everything `boot_and_verify` decides afterwards is the real code."""
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict]] = []  # (argv, kwargs) of every call
 
     def _fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003 -- test stub mirrors subprocess.run
-        calls.append(list(cmd))
+        calls.append((list(cmd), kwargs))
         if raises is not None:
             raise raises
         if writes is not None:
@@ -174,11 +174,13 @@ def test_boot_and_verify_timeout_expired_raises(tmp_path: Path, monkeypatch: pyt
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     cmd = ["boot", "it"]
-    _stub_boot_run(monkeypatch, raises=subprocess.TimeoutExpired(cmd, 0.5))
+    calls = _stub_boot_run(monkeypatch, raises=subprocess.TimeoutExpired(cmd, 0.5))
     spec = fg.ArmBootSpec(arm="A", port=1, run_dir=run_dir, ready_timeout=0.5)
 
     with pytest.raises(fg.ForegroundBootError, match="did not complete"):
         fg.boot_and_verify(spec, boot_cmd=cmd)
+    # the anti-stall guarantee: the boot command is run with the spec's ready_timeout as its bound
+    assert [kwargs["timeout"] for _, kwargs in calls] == [0.5]
 
 
 # --- G3(a): expect_brain_repo_under cross-check rejects a bad build -------------------------------

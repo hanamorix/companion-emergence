@@ -104,7 +104,7 @@ def no_venv(monkeypatch: pytest.MonkeyPatch) -> None:
     """For the tests of the copy semantics: `ingest_version` returns the interpreter path a venv would have, but no
     venv is built (the tests that look at a venv or its startup hook build real ones)."""
     monkeypatch.setattr(
-        dropin_mod, "_build_venv", lambda dest, deps: dest / dropin_mod._VENV_DIRNAME / "bin" / "python"
+        dropin_mod, "_build_venv", lambda dest, deps: dropin_mod._venv_python(dest / dropin_mod._VENV_DIRNAME)
     )
 
 
