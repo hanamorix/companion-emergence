@@ -24,10 +24,23 @@ on:
           - macos-latest
           - windows-latest
         default: all
+      workers:
+        description: >-
+          pytest-xdist worker processes (#540): 1 is the serial run, auto is one worker per CPU.
+          Any other value than 1 also switches on --dist loadgroup and turns off the tdd-guard plugin.
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "auto"
+        default: "1"
 
 jobs:
   python:
     name: python ${{ matrix.os }}
+    # A hung parallel trial must not hold a runner for the default six hours.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -55,16 +68,26 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         run: uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml
 
-      # Manual run only. The input reaches the shell as an environment variable (never
-      # spliced into the script), is split on all whitespace (newlines included) with globbing switched off, and
-      # every word is passed to pytest as one quoted argument. `shell: bash` so the
-      # same script runs on all three OSes (Windows would otherwise use pwsh).
+      # Manual run only. The inputs reach the shell as environment variables (never
+      # spliced into the script). TESTS is split on all whitespace (newlines included) with
+      # globbing switched off, and every word is passed to pytest as one quoted argument.
+      # WORKERS other than 1 runs pytest-xdist: `--dist loadgroup` keeps each xdist_group
+      # mark's tests on one worker (the tests sharing a real resource), and `-p no:tdd-guard`
+      # stops the tdd-guard plugin, which every worker would otherwise load and make write the
+      # same status file. The push and pull_request run above stays serial until the suite is
+      # switched over. `shell: bash` so the same script runs on all three OSes (Windows would
+      # otherwise use pwsh).
       - name: Run pytest (selected tests)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           TESTS: ${{ inputs.tests }}
+          WORKERS: ${{ inputs.workers }}
         run: |
+          case "$WORKERS" in
+            1|2|4|auto) ;;
+            *) echo "::error::refusing workers '$WORKERS': use 1, 2, 4 or auto"; exit 1 ;;
+          esac
           set -f
           selected=($TESTS)
           set +f
@@ -73,7 +96,11 @@ jobs:
               -*) echo "::error::refusing '$word': pass test paths or node ids only, not pytest options"; exit 1 ;;
             esac
           done
-          uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml "${selected[@]}"
+          parallel=()
+          if [ "$WORKERS" != "1" ]; then
+            parallel=(-n "$WORKERS" --dist loadgroup -p no:tdd-guard)
+          fi
+          uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml "${parallel[@]}" "${selected[@]}"
 
       # Per-test timings (#540): the junit file carries every test's duration so
       # the slow ones can be found per OS.
