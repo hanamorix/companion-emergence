@@ -8,6 +8,8 @@ import subprocess
 import sys
 import warnings
 
+import pytest
+
 from brain.update import overlay_hook
 
 
@@ -68,23 +70,51 @@ def _where(site, home):
     return out.stdout.split()
 
 
-def test_unload_platformdirs_drops_it_from_sys_modules():
+def _unload_platformdirs_with_fakes(mp: pytest.MonkeyPatch) -> None:
+    """Run the helper over fake platformdirs entries, with `mp` set to undo ALL of it.
+
+    The helper deletes every `platformdirs` / `platformdirs.*` entry from sys.modules, the real
+    ones included, and the rest of this worker's tests need the real module back. So every
+    real entry is registered with `mp` first (set to itself, restored on undo), then the fakes
+    go in through `mp` too (undo puts back the real entry, or removes a key that was absent)."""
+    fakes = {"platformdirs": object(), "platformdirs.macos": object(), "platformdirs_unrelated": object()}
+    for name in [m for m in sys.modules if m == "platformdirs" or m.startswith("platformdirs.")]:
+        if name not in fakes:
+            mp.setitem(sys.modules, name, sys.modules[name])
+    for name, fake in fakes.items():  # "platformdirs_unrelated" must survive: prefix trap
+        mp.setitem(sys.modules, name, fake)
+    overlay_hook._unload_platformdirs()
+    assert "platformdirs" not in sys.modules
+    assert "platformdirs.macos" not in sys.modules
+    assert "platformdirs_unrelated" in sys.modules
+
+
+def test_unload_platformdirs_drops_it_from_sys_modules(monkeypatch):
     """After activation, an overlay's own (possibly newer) platformdirs must be able
     to load — so this helper drops what the hook imported. Direct unit test on the
     helper (subprocess env control for the full through-path is awkward: it needs
     HOME/XDG pointed at a temp dir with KINDLED_HOME/NELLBRAIN_HOME both unset, which
     the other tests in this file deliberately avoid)."""
-    sys.modules["platformdirs"] = object()
-    sys.modules["platformdirs.macos"] = object()
-    sys.modules["platformdirs_unrelated"] = object()  # must survive: prefix trap
-    try:
-        overlay_hook._unload_platformdirs()
-        assert "platformdirs" not in sys.modules
-        assert "platformdirs.macos" not in sys.modules
-        assert "platformdirs_unrelated" in sys.modules
-    finally:
-        for k in ("platformdirs", "platformdirs.macos", "platformdirs_unrelated"):
-            sys.modules.pop(k, None)
+    _unload_platformdirs_with_fakes(monkeypatch)
+
+
+def test_the_unload_test_leaves_the_real_platformdirs_in_sys_modules():
+    """The unload test must not take the real module away from later tests in the same worker
+    (xdist runs many tests per process): every platformdirs entry present before is the same
+    object after, and no fake entry is left behind."""
+    import importlib
+
+    for name in ("platformdirs", "platformdirs.api", "platformdirs.version"):  # real ones, present on every OS
+        importlib.import_module(name)  # loaded (again, if an earlier test removed them) before the snapshot
+
+    def snapshot() -> dict[str, object]:
+        return {k: v for k, v in sys.modules.items() if k == "platformdirs_unrelated" or k.startswith("platformdirs")}
+
+    before = snapshot()
+    with pytest.MonkeyPatch.context() as mp:
+        _unload_platformdirs_with_fakes(mp)
+    assert snapshot() == before
+    assert "platformdirs_unrelated" not in before, "precondition: the fake key is not a real module"
 
 
 def test_active_overlay_wins_and_brain_is_not_imported(tmp_path):

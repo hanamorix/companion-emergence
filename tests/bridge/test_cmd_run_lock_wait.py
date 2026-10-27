@@ -17,6 +17,8 @@ import pytest
 from brain import process_identity as pi
 from brain.bridge import daemon, state_file
 
+REPO = Path(__file__).resolve().parents[2]  # not the cwd: pytest may run from anywhere
+
 _HOLDER = textwrap.dedent(
     """
     import sys, time
@@ -43,7 +45,7 @@ def home(tmp_path, monkeypatch):
 
 def _holder(persona_dir: Path, tmp_path: Path):
     ready, go = tmp_path / "ready", tmp_path / "go"
-    env = dict(os.environ, PYTHONPATH=os.getcwd())
+    env = dict(os.environ, PYTHONPATH=str(REPO))
     p = subprocess.Popen([sys.executable, "-c", _HOLDER, str(persona_dir), str(ready), str(go)], env=env)
     deadline = time.time() + 30
     while not ready.exists():

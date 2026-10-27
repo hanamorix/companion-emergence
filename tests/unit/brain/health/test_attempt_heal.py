@@ -936,12 +936,10 @@ def test_unreadable_live_file_fails_loud_and_changes_nothing(tmp_path: Path, mon
 # ---- #389: concurrent savers of one path must not share a temp file ----
 
 
-def _dead_pid() -> int:
-    import subprocess
-
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait()
-    return proc.pid
+# A pid no process can have: Linux caps pid_max at 2**22, macOS pids stay below 100000, and Windows rejects it in
+# OpenProcess. The pid of a child that has just exited is not safe as a "dead owner": the OS may hand it to a
+# process another pytest-xdist worker starts a moment later.
+_NEVER_A_PID = 2**22 + 7
 
 
 def test_stale_temps_are_removed_by_pattern_but_not_a_live_writers_temp(tmp_path: Path) -> None:
@@ -950,8 +948,8 @@ def test_stale_temps_are_removed_by_pattern_but_not_a_live_writers_temp(tmp_path
     p = tmp_path / "x.json"
     _seed(p)
     stale = [
-        f"x.json.t{_dead_pid()}-0123456789ab.new",  # dead process
-        f"x.json.t{_dead_pid()}-0123456789ab.bak1.new",
+        f"x.json.t{_NEVER_A_PID}-0123456789ab.new",  # dead process
+        f"x.json.t{_NEVER_A_PID}-0123456789ab.bak1.new",
         f"x.json.t{os.getpid()}-0123456789ab.new",  # this process, not in flight
         "x.json.new",  # pre-#389 fixed names
         "x.json.bak1.new",

@@ -94,14 +94,19 @@ if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
     )
 
 
-def _run_subprocess_script(script: str) -> dict:
+def _run_subprocess_script(script: str, scratch_dir: Path) -> dict:
     """Run `script` in a fresh `python -P` subprocess (mirrors test_search_
     via_bridge.py's `-P` convention — no cwd-shadowing of `brain`), parse the
     LAST stdout line as the JSON result dict this file's scripts always print,
-    and fail loudly (with full stdout/stderr) on any non-zero exit."""
+    and fail loudly (with full stdout/stderr) on any non-zero exit.
+
+    `scratch_dir` (the test's `tmp_path`) reaches the script as the env var
+    ``RSS_TEST_SCRATCH_DIR``; the script keeps its persona / empty-cache dirs
+    under it, so pytest removes them (the scripts used to `mkdtemp` and leak)."""
     proc = subprocess.run(
         [sys.executable, "-P", "-c", script],
         cwd=str(_REPO_ROOT),
+        env={**os.environ, "RSS_TEST_SCRATCH_DIR": str(scratch_dir)},
         capture_output=True,
         text=True,
         timeout=_TIMEOUT_S,
@@ -238,7 +243,7 @@ def _report(arm: str, rss_before: int, peak: int, rss_after: int) -> None:
     )
 
 
-def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
+def test_c2a_calibration_tick_finish_releases_judge_rss(tmp_path: Path) -> None:
     """C2 (calibration finish arm): a real `_run_calibration_tick` call that
     builds the real torch judge (one unlabeled calibration_log row, a clearly
     non-ambiguous pair so no Haiku call is needed — a `FakeProvider` is
@@ -255,7 +260,6 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     """
     script = _RSS_TRACE_PRELUDE + textwrap.dedent(
         """
-        import tempfile
         from pathlib import Path
 
         from brain.bridge.provider import FakeProvider
@@ -283,7 +287,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
 
         reranker_mod.build_reranker_provider = _no_reranker
 
-        persona_dir = Path(tempfile.mkdtemp())
+        persona_dir = Path(os.environ["RSS_TEST_SCRATCH_DIR"])
         store = MemoryStore(persona_dir / "memories.db")
         # Same genuine pair as test_relevance_judge_real_model.py's
         # _GENUINE_PAIRS[0] (measured there, and independently confirmed
@@ -319,7 +323,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
@@ -335,7 +339,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     )
 
 
-def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
+def test_c2c_calibration_tick_pause_releases_judge_rss(tmp_path: Path) -> None:
     """C2 (calibration PAUSE arm, ram-spike-fix INC-10): two unlabeled
     calibration_log rows, a `should_pause` that fires True right after the
     FIRST row is labeled (before the second) — `_run_calibration_tick`
@@ -350,7 +354,6 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
     """
     script = _RSS_TRACE_PRELUDE + textwrap.dedent(
         """
-        import tempfile
         from pathlib import Path
 
         from brain.bridge.provider import FakeProvider
@@ -364,7 +367,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
 
         reranker_mod.build_reranker_provider = _no_reranker
 
-        persona_dir = Path(tempfile.mkdtemp())
+        persona_dir = Path(os.environ["RSS_TEST_SCRATCH_DIR"])
         store = MemoryStore(persona_dir / "memories.db")
         pairs = [
             ("deep breathing helps when you are feeling anxious", "how do I calm down when everything feels like too much"),
@@ -407,7 +410,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
@@ -428,7 +431,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
     )
 
 
-def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
+def test_c2b_weight_retrain_finish_releases_judge_rss(tmp_path: Path) -> None:
     """C2 (self-tune finish arm, scoped per this file's module docstring): a
     real champion build (`build_judge_provider()`) + a real, tiny LoRA
     weight-retrain (`judge_lora.build_lora_retrain_fn`, 1 epoch, 6 real
@@ -490,7 +493,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
@@ -511,7 +514,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
     )
 
 
-def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
+def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> None:
     """C3(a): with the configured judge id present in the local HF cache
     (this machine's real cache dir, per the module's own `get_cache_dir()`),
     building the judge via the production factory
@@ -589,7 +592,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     assert result["model_id"] == "BAAI/bge-reranker-v2-m3"
     assert result["score_is_float"]
     assert result["device"] == "cpu", (
@@ -605,7 +608,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
     )
 
 
-def test_c3b_uncached_judge_id_attempts_network_load() -> None:
+def test_c3b_uncached_judge_id_attempts_network_load(tmp_path: Path) -> None:
     """C3(b): with a cache dir that does NOT have the judge cached (a fresh
     empty tmp dir passed as `cache_dir`), `offline_load_kwargs` returns `{}`
     (no offline kwargs at all) -- so the caller falls through to today's
@@ -618,8 +621,8 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
     script = textwrap.dedent(
         """
         import json
+        import os
         import socket
-        import tempfile
 
         _connect_calls = [0]
 
@@ -631,7 +634,8 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
 
         import brain.memory.relevance_judge as rj
 
-        empty_cache_dir = tempfile.mkdtemp()
+        empty_cache_dir = os.path.join(os.environ["RSS_TEST_SCRATCH_DIR"], "empty-hf-cache")
+        os.makedirs(empty_cache_dir)
         kwargs = rj.offline_load_kwargs("BAAI/bge-reranker-v2-m3", empty_cache_dir)
 
         # offline_load_kwargs itself must have already tried (and failed) the
@@ -653,7 +657,7 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     assert not result["hf_cached_probe_itself_touched_network"], (
         "the _hf_cached probe (local_files_only=True) must decide 'not cached' without "
         "ever touching the network itself"

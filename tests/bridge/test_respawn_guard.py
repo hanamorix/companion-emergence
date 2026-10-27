@@ -23,6 +23,8 @@ import pytest
 from brain import process_identity as pi
 from brain.bridge import daemon, kill, respawn_guard, shutdown_progress, state_file
 
+REPO = Path(__file__).resolve().parents[2]  # not the cwd: pytest may run from anywhere
+
 
 @pytest.fixture
 def pd(tmp_path, monkeypatch):
@@ -96,7 +98,7 @@ def test_a_respawn_already_waiting_for_the_lock_checks_again_after_it(pd, gone_p
     monkeypatch.setattr(respawn_guard, "_platform", lambda: "linux")
     ready, go = tmp_path / "ready", tmp_path / "go"
     holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(pd), str(ready), str(go)],
-                              env=dict(os.environ, PYTHONPATH=os.getcwd()))
+                              env=dict(os.environ, PYTHONPATH=str(REPO)))
     try:
         while not ready.exists():
             time.sleep(0.02)

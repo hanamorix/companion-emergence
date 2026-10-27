@@ -180,9 +180,9 @@ def test_g1g_a_dead_writers_temp_is_swept_and_a_live_other_process_temp_is_left(
     p = tmp_path / "k.bin"
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
-        dead.wait()
-        stale = tmp_path / f"k.bin.t{dead.pid}-aaaaaaaaaaaa.new"
+        # No process can have this pid (Linux pid_max <= 2**22, macOS < 100000, Windows rejects it); the pid of a
+        # child that just exited could be handed to another pytest-xdist worker's new process.
+        stale = tmp_path / f"k.bin.t{2**22 + 7}-aaaaaaaaaaaa.new"
         live = tmp_path / f"k.bin.t{sleeper.pid}-bbbbbbbbbbbb.new"
         stale.write_bytes(b"x")
         live.write_bytes(b"y")

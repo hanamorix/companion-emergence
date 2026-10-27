@@ -22,6 +22,7 @@ from brain.bridge import runner as _runner
 from brain.bridge.shutdown import POLL_S
 
 SERVICE_ORIGINS = ("systemd", "launchd", "task-scheduler")
+REPO = Path(__file__).resolve().parents[2]  # not the cwd: pytest may run from anywhere
 
 
 real_setup_runtime_logging = _runner._setup_runtime_logging  # captured before any fixture patches it
@@ -493,7 +494,7 @@ def test_sigterm_during_the_wait_ends_the_process_at_once_with_nothing_held(tmp_
         f'{{"unproven_starts": 4, "at": {time.time()}}}', encoding="utf-8"
     )  # a 600 s wait
     err = tmp_path / "err.txt"
-    env = dict(os.environ, PYTHONPATH=os.getcwd(), KINDLED_HOME=str(home))
+    env = dict(os.environ, PYTHONPATH=str(REPO), KINDLED_HOME=str(home))
     with err.open("w") as ef:
         p = subprocess.Popen(
             [sys.executable, "-m", "brain.cli", "supervisor", "run", "--persona", "nell", "--client-origin", "systemd",

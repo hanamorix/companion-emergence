@@ -23,6 +23,37 @@ from brain.bridge import kill, shutdown_progress, state_file
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and suspend; Windows leg in CI")
 
+
+def _signal_self(sig) -> None:
+    """Send ``sig`` to this process, but only when a handler is installed for it.
+
+    A signal whose disposition is the default (SIG_DFL) would terminate this process, which under
+    pytest-xdist is the worker running a whole share of the suite. SIG_IGN is fine (``kill_bridge``
+    ignores the stop signals while it resumes, and one test sends a second signal from there)."""
+    handler = signal.getsignal(sig)
+    assert handler is not signal.SIG_DFL, f"{sig!r} has no handler: sending it would kill this process"
+    os.kill(os.getpid(), sig)
+
+
+def test_signal_self_refuses_a_signal_that_would_kill_the_process():
+    sig = signal.SIGUSR1
+    seen = []
+    previous = signal.signal(sig, signal.SIG_DFL)
+    try:
+        with pytest.raises(AssertionError, match="no handler"):
+            _signal_self(sig)
+        signal.signal(sig, signal.SIG_IGN)
+        _signal_self(sig)  # ignored: allowed, and nothing happens
+        signal.signal(sig, lambda s, f: seen.append(s))
+        _signal_self(sig)
+        deadline = time.monotonic() + 5
+        while not seen and time.monotonic() < deadline:  # the handler runs in this (main) thread soon after the kill
+            time.sleep(0.01)
+        assert seen == [sig]
+    finally:
+        signal.signal(sig, previous)
+
+
 _FAKE_BRIDGE = textwrap.dedent(
     """
     import os, subprocess, sys, time
@@ -176,7 +207,7 @@ def test_a_signal_after_the_freeze_before_the_bridge_kill_resumes_everything(tmp
     b = fake()
 
     def _signal():
-        os.kill(os.getpid(), getattr(signal, sig))
+        _signal_self(getattr(signal, sig))
         time.sleep(0.2)
 
     with pytest.raises((kill._KillInterrupted, KeyboardInterrupt)):
@@ -191,12 +222,12 @@ def test_a_second_signal_while_resuming_is_ignored(tmp_path, fake):
     calls = {"n": 0}
 
     def _first():
-        os.kill(os.getpid(), signal.SIGTERM)
+        _signal_self(signal.SIGTERM)
         time.sleep(0.2)
 
     def _second():
         calls["n"] += 1
-        os.kill(os.getpid(), signal.SIGTERM)
+        _signal_self(signal.SIGTERM)
         time.sleep(0.2)
 
     with pytest.raises(kill._KillInterrupted):
@@ -211,7 +242,7 @@ def test_a_signal_after_the_bridge_kill_returned_kills_the_tree_and_keeps_the_in
     b = fake()
 
     def _signal():
-        os.kill(os.getpid(), signal.SIGTERM)
+        _signal_self(signal.SIGTERM)
         time.sleep(0.2)
 
     with pytest.raises(kill._KillInterrupted):
@@ -347,7 +378,7 @@ def test_a_signal_during_the_wait_or_the_manager_call_freezes_nothing_and_delete
     b = fake()
 
     def _signal(*_a):
-        os.kill(os.getpid(), getattr(signal, sig))
+        _signal_self(getattr(signal, sig))
         time.sleep(0.2)
 
     if when == "manager":
@@ -367,7 +398,7 @@ def test_a_signal_during_the_hard_exit_wait_withdraws_the_request(tmp_path, fake
     b = fake()
 
     def _signal(*_a):
-        os.kill(os.getpid(), signal.SIGINT)
+        _signal_self(signal.SIGINT)
         time.sleep(0.2)
 
     with pytest.raises((kill._KillInterrupted, KeyboardInterrupt)):
@@ -450,7 +481,7 @@ def test_a_signal_while_the_pending_intent_is_written_deletes_it_and_restores_th
 
     def _write_then_signal(pd, intent):
         real_write(pd, intent)
-        os.kill(os.getpid(), signal.SIGTERM)
+        _signal_self(signal.SIGTERM)
         time.sleep(0.2)
 
     monkeypatch.setattr(kill, "_write_intent", _write_then_signal)
