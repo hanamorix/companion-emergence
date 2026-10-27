@@ -39,8 +39,9 @@ class Clock:
         for _, fn in due:
             fn()
         if any(t not in self._threads_at_start for t in threading.enumerate()):
-            # The watcher has started its prompt thread: let it run. A sleep on every one of the thousands of ticks (the
-            # real poll is 0.2 s of fake time) cost over 20 s on macOS, where a 1 ms sleep takes about 10 ms.
+            # A thread has started since the clock was created (the watcher's prompt thread): let it run. A sleep
+            # on every one of the thousands of ticks (the real poll is 0.2 s of fake time) cost over 20 s on macOS,
+            # where a 1 ms sleep takes about 10 ms.
             time.sleep(0.001)
 
 
