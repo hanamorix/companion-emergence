@@ -13,7 +13,7 @@ import tomllib
 from pathlib import Path
 
 from brain.bridge import provider
-from tests.source_tree import brain_sources, brain_trees
+from tests.source_tree import brain_trees
 
 _BRAIN = Path(__file__).parents[4] / "brain"
 _OLD_FORMAT_PHRASES = (
@@ -84,15 +84,6 @@ def test_c6_user_name_is_a_context_key_and_the_engine_sets_it() -> None:
     assert "user_name" in provider._PROVIDER_CONTEXT_OPTION_KEYS
     engine = (_BRAIN / "chat" / "engine.py").read_text(encoding="utf-8")
     assert 'chat_options["user_name"]' in engine
-
-
-def test_c6_the_old_renderer_name_is_gone_everywhere_under_brain() -> None:
-    offenders = [
-        Path(rel).relative_to("brain").as_posix()
-        for rel, text in brain_sources().items()
-        if "_claude_context_jsonl_lines" in text
-    ]
-    assert offenders == []
 
 
 def test_c6_no_model_bound_string_or_docstring_describes_the_format_as_jsonl() -> None:

@@ -230,24 +230,6 @@ def test_the_tests_scan_catches_a_removed_keyword_and_a_removed_name_in_a_commen
     assert not _REMOVED_KWARG.search("model_override(TIER_COMPACTION, 'x')")
 
 
-def test_removed_attributes_do_not_exist() -> None:
-    from brain import persona_config
-    from brain.bridge import persona_state, provider
-    from brain.chat import compaction
-    from brain.self_model import articulate
-
-    for mod, names in (
-        (model_tier, ("MODEL_LITTLE", "MODEL_MEDIUM", "MODEL_BIGGEST", "TIER_MODEL", "TIER_DEV_CLI", "NAMED_CHOICES")),
-        (persona_config, ("DEFAULT_MODEL", "ROUTED_TIER_NAMES", "is_valid_model", "KNOWN_MODELS")),
-        (compaction, ("COMPACTION_MODEL",)),
-        (articulate, ("SELF_MODEL_MODEL",)),
-        (persona_state, ("_default_model_for",)),
-        (provider, ("DEFAULT_MODEL",)),
-    ):
-        for name in names:
-            assert not hasattr(mod, name), f"{mod.__name__}.{name} should not exist"
-
-
 # ---------------------------------------------------------------------------
 # model_for_tier and the non-Claude tiers
 # ---------------------------------------------------------------------------

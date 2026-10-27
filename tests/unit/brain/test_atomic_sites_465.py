@@ -466,8 +466,3 @@ def test_append_archive_new_segment_and_new_marker_fsync_the_directory(tmp_path,
     buffer.write_archive_marker(tmp_path, "sess1", "key-1")
     assert len(seen) >= 1 and all(p == marker_dir for p in seen)
 
-
-def test_the_old_private_directory_fsync_is_gone():
-    from brain.ingest import buffer
-
-    assert not hasattr(buffer, "_fsync_dir")

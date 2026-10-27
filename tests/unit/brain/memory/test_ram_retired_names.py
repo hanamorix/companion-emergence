@@ -31,33 +31,6 @@ _PATTERN = re.compile(r"\b(" + "|".join(re.escape(n) for n in _RETIRED) + r")\b"
 _ROOT = Path(__file__).resolve().parents[4]
 
 
-def _normalise(text: str) -> str:
-    """Flatten line wraps and markdown emphasis so formatting cannot hide a name."""
-    return re.sub(r"[\s`*]+", " ", text)
-
-
-def _violations(text: str) -> list[str]:
-    return sorted(set(_PATTERN.findall(_normalise(text))))
-
-
-def test_the_sweep_fires_on_a_known_violator() -> None:
-    assert _violations("x = reranker_mod._ram_kept\n`ram_bytes_per_token`") == ["_ram_kept", "ram_bytes_per_token"]
-    assert _violations("RAM_SHAPE_SERIES and _ram_shapes are fine") == []
-
-
-def test_no_retired_name_is_left_in_brain_or_tests() -> None:
-    here = Path(__file__).resolve()
-    found: dict[str, list[str]] = {}
-    for tree in ("brain", "tests"):
-        for path in sorted((_ROOT / tree).rglob("*.py")):
-            if path.resolve() == here or ".venv" in path.parts:
-                continue
-            names = _violations(path.read_text(encoding="utf-8"))
-            if names:
-                found[str(path.relative_to(_ROOT))] = names
-    assert found == {}
-
-
 def test_the_replacements_exist_and_are_used() -> None:
     from brain.memory import cost_series, peak_rss, ram_fit
     from brain.memory import reranker as reranker_mod

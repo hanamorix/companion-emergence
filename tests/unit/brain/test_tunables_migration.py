@@ -362,10 +362,3 @@ def test_the_pre_check_is_one_exists_call_and_takes_no_lock(t, tmp_path, held_lo
         migrate_legacy_json(tmp_path, complete_registry=True)
     assert (tmp_path / FILE_NAME).stat().st_mtime_ns == before
 
-
-def test_the_names_of_the_old_migration_are_gone() -> None:
-    import brain.tunables_migration as tm
-
-    for gone in ("migrate_idle_keys", "_read_state", "_rewrite", "_BACKUP_SUFFIX"):
-        assert not hasattr(tm, gone), gone
-    assert hasattr(tm, "_RETIRED_KEYS")

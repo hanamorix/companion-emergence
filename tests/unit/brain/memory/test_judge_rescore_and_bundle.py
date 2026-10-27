@@ -7,8 +7,6 @@ are base deps) + C20 (no residual optional-extra plumbing in brain/).
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from brain.memory.store import MemoryStore
 
 
@@ -79,17 +77,3 @@ def test_rows_with_doc_snapshot_returns_only_doc_having() -> None:
 
 # --- C19 / C20: the peft/datasets bundle reversal (now base deps) -----------
 
-
-def test_no_residual_optional_extra_plumbing_in_brain() -> None:
-    # C20: the inc5a optional-extra plumbing is fully removed from brain/.
-    # Positive absence sweep (would fire on the pre-change tree, which had
-    # `lora_available` / `_downgrade_for_missing_lora_extra` / the extra hint).
-    brain_root = Path(__file__).resolve().parents[4] / "brain"
-    banned = ["lora_available", "_downgrade_for_missing_lora_extra", "_F2C_TRAINING_EXTRA_HINT"]
-    offenders: list[str] = []
-    for py in brain_root.rglob("*.py"):
-        text = py.read_text(encoding="utf-8")
-        for token in banned:
-            if token in text:
-                offenders.append(f"{py}: {token}")
-    assert not offenders, f"residual optional-extra plumbing: {offenders}"

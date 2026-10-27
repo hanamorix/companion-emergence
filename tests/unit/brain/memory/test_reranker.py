@@ -36,7 +36,7 @@ from brain.memory.reranker import (
     normalize_bundled_pairs_against_anchors,
 )
 from brain.memory.store import MemoryStore
-from tests.source_tree import brain_sources, brain_trees
+from tests.source_tree import brain_trees
 
 # ---------------------------------------------------------------------------
 # FakeRerankerProvider — scriptable, offline
@@ -241,31 +241,6 @@ def test_ac3_reranker_precision_override_loads_fp32_instead(
     )
     _reset_reranker_provider_cache()
     tunables_mod._reset_for_tests()
-
-
-def test_ac4_no_precision_selfcheck_reference_remains_in_reranker_module() -> None:
-    """AC4 (grep-clean): no reference to a cached first-use precision
-    decision, an agreement bar, or a floor-write-triggered precision-cache
-    invalidation remains in brain/memory/reranker.py or brain/bridge/
-    supervisor.py — mechanical check, same shape as
-    `test_ac3_no_int8_quantization_code_path` below."""
-    import inspect
-
-    from brain.bridge import supervisor as supervisor_mod
-
-    forbidden = [
-        "_precision_decision_cache",
-        "_choose_reranker_model_id",
-        "_run_precision_selfcheck",
-        "reset_precision_decision_for_floor_change",
-        "agreement bar",
-    ]
-    for mod in (reranker_mod, supervisor_mod):
-        source = inspect.getsource(mod)
-        for token in forbidden:
-            assert token not in source, (
-                f"stale precision-self-check reference {token!r} still present in {mod.__name__}"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -2346,10 +2321,6 @@ def test_j4_the_cap_refuses_a_single_pair_longer_than_any_measured_and_allows_on
     assert reranker_mod.fit_rerank_width([1025], anchors, capped, 4.0, 1e15, max_real=1) == 0
 
 
-def _py_files_mentioning(root, token: str) -> list[str]:
-    return [str(p) for p in root.rglob("*.py") if token in p.read_text(encoding="utf-8")]
-
-
 def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected() -> None:
     v2 = reranker_mod._cgroup_v2_memory_headroom_bytes.__doc__ or ""
     v1 = reranker_mod._cgroup_v1_memory_headroom_bytes.__doc__ or ""
@@ -2367,16 +2338,6 @@ def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected(
     assert "psutil" in avail and "memory.high" in avail
     for doc in (v2, v1, helper, avail):
         assert "matches psutil" not in doc.lower() and "matches the host" not in doc.lower()
-
-
-def test_g12_no_text_in_brain_still_calls_inactive_file_the_reclaimable_term(tmp_path) -> None:
-    assert "brain/memory/reranker.py" in brain_sources()
-    assert [rel for rel, text in brain_sources().items() if "inactive_file" in text] == []
-    # the sweep can fail: it flags a known-bad file placed in a directory it walks
-    (tmp_path / "sub").mkdir()
-    (tmp_path / "sub" / "stale.py").write_text('"""reclaimable = memory.stat inactive_file"""\n', encoding="utf-8")
-    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
-    assert _py_files_mentioning(tmp_path, "inactive_file") == [str(tmp_path / "sub" / "stale.py")]
 
 
 def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2452,24 +2413,6 @@ def test_available_ram_headroom_none_when_everything_fails(monkeypatch: pytest.M
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
     monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: None)
     assert reranker_mod._available_ram_headroom_bytes() is None
-
-
-def test_ac3_no_int8_quantization_code_path() -> None:
-    """AC#3: int8 quantization was explicitly dropped (Roy's catch: a 278M
-    model has less redundancy to absorb int8's accuracy hit than fp16 —
-    fp16 is the one quantization lever). Mechanical grep-level check: the
-    reranker module (and the model_tier registrations it reads) must
-    contain no "int8" code path at all."""
-    import inspect
-
-    from brain.bridge import model_tier as model_tier_mod
-
-    assert "int8" not in inspect.getsource(reranker_mod).lower(), (
-        "no int8 quantization code path may exist in brain/memory/reranker.py"
-    )
-    assert "int8" not in inspect.getsource(model_tier_mod).lower(), (
-        "no int8 quantization code path may exist in brain/bridge/model_tier.py"
-    )
 
 
 # ---------------------------------------------------------------------------

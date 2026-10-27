@@ -183,11 +183,6 @@ class TestNoWorkerThread:
         assert not any(t.name == "pass2-queue-worker" for t in after)
         assert pass2_queue._queue_size(tmp_path) == 3  # saved, waiting for a drainer
 
-    def test_module_has_no_worker_machinery(self):
-        for name in ("_ensure_worker", "_worker_loop", "_worker_thread", "_worker_inhibited"):
-            assert not hasattr(pass2_queue, name), name
-
-
 # ---------------------------------------------------------------------------
 # 4. A raising item must not kill the drain (error isolation)
 # ---------------------------------------------------------------------------

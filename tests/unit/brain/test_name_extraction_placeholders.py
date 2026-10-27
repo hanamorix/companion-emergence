@@ -1,9 +1,8 @@
 """Names increment (name-recall fix): the persona-facing strings are the approved
-wording, byte-exact, and no placeholder is left (S107; criteria N18, N23-N25).
+wording, byte-exact (S107; criteria N18, N23-N25).
 
-This file held N2's PLACEHOLDER-marker test; the owner's wording now replaces
-every placeholder (the last one, the `rerank_width_remeasure` label, is final: wording
-file section 8). The texts below are copied from
+The owner's wording replaced every placeholder (the last one, the `rerank_width_remeasure` label, is final: wording
+file section 8); that no placeholder comes back is listed in tests/unit/test_removed_names_stay_removed.py. The texts below are copied from
 ``~/.claude/plans/name-recall-fix-wording.md`` sections 1, 4, 7 and 8; the stage-8
 harness additionally compares them with that file. The two consolidation prompts
 are pinned in ``tests/unit/brain/engines/test_names_increment_consolidation.py``.
@@ -80,35 +79,11 @@ def test_no_em_dash_or_llm_tell(text):
         assert tell not in text.lower(), tell
 
 
-def _consolidation_toml_section() -> str:
-    text = (_REPO / "brain/prompt_strings.toml").read_text(encoding="utf-8")
-    start = text.index("[engines.consolidation]")
-    return text[start : text.index("\n[", start + 1)]
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "brain/tools/schemas.py",
-        "brain/tools/impls/add_known_name.py",
-        "brain/tools/impls/remove_known_name.py",
-        "brain/chat/tool_recruit.py",
-    ],
-)
-def test_no_placeholder_left_in_the_name_tool_files(path):
-    assert "placeholder" not in (_REPO / path).read_text(encoding="utf-8").lower()
-
-
-def test_no_placeholder_left_in_the_consolidation_prompts():
-    assert "placeholder" not in _consolidation_toml_section().lower()
-
-
-def test_app_job_descriptors_carry_the_three_final_labels_and_no_placeholder():
+def test_app_job_descriptors_carry_the_three_final_labels():
     """Wording file section 4 (two labels) and section 8 (`rerank_width_remeasure`, final):
-    each label is present at its site, and no PLACEHOLDER marker is left in App.tsx."""
+    each label is present at its site."""
     lines = (_REPO / "app/src/App.tsx").read_text(encoding="utf-8").splitlines()
     stripped = [line.strip() for line in lines]
     assert 'cosine_floor_bootstrap: "similarity pass mark setup",' in stripped
     assert 'rerank_floor_bootstrap: "re-scoring pass mark setup",' in stripped
     assert 'rerank_width_remeasure: "re-scoring cost check",' in stripped
-    assert [n for n, line in enumerate(lines) if "PLACEHOLDER" in line] == []

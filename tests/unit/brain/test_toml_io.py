@@ -329,10 +329,6 @@ def test_write_toml_text_replaces_a_dangling_link_as_before(tmp_path: Path) -> N
     assert not (tmp_path / "nowhere").exists()
 
 
-def test_a_read_result_carries_no_unused_text_field() -> None:
-    assert "text" not in {f.name for f in __import__("dataclasses").fields(toml_io.TomlRead)}
-
-
 def test_write_toml_text_is_atomic_for_a_polling_reader(tmp_path: Path) -> None:
     p = tmp_path / "a.toml"
     toml_io.write_toml_text(p, b'v = "0"\n')
@@ -422,12 +418,6 @@ def test_read_toml_cached_is_thread_safe(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------------------------------------------
 # No new dependency
 # ---------------------------------------------------------------------------------------------------------------
-
-
-def test_pyproject_gains_no_toml_dependency() -> None:
-    pyproject = (Path(__file__).resolve().parents[3] / "pyproject.toml").read_text(encoding="utf-8")
-    for lib in ("tomli", "tomlkit", "tomli_w", "tomli-w", "toml>", "toml=", '"toml"'):
-        assert lib not in pyproject
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -14,7 +14,6 @@ the filter judges advances the budget clock by a fixed cost per character
 
 from __future__ import annotations
 
-import inspect
 import sqlite3
 import sys
 import time
@@ -487,18 +486,6 @@ def test_cs8b3_the_walk_ends_when_the_cursor_is_exhausted_or_limit_rows_are_kept
     rows = paged._fts_rows_kept(SQL, ['"will"'], 2, keep, _Budget(1.0, clock=clock))  # noqa: SLF001
     # limit 2: the two shortest "Will" rows end the walk before the cursor is read to its end
     assert len(rows) == 2 and len(keep.texts) < PAGED_ROWS + 3
-
-
-def test_cs8b4_no_interrupt_machinery_is_left_in_the_store() -> None:
-    assert not hasattr(store_mod, "_Deadline")
-    assert "threading" not in vars(store_mod)
-    for obj in (
-        store_mod.MemoryStore.search_fts_scored,
-        store_mod.MemoryStore._fts_rows_kept,  # noqa: SLF001
-        store_mod.KeepBudget,
-    ):
-        text = inspect.getsource(obj).lower()
-        assert "interrupt" not in text and "deadline" not in text, obj
 
 
 class _Cursor:

@@ -1,12 +1,12 @@
 """brain.utils.atomic_write: the one home of the shared atomic writers (#465 C2).
 
 Covers the bytes writer contract, the directory fsync, the content-addressed blob writer, the text writer's
-interrupt cleanup, the sweep/in-flight interleaving and the placement rules (one module, no shim, no cycle).
+interrupt cleanup, the sweep/in-flight interleaving and the import-cycle check. Where the writers live (one module, no shim)
+is pinned by tests/unit/test_removed_names_stay_removed.py.
 """
 
 from __future__ import annotations
 
-import ast
 import os
 import re
 import stat
@@ -370,141 +370,7 @@ class _EverythingIsStale(set):
         return None
 
 
-# --- G20: placement: one module, no shim, no cycle ----------------------------------------------------------------
-
-NEW = REPO / "brain" / "utils" / "atomic_write.py"
-HEAL = REPO / "brain" / "health" / "attempt_heal.py"
-HEAL_MOD = "brain.health.attempt_heal"
-
-
-def _moved_names(path: Path = NEW) -> set[str]:
-    """Top-level names defined or assigned in the new module (not merely imported)."""
-    names: set[str] = set()
-    for node in ast.parse(path.read_text(encoding="utf-8")).body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for t in node.targets:
-                names.update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
-    return names
-
-
-def _defined_or_assigned(path: Path) -> set[str]:
-    return _moved_names(path)
-
-
-def backdoor_findings(source: str, moved: set[str]) -> list[str]:
-    """Ways a module can reach a moved writer through attempt_heal (the shim this change must not leave)."""
-    out: list[str] = []
-    tree = ast.parse(source)
-    aliases: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == HEAL_MOD:
-            for a in node.names:
-                if a.name == "*":
-                    out.append("star import")
-                elif a.name in moved:
-                    out.append(f"imports {a.name}")
-        elif isinstance(node, ast.ImportFrom) and node.module == "brain.health":
-            aliases.update(a.asname or a.name for a in node.names if a.name == "attempt_heal")
-        elif isinstance(node, ast.Import):
-            for a in node.names:
-                if a.name == HEAL_MOD:
-                    aliases.add(a.asname or HEAL_MOD)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in moved:
-            if ast.unparse(node.value) in aliases:
-                out.append(f"attribute {node.attr}")
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if any(node.value == f"{HEAL_MOD}.{n}" for n in moved):
-                out.append(f"string {node.value}")
-    return out
-
-
-def test_g20a_the_new_module_holds_the_writers_and_attempt_heal_holds_none_of_them():
-    moved = _moved_names()
-    for name in (
-        "save_with_backup_text",
-        "save_bytes_atomic",
-        "fsync_dir",
-        "save_blob_once",
-        "_save_payload",
-        "_temp_scope",
-        "_remove_stale_temps",
-        "_owner_alive",
-        "_copy_for_backup",
-        "_retry_perm",
-        "_replace_with_retry",
-        "_REPLACE_RETRIES",
-        "_REPLACE_RETRY_SLEEP_S",
-        "_INFLIGHT",
-        "_INFLIGHT_LOCK",
-    ):
-        assert name in moved, name
-    heal_defs = _defined_or_assigned(HEAL)
-    assert not (heal_defs & moved), heal_defs & moved
-    assert {
-        "save_with_backup",
-        "attempt_heal_text",
-        "_heal_text_from_baks",
-        "_classify_cause",
-        "_filename_safe_timestamp",
-    } <= heal_defs
-    import brain.health.attempt_heal as heal
-
-    for name in moved - {"save_with_backup_text"}:
-        assert not hasattr(heal, name), name
-    tree = ast.parse(HEAL.read_text(encoding="utf-8"))
-    imports_from_new = [
-        a.name
-        for n in ast.walk(tree)
-        if isinstance(n, ast.ImportFrom) and n.module == "brain.utils.atomic_write"
-        for a in n.names
-    ]
-    assert imports_from_new == ["save_with_backup_text"]
-    assert "__all__" not in heal_defs
-    assert not any(
-        isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
-        for n in ast.walk(tree)
-    )
-
-
-def _py_files():
-    for root in ("brain", "tests", "scripts"):
-        yield from sorted((REPO / root).rglob("*.py"))
-
-
-def test_g20b_no_module_reaches_a_moved_writer_through_attempt_heal():
-    moved = _moved_names()
-    offenders = {}
-    for path in _py_files():
-        if path == Path(__file__).resolve():
-            continue  # this file names the offenders in its own table below
-        source = path.read_text(encoding="utf-8")
-        if "attempt_heal" not in source:
-            continue  # every way of reaching it (import, alias, attribute, dotted string) names the module: skip the parse
-        found = backdoor_findings(source, moved)
-        if found:
-            offenders[path.relative_to(REPO).as_posix()] = found
-    assert offenders == {}
-
-
-def test_g20b_the_scan_flags_each_kind_of_offender():
-    moved = {"save_with_backup_text", "_copy_for_backup", "_INFLIGHT"}
-    cases = {
-        "from brain.health.attempt_heal import _copy_for_backup": "imports _copy_for_backup",
-        "from brain.health.attempt_heal import *": "star import",
-        "import brain.health.attempt_heal as heal\nheal.save_with_backup_text(p, t)": "attribute save_with_backup_text",
-        "from brain.health import attempt_heal\nattempt_heal._INFLIGHT.clear()": "attribute _INFLIGHT",
-        "def f():\n    import brain.health.attempt_heal as h\n    return h.save_with_backup_text": "attribute save_with_backup_text",
-        'monkeypatch.setattr("brain.health.attempt_heal._copy_for_backup", f)': "string brain.health.attempt_heal._copy_for_backup",
-    }
-    for src, expected in cases.items():
-        assert expected in backdoor_findings(src, moved), src
-    assert backdoor_findings("from brain.health.attempt_heal import save_with_backup", moved) == []
-    assert backdoor_findings("from brain.utils.atomic_write import _copy_for_backup", moved) == []
+# --- G20(c): the shared writer imports nothing from brain.health (no cycle) ---------------------------------------
 
 
 def _fresh(code: str, repo: Path = REPO) -> subprocess.CompletedProcess:
@@ -551,76 +417,6 @@ def test_g20c_the_check_can_fail_with_the_wrong_tree_or_a_cycle(tmp_path):
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() != "[]"  # the sys.modules assertion flags the stand-in
-
-
-def test_g20d_every_importer_takes_its_writers_from_the_new_module():
-    importers = {
-        "brain/migrator/cli.py": "save_with_backup_text",
-        "brain/bridge/server.py": "save_with_backup_text",
-        "brain/works/storage.py": "save_with_backup_text",
-        "brain/engines/research_notes.py": "save_with_backup_text",
-        "brain/ingest/buffer.py": "save_with_backup_text",
-        "brain/service/systemd.py": "save_with_backup_text",
-        "brain/service/windows_service.py": "save_with_backup_text",
-        "brain/health/json_io.py": "save_with_backup_text",
-        "brain/health/log_rotation.py": "_replace_with_retry",
-    }
-    for rel, name in importers.items():
-        tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
-        got = {
-            a.name
-            for n in ast.walk(tree)
-            if isinstance(n, ast.ImportFrom) and n.module == "brain.utils.atomic_write"
-            for a in n.names
-        }
-        assert name in got, rel
-
-
-# --- G3(b), G4(a), G12: no second implementation by hand ----------------------------------------------------------
-
-
-def test_g3b_the_directory_fsync_flag_is_named_in_exactly_one_place():
-    uses = []
-    for path in sorted((REPO / "brain").rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Attribute) and node.attr == "O_DIRECTORY":
-                uses.append(path.relative_to(REPO).as_posix())
-    assert uses == ["brain/utils/atomic_write.py"], uses
-
-
-@pytest.mark.parametrize("rel", ["brain/images.py", "brain/file_store.py"])
-def test_g4a_the_blob_modules_hold_no_replace_uuid_or_new_temp_name_in_code(rel):
-    tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            assert ast.unparse(node) not in {"os.replace", "uuid.uuid4"}, (rel, ast.unparse(node))
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
-            assert "uuid" not in names, rel
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and not _is_docstring(tree, node)
-        ):
-            assert ".new" not in node.value, (rel, node.value)
-    called = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
-    assert "save_blob_once" in called, rel
-
-
-def _is_docstring(tree: ast.Module, node: ast.Constant) -> bool:
-    for parent in ast.walk(tree):
-        if isinstance(parent, (ast.Module, ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
-            body = parent.body
-            if body and isinstance(body[0], ast.Expr) and body[0].value is node:
-                return True
-    return False
-
-
-def test_g12_no_mkstemp_anywhere_in_brain():
-    for path in sorted((REPO / "brain").rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Attribute) and node.attr == "mkstemp":
-                raise AssertionError(path)
 
 
 # --- the one temp-open helper under the text and bytes writers -----------------------------------------------------

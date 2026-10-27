@@ -53,12 +53,6 @@ def test_is_stopword_name():
     assert not is_stopword_name("new york")
 
 
-def test_the_sentence_start_rule_is_gone():
-    """S151 supersedes S104/S121: no position rule is left in the shared definition."""
-    assert not hasattr(name_rules, "is_sentence_start")
-    assert "is_sentence_start" not in name_rules.__all__
-
-
 @pytest.mark.parametrize(
     ("text", "start", "end", "expected"),
     [

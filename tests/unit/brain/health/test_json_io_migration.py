@@ -210,17 +210,6 @@ def test_bc17_the_new_sidecars_are_ignored_by_the_sweep_and_the_walker(tmp_path:
     assert all(p.exists() for p in sidecars)
 
 
-def test_bc19_characterization_the_deleted_names_are_undefined() -> None:
-    import brain.health.attempt_heal as heal
-    import brain.health.jsonl_reader as reader
-
-    for name in ("attempt_heal", "_heal_from_baks", "_load_and_validate"):
-        assert not hasattr(heal, name)
-    for name in ("read_jsonl_skipping_corrupt", "iter_jsonl_streaming", "read_last_n_jsonl_lines"):
-        assert not hasattr(reader, name)
-    assert hasattr(heal, "save_with_backup") and hasattr(reader, "iter_jsonl_skipping_corrupt")  # kept, byte-identical
-
-
 def test_bc20_a_former_in_place_writer_is_atomic_and_rides_out_a_transient_permission_error(tmp_path: Path, monkeypatch) -> None:
     from brain.kindled_link.cadence import load_tick_cadence, save_tick_cadence
 

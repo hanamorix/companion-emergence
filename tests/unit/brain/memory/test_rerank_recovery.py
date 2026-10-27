@@ -1213,14 +1213,6 @@ def test_c16d_a_raising_compaction_job_propagates(tmp_path, monkeypatch: pytest.
         _job(tmp_path, "compaction").run()
 
 
-def test_c16d_nothing_starts_a_new_period_any_more() -> None:
-    """S146 supersedes S101's reset at the compaction tick."""
-    for rel, tree in brain_trees().items():
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                assert node.func.attr != "start_new_period", rel
-
-
 # ---------------------------------------------------------------------------
 # C15h: the NellFace label (final: wording file section 8).
 # ---------------------------------------------------------------------------

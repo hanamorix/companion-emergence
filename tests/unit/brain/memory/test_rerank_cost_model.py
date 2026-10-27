@@ -379,26 +379,6 @@ def test_c1a_iv_short_message_after_a_long_one_gets_a_wider_rerank(clock: _Clock
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "get_rerank_width",
-        "_latency_cache",
-        "_memory_cache",
-        "_warm_per_doc_latency",
-        "_warm_per_doc_memory",
-        "_measure_warm_per_doc_latency",
-        "_measure_warm_per_doc_memory",
-        "_LATENCY_RECOMPUTE_INTERVAL_SECONDS",
-        "_MEMORY_RECOMPUTE_INTERVAL_SECONDS",
-        "_MEASURE_RERANKS",
-        "CALIBRATION_SAMPLE_SIZE",
-    ],
-)
-def test_c1a_v_hourly_machinery_removed(name: str) -> None:
-    assert not hasattr(reranker_mod, name)
-
-
 def test_c1a_v_ram_headroom_reader_kept_for_judge_selftune() -> None:
     from brain.memory import judge_selftune  # imports _available_ram_headroom_bytes
 
