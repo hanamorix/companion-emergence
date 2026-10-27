@@ -459,6 +459,7 @@ def test_model_swap_recomputes_rather_than_serving_stale_tags(
         store.close()
 
 
+@pytest.mark.slow(reason='4.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_clustering_includes_rows_beyond_the_old_fixed_window_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -356,6 +356,7 @@ def test_owned_bridge_that_accepts_the_hard_exit_leaves_no_descendant(tmp_path, 
     assert _intent(b.pd)["state"] == "committed"
 
 
+@pytest.mark.slow(reason='1.7 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_owned_bridge_ignoring_the_request_gets_the_manager_then_the_helper_kills_the_rest(
     tmp_path, fake, owned, monkeypatch
 ):

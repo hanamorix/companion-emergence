@@ -38,7 +38,7 @@ def test_only_compares_paths(real_platform_dirs):
 def test_the_fixture_fails_a_test_that_writes_into_an_exposed_directory(pytester):
     pytester.makeconftest(_CONFTEST)
     pytester.makepyfile(test_inner=_TESTS)
-    result = pytester.runpytest("-p", "no:cacheprovider")
+    result = pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly")
     result.assert_outcomes(passed=2, errors=1)
     result.stdout.fnmatch_lines(["*ERROR at teardown of test_writes_into_an_exposed_directory*"])
     result.stdout.fnmatch_lines(["*created or changed a real user directory*"])

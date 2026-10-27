@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -24,6 +25,7 @@ def _client(tmp_path: Path, name: str):
     return TestClient(app), persona
 
 
+@pytest.mark.slow(reason='1.5 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_connect_pairs_in_one_call_and_adopts_relay(tmp_path: Path):
     # Persona A generates a code; persona B connects with it.
     # B opts in via an explicit relay (not the enabled toggle) — proves the
@@ -80,6 +82,7 @@ def test_connect_requires_code(tmp_path: Path):
     assert r.status_code == 400
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_connect_uses_own_default_relay_not_peer_code_relay(tmp_path: Path):
     """A peer code carrying a custom (hostile) relay must NOT redirect the connector's
     relay config — the connector keeps its own (default) relay."""
@@ -105,6 +108,7 @@ def test_connect_uses_own_default_relay_not_peer_code_relay(tmp_path: Path):
     assert cfg.kindled_relay_url == DEFAULT_KINDLED_RELAY_URL  # own default, not adopted from code
 
 
+@pytest.mark.slow(reason='2.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_reconnect_does_not_downgrade_consent(tmp_path: Path):
     """A 2nd connect from an already-paired peer stays paired with no transient
     pending_local downgrade (atomic re-connect)."""

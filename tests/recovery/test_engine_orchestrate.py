@@ -1,6 +1,8 @@
 import hashlib
 from datetime import UTC, datetime
 
+import pytest
+
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.engine import preflight_recovery, run_recovery
@@ -62,6 +64,7 @@ def test_real_run_restores_links_and_preserves_source(tmp_path):
     assert hashlib.sha256((src / "memories.db").read_bytes()).hexdigest() == src_before
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_recover_backup_includes_emotion_vocabulary(tmp_path):
     """The recover backup must preserve emotion_vocabulary.json, not just
     memories.db + hebbian.db. Omitting it is how `nell recover` silently dropped

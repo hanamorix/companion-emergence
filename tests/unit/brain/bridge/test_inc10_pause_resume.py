@@ -278,6 +278,7 @@ def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c8_calibration_pauses_between_rows_releases_judge_resumes(tmp_path: Path) -> None:
     from brain.bridge.provider import FakeProvider
     from brain.bridge.supervisor import _run_calibration_tick

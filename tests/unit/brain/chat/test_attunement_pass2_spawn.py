@@ -196,6 +196,7 @@ def test_pass2_threads_user_name_from_persona_config(tmp_path: Path):
     assert mock_detector.call_args.kwargs["user_name"] == "Alex"
 
 
+@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: Path):
     """Pre-merge review O-7: the budget is checked before the call and charged after it (D24), so the check and the
     charge must be one critical section: two callers with one call left must not both pass the check. The first

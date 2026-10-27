@@ -432,6 +432,7 @@ def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize(
     ("week1", "week2"),
     [
@@ -465,6 +466,7 @@ def test_week_two_starts_from_week_one_champion_and_trains_on_its_own_rows(
     assert _current(tmp_path) == Path(env.builds[1]["staged"])
 
 
+@pytest.mark.slow(reason='2.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("grade", GRADES)
 def test_week_after_a_revert_starts_from_the_unchanged_champion(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -529,6 +531,7 @@ def test_dispatch_matrix(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.4 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -556,6 +559,7 @@ def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     assert all(_consumed(store, rid) for rid in tick_rows) and set(_all_ids(ids)) <= set(tick_rows)
 
 
+@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("accept_week2", [True, False])
 def test_beefy_to_mid_drop_runs_lora_on_the_same_model(
     accept_week2: bool, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -588,6 +592,7 @@ def test_beefy_to_mid_drop_runs_lora_on_the_same_model(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='5.7 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_stored_dir_set_across_a_week_sequence(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -620,6 +625,7 @@ def test_stored_dir_set_across_a_week_sequence(
     assert _current(tmp_path).name == c3
 
 
+@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_refused_delete_is_not_raised_and_a_later_tick_reaps_it(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

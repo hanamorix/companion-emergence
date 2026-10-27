@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.forgetting import graveyard
 from brain.forgetting.prompt import render_fading_summary_block
 from brain.forgetting.salience import SalienceInputs
@@ -54,6 +56,7 @@ def test_render_with_mixed_states(tmp_path: Path) -> None:
     store.close()
 
 
+@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_render_stays_under_token_budget(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     # 50 fading + 50 lost — enough to verify counts render and stay compact

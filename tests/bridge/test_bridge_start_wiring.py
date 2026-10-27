@@ -14,6 +14,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge import cli_throttle, supervisor
@@ -24,6 +25,7 @@ from brain.bridge.server import build_app
 from brain.chat.session import all_sessions, reset_registry
 
 
+@pytest.mark.slow(reason='2.2 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_app_mount_session_is_created_after_the_bridge_start_the_supervisor_gets(
     persona_dir: Path, monkeypatch
 ) -> None:

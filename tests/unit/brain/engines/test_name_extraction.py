@@ -425,6 +425,7 @@ def test_reappraiser_provider_failure_is_a_noop(persona):
     assert _rows(tmp) == []
 
 
+@pytest.mark.slow(reason='11.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_reappraiser_names_go_through_admission_and_carry_source(persona):
     """S152: the second writer admits as the first does (S144): a stopword entry, several
     words and a period pass, and so does an entry with no ASCII letter or digit (S166); over
@@ -445,6 +446,7 @@ def test_reappraiser_names_go_through_admission_and_carry_source(persona):
     ]
 
 
+@pytest.mark.slow(reason='5.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_reappraiser_names_written_only_after_the_importance_update(persona):
     """P-18: a memory hard-deleted between the read and the write is skipped, and its
     names are NOT written. Able to fail: writing the names before the update."""

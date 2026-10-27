@@ -176,7 +176,7 @@ def _run_inner(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, *, gu
     pytester.makeini(_INNER_INI)
     pytester.makeconftest(_INNER_CONFTEST)
     pytester.makepyfile(source)
-    return pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:tdd-guard", "-rfE")
+    return pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:randomly", "-p", "no:tdd-guard", "-rfE")
 
 
 @pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
@@ -280,7 +280,7 @@ def test_a_fake_under_pytests_base_temp_is_allowed_even_when_the_system_temp_is_
     pytester.makeini(_INNER_INI)
     pytester.makeconftest(_INNER_CONFTEST)
     pytester.makepyfile(_FAKE_PLANTS)
-    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:tdd-guard", f"--basetemp={tmp_path / 'base'}")
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:randomly", "-p", "no:tdd-guard", f"--basetemp={tmp_path / 'base'}")
     result.assert_outcomes(passed=2)
 
 

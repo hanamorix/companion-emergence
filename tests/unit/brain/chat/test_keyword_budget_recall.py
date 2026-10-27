@@ -611,6 +611,7 @@ def test_no_persona_dir_path_sizes_a_fresh_process_from_its_tier_one_seed(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_extras_share_the_one_budget_with_the_semantic_step(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock
 ) -> None:

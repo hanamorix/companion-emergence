@@ -123,6 +123,7 @@ def test_a_healthy_manifest_keeps_its_other_keys(tmp_path):
     assert live["keep"] == "me" and _RECOVERY_KEYS <= set(live) and not _corrupt_copies(p)
 
 
+@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_an_absent_manifest_is_created(tmp_path):
     # C461-e PIN
     p, src = _persona(tmp_path), _source(tmp_path)

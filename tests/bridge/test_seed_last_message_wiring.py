@@ -9,6 +9,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge import cli_throttle
@@ -23,6 +24,7 @@ def _write_turn(persona_dir: Path, session_id: str, ts: str) -> None:
         fh.write(json.dumps({"session_id": session_id, "speaker": "user", "text": "hi", "ts": ts}) + "\n")
 
 
+@pytest.mark.slow(reason='1.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_lifespan_seeds_not_idle_right_after_a_recent_saved_message(persona_dir: Path) -> None:
     cli_throttle.reset()
     recent_ts = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()

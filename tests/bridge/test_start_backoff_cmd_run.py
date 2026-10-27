@@ -245,6 +245,7 @@ def test_a_keyboard_interrupt_in_the_wait_exits_zero_and_keeps_the_record(pd, cl
 # ---- C67 (h): the D4 lock wait follows, unchanged ----------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.1 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_after_the_wait_a_held_lock_is_still_waited_for(pd, clock, monkeypatch):
     _record(pd, 1, clock)
     fd = daemon.acquire_lock(pd)
@@ -430,6 +431,7 @@ def _manager_loop(pd: Path, clock: Clock, monkeypatch, runs: list[dict], restart
     return starts
 
 
+@pytest.mark.slow(reason='4.5 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_bridge_that_never_starts_is_spaced_on_the_apps_ladder_forever(pd, clock, monkeypatch):
     starts = _manager_loop(pd, clock, monkeypatch, [{"lived": 4}] * 10)
     gaps = [b - a for a, b in zip(starts, starts[1:], strict=False)]

@@ -144,6 +144,7 @@ def test_g6_selection_latency_stays_within_the_budget() -> None:
         store.close()
 
 
+@pytest.mark.slow(reason='2.1 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_g6_latency_harness_is_able_to_fail() -> None:
     """Same harness, with an artificial delay (twice the budget) injected into the
     store's term_stats call, must report over the budget. Demonstrates the

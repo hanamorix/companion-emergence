@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -18,6 +19,7 @@ def _client(persona_dir: Path) -> TestClient:
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests"))
 
 
+@pytest.mark.slow(reason='3.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_deferred_close_is_reported_as_deferred_and_the_session_stays(persona_dir: Path, monkeypatch):
     calls = 0
 

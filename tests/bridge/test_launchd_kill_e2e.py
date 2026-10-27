@@ -230,6 +230,7 @@ def _no_bridge(pd: Path) -> bool:
     return st is None or state_file.bridge_liveness(st, pd) != state_file.ALIVE
 
 
+@pytest.mark.slow(reason='6.4 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("mode", ["m1", "m2", "m3", "m4"])
 def test_a_launchd_owned_bridge_is_killed_with_its_tree_and_stays_down(env_pd, launchd_seams, mode):
     env, pd = env_pd
@@ -296,6 +297,7 @@ def _stop(pd: Path, fake: FakeLaunchd) -> None:
         time.sleep(0.05)
 
 
+@pytest.mark.slow(reason='8.0 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_every_start_path_after_a_kill_reaches_a_healthy_bridge(env_pd, launchd_seams, monkeypatch):
     """C62 (start half), C58 (c): after the kill (m2), each start path clears the stop intent and runs print ->
     bootstrap (when unloaded) -> plain kickstart, and the bridge is healthy (not stopped by the guard)."""

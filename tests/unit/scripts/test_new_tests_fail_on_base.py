@@ -188,6 +188,7 @@ def _base_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, _git(repo, "rev-parse", "HEAD")
 
 
+@pytest.mark.slow(reason='1.8 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.skipif(sys.platform != "linux", reason="the check runs on the ubuntu PR job; it uses git worktrees and POSIX paths")
 def test_the_script_reports_an_always_passing_new_test_and_exempts_a_marked_one(tmp_path: Path) -> None:
     repo, base = _base_repo(tmp_path)

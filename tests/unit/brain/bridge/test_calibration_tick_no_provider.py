@@ -52,6 +52,7 @@ def constructions(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return hits
 
 
+@pytest.mark.slow(reason='6.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_tick_derives_both_floors_under_the_runtime_ids_without_building_a_provider(
     constructions: list[str],
 ) -> None:

@@ -33,6 +33,7 @@ def persona_with_low_salience_memory(tmp_path):
     return tmp_path, m.id
 
 
+@pytest.mark.slow(reason='2.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_run_pass_fades_low_salience_memory(persona_with_low_salience_memory):
     persona_dir, mem_id = persona_with_low_salience_memory
     event_bus = MagicMock()
@@ -94,6 +95,7 @@ def test_run_pass_exempts_recent_factual_memory_within_grace(tmp_path):
     store.close()
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_run_pass_lost_after_two_consecutive_low_passes(persona_with_low_salience_memory):
     persona_dir, mem_id = persona_with_low_salience_memory
     event_bus = MagicMock()
@@ -141,6 +143,7 @@ def test_run_pass_cold_start_no_memories(tmp_path):
     assert summary["lost"] == 0
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_run_pass_intensity_drivers_protects_borderline_memory(tmp_path):
     """intensity_drivers.narrative_weight threads to policy and protects memories from fading."""
     from datetime import timedelta
@@ -304,6 +307,7 @@ def _accept_candidate_for_real(persona_dir, memory_id: str) -> str:
     return crystallization_id
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_run_pass_exempts_soul_crystallised_memory_through_real_files(tmp_path):
     """CANARY (#362) — pins run_pass → _load_soul_linked_ids → the crystallised
     leg against a REAL accepted candidate + a REAL active Crystallization.

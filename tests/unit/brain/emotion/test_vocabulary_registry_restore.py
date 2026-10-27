@@ -38,7 +38,7 @@ def test_b_sees_none_of_it_and_the_same_objects():
 def test_a_registration_and_a_warn_once_entry_do_not_reach_the_next_test(pytester) -> None:
     pytester.makeconftest("from tests.conftest import _vocabulary_registry_restore  # noqa: F401\n")
     pytester.makepyfile(_TESTS)
-    pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=2)
+    pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly").assert_outcomes(passed=2)
 
 
 @pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
@@ -46,4 +46,4 @@ def test_without_the_fixture_the_registration_does_reach_the_next_test(pytester)
     """Control arm: the inner session's own fixture is what makes the test above pass."""
     pytester.makepyfile(_TESTS)
     # The outer session's autouse fixture restores the real registry after THIS test, whatever the inner run left.
-    pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1, failed=1)
+    pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly").assert_outcomes(passed=1, failed=1)

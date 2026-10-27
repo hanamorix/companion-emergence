@@ -532,6 +532,7 @@ def test_c34_per_turn_open_takes_no_transaction_while_a_writer_holds_one(tmp_hom
     assert elapsed <= 2.0
 
 
+@pytest.mark.slow(reason='2.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeypatch):
     """Same property as the synthetic-holder test above, proven against the
     REAL, unmodified `set_cluster_memberships` write path instead of a

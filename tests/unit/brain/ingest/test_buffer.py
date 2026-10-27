@@ -429,6 +429,7 @@ def test_rewrite_session_atomic_retries_transient_permission_error(tmp_path, mon
     assert not path.with_suffix(".jsonl.tmp").exists()
 
 
+@pytest.mark.slow(reason='2.0 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
     from brain.ingest import buffer as buf
 

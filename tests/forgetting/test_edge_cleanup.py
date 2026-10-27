@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.forgetting import FORGETTING_STATE_FILENAME, run_pass
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -18,6 +20,7 @@ def _old(days):
     return datetime.now(UTC) - timedelta(days=days)
 
 
+@pytest.mark.slow(reason='14.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_lose_removes_edges_and_records_neighbors(tmp_path):
     # Survivor S (high emotion → salience > FADE), victim V (will be LOST).
     store = MemoryStore(tmp_path / "memories.db")

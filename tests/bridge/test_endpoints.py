@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -393,6 +394,7 @@ def test_stream_chunks_survive_a_worker_that_finishes_before_the_loop_resumes(
     assert chunked == "hello world from nell", [f.get("type") for f in frames]
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path, monkeypatch):
     """A silent provider stretch (first-token latency / tool round-trip) must
     produce server keepalive frames so the client's 60s idle timer never fires
@@ -1053,6 +1055,7 @@ def test_post_voice_edit_accept_with_edits_records_user_modified(
     assert ev.new_text == "hana's tweaked line"
 
 
+@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_post_voice_edit_reject_records_dismissed_no_voice_write(
     persona_dir: Path,
 ) -> None:

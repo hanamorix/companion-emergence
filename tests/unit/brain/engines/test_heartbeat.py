@@ -2211,6 +2211,7 @@ def test_daemon_state_writer_error_is_fault_isolated(tmp_path: Path, caplog) -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_emotion_spike_above_baseline_emits_initiate_candidate(tmp_path: Path) -> None:
     """When current_resonance is >=1.5 sigma above the 24-tick rolling mean, emit."""
     from brain.initiate.emit import read_candidates
@@ -2231,6 +2232,7 @@ def test_emotion_spike_above_baseline_emits_initiate_candidate(tmp_path: Path) -
         engine.hebbian.close()
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_emotion_within_baseline_does_not_emit(tmp_path: Path) -> None:
     """A normal-range tick produces no initiate candidate."""
     from brain.initiate.emit import read_candidates
@@ -2247,6 +2249,7 @@ def test_emotion_within_baseline_does_not_emit(tmp_path: Path) -> None:
         engine.hebbian.close()
 
 
+@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
     """A 0.5σ ≤ delta < 1.5σ spike writes a draft fragment, not an initiate."""
     from brain.initiate.emit import read_candidates
@@ -2273,6 +2276,7 @@ def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
         engine.hebbian.close()
 
 
+@pytest.mark.slow(reason='3.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_emotion_spike_draft_compose_resolves_haiku_via_the_tier_accessor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

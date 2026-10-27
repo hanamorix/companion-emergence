@@ -274,6 +274,7 @@ def test_semantic_precondition_without_the_list_general_hits_lead_the_keyword_fi
     assert ids[:2] == [sem.id, general.id]
 
 
+@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_semantic_name_hits_fill_only_the_slots_semantic_leaves(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -341,6 +342,7 @@ def _many_pretzels(persona: Path, n: int = 60):
     return ctx, target
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_name_with_many_memories_no_longer_pushes_out_a_memory_matching_the_rest_of_the_query(
     tmp_path: Path,
 ) -> None:

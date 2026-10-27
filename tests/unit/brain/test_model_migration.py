@@ -317,6 +317,7 @@ def test_an_older_persona_cannot_win_over_the_decision_by_starting_later() -> No
     assert "model" not in _cfg("beta")
 
 
+@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_marker_records_every_persona_the_decision_considered() -> None:
     _persona("alpha", model="opus", opened="2026-05-01T00:00:00Z")
     _persona("beta", model="haiku", opened="2026-01-01T00:00:00Z")

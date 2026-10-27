@@ -369,6 +369,7 @@ def _seed_scale(store: MemoryStore, rng, *, n: int, model_id: str, scale: str, r
     return pairs
 
 
+@pytest.mark.slow(reason='8.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c2d_the_tick_fits_each_scale_from_its_own_rows_never_pooled() -> None:
     """Both scales are seeded under BOTH model ids (as if the ids collided), so
     only the scale filter, not the id filter, keeps a fit from being pooled."""
@@ -563,6 +564,7 @@ def _persisted(pd: Path):
         check.close()
 
 
+@pytest.mark.slow(reason='2.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_failing_rerank_floor_step_does_not_skip_the_cosine_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*a, **kw):
         raise RuntimeError("simulated rerank floor derivation failure")
@@ -576,6 +578,7 @@ def test_a_failing_rerank_floor_step_does_not_skip_the_cosine_floor(monkeypatch:
     assert rerank_row is None and cosine_row is not None
 
 
+@pytest.mark.slow(reason='2.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_failing_cosine_floor_step_does_not_fail_the_tick_or_undo_the_rerank_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -595,6 +598,7 @@ def test_a_failing_cosine_floor_step_does_not_fail_the_tick_or_undo_the_rerank_f
     assert rerank_row is not None and cosine_row is None
 
 
+@pytest.mark.slow(reason='2.5 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_paused_labeling_pass_defers_the_cosine_floor_too(monkeypatch: pytest.MonkeyPatch) -> None:
     from brain.memory import relevance_judge
 

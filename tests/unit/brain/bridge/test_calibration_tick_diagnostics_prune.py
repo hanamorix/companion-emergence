@@ -160,6 +160,7 @@ def test_a_tick_that_defers_for_a_busy_session_does_not_prune(
     assert _tags(tmp_path) == {"old", "today"}
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_window_is_the_calibration_retention_tunable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -168,6 +168,7 @@ def _cold_pair(names_a: list[str], names_b: list[str], text: str) -> tuple[float
     return best[0], best[1]
 
 
+@pytest.mark.slow(reason='5.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("shape", ["random", "repeated"])
 def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
     # Only ratios, and each pair of timings is taken alternately in one loop: absolute wall-clock bounds fail on a busy

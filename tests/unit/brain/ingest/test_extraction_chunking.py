@@ -575,6 +575,7 @@ def test_c5_completed_only_when_the_end_was_reached(world) -> None:
     assert empty.chunks == 0 and empty.completed
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c7_close_reads_after_the_cursor_and_chunks_the_rest(world) -> None:
     persona, _, _, transcripts = world
     rows = _seed(persona, "sess_c07", 16)

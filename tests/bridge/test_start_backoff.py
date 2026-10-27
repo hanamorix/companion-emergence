@@ -267,6 +267,7 @@ def real_boot_rule(monkeypatch):
     monkeypatch.setattr(start_backoff, "_same_boot", REAL_SAME_BOOT)
 
 
+@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize(
     ("record_boot", "current_boot", "same"),
     [("boot-now", "boot-now", True), ("boot-old", "boot-now", False), (None, "boot-now", False),

@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.forgetting import run_pass
 from brain.memory.store import Memory, MemoryStore
 
@@ -10,6 +12,7 @@ class _Bus:
         pass
 
 
+@pytest.mark.slow(reason='7.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_migrated_memory_within_grace_is_exempt(tmp_path):
     # install has accrued 10 lived-h; migrated at 5 lived-h → 5 elapsed < 168.
     (tmp_path / "felt_time_state.json").write_text(json.dumps({"lived_age_hours": 10.0}))
@@ -34,6 +37,7 @@ def test_migrated_memory_within_grace_is_exempt(tmp_path):
     assert summary["exempt"] >= 1
 
 
+@pytest.mark.slow(reason='17.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_post_migration_memory_not_grace_exempt_and_fades(tmp_path):
     # Same setup, but memory created AFTER migration → grace does not apply.
     (tmp_path / "felt_time_state.json").write_text(json.dumps({"lived_age_hours": 10.0}))

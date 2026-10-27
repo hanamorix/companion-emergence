@@ -127,6 +127,7 @@ def _name_samples() -> list[cost_series._Sample]:  # noqa: SLF001
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.5 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_fixture_the_first_page_is_all_rejects_and_the_hits_lie_past_it(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -136,6 +137,7 @@ def test_fixture_the_first_page_is_all_rejects_and_the_hits_lie_past_it(
     assert all(t.startswith("i will") for t in texts[:FIRST_PAGE])
 
 
+@pytest.mark.slow(reason='2.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8a_without_an_estimate_the_pages_and_the_clock_stop_the_walk_when_left_is_reached(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -147,6 +149,7 @@ def test_cs8a_without_an_estimate_the_pages_and_the_clock_stop_the_walk_when_lef
     assert hits == [], "the rejected prefix holds no hit"
 
 
+@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8a_with_an_estimate_the_prediction_stops_the_walk_from_the_second_row_on(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -159,6 +162,7 @@ def test_cs8a_with_an_estimate_the_prediction_stops_the_walk_from_the_second_row
     assert continuation == full[FIRST_PAGE : FIRST_PAGE + 10]
 
 
+@pytest.mark.slow(reason='3.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("rows", [1, 2, 3, 40])
 def test_cs8a_the_prediction_is_exact_at_the_boundary(
     store: MemoryStore, clock: Clock, judged: Judged, rows: int
@@ -169,6 +173,7 @@ def test_cs8a_the_prediction_is_exact_at_the_boundary(
     assert len(texts[FIRST_PAGE:]) == max(rows, 1), "the first row is judged whenever the clock allows"
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8a_the_prediction_counts_the_next_rows_characters_and_the_overhead(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -178,6 +183,7 @@ def test_cs8a_the_prediction_counts_the_next_rows_characters_and_the_overhead(
     assert len(texts[FIRST_PAGE:]) == 7
 
 
+@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8a_kept_rows_are_a_prefix_of_the_unbudgeted_kept_rows(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -637,11 +643,13 @@ def test_cs8b6_long_contents_leave_the_hits_of_an_ample_budget_equal_to_the_unbu
         s.close()
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_name_walk_budget_reads_the_modules_clock(store: MemoryStore, clock: Clock) -> None:
     clock.t = 3.5
     assert keyword_budget.NameWalkBudget(store, started=0.0).now() == 3.5
 
 
+@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8a_a_refused_row_stops_the_walk_it_does_not_skip_to_a_shorter_one(store: MemoryStore) -> None:
     """Rows in a fixed order: one short reject and two long rows on the first page
     (limit 3), then three more long rows, then 199 short rejects. The budget
@@ -687,6 +695,7 @@ class _Spy:
         return getattr(self._conn, name)
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8c_with_no_time_left_the_first_pages_kept_rows_come_back_and_no_continuation_runs(
     store: MemoryStore, clock: Clock, judged: Judged, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -722,6 +731,7 @@ def test_cs8c_the_first_pages_kept_rows_equal_the_result_when_the_budget_is_spen
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8d_a_walk_records_one_sample_x_characters_judged_y_its_seconds(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -733,6 +743,7 @@ def test_cs8d_a_walk_records_one_sample_x_characters_judged_y_its_seconds(
     assert sample.seconds == pytest.approx(sum(len(t) for t in continuation) * PER_CHAR)
 
 
+@pytest.mark.slow(reason='2.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8d_the_first_walk_of_a_process_is_discarded_the_second_recorded(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -742,6 +753,7 @@ def test_cs8d_the_first_walk_of_a_process_is_discarded_the_second_recorded(
     assert len(_name_samples()) == 1
 
 
+@pytest.mark.slow(reason='1.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8d_a_walk_that_judged_no_row_records_nothing(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -854,6 +866,7 @@ def test_cs8e_the_search_tools_semantic_mode_passes_the_clock_reading_too(
     assert seen == [3.0]
 
 
+@pytest.mark.slow(reason='2.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8e_without_started_the_walk_is_unbudgeted(
     store: MemoryStore, clock: Clock, judged: Judged, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -903,6 +916,7 @@ def test_cs8f_an_ordinary_name_runs_no_continuation_and_records_nothing(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cs8g_an_estimate_predicting_even_the_first_row_over_left_still_judges_it_and_records(
     store: MemoryStore, clock: Clock, judged: Judged
 ) -> None:
@@ -918,6 +932,7 @@ def test_cs8g_an_estimate_predicting_even_the_first_row_over_left_still_judges_i
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_budget_reads_the_estimate_before_it_starts_its_clock(
     store: MemoryStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

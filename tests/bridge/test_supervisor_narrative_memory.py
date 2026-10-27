@@ -89,6 +89,7 @@ def test_supervisor_runs_arc_update_after_forgetting_on_soul_review_tick(
     )
 
 
+@pytest.mark.slow(reason='2.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_supervisor_arc_update_failure_is_isolated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

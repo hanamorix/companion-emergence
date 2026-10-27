@@ -132,6 +132,7 @@ def _discriminating_raw(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k1_double_fault_never_serves_a_stale_knob(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -169,6 +170,7 @@ def test_k1_double_fault_never_serves_a_stale_knob(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k2_accept_writes_knob_first_then_swaps_then_deletes_the_previous(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -242,6 +244,7 @@ def test_k2_accept_writes_knob_first_then_swaps_then_deletes_the_previous(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='3.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k3_crash_between_knob_write_and_swap_keeps_prior_and_next_tick_reaps_orphan(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -273,6 +276,7 @@ def test_k3_crash_between_knob_write_and_swap_keeps_prior_and_next_tick_reaps_or
     assert not staged.exists()
 
 
+@pytest.mark.slow(reason='3.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k3b_first_ever_crash_before_swap_keeps_base_and_reaps_orphan(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -385,6 +389,7 @@ def test_k8_injected_full_model_judge_never_reads_the_base_knob(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k9_rejected_challenger_leaves_no_knob_row(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -412,6 +417,7 @@ def test_k9_rejected_challenger_leaves_no_knob_row(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k10a_reap_keeps_the_served_checkpoints_row_after_an_accept(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -449,6 +455,7 @@ def test_k10c_absent_pointer_reaps_tuned_rows_only(store: MemoryStore, tmp_path:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='3.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k11_faulted_post_commit_row_delete_is_swept_next_tick(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

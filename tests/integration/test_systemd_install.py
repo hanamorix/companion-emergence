@@ -119,6 +119,7 @@ def _poll_unit_property(
         time.sleep(0.2)
 
 
+@pytest.mark.slow(reason='1.6 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.integration
 def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
     """Round-trip: install → assert unit file + systemd loaded it → uninstall."""

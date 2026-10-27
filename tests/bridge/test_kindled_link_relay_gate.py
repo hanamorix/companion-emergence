@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -96,6 +97,7 @@ def test_connect_disabled_and_unset_creates_no_kindled_dir(tmp_path: Path):
     assert not (persona / "kindled_link").exists()
 
 
+@pytest.mark.slow(reason='1.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_connect_enabled_proceeds(tmp_path: Path):
     a, _ = _client(tmp_path, enabled=True, relay_url=None, name="a")
     b, _ = _client(tmp_path, enabled=True, relay_url=None, name="b")

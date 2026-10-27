@@ -66,7 +66,7 @@ def test_cwd_leak_guard_errors_a_test_that_grows_the_cwd_queue(pytester) -> None
         "    with open('pending_candidates.jsonl', 'a', encoding='utf-8') as fh:\n"
         "        fh.write('{}\\n')\n"
     )
-    result = pytester.runpytest("-p", "no:cacheprovider")
+    result = pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly")
     result.assert_outcomes(passed=1, errors=1)  # body passes, the guard's teardown errors
     result.stdout.fnmatch_lines(["*pending_candidates.jsonl*"])
 
@@ -75,7 +75,7 @@ def test_cwd_leak_guard_ignores_a_queue_that_pre_exists_and_does_not_grow(pytest
     pytester.makeconftest("from tests.conftest import _no_cwd_queue_leak  # noqa: F401\n")
     (pytester.path / "pending_candidates.jsonl").write_text("{}\n", encoding="utf-8")
     pytester.makepyfile("def test_quiet():\n    assert True\n")
-    result = pytester.runpytest("-p", "no:cacheprovider")
+    result = pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly")
     result.assert_outcomes(passed=1)
 
 
@@ -114,7 +114,7 @@ def test_another_process_growing_the_cwd_queue_does_not_fail_an_innocent_test(py
     """Under xdist the repo root is shared by every worker: a leak made by another process is not this test's."""
     pytester.makeconftest(_GUARD_CONFTEST)
     pytester.makepyfile(_FOREIGN_PROCESS_WRITES)
-    pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1)
+    pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly").assert_outcomes(passed=1)
 
 
 @pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
@@ -122,7 +122,7 @@ def test_the_previous_size_check_fails_an_innocent_test_on_the_same_foreign_writ
     """Control arm: the scenario above really is one the size comparison got wrong."""
     pytester.makeconftest(_SIZE_CHECK_CONFTEST)
     pytester.makepyfile(_FOREIGN_PROCESS_WRITES)
-    pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1, errors=1)
+    pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly").assert_outcomes(passed=1, errors=1)
 
 
 _LEAKS = {
@@ -146,7 +146,7 @@ def test_every_way_of_changing_the_cwd_queue_errors_the_test_that_did_it_and_nam
     (pytester.path / "pending_candidates.jsonl").write_text("{}\n", encoding="utf-8")
     body = "".join("    " + line + "\n" for line in _LEAKS[kind].splitlines())
     pytester.makepyfile(test_leaks="def test_leaks():\n" + body)
-    result = pytester.runpytest("-p", "no:cacheprovider")
+    result = pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly")
     result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(["*pending_candidates.jsonl*", "*test_leaks.py:[0-9]* in test_leaks*"])
 
@@ -165,7 +165,7 @@ def test_reading_the_cwd_queue_is_not_a_write(pytester) -> None:
         "    open('pending_candidates.jsonl', 'rb').close()\n"
         "    assert os.stat('pending_candidates.jsonl').st_size == 3\n"
     )
-    pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1)
+    pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly").assert_outcomes(passed=1)
 
 
 @pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
@@ -181,4 +181,4 @@ def test_a_same_named_file_in_another_directory_is_not_the_cwd_queue(pytester) -
         "    with tempfile.TemporaryDirectory() as other:\n"
         "        Path(other, 'pending_candidates.jsonl').write_text('{}\\n', encoding='utf-8')\n"
     )
-    pytester.runpytest("-p", "no:cacheprovider").assert_outcomes(passed=1)
+    pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly").assert_outcomes(passed=1)

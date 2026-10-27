@@ -100,6 +100,7 @@ def _poisoned_texts(persona: Path) -> list[str]:
     return [json.loads(line)["text"] for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_session_in_daily_use_with_a_persistent_extraction_failure_ends_with_a_bounded_buffer(world):
     persona, store, hebbian = world
     _seed(persona, "sess_old", 0, 10)

@@ -115,6 +115,7 @@ def test_installed_versions_reads_only_the_given_site_dir(tmp_path):
     assert install.installed_versions(site) == {"certifi": "2026.4.22", "idna": "3.9"}
 
 
+@pytest.mark.slow(reason='4.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_apply_installs_only_the_diff_and_the_brain_then_activates(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -134,6 +135,7 @@ def test_apply_installs_only_the_diff_and_the_brain_then_activates(tmp_path):
     assert entry["brain_version"] == "9.9.9" and entry["bundle_id"] == "bundle-1"
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_failed_smoke_leaves_the_active_overlay_untouched(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()
@@ -176,6 +178,7 @@ def test_smoke_places_the_new_folder_after_the_stdlib(tmp_path):
     install._smoke(folder, ["json"])
 
 
+@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_hash_mismatch_fails_before_activation(tmp_path):
     finds = tmp_path / "finds"
     finds.mkdir()

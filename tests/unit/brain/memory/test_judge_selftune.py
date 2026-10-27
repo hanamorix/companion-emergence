@@ -868,6 +868,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     assert sorted(r["id"] for r in consumed_rows) == sorted(ids)
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -503,6 +503,7 @@ def test_b1ii_backward_clock_loses_nothing(store) -> None:
     assert _ids(store) == kept_forward | {during_skew}
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_b1iii_backward_clock_never_double_counts(store) -> None:
     """Part (iii): rows a tick at the true `now` consumed (including rows
     logged after the backward `now`, i.e. "in the future" to it) are neither

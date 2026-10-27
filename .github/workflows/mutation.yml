@@ -150,7 +150,7 @@ jobs:
               '    app' '    scripts' '    docs' '    examples' '    expressions' '    hooks' '    relay' '    wizard-validation' \
               '    CHANGELOG.md' '    README.md' '    INSTALL.md' \
               'pytest_add_cli_args =' \
-              '    -p' '    no:tdd-guard' '    -m' "    ${marker_expr}" > setup.cfg
+              '    -p' '    no:tdd-guard' '    -p' '    no:randomly' '    -m' "    ${marker_expr}" > setup.cfg
             if [ -s report/excluded-tests.txt ]; then
               while read -r id; do printf '    --deselect\n    %s\n' "$id" >> setup.cfg; done < report/excluded-tests.txt
             fi
@@ -176,7 +176,7 @@ jobs:
               grep -a '^FAILED ' mutmut-run.log | sed 's/^FAILED //; s/ - .*$//'
               # ... and, on the first attempt, every test that fails in a plain full pass of the copy
               if [ "$attempt" = 1 ]; then
-                (cd mutants && MUTANT_UNDER_TEST= ../.venv/bin/python -m pytest -p no:tdd-guard -p no:cacheprovider -q -rf --tb=no \
+                (cd mutants && MUTANT_UNDER_TEST= ../.venv/bin/python -m pytest -p no:tdd-guard -p no:randomly -p no:cacheprovider -q -rf --tb=no \
                   -m "$marker_expr" "tests/unit/brain/${PACKAGE}" 2>&1) | grep -a '^FAILED ' | sed 's/^FAILED //; s/ - .*$//'
               fi
               cat report/excluded-tests.txt

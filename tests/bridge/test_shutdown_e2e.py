@@ -156,6 +156,7 @@ def _until(pred, timeout: float = 30.0, step: float = 0.05):
     raise AssertionError("condition not met in time")
 
 
+@pytest.mark.slow(reason='2.4 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_http_stop_waits_for_work_reports_progress_and_ends_honestly(tmp_path, bridges):
     """C10, C11, C12, C13 (user stop), C15 (HTTP): no internal time limit; "stopping" in the first read after the
     202, never "stopped" (nor the lock free) while a task runs; the progress record counts the tasks down with
@@ -211,6 +212,7 @@ def test_sigterm_stop_marks_stopping_and_exits_0(tmp_path, bridges):
     assert b.record().phase == "stopped" and b.record().shutdown_clean
 
 
+@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_idle_stop_records_its_reason(tmp_path, bridges):
     b = Bridge(tmp_path, idle_s=1.0)
     bridges.append(b)
@@ -218,6 +220,7 @@ def test_idle_stop_records_its_reason(tmp_path, bridges):
     assert b.record().stop_reason == "idle_timeout" and b.record().phase == "stopped"
 
 
+@pytest.mark.slow(reason='1.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("gap", ["during-wait", "immediate"])
 def test_second_sigint_is_a_hard_exit(tmp_path, bridges, gap):
     """C42 (c) [P2]: a second SIGINT during the lifespan wait, or within 0.1 s of the first, takes the hard-exit
@@ -238,6 +241,7 @@ def test_second_sigint_is_a_hard_exit(tmp_path, bridges, gap):
     assert st.phase == "hard_exit" and st.shutdown_clean is False and st.stop_reason == "hard_exit"
 
 
+@pytest.mark.slow(reason='1.7 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_hard_exit_request_naming_the_bridge_ends_it(tmp_path, bridges):
     """C13 (hard exit) and the request channel (D6 b): a request for this pid + token ends the bridge at once, exit 0,
     not clean; a request naming another token is ignored."""
@@ -255,6 +259,7 @@ def test_hard_exit_request_naming_the_bridge_ends_it(tmp_path, bridges):
     assert st.phase == "hard_exit" and not st.shutdown_clean and st.stop_reason == "hard_exit"
 
 
+@pytest.mark.slow(reason='3.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_watcher_files_are_deleted_only_by_the_lock_holder(tmp_path, bridges):
     """C55, C43 (a): files left by an earlier process are deleted by the runner that takes the lock; a runner that
     loses the lock (exit 2) deletes nothing."""
@@ -278,6 +283,7 @@ def test_watcher_files_are_deleted_only_by_the_lock_holder(tmp_path, bridges):
     assert not (b2.pd / shutdown_progress.INTENT_FILENAME).exists()
 
 
+@pytest.mark.slow(reason='3.0 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
     """C42 (a, b): the old bridge writes nothing after it releases the lock, so a `nell supervisor run` waiting for the
     lock keeps the record it writes when it takes over."""
@@ -319,6 +325,7 @@ def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
         err_file.close()
 
 
+@pytest.mark.slow(reason='2.2 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_sighup_starts_a_graceful_stop(tmp_path, bridges):
     """C64 (bridge half; the fake `claude` child half is in the I5 tests): SIGHUP to a terminal-run runner starts a
     normal stop: the stopping mark, waits for the task, exit 0."""
@@ -333,6 +340,7 @@ def test_sighup_starts_a_graceful_stop(tmp_path, bridges):
     assert b.record().phase == "stopped" and b.record().stop_reason == "os_signal"
 
 
+@pytest.mark.slow(reason='2.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_runner_started_with_sighup_ignored_keeps_ignoring_it(tmp_path, bridges):
     """C64 (S5-h): nohup-style start (SIGHUP ignored) -> SIGHUP does not stop the bridge."""
     b = Bridge(tmp_path, sighup_ignored=True)

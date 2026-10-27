@@ -2,6 +2,8 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from brain.attunement.budget import consume_call, get_remaining
 
 
@@ -15,6 +17,7 @@ def test_consume_call_decrements_remaining(tmp_path: Path):
     assert get_remaining(tmp_path, now=now) == 149
 
 
+@pytest.mark.slow(reason='3.5 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_consume_call_returns_false_when_cap_reached(tmp_path: Path):
     now = datetime(2026, 5, 31, 12, 0, tzinfo=UTC)
     for _ in range(150):
@@ -23,6 +26,7 @@ def test_consume_call_returns_false_when_cap_reached(tmp_path: Path):
     assert get_remaining(tmp_path, now=now) == 0
 
 
+@pytest.mark.slow(reason='3.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_counter_resets_at_local_midnight(tmp_path: Path):
     # Use noon vs. the following noon to guarantee different local dates
     # regardless of timezone offset (avoids false failures near day boundaries).

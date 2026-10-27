@@ -2681,6 +2681,7 @@ def test_the_rerank_call_sites_are_exactly_the_audited_set() -> None:
     )
 
 
+@pytest.mark.slow(reason='2.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_call_site_scan_sees_a_call_it_has_not_been_told_about(tmp_path) -> None:
     """The scan can fail: a throwaway tree with a rerank call is reported, enclosing function included."""
     (tmp_path / "brain" / "memory").mkdir(parents=True)

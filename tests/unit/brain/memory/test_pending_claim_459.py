@@ -420,6 +420,7 @@ def test_claim_collapses_a_new_duplicate_against_an_unsettled_leftover(tmp_path)
     assert read_jsonl(q.path) == []
 
 
+@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_files_do_not_grow_with_the_number_of_ticks_in_an_outage(tmp_path):
     # An outage: every tick the recall enqueues the same ids again and the gate settles none of them.
     q = PendingQueue(tmp_path)

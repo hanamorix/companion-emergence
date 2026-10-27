@@ -180,6 +180,7 @@ def test_a_bridge_error_status_is_reported_as_before(world, monkeypatch, capsys)
     assert world.proxy.connections == 0
 
 
+@pytest.mark.slow(reason='2.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_an_unreachable_bridge_is_reported_as_before(world, monkeypatch, capsys):
     state = SimpleNamespace(port=_closed_port(), auth_token=TOKEN, pid=1)
     cli = _cli(monkeypatch, state)
@@ -320,6 +321,7 @@ def _brain_violations() -> list[str]:
     return found
 
 
+@pytest.mark.slow(reason='1.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_no_brain_code_reaches_the_bridge_through_the_environments_proxy_settings():
     assert _brain_violations() == []
 

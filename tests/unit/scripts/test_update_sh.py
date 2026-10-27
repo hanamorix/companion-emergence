@@ -95,6 +95,7 @@ def _bundled_root(root: Path) -> Path:
     return root
 
 
+@pytest.mark.slow(reason='1.5 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_bundled_kind_plan_uses_wheel_and_restores_wrapper(tmp_path):
     root = _bundled_root(tmp_path / "python-runtime")
     src = _src(tmp_path)

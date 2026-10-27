@@ -405,6 +405,7 @@ _HOLD_SECONDS = dev_constants.HEARTBEAT_DECAY_BATCH_BUDGET_S + 0.2
 _READY_WAIT_TIMEOUT_S = 15.0
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c17_chat_write_waits_for_open_decay_batch_then_succeeds(tmp_path: Path) -> None:
     db_path = tmp_path / "memories.db"
     store = MemoryStore(db_path)

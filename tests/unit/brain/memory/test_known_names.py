@@ -933,6 +933,7 @@ for k in range(5):
 _RACE_ROUNDS = 3  # rounds of two fresh interpreters released together by one go file
 
 
+@pytest.mark.slow(reason='3.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_two_processes_writing_at_once_lose_nothing_and_keep_first_seen(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[4]
     env = {**os.environ, "PYTHONPATH": str(root)}

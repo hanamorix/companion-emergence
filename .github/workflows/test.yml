@@ -35,6 +35,13 @@ on:
           - "4"
           - "auto"
         default: "1"
+      seed:
+        description: >-
+          pytest-randomly seed to reproduce a red random order (digits only; empty = a fresh random seed). Use
+          workers 1 for a faithful reproduction.
+        type: string
+        required: false
+        default: ""
 
 jobs:
   python:
@@ -64,9 +71,18 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
+      # #540: the suite runs in parallel (pytest-xdist, one worker per CPU). `--dist loadgroup` keeps each
+      # xdist_group mark's tests on one worker (the tests sharing a real resource: the Hugging Face cache, the
+      # systemd user manager, a network install); `-p no:tdd-guard` stops the tdd-guard plugin, which every worker
+      # would otherwise load and make write the same status file. KINDLED_SLOW_BUDGET switches on the slow-test
+      # budget (tests/slow_budget.py): a test over 2 s must say why with @pytest.mark.slow(reason=...). Test order is
+      # random (pytest-randomly): the seed is printed in the header and at the end; to reproduce a red order run
+      # serially with `--randomly-seed=N`, or switch it off with `-p no:randomly`.
       - name: Run pytest
         if: github.event_name != 'workflow_dispatch'
-        run: uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml
+        env:
+          KINDLED_SLOW_BUDGET: "1"
+        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml
 
       # Manual run only. The inputs reach the shell as environment variables (never
       # spliced into the script). TESTS is split on all whitespace (newlines included) with
@@ -74,15 +90,17 @@ jobs:
       # WORKERS other than 1 runs pytest-xdist: `--dist loadgroup` keeps each xdist_group
       # mark's tests on one worker (the tests sharing a real resource), and `-p no:tdd-guard`
       # stops the tdd-guard plugin, which every worker would otherwise load and make write the
-      # same status file. The push and pull_request run above stays serial until the suite is
-      # switched over. `shell: bash` so the same script runs on all three OSes (Windows would
-      # otherwise use pwsh).
+      # same status file. The push and pull_request run above uses `-n auto` too; this step
+      # defaults to 1 (serial) so a single failing test can be reproduced faithfully. `shell: bash`
+      # so the same script runs on all three OSes (Windows would otherwise use pwsh).
       - name: Run pytest (selected tests)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           TESTS: ${{ inputs.tests }}
           WORKERS: ${{ inputs.workers }}
+          SEED: ${{ inputs.seed }}
+          KINDLED_SLOW_BUDGET: "1"
         run: |
           case "$WORKERS" in
             1|2|4|auto) ;;
@@ -100,7 +118,14 @@ jobs:
           if [ "$WORKERS" != "1" ]; then
             parallel=(-n "$WORKERS" --dist loadgroup -p no:tdd-guard)
           fi
-          uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml "${parallel[@]}" "${selected[@]}"
+          seed=()
+          if [ -n "$SEED" ]; then
+            case "$SEED" in
+              *[!0-9]*) echo "::error::refusing seed '$SEED': digits only"; exit 1 ;;
+            esac
+            seed=(-p randomly "--randomly-seed=$SEED")
+          fi
+          uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml "${parallel[@]}" "${seed[@]}" "${selected[@]}"
 
       # Per-test timings (#540): the junit file carries every test's duration so
       # the slow ones can be found per OS.

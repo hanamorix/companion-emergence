@@ -292,6 +292,7 @@ def test_replace_retries_a_transient_permission_error(tmp_path, monkeypatch):
     assert overlay.read_state(tmp_path)["active"] == ENTRY_A
 
 
+@pytest.mark.slow(reason='2.1 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_replace_gives_up_after_the_bounded_retries(tmp_path, monkeypatch):
     def always(src, dst):
         raise PermissionError("in use")

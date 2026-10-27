@@ -1225,6 +1225,7 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
     assert "Everything has stopped." in capsys.readouterr().out  # #456: the stop watcher's words
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cmd_stop_returns_1_when_timeout_exceeded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1274,6 +1275,7 @@ def test_cmd_stop_returns_1_when_timeout_exceeded(
     assert "still stopping after" in capsys.readouterr().out
 
 
+@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cmd_stop_handles_processlookuperror_during_kill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

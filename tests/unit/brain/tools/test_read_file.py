@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from brain.tools.impls.read_file import _FILE_READ_MAX_BYTES, read_file
 
 
@@ -22,11 +24,13 @@ def test_read_file_missing_returns_clean_error(tmp_path):
     assert "error" in out
 
 
+@pytest.mark.slow(reason='2.0 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_read_file_directory_returns_clean_error(tmp_path):
     out = read_file(path=str(tmp_path), persona_dir=tmp_path)
     assert "error" in out
 
 
+@pytest.mark.slow(reason='4.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_read_file_writes_audit_line(tmp_path):
     f = tmp_path / "note.txt"
     f.write_text("hi")

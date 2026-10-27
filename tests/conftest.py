@@ -13,6 +13,7 @@ import traceback
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,12 +28,61 @@ pytest_plugins = ["pytester"]
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Refuse a ``no_base_failure`` mark that gives no reason (see ``tests/no_base_failure.py``)."""
+    """Refuse a ``no_base_failure`` or ``slow`` mark that gives no reason or sits on a module or class (tests/no_base_failure.py)."""
     from tests.no_base_failure import marker_problems
 
-    problems = marker_problems(items)
+    problems = marker_problems(items) + marker_problems(items, "slow")
     if problems:
         raise pytest.UsageError("\n".join(problems))
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Where the slow-test budget is on, import the heavy libraries up front (setup time is not budgeted).
+
+    Whichever test imports torch or onnxruntime first pays several seconds for it. With a fixed order that is one known
+    test; with random order (pytest-randomly) it is any test, and an unmarked one would fail the budget by bad luck.
+    Imported with the budget on only, so a local run of one file does not pay for it.
+    """
+    from tests import slow_budget
+
+    if not slow_budget.enabled():
+        return
+    import importlib
+
+    for name in ("torch", "sentence_transformers", "onnxruntime", "fastembed"):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - an extra that is not installed is fine
+            pass
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Iterator[None]:
+    """The slow-test budget (tests/slow_budget.py): a passing call phase over the budget, without a ``slow`` mark, fails."""
+    outcome = yield
+    from tests import slow_budget
+
+    if call.when != "call" or not slow_budget.enabled():
+        return
+    report = outcome.get_result()
+    if report.outcome != "passed" or hasattr(report, "wasxfail"):
+        return
+    message = slow_budget.over_budget(
+        call.duration,
+        slow_budget.budget_s(),
+        has_slow_mark=item.get_closest_marker("slow") is not None,
+        exempt=any(item.get_closest_marker(name) is not None for name in slow_budget.EXEMPT_MARKERS),
+    )
+    if message:
+        report.outcome = "failed"
+        report.longrepr = f"{item.nodeid}: {message}"
+
+
+def pytest_terminal_summary(terminalreporter: Any, config: pytest.Config) -> None:
+    """Print the pytest-randomly seed at the end too (the header line is hidden by -q), so a red order can be reproduced."""
+    seed = getattr(config.option, "randomly_seed", None)
+    if seed is not None and config.pluginmanager.hasplugin("randomly"):
+        terminalreporter.write_line(f"pytest-randomly seed: {seed} (reproduce serially with --randomly-seed={seed}, or switch it off with -p no:randomly)")
 
 
 @functools.cache

@@ -103,6 +103,7 @@ def test_group_d_reader_corrupt_bytes(tmp_path: Path, name: str) -> None:
         call(pd)  # DEFAULT and CONTENT: bad content takes the fallback
 
 
+@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("name", sorted(READERS))
 def test_group_d_reader_io_fault_follows_its_mode(tmp_path: Path, name: str) -> None:
     _rel, call, mode, _expected = READERS[name]

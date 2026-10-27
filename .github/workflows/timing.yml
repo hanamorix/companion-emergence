@@ -1,0 +1,74 @@
+name: timing
+
+# #540: a weekly timing report of the whole suite, so a suite that is getting slow shows up as a number before it is a
+# problem. It runs the suite the way the pull-request job does (parallel, random order) but WITHOUT the slow-test budget
+# (KINDLED_SLOW_BUDGET is not set here), writes the junit file, and turns it into `timing-report.md`: the totals, how many
+# tests take over 1 s and over 2 s, the slowest 40 and the largest modules, per operating system. Not a gate: a red test
+# fails the job, but nothing waits for it. Artifact `timing-report-<os>` holds the report and the junit file.
+
+on:
+  # TEMPORARY (#540 proof run, removed in the next commit): a workflow that is not on main cannot be dispatched.
+  pull_request:
+    paths:
+      - .github/workflows/timing.yml
+  schedule:
+    - cron: "17 5 * * 0" # Sundays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    name: timing ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run the suite
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          target=()
+          if [ "$EVENT" = "pull_request" ]; then target=(tests/unit/scripts/test_timing_report.py); fi # TEMPORARY (#540 proof)
+          uv run pytest -n auto --dist loadgroup -p no:tdd-guard --tb=short --durations=0 --junitxml=pytest-junit.xml "${target[@]}"
+
+      - name: Write the timing report
+        if: always()
+        shell: bash
+        env:
+          OS_NAME: ${{ matrix.os }}
+        run: |
+          if [ -f pytest-junit.xml ]; then
+            uv run python scripts/timing_report.py pytest-junit.xml --title "Test timing on ${OS_NAME}" --top 40 | tee timing-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no junit file was written" | tee timing-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the timing report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: timing-report-${{ matrix.os }}
+          path: |
+            timing-report.md
+            pytest-junit.xml
+          if-no-files-found: warn

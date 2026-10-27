@@ -15,8 +15,8 @@ from typing import Any
 MARKER = "no_base_failure"
 
 
-def marker_problems(items: Iterable[Any]) -> list[str]:
-    """One line per item whose ``no_base_failure`` mark is not on the test itself, or has no non-empty ``reason=``.
+def marker_problems(items: Iterable[Any], marker: str = MARKER) -> list[str]:
+    """One line per item whose ``marker`` mark (default ``no_base_failure``) is not on the test itself, or has no non-empty ``reason=``.
 
     A mark on a module or class would exempt every test added to it later without anyone choosing that, so it is
     refused: mark the test function (or the ``pytest.param``). ``own_markers`` holds only the marks applied to the
@@ -24,13 +24,13 @@ def marker_problems(items: Iterable[Any]) -> list[str]:
     """
     problems = []
     for item in items:
-        own = [m for m in getattr(item, "own_markers", []) if m.name == MARKER]
-        if len(list(item.iter_markers(MARKER))) > len(own):
-            problems.append(f"{item.nodeid}: @pytest.mark.{MARKER} is on a module or class; mark the test function itself")
+        own = [m for m in getattr(item, "own_markers", []) if m.name == marker]
+        if len(list(item.iter_markers(marker))) > len(own):
+            problems.append(f"{item.nodeid}: @pytest.mark.{marker} is on a module or class; mark the test function itself")
             continue
         for mark in own:
             reason = mark.kwargs.get("reason")
             if not isinstance(reason, str) or not reason.strip():
-                problems.append(f"{item.nodeid}: @pytest.mark.{MARKER} needs reason=\"why this test passes on the old code\"")
+                problems.append(f"{item.nodeid}: @pytest.mark.{marker} needs reason=\"why\"")
                 break
     return problems
