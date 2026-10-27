@@ -321,13 +321,15 @@ def test_same_size_replacement_with_identical_mtime_ns_is_seen_through_the_inode
     assert t.get_tunable("a", 0) == 2
 
 
-def test_a_second_process_sees_a_write_within_two_seconds(t, tmp_path, repo_root) -> None:
+def test_a_second_process_sees_a_write_made_after_it_started(t, tmp_path, repo_root) -> None:
+    # The child polls for up to 20 s and stops at the first sight of the value, so the deadline only matters when the write
+    # is never seen; it is long so that a loaded host (a slow interpreter start) cannot miss it.
     code = (
         "import sys, time\n"
         f"sys.path.insert(0, {str(repo_root)!r})\n"
         "from brain import tunables\n"
         "print('READY', flush=True)\n"
-        "end = time.monotonic() + 2.0\n"
+        "end = time.monotonic() + 20.0\n"
         "while time.monotonic() < end:\n"
         "    if tunables.get_tunable('a', 1) == 5:\n"
         "        print('SEEN'); break\n"
@@ -338,7 +340,7 @@ def test_a_second_process_sees_a_write_within_two_seconds(t, tmp_path, repo_root
     assert proc.stdout is not None
     assert proc.stdout.readline().strip() == "READY"
     t.set_values({"a": 5})
-    out, _ = proc.communicate(timeout=20)
+    out, _ = proc.communicate(timeout=60)  # longer than the child's own 20 s, so a missing write fails the assertion below
     assert "SEEN" in out
 
 

@@ -458,7 +458,9 @@ def test_append_attempted_inside_the_prune_window_does_not_wait_and_lands_after_
 ):
     path = rd.diagnostics_path(tmp_path)
     _write(path, [_rec_line(NOW - timedelta(days=9), 0), _rec_line(NOW - timedelta(hours=1), 1)])
-    state = _append_inside_prune_window(monkeypatch, path, point, settle_s=0.5)
+    # settle_s is only an upper bound: the wait ends when the append finishes. An append that waits on the prune's lock
+    # (the regression) never finishes inside the window, so it is the full 30 s before the assertion below fails.
+    state = _append_inside_prune_window(monkeypatch, path, point, settle_s=30.0)
     assert rd.prune(path, window_days=2.0, now=NOW) == 1
     monkeypatch.undo()
     state["thread"].join(timeout=10)

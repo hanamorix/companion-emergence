@@ -724,18 +724,19 @@ class _OpenSpy:
         monkeypatch.setattr(gz, "open", check("gzip.open", gz.open))
 
 
-def test_cr11_baseline_the_spy_flags_the_held_writer_and_the_migrated_ones_are_clean(
+def test_cr11_baseline_the_spy_flags_a_locale_codec_writer_and_the_migrated_ones_are_clean(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from datetime import UTC, datetime
-
     from brain.chat.tool_loop import _log_attunement_error
-    from brain.felt_time.weather_shift import append_shift_log
     from brain.self_model.articulate import _log_articulate_error
 
+    def locale_codec_writer(directory: Path) -> None:
+        with open(directory / "log.txt", "a") as fh:  # text mode, no encoding: the very thing the spy exists to flag
+            fh.write("x\n")
+
     spy = _OpenSpy(monkeypatch)
-    append_shift_log(tmp_path, ts=datetime.now(UTC), channel="c", label="l")
-    assert spy.violations, "weather_shift.append_shift_log (held, felt-time audit) still opens with the locale codec"
+    locale_codec_writer(tmp_path)
+    assert spy.violations, "the spy no longer flags a text-mode open() with the locale codec"
     spy.violations.clear()
     _log_attunement_error(tmp_path, "t1", ValueError("x"))
     _log_articulate_error(tmp_path, "kind", ValueError("x"))
@@ -2869,24 +2870,27 @@ def test_cj4_a_file_whose_first_line_is_only_a_bom_does_not_count_it_as_a_line(
     assert jio._tail_lines(p, 5) == [b'{"a": 1}', b'{"b": 2}']
 
 
-def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Path) -> None:
-    """F9: re-concatenating and re-splitting the whole block per chunk made one long line quadratic."""
+def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Path, monkeypatch) -> None:
+    """F9: re-concatenating and re-splitting the whole block per chunk made one long line quadratic.
+
+    A tiny chunk gives a short file many chunks, so the quadratic copying is large at 2 MB. CPU time of this
+    process (not wall-clock) and the minimum of three runs, so a busy host moves both sizes together; four times the
+    line takes about four times as long when linear and sixteen times as long when quadratic, compared with 8x plus
+    100 ms (Windows CPU-time ticks are about 16 ms)."""
+    monkeypatch.setattr(jio, "_TAIL_CHUNK", 1024)
 
     def best(size: int) -> float:
         p = tmp_path / f"long{size}.jsonl"
         p.write_bytes(b'{"k": "' + b"x" * size + b'"}\n')
         times = []
         for _ in range(3):
-            t0 = time.perf_counter()
+            t0 = time.process_time()
             assert len(jio.read_jsonl_tail(p, 1)) == 1
-            times.append(time.perf_counter() - t0)
+            times.append(time.process_time() - t0)
         return min(times)
 
-    small, big = best(1_000_000), best(8_000_000)
-    assert big < small * 32, (
-        small,
-        big,
-    )  # linear is about 8x; quadratic is about 64x (timing noise is allowed for)
+    small, big = best(500_000), best(2_000_000)
+    assert big < small * 8 + 0.1, (small, big)
 
 
 # ---- review nits: HEAL validator exceptions and the strict reset-to-default write ----

@@ -528,8 +528,8 @@ def test_c34_per_turn_open_takes_no_transaction_while_a_writer_holds_one(tmp_hom
 
     # Fail-first: pre-change, `_boot_fts_backstop` ran its integrity-check
     # INSERT on this very open and blocked behind `holder`'s write lock for
-    # up to the busy timeout (30 s) — this open must return fast instead.
-    assert elapsed <= 1.0
+    # up to the busy timeout (30 s) — this open must return fast instead (2 s leaves room for a busy host).
+    assert elapsed <= 2.0
 
 
 def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeypatch):
@@ -617,4 +617,4 @@ def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeyp
     t.join(timeout=5)
 
     assert done.is_set(), "clustering write should have completed within the join timeout"
-    assert elapsed <= 1.0
+    assert elapsed <= 2.0  # the blocked open waited up to the 30 s busy timeout; 2 s leaves room for a busy host

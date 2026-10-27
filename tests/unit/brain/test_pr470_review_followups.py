@@ -449,18 +449,25 @@ def test_find_json_object_block_gives_the_same_result_as_before_on_longer_random
 @pytest.mark.parametrize("unit", ["{", "{ ", 'x {"', "{[", '{"a": {', 'say { "'])
 def test_find_json_object_block_is_linear_on_a_reply_of_many_unclosed_braces(unit):
     # S2 of the round-4 review: each `{` that failed to decode re-scanned to the end of the text, so 8000 braces took 5 s (the
-    # classifier is exposed to a degenerate repetition reply). A generous ceiling, hundreds of times what a linear pass needs
-    # and far under what the quadratic one takes at this size.
+    # classifier is exposed to a degenerate repetition reply). Growth, not a wall-clock ceiling: four times the text takes
+    # about four times as long when linear and sixteen times as long when quadratic; 8x (plus 50 ms for timer noise) tells them
+    # apart on any host, because both sizes slow down together under load. The quadratic one takes seconds at these sizes.
     import time
 
     from brain.utils.llm_output import find_json_object_block
 
-    text = unit * 10_000
-    started = time.perf_counter()
-    find_json_object_block(text, prefer_key="verdict")
-    elapsed = time.perf_counter() - started
+    def best_of_three(repeats: int) -> float:
+        text = unit * repeats
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            find_json_object_block(text, prefer_key="verdict")
+            best = min(best, time.perf_counter() - started)
+        return best
 
-    assert elapsed < 1.5, f"{elapsed:.2f}s for {len(text)} chars of {unit!r}"
+    small = best_of_three(2_500)
+    large = best_of_three(10_000)
+    assert large < 8 * small + 0.05, f"{small:.4f}s for 2500 repeats of {unit!r}, {large:.4f}s for 10000"
 
 
 def test_find_json_object_block_still_finds_the_answer_after_many_unclosed_braces():

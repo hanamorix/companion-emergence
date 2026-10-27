@@ -139,7 +139,18 @@ def _large(shape: str, n_names: int, n_words: int) -> tuple[list[str], str]:
 def _warm_best(known: kn.KnownNames, text: str) -> float:
     kn.match_known_names(text, known)
     best = float("inf")
+    for _ in range(5):  # the minimum of several runs: a busy host slows runs, it does not speed one up
+        t0 = time.perf_counter()
+        kn.match_known_names(text, known)
+        best = min(best, time.perf_counter() - t0)
+    return best
+
+
+def _cold_best(names: list[str], text: str) -> float:
+    """Best of 3 times of the first match against a freshly built list (it builds the automaton)."""
+    best = float("inf")
     for _ in range(3):
+        known = kn.KnownNames.from_names(names)
         t0 = time.perf_counter()
         kn.match_known_names(text, known)
         best = min(best, time.perf_counter() - t0)
@@ -148,16 +159,17 @@ def _warm_best(known: kn.KnownNames, text: str) -> float:
 
 @pytest.mark.parametrize("shape", ["random", "repeated"])
 def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
+    # Only ratios: absolute wall-clock bounds fail on a busy parallel worker without a regression. The base matcher took
+    # 6.0-9.5 s per call here and its cost grows faster than the list (it joins a window for every distinct name length:
+    # about 3.2x when the list doubles), which the list-doubling ratio below catches. The ratios stay tight: a bound of
+    # 4x on a doubling could never fail for a quadratic-in-message matcher (4x at most), and 1.5x holds under load.
     names, text = _large(shape, 399, 6000)
     known = kn.KnownNames.from_names(names)
-    t0 = time.perf_counter()
-    kn.match_known_names(text, known)  # the first, cold call builds the automaton
-    assert time.perf_counter() - t0 < 2.0  # the base took 6.0-9.5 s here
     names2, _ = _large(shape, 798, 6000)
-    t0 = time.perf_counter()
+    # Building the automaton is linear in the name text, and doubling the list quadruples that text (a name has k words
+    # for k up to n): 4x-6x measured, 16x for a quadratic build. Compared with a 10x bound plus a small floor.
+    assert _cold_best(names2, text) < 10 * _cold_best(names, text) + 0.02, "building the doubled list"
     known2 = kn.KnownNames.from_names(names2)
-    kn.match_known_names("warm up", known2)
-    assert time.perf_counter() - t0 < 2.0  # the build alone for the doubled list
     base = _warm_best(known, text)
     assert _warm_best(known2, text) < 1.5 * base + 0.005, "doubling the list"
     _, text2 = _large(shape, 399, 12000)

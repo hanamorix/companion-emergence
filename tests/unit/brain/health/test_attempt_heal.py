@@ -13,6 +13,7 @@ import shutil
 import stat
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,11 @@ import brain.utils.atomic_write as heal
 from brain.health.attempt_heal import save_with_backup
 from brain.health.json_io import Recovery, read_json_result
 from brain.utils.atomic_write import save_with_backup_text
+
+# The polling-reader tests need the reader to have really read while saves were in flight. On a busy host the reader thread
+# can be starved while the writers finish, so the writers keep saving (bounded) until it has made this many reads.
+_MIN_POLLER_READS = 100
+_POLLER_GRACE_S = 30.0
 
 
 def attempt_heal(path, default_factory, schema_validator=None):
@@ -490,7 +496,7 @@ def test_live_path_never_missing_at_any_step_boundary(tmp_path: Path, monkeypatc
 )
 @pytest.mark.parametrize("run", [1, 2, 3])
 def test_concurrent_reader_never_sees_live_path_missing(tmp_path: Path, monkeypatch, run) -> None:
-    """C2: a thread polling the live path through 1500 saves sees no gap, no partial file, and
+    """C2: a thread polling the live path through at least 1500 saves sees no gap, no partial file, and
     versions that never go backwards."""
     p = tmp_path / "x.json"
     save_with_backup_text(p, _payload(0))
@@ -519,13 +525,16 @@ def test_concurrent_reader_never_sees_live_path_missing(tmp_path: Path, monkeypa
     t = threading.Thread(target=poll)
     t.start()
     try:
-        for n in range(1, 1501):
+        n = 0
+        grace_ends = time.monotonic() + _POLLER_GRACE_S
+        while n < 1500 or (stats["reads"] < _MIN_POLLER_READS and time.monotonic() < grace_ends):
+            n += 1
             save_with_backup_text(p, _payload(n))
     finally:
         stop.set()
         t.join()
         sys.setswitchinterval(old_interval)
-    assert stats["reads"] > 100, stats  # the poller really ran
+    assert stats["reads"] >= _MIN_POLLER_READS, stats  # the poller really ran
     assert stats["missing"] == 0 and stats["bad"] == 0 and stats["backwards"] == 0, stats
 
 
@@ -1011,7 +1020,7 @@ def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
 def test_concurrent_savers_of_one_path_raise_nothing_and_never_expose_a_gap(
     tmp_path: Path, monkeypatch, run
 ) -> None:
-    """C15b: 4 threads x 150 saves of one path. No save raises (the old shared temp names made
+    """C15b: 4 threads x at least 150 saves of one path. No save raises (the old shared temp names made
     savers raise FileNotFoundError), a polling reader never sees the file missing or partial,
     and no temp is left behind."""
     p = tmp_path / "x.json"
@@ -1023,8 +1032,11 @@ def test_concurrent_savers_of_one_path_raise_nothing_and_never_expose_a_gap(
 
     def writer(k: int) -> None:
         try:
-            for n in range(150):
+            n = 0
+            grace_ends = time.monotonic() + _POLLER_GRACE_S
+            while n < 150 or (stats["reads"] < _MIN_POLLER_READS and time.monotonic() < grace_ends):
                 save_with_backup_text(p, _payload(k * 1000 + n))
+                n += 1
         except BaseException as exc:  # noqa: BLE001 - the test reports whatever escaped
             errors.append(exc)
 
@@ -1053,7 +1065,7 @@ def test_concurrent_savers_of_one_path_raise_nothing_and_never_expose_a_gap(
         reader.join()
         sys.setswitchinterval(old_interval)
     assert not errors, [repr(e) for e in errors[:3]]
-    assert stats["reads"] > 100 and stats["missing"] == 0 and stats["bad"] == 0, stats
+    assert stats["reads"] >= _MIN_POLLER_READS and stats["missing"] == 0 and stats["bad"] == 0, stats
     assert not list(tmp_path.glob("*.new"))
     _version(p)
     for i in (1, 2, 3):
