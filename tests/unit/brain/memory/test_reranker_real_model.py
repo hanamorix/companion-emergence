@@ -61,7 +61,8 @@ from brain.memory.reranker import (
 )
 from brain.memory.store import MemoryStore
 
-pytestmark = [pytest.mark.requires_network, pytest.mark.integration]
+# #540: a real-model download/load can legitimately outlast the default per-test timeout in pyproject.toml.
+pytestmark = [pytest.mark.requires_network, pytest.mark.integration, pytest.mark.timeout(3600)]
 
 _MODEL_ID = "jinaai/jina-reranker-v2-base-multilingual"
 _FP16_MODEL_ID = "jinaai/jina-reranker-v2-base-multilingual-fp16"  # F2a inc2, #250 §2 — model_tier.MODEL_RERANKER_FP16

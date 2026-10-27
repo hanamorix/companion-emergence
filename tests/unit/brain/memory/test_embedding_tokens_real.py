@@ -17,7 +17,8 @@ from brain.bridge.model_tier import MODEL_EMBEDDING
 from brain.memory.embeddings import FastEmbedProvider
 from brain.paths import get_cache_dir
 
-pytestmark = [pytest.mark.requires_models, pytest.mark.integration]
+# #540: loading the real cached model can outlast the default per-test timeout in pyproject.toml.
+pytestmark = [pytest.mark.requires_models, pytest.mark.integration, pytest.mark.timeout(3600)]
 
 
 @pytest.fixture(scope="module")

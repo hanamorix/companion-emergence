@@ -73,6 +73,10 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.5",
+    # #540: lets the suite run in parallel (`-n N --dist loadgroup`). `-n` is deliberately not in addopts: the caller (the CI workflow) chooses it.
+    "pytest-xdist>=3.6",
+    # #540: a hung test would stall one xdist worker and then the whole job; this bounds each test.
+    "pytest-timeout>=2.3",
 ]
 
 [project.scripts]
@@ -113,6 +117,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 pythonpath = ["."]
 tdd_guard_project_root = "the project root"
+# #540: per-test ceiling (seconds). The slowest ordinary tests take far less; the real-model and network-install
+# modules raise it for themselves with @pytest.mark.timeout(3600).
+timeout = 600
 markers = [
     "unit: unit tests",
     "integration: integration tests (deselect with '-m \"not integration\"')",
