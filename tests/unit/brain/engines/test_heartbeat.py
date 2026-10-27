@@ -2434,6 +2434,9 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         "brain.engines.heartbeat.build_tier_provider",
         lambda persona_dir, tier: provider,
     )
+    # The completion-candidate step builds its own classifier-tier provider (topic overlap); without this it starts the
+    # real claude CLI on a machine that has it (the CI guard, tests/claude_spawn_guard.py, caught it).
+    monkeypatch.setattr("brain.engines.research.build_tier_provider", lambda persona_dir, tier: FakeProvider())
 
     # On-disk so store.persona_dir == tmp_path (== interests_path.parent, the
     # heartbeat's persona_dir): the gated "research" candidate lands in that

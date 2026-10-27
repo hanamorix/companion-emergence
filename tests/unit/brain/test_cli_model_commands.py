@@ -287,7 +287,7 @@ def test_show_is_read_only_and_says_when_a_migration_is_pending(tmp_path, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_a_damaged_settings_file_prints_the_reason_and_the_path_and_exits_non_zero(capsys) -> None:
+def test_a_damaged_settings_file_prints_the_reason_and_the_path_and_exits_non_zero(capture_claude_argv, capsys) -> None:
     _PATH().parent.mkdir(parents=True, exist_ok=True)
     _PATH().write_text("# mine\nb = = 2\n")
     assert _run(["set", "opus"]) == 1

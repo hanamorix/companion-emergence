@@ -164,6 +164,10 @@ python scripts/new_tests_fail_on_base.py --base origin/main --workers 0
 
 `--only <text>` limits a local run to changed test files whose path contains the text; `--mark-expr "<expr>"` adds a `-m` expression to every pytest call.
 
+## Tests must not start a real `claude` in CI
+
+The product starts the claude CLI by its bare name. CI has no `claude`, so a test that reaches that spawn unpatched can only fail the spawn, and a test that tolerates the failure passes without testing what it claims (on a machine that has `claude`, it would spend tokens). When `GITHUB_ACTIONS` is set (or `KINDLED_GUARD_CLAUDE=1` locally, to try it), `tests/claude_spawn_guard.py` fails any test without the `requires_claude_cli` marker that starts a `claude` by bare name through `subprocess` (so `run`, `Popen`, `check_output` and asyncio subprocesses), even if the test catches the error. The message says where the spawn came from. Ways out: patch the spawn (a patched `subprocess.Popen` or provider helper is never seen by the guard); put a fake `claude` script under `tmp_path` and spawn it by explicit path, or put its directory first on the `PATH` you pass; or mark the test `@pytest.mark.requires_claude_cli`. Spawns by explicit path are never blocked. Not seen: spawns made by a child process of the test, by module- or session-scoped fixtures, or by a thread that was already running when the test began.
+
 ## What Discord is for
 
 Discord is still useful, just not as the source of truth:

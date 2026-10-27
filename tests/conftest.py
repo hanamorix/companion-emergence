@@ -19,6 +19,9 @@ import pytest
 from brain.bridge import cli_throttle, model_error, provider_auth
 from brain.chat import pass2_queue
 from brain.memory import pending
+from tests.claude_spawn_guard import (
+    no_real_claude_in_ci,  # noqa: F401  (autouse, J11: no real `claude` in CI)
+)
 
 pytest_plugins = ["pytester"]
 

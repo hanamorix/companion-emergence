@@ -19,6 +19,8 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
+
 # brain.chat.rollover binds cascade_conversation when it is first imported. Import it here, before any test patches
 # brain.chat.compaction.cascade_conversation, or the first import happens under the patch and the fake stays bound
 # there for the rest of the process (it broke test_cascade_rollover_endpoints when this file ran first).
@@ -216,7 +218,9 @@ def test_c8_emotion_backfill_pauses_between_memories_and_resumes(tmp_path: Path)
     store.close()
 
 
-def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(tmp_path: Path) -> None:
+def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A systematic tagger failure (processed candidates, tagged none) sets
     status='running' too, but for an UNRELATED reason -- supervisor.py's
     _emotion_backfill_job must only report JobOutcome.PAUSED for a REAL
@@ -224,12 +228,16 @@ def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(tmp_pa
     the whole S55 sequence for a tagger bug, not a chat-idle event) -- see
     test_supervisor.py::test_supervisor_tick_embeds_backlogged_memory for
     the end-to-end proof this exact confusion broke."""
+    from brain.bridge import supervisor
     from brain.bridge.central_cadence import JobOutcome
     from brain.bridge.events import EventBus
     from brain.bridge.provider import FakeProvider
     from brain.bridge.supervisor import _build_gated_jobs
     from brain.memory.store import Memory, MemoryStore
 
+    # The job builds its own classifier-tier provider: without this it starts the real claude CLI (and spends tokens) on a
+    # machine that has it, which is what the CI guard (tests/claude_spawn_guard.py) caught.
+    monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
     persona_dir = _persona(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     m = Memory.create_new(content="a memory long enough to tag", memory_type="conversation", domain="us")
