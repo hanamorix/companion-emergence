@@ -232,7 +232,10 @@ def test_mode_lexical_never_touches_the_embedding_path(
     """lexical mode must not construct an embedding cache/provider at all —
     forcing that construction to raise proves the lexical path never even
     tries it. An unknown `mode` value falls back to the same lexical path,
-    and the output reports the path that actually ran, never the input."""
+    and the output reports the path that actually ran, never the input
+    (#231 Fix 3: `dispatch` does not enforce the schema enum, so the garbage value reaches
+    the impl as-is; pre-fix, `resolved_mode` was seeded from the raw argument and kept
+    reporting "garbage" although lexical is what ran)."""
 
     def _boom() -> None:
         raise AssertionError("lexical mode must never build an embedding provider")
@@ -403,17 +406,3 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     assert res["mode"] == "lexical"
     ids = {mm["id"] for mm in res["memories"]}
     assert m.id in ids
-
-
-# ---------------------------------------------------------------------------
-# #231 Fix 3 — resolved_mode must never lie. An invalid `mode` value isn't
-# blocked by `dispatch` (the "enum" in the schema is advisory, not enforced
-# at the call boundary — see brain/tools/dispatch.py, which only checks
-# `required`), so it reaches the impl as-is. Pre-fix, that garbage value
-# skipped the `mode == "semantic"` branch entirely (retrieval correctly ran
-# lexical) but `resolved_mode` was seeded from the raw `mode` argument and
-# only ever corrected inside that branch — so the output "mode" field kept
-# reporting "garbage" even though lexical is what actually ran.
-# ---------------------------------------------------------------------------
-
-

@@ -132,6 +132,7 @@ def test_real_embedding_model_batch_matches_single_embeds_within_1e_5(provider) 
         )
 
 
+@pytest.mark.no_base_failure(reason='moved unchanged from the deleted tests/unit/brain/memory/test_embedding_tokens_real.py (#540, J9) to share one embedder load; the id is new but the test is not')
 def test_c18_real_ensure_loaded_builds_the_session_once(provider) -> None:
     inner = provider._inner_model()
     inner.model = None  # not built yet, whichever test ran first: ensure_loaded must build it
@@ -142,6 +143,7 @@ def test_c18_real_ensure_loaded_builds_the_session_once(provider) -> None:
     assert inner.model is session
 
 
+@pytest.mark.no_base_failure(reason='moved unchanged from the deleted tests/unit/brain/memory/test_embedding_tokens_real.py (#540, J9) to share one embedder load; the id is new but the test is not')
 def test_c17e_real_token_lengths_are_the_attention_mask_sums(provider) -> None:
     short = "a quiet evening"
     long_text = "the harbour kite drifted over the grey water " * 200  # far past 512 tokens

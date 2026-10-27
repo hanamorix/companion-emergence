@@ -42,7 +42,6 @@ def build(tmp_path_factory: pytest.TempPathFactory):
 
 
 def test_c7_real_brain_positive_resolves_under_copy_and_boots(build, tmp_path: Path) -> None:
-
     # POSITIVE: the venv python imports the REAL brain + brain.mcp_server, resolving under the copy
     # (hook ran and passed; deps installed so the import succeeds).
     proc = subprocess.run(

@@ -205,7 +205,7 @@ _RECENT = _NOW - timedelta(minutes=1)
 def test_default_order_is_relevance_and_matches_omitted_order(tmp_path: Path) -> None:
     """One store, two memories (a strong old `workshop` note and a weak recent one), `limit=1`:
     - `order` omitted is relevance, and explicit `order="relevance"` gives the exact same result (purely additive,
-      no behaviour change when unused). Both calls are bump-free and read-only, so they can share the store;
+      no behaviour change when unused). The relevance calls are bump-free and read-only, so they can share the store (the age dispatch strengthens a hebbian edge between the two memories, so it stays last);
     - a garbage `order` normalizes to "relevance": never echoed back, never silently behaves like "age";
     - `order="age"` widens the fetch to CANDIDATE_POOL (both memories are still matches), sorts by created_at DESC,
       THEN slices to the limit, so the recent-but-weak match surfaces instead of the strong old one."""
