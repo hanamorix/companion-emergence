@@ -1427,5 +1427,3 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
     assert state.next_at is not None
     assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
-
-

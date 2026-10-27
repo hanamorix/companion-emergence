@@ -675,10 +675,10 @@ def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stu
     stubs.work["deploy_recalibration"] = True
     filename, _interval = INTERVAL_JOBS["daily_calibration"]
     _seed(persona_dir, filename, NOW - timedelta(hours=1))  # the job after it in the S55 order is overdue
-    attempts: list[int] = []
+    attempts: list[tuple] = []
 
-    def boom(*_a, **_k):
-        attempts.append(1)
+    def boom(*args, **_k):
+        attempts.append(args)
         raise RuntimeError("simulated deploy recalibration failure")
 
     monkeypatch.setattr(supervisor, "_run_deploy_recalibration", boom)
@@ -688,7 +688,7 @@ def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stu
     assert ("daily_calibration", "completed") in [(d.job, d.action) for d in decisions]
     assert stubs.order == ["daily_calibration"]
     _pass(persona_dir, jobs)
-    assert len(attempts) == 2, "a job that stays due is tried again at the next pass"
+    assert attempts == [(persona_dir,)] * 2, "a job that stays due is tried again at the next pass, on this persona"
 
 
 def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch):
