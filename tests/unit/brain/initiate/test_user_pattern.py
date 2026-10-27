@@ -541,7 +541,7 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     import brain.initiate.user_pattern as up
 
     rows = []
-    for i in range(10_000):
+    for i in range(1_000):  # well past the primary window (window_n + tie margin = 350 rows)
         rows.append({
             "audit_id": f"old_{i}", "ts": f"2026-01-{(i % 27) + 1:02d}T00:00:{i % 60:02d}+00:00",
             "decision": "send_notify", "delivery": {"current_state": "dismissed"},
@@ -582,10 +582,14 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     assert oracle == result
 
 
-def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(tmp_path: Path) -> None:
+def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No resolution in the primary window_n rows, but one exists further
     back within window_n_max: the widened read must find it and match the
-    oracle's exact count."""
+    oracle's exact count, and the widen step (a second, larger read) must
+    really fire, not merely leave the count right by some other means."""
+    import brain.initiate.user_pattern as up
     from brain.initiate.user_pattern import _compute_ignore_streak, _compute_ignore_streak_bounded
 
     rows = [
@@ -601,29 +605,6 @@ def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(tmp_path: Path)
 
     oracle = _compute_ignore_streak(tmp_path)
     assert oracle == 29
-    bounded = _compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
-    assert bounded == oracle
-
-
-def test_c20a_widen_path_is_actually_exercised(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Confirms the widen step (a second, larger read) actually fires when
-    the primary window has no resolution — not merely that the final count
-    happens to be right by some other means."""
-    import brain.initiate.user_pattern as up
-
-    rows = [
-        {"audit_id": "resolved", "ts": "2026-05-01T00:00:00+00:00", "decision": "send_notify",
-         "delivery": {"current_state": "replied_explicit"}},
-    ]
-    for i in range(29):
-        rows.append({
-            "audit_id": f"d_{i}", "ts": f"2026-05-{2 + i:02d}T00:00:00+00:00",
-            "decision": "send_notify", "delivery": {"current_state": "dismissed"},
-        })
-    _write_audit_rows(tmp_path, rows)
-
     seen_ns: list[int] = []
     real_window = up._read_ignore_streak_window
 
@@ -632,7 +613,8 @@ def test_c20a_widen_path_is_actually_exercised(
         return real_window(persona_dir, n)
 
     monkeypatch.setattr(up, "_read_ignore_streak_window", spy)
-    up._compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
+    bounded = _compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
+    assert bounded == oracle
     assert seen_ns == [5, 30]  # primary window, then the widened read
 
 

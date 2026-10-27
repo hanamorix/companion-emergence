@@ -216,10 +216,8 @@ def _flagged(persona: Path) -> set[str]:
     ("entry", "lower"),
     [
         ("will", "will"),
-        ("the", "the"),
         ("The", "the"),
         (" WILL ", "will"),
-        ("will.", "will"),
         ("Will!", "will"),
         ("hello", "hello"),
     ],

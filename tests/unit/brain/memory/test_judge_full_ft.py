@@ -16,9 +16,6 @@ is LoRA-adapter-specific and cannot apply here).
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -299,36 +296,6 @@ def test_full_ft_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Pa
         return [label_fn(item) for item in _FIXED_EVAL_ITEMS]
 
     assert train_and_score() == train_and_score()
-
-
-# ---------------------------------------------------------------------------
-# C6 — importing the module never pulls torch/sentence_transformers/peft/
-# datasets (I6/AC8).
-# ---------------------------------------------------------------------------
-
-
-def test_module_import_does_not_import_torch_or_sentence_transformers() -> None:
-    script = textwrap.dedent(
-        """
-        import sys
-
-        import brain.memory.judge_full_ft  # noqa: F401
-
-        for heavy in ("torch", "sentence_transformers", "peft", "datasets"):
-            assert heavy not in sys.modules, f"{heavy} imported merely by importing judge_full_ft: {sorted(sys.modules)}"
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
 
 
 # ---------------------------------------------------------------------------

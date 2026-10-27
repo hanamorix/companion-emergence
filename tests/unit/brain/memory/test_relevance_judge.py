@@ -1174,8 +1174,8 @@ def test_label_calibration_sample_with_persona_knob_does_not_import_torch() -> N
     """AC8 / I6: loading a persona's persisted knob (F2c inc4a) at the
     judge-label call site is a plain SQLite read (`MemoryStore.get_judge_
     knob_calibration`) — it must not pull torch/sentence_transformers into
-    `sys.modules`. Fresh subprocess (mirrors test_judge_selftune.py's
-    `test_tick_does_not_import_torch_or_sentence_transformers`) so an
+    `sys.modules`. Fresh subprocess (mirrors test_import_hygiene.py's
+    `test_judge_modules_stay_torch_free`) so an
     earlier test's own torch import in this same process can't make an
     in-process `sys.modules` check meaningless.
     """

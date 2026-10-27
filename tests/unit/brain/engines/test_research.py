@@ -587,16 +587,6 @@ def test_research_log_load_missing_returns_empty(tmp_path: Path) -> None:
     assert log.fires == ()
 
 
-def test_research_log_load_corrupt_returns_empty(tmp_path: Path) -> None:
-    """Corrupt file is healed to empty via json_io's HEAL recovery; fires == ()."""
-    from brain.engines.research import ResearchLog
-
-    path = tmp_path / "research_log.json"
-    path.write_text("{{{not json", encoding="utf-8")
-    log = ResearchLog.load(path)
-    assert log.fires == ()
-
-
 def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog) -> None:
     """Corrupt primary is quarantined and a WARNING is emitted."""
     import logging
@@ -606,7 +596,8 @@ def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog)
     caplog.set_level(logging.WARNING)
     path = tmp_path / "research_log.json"
     path.write_text("{{{not json", encoding="utf-8")
-    ResearchLog.load(path)
+    log = ResearchLog.load(path)
+    assert log.fires == ()  # healed to an empty log
     corrupt_files = list(tmp_path.glob("research_log.json.corrupt-*"))
     assert len(corrupt_files) == 1
     warn_msgs = [r.getMessage() for r in caplog.records if "ResearchLog anomaly" in r.getMessage()]

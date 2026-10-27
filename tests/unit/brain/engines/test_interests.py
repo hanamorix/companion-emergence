@@ -134,8 +134,9 @@ def test_interestset_load_corrupt_quarantines_restores_from_bak(tmp_path: Path):
     assert len(corrupt_files) == 1
 
 
-def test_interestset_load_corrupt_no_bak_resets_to_default(tmp_path: Path):
-    """Corrupt live file + no .bak → reset to default (empty), anomaly with reset_to_default."""
+def test_interestset_load_corrupt_no_bak_resets_to_default(tmp_path: Path, caplog):
+    """Corrupt live file + no .bak → reset to default (empty), anomaly with reset_to_default; the public
+    `load` returns the same empty set and logs the anomaly."""
     path = tmp_path / "interests.json"
     path.write_text("{corrupt json{{", encoding="utf-8")
 
@@ -145,12 +146,13 @@ def test_interestset_load_corrupt_no_bak_resets_to_default(tmp_path: Path):
     assert anomaly.action == "reset_to_default"
     assert result.interests == ()
 
-
-def test_interestset_load_corrupt_falls_back(tmp_path: Path):
-    bad = tmp_path / "interests.json"
-    bad.write_text("not valid{", encoding="utf-8")
-    loaded = InterestSet.load(bad, default_path=DEFAULT_INTERESTS_PATH)
+    public = tmp_path / "public" / "interests.json"
+    public.parent.mkdir()
+    public.write_text("not valid{", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        loaded = InterestSet.load(public, default_path=DEFAULT_INTERESTS_PATH)
     assert loaded.interests == ()
+    assert any("InterestSet anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_interestset_load_valid_file(tmp_path: Path):

@@ -128,21 +128,16 @@ def _errors_naming(caplog, memory: Memory) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.levelno >= logging.ERROR and memory.id in r.getMessage()]
 
 
+# Which exception classes are environment or item faults is `failure_scope`'s table (utils/test_failure_scope.py);
+# the consolidation code only branches on the verdict, so two of each (a sqlite error and an OS error, a sqlite
+# error and a plain value error) run both queue branches here.
 _ENVIRONMENT_FAULTS = [
     sqlite3.OperationalError("database is locked"),
     OSError(errno.ENOSPC, "No space left on device"),
-    OSError(errno.EIO, "Input/output error"),
-    PermissionError("denied"),
-    TimeoutError("slow"),
-    sqlite3.DatabaseError("database disk image is malformed"),
-    sqlite3.OperationalError("no such table: memories"),
 ]
 _ITEM_FAULTS = [
     sqlite3.ProgrammingError("Error binding parameter 1"),
-    sqlite3.DataError("string or blob too big"),
-    TypeError("Object of type object is not JSON serializable"),
     ValueError("bad value"),
-    RuntimeError("boom"),
 ]
 
 

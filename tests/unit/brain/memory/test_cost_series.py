@@ -905,20 +905,19 @@ def _production_series():
 
 
 @pytest.mark.parametrize("which", range(6))
-@pytest.mark.parametrize("flushed", [True, False])
 def test_cs1_each_production_series_counts_a_sample_for_exactly_the_window(
-    store: MemoryStore, clock: Clock, which: int, flushed: bool
+    store: MemoryStore, clock: Clock, which: int
 ) -> None:
     """CS1a on EACH of the six series' own objects (not the generic class): the
     estimate at t0 + W - 1 is the independent least-squares fit, at exactly t0 + W
-    the samples no longer count."""
+    the samples no longer count. Flushed samples only: the six are plain `CostSeries` objects, and the generic
+    test_cs1a_ carries both the flushed and the buffered-only variant."""
     name, series, key = _production_series()[which]
     assert series.name == name
     points = [(1000, 0.3), (3000, 0.7), (2000, 0.5001)]
     for x, y in points:
         series.record(store, key, x, y)
-    if flushed:
-        cost_series.flush(store)
+    cost_series.flush(store)
     clock.now = T0 + W - 1
     _assert_fit(series.fit(store, key), points)
     clock.now = T0 + W
@@ -967,12 +966,11 @@ def test_cs6e_window_counts_also_reads_the_database_before_the_buffer(
 
 
 @pytest.mark.parametrize("which", range(6))
-@pytest.mark.parametrize("flushed", [True, False])
 def test_cs1b_each_production_series_counts_only_the_later_samples_when_the_earlier_age_out(
-    store: MemoryStore, clock: Clock, which: int, flushed: bool
+    store: MemoryStore, clock: Clock, which: int
 ) -> None:
     """Parent CS1b on EACH series' own object: samples at t0 and at t0 + W/2; at t0 + W only the
-    later ones count (independent least-squares fit of them alone)."""
+    later ones count (independent least-squares fit of them alone). Flushed samples only (see the CS1a test)."""
     _name, series, key = _production_series()[which]
     early = [(1000, 0.3), (3000, 0.7)]
     later = [(2000, 0.5), (4000, 0.9)]
@@ -981,8 +979,7 @@ def test_cs1b_each_production_series_counts_only_the_later_samples_when_the_earl
     clock.now = T0 + W / 2
     for x, y in later:
         series.record(store, key, x, y)
-    if flushed:
-        cost_series.flush(store)
+    cost_series.flush(store)
     clock.now = T0 + W
     _assert_fit(series.fit(store, key), later)
 

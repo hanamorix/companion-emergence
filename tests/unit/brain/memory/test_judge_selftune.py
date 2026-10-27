@@ -22,10 +22,7 @@ own TODO(F2c inc3+) marker).
 from __future__ import annotations
 
 import inspect
-import subprocess
-import sys
 import tempfile
-import textwrap
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import mock_open
@@ -1010,75 +1007,6 @@ def test_tick_fault_during_fit_leaves_rows_unconsumed(
     assert sorted(post_row_ids) == sorted(ids)
 
 
-def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
-    """I6 / AC8 (off hot path): the scaffold, INCLUDING a FIRING tick that
-    actually runs F2c inc3's real knob-refit training code (assembly +
-    `fit_platt_knob` + persist), must never pull torch/sentence_transformers
-    into `sys.modules` — that stays scoped to the future LoRA/full-FT
-    tiers (inc5/6), never to the knob-refit this increment ships.
-
-    Red-team fix F-3 (inc2, still honored here): the prior version of this
-    test grepped `judge_selftune`'s own source TEXT for the literal strings
-    "import torch" / "import sentence_transformers". That only proves this
-    one module has no such import statement in it — it would NOT catch a
-    TRANSITIVE pull via some other module `judge_selftune` imports (e.g. a
-    future change to `brain.memory.reranker` or `brain.memory.store`
-    growing a module-scope torch import). This runs a FRESH subprocess —
-    never inheriting whatever this test PROCESS's own earlier tests may
-    already have imported into `sys.modules`, which would make an
-    in-process `sys.modules` check meaningless (the same caveat
-    `test_relevance_judge.py`'s sibling import-scope test documents) — that
-    imports `judge_selftune`, seeds enough `calibration_log` rows (WITH raw
-    judge scores, so the knob-refit has real pairs to fit — inc3's fire
-    path now actually trains, not just consumes) to FIRE the >handful
-    gate, actually runs `_run_judge_selftune_tick` end to end, and only
-    THEN asserts neither package landed in `sys.modules`.
-    """
-    script = textwrap.dedent(
-        """
-        import sys
-        from datetime import UTC, datetime
-
-        from brain.memory import judge_selftune
-        from brain.memory.store import MemoryStore
-
-        store = MemoryStore(db_path=":memory:")
-        handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
-        for i in range(handful + 1):
-            store.log_calibration_sample(
-                query=f"q{i}",
-                candidate_ids=["m"],
-                reranker_scores=[1.0],
-                reranker_model_id="m",
-            )
-            row_id = store._conn.execute(
-                "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()["id"]
-            store.write_calibration_labels(
-                row_id, ["relevant"], ["relevant"], local_judge_raw_score=[2.0]
-            )
-
-        result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
-        assert result["fired"] is True, result
-        assert store.get_judge_knob_calibration(judge_selftune.MODEL_RELEVANCE_JUDGE) is not None
-
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-
-
 # ---------------------------------------------------------------------------
 # AC9: the durable Haiku-oracle note must be present in F2c's OWN training
 # code location (relevance_judge.py's own copy is covered by that module's
@@ -1286,31 +1214,3 @@ def test_fit_platt_knob_anti_correlated_data_falls_back_to_identity_not_negative
     slope, intercept = judge_selftune.fit_platt_knob(pairs)
     assert slope == pytest.approx(1.0), "must fall back to the identity slope, never a negative one"
     assert intercept == pytest.approx(0.0)
-
-
-def test_fit_platt_knob_does_not_import_torch() -> None:
-    """AC8: the fit function itself, exercised directly (not only via the
-    tick), must never import torch -- pure numpy only."""
-    script = textwrap.dedent(
-        """
-        import sys
-        from brain.memory import judge_selftune
-
-        pairs = [(-3.0, "irrelevant"), (3.0, "relevant")]
-        slope, intercept = judge_selftune.fit_platt_knob(pairs)
-        assert isinstance(slope, float) and isinstance(intercept, float)
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"

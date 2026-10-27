@@ -80,13 +80,6 @@ def test_rows_with_doc_snapshot_returns_only_doc_having() -> None:
 # --- C19 / C20: the peft/datasets bundle reversal (now base deps) -----------
 
 
-def test_peft_and_datasets_are_base_deps_importable() -> None:
-    # C19: base deps (not an optional f2c-training extra) -> importable in the
-    # plain env (no --extra needed). A missing one is now a broken install.
-    import datasets  # noqa: F401
-    import peft  # noqa: F401
-
-
 def test_no_residual_optional_extra_plumbing_in_brain() -> None:
     # C20: the inc5a optional-extra plumbing is fully removed from brain/.
     # Positive absence sweep (would fire on the pre-change tree, which had

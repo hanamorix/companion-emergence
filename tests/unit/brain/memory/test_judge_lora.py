@@ -24,9 +24,6 @@ the dominant cost, not training on top of it.
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -455,41 +452,6 @@ def test_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Path) -> N
     second = train_and_score()
     assert first == second
 
-
-
-# ---------------------------------------------------------------------------
-# I6/AC8 — importing this module never pulls torch into sys.modules.
-# ---------------------------------------------------------------------------
-
-
-def test_module_import_does_not_import_torch_or_sentence_transformers() -> None:
-    """Mirrors `test_judge_eval.py`'s identical fresh-subprocess proof:
-    merely importing `judge_lora` (module top level, plus its class/
-    function definitions -- none of which call any of the lazy-imported
-    training/reload functions) never pulls torch/sentence_transformers/
-    peft/datasets into `sys.modules`.
-    """
-    script = textwrap.dedent(
-        """
-        import sys
-
-        import brain.memory.judge_lora  # noqa: F401
-
-        for heavy in ("torch", "sentence_transformers", "peft", "datasets"):
-            assert heavy not in sys.modules, f"{heavy} imported merely by importing judge_lora: {sorted(sys.modules)}"
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
 
 
 # ---------------------------------------------------------------------------

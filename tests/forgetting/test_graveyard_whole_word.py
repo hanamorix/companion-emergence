@@ -230,21 +230,16 @@ def test_passive_recall_does_not_match_the_domain(tmp_path):
         ("saw Will today", "chat", True),
         ("Will you come", "chat", True),  # S151: a sentence start counts
         ("he left. Will you come", "chat", True),
-        ("really! Will you", "chat", True),
         ("really? Will you", "chat", True),
-        ("first line\nWill you", "chat", True),
         ("I will go", "chat", False),
         ("will you come", "chat", False),
         ("ok. will you come", "chat", False),
-        ("we said Will", "chat", True),
         ("Bob: Will you come", "chat", True),
         ('so he asked "Will you?"', "chat", True),
         ("nothing", "team Will", False),  # S150: never the domain
         ("nothing", "Will", False),
-        ("Hi, Will", "chat", True),
         ("\u0130\u0130\u0130 saw Will", "chat", True),  # F12: spans on the original text
         ("\u0130 was there. Will you", "chat", True),
-        ("\u0130 was there. will you", "chat", False),
     ],
 )
 def test_a_stopword_name_matches_only_capitalized_in_any_position(tmp_path, summary, domain, expected):

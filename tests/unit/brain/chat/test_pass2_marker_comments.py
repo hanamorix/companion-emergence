@@ -139,20 +139,6 @@ class TestPositiveControlDiscriminatesScope:
         )
         assert not _marker_present_in_function_with_issue_ref(planted, "some_function")
 
-    def test_marker_strictly_inside_body_is_accepted_by_the_checker(self, tmp_path):
-        planted = tmp_path / "planted3.py"
-        planted.write_text(
-            textwrap.dedent(
-                f"""\
-                def some_function():
-                    # {MARKER}: repeats on crash. See {ISSUE_REF}.
-                    return 1
-                """
-            ),
-            encoding="utf-8",
-        )
-        assert _marker_present_in_function_with_issue_ref(planted, "some_function")
-
     def test_trailing_comment_after_last_statement_is_outside_end_lineno(self, tmp_path):
         """round-7 trailing-edge guard: end_lineno is the LAST STATEMENT's
         line; a comment after it, even at the same indentation, is NOT

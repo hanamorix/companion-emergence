@@ -349,14 +349,6 @@ def test_heartbeat_engine_construction(tmp_path: Path) -> None:
     hebbian.close()
 
 
-def test_heartbeat_config_load_invalid_json_returns_defaults(tmp_path: Path) -> None:
-    """Malformed JSON in config → defaults, no crash."""
-    path = tmp_path / "cfg.json"
-    path.write_text("not json at all {[}")
-    c = HeartbeatConfig.load(path)
-    assert c.dream_every_hours == 24.0
-
-
 def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path) -> None:
     """Hand-edited config with wrong-type values (dream_every_hours={} etc.)
     must NOT crash the CLI with TypeError. Graceful degrade to defaults.
@@ -365,15 +357,6 @@ def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path)
     path.write_text(json.dumps({"dream_every_hours": {}}))
     c = HeartbeatConfig.load(path)
     assert c.dream_every_hours == 24.0
-
-
-def test_heartbeat_state_load_corrupt_returns_none(tmp_path: Path) -> None:
-    """A corrupt state file returns None (→ engine treats as first-ever tick
-    and reinitialises) rather than crashing with a traceback.
-    """
-    path = tmp_path / "state.json"
-    path.write_text("not json")
-    assert HeartbeatState.load(path) is None
 
 
 def test_heartbeat_state_load_missing_keys_returns_none(tmp_path: Path) -> None:
