@@ -50,7 +50,6 @@ Run by hand with network enabled, e.g.:
 from __future__ import annotations
 
 import math
-import time
 
 import pytest
 
@@ -222,7 +221,20 @@ def test_real_reranker_orders_genuine_above_decoy_across_sample(real_provider) -
     )
 
 
-def test_real_fp16_reranker_loads_and_scores() -> None:
+@pytest.fixture(scope="module")
+def fp16_provider(real_provider):
+    """The fp16 export as a provider. The factory's default is the fp16 export, so ``real_provider`` already is one
+    and is reused (one ONNX session load for the module, not two); only when the ambient ``reranker.precision``
+    selects fp32 is the fp16 provider built directly, which keeps this proof independent of that tunable."""
+    if real_provider.model_id() == _FP16_MODEL_ID:
+        return real_provider
+    from brain.paths import get_cache_dir
+
+    _register_fp16_reranker_model(_FP16_MODEL_ID, _MODEL_ID)
+    return CrossEncoderProvider(model_id=_FP16_MODEL_ID, cache_dir=get_cache_dir())
+
+
+def test_real_fp16_reranker_loads_and_scores(fp16_provider) -> None:
     """F2a inc2 (#250 §2) acceptance criterion #2's REAL-load proof: the
     fp16 onnx export (``onnx/model_fp16.onnx`` on the SAME jina HF repo,
     ~557MB) registers via ``TextCrossEncoder.add_custom_model()`` and
@@ -236,16 +248,14 @@ def test_real_fp16_reranker_loads_and_scores() -> None:
     real-load proof now backs that default path directly rather than one
     branch of a self-check's decision.
 
-    Deliberately constructs the fp16 provider DIRECTLY (not via
-    ``build_reranker_provider()``) so this test is independent of
+    Uses the ``fp16_provider`` fixture, which is independent of
     `reranker.precision`'s live tunable state (whatever it happens to be
-    set to locally) — this is purely "does the fp16 export load and score
-    cleanly," the same shape as ``test_real_reranker_loads_and_scores``
-    above but for the fp16 candidate specifically."""
-    from brain.paths import get_cache_dir
-
-    _register_fp16_reranker_model(_FP16_MODEL_ID, _MODEL_ID)
-    provider = CrossEncoderProvider(model_id=_FP16_MODEL_ID, cache_dir=get_cache_dir())
+    set to locally): the module's own provider when that already is the
+    fp16 export, else one built directly — this is purely "does the fp16
+    export load and score cleanly," the same shape as
+    ``test_real_reranker_loads_and_scores`` above but for the fp16
+    candidate specifically."""
+    provider = fp16_provider
 
     query = "how do I calm down when everything feels like too much"
     docs = [
@@ -253,12 +263,9 @@ def test_real_fp16_reranker_loads_and_scores() -> None:
         "deep breathing helps when you are feeling anxious",  # genuine
     ]
 
-    start = time.monotonic()
     scores = provider.rerank(query, docs)
-    elapsed = time.monotonic() - start
 
-    print(f"\njina fp16 real reranker load+score time: {elapsed:.2f}s")
-    print(f"jina fp16 real reranker scores: {list(zip(docs, scores, strict=True))}")
+    print(f"\njina fp16 real reranker scores: {list(zip(docs, scores, strict=True))}")
 
     assert provider.model_id() == _FP16_MODEL_ID
     assert isinstance(scores, list), "rerank() must return a list, not a lazy iterable/generator"

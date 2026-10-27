@@ -1,10 +1,12 @@
-"""C7 real-brain proof for the drop-in capability — NETWORK-ENABLED, EXCLUDED from the CI marker set.
+"""C7 real-brain proof for the drop-in capability — NETWORK-ENABLED.
 
-Marked ``@pytest.mark.integration`` so it is deselected by the default
-``-m "not live and not requires_claude_cli and not integration"`` run. It ingests the REAL ``brain``
-in this worktree with ``deps="auto"`` (``uv pip install -e`` — needs network/build backend) and proves,
-end to end, that the drop-in venv + startup hook resolve ``brain`` from the copy and fail loud on a
-shadowing source. Run by hand with the network enabled; record the result in ``8-harness.md``.
+Marked ``@pytest.mark.integration`` so the local pre-check gate
+``-m "not live and not requires_claude_cli and not integration"`` deselects it. The CI workflow
+(``.github/workflows/test.yml``) runs bare ``pytest`` with no ``-m`` filter, so it DOES run there, on all three
+operating systems. It ingests the REAL ``brain`` in this worktree with ``deps="auto"`` (``uv pip install -e`` —
+needs network/build backend) and proves, end to end, that the drop-in venv + startup hook resolve ``brain`` from
+the copy and fail loud on a shadowing source. The install is the expensive part (about 50 s on the Windows
+runner), so one module fixture does it once and both tests use that build; neither test changes it.
 
 NOT run by the offline builder. Out of scope here (F4 residual): whether the external ``claude`` CLI
 escalates a dead ``brain-tools`` MCP child into a run-abort vs proceeding tool-less — that needs a live
@@ -32,10 +34,14 @@ def _worktree_root() -> Path:
     return root
 
 
-def test_c7_real_brain_positive_resolves_under_copy_and_boots(tmp_path: Path) -> None:
-    src = _worktree_root()
-    dest = tmp_path / "dropin"
-    build = ingest_version(src, dest, on_existing="delete", deps="auto", install_guard=True)
+@pytest.fixture(scope="module")
+def build(tmp_path_factory: pytest.TempPathFactory):
+    """The drop-in copy of the real brain with its venv, installed once for the module."""
+    dest = tmp_path_factory.mktemp("dropin") / "dropin"
+    return ingest_version(_worktree_root(), dest, on_existing="delete", deps="auto", install_guard=True)
+
+
+def test_c7_real_brain_positive_resolves_under_copy_and_boots(build, tmp_path: Path) -> None:
 
     # POSITIVE: the venv python imports the REAL brain + brain.mcp_server, resolving under the copy
     # (hook ran and passed; deps installed so the import succeeds).
@@ -77,10 +83,8 @@ def test_c7_real_brain_positive_resolves_under_copy_and_boots(tmp_path: Path) ->
             server.kill()
 
 
-def test_c7_real_brain_negative_shadowed_source_exits_loud(tmp_path: Path) -> None:
+def test_c7_real_brain_negative_shadowed_source_exits_loud(build, tmp_path: Path) -> None:
     src = _worktree_root()
-    dest = tmp_path / "dropin"
-    build = ingest_version(src, dest, on_existing="delete", deps="auto", install_guard=True)
 
     # NEGATIVE: point PYTHONPATH at the worktree source (a DIFFERENT real brain checkout, outside the
     # copy). The hook must make the process exit non-zero and loud.

@@ -19,7 +19,6 @@ REPO = Path(__file__).resolve().parents[2]
 MODULE_GROUPS = {
     "tests/integration/test_systemd_install.py": ("systemd", "one fixed unit name in the one real user manager"),
     "tests/unit/brain/memory/test_embedding_real_model.py": ("hf-cache", "the shared Hugging Face cache"),
-    "tests/unit/brain/memory/test_embedding_tokens_real.py": ("hf-cache", "the shared Hugging Face cache"),
     "tests/unit/brain/memory/test_relevance_judge_real_model.py": ("hf-cache", "the shared Hugging Face cache"),
     "tests/unit/brain/memory/test_reranker_real_model.py": ("hf-cache", "the shared Hugging Face cache"),
     "tests/unit/brain/memory/test_reranker_tokenizer_real.py": ("hf-cache", "the shared Hugging Face cache"),
