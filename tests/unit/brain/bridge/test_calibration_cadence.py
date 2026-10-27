@@ -1,11 +1,10 @@
-"""Tests for the calibration_cadence.json persisted-cadence wiring (F2a #250
+"""Tests for the calibration tick and its persisted-cadence wiring (F2a #250
 inc5, spec Section 5).
 
-Mirrors test_compaction_cadence.py's coverage for the 4th sibling cadence:
-  - calibration_cadence.json is created and advances after a tick fires.
-  - is_due fires when the cadence is past its next_at (86400s interval).
   - _run_calibration_tick is importable and has the expected signature.
-  - run_folded accepts calibration_interval_s as a keyword argument.
+  - run_folded takes calibration_interval_s and compaction_interval_s, each defaulting to a day.
+  (The cadence file itself, "last ran now" on a missing file, due-ness at the interval and the save/load round trip
+  are held by test_central_cadence.py and test_persisted_cadence.py, which every gated job shares.)
 
 Plus the acceptance-5b retention-pruning test: after simulating logs spanning
 more than the retention window, the tick prunes old rows while rows inside
@@ -17,7 +16,7 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.bridge import persisted_cadence as pc
+import pytest
 
 
 def test_run_calibration_tick_importable_and_callable():
@@ -51,47 +50,15 @@ def test_run_calibration_tick_importable_and_callable():
     assert judge_param.default is None
 
 
-def test_calibration_cadence_missing_is_created_as_last_ran_now():
-    """ram-spike-fix INC-9 (S22/S69): calibration is a gated job, so a missing
-    cadence file is created as "last ran now" (next_at = now + interval) and
-    the job is NOT due — it first runs one full interval later."""
-    with tempfile.TemporaryDirectory() as d:
-        pd = Path(d)
-        now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state, created = pc.load_or_init_cadence(
-            pd, "calibration_cadence.json", now=now, interval_s=86400.0
-        )
-        assert created is True
-        assert state.next_at == now + timedelta(seconds=86400.0)
-        assert pc.is_due(state, now=now) is False
-        assert pc.load_cadence(pd, "calibration_cadence.json").next_at == state.next_at
-
-
-def test_calibration_cadence_not_due_after_advance_and_fires_at_86400():
-    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-    state = pc.advance(now=now, interval_s=86400.0)
-    assert pc.is_due(state, now=now) is False
-    assert pc.is_due(state, now=now + timedelta(seconds=86400)) is True
-
-
-def test_calibration_cadence_save_load_round_trip():
-    with tempfile.TemporaryDirectory() as d:
-        pd = Path(d)
-        now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state = pc.advance(now=now, interval_s=86400.0)
-        pc.save_cadence(pd, "calibration_cadence.json", state)
-        loaded = pc.load_cadence(pd, "calibration_cadence.json")
-        assert loaded.next_at == state.next_at
-        assert not list(pd.glob("*.tmp")), "atomic write must leave no .tmp"
-
-
-def test_run_folded_accepts_calibration_interval_s():
+@pytest.mark.parametrize("parameter", ["calibration_interval_s", "compaction_interval_s"])
+def test_run_folded_defaults_the_calibration_and_compaction_intervals_to_a_day(parameter):
     from brain.bridge.supervisor import run_folded
 
     sig = inspect.signature(run_folded)
-    assert "calibration_interval_s" in sig.parameters
-    param = sig.parameters["calibration_interval_s"]
-    assert param.default == 86400.0, f"expected default 86400.0, got {param.default!r}"
+    assert parameter in sig.parameters
+    assert sig.parameters[parameter].default == 86400.0, (
+        f"expected default 86400.0, got {sig.parameters[parameter].default!r}"
+    )
 
 
 def test_calibration_tick_skips_entirely_when_a_session_is_busy():

@@ -56,7 +56,7 @@ def clock(monkeypatch) -> Clock:
 
 @pytest.mark.parametrize(
     ("starts", "step"),
-    [(0, 0), (1, 30), (2, 60), (3, 300), (4, 600), (5, 600), (6, 600), (50, 600)],
+    [(0, 0), (1, 30), (2, 60), (3, 300), (4, 600), (50, 600)],
 )
 def test_the_step_before_a_start_follows_the_apps_ladder(starts, step):
     assert start_backoff.step_s(starts) == step

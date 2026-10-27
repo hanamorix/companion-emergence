@@ -333,6 +333,17 @@ class _FakeProviderForTagger:
         return "fake-tagger"
 
 
+def test_run_emotion_backfill_with_neither_tagger_nor_provider_raises(tmp_path):
+    """The default tagger needs a provider: a missing one is an error at the call, not a tagger that swallows the
+    failure and tags every memory to nothing."""
+    import pytest
+
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+
+    with pytest.raises(ValueError, match="tagger_fn or a provider"):
+        run_emotion_backfill(tmp_path, tagger_fn=None, provider=None, cap=50, delay_s=0)
+
+
 def test_default_tagger_path_tags_memories_via_provider(tmp_path):
     """Production-seam test: tagger_fn=None uses the injected provider, not a bad import.
 

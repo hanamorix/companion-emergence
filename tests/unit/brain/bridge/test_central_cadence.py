@@ -347,7 +347,9 @@ def test_c15a_all_17_due_run_in_s55_order_real_table(tmp_path, stubs):
     assert runs == list(GATED_JOB_ORDER)
 
 
-@pytest.mark.parametrize("j", range(len(GATED_JOB_ORDER)))
+# The loop asks is-chat-idle in one place before every job (no per-job branch), so the first and second job, one in
+# the middle and the last stand for all 21; the real-table test below pins the calibration boundary.
+@pytest.mark.parametrize("j", [0, 1, len(GATED_JOB_ORDER) // 2, len(GATED_JOB_ORDER) - 1])
 def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     log: list[str] = []
     asked: list[int] = []
@@ -360,6 +362,32 @@ def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     assert log == list(GATED_JOB_ORDER[:j])
     assert len(asked) == j + 1, "is-chat-idle must be asked again before every job"
     assert (decisions[-1].job, decisions[-1].action) == (GATED_JOB_ORDER[j], "skip-no-lull")
+
+
+def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tmp_path, stubs, monkeypatch):
+    """The real emotion_backfill job hands the backfill a provider built for the background-classifier tier
+    (the behaviour the source-text check in test_emotion_backfill_model_tier.py pins by reading supervisor.py)."""
+    from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
+
+    persona_dir = _persona(tmp_path)
+    built: list[tuple] = []
+    given: dict = {}
+    provider = FakeProvider()
+
+    def build(pd, tier, *a, **k):
+        built.append((pd, tier))
+        return provider
+
+    def run(pd, **kwargs):
+        given.update(kwargs)
+        return SimpleNamespace(status="complete")
+
+    monkeypatch.setattr(supervisor, "build_tier_provider", build)
+    monkeypatch.setattr(supervisor, "_emotion_backfill_run", run)
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "emotion_backfill")
+    assert job.run() is JobOutcome.COMPLETED
+    assert built == [(persona_dir, TIER_BACKGROUND_CLASSIFIER)]
+    assert given["provider"] is provider
 
 
 def test_c15a_idle_flip_real_table_stops_before_calibration(tmp_path, stubs):

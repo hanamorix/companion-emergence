@@ -52,8 +52,10 @@ def test_mcp_tools_path_budget_flag_and_graceful(tmp_path, monkeypatch):
     assert "limit" in resp.content.lower() or "continue" in resp.content.lower()
 
 
-def test_chat_with_images_path_budget_flag_and_graceful(tmp_path, monkeypatch):
-    """_chat_with_images: flag present + over-budget frame handled gracefully."""
+def test_chat_with_a_persona_dir_and_an_image_message_budget_flag_and_graceful(tmp_path, monkeypatch):
+    """The text path with a persona dir (stream-json output, no tools), for a message that carries an image: the
+    image transport is gone, the image is flattened into the text, and the flag is present with the over-budget
+    frame handled gracefully."""
     import hashlib
 
     from brain.bridge.chat import ImageBlock
@@ -75,7 +77,7 @@ def test_chat_with_images_path_budget_flag_and_graceful(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setitem(__import__("sys").modules, "mcp", __import__("types").ModuleType("mcp"))
 
-    # Build a fake image so _chat_with_images can be reached
+    # Build a fake image so the message carries an image block
     persona = tmp_path / "persona"
     images_dir = persona / "images"
     images_dir.mkdir(parents=True)

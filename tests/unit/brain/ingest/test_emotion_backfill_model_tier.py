@@ -1,16 +1,11 @@
-"""Tests for #154's model-tier fix to brain.ingest.emotion_backfill — C3/C5/C7.
+"""Tests for #154's model-tier routing of brain.ingest.emotion_backfill.
 
-C3: the usage-log label for emotion_backfill's tagger must derive from the real
-    model the constructed provider used, not a disconnected hardcoded literal.
-C5: `_make_default_tagger`'s `if provider is None` fallback branch — confirmed
-    dead in production (the live caller, supervisor.py, always supplies a
-    provider) — must source its model from `model_for_tier(TIER_BACKGROUND_
-    CLASSIFIER)`, the SAME single source of truth the live path now uses,
-    rather than a separately-hardcoded, potentially-divergent literal.
-C7: the oracle must be shown able to fail — this file's
-    `test_supervisor_call_site_names_the_classifier_tier` fails against the
-    PRE-#154 source (read via `git show`) and passes against the post-#154
-    source, proving it is not vacuously true.
+The live call site (`brain/bridge/supervisor.py`) must build the backfill's provider for the
+background-classifier tier. The behaviour check is
+`tests/unit/brain/bridge/test_central_cadence.py::test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier`;
+this file keeps the source-text check of the same call site and its oracle:
+`test_supervisor_call_site_names_the_classifier_tier` fails against the PRE-#154 source (read via `git show`) and
+passes against the post-#154 source, proving it is not vacuously true.
 """
 from __future__ import annotations
 
@@ -20,62 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, model_for_tier
-from brain.bridge.provider import ClaudeCliProvider
-from brain.ingest.emotion_backfill import _make_default_tagger
-
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SUPERVISOR_PATH = _REPO_ROOT / "brain" / "bridge" / "supervisor.py"
-
-
-class _RecordingProvider:
-    """A minimal stand-in exposing `.generate()` and a `._model` attribute, so
-    the wiring can be verified without shelling out to a live `claude` CLI."""
-
-    def __init__(self, model: str) -> None:
-        self._model = model
-        self.generate_calls: list[tuple[str, str | None]] = []
-
-    def generate(self, prompt: str, *, system: str | None = None, persona_dir=None) -> str:
-        self.generate_calls.append((prompt, system))
-        return "{}"
-
-
-def test_tagger_uses_exactly_the_provider_it_was_given(tmp_path):
-    """Wiring check: whatever provider `run_emotion_backfill`'s caller supplies
-    is the ONE the tagger actually calls .generate() on — no silent fallback to
-    a different object. Combined with `build_tier_provider`'s own test (that it
-    constructs a real Haiku ClaudeCliProvider), this proves the live path is
-    honest end-to-end without needing a real subprocess spawn here."""
-    provider = _RecordingProvider(model="haiku")
-    tagger = _make_default_tagger(provider)
-
-    class _Mem:
-        content = "a memory about the ocean"
-
-    tagger(_Mem())
-    assert len(provider.generate_calls) == 1
-
-
-def test_make_default_tagger_dead_branch_sources_from_model_for_tier(monkeypatch):
-    """C5: the `provider is None` fallback branch (confirmed dead in production —
-    the live caller always supplies a provider) constructs its ClaudeCliProvider
-    for the background-classifier JOB, so the model it runs is whatever
-    `model_for_tier(TIER_BACKGROUND_CLASSIFIER)` returns at call time — no
-    separately-hardcoded literal to drift out of sync."""
-    captured: dict[str, object] = {}
-    real_init = ClaudeCliProvider.__init__
-
-    def _capturing_init(self, tier="interactive-chat", *, probe_model=None, timeout_seconds=60):
-        captured["tier"] = tier
-        real_init(self, tier, probe_model=probe_model, timeout_seconds=timeout_seconds)
-
-    monkeypatch.setattr(ClaudeCliProvider, "__init__", _capturing_init)
-
-    _make_default_tagger(None)
-
-    assert captured["tier"] == TIER_BACKGROUND_CLASSIFIER
-    assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 
 def _emotion_backfill_call_site_tier(supervisor_src: str) -> str | None:

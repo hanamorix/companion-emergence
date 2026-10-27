@@ -200,8 +200,12 @@ def test_own_kill_freezes_kills_the_bridge_first_then_the_tree_and_commits(tmp_p
     assert len(objects) == 1  # (h) one psutil.Process object for the bridge, from the check to the kill
 
 
-@pytest.mark.parametrize("sig", ["SIGTERM", "SIGHUP", "SIGINT"])
-@pytest.mark.parametrize("when", ["before_bridge_kill", "after_bridge_suspend"])
+# One handler is installed on all three stop signals in one loop (kill.py), so the signal is not a branch: each
+# signal runs once, and both code positions run.
+@pytest.mark.parametrize(
+    ("sig", "when"),
+    [("SIGTERM", "before_bridge_kill"), ("SIGHUP", "after_bridge_suspend"), ("SIGINT", "before_bridge_kill")],
+)
 def test_a_signal_after_the_freeze_before_the_bridge_kill_resumes_everything(tmp_path, fake, sig, when):
     """C45 (a iii, g): the intent is deleted and every suspended process runs again."""
     b = fake()
@@ -369,8 +373,7 @@ def test_owned_bridge_ignoring_the_request_gets_the_manager_then_the_helper_kill
     assert b.all_gone()
 
 
-@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
-@pytest.mark.parametrize("when", ["hard_exit_wait", "manager"])
+@pytest.mark.parametrize(("sig", "when"), [("SIGTERM", "hard_exit_wait"), ("SIGINT", "manager")])
 def test_a_signal_during_the_wait_or_the_manager_call_freezes_nothing_and_deletes_the_intent(
     tmp_path, fake, owned, monkeypatch, sig, when
 ):

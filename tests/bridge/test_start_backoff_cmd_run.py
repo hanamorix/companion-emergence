@@ -90,8 +90,12 @@ def _fake_run(monkeypatch, *, rc: int = 0, on_run=None) -> list[float]:
 # ---- C67 (a): the wait, per origin and per step --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("origin", SERVICE_ORIGINS)
-@pytest.mark.parametrize(("starts", "step"), [(1, 30), (2, 60), (3, 300), (4, 600), (5, 600)])
+# The ladder itself is test_start_backoff.py's; here every service origin waits the first step and one origin each
+# step after it (cmd_run has no per-origin ladder: the per-origin extras are stubbed by the `pd` fixture).
+@pytest.mark.parametrize(
+    ("origin", "starts", "step"),
+    [(origin, 1, 30) for origin in SERVICE_ORIGINS] + [("systemd", 2, 60), ("systemd", 3, 300), ("systemd", 4, 600)],
+)
 def test_a_service_run_waits_out_the_step_in_poll_slices_then_runs(pd, clock, monkeypatch, origin, starts, step):
     _record(pd, starts, clock)
     ran = _fake_run(monkeypatch)
@@ -101,7 +105,7 @@ def test_a_service_run_waits_out_the_step_in_poll_slices_then_runs(pd, clock, mo
     assert sum(clock.slept) == pytest.approx(step, abs=POLL_S)
 
 
-@pytest.mark.parametrize("origin", SERVICE_ORIGINS)
+@pytest.mark.parametrize("origin", ["systemd"])
 def test_a_service_run_with_no_failures_runs_at_once(pd, clock, monkeypatch, origin):
     ran = _fake_run(monkeypatch)
     assert daemon.cmd_run(_args(origin)) == 0

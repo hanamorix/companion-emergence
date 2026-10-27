@@ -262,7 +262,8 @@ def test_cmd_start_reports_a_failed_service_start_at_once(pd, monkeypatch, capsy
     assert "service start failed" in err and "Job for the unit failed." in err
 
 
-@pytest.mark.parametrize("origin", ["systemd", "launchd", "task-scheduler"])
+# `guard_fires` reads only the stop intent (a crash writes none) and never the origin, so one origin is enough.
+@pytest.mark.parametrize("origin", ["systemd"])
 def test_a_crashed_service_bridge_is_not_held_back_by_the_guard(pd, gone_pid, ran, monkeypatch, origin):
     """Review R2-S1: a crash writes no stop intent, so the service manager's restart (`supervisor run`) runs."""
     monkeypatch.setattr(respawn_guard, "_platform", lambda: "linux")
