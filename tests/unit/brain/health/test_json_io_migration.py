@@ -1,9 +1,10 @@
 """The behaviour changes a migrated caller sees (BC of 2-plan-phase2.md), each pinned on a REAL migrated function.
 
 Test names start with the BC id. Only the BC pins that no module test repeats are here (BC2, BC3, BC4, BC6, BC7,
-BC10, BC11, BC14, BC15, BC16, BC17, BC19, BC20); BC1, BC5, BC8, BC9, BC12, BC13, BC18, BC21 and BC22 are held by
-test_json_io.py, test_migrated_group_b.py / _c.py / _d.py and test_parse_failures.py. Characterization pins (BC2,
-BC10 and BC11 first halves, BC16, BC19) say so: an existing or module test passes through the new call and cannot be
+BC10, BC11, BC14, BC15, BC16, BC17, BC20); BC1, BC5, BC8, BC9, BC12, BC13, BC18, BC21 and BC22 are held by
+test_json_io.py, test_migrated_group_b.py / _c.py / _d.py and test_parse_failures.py; BC19 (the deleted names stay
+undefined) is a line of tests/unit/test_removed_names_stay_removed.py. Characterization pins (BC2,
+BC10 and BC11 first halves, BC16) say so: an existing or module test passes through the new call and cannot be
 red before green. Every other test asserts new behaviour and fails against the old code path. Nothing here touches a
 persona directory.
 """

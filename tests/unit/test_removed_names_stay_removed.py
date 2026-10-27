@@ -72,7 +72,8 @@ _MOVED_WRITERS = (
     "save_bytes_atomic",
     "save_blob_once",
 )
-_MOVED_ALTERNATION = "|".join(re.escape(n) for n in _MOVED_WRITERS)
+# A route through attempt_heal to ANY writer of the shared module, save_with_backup_text included, is a shim.
+_MOVED_ALTERNATION = "|".join(re.escape(n) for n in (*_MOVED_WRITERS, "save_with_backup_text"))
 
 REMOVED: tuple[Removed, ...] = (
     # --- extended thinking (v0.0.26) ---------------------------------------------------------------------------------
@@ -206,8 +207,15 @@ REMOVED: tuple[Removed, ...] = (
         ref="f7c5f359 feat(judge_selftune): wire the LoRA/full-FT weight-retrain tick lifecycle (F2c inc5b-2)",
     ),
     Removed(
-        names=("_Deadline", "threading", "interrupt", "deadline"),
-        why="the name-budget search no longer interrupts a statement or tracks a deadline, and the store holds no thread machinery (CS8b)",
+        names=("_Deadline", "interrupt", "deadline"),
+        why="the name-budget search no longer interrupts a statement or tracks a deadline (CS8b)",
+        ref=_ST_REF,
+        scope=("brain/memory/store.py",),
+        ignore_case=True,
+    ),
+    Removed(
+        names=("threading",),
+        why="the memory store holds no thread machinery after the name-budget rework (CS8b)",
         ref=_ST_REF,
         kind="code",
         scope=("brain/memory/store.py",),
@@ -412,7 +420,7 @@ REMOVED: tuple[Removed, ...] = (
         allow=("brain/utils/atomic_write.py",),
     ),
     Removed(
-        names=("os.replace", "uuid", re.compile(r"\.new\b")),
+        names=("os.replace", "uuid", ".new"),
         why="the blob modules write through save_blob_once: no replace, no uuid and no new temp name of their own (#465, G4a)",
         ref=_ATOMIC_REF,
         scope=("brain/images.py", "brain/file_store.py"),
@@ -515,6 +523,9 @@ def find_reappeared(entries: tuple[Removed, ...], texts: dict[str, str], trees: 
             if not (repo / scope).exists():
                 problems.append(f"entry scope {scope!r} no longer exists: delete or re-scope the entry ({label})")
         files = [rel for rel in sorted(texts) if _under(rel, entry.scope) and not _under(rel, entry.allow)]
+        if not files or (entry.kind == "code" and not any(rel in trees for rel in files)):
+            problems.append(f"entry scope {entry.scope} holds no scanned {'python ' if entry.kind == 'code' else ''}file: fix the scope ({label})")
+            continue
         if entry.kind == "text":
             regexes = _text_regexes(entry)
             for rel in files:
@@ -552,6 +563,8 @@ def test_removed_names_stay_removed() -> None:
     """Nothing listed in ``REMOVED`` has come back; a failure names each name, where it reappeared and why it was removed."""
     texts = _scanned_texts()
     assert "brain/tunables.py" in texts and "app/src/App.tsx" in texts, "the scan did not read the source tree"
+    # The consolidation entry is a regex over this section header; if the header is renamed the regex would match nothing.
+    assert "[engines.consolidation]" in texts["brain/prompt_strings.toml"], "update the consolidation-section entry of REMOVED"
     problems = find_reappeared(REMOVED, texts, dict(tree_asts("brain")), REPO)
     assert not problems, (
         "Removed code has reappeared. If it is intended, delete its line from REMOVED in tests/unit/test_removed_names_stay_removed.py; "

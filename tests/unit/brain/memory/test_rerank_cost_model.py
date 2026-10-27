@@ -375,7 +375,8 @@ def test_c1a_iv_short_message_after_a_long_one_gets_a_wider_rerank(clock: _Clock
 
 
 # ---------------------------------------------------------------------------
-# C1a (v): the hourly machinery is gone.
+# C1a (v): the RAM headroom reader stays. (The hourly width machinery that was removed is listed in
+# tests/unit/test_removed_names_stay_removed.py.)
 # ---------------------------------------------------------------------------
 
 

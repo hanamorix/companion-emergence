@@ -1,8 +1,8 @@
 """F2c inc5b-2 — the re-score store extraction + the peft/datasets bundle.
 
 Covers: the accept-path re-score set (`judge_knob_refit_rescore_items`) and
-the 2B doc-having subset (`rows_with_doc_snapshot`); plus C19 (peft/datasets
-are base deps) + C20 (no residual optional-extra plumbing in brain/).
+the 2B doc-having subset (`rows_with_doc_snapshot`). (That the optional-extra plumbing, C20, stays out of
+brain/ is listed in tests/unit/test_removed_names_stay_removed.py.)
 """
 
 from __future__ import annotations
@@ -73,7 +73,3 @@ def test_rows_with_doc_snapshot_returns_only_doc_having() -> None:
     got = store.rows_with_doc_snapshot([r_doc, r_absent])
     assert got == [r_doc]
     assert store.rows_with_doc_snapshot([]) == []
-
-
-# --- C19 / C20: the peft/datasets bundle reversal (now base deps) -----------
-

@@ -7,7 +7,7 @@ smoothing and bootstrap-CI stability gate that used to sit on top of the
 raw fit, and re-points the daily fit from the full multi-day retention pool
 to a single day (the most recently completed one). This file's coverage
 was rewritten accordingly: `ema_update`/`stability_gate_accepts`/
-`_bootstrap_ci` no longer exist (see the dead-code test below), and
+`_bootstrap_ci` no longer exist (listed in tests/unit/test_removed_names_stay_removed.py), and
 `derive_and_persist_floor`'s own cold-start branch (bundled-pair fit,
 unconditionally persisted) is gone, replaced by a data-starvation backstop.
 `get_bootstrap_floor` (the SEPARATE, still-standing rerank bootstrap, now computed at process start) and
@@ -216,13 +216,6 @@ def test_derive_retention_window_days_never_collapses_below_two_days() -> None:
     against the registered tunable's own (non-negative) default, not just
     a hand-picked safe input."""
     assert derive_retention_window_days() >= 2.0
-
-
-# ---------------------------------------------------------------------------
-# Dead code (acceptance criterion 6): the EMA layer, the bootstrap-CI
-# stability gate, and their now-unused constants must be genuinely GONE
-# from the module, not merely unused.
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
