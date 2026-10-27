@@ -505,25 +505,35 @@ def test_the_chat_choice_follows_the_effective_id(persona_dir, model_override) -
 
 
 # ---------------------------------------------------------------------------
-# C38: no import cycle, whichever module is imported first
+# C38: no import cycle, in the import orders that differ
 # ---------------------------------------------------------------------------
 
 # Every fresh interpreter imports all of these; only the module imported FIRST varies.
-_MODULES = ["brain.bridge.model_error", "brain.bridge.model_tier", "brain.bridge.provider", "brain.bridge.persona_state", "brain.tunables"]
-# Three first imports are enough, read off the import graph: importing any `brain.bridge.X` first runs
-# `brain/bridge/__init__.py` first, which imports provider, which loads model_error, model_tier and tunables in one
-# fixed order, so model_error-, model_tier-, provider- and persona_state-first are the same load sequence (the cycle
-# between model_error and model_tier is broken by the function-scoped `from brain.bridge import model_error` in
-# model_tier.py `model_for_tier` and `set_job_models`); tunables-first is the one other order (tunables imports nothing from brain.bridge).
-# persona_state stands for "a consumer the chain does not load". The premise is checked, not assumed: the bridge
-# entries first import the bare package and assert that provider was loaded by it; if that fails the five orders are
-# different again.
+_MODULES = [
+    "brain.bridge.model_error",
+    "brain.bridge.model_tier",
+    "brain.bridge.provider",
+    "brain.bridge.persona_state",
+    "brain.tunables",
+]
+# Three first imports are enough, read off the import graph. Importing any `brain.bridge.X` first runs
+# `brain/bridge/__init__.py` first, which imports provider, which loads tunables, model_error and model_tier in one fixed
+# order, so model_error-, model_tier- and provider-first are the same load sequence (the cycle between model_error and
+# model_tier is broken by the function-scoped `from brain.bridge import model_error` in model_tier.py `model_for_tier` and
+# `set_job_models`), and persona_state-first is that sequence plus its own imports (nothing in the chain imports it).
+# tunables-first is the one other order (tunables imports nothing from brain.bridge). So there are two distinct orders
+# today; the third entry is persona_state, the one module the chain does not load. The premise is checked, not assumed:
+# the bridge entries first import the bare package and assert that the chain was loaded by it; if that fails the five
+# orders are different processes again and the dropped entries (model_tier, provider) must be restored.
 _FIRST = ["brain.bridge.model_error", "brain.bridge.persona_state", "brain.tunables"]
 _PREMISE = (
     "import sys\n"
     "import brain.bridge\n"
-    "assert 'brain.bridge.provider' in sys.modules, 'importing brain.bridge no longer imports provider, so the import "
-    "orders are different again: restore the first-import entries model_tier and provider'\n"
+    "_missing = [m for m in ('brain.bridge.provider', 'brain.bridge.model_error', 'brain.bridge.model_tier', "
+    "'brain.tunables') if m not in sys.modules]\n"
+    "if _missing:\n"
+    "    raise SystemExit(f'importing brain.bridge no longer loads {_missing}, so the import orders are different "
+    "again: restore the first-import entries model_tier and provider')\n"
 )
 
 
