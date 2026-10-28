@@ -58,6 +58,7 @@ def test_calibration_tick_skips_entirely_when_a_session_is_busy():
         )
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on ubuntu in CI (wall 1.0 s); #540, J12')
 def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
     """Acceptance 5b: after simulating calibration_log rows spanning more than
     the retention window (many synthetic day_buckets), the daily tick prunes
@@ -117,6 +118,7 @@ def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
         assert all(b >= cutoff for b in remaining_buckets)
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.4 s); #540, J12')
 def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committed(
     monkeypatch,
 ):
@@ -192,6 +194,7 @@ def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committ
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.5 s); #540, J12')
 def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkeypatch):
     """The tick must derive a floor for the CURRENT production reranker's
     model_id (`resolve_reranker_model_id()`), not a stale or
@@ -225,6 +228,7 @@ def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkey
         )
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.5 s); #540, J12')
 def test_calibration_tick_floor_derivation_failure_does_not_crash_the_tick(monkeypatch):
     """Spec Section 5/6's 'must not crash the tick or the bridge' fault-
     isolation posture extends to inc7's floor-derivation step too — wrapped

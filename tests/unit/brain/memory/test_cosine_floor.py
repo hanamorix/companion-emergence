@@ -502,6 +502,7 @@ def _seed_skewed_day(store: MemoryStore, *, relevant_fraction: float, seed: int)
                     scale=COSINE_SCORE_SCALE)
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on windows in CI (wall 1.3 s); #540, J12')
 @pytest.mark.parametrize(("fraction", "seed"), [(0.7, 1), (0.8, 3), (0.95, 2)])
 def test_a_skewed_overlapping_cosine_day_never_persists_a_gates_nothing_floor(
     store: MemoryStore, fraction: float, seed: int

@@ -64,6 +64,7 @@ def _window() -> float:
     )
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.2 s); #540, J12')
 def test_the_tick_removes_old_records_and_keeps_newer_ones(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -76,6 +77,7 @@ def test_the_tick_removes_old_records_and_keeps_newer_ones(
     assert _tags(tmp_path) == {"recent", "today"}
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.1 s); #540, J12')
 def test_the_prune_runs_after_the_calibration_log_and_before_the_labeling_step(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -105,6 +107,7 @@ def test_the_prune_runs_after_the_calibration_log_and_before_the_labeling_step(
     assert order == ["calibration_prune", "diagnostics_prune", "label"]
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on windows in CI (wall 1.6 s); #540, J12')
 def test_the_prune_still_runs_when_the_labeling_step_pauses_and_the_tick_reports_paused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -117,6 +120,7 @@ def test_the_prune_still_runs_when_the_labeling_step_pauses_and_the_tick_reports
     assert _tags(tmp_path) == {"today"}
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.1 s); #540, J12')
 def test_the_prune_still_runs_when_the_labeling_step_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -129,6 +133,7 @@ def test_the_prune_still_runs_when_the_labeling_step_raises(
     assert _tags(tmp_path) == {"today"}
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on windows in CI (wall 1.5 s); #540, J12')
 @pytest.mark.parametrize("breakage", ["prune_raises", "path_raises"])
 def test_a_prune_failure_is_caught_and_the_rest_of_the_tick_runs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, breakage: str

@@ -21,7 +21,7 @@ _REASON = "test-suite machinery (#540): checks how the suite itself runs, which 
 # The number of `@pytest.mark.slow(...)` decorators under tests/. It can only go down: when a slow test is made fast and its
 # mark removed, lower this number to the count the failure message shows. Raising it is a one-number edit that shows in the
 # diff of the PR that adds a slow test, which is the point.
-PINNED_SLOW_MARKS = 94
+PINNED_SLOW_MARKS = 115
 
 
 @pytest.mark.no_base_failure(reason=_REASON)

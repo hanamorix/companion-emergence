@@ -7,10 +7,6 @@ name: timing
 # fails the job, but nothing waits for it. Artifact `timing-report-<os>` holds the report and the junit file.
 
 on:
-  # TEMPORARY (#540 proof run, removed in the next commit): a workflow that is not on main cannot be dispatched.
-  pull_request:
-    paths:
-      - .github/workflows/timing.yml
   schedule:
     - cron: "17 5 * * 0" # Sundays 05:17 UTC
   workflow_dispatch:
@@ -44,12 +40,7 @@ jobs:
 
       - name: Run the suite
         shell: bash
-        env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          target=()
-          if [ "$EVENT" = "pull_request" ]; then target=(tests/unit/scripts/test_timing_report.py); fi # TEMPORARY (#540 proof)
-          uv run pytest -n auto --dist loadgroup -p no:tdd-guard --tb=short --durations=0 --junitxml=pytest-junit.xml "${target[@]}"
+        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard --tb=short --durations=0 --junitxml=pytest-junit.xml
 
       - name: Write the timing report
         if: always()
