@@ -44,9 +44,17 @@ from tests.shared_settings import (
 )
 from tests.source_tree import REPO, brain_trees
 
-_NBF = pytest.mark.no_base_failure(
-    reason="#531 guard: the checkers and the fixtures are new test infrastructure; each fixture passes or fails on the old "
-    "product code alike, because the product code under test is the test's own synthetic source or the tree as it stands"
+# Only tests that pass on the pre-change code by design are exempt from tests/no_base_failure's "must fail on the base"
+# rule (scripts/new_tests_fail_on_base.py), each with the reason that applies to it. The real-tree test
+# (`test_real_tree_findings_equal_the_allow_list`) carries no mark: it fails on any tree that holds a copy the list does not name.
+_NBF_SYNTHETIC = pytest.mark.no_base_failure(
+    reason="#531 guard: a checker (tests/shared_settings.py) or the ratchet logic run over a source or a list this test builds; "
+    "the product code is not an input, so the test passes on the pre-change code and on any other"
+)
+_NBF_TREE_SNAPSHOT = pytest.mark.no_base_failure(
+    reason="#531 guard: asserts a property of the tree that the pre-change tree already has (model vocabulary entries still match, "
+    "settings are derived, no model-rule finding, the app files' alias words, the connection panel); it records that state, "
+    "it does not test a change"
 )
 
 # ---------------------------------------------------------------------------
@@ -233,34 +241,34 @@ _VIOLATING_G2_GET_TUNABLE = {
 }
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_VIOLATING_G2_GET_TUNABLE))
 def test_fixture_g2_a_get_tunable_result_is_not_a_model_accessor_result(name: str) -> None:
     """Only the MODEL accessors may feed ``--model``: a tunable of any other key is not the model setting."""
     assert "G2" in {f.rule for f in check_all(_VIOLATING_G2_GET_TUNABLE[name], _MODULE, SETTINGS)}, name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_CONFORMING) + sorted(_CONFORMING_GET_TUNABLE))
 def test_fixture_conforming_model_and_accessor_source_passes_every_rule(name: str) -> None:
     source = _CONFORMING.get(name) or _CONFORMING_GET_TUNABLE[name]
     assert check_all(source, _MODULE, SETTINGS) == []
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_VIOLATING))
 def test_fixture_violating_model_source_is_flagged(name: str) -> None:
     flagged = check_all(_VIOLATING[name], _MODULE, SETTINGS)
     assert flagged, f"fixture {name!r} was not flagged by any rule"
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_VIOLATING_GET_TUNABLE))
 def test_fixture_get_tunable_copy_that_outlives_the_call_is_flagged_by_r4(name: str) -> None:
     assert "R4" in {f.rule for f in check_all(_VIOLATING_GET_TUNABLE[name], _MODULE, SETTINGS)}, name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_g5_model_key_is_the_model_cases_and_set_values_is_r1d() -> None:
     """The model key literal is G5; ``set_values`` ownership is R1(d): the fold function only, not its file."""
     fold = "from brain import tunables\ndef _fold(legacy, complete):\n    tunables.set_values({'a': 1}, only_if_default=True)\n"
@@ -276,13 +284,13 @@ def test_fixture_g5_model_key_is_the_model_cases_and_set_values_is_r1d() -> None
     assert check_g5("KEY = 'model.interactive_chat'\n", "brain/bridge/model_tier.py") == []
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_the_one_probe_site_may_use_probe_model() -> None:
     src = "from brain.bridge.provider import ClaudeCliProvider\ndef _check_model_blocking(x):\n    return ClaudeCliProvider(probe_model=x)\n"
     assert check_g4(src, "brain/bridge/server.py") == []
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_g1_allow_entry_is_shape_specific() -> None:
     """C19: a real literal in an allow-listed file in a non-label shape fails; in the label shape it passes."""
     label = "def f(deps):\n    return DCallRow(model_tier_used='sonnet')\n"
@@ -295,7 +303,7 @@ def test_fixture_g1_allow_entry_is_shape_specific() -> None:
     assert ("initiate/reflection.py", "sonnet", "label_keyword") not in used
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_g1_does_not_flag_unrelated_claude_words() -> None:
     src = "A = 'claude-cli'\nB = 'claude-config'\nC = 'claude-work'\nD = 'claude-tool'\nE = 'the claude CLI'\n"
     assert check_g1(src, "brain/x.py") == []
@@ -341,13 +349,13 @@ _R1_CONFORMING = {
 }
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R1_VIOLATING))
 def test_fixture_r1_write_is_flagged(name: str) -> None:
     assert "R1" in _rules(_R1_VIOLATING[name]), name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R1_CONFORMING))
 def test_fixture_r1_conforming_source_passes_every_rule(name: str) -> None:
     source, path = _R1_CONFORMING[name]
@@ -388,20 +396,20 @@ _R2_CONFORMING = {
 }
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R2_VIOLATING))
 def test_fixture_r2_same_name_is_flagged(name: str) -> None:
     assert "R2" in _rules(_R2_VIOLATING[name]), name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R2_CONFORMING))
 def test_fixture_r2_conforming_source_passes_every_rule(name: str) -> None:
     source, path = _R2_CONFORMING[name]
     assert _findings(source, path) == [], name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_group_prefix_is_removed_only_from_a_group_and_only_when_two_words_remain() -> None:
     """The prefixes the move to dev_constants added (ATTUNEMENT_, KINDLED_LINK_, JUDGE_TUNE_GRADE_) hide the natural name from
     an exact name match. A leading run of name words shared by at least three dev constants is a group prefix; the name
@@ -481,26 +489,26 @@ _R3_COLLECTION_CONFORMING = {
 }
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R3_VIOLATING))
 def test_fixture_r3_distinctive_value_is_flagged(name: str) -> None:
     assert "R3" in _rules(_R3_VIOLATING[name]), name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R3_LOOSE_VIOLATING))
 def test_fixture_r3_loose_value_with_the_settings_words_is_flagged(name: str) -> None:
     assert "R3-loose" in _rules(_R3_LOOSE_VIOLATING[name]), name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R3_COLLECTION_VIOLATING))
 def test_fixture_r3_collection_of_the_same_elements_is_flagged_once(name: str) -> None:
     flagged = [f for f in _findings(_R3_COLLECTION_VIOLATING[name]) if f.rule == "R3-collection"]
     assert len(flagged) == 1 and flagged[0].settings == ("dev_constants.IMAGE_KINDS",), name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize(
     "name",
     [f"value:{n}" for n in sorted(_R3_CONFORMING)]
@@ -513,7 +521,7 @@ def test_fixture_r3_conforming_source_passes_every_rule(name: str) -> None:
     assert _findings(source, path) == [], name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_r3_reports_one_finding_per_site_naming_every_setting_that_shares_the_value() -> None:
     flagged = _findings("def f():\n    return 20 * 1024 * 1024\n")
     assert [f.rule for f in flagged] == ["R3"]
@@ -521,19 +529,19 @@ def test_fixture_r3_reports_one_finding_per_site_naming_every_setting_that_share
     assert flagged[0].site == "in f" and flagged[0].line == 2
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_r3_distinctive_wins_over_loose_at_one_site() -> None:
     """B6: a literal that is distinctive AND bound to the setting's words is reported once, as the precise rule."""
     flagged = _findings("def f():\n    upload_ceiling = 20971520\n    return upload_ceiling\n")
     assert [f.rule for f in flagged] == ["R3"]
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_r3_a_model_tunables_string_is_the_model_cases_not_r3() -> None:
     assert {f.rule for f in _findings("X = 'claude-test-9'\n")} == {"G1"}
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_r3_loose_names_only_the_settings_whose_words_match() -> None:
     """The loose tier lists the settings whose value AND words match, not every setting that shares the value."""
     flagged = _findings("def f():\n    retry_wait = 12\n    return retry_wait\n")
@@ -582,20 +590,20 @@ _R5_CONFORMING = {
 }
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R4B_VIOLATING))
 def test_fixture_r4b_literal_default_of_get_tunable_is_flagged(name: str) -> None:
     assert "R4b" in _rules(_R4B_VIOLATING[name]), name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R4B_CONFORMING) + sorted(_R5_CONFORMING))
 def test_fixture_r4b_and_r5_conforming_source_passes_every_rule(name: str) -> None:
     source, path = (_R4B_CONFORMING[name], _MODULE) if name in _R4B_CONFORMING else _R5_CONFORMING[name]
     assert _findings(source, path) == [], name
 
 
-@_NBF
+@_NBF_SYNTHETIC
 @pytest.mark.parametrize("name", sorted(_R5_VIOLATING))
 def test_fixture_r5_alias_and_default_are_flagged(name: str) -> None:
     rule, source = _R5_VIOLATING[name]
@@ -607,7 +615,7 @@ def test_fixture_r5_alias_and_default_are_flagged(name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_derive_settings_reads_dev_constants_and_every_register_call(tmp_path) -> None:
     import ast
 
@@ -655,7 +663,7 @@ def test_fixture_derive_settings_reads_dev_constants_and_every_register_call(tmp
 # ---------------------------------------------------------------------------
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_app_numbers_folds_products_and_skips_comments_strings_and_test_modules() -> None:
     ts = "const A = 20 * 1024 * 1024;\n// 99999\nconst B = '12345' + 1_000 * 20;\n/* 77777\n 88888 */ const C = 0.5 * 4;\n"
     assert app_numbers(ts, "ts") == [(1, 20971520), (3, 20000), (5, 2.0)]
@@ -665,7 +673,7 @@ def test_fixture_app_numbers_folds_products_and_skips_comments_strings_and_test_
     assert app_numbers("x20 = 0x1F + 1e5 + 1024u64 + 3.14\n", "rust") == [(1, 3.14)]
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_app_flags_a_numeric_mirror_of_a_setting_in_typescript_and_rust() -> None:
     ts = app_findings("const MAX_BYTES = 20 * 1024 * 1024;\n", "app/src/a.ts", "ts", SETTINGS, alias_allowed=False)
     rs = app_findings("const MAX: u64 = 20 * 1024 * 1024;\n", "app/src-tauri/src/a.rs", "rust", SETTINGS, alias_allowed=False)
@@ -674,13 +682,13 @@ def test_fixture_app_flags_a_numeric_mirror_of_a_setting_in_typescript_and_rust(
         assert flagged[0].settings == ("dev_constants.UPLOAD_CEILING_BYTES", "tunables:area.upload_cap")
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_app_flags_a_distinctive_string_and_passes_round_numbers_and_plain_words() -> None:
     assert [f.rule for f in app_findings("const F = 'widget_store.db';\n", "app/src/a.ts", "ts", SETTINGS, alias_allowed=False)] == ["APP-R3"]
     assert app_findings("const T = 60; const S = 'strict'; const D = 86400; const M = 20 * 1024;\n", "app/src/a.ts", "ts", SETTINGS, alias_allowed=False) == []
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_fixture_app_tokenizer_flags_model_ids_and_ignores_comments_prose_and_claude_cli() -> None:
     src = (
         "// const A = 'claude-sonnet-5'\n"
@@ -713,7 +721,7 @@ def _entry(rule="R3", file="brain/a.py", site="in f", settings=("dev_constants.A
     return (rule, file, site, tuple(settings), reason)
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_ratchet_a_finding_that_is_not_listed_fails_and_names_rule_file_site_and_settings() -> None:
     problems = ratchet_problems([_finding(), _finding(file="brain/b.py", site="assign X", settings=("dev_constants.A", "tunables:k"))], [_entry()], 1)
     assert len(problems) == 1
@@ -722,19 +730,19 @@ def test_ratchet_a_finding_that_is_not_listed_fails_and_names_rule_file_site_and
     assert "not in ALLOW" in text
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_ratchet_a_listed_entry_without_a_finding_fails_and_says_delete_it() -> None:
     problems = ratchet_problems([], [_entry(), _entry(file="brain/gone.py")], 2)
     assert len(problems) == 2 and all("delete" in p for p in problems) and any("brain/gone.py" in p for p in problems)
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_ratchet_is_a_multiset_a_second_copy_at_a_listed_site_is_new() -> None:
     assert len(ratchet_problems([_finding(), _finding()], [_entry()], 1)) == 1
     assert ratchet_problems([_finding(), _finding()], [_entry(), _entry()], 2) == []
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_ratchet_size_must_equal_the_list_and_says_whether_it_grew_or_shrank() -> None:
     grown = ratchet_problems([_finding()], [_entry()], 0)
     shrunk = ratchet_problems([_finding()], [_entry()], 3)
@@ -743,13 +751,13 @@ def test_ratchet_size_must_equal_the_list_and_says_whether_it_grew_or_shrank() -
     assert ratchet_problems([_finding()], [_entry()], 1) == []
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_ratchet_an_entry_without_a_reason_fails() -> None:
     assert len(ratchet_problems([_finding()], [_entry(reason="")], 1)) == 1
     assert len(ratchet_problems([_finding()], [_entry(reason="   ")], 1)) == 1
 
 
-@_NBF
+@_NBF_SYNTHETIC
 def test_ratchet_counts_findings_by_identity_without_line_numbers() -> None:
     """An edit that moves a copy to another line does not break the list; the line is only in the message."""
     assert ratchet_problems([_finding(line=10)], [_entry()], 1) == []
@@ -793,14 +801,13 @@ def scan() -> tuple[Settings, list[Finding], frozenset[tuple[str, str, str]]]:
     return settings, findings, used
 
 
-@_NBF
 def test_real_tree_findings_equal_the_allow_list(scan) -> None:
     _settings, findings, _used = scan
     problems = ratchet_problems(findings, ALLOW, ALLOW_SIZE)
     assert not problems, "the shared-settings guard (#531):\n" + "\n".join(problems)
 
 
-@_NBF
+@_NBF_TREE_SNAPSHOT
 def test_every_model_vocabulary_entry_still_matches_something_at_its_shape(scan) -> None:
     """C19: the model case's vocabulary list cannot rot. An entry that matches nothing at its shape fails (delete it)."""
     _settings, _findings_, used = scan
@@ -808,7 +815,7 @@ def test_every_model_vocabulary_entry_still_matches_something_at_its_shape(scan)
     assert unused == [], f"stale model vocabulary entries (no match at their shape): {unused}"
 
 
-@_NBF
+@_NBF_TREE_SNAPSHOT
 def test_the_scan_derives_both_kinds_of_setting_from_the_tree(scan) -> None:
     """The scan is not vacuous: settings of both kinds were derived. (Without it a derivation that finds nothing, and an
     ALLOW list shrunk to nothing, would pass the real-tree test with no setting guarded.)"""
@@ -817,7 +824,7 @@ def test_the_scan_derives_both_kinds_of_setting_from_the_tree(scan) -> None:
     assert settings.tunables, "no tunables.register call was derived from brain/"
 
 
-@_NBF
+@_NBF_TREE_SNAPSHOT
 def test_no_model_rule_finding_is_ever_allow_listed(scan) -> None:
     """The #529 model rules are not ratcheted: no model id or alias word is chosen outside the accessor (G1, G2, G4, G5), held
     by the app outside the picker vocabulary (APP-MODEL), or kept from a model accessor beyond the call (R4), and no
@@ -831,7 +838,7 @@ def test_no_model_rule_finding_is_ever_allow_listed(scan) -> None:
     assert [e for e in ALLOW if is_model_finding(e[0], e[2], e[3])] == []
 
 
-@_NBF
+@_NBF_TREE_SNAPSHOT
 def test_app_alias_vocabulary_entries_still_hold_an_alias_word() -> None:
     """C19 for the app: a file allowed to hold the picker's alias words that holds none any more must leave the list."""
     for rel in APP_ALIAS_ALLOW:
@@ -841,7 +848,7 @@ def test_app_alias_vocabulary_entries_still_hold_an_alias_word() -> None:
         assert words, f"{rel} holds no alias-word token any more: remove it from APP_ALIAS_ALLOW"
 
 
-@_NBF
+@_NBF_TREE_SNAPSHOT
 def test_the_connection_panel_no_longer_defaults_the_picker_to_sonnet() -> None:
     text = (REPO / "app" / "src" / "components" / "panels" / "ConnectionPanel.tsx").read_text(encoding="utf-8")
     assert '?? "sonnet"' not in text
