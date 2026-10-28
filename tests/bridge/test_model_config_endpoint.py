@@ -19,6 +19,7 @@ from brain import dev_constants, tunables
 from brain.bridge import model_error, server
 from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT
 from brain.bridge.server import build_app
+from tests.thread_support import finish_threads
 from tests.tunables_file import differing_from_defaults
 
 _CHAT = "model.interactive_chat"
@@ -238,7 +239,7 @@ def test_concurrent_saves_run_their_checks_one_at_a_time(tmp_path, monkeypatch) 
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            finish_threads(t)
     assert results == [200, 200, 200] and live["max"] == 1
 
 

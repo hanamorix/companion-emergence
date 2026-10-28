@@ -34,6 +34,7 @@ from brain.memory.cost_series import (
     fit_linear,
 )
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 
 W = dev_constants.COST_SERIES_WINDOW_S
 T0 = 1_000_000.0
@@ -568,7 +569,7 @@ def test_cs6a_no_lost_update_when_a_second_flush_starts_inside_the_first(
     monkeypatch.setattr(a, "_cost_record_hook", hook)
     try:
         assert cost_series.flush(a) == 2
-        started[0].join(60)
+        finish_threads(started[0])
         assert not b_error, b_error
         _, carried = a.cost_series_state(series.name, "test-machine", "m", now=clock.now, window_seconds=W)
         n = a._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0]
@@ -780,9 +781,9 @@ def test_cs6c_concurrent_records_and_flushes_lose_no_sample(store: MemoryStore, 
         for w in workers:
             w.start()
         for w in workers:
-            w.join(60)
+            finish_threads(w)
         stop.set()
-        bg.join(60)
+        finish_threads(bg)
     finally:
         sys.setswitchinterval(previous)
     assert not errors, errors
@@ -814,7 +815,7 @@ def test_cs6c_the_take_out_is_atomic_against_a_record_made_while_it_runs(
 
     monkeypatch.setattr(cost_series, "_pending", Interleaving(cost_series._pending))
     assert cost_series.flush(store) == 1
-    threads[0].join(10)
+    finish_threads(threads[0])
     assert cost_series.flush(store) == 1, "the sample made during the take-out was kept for the next flush"
     assert store._conn.execute("SELECT COUNT(*) FROM cost_series_samples").fetchone()[0] == 2  # noqa: SLF001
 

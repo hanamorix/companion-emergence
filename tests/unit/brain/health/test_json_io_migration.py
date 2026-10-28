@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.thread_support import finish_threads
+
 NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
 
 
@@ -137,7 +139,7 @@ def test_bc11_a_save_with_verify_restores_bak1_and_waits_for_a_heal_in_progress(
         t = threading.Thread(target=lambda: (HeartbeatConfig().save(path), done.set()))
         t.start()
         assert not done.wait(0.3), "a save must wait for the heal lock"
-    t.join(5)
+    finish_threads(t)
     assert done.is_set() and json.loads(path.read_text())
 
 
@@ -168,12 +170,14 @@ def test_bc15_an_append_between_a_rewriters_read_and_replace_is_not_lost(tmp_pat
     def slow_read(pd):
         out = real(pd)
         started.set()
-        finish.wait(2)
+        finish.wait()
         return out
 
     emit.read_candidates = slow_read
+    threads: list[threading.Thread] = []
     try:
         remover = threading.Thread(target=emit.remove_candidate, args=(tmp_path, target))
+        threads.append(remover)
         remover.start()
         assert started.wait(2)
         appender = threading.Thread(
@@ -181,11 +185,14 @@ def test_bc15_an_append_between_a_rewriters_read_and_replace_is_not_lost(tmp_pat
                 tmp_path, kind="message", source="dream", source_id="late", semantic_context=SemanticContext()
             )
         )
+        threads.append(appender)
         appender.start()
         finish.set()
-        remover.join(5)
-        appender.join(5)
+        finish_threads(remover)
+        finish_threads(appender)
     finally:
+        finish.set()  # whatever assert ended the test early, no thread stays parked on the gate
+        finish_threads(*threads)
         emit.read_candidates = real
     ids = {c.source_id for c in real(tmp_path)}
     assert "late" in ids and target not in {c.candidate_id for c in real(tmp_path)}

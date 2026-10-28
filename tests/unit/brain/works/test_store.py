@@ -9,6 +9,7 @@ import pytest
 
 from brain import works
 from brain.works.store import WorksStore
+from tests.thread_support import finish_threads
 
 
 def _w(
@@ -308,7 +309,7 @@ def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10.0)
+        finish_threads(t)
 
     assert errors == [], f"unexpected errors: {errors[:3]}"
     # Exactly one row in works AND exactly one in works_fts

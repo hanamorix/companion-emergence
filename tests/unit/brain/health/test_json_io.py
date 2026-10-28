@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from brain.utils.atomic_write import save_with_backup_text
+from tests.thread_support import finish_threads, release_at_teardown
 
 POSIX = os.name == "posix"
 
@@ -1054,7 +1055,7 @@ def test_cr9_d_a_save_started_during_the_heal_waits_and_lands_after_it(
 
     _seam_hook(monkeypatch, inside_heal=start_writer)
     r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
-    state["thread"].join(5)
+    finish_threads(state["thread"])
     assert r.data == {"restored": True}
     assert state["alive_during_heal"] is True, "the save did not wait for the heal"
     assert "error" not in state["box"]
@@ -1121,7 +1122,7 @@ def _hold_shared_lock_in_thread(path: Path):
     def hold():
         with file_lock(path):
             acquired.set()
-            release.wait(10)
+            release.wait()
 
     t = threading.Thread(target=hold, daemon=True)
     t.start()
@@ -1140,7 +1141,7 @@ def test_cr14_heal_completes_while_another_descriptor_holds_the_shared_lock(tmp_
         assert box["result"] == {"restored": True}
     finally:
         release.set()
-        t.join(5)
+        finish_threads(t)
 
 
 def test_cr14_heal_save_and_if_missing_complete_while_the_same_thread_holds_the_shared_lock(
@@ -1432,10 +1433,10 @@ def test_cw2_concurrent_writers_raise_nothing_and_leave_a_whole_file_and_no_temp
     for t in threads:
         t.start()
     for t in threads:
-        t.join(60)
+        finish_threads(t)
     stop.set()
     if POSIX:
-        rt.join(10)
+        finish_threads(rt)
     assert errors == [] and seen_bad == []
     assert "w" in json.loads(p.read_text())
     assert not list(tmp_path.glob("*.new"))
@@ -1774,7 +1775,7 @@ def test_cw12_two_threads_racing_to_create_exactly_one_wins(tmp_path: Path) -> N
     for t in threads:
         t.start()
     for t in threads:
-        t.join(10)
+        finish_threads(t)
     assert sorted(results) == [False, True]
     assert json.loads(p.read_text())["winner"] in (0, 1)
 
@@ -2157,7 +2158,7 @@ def test_ca2_concurrent_appends_from_threads_and_a_process_lose_nothing(tmp_path
     for t in threads:
         t.start()
     for t in threads:
-        t.join(60)
+        finish_threads(t)
     assert child.wait(60) == 0
     rows = jio.read_jsonl(p)
     assert len(rows) == 8 * 25 + 25
@@ -2173,8 +2174,8 @@ def test_ca2_block_waits_while_another_handle_holds_the_lock(tmp_path: Path) -> 
         assert not p.exists() or p.read_bytes() == b""
     finally:
         release.set()
-        holder.join(5)
-    worker.join(5)
+        finish_threads(holder)
+    finish_threads(worker)
     assert box.get("result") == len(jio.encode_jsonl({"a": 1}))
     assert jio.read_jsonl(p) == [{"a": 1}]
 
@@ -2187,7 +2188,7 @@ def test_ca2_try_returns_none_and_writes_nothing_when_the_lock_is_busy(tmp_path:
         assert not p.exists() or p.read_bytes() == b""
     finally:
         release.set()
-        holder.join(5)
+        finish_threads(holder)
     assert jio.append_jsonl(p, {"a": 1}, lock="try") is not None
 
 
@@ -2444,7 +2445,7 @@ def test_cr9_f_a_plain_reader_arriving_mid_heal_waits_and_never_gets_the_default
     assert jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=_policy(policy)) == {
         "restored": True
     }
-    state["thread"].join(5)
+    finish_threads(state["thread"])
     assert state["early"] != {"DEFAULT": 1}, "a reader got default() while a heal was in progress"
     assert state["box"].get("result") == {"restored": True}
 
@@ -2467,12 +2468,13 @@ def test_cr9_f_stress_no_reader_ever_sees_the_default_while_others_heal(tmp_path
         for t in threads:
             t.start()
         for t in threads:
-            t.join(20)
+            finish_threads(t)
     assert bad == []
 
 
 def test_cr9_f_a_reader_finding_the_file_absent_while_a_heal_lock_is_held_waits_for_it(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     """A legacy healer (no sidecar of its own) cannot be waited on, but a module heal in progress can."""
     from brain.utils.file_lock import file_lock
@@ -2484,20 +2486,23 @@ def test_cr9_f_a_reader_finding_the_file_absent_while_a_heal_lock_is_held_waits_
     def healer():
         with file_lock(heal_target):
             acquired.set()
-            release.wait(10)
+            release.wait()
             p.write_text('{"restored": true}')
 
     h = threading.Thread(target=healer, daemon=True)
+    threads = [h]
+    release_at_teardown(request, release, threads)
     h.start()
     assert acquired.wait(5)
     t, box = _start_thread(
         lambda: jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=jio.Recovery.RESTORE)
     )
+    threads.append(t)
     t.join(0.4)
     assert t.is_alive(), "the reader did not wait for the heal in progress"
     release.set()
-    t.join(5)
-    h.join(5)
+    finish_threads(t)
+    finish_threads(h)
     assert box.get("result") == {"restored": True}
 
 
@@ -2627,7 +2632,7 @@ def test_cw9_verify_runs_under_the_lock_so_a_concurrent_newer_save_is_not_undone
 
     monkeypatch.setattr(jio, "_seam", b_arrives)
     assert jio.write_json(p, {"v": "A"}, backups=1, verify=True) is True
-    state["t"].join(5)
+    finish_threads(state["t"])
     assert state["b_waited"], "B's save ran inside A's save-and-verify"
     assert json.loads(p.read_text()) == {"v": "B-newer"}
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.thread_support import finish_threads
 from tests.tunables_file import FILE_NAME, read_values, write_text
 
 
@@ -46,7 +47,7 @@ class _Competitor:
         return not self._thread.is_alive()
 
     def finish(self) -> None:
-        self._thread.join(timeout=20)
+        finish_threads(self._thread)
         assert not self._thread.is_alive()
 
 

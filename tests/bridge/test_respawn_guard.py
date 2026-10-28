@@ -20,6 +20,7 @@ import pytest
 
 from brain import process_identity as pi
 from brain.bridge import daemon, kill, respawn_guard, shutdown_progress, state_file
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture
@@ -106,7 +107,7 @@ def test_a_respawn_already_waiting_for_the_lock_checks_again_after_it(pd, gone_p
         (pd / shutdown_progress.PROGRESS_FILENAME).write_text("{}")  # a watcher file the start would delete
         daemon.release_lock(pd, holder_fd)
         holder_fd = None
-        t.join(30)
+        finish_threads(t)
         assert out["rc"] == 0 and ran == []
         assert kill.read_intent(pd) == it
         assert (pd / shutdown_progress.PROGRESS_FILENAME).exists()  # checked BEFORE the watcher-file cleanup
@@ -117,7 +118,7 @@ def test_a_respawn_already_waiting_for_the_lock_checks_again_after_it(pd, gone_p
         if holder_fd is not None:
             daemon.release_lock(pd, holder_fd)
         if t is not None:
-            t.join(10)
+            finish_threads(t)
 
 
 @linux_only

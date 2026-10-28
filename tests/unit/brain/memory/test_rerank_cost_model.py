@@ -40,6 +40,7 @@ from brain.memory.reranker import (
     surviving_pair_token_lengths,
 )
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 
 _MODEL = "cost-scripted"
 _QUERY = "q"
@@ -762,7 +763,7 @@ def test_recorded_samples_from_many_threads_are_all_counted_once() -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10.0)
+        finish_threads(t)
     groups = reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL)
     assert sum(n for _x, n, _t in groups) == 400 and _window().n == 400
 
@@ -825,7 +826,7 @@ def test_cross_encoder_rerank_timed_excludes_time_waiting_for_the_lock(
     worker.join(timeout=0.2)  # the worker is now blocked on the lock
     clock.t += 10.0  # another thread's rerank holding the lock
     provider._rerank_lock.release()
-    worker.join(timeout=5.0)
+    finish_threads(worker)
 
     (scores, seconds, growth) = result[0]
     assert scores == [0.0, 0.0]

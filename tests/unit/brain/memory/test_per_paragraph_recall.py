@@ -59,6 +59,7 @@ from brain.memory.semantic_recall import (
 )
 from brain.memory.store import CALIBRATION_SCORE_SCALE, COSINE_SCORE_SCALE, Memory, MemoryStore
 from brain.tools.dispatch import dispatch
+from tests.thread_support import finish_threads
 from tests.unit.brain.chat.test_recall_keyword_merge import _LONG, _active_rows, _render
 from tests.unit.brain.memory.test_monologue_last import (
     _EMBEDDER_ID,
@@ -1288,7 +1289,7 @@ def test_a_put_while_the_stack_is_built_waits_and_the_next_reader_sees_it(
 
     monkeypatch.setattr(matrix_mod, "_stack_hook", _hook)
     ids, unit = matrix.stacked()
-    _hook.writer.join(timeout=5)  # type: ignore[attr-defined]
+    finish_threads(_hook.writer)  # type: ignore[attr-defined]
 
     assert done_inside == [False], "the put waited for the build's lock"
     assert ids == ("a",)

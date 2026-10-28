@@ -311,7 +311,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss(tmp_path: Path) -> None:
         _poll_thread.start()
         _run_calibration_tick(persona_dir, provider=FakeProvider())
         _stop.set()
-        _poll_thread.join(timeout=5)
+        _poll_thread.join()
         rss_after = _settled_rss()
         peak = max(_trace) if _trace else rss_after
 
@@ -391,7 +391,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss(tmp_path: Path) -> None:
         _poll_thread.start()
         ran = _run_calibration_tick(persona_dir, provider=FakeProvider(), should_pause=_should_pause)
         _stop.set()
-        _poll_thread.join(timeout=5)
+        _poll_thread.join()
         rss_after = _settled_rss()
         peak = max(_trace) if _trace else rss_after
 
@@ -480,7 +480,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss(tmp_path: Path) -> None:
         rj.release_judge()
 
         _stop.set()
-        _poll_thread.join(timeout=5)
+        _poll_thread.join()
         rss_after = _settled_rss()
         peak = max(_trace) if _trace else rss_after
 

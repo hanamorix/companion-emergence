@@ -17,6 +17,7 @@ from brain.initiate.audit import (
     update_audit_state,
 )
 from brain.initiate.schemas import AuditRow
+from tests.thread_support import finish_threads, release_at_teardown
 
 
 def _row(
@@ -214,7 +215,7 @@ def test_c17_replied_explicit_posted_twice_folds_once(tmp_path: Path) -> None:
 
 
 def test_c13_concurrent_transitions_guarded_no_lost_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """With the real _AUDIT_LOCK, both transitions survive: the second call
     blocks until the first's read-modify-write completes and releases."""
@@ -233,7 +234,7 @@ def test_c13_concurrent_transitions_guarded_no_lost_update(
         if row.audit_id == "a" and not paused_once.is_set():
             paused_once.set()
             reached_mid.set()
-            proceed.wait(timeout=5)
+            proceed.wait()
         return row
 
     monkeypatch.setattr(AuditRow, "from_dict", staticmethod(hooked))
@@ -249,15 +250,18 @@ def test_c13_concurrent_transitions_guarded_no_lost_update(
         )
 
     ta = threading.Thread(target=call_a)
+    threads = [ta]
+    release_at_teardown(request, proceed, threads)
     ta.start()
     assert reached_mid.wait(timeout=5)  # A holds _AUDIT_LOCK, paused mid-read
 
     tb = threading.Thread(target=call_b)
+    threads.append(tb)
     tb.start()
     time.sleep(0.05)  # give B a chance to attempt (and block on) the real lock
     proceed.set()
-    ta.join(timeout=5)
-    tb.join(timeout=5)
+    finish_threads(ta)
+    finish_threads(tb)
 
     rows = {r.audit_id: r for r in read_recent_audit(tmp_path, window_hours=24)}
     assert rows["a"].delivery["current_state"] == "delivered"

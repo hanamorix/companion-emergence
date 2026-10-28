@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from brain.bridge import daemon
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -385,7 +386,7 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     t.start()
 
     rc = daemon.cmd_tail_log(_tail_args("nell", lines=1, follow=True))
-    t.join(timeout=2.0)
+    finish_threads(t)
     assert rc == 0
     out = capsys.readouterr().out
     assert "seed" in out
@@ -723,7 +724,7 @@ def test_acquire_lock_c19_two_racing_acquires_exactly_one_wins(tmp_path: Path) -
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5.0)
+        finish_threads(t)
 
     winners = [fd for fd in results if fd is not None]
     losers = [fd for fd in results if fd is None]

@@ -26,6 +26,7 @@ from brain.bridge.supervisor import (
     run_folded,
 )
 from brain.engines import interest_sweep
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +91,7 @@ def _running_supervisor(stop: threading.Event, runner):
         yield t
     finally:
         stop.set()
-        t.join(timeout=_STARTUP_BUDGET_S)
+        finish_threads(t)
 
 
 def _ran_a_few_passes(bus: _CapturingBus) -> bool:
@@ -304,7 +305,7 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
         assert len(seen_last_heartbeat_at) >= 4, "did not observe enough heartbeat attempts"
     finally:
         stop.set()
-        t.join(timeout=_STARTUP_BUDGET_S)
+        finish_threads(t)
     assert not t.is_alive()
 
     # The two SKIPPED calls (both None) must have been handed the exact
@@ -372,7 +373,7 @@ def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> Non
         )
     finally:
         stop.set()
-        t.join(timeout=30.0)
+        finish_threads(t)
     assert not t.is_alive()
 
 
@@ -457,7 +458,7 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(
     t.start()
     _wait_until(lambda: "session_snapshot" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
     assert buf.exists(), "snapshot sweep must NOT delete the buffer"
@@ -512,7 +513,7 @@ def test_supervisor_snapshot_sweep_defers_while_chat_active(
         lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
     )
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     types = [e.get("type") for e in bus.events]
     assert "session_snapshot" not in types, (
@@ -561,7 +562,7 @@ def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
     t.start()
     _wait_until(lambda: "supervisor_tick" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     try:
@@ -618,7 +619,7 @@ def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) 
         lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
     )
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     try:
@@ -834,7 +835,7 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
     span = persona_dir / "active_conversations" / "poison" / f"{sid}.span.jsonl"
     _wait_until(lambda: span.exists() and read_cursor(persona_dir, sid) is not None)
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     set_aside = [_json.loads(line) for line in span.read_text(encoding="utf-8").splitlines()]
     assert [r["text"] for r in set_aside] == ["ancient"], "finalize must set the failing chunk aside"

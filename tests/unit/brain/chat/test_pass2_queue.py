@@ -18,6 +18,7 @@ import logging
 
 from brain.bridge import cli_throttle
 from brain.chat import pass2_queue
+from tests.thread_support import finish_threads
 
 
 def _make_recorder() -> tuple[list[str], callable]:
@@ -324,7 +325,7 @@ class TestQueueFileLockFreshRead:
             t = threading.Thread(target=enqueue_b_from_another_thread)
             t.start()
             assert b_enqueued.wait(timeout=5.0), "second thread never finished enqueuing B"
-            t.join(timeout=5.0)
+            finish_threads(t)
 
         pass2_queue.register_test_side_effect(a_id, fn_a)
         pass2_queue.enqueue({"id": a_id, "kind": "test_probe"}, persona_dir=tmp_path)

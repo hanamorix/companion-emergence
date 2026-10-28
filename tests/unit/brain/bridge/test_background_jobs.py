@@ -14,6 +14,7 @@ from collections import Counter
 import pytest
 
 from brain.bridge import background_jobs
+from tests.thread_support import finish_threads
 
 
 def setup_function() -> None:
@@ -214,7 +215,7 @@ def _hammer(*, duration_s: float) -> list[BaseException]:
     time.sleep(duration_s)
     stop.set()
     for t in threads:
-        t.join(timeout=5.0)
+        finish_threads(t)
         assert not t.is_alive()
     return errors
 
@@ -270,7 +271,7 @@ def test_c31c_hammer_fails_without_the_lock(monkeypatch) -> None:
     def _mutate_registry() -> None:
         with background_jobs.running("interloper"):
             added.set()
-            may_exit.wait(timeout=2.0)
+            may_exit.wait()
         # `running()`'s discard fires here, after `may_exit` is set below.
 
     def _inject() -> None:
@@ -291,7 +292,7 @@ def test_c31c_hammer_fails_without_the_lock(monkeypatch) -> None:
             background_jobs.snapshot()
     finally:
         may_exit.set()
-        writer_thread[0].join(timeout=2.0)
+        finish_threads(writer_thread[0])
         assert not writer_thread[0].is_alive()
 
 

@@ -14,6 +14,7 @@ from brain.bridge import server
 from brain.bridge.central_cadence import GATED_JOB_ORDER, JobOutcome
 from brain.memory import recall_diagnostics as rd
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 from tests.unit.brain.bridge.test_central_cadence import _persona, _real_jobs
 
 
@@ -45,7 +46,7 @@ def test_due_iff_records_are_buffered_for_this_personas_log(tmp_path) -> None:
     with rd.file_lock(path):
         t = threading.Thread(target=rd.append_record, args=(path, _rec(1)), daemon=True)
         t.start()
-        t.join(timeout=5)
+        finish_threads(t)
         assert job.has_work() is True
         other = tmp_path / "another-persona"
         other.mkdir()
@@ -61,7 +62,7 @@ def test_the_run_leaves_the_records_buffered_while_the_lock_is_still_held(tmp_pa
     with rd.file_lock(path):
         t = threading.Thread(target=rd.append_record, args=(path, _rec(1)), daemon=True)
         t.start()
-        t.join(timeout=5)
+        finish_threads(t)
         done = []
         r = threading.Thread(target=lambda: done.append(_job(persona).run()), daemon=True)
         r.start()
@@ -79,7 +80,7 @@ def test_the_bridge_clean_stop_writes_the_buffered_records(tmp_path) -> None:
     with rd.file_lock(path):
         t = threading.Thread(target=rd.append_record, args=(path, _rec(7)), daemon=True)
         t.start()
-        t.join(timeout=5)
+        finish_threads(t)
     assert rd.has_pending(path) or _lines(persona) == [7]
     asyncio.run(server._flush_cost_series_at_stop(persona))
     assert _lines(persona) == [7]
@@ -94,7 +95,7 @@ def test_the_no_bridge_exit_writes_the_buffered_records_and_never_raises(tmp_pat
         with rd.file_lock(path):
             t = threading.Thread(target=rd.append_record, args=(path, _rec(9)), daemon=True)
             t.start()
-            t.join(timeout=5)
+            finish_threads(t)
         cli._flush_cost_series_at_exit(store)
         assert _lines(persona) == [9]
         monkeypatch.setattr(rd, "flush_pending", lambda _p: (_ for _ in ()).throw(RuntimeError("x")))

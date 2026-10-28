@@ -28,6 +28,7 @@ from brain.ingest.pipeline import extract_session_snapshot, finalize_stale_sessi
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.pending import PendingQueue
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 
 _PERSONA_NAME = "persona"
 
@@ -486,7 +487,7 @@ def test_persist_during_rollover_destructive_window_not_orphaned(
         # written, registry evicted) and is about to delete the old buffer. Pause
         # here so the racing persist executes in exactly this window.
         at_delete.set()
-        release_delete.wait(5)
+        release_delete.wait()
         real_delete(pd, sid)
 
     monkeypatch.setattr(rollover_mod, "delete_session_buffer", blocking_delete)
@@ -518,11 +519,11 @@ def test_persist_during_rollover_destructive_window_not_orphaned(
         ])
 
         release_delete.set()
-        t.join(5)
+        finish_threads(t)
         assert not t.is_alive(), "rollover thread did not finish"
     finally:
         release_delete.set()
-        t.join(5)
+        finish_threads(t)
         reset_registry()
 
     new_sid = result.get("new_sid")
@@ -605,7 +606,7 @@ def test_persist_during_summary_only_rollover_window_not_orphaned(
 
     def blocking_delete(pd, sid):
         at_delete.set()
-        release_delete.wait(5)
+        release_delete.wait()
         real_delete(pd, sid)
 
     monkeypatch.setattr(rollover_mod, "delete_session_buffer", blocking_delete)
@@ -626,11 +627,11 @@ def test_persist_during_summary_only_rollover_window_not_orphaned(
             {"session_id": old_sid, "speaker": "assistant", "text": "so-raced-asst"},
         ])
         release_delete.set()
-        t.join(5)
+        finish_threads(t)
         assert not t.is_alive(), "rollover thread did not finish"
     finally:
         release_delete.set()
-        t.join(5)
+        finish_threads(t)
         reset_registry()
 
     new_sid = result.get("new_sid")

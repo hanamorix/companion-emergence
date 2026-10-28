@@ -15,6 +15,7 @@ import pytest
 
 from brain.attunement.store import BufferTurn
 from brain.chat.tool_loop import _spawn_pass2_attunement
+from tests.thread_support import finish_threads
 
 
 def _drain_pass2_queue(persona_dir) -> None:
@@ -242,7 +243,7 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
     def detector(**_kw):
         calls.append(1)
         if len(calls) == 1:
-            second_arrived.wait(timeout=5.0)
+            second_arrived.wait()
         return DetectorOutput(current_read=fake_read, pattern_candidates=[], addressed_pattern_ids=[])
 
     def run():
@@ -263,6 +264,6 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            finish_threads(t)
     assert len(calls) == 1
     assert budget._load(tmp_path)["count"] == DAILY_BUDGET_DEFAULT

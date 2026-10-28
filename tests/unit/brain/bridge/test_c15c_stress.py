@@ -62,6 +62,7 @@ import brain.bridge.provider as provider_mod
 from brain.bridge import cli_throttle, job_progress
 from brain.bridge.events import EventBus
 from brain.felt_time.state import FeltTimeState, load_or_recover, persist
+from tests.thread_support import finish_threads
 
 # Opt-in (#421, #540): the 60 s test and the stand-in tests that prove its assertions can fail run only where
 # KINDLED_RUN_STRESS=1, which test.yml's python-313-bridge job sets. The main matrix does not run them.
@@ -576,7 +577,7 @@ def _after_ready(
 
 def _after_loop_ends(loop: _ThreadRun, _writer: _ThreadRun, _counter: list[int]) -> None:
     """For a stand-in loop that is meant to be dead at the sample."""
-    loop.thread.join(timeout=5.0)
+    finish_threads(loop.thread)
 
 
 def _after_writer_ends(
@@ -586,7 +587,7 @@ def _after_writer_ends(
 
     def _settle(_loop: _ThreadRun, writer: _ThreadRun, _counter: list[int]) -> None:
         assert ready.wait(5.0), "the stand-in loop never became ready"
-        writer.thread.join(timeout=5.0)
+        finish_threads(writer.thread)
 
     return _settle
 

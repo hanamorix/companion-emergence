@@ -21,6 +21,7 @@ from brain.memory import floor_startup
 from brain.memory import reranker as reranker_mod
 from brain.memory.reranker import RamMeasurementAbandoned
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 from tests.unit.brain.memory._ram_support import FULL, ScriptedLadderProvider, shapes_in_window
 
 _MODEL = "scripted-ladder"
@@ -245,7 +246,7 @@ class _Loop:
 
     def finish(self, thread: threading.Thread) -> None:
         cli_throttle.reset()  # releases a waiter if a test failed half way
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive(), "the measurement thread must end"
         assert not floor_startup.inflight("ram-figure")
         self.store.close()
@@ -282,7 +283,7 @@ def test_a_reply_starting_during_a_call_abandons_that_rung_and_the_rerun_after_t
         assert floor_startup.request_ram_figure() is True
         assert floor_startup.start_requested_ram_figure() is None
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         assert provider.timed == [*_PHASE_ONE[:3], (1, 256), (1, 128), (2, 949)], "resumed from the window, no residue"
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
@@ -302,7 +303,7 @@ def test_a_reply_that_started_and_ended_inside_a_call_is_seen_too(monkeypatch: p
         cli_throttle.note_user_message()
         cli_throttle.note_reply_end()  # the whole reply fits inside the call
         release.set()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         assert provider.timed == [(1, 1024), *_PASS], "the sample was discarded; the pass ran again at once"
         assert loop.runs == 2 and reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
@@ -332,7 +333,7 @@ def test_a_reply_starting_during_the_probe_abandons_before_any_call_and_the_reru
         assert provider.timed == [] and thread.is_alive()
         _nothing_recorded(loop.store)
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         assert provider.timed == _PASS
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
@@ -357,7 +358,7 @@ def test_a_reply_starting_during_the_warm_ups_abandons_and_the_rerun_measures(mo
         assert loop.entered[1].wait(_TIMEOUT)
         assert provider.timed == [] and thread.is_alive()
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert provider.timed == _PASS
     finally:
         loop.finish(thread)
@@ -387,7 +388,7 @@ def test_the_loop_closes_the_store_it_opened_for_every_run_abandoned_or_not(monk
     try:
         assert loop.entered[1].wait(_TIMEOUT)
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         own = [name for name in closed if name == "ram-figure-measure"]
         # due-check store + run store for the abandoned pass, the same for the measuring pass
@@ -406,7 +407,7 @@ def test_a_reply_in_flight_when_the_thread_starts_delays_everything_until_it_end
         assert thread.is_alive()
         assert (loop.builds, provider.probes, provider.plain, provider.timed) == (0, 0, [], [])
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         assert loop.builds == 1 and provider.timed == _PASS
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
@@ -435,7 +436,7 @@ def test_a_reply_starting_between_the_wait_and_the_snapshot_abandons_at_once(mon
         assert loop.entered[1].wait(_TIMEOUT)
         assert loop.builds == 0 and provider.probes == 0, "nothing built while a reply is in flight"
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert loop.builds == 1 and provider.timed == _PASS
     finally:
         loop.finish(thread)
@@ -446,7 +447,7 @@ def test_a_run_that_is_not_abandoned_ends_the_loop_after_one_pass(monkeypatch, t
     loop = _Loop(monkeypatch, tmp_path, provider)
     thread = loop.start()
     try:
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         assert loop.waits == 1 and provider.timed == [(1, FULL)]
         _nothing_recorded(loop.store)

@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from brain.tunables_migration import migrate_legacy_json
+from tests.thread_support import finish_threads
 from tests.tunables_file import FILE_NAME, read_values, write_text
 
 LEGACY = "tunables.json"
@@ -329,7 +330,7 @@ def test_a_set_values_landing_between_the_json_read_and_the_write_survives(t, tm
         migrate_legacy_json(tmp_path, complete_registry=True)
     finally:
         t._LOCKED_WINDOW_HOOK = None
-    competitor.join(timeout=20)
+    finish_threads(competitor)
     assert finished_inside and finished_inside[0] is False  # it waited for the fold's lock window
     values = read_values(tmp_path)
     assert values["a.one"] == 5.0 and values["a.three"] == 99

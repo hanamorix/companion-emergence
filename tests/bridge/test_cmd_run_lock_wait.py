@@ -16,6 +16,7 @@ import pytest
 
 from brain import process_identity as pi
 from brain.bridge import daemon, state_file
+from tests.thread_support import finish_threads
 
 REPO = Path(__file__).resolve().parents[2]  # not the cwd: pytest may run from anywhere
 
@@ -135,7 +136,7 @@ def test_cmd_run_waits_for_the_lock_then_runs(home, tmp_path, monkeypatch, live_
         _is_waiting_for_the_lock(t, waiting, result)
         assert not ran.is_set()
         holder.release()
-        t.join(timeout=30)
+        finish_threads(t)
         assert not t.is_alive()
         assert result["rc"] == 0 and ran.is_set()
     finally:
@@ -146,7 +147,7 @@ def _finish(holder, t) -> None:
     """Let go of the lock and end the waiter, so a failed assertion cannot leave ``cmd_run`` waiting or running on."""
     holder.release()
     if t is not None:
-        t.join(timeout=10)
+        finish_threads(t)
     holder.close()
 
 
@@ -161,7 +162,7 @@ def test_cmd_run_over_a_stale_reused_pid_record_runs_at_once(home, tmp_path, mon
             ),
         )
         t, ran, result, _waiting = _run_in_thread(monkeypatch, home)
-        t.join(timeout=30)
+        finish_threads(t)
         assert result.get("rc") == 0 and ran.is_set()
     finally:
         sleeper.kill()
@@ -202,7 +203,7 @@ def test_a_service_run_waiting_for_a_bridge_does_not_undo_its_plain_stop(home, t
         _is_waiting_for_the_lock(t, waiting, result)
         _stopped_on_request(home, "user_stop")
         holder.release()
-        t.join(timeout=30)
+        finish_threads(t)
         assert not t.is_alive()
         assert result["rc"] == 0 and not ran.is_set()
     finally:
@@ -247,7 +248,7 @@ def test_a_waiting_run_still_starts_after_a_crash_or_when_run_by_hand(home, tmp_
         elif ended in ("user_stop", "idle_timeout", "os_signal", "app_restart", "manual_restart", "hard_exit"):
             _stopped_on_request(home, ended)
         holder.release()
-        t.join(timeout=30)
+        finish_threads(t)
         assert not t.is_alive()
         assert result["rc"] == 0 and ran.is_set()
     finally:

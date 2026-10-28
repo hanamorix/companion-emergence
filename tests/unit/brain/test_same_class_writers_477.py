@@ -29,6 +29,7 @@ from brain.felt_time.chat_log import (
 )
 from brain.initiate.audit import append_audit_row, iter_initiate_audit_full
 from brain.initiate.schemas import AuditRow
+from tests.thread_support import finish_threads
 
 
 def _flaky_replace(monkeypatch, suffix: str, failures: int = 2):
@@ -178,5 +179,5 @@ def test_the_tick_appender_waits_for_the_logs_lock(tmp_path):
         t.start()
         assert not done.wait(timeout=0.4), "the append did not wait for the log's lock"
     assert done.wait(timeout=5)
-    t.join(timeout=5)
+    finish_threads(t)
     assert log_path.read_text(encoding="utf-8").count("\n") == 1

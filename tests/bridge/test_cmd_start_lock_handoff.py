@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import brain.bridge.daemon as daemon
 from brain.bridge import state_file
+from tests.thread_support import finish_threads
 
 
 def test_cmd_start_leaves_lock_free_for_child_runner(tmp_path, monkeypatch):
@@ -206,11 +207,10 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch, c
 
         # role-b's cmd_start should resolve very shortly after its child's
         # marker appears (the child writes the matching state_file right
-        # after the marker, in the same stub call) — generous bound for
-        # slow Windows scheduling, not because this side is expected to
-        # actually take that long.
-        t_b.join(timeout=30.0)
-        assert not t_b.is_alive(), "role-b's cmd_start should have returned quickly"
+        # after the marker, in the same stub call). No time bound on the wait: a slow
+        # runner must not make the asserts below run early.
+        finish_threads(t_b)
+        assert not t_b.is_alive(), "role-b's cmd_start should have returned"
         assert results["role-b"] == 0
 
         inode_while_held = lock_path.stat().st_ino
@@ -224,11 +224,10 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch, c
 
         # role-a's cmd_start must notice its child exited and report now,
         # while the winner is STILL running (stop_file not yet written), not
-        # at its 50s deadline. Generous bound for slow Windows scheduling;
-        # the rc == 2 below is the part only the early-exit path can produce
-        # (the deadline path returns 1).
-        t_a.join(timeout=30.0)
-        assert not t_a.is_alive(), "role-a's cmd_start must return promptly once its child lost"
+        # at its 50s deadline. The rc == 2 below is the part only the early-exit path
+        # can produce (the deadline path returns 1).
+        finish_threads(t_a)
+        assert not t_a.is_alive(), "role-a's cmd_start must return once its child lost"
         assert results["role-a"] == 2
         winner_pid = launched["role-b"].pid
         assert (
@@ -252,4 +251,4 @@ def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch, c
                 proc.kill()
             proc.wait(timeout=10.0)
         for t in (t_a, t_b):
-            t.join(timeout=5.0)
+            finish_threads(t)
