@@ -15,7 +15,7 @@ Done means: each work item in §4 is merged with its tests, the A1 expected-fail
 | Plan | Code (file:line at verification) | Consequence |
 |---|---|---|
 | Old memories register their words when reappraisal brings them back (§5) | `consolidation._handle_reappraisals` (`brain/engines/consolidation.py:833`) re-scores importance and names only; it never reads emotions | Replaced: one final heal scan, then delete (§4 A4) |
-| Heal scan runs every 15 min | `persona_loader._heal_referenced_but_unregistered` (`brain/emotion/persona_loader.py:195`) runs on every `load_persona_vocabulary(store=…)`: heartbeat (`supervisor.py:2026`), soul review (`:2138`), bridge startup (`server.py:160`), 7 CLI sites (`cli.py:718,939,1000,1122,1178,1811,2154`) | Removing it drops `store=` at all 10 store-passing callers |
+| Heal scan runs every 15 min | `persona_loader._heal_referenced_but_unregistered` (`brain/emotion/persona_loader.py:195`) runs on every `load_persona_vocabulary(store=…)`: heartbeat (`supervisor.py:2026`), soul review (`:2138`), bridge startup (`server.py:160`), 7 CLI sites (`cli.py:718,939,1000,1122,1178,1811,2154`) | Gate the heal behind a one-time marker inside the loader; callers unchanged |
 | Reuse the "letters and underscores, ≤100 chars" rule | No emotion-name rule exists. `known_names.MAX_NAME_LENGTH = 100` has no character rule; `growth/scheduler._is_valid_name` only rejects `/ \ { }` | The gate is new code |
 | `add_memory` must set last-accessed | Confirmed it doesn't (`Memory.create_new` leaves `last_accessed_at=None`). Also its auto-link `store.search_text(kw, limit=4)` bumps last-accessed and recall count on related memories | Fix both in A4 |
 | Emotion-only rows "hold no content" | They hold a bracketed channel list, e.g. `[monologue emotion influence: joy:1.50]` | None; noted for accuracy |
@@ -57,7 +57,7 @@ New file `tests/unit/brain/emotion/test_rework_writer_pins.py`, temp `KINDLED_HO
 
 - Delete `brain/emotion/blend.py` + `tests/unit/brain/emotion/test_blend.py`.
 - Delete the residue queue: `ResidueEntry`, `EmotionalState.residue`, `add_residue` and their `copy/to_dict/from_dict` handling (`brain/emotion/state.py:25-117`). `EmotionalState` is never loaded from disk, but `from_dict` keeps ignoring an unknown `residue` key.
-- Delete the dead peer table: `_EMOTION_BASE`, `_EMOTION_ACCENT`, `relationship_emotion_delta` (`kindled_link/relationship.py:336-352`) + `tests/kindled_link/test_relationship_emotion.py`.
+- Delete the dead peer table: `_EMOTION_BASE`, `_EMOTION_ACCENT`, `relationship_emotion_delta` (`kindled_link/relationship.py:336-352`) and only the tests in `tests/kindled_link/test_relationship_emotion.py` that use it. The rest of that file tests the live `apply_peer_emotion`.
 - Remove `protected` from `brain/migrator/transform.py:159`, `brain/cli.py:635`, `brain/recovery/source_reader.py:66`. The `Memory` field, the column and the heartbeat check stay until ThinkerOfThoughts removes them in C.
 - Fix wrong comments in Hana-owned files. Tool-text wording waits for the final pass.
 
@@ -86,7 +86,7 @@ New file `tests/unit/brain/emotion/test_rework_writer_pins.py`, temp `KINDLED_HO
   - half-life = the mean of the parents' half-lives (a parent with none uses the default);
   - read the emotion column only, newest first, with a limit, through a new additive getter `MemoryStore.list_recent_emotions(limit)`.
 - **Vocab repair:** `_excerpts_for_name` passes `bump=False` (`health/vocab_repair.py:280`). Its stale "startup only" docstring is fixed.
-- **Final heal:** vocab repair's startup step runs `_heal_referenced_but_unregistered` once, then writes the marker `cadence/vocab_heal_final.done` through `brain.paths.cadence_state_path`. Then the `store=` heal path is deleted from `load_persona_vocabulary` and all its callers.
+- **Final heal:** `load_persona_vocabulary_with_anomaly` runs `_heal_referenced_but_unregistered` only while the marker `cadence/vocab_heal_final.json` (resolved through `brain.paths.cadence_state_path`) is absent, then writes the marker. So the first store-carrying load after the upgrade heals once, and never again. The `store=` parameter and its 10 callers stay: it also drives the reconstruct-from-memories recovery for a missing or corrupt vocabulary file. *(Corrected while planning, 2026-10-28; the first draft routed this through vocab repair and dropped `store=`.)*
 - **Half-life source:** the per-persona vocabulary file keeps `decay_half_life_days` per word. The dev-file default and the baseline table are ThinkerOfThoughts' step 0 / dev-constants work; A4 reads the default through his lookup (stubbed until it lands).
 
 ### B1 — writers (after the step 0 stub; every change gated on the switch)
