@@ -264,6 +264,9 @@ class EmbeddingMatrix:
         `EmbeddingMatrix.put()` is the backstop against a genuinely wrong-dim
         vector reaching `_vectors` (see that method).
         """
+        # This connection opens memories.db in normal read-write mode, and the code below only
+        # reads from it. SQLite read-only mode is deliberately not used, because it can behave
+        # differently while another process is writing. So nothing here enforces read-only.
         # memdb-single-writer reader exception: this only SELECTs id and embedding from
         # memories.db (plus PRAGMA busy_timeout). It stays outside MemoryStore for now (owner
         # ruling); the scanner is tests/unit/test_memories_db_single_writer.py.

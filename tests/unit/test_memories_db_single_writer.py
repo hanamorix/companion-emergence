@@ -58,6 +58,14 @@ STORE = "brain/memory/store.py"
 MARKER = "memdb-single-writer reader exception"
 MARKER_WINDOW = 3  # the marker comment sits on the call line or up to this many lines above it
 
+# The scanner lives in this test file, not in product code, so the tests that feed it synthetic trees (or that
+# pin facts the base commit already had) pass against the base commit by design. The tests that fail there are
+# the real-tree scan and the new MemoryStore method tests.
+_NO_BASE_FAILURE_REASON = (
+    "exercises the scanner that this file itself adds, on synthetic trees or on facts the base commit already "
+    "had, so the old product code cannot make it fail; the real-tree scan test is the one that bites on base"
+)
+
 # Files that may open a SQLite connection, and which database each one opens.
 OPENERS: dict[str, str] = {
     STORE: "memories.db. THE writer: MemoryStore, plus the FTS health connection used before any store exists.",
@@ -406,12 +414,14 @@ def test_real_tree_has_no_memories_db_writer_outside_the_store():
     )
 
 
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
 def test_registry_entries_all_match_a_real_call(tmp_path):
     assert not registry_problems(scan_tree(REPO))
     # the oracle can fail: on a tree with no brain/ files every entry is reported stale
     assert len(registry_problems(scan_tree(tmp_path))) == len(OPENERS) + len(READER_EXCEPTIONS)
 
 
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
 def test_derived_memories_tables_cover_the_schema():
     tables = memories_tables()
     assert {"memories", "memories_fts", "calibration_log", "cost_series_samples", "cluster_centroids"} <= tables
@@ -530,6 +540,7 @@ PLANTED = {
 }
 
 
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
 @pytest.mark.parametrize("name", sorted(PLANTED))
 def test_scanner_flags_each_planted_violation(tmp_path, name):
     rel, source, rule = PLANTED[name]
@@ -568,6 +579,7 @@ INNOCENT = {
 }
 
 
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
 @pytest.mark.parametrize("name", sorted(INNOCENT))
 def test_scanner_leaves_innocent_code_alone(tmp_path, name):
     rel, source = INNOCENT[name]
