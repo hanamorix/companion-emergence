@@ -125,6 +125,6 @@ jobs:
             case "$SEED" in
               *[!0-9]*) echo "::error::refusing seed '$SEED': digits only"; exit 1 ;;
             esac
-            seed=("--randomly-seed=$SEED")
+            seed=(-p randomly "--randomly-seed=$SEED")
           fi
           uv run pytest -m requires_models -v -s "${seed[@]}" "${selected[@]}"

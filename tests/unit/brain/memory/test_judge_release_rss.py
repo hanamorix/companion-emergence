@@ -586,7 +586,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
 
                 def _counting_request(*a, **kw):
                     _hf_session_calls[0] += 1
-                    _hf_session_requests.append([repr(x) for x in a[:2]])
+                    _hf_session_requests.append([repr(x) for x in a[:2]] + [f"{k}={v!r}" for k, v in kw.items() if k in ("method", "url")])
                     return _orig_request(*a, **kw)
 
                 session.request = _counting_request
