@@ -136,8 +136,8 @@ def _create_and_backfill_fts(conn: sqlite3.Connection) -> tuple[str, str | None]
     doesn't exist yet (this check now runs BEFORE the first `MemoryStore`
     open, so it can observe this state — the retired `_boot_fts_backstop`
     never could, since it ran after schema creation). Build the FTS schema
-    (the same idempotent statements `MemoryStore.__init__` runs — imported
-    from there, not duplicated, so the two can never drift) and backfill
+    (the same idempotent statements `MemoryStore.__init__` runs, through
+    `MemoryStore.fts_create_schema_and_rebuild`, so the two can never drift) and backfill
     every existing row via `rebuild`, so this persona's pre-existing
     memories don't silently sit outside the FTS index for this process's
     whole lifetime (code-red-team pass 1, M2)."""

@@ -16,7 +16,7 @@ def _ro_connect(db: Path) -> sqlite3.Connection:
     # memdb-single-writer reader exception: a mode=ro open of a SOURCE persona's memories.db,
     # which must not be altered. It stays outside MemoryStore for now (owner ruling); the
     # scanner is tests/unit/test_memories_db_single_writer.py.
-    conn =sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 

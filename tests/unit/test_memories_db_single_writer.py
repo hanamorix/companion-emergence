@@ -27,24 +27,26 @@ away from the call site. If this test ever fails on one of them, start there.
 
 Limits (the scanner is a name-and-text check, not a type check):
 - SQL with no resolvable literal prefix (built by a function call, read from a file, or whose first
-  piece is a variable) is not analysed.
+  piece is a variable) is not analysed. So are: a table name held in a variable (`UPDATE {t}`), SQL in
+  a class attribute, dict value, ternary or parameter default, and a literal handed to a wrapper
+  function that runs it. A bare name is judged against every value assigned to it in scope.
 - PRAGMA statements that write (journal_mode, user_version) are not flagged.
 - Registered other-db openers (OPENERS) are trusted not to open memories.db; only humans reviewing a
   registry edit catch that. Likewise a second open in the same function of a reader exception.
+  Other drivers (aiosqlite, the sqlite3 command line, SQLAlchemy) and `getattr(sqlite3, "connect")`
+  are not seen; `open_store_connection` is followed through `from ... import ... as` aliases.
 - Scope is brain/ only. Test fixtures, wizard-validation/ and file-level copies (shutil) are not seen.
 - Calls to the MemoryStore `fts_*` and `connect_for_fts_health` static methods are the store itself,
   so passing them any connection is not flagged.
 - `MemoryStore(...)` instances are deliberately many (one per thread or request, see
   brain/bridge/server.py "HA hardening"); this test is about who writes, not how many store
   objects exist.
-Pass `--print` to see the registries checked against the live tree.
 """
 
 from __future__ import annotations
 
 import ast
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -114,7 +116,7 @@ def memories_tables() -> frozenset[str]:
     return frozenset(n.lower() for n in names)
 
 
-def _pieces(node: ast.AST, consts: list[dict[str, ast.AST]], depth: int = 0) -> list[str | None]:
+def _pieces(node: ast.AST, consts: list[dict[str, list[ast.AST]]], depth: int = 0) -> list[str | None]:
     """The literal pieces of a SQL expression, in order; None marks a part that is not a literal."""
     if depth > 6:
         return [None]
@@ -141,11 +143,24 @@ def _pieces(node: ast.AST, consts: list[dict[str, ast.AST]], depth: int = 0) -> 
     if isinstance(node, ast.Name):
         for scope in reversed(consts):
             if node.id in scope:
-                return _pieces(scope[node.id], consts, depth + 1)
+                return _pieces(scope[node.id][-1], consts, depth + 1)
     return [None]
 
 
-def _sql_text(node: ast.AST, consts: list[dict[str, ast.AST]]) -> str | None:
+def _sql_texts(node: ast.AST, consts: list[dict[str, list[ast.AST]]]) -> list[str]:
+    """Every SQL text the argument can hold. A bare name gives one text per value assigned to it
+    anywhere in scope (so `sql = 'UPDATE ...'` in an `if` and `sql = 'SELECT 1'` in the `else` are
+    both judged); anything else gives its one text. Texts that do not start with a literal are dropped."""
+    if isinstance(node, ast.Name):
+        values = [v for scope in consts for v in scope.get(node.id, [])]
+        candidates = values or [node]
+    else:
+        candidates = [node]
+    texts = [_sql_text(c, consts) for c in candidates]
+    return [t for t in texts if t is not None]
+
+
+def _sql_text(node: ast.AST, consts: list[dict[str, list[ast.AST]]]) -> str | None:
     """Upper-cased SQL with comments stripped, or None when it does not start with a literal."""
     pieces = _pieces(node, consts)
     if not pieces or pieces[0] is None:
@@ -156,15 +171,15 @@ def _sql_text(node: ast.AST, consts: list[dict[str, ast.AST]]) -> str | None:
     return text.upper()
 
 
-def _assignments(scope: ast.AST) -> dict[str, ast.AST]:
-    """name -> assigned value for a function (anywhere inside it) or a module (top level only)."""
-    out: dict[str, ast.AST] = {}
+def _assignments(scope: ast.AST) -> dict[str, list[ast.AST]]:
+    """name -> every value assigned to it, for a function (anywhere inside it) or a module (top level only)."""
+    out: dict[str, list[ast.AST]] = {}
     nodes = scope.body if isinstance(scope, ast.Module) else list(ast.walk(scope))
     for node in nodes:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            out[node.targets[0].id] = node.value
+            out.setdefault(node.targets[0].id, []).append(node.value)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
-            out[node.target.id] = node.value
+            out.setdefault(node.target.id, []).append(node.value)
     return out
 
 
@@ -191,22 +206,25 @@ class _FileScan(ast.NodeVisitor):
         self.readers = readers
         self.result = result
         self.funcs: list[str] = []
-        self.consts: list[dict[str, ast.AST]] = [_assignments(tree)]
+        self.consts: list[dict[str, list[ast.AST]]] = [_assignments(tree)]
         # Names that mean sqlite3.connect / sqlite3.Connection in this file.
         self.module_names = {"sqlite3"}
         self.connect_names: set[str] = set()
         self.connection_names: set[str] = set()
+        self.store_open_names = {"open_store_connection"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.name == "sqlite3":
                         self.module_names.add(alias.asname or "sqlite3")
-            elif isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+            elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
-                    if alias.name == "connect":
+                    if node.module == "sqlite3" and alias.name == "connect":
                         self.connect_names.add(alias.asname or "connect")
-                    elif alias.name == "Connection":
+                    elif node.module == "sqlite3" and alias.name == "Connection":
                         self.connection_names.add(alias.asname or "Connection")
+                    elif alias.name == "open_store_connection":
+                        self.store_open_names.add(alias.asname or "open_store_connection")
 
     # -- scope tracking -----------------------------------------------------
     def _enter(self, node: ast.AST, name: str) -> None:
@@ -237,7 +255,7 @@ class _FileScan(ast.NodeVisitor):
         elif isinstance(node, ast.Name):
             if node.id in self.connect_names or (node.id in self.connection_names and called):
                 return f"sqlite3 ({node.id})"
-            if node.id == "open_store_connection":
+            if node.id in self.store_open_names:
                 return "open_store_connection"
         return None
 
@@ -311,32 +329,30 @@ class _FileScan(ast.NodeVisitor):
             )
         if not node.args:
             return
-        text = _sql_text(node.args[0], self.consts)
-        if text is None:
-            return
+        for text in _sql_texts(node.args[0], self.consts):
+            detail = self._judge(text, method)
+            if detail is not None:
+                self.result.findings.append(Finding(self.rel, node.lineno, "write", detail))
+                return
+
+    def _judge(self, text: str, method: str) -> str | None:
+        """Why this SQL text is a forbidden write, or None."""
         first = text.split(None, 1)[0] if text.strip() else ""
         if first in _BARE_MAINTENANCE and self.rel not in self.openers:
-            self.result.findings.append(
-                Finding(self.rel, node.lineno, "write", f"{first} outside the registered openers")
-            )
-            return
+            return f"{first} outside the registered openers"
         if method == "executescript":
             is_write = bool(_WRITE_VERB_RE.search(text))
         else:
             is_write = first in _WRITE_VERBS or (first == "WITH" and bool(_WRITE_VERB_RE.search(text)))
         if not is_write or self.table_re is None:
-            return
+            return None
         hit = self.table_re.search(text)
-        if hit:
-            self.result.findings.append(
-                Finding(
-                    self.rel,
-                    node.lineno,
-                    "write",
-                    f"{method} writes the memories table {hit.group(0).lower()!r}; only "
-                    f"{STORE} may write memories.db. Add a MemoryStore method and call it.",
-                )
-            )
+        if hit is None:
+            return None
+        return (
+            f"{method} writes the memories table {hit.group(0).lower()!r}; only "
+            f"{STORE} may write memories.db. Add a MemoryStore method and call it."
+        )
 
 
 def scan_tree(
@@ -492,6 +508,20 @@ PLANTED = {
         "import sqlite3\ndef go(p):\n    c = sqlite3.connect(p)\n    c.executescript('CREATE TABLE IF NOT EXISTS memories (id TEXT);')\n",
         "write",
     ),
+    "open_store_connection_imported_under_an_alias": (
+        "brain/rogue.py",
+        "from brain.utils.sqlite_open import open_store_connection as osc\n"
+        "def go(p):\n    return osc(p, caller='x', integrity_check=False)\n",
+        "open",
+    ),
+    "write_sql_assigned_in_one_branch_and_a_select_in_the_other": (
+        "brain/rogue.py",
+        "def go(store, flag):\n"
+        "    if flag:\n        sql = 'UPDATE memories SET state = 1'\n"
+        "    else:\n        sql = 'SELECT 1'\n"
+        "    store._conn.execute(sql)\n",
+        "write",
+    ),
     "connect_taken_as_a_reference": (
         "brain/rogue.py",
         "import sqlite3\ndef go(p):\n    c = sqlite3.connect\n    return c(p)\n",
@@ -544,9 +574,3 @@ def test_scanner_leaves_innocent_code_alone(tmp_path, name):
     result = scan_tree(_plant(tmp_path, {rel: source}))
     assert not result.findings, [str(f) for f in result.findings]
 
-
-if __name__ == "__main__":  # pragma: no cover
-    if "--print" in sys.argv:
-        res = scan_tree(REPO)
-        print("findings:", *map(str, res.findings), sep="\n  ")
-        print("registry problems:", *registry_problems(res), sep="\n  ")
