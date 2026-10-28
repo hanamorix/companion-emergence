@@ -208,7 +208,7 @@ def build_lora_retrain_fn(
             CrossEncoderTrainingArguments,
         )
 
-        from brain.memory.relevance_judge import offline_load_kwargs
+        from brain.memory.relevance_judge import offline_load_kwargs, offline_load_scope
 
         resolved_rank = (
             lora_rank
@@ -234,15 +234,17 @@ def build_lora_retrain_fn(
         # (Recommended)"): CPU on every platform, never MPS — see
         # relevance_judge.TorchCrossEncoderJudge.__init__ for the full
         # rationale (no MPS-specific release call, low-memory-Mac OOM risk).
-        model = CrossEncoder(
-            str(start_model_path),
-            cache_folder=str(cache_dir) if cache_dir is not None else None,
-            config_kwargs={"num_labels": 1},
-            max_length=resolved_max_length,
-            activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
-            device="cpu",
-            **offline_load_kwargs(str(start_model_path), cache_dir),
-        )
+        load_kwargs = offline_load_kwargs(str(start_model_path), cache_dir)
+        with offline_load_scope(load_kwargs):
+            model = CrossEncoder(
+                str(start_model_path),
+                cache_folder=str(cache_dir) if cache_dir is not None else None,
+                config_kwargs={"num_labels": 1},
+                max_length=resolved_max_length,
+                activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
+                device="cpu",
+                **load_kwargs,
+            )
         lora_config = LoraConfig(
             r=resolved_rank,
             lora_alpha=resolved_alpha,

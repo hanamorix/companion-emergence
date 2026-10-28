@@ -175,7 +175,7 @@ def build_full_ft_retrain_fn(
             CrossEncoderTrainingArguments,
         )
 
-        from brain.memory.relevance_judge import offline_load_kwargs
+        from brain.memory.relevance_judge import offline_load_kwargs, offline_load_scope
 
         resolved_epochs = (
             epochs
@@ -200,15 +200,17 @@ def build_full_ft_retrain_fn(
         # (Recommended)"): CPU on every platform, never MPS — see
         # relevance_judge.TorchCrossEncoderJudge.__init__ for the full
         # rationale (no MPS-specific release call, low-memory-Mac OOM risk).
-        model = CrossEncoder(
-            str(start_model_path),
-            cache_folder=str(cache_dir) if cache_dir is not None else None,
-            config_kwargs={"num_labels": 1},
-            max_length=resolved_max_length,
-            activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
-            device="cpu",
-            **offline_load_kwargs(str(start_model_path), cache_dir),
-        )
+        load_kwargs = offline_load_kwargs(str(start_model_path), cache_dir)
+        with offline_load_scope(load_kwargs):
+            model = CrossEncoder(
+                str(start_model_path),
+                cache_folder=str(cache_dir) if cache_dir is not None else None,
+                config_kwargs={"num_labels": 1},
+                max_length=resolved_max_length,
+                activation_fn=activation_fn if activation_fn is not None else (lambda x: x),
+                device="cpu",
+                **load_kwargs,
+            )
         # NOTE: no model.add_adapter(...) — every parameter is trainable.
 
         dataset = _dataset_from_triples(train_items)
@@ -287,15 +289,17 @@ def load_full_scorer(
     """
     from sentence_transformers import CrossEncoder  # lazy for torch-scoping (I6)
 
-    from brain.memory.relevance_judge import offline_load_kwargs
+    from brain.memory.relevance_judge import offline_load_kwargs, offline_load_scope
 
-    model = CrossEncoder(
-        str(full_dir),
-        cache_folder=str(cache_dir) if cache_dir is not None else None,
-        device="cpu",  # S81: CPU everywhere, never MPS
-        **({"max_length": max_length} if max_length is not None else {}),
-        **offline_load_kwargs(str(full_dir), cache_dir),
-    )
+    load_kwargs = offline_load_kwargs(str(full_dir), cache_dir)
+    with offline_load_scope(load_kwargs):
+        model = CrossEncoder(
+            str(full_dir),
+            cache_folder=str(cache_dir) if cache_dir is not None else None,
+            device="cpu",  # S81: CPU everywhere, never MPS
+            **({"max_length": max_length} if max_length is not None else {}),
+            **load_kwargs,
+        )
 
     def score(item: tuple[str, str]) -> float:
         query, document = item[0], item[1]
