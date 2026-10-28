@@ -47,15 +47,6 @@ logger = logging.getLogger(__name__)
 # --- Tunables (I3/I7 — every threshold below is a registered tunable, never
 # a bare hardcoded constant) --------------------------------------------
 
-# ">a handful" gate (spec §2): the weekly tick fires only when MORE new
-# non-None `haiku_label` POSITIONS (one Haiku decision each — spec §2's
-# pinned counting unit, red-team fix F-2) than
-# `dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS` have accumulated across
-# UNCONSUMED `calibration_log` rows (`MemoryStore.count_new_haiku_
-# decisions`). That threshold is a DEV-level constant, not a user tunable
-# (S7/S26), so it is not `tunables.register()`-ed here like the
-# RAM-tier/footprint knobs below; why is in dev_constants.py.
-
 # RAM tier thresholds (spec §1: "set by the dry-run... NOT hand-picked").
 # ⚠ PROVISIONAL until F2c inc5's timed LoRA dry-run on deploy-class
 # no-AVX2 hardware (spec Open Reconfirmations) actually measures them —
@@ -697,10 +688,15 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
         except Exception:  # noqa: BLE001 — reaping is best-effort; never blocks the tick
             logger.warning("judge self-tune: orphan knob-row reap faulted", exc_info=True)
     try:
-        # Dev-level constant (S26), not a user tunable — read directly, not
-        # via tunables.get_tunable (see the gate comment above). Read here at
-        # call time (not a captured default) so a test can still override it
-        # via monkeypatch.setattr on brain.dev_constants.
+        # ">a handful" gate (spec §2): the weekly tick fires only when MORE new
+        # non-None `haiku_label` POSITIONS (one Haiku decision each — spec §2's
+        # pinned counting unit, red-team fix F-2) than the threshold have
+        # accumulated across UNCONSUMED `calibration_log` rows
+        # (`MemoryStore.count_new_haiku_decisions`). The threshold is a
+        # dev-level constant (S7/S26), not a user tunable — read directly, not
+        # via tunables.get_tunable (why: dev_constants.py). Read here at call
+        # time (not a captured default) so a test can still override it via
+        # monkeypatch.setattr on brain.dev_constants.
         gate_handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
         # F2c inc8: only Haiku decisions logged within one weekly cadence of
         # `now` are counted (and so trained on — every training read is scoped

@@ -39,7 +39,8 @@ _BACKOFF_BASE_S = 30 * 60.0
 # embedding_backfill.tick_interval_seconds setting, read by run_folded in
 # brain/bridge/supervisor.py) - any value at or below that granularity is
 # equivalent, since the next real retry opportunity is gated by the
-# supervisor's own loop cadence regardless of a finer-grained number here.
+# supervisor's own loop cadence regardless of a finer-grained number here (a
+# tick set below 60 s only makes this retry coarser than the loop, never wrong).
 _DEFERRED_RETRY_INTERVAL_S = 60.0
 
 

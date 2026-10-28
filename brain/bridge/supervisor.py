@@ -331,7 +331,7 @@ def run_folded(
     note.
     """
     # ``tick_interval_s`` None = the ``embedding_backfill.tick_interval_seconds`` setting, read once per entry. An
-    # explicit value, ``0.0`` included, wins (the tests pass tiny ones).
+    # explicit value, ``0.0`` included, wins.
     if tick_interval_s is None:
         tick_interval_s = _backfill_tick_interval_seconds()
     logger.info(

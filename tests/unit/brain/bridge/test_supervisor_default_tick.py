@@ -13,7 +13,6 @@ from pathlib import Path
 import brain.bridge.provider as provider_mod
 import brain.bridge.supervisor as supervisor_mod
 from brain import tunables
-from brain.bridge import cli_throttle
 from brain.bridge.events import EventBus
 
 _KEY = "embedding_backfill.tick_interval_seconds"
@@ -69,7 +68,6 @@ def _waits_of_one_loop(persona_dir: Path, monkeypatch, **tick) -> list[float | N
 
 
 def test_the_default_tick_follows_the_setting_and_an_explicit_tick_wins(tmp_path, monkeypatch) -> None:
-    cli_throttle.reset()
     persona_dir = tmp_path / "persona"
     (persona_dir / "active_conversations").mkdir(parents=True)
     tunables.set_values({_KEY: 7.5})
@@ -79,4 +77,3 @@ def test_the_default_tick_follows_the_setting_and_an_explicit_tick_wins(tmp_path
 
     explicit = _waits_of_one_loop(persona_dir, monkeypatch, tick_interval_s=0.0)
     assert 0.0 in explicit and 7.5 not in explicit, explicit
-    cli_throttle.reset()

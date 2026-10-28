@@ -163,7 +163,7 @@ _BATCH_BUDGET_SECONDS_DEFAULT = tunables.register(
 )
 _TICK_INTERVAL_SECONDS_DEFAULT = tunables.register(
     "embedding_backfill.tick_interval_seconds", 60.0,
-    description="How often, in seconds, the app's background passes run.",
+    description="How often, in seconds, the app's background passes run. Takes effect when the app starts.",
 )
 
 
@@ -252,7 +252,7 @@ def _derive_batch_size(per_embed_seconds: float, scan_cap: int) -> int:
     already kept reasonable (>= 1) by the existing low clamp below.
 
     Logs once (per process) if the configured budget leaves no headroom
-    inside the assumed tick interval — a configuration smell, not a fatal
+    inside the supervisor tick — a configuration smell, not a fatal
     error, so this never raises.
     """
     global _warned_no_headroom
