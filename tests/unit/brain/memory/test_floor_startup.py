@@ -64,7 +64,7 @@ def _finish(*threads: threading.Thread) -> None:
     function (CI run 40639503385: a retry thread that needed more than 10 s). No bound
     here on purpose: every thread these tests start ends on its own (a gate is released
     first), and a thread that really never ends is a deadlock that pytest-timeout
-    (`timeout` in pyproject.toml) stops."""
+    (`timeout` in pyproject.toml) ends, on Windows by killing the xdist worker."""
     for thread in threads:
         thread.join()
 
@@ -1245,8 +1245,15 @@ class _LockSpy:
     def __init__(self) -> None:
         self.taken_by: list[str] = []
 
-    def __enter__(self) -> _LockSpy:
+    def acquire(self, *args: object, **kwargs: object) -> bool:
         self.taken_by.append(threading.current_thread().name)
+        return True
+
+    def release(self) -> None:
+        pass
+
+    def __enter__(self) -> _LockSpy:
+        self.acquire()
         return self
 
     def __exit__(self, *exc: object) -> bool:
