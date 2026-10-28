@@ -7,6 +7,7 @@ the setting"; an explicit value, including ``0.0``, still wins.
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import brain.bridge.provider as provider_mod
 import brain.bridge.supervisor as supervisor_mod
 from brain import tunables
 from brain.bridge.events import EventBus
+from brain.memory import embedding_backfill
 
 _KEY = "embedding_backfill.tick_interval_seconds"
 
@@ -77,3 +79,43 @@ def test_the_default_tick_follows_the_setting_and_an_explicit_tick_wins(tmp_path
 
     explicit = _waits_of_one_loop(persona_dir, monkeypatch, tick_interval_s=0.0)
     assert 0.0 in explicit and 7.5 not in explicit, explicit
+
+
+# A hand-edited value that is not a finite number above 0 reads as the registered default (#531): 0, a negative number and
+# `nan` would make the wait return at once, and `inf` makes Event.wait raise OverflowError and ends the supervisor.
+_BAD_TICKS = (0.0, -1.0, float("nan"), float("inf"))
+
+
+def test_a_bad_tick_setting_runs_the_loop_at_the_registered_default(tmp_path, monkeypatch) -> None:
+    persona_dir = tmp_path / "persona"
+    (persona_dir / "active_conversations").mkdir(parents=True)
+    default = embedding_backfill._TICK_INTERVAL_SECONDS_DEFAULT  # noqa: SLF001
+    tunables.set_values({_KEY: 7.5})
+    waits = _waits_of_one_loop(persona_dir, monkeypatch)
+    assert 7.5 in waits and default not in waits, waits  # the loop follows the setting, so the next phases mean something
+
+    for bad in _BAD_TICKS:
+        tunables.set_values({_KEY: bad})
+        waits = _waits_of_one_loop(persona_dir, monkeypatch)
+        assert default in waits, (bad, waits)
+
+    tunables.set_values({_KEY: 0.0})
+    explicit = _waits_of_one_loop(persona_dir, monkeypatch, tick_interval_s=0.0)
+    assert 0.0 in explicit and default not in explicit, explicit  # an explicit value still wins
+
+
+def test_a_bad_tick_setting_reads_as_the_default_and_is_logged_once(monkeypatch, caplog) -> None:
+    default = embedding_backfill._TICK_INTERVAL_SECONDS_DEFAULT  # noqa: SLF001
+    monkeypatch.setattr(tunables, "_warned_keys", set())
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        for bad in _BAD_TICKS:
+            tunables.set_values({_KEY: bad})
+            caplog.clear()
+            assert embedding_backfill.tick_interval_seconds() == default
+            assert embedding_backfill.tick_interval_seconds() == default
+            texts = [r.getMessage() for r in caplog.records]
+            assert len(texts) == 1 and _KEY in texts[0] and repr(bad) in texts[0], (bad, texts)
+        tunables.set_values({_KEY: 7.5})
+        caplog.clear()
+        assert embedding_backfill.tick_interval_seconds() == 7.5
+    assert caplog.records == []

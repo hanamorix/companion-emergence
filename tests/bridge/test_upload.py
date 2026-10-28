@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -118,6 +119,48 @@ def test_upload_honours_a_lowered_upload_cap(persona_dir: Path) -> None:
     assert too_big_image.status_code == 413, too_big_image.text
     assert file_at_the_cap.status_code == 200, file_at_the_cap.text
     assert image_at_the_cap.status_code == 200, image_at_the_cap.text
+
+
+_KEY = "files.upload_max_bytes"
+
+
+def test_upload_reads_a_cap_that_is_not_above_zero_as_the_registered_default(persona_dir: Path) -> None:
+    """A hand-edited cap of 0 or below falls back to the registered default (#531), it does not refuse everything.
+
+    With 0 the route would answer 413 to every non-empty body; with -2 it would read the whole body before refusing.
+    """
+    default = file_store._UPLOAD_MAX_BYTES  # noqa: SLF001
+    tunables.set_values({_KEY: 1024})
+    client = _client(persona_dir)
+    with client:
+        anchor = client.post("/upload", files={"file": ("big.bin", b"a" * 1025, "application/octet-stream")})
+        assert anchor.status_code == 413, anchor.text  # the route follows the setting, so the phases below mean something
+        for bad in (0, -2):
+            tunables.set_values({_KEY: bad})
+            assert file_store.upload_max_bytes() == default
+            small_file = client.post("/upload", files={"file": ("x.bin", b"b" * 2048, "application/octet-stream")})
+            small_image = client.post("/upload", files={"file": ("x.png", _TINY_PNG, "image/png")})
+            assert small_file.status_code == 200, (bad, small_file.text)
+            assert small_image.status_code == 200, (bad, small_image.text)
+        too_big = client.post("/upload", files={"file": ("big.bin", b"\x00" * (default + 1), "application/octet-stream")})
+        assert too_big.status_code == 413, too_big.text
+
+
+def test_a_cap_that_is_not_above_zero_reads_as_the_default_and_is_logged_once(monkeypatch, caplog) -> None:
+    default = file_store._UPLOAD_MAX_BYTES  # noqa: SLF001
+    monkeypatch.setattr(tunables, "_warned_keys", set())
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        for bad in (0, -2):
+            tunables.set_values({_KEY: bad})
+            caplog.clear()
+            assert file_store.upload_max_bytes() == default
+            assert file_store.upload_max_bytes() == default
+            texts = [r.getMessage() for r in caplog.records]
+            assert len(texts) == 1 and _KEY in texts[0] and repr(bad) in texts[0], (bad, texts)
+        tunables.set_values({_KEY: 1024})
+        caplog.clear()
+        assert file_store.upload_max_bytes() == 1024
+    assert caplog.records == []
 
 
 def test_upload_requires_auth_when_token_set(persona_dir: Path) -> None:

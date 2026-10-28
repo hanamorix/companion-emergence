@@ -174,8 +174,13 @@ def _batch_budget_seconds() -> float:
 
 
 def tick_interval_seconds() -> float:
-    return tunables.get_tunable(
-        "embedding_backfill.tick_interval_seconds", _TICK_INTERVAL_SECONDS_DEFAULT
+    """The supervisor's tick in seconds. A setting that is not a finite number above 0 reads as the registered default."""
+    return tunables.positive_or_default(
+        "embedding_backfill.tick_interval_seconds",
+        tunables.get_tunable(
+            "embedding_backfill.tick_interval_seconds", _TICK_INTERVAL_SECONDS_DEFAULT
+        ),
+        _TICK_INTERVAL_SECONDS_DEFAULT,
     )
 
 

@@ -41,8 +41,15 @@ _UPLOAD_MAX_BYTES = tunables.register(
 
 
 def upload_max_bytes() -> int:
-    """Current upload byte cap of POST /upload, for images and other files alike (a tunable)."""
-    return tunables.get_tunable("files.upload_max_bytes", _UPLOAD_MAX_BYTES)
+    """Current upload byte cap of POST /upload, for images and other files alike (a tunable).
+
+    A setting that is not a finite number above 0 reads as the registered default.
+    """
+    return tunables.positive_or_default(
+        "files.upload_max_bytes",
+        tunables.get_tunable("files.upload_max_bytes", _UPLOAD_MAX_BYTES),
+        _UPLOAD_MAX_BYTES,
+    )
 
 
 @dataclass(frozen=True)

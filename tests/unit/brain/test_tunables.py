@@ -5,6 +5,8 @@ silently strips or corrupts operational settings on live installs.
 """
 from __future__ import annotations
 
+import logging
+import math
 import os
 import time
 
@@ -130,3 +132,33 @@ def test_file_mtime_is_the_files_modification_time_or_none(tunables, tmp_path):
     path = write_values(tmp_path, {"a": 1})
     assert tunables.file_mtime() == path.stat().st_mtime
 
+
+
+# --- positive_or_default (#531): a duration or size cap that is not a finite number above 0 reads as its registered default ---
+
+
+@pytest.mark.parametrize("value", [1, 7.5, 1e-9, 10**400, 1e300])
+def test_positive_or_default_keeps_a_finite_number_above_zero(tunables, value, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", value, 60.0) == value
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -0.0, -1, -2.5, math.nan, math.inf, -math.inf, True, False, "fast", None])
+def test_positive_or_default_returns_the_default_for_anything_else(tunables, value, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", value, 60.0) == 60.0
+    assert len(caplog.records) == 1
+
+
+def test_positive_or_default_warns_once_per_key_and_value_naming_both(tunables, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        for _ in range(3):
+            tunables.positive_or_default("a.b", math.nan, 60.0)
+            tunables.positive_or_default("a.b", -1, 60.0)
+        tunables.positive_or_default("a.c", -1, 60.0)
+    texts = [r.getMessage() for r in caplog.records]
+    assert len(texts) == 3, texts
+    assert "a.b" in texts[0] and "nan" in texts[0] and "60.0" in texts[0]
+    assert "a.b" in texts[1] and "-1" in texts[1]
+    assert "a.c" in texts[2]
