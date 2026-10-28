@@ -68,12 +68,15 @@ SETTINGS = make_settings(
         "ZETA_SPAN_HOURS": 3.0,  # one word remains after ZETA
         "PAIR_FADE_FLOOR": 0.2,  # a pair shares PAIR: a pair is not a group
         "PAIR_FADE_STEP": 0.1,
+        "TWIN_ALPHA_BETA_GAMMA": 11,  # a pair whose remainders are long enough: still a pair, not a group
+        "TWIN_DELTA_EPSILON_ETA": 12,
         "IMAGE_KINDS": ("alpha_kind", "beta_kind"),  # a collection of strings
     },
     tunables=[
         TunableInfo("area.retry_wait_seconds", 12.0, "RETRY_WAIT_SECONDS", "brain/area.py"),
         TunableInfo("area.upload_cap", _MIB20, None, "brain/area.py"),
-    TunableInfo("area.read_cap", 524288, None, "brain/area.py"),
+        TunableInfo("area.read_cap", 524288, None, "brain/area.py"),
+        TunableInfo("area.cap", 777, "_CAP", "brain/area.py"),  # a bound name of one word
         TunableInfo("other.sample_rows", 100, "SAMPLE_ROWS", "brain/other.py"),
         TunableInfo("model.thing", "claude-test-9", None, "brain/bridge/model_tier.py"),
     ],
@@ -218,6 +221,21 @@ _CONFORMING_GET_TUNABLE = {
 }
 
 
+_VIOLATING_G2_GET_TUNABLE = {
+    "argv_from_get_tunable": "from brain import tunables\ndef f():\n    return ['claude', '--model', tunables.get_tunable('a.b', 'x')]\n",
+    "argv_from_a_local_holding_get_tunable": (
+        "from brain import tunables\ndef f():\n    m = tunables.get_tunable('a.b', 'x')\n    return ['claude', '--model', m]\n"
+    ),
+}
+
+
+@_NBF
+@pytest.mark.parametrize("name", sorted(_VIOLATING_G2_GET_TUNABLE))
+def test_fixture_g2_a_get_tunable_result_is_not_a_model_accessor_result(name: str) -> None:
+    """Only the MODEL accessors may feed ``--model``: a tunable of any other key is not the model setting."""
+    assert "G2" in {f.rule for f in check_all(_VIOLATING_G2_GET_TUNABLE[name], _MODULE, SETTINGS)}, name
+
+
 @_NBF
 @pytest.mark.parametrize("name", sorted(_CONFORMING) + sorted(_CONFORMING_GET_TUNABLE))
 def test_fixture_conforming_model_and_accessor_source_passes_every_rule(name: str) -> None:
@@ -240,7 +258,7 @@ def test_fixture_get_tunable_copy_that_outlives_the_call_is_flagged_by_r4(name: 
 
 @_NBF
 def test_fixture_g5_model_key_is_the_model_cases_and_set_values_is_r1d() -> None:
-    """The model key literal is G5; ``set_values`` ownership is R1(d): the fold function only, not its file (rev-4 review S2)."""
+    """The model key literal is G5; ``set_values`` ownership is R1(d): the fold function only, not its file."""
     fold = "from brain import tunables\ndef _fold(legacy, complete):\n    tunables.set_values({'a': 1}, only_if_default=True)\n"
     second = "from brain import tunables\ndef _another(u):\n    tunables.set_values(u)\n"
     nested = "from brain import tunables\ndef _fold(l, c):\n    def inner(u):\n        tunables.set_values(u)\n    return inner\n"
@@ -312,6 +330,9 @@ _R1_CONFORMING = {
         "from brain import tunables\ndef _fold(a, b):\n    tunables.set_values({}, only_if_default=True)\n", "brain/tunables_migration.py"
     ),
     "set_values_in_tunables_itself": ("def set_values(u):\n    return u\ndef g():\n    set_values({})\n", "brain/tunables.py"),
+    "a_local_that_shadows_an_imported_name": (
+        "from brain.dev_constants import WIDGET_TIMEOUT_S\ndef f():\n    WIDGET_TIMEOUT_S = 1.0\n    return WIDGET_TIMEOUT_S\n", _MODULE
+    ),
     "a_local_that_shares_a_setting_name_but_was_not_imported": ("def f():\n    WIDGET_TIMEOUT_S = 1.0\n    return WIDGET_TIMEOUT_S\n", _MODULE),
 }
 
@@ -354,6 +375,8 @@ _R2_CONFORMING = {
     "a_pair_prefix_is_not_a_group": ("FADE_FLOOR = 9.5\n", _MODULE),
     "a_remainder_of_one_word_is_not_matched": ("SPAN = 8.5\n", _MODULE),
     "a_remainder_of_two_words_is_not_matched": ("MIN_AGE = 8.5\nDAILY_BUDGET = 9.5\n", _MODULE),
+    "a_pair_is_not_a_group_even_with_long_remainders": ("ALPHA_BETA_GAMMA = 8.5\n", _MODULE),
+    "a_setting_name_of_one_word_is_not_matched": ("ORBIT = 5.5\nCAP = 3.5\ndef f(cap=2.5):\n    return cap\n", _MODULE),
     "a_bare_annotation_holds_no_copy": ("class C:\n    widget_timeout: float\n    widget_timeout_s: float | None = None\n", _MODULE),
     "a_local_variable": ("def f():\n    widget_timeout = 3.5\n    return widget_timeout\n", _MODULE),
     "a_different_name": ("WIDGET_RETRY = 3.5\nCACHE_TIMEOUT = 4.5\n", _MODULE),
@@ -385,6 +408,7 @@ def test_fixture_group_prefix_is_removed_only_from_a_group_and_only_when_two_wor
     assert forms["ZETA_MIN_AGE_HOURS"] == (frozenset({"ZETA", "MIN", "AGE"}),)  # two words remain: too generic
     assert forms["ZETA_SPAN_HOURS"] == (frozenset({"ZETA", "SPAN"}),)  # one word remains: not a form
     assert forms["PAIR_FADE_FLOOR"] == (frozenset({"PAIR", "FADE", "FLOOR"}),)  # a pair is not a group
+    assert forms["TWIN_ALPHA_BETA_GAMMA"] == (frozenset({"TWIN", "ALPHA", "BETA", "GAMMA"}),)  # a pair of long names neither
     assert forms["WIDGET_TIMEOUT_S"] == (frozenset({"WIDGET", "TIMEOUT"}),)  # no group at all
 
 
@@ -406,8 +430,8 @@ _R3_CONFORMING = {
     "the_register_call_own_default": (
         "from brain import tunables\nCOPY = tunables.register('area.copy_cap', 20 * 1024 * 1024, description='d')\n", _MODULE
     ),
-    "a_docstring_naming_the_value": ("def f():\n    '''Writes widget_store.db and 20971520 bytes.'''\n    return 1\n", _MODULE),
-    "a_string_inside_an_fstring": ("def f(x):\n    return f'widget_store.db {x}'\n", _MODULE),
+    "a_docstring_that_is_the_value": ("def f():\n    '''widget_store.db'''\n    return 1\n", _MODULE),
+    "a_part_of_an_fstring_that_is_the_value": ("def f(x):\n    return f'widget_store.db{x}'\n", _MODULE),
     "a_product_that_is_not_the_value": ("def f():\n    return 20 * 1024\n", _MODULE),
     "owner_file_of_the_dev_constants": ("UPLOAD_CEILING_BYTES = 20 * 1024 * 1024\nSTORE_FILE = 'widget_store.db'\n", "brain/dev_constants.py"),
 }
@@ -539,6 +563,7 @@ _R5_VIOLATING = {
 }
 _R5_CONFORMING = {
     "read_inside_a_body": (_DC + "def f():\n    return dev_constants.WIDGET_TIMEOUT_S\n", _MODULE),
+    "a_local_variable_holding_the_read": (_DC + "def f():\n    x = dev_constants.WIDGET_TIMEOUT_S\n    return x\n", _MODULE),
     "module_import_alone": (_DC, _MODULE),
     "a_default_computed_from_a_constant_is_not_detected": (
         _DC + "def f(x=dev_constants.WIDGET_TIMEOUT_S * 3600.0):\n    return x\n", _MODULE
@@ -730,13 +755,17 @@ _IMAGE_TYPES = ("tunables:files.image_types",)
 _TICK = ("tunables:embedding_backfill.tick_interval_seconds",)
 _UPLOAD_CAPS = ("tunables:files.image_max_bytes", "tunables:files.pdf_max_bytes", "tunables:files.upload_max_bytes")
 ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
-    # The four kinds of image the kindled can look at are written out again beside the setting that holds them.
+    # The four kinds of image written out again beside files.image_types. The setting says which images the read_file tool
+    # opens; these constants say which images chat and upload accept. Same four, written independently.
     ("R3-collection", "brain/bridge/chat.py", "assign _ALLOWED_MEDIA_TYPES", _IMAGE_TYPES,
-     "real copy of files.image_types (the same four image kinds); predates the guard, to be replaced by the setting"),
+     "equal value, possibly a different purpose (the setting lists what the read_file tool opens, this lists what chat accepts); "
+     "whether they should share one setting is an owner call; predates the guard"),
     ("R3-collection", "brain/bridge/server.py", "assign _ALLOWED_UPLOAD_MEDIA_TYPES", _IMAGE_TYPES,
-     "real copy of files.image_types, a local constant of build_app; predates the guard, to be replaced by the setting"),
+     "equal value, possibly a different purpose (what upload accepts, a local constant of build_app); whether it should share "
+     "the setting is an owner call; predates the guard"),
     ("R3-collection", "brain/images.py", "assign _ALLOWED_MEDIA_TYPES", _IMAGE_TYPES,
-     "real copy of files.image_types; predates the guard, to be replaced by the setting"),
+     "equal value, possibly a different purpose (what may be saved as an image blob); whether it should share the setting is "
+     "an owner call; predates the guard"),
     # The 20 MiB upload cap, written out again where the upload route compares against it.
     ("R3", "brain/bridge/server.py", "assign _IMAGE_MAX_BYTES", _UPLOAD_CAPS,
      "real copy of the 20 MiB upload default, used as max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes()); predates the guard"),
@@ -785,10 +814,24 @@ def test_every_model_vocabulary_entry_still_matches_something_at_its_shape(scan)
 
 @_NBF
 def test_the_scan_derives_both_kinds_of_setting_from_the_tree(scan) -> None:
-    """The scan is not vacuous: the settings it derived from the tree are numerous and of both kinds."""
+    """The scan is not vacuous: settings of both kinds were derived, every dev constant is one the snapshot test also sees,
+    and every tunable's owner file is a file of the tree."""
+    from tests.unit.test_dev_constants_snapshot import current_constants
+
     settings, _findings_, _used = scan
-    assert len(settings.dev) > 40 and len(settings.tunables) > 40
-    assert "files.upload_max_bytes" in settings.tunables and "SEARCH_BRIDGE_TIMEOUT_S" in settings.dev
+    assert settings.dev and settings.tunables
+    assert set(settings.dev) <= set(current_constants())
+    assert all(info.owner_file in brain_trees() for info in settings.tunables.values())
+
+
+@_NBF
+def test_no_model_rule_finding_is_ever_allow_listed(scan) -> None:
+    """The #529 model rules are not ratcheted: no model id or alias word is chosen outside the accessor (G1, G2, G4, G5) or
+    held by the app outside the picker vocabulary (APP-MODEL), and none of them may be put in ALLOW."""
+    _settings, findings, _used = scan
+    model_rules = {"G1", "G2", "G4", "G5", "APP-MODEL"}
+    assert [f.message for f in findings if f.rule in model_rules] == []
+    assert [e for e in ALLOW if e[0] in model_rules] == []
 
 
 @_NBF

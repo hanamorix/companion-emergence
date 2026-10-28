@@ -37,42 +37,49 @@ G1 G2 G4 G5  the model case (#529): the model grammar is the recognizer of a cop
 APP-R3, APP-MODEL  the app (TypeScript and Rust, tests excluded): the distinctive tier over numeric expressions and string
     tokens, plus the model tokens. Names are not compared across languages.
 
-Thresholds, all derived and none tuned:
+Thresholds. Each is derived from a measurement of the tree and says which:
 
 * Four significant digits. A literal's purpose is not in the AST, and round figures recur for unrelated reasons. The
-  counts of numeric literals equal to a setting's value over ``brain/*.py`` at the time of the survey (constant arithmetic
-  folded, int and float equal, the definitions included): 1.0: 1089, 2.0: 228, 5.0: 104, 3: 156, 30.0: 35, 200: 48, 8: 62,
-  20.0: 42. Every such figure has one or two significant digits. The shared value that separates three from four is
-  ``86400`` ("864", three digits): the seconds in a day, written in 15 places of ``brain/`` for unrelated purposes and also
-  the value of ``COST_SERIES_WINDOW_S``. Three would make it a source of false positives; four excludes it, and the next
-  shared figure up (``0.14227``, five digits) is a measured result. Values with four or more digits occurred at their own
-  definitions only, except the 20 MiB byte figure (the default of three upload tunables, also written in
-  ``bridge/server.py`` and ``app/src/components/ChatPanel.tsx``).
+  counts of numeric literals equal to a setting's value over ``brain/*.py`` (folded exactly as this module folds, ``+ - *
+  **`` only; int and float equal; the definitions included), measured when this guard landed: 1.0: 1019, 2.0: 226,
+  5.0: 102, 3: 157, 30.0: 33, 200: 48, 8: 61, 20.0: 42. Every such figure has one or two significant digits. The shared
+  value that separates three from four is ``86400`` ("864", three digits): the seconds in a day, written in 15 places of
+  ``brain/`` for unrelated purposes and also the value of ``COST_SERIES_WINDOW_S``. Three would make it a source of false
+  positives; four excludes it, and the next shared figure up (``0.14227``, five digits) is a measured result. Values with
+  four or more digits occurred at their own definitions only, except the 20 MiB byte figure (the default of three upload
+  tunables, also written in ``bridge/server.py`` and ``app/src/components/ChatPanel.tsx``).
 * Two words. One word names a kind of thing, not a purpose (``OPUS``, ``FALLBACK``, ``REPROBE`` would match anything), so
-  a name form needs at least two non-unit words, which all have to be present in the bound name.
+  a name form (exact or loose) needs at least two non-unit words; the loose tier needs all of them in the bound name.
 * Unit words (``S SEC SECS SECOND SECONDS MS MINUTES HOURS DAYS BYTES``) are spellings of the unit of the number, not its
   purpose: ``_S`` and ``_SECONDS`` are one name. ``DEFAULT`` is a qualifier and is not a unit word.
 * Group prefix: the moves into dev_constants gave constants a prefix (``ATTUNEMENT_``, ``KINDLED_LINK_``,
   ``JUDGE_TUNE_GRADE_``), so a copy under the natural unprefixed name would not equal the name. A leading run of name
-  words shared by at least three dev constants is a group prefix (a pair such as ``FADE_`` before two different words
-  is not a group: the third member is what makes it a namespace); the name without it is also a form of the setting
-  when at least three non-unit words remain: the prefix carried the family of the setting, so what is left must say
-  the purpose on its own, and a remainder of two generic words is a name unrelated modules already use. Measured on
-  the real tree when the rule was first run with two words: ``SCHEMA_VERSION`` (the attunement schema, against three
-  other schema versions in ``ingest/`` and ``works/``) and ``CADENCE_FILE`` (against two unrelated cadence files in
-  ``kindled_link/``) matched five unrelated constants; with three words nothing unrelated matched. A prefix shared by
-  exactly two constants, and the remainders of one or two words (``SCHEMA_VERSION``, ``ADDRESS_COOLDOWN``,
-  ``SESSION_COOLDOWN``, ``BUDGET_MAX``, ``LORA``, ``ORDER``), are therefore missed: a copy under those natural names is
-  not caught by name (a copy of the value with 4+ digits or with the setting's words still is).
+  words shared by at least three dev constants is a group prefix; the name without it is also a form of the setting when
+  at least three non-unit words remain. Neither number is a tuned target. ``MIN_GROUP_SIZE = 3`` is the smallest size
+  that is more than a pair (a prefix shared by two constants may be part of two different names); it has no measurement
+  behind it, and on today's tree any size from 1 to 5 gives the same findings. ``MIN_STRIPPED_WORDS = 3`` is the smallest
+  remainder with no unrelated match on today's tree: with two words the rule flagged five unrelated constants,
+  ``SCHEMA_VERSION`` (the attunement schema against the other schema versions in ``ingest/`` and ``works/``) and
+  ``CADENCE_FILE`` (against two unrelated cadence files in ``kindled_link/``). The cost: a copy under these natural
+  names is not caught by name, the eight prefixed dev constants whose remainder is one or two words
+  (``SCHEMA_VERSION``, ``ADDRESS_COOLDOWN``, ``SESSION_COOLDOWN``, ``BUDGET_MAX``, ``CADENCE_FILE``, ``INTERVAL``,
+  ``GRADE_LORA``, ``GRADE_ORDER``); a copy of their value with four or more digits, or bound to the setting's words, still
+  is.
 
-NOT detected: a copy of a round value under an unrelated name (``delay = 60`` for a 60 s tick), a copy computed at run
-time, a value spelled differently across a call (``datetime.timedelta(minutes=15)`` for 900 s), a default computed from a
-dev constant (``def f(x=dev_constants.Y * 3600.0)``), constant folding other than ``+ - * **`` (``/``, ``//``, ``<<``
-are not folded), a collection that is not a literal of strings (a dict, a comprehension, a list built by a call), and
-anything in a language the check does not parse. In the app also: a collection of strings (the accepted image kinds in
-ChatPanel.tsx), a value scaled to another unit (``HEARTBEAT_INTERVAL_MINUTES = 15`` against a 900 s setting, ``600_000``
-ms against 600.0 s), a value spelled in prose ("max 20 MB"), hex, shifts, ``**`` and exponents, and Rust integer
-suffixes (``1024u64``).
+NOT detected: a copy of a round value under an unrelated name (``delay = 60`` for a 60 s tick) or under a related name
+that lacks one of the setting's words (``scan_cap = 500`` for ``DEFAULT_SCAN_CAP``); a copy computed at run time; a value
+spelled differently across a call (``datetime.timedelta(minutes=15)`` for 900 s) or in another unit or inside a string
+(``PRAGMA busy_timeout = 5000`` for the 5.0 s ``SQLITE_STORE_BUSY_TIMEOUT_S``, in brain/initiate/resonance.py); a default
+computed from a dev constant (``def f(x=dev_constants.Y * 3600.0)``); constant folding other than ``+ - * **`` (``/``,
+``//``, ``<<`` are not folded); a collection that is not a literal of strings (a dict, a comprehension, a list built by a
+call); a tunable registered through ``from brain.tunables import register`` or ``brain.tunables.register(...)`` (the tree
+has the one spelling ``tunables.register``); a result of ``tunables.get_raw`` (the raw-file reader of the migration and the
+model writer) kept somewhere that outlives the call; a function that returns an accessor result and is called at module or
+class scope from ANOTHER file (the returner set is per file); and anything in a language the check does not parse. In the
+app also: a collection of strings (the accepted image kinds in ChatPanel.tsx), a value scaled to another unit
+(``HEARTBEAT_INTERVAL_MINUTES = 15`` against a 900 s setting, ``600_000`` ms against 600.0 s), a value spelled in prose
+("max 20 MB") or inside a template literal, hex, shifts, ``**`` and exponents, and Rust integer suffixes (``1024u64``); a
+product is read as written, so ``n * 20 * 1024 * 1024`` reads its trailing run ``20 * 1024 * 1024``.
 
 The checkers are small pure functions over a source string (or a ``Parsed``); a checker takes the ``Settings`` it should
 guard, so fixtures run over a small synthetic one and the real tree over ``derive_settings``. Parent maps are built per
@@ -303,11 +310,11 @@ class Settings:
         settings: list[_Setting] = []
         for name, value in self.dev.items():
             forms = self.dev_forms[name]
-            settings.append(
-                _Setting(f"dev_constants.{name}", value, forms, tuple(f for f in forms if len(f) >= MIN_FORM_WORDS), dev_owner, (name,))
-            )
+            wide = tuple(f for f in forms if len(f) >= MIN_FORM_WORDS)
+            settings.append(_Setting(f"dev_constants.{name}", value, wide, wide, dev_owner, (name,)))
         for key, info in self.tunables.items():
             bound = name_words(info.bound_name) if info.bound_name else frozenset()
+            bound = bound if len(bound) >= MIN_FORM_WORDS else frozenset()  # one word names a kind of thing
             segments = key.split(".")
             loose = [bound] if len(bound) >= MIN_FORM_WORDS else []
             loose += [f for f in (name_words(".".join(segments[i:])) for i in range(len(segments))) if len(f) >= MIN_FORM_WORDS]
@@ -509,6 +516,10 @@ def _call_name(p: Parsed, call: ast.Call) -> str | None:
 
 def _is_accessor_call(p: Parsed, node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and _call_name(p, node) in ACCESSORS
+
+
+def _is_model_accessor_call(p: Parsed, node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _call_name(p, node) in MODEL_ACCESSORS
 
 
 def _enclosing_function(p: Parsed, node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
@@ -1008,7 +1019,9 @@ def check_g1(
 
 
 def _is_sanctioned_value(p: Parsed, value: ast.AST, scope_node: ast.AST) -> bool:
-    if _is_accessor_call(p, value):
+    """A value that may follow ``--model``: a result of a MODEL accessor (not any ``get_tunable`` result), directly or
+    through a local that is only ever assigned one."""
+    if _is_model_accessor_call(p, value):
         return True
     if isinstance(value, ast.Name):
         func = _enclosing_function(p, scope_node)
@@ -1022,7 +1035,7 @@ def _is_sanctioned_value(p: Parsed, value: ast.AST, scope_node: ast.AST) -> bool
         if value.id in params:
             return False
         vals = _assignments_to(func, value.id)
-        return bool(vals) and all(_is_accessor_call(p, v) for v in vals)
+        return bool(vals) and all(_is_model_accessor_call(p, v) for v in vals)
     return False
 
 
