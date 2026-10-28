@@ -416,7 +416,7 @@ class _LazyLoadRaceStubTextEmbedding:
         self._loaded = False
         self.concurrent_loads = 0
         self.max_concurrent_loads = 0
-        self.expected_arrivals = 2
+        self.expected_arrivals: int | None = None
         self._arrived: set[int] = set()
         self.all_arrived = threading.Event()
         # See _StubTextEmbedding's docstring: gives the materialize-
@@ -428,6 +428,8 @@ class _LazyLoadRaceStubTextEmbedding:
 
     def arrive(self) -> None:
         """Record the calling thread as arrived; release everyone once all have."""
+        if self.expected_arrivals is None:
+            raise RuntimeError("set expected_arrivals to the test's thread count first")
         with self._cls_lock:
             self._arrived.add(threading.get_ident())
             if len(self._arrived) >= self.expected_arrivals:
@@ -441,6 +443,7 @@ class _LazyLoadRaceStubTextEmbedding:
             try:
                 self.arrive()
                 if not self.all_arrived.wait(timeout=_RACE_RENDEZVOUS_TIMEOUT_S):
+                    self.all_arrived.set()  # let the other waiting threads fail fast too, not one timeout each
                     raise RuntimeError(
                         f"only {len(self._arrived)} of {self.expected_arrivals} threads arrived "
                         f"within {_RACE_RENDEZVOUS_TIMEOUT_S} s"
