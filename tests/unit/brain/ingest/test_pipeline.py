@@ -1667,8 +1667,10 @@ def test_the_close_holds_the_append_lock_from_the_late_rows_check_to_the_removal
     at_late_read: list[int | None] = []
     at_archive: list[int | None] = []
     at_delete: list[int | None] = []
+    at_backoff: list[int | None] = []
     real_read_after = pipeline.read_session_after
     real_delete = pipeline.delete_session_buffer
+    real_delete_backoff = pipeline.delete_backoff
     reads: list[int] = []
 
     def _read_after(persona_dir, session_id, after_ts):
@@ -1686,13 +1688,38 @@ def test_the_close_holds_the_append_lock_from_the_late_rows_check_to_the_removal
         at_delete.append(append_jsonl(buffer_path, probe_row, lock="try"))
         real_delete(persona_dir, session_id)
 
+    def _delete_backoff(persona_dir, session_id):  # the last removal of the close
+        at_backoff.append(append_jsonl(buffer_path, probe_row, lock="try"))
+        real_delete_backoff(persona_dir, session_id)
+
     monkeypatch.setattr(pipeline, "read_session_after", _read_after)
     monkeypatch.setattr(pipeline, "archive_once", _archive, raising=False)
     monkeypatch.setattr(pipeline, "delete_session_buffer", _delete)
+    monkeypatch.setattr(pipeline, "delete_backoff", _delete_backoff)
 
     assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
 
-    assert (at_late_read, at_archive, at_delete) == ([None], [None], [None])
+    assert (at_late_read, at_archive, at_delete, at_backoff) == ([None], [None], [None], [None])
     assert not buffer_path.exists()
+    # positive control: the probe does write when nobody holds the lock, so a None above means "held", not "the probe cannot write"
+    assert append_jsonl(buffer_path, probe_row, lock="try") is not None
+    buffer_path.unlink()
     ingest_turn(tmp_path, {"session_id": _ARCHIVE_SID, "speaker": "user", "text": "after the close"})
     assert [r["text"] for r in read_session(tmp_path, _ARCHIVE_SID)] == ["after the close"]
+
+
+def test_a_torn_line_is_dropped_with_the_file_and_every_parseable_row_is_archived(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """Policy D5, as compaction and the rollover treat it: the buffer reader skips an unparseable line, so the close archives the parseable rows and the fragment goes with the file."""
+    rows = _seed_closable(
+        tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
+    )
+    buffer_path = _sidecars(tmp_path, _ARCHIVE_SID)["buffer"]
+    with buffer_path.open("ab") as fh:  # a crash mid-append leaves a torn tail (#434)
+        fh.write(b'{"session_id": "sess_arch", "speaker": "user", "te')
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+
+    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert not buffer_path.exists()

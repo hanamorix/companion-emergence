@@ -414,6 +414,9 @@ def close_session(
 
     Without the lock a close extracts and deletes the buffer while the stale sweep, a rollover or the snapshot route is
     mid-extraction of the same turns: both commit them, and the snapshot then writes a cursor for a deleted session.
+
+    A close that reaches the end archives the whole buffer before it removes the buffer, cursor and backoff (see
+    ``_close_session_locked``); an archive error propagates and keeps all three.
     """
     with file_lock(extract_lock_path(persona_dir, session_id), blocking=False) as acquired:
         if not acquired:
@@ -437,7 +440,8 @@ def _archive_buffer(persona_dir: Path, session_id: str) -> list[dict]:
     """Archive every row now in the buffer and return those rows.
 
     Uses ``archive_once`` (fsync, durable commit marker), the writer compaction, the cascade and the rollover also use, so the rows
-    are durable before the caller removes the buffer and a retry of the same batch after a crash does not write it twice. An error
+    are durable before the caller removes the buffer and a retry of the same batch after a crash does not write it twice (except
+    after a crash between ``archive_once``'s append and its marker write, where the batch is repeated, never lost). An error
     propagates and the caller has removed nothing. A malformed line is skipped by ``read_session`` like everywhere else.
     """
     rows = read_session(persona_dir, session_id)
@@ -468,7 +472,8 @@ def _close_session_locked(
     Then every row of the buffer (user and assistant turns, rows at or before the cursor, the summary row) is appended to the
     conversation archive with ``archive_once``, fsynced, before the buffer is removed, so the newest turns do not survive only
     as extracted memories (#555). An archive error propagates with the buffer, cursor and backoff untouched; a crash
-    after the archive and before the removal leaves the buffer, and the retry finds the batch already archived. The late-rows
+    after the archive and before the removal leaves the buffer, and the retry finds the batch already archived (see
+    ``_archive_buffer`` for the one window where it is repeated instead). The late-rows
     check, the archive, a confirming re-read and the removal run under the buffer's append lock (``session_append_lock``),
     so an ``ingest_turn`` row cannot land between the check and the removal. A buffer that a writer without that lock
     (compaction's rewrite) changed during the archive write is kept (``conversation_close_changed_during_archive``, the report
