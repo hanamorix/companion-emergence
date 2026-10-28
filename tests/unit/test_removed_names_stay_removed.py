@@ -467,6 +467,12 @@ REMOVED: tuple[Removed, ...] = (
         why="no module reaches a moved writer through attempt_heal: no import of one, no dotted name, no star import, no alias of the module (#465, G20b)",
         ref=_ATOMIC_REF,
     ),
+    Removed(
+        names=("offline_load_scope", "_hf_telemetry_lock", "_hf_telemetry_depth", "_hf_telemetry_before"),
+        why="huggingface_hub's telemetry opt-out is one process-wide default set in brain/__init__.py, not a scoped flip of the library's flag around each offline load (#554)",
+        ref="71745dcc Hold Hugging Face telemetry off around offline model loads so they make no request (#554), on the #554 branch only: the scope never reached main",
+        kind="code",
+    ),
 )
 
 

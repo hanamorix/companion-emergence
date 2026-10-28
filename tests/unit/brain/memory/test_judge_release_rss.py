@@ -535,15 +535,16 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
     reads a registry file in the HF home (`$HF_HOME/.agent_harnesses.json`, younger
     than 24 h) and otherwise does `GET {endpoint}/api/agent-harnesses` -- before the
     offline short-circuit, so a `local_files_only` load made that one GET (#554).
-    `relevance_judge.offline_load_scope` holds the library's telemetry flag off around
-    an offline load, so the load must not make it. The HF home is not in the CI model
-    cache, so whether the registry file existed depended on whether an earlier test had
-    loaded a judge (random order exposed it, #540); the script therefore points the
-    constant at a fresh, ABSENT file under the test's scratch directory, which is the
-    state of the first load of a day, and nothing is written there for the library to
-    find. The library's own opt-outs are removed from the environment first (a runner
-    that exports one would pass without the fix), and the flag is checked off before
-    the load and back off after it.
+    The app switches the library's telemetry off for the whole process (`brain/
+    __init__.py` sets `HF_HUB_DISABLE_TELEMETRY`), so the load must not make it. The
+    HF home is not in the CI model cache, so whether the registry file existed depended
+    on whether an earlier test had loaded a judge (random order exposed it, #540); the
+    script therefore points the constant at a fresh, ABSENT file under the test's
+    scratch directory, which is the state of the first load of a day, and nothing is
+    written there for the library to find. The library's own opt-outs are removed from
+    the environment first (a runner that exports one would pass without the fix), `brain`
+    is imported before the library as every entry point does, and the telemetry flag is
+    checked on before the load.
     """
     script = textwrap.dedent(
         """
@@ -552,14 +553,18 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
         import socket
 
         # See the test docstring: the library's opt-outs must not be what keeps the request away.
-        for _name in ("HF_HUB_OFFLINE", "HF_HUB_DISABLE_TELEMETRY", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+        for _name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_HUB_DISABLE_TELEMETRY", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
             os.environ.pop(_name, None)
+
+        # The package import is what turns the library's telemetry off; it comes before the library, as in every entry point.
+        import brain  # noqa: F401
 
         # Reading the constant first fails loudly (AttributeError) if the library renames it.
         import huggingface_hub.constants as hf_constants
 
         assert hf_constants.AGENT_HARNESSES_PATH
-        assert hf_constants.HF_HUB_DISABLE_TELEMETRY is False
+        assert hf_constants.HF_HUB_OFFLINE is False
+        assert hf_constants.HF_HUB_DISABLE_TELEMETRY is True
         hf_constants.AGENT_HARNESSES_PATH = os.path.join(os.environ["RSS_TEST_SCRATCH_DIR"], "agent-harnesses.json")
         assert not os.path.exists(hf_constants.AGENT_HARNESSES_PATH)
 
@@ -611,7 +616,6 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
             "hf_session_requests": _hf_session_requests,
             "model_id": provider.model_id(),
             "score_is_float": isinstance(score, float),
-            "telemetry_flag_after": hf_constants.HF_HUB_DISABLE_TELEMETRY,
             # S81 (owner ruling, "CPU everywhere (Recommended)"): every
             # judge construction site passes device="cpu" explicitly now
             # (relevance_judge.py), so this assertion measures the actual
@@ -627,7 +631,6 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
     result = _run_subprocess_script(script, tmp_path)
     assert result["model_id"] == "BAAI/bge-reranker-v2-m3"
     assert result["score_is_float"]
-    assert result["telemetry_flag_after"] is False, "the offline load left the library's telemetry flag on"
     assert result["device"] == "cpu", (
         f"expected the S81 device='cpu' construction to land the judge on cpu, "
         f"got {result['device']!r}"
