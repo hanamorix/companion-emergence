@@ -655,7 +655,8 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     continues. Token cost ~80 (raw metadata, no LLM summarization).
 
     Inviolate properties enforced here:
-    - #4 perf budget (compute_body_state is sub-ms; tested separately)
+    - #4 compute_body_state does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
+      the input reads below are this function's, not compute_body_state's
     - #5 no self-perpetuation (we read from store, never write)
     - #8 no cache (compute_body_state is recomputed every call)
     """

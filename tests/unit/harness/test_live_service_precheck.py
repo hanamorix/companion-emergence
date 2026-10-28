@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -544,7 +545,10 @@ def test_env_restored_after_live_service_raise(
     monkeypatch.setenv("KINDLED_HOME", "/prior/kindled/home")
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
-    roots_before = set(Path(tempfile_gettempdir()).glob("ce-harness-*"))
+    # The sandbox root is `mkdtemp(prefix="ce-harness-")` in the temp dir. Under pytest-xdist the
+    # real temp dir is shared by every worker, so a concurrent sandbox() on another worker would
+    # show up in a before/after glob of it. Point this test's temp dir at its own tmp_path.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     with pytest.raises(LiveServiceDetected):
         with sandbox():
             pass  # pragma: no cover
@@ -552,15 +556,8 @@ def test_env_restored_after_live_service_raise(
     # Env fully restored: prior KINDLED_HOME back, CLAUDE_CONFIG_DIR still absent.
     assert os.environ["KINDLED_HOME"] == "/prior/kindled/home"
     assert "CLAUDE_CONFIG_DIR" not in os.environ
-    # Tempdir removed (no new ce-harness-* left behind by this run).
-    roots_after = set(Path(tempfile_gettempdir()).glob("ce-harness-*"))
-    assert roots_after <= roots_before
-
-
-def tempfile_gettempdir() -> str:
-    import tempfile
-
-    return tempfile.gettempdir()
+    # Tempdir removed (no ce-harness-* left behind by this run).
+    assert not list(tmp_path.glob("ce-harness-*"))
 
 
 # ─────────────────────── #241 — detection must scan the REAL home, not the sandbox ───────────────────────

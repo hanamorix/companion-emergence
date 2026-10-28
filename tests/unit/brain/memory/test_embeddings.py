@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import math
 import threading
-import time
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +28,7 @@ from brain.memory.embeddings import (
     build_embedding_provider,
     cosine_similarity,
 )
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture
@@ -379,6 +379,11 @@ def test_build_embedding_provider_cache_reset_hook_forces_a_fresh_build(
     assert first is not second, "resetting the cache must force a fresh construction"
 
 
+# How long the race stub waits for every expected thread to arrive. A FAILURE bound, never a delay the
+# passing path pays: the wait is released the moment the last thread arrives, and running out raises.
+_RACE_RENDEZVOUS_TIMEOUT_S = 20.0
+
+
 class _LazyLoadRaceStubTextEmbedding:
     """Stand-in for fastembed.TextEmbedding that reproduces the ACTUAL race
     pattern found in fastembed's real `OnnxTextModel._embed_documents`:
@@ -386,13 +391,20 @@ class _LazyLoadRaceStubTextEmbedding:
         if not hasattr(self, "model") or self.model is None:
             self.load_onnx_model()
 
-    an unguarded check-then-act on first use. A `time.sleep` between the
-    check and the "load" widens the race window so that two threads calling
-    `embed()` on the SAME instance without any external serialization would
-    both observe "not yet loaded" and both "load" concurrently —
-    `max_concurrent_loads` would exceed 1. Used to prove
+    an unguarded check-then-act on first use. The "load" does not finish (and
+    `_loaded` is not set) until EVERY expected thread has arrived, where a
+    thread arrives by entering this unloaded branch or by being seen parked
+    behind a lock (`arrive()`, called by `_ContentionSpyLock`). So the overlap
+    is forced rather than hoped for: with no external serialization every
+    thread is inside the "load" at once (`max_concurrent_loads` equals the
+    thread count), and a thread that is not behind a lock cannot miss the
+    others however slowly the machine starts threads. Used to prove
     FastEmbedProvider.embed()'s own lock actually serializes against this,
     rather than merely trusting it by inspection.
+
+    A test must set `expected_arrivals` to its thread count. If the threads do
+    not all arrive within `_RACE_RENDEZVOUS_TIMEOUT_S` the load raises
+    RuntimeError (loud, never a hang or a silent pass).
     """
 
     _cls_lock = threading.Lock()
@@ -404,6 +416,9 @@ class _LazyLoadRaceStubTextEmbedding:
         self._loaded = False
         self.concurrent_loads = 0
         self.max_concurrent_loads = 0
+        self.expected_arrivals: int | None = None
+        self._arrived: set[int] = set()
+        self.all_arrived = threading.Event()
         # See _StubTextEmbedding's docstring: gives the materialize-
         # workaround step a `.model._model_dir` to find (an existing, empty
         # tmp_path) so it silently no-ops instead of logging. Unrelated to
@@ -411,17 +426,66 @@ class _LazyLoadRaceStubTextEmbedding:
         self.model = self
         self._model_dir = cache_dir
 
+    def arrive(self) -> None:
+        """Record the calling thread as arrived; release everyone once all have."""
+        if self.expected_arrivals is None:
+            raise RuntimeError("set expected_arrivals to the test's thread count first")
+        with self._cls_lock:
+            self._arrived.add(threading.get_ident())
+            if len(self._arrived) >= self.expected_arrivals:
+                self.all_arrived.set()
+
     def embed(self, texts):
         if not self._loaded:
             with self._cls_lock:
                 self.concurrent_loads += 1
                 self.max_concurrent_loads = max(self.max_concurrent_loads, self.concurrent_loads)
-            time.sleep(0.05)  # widen the race window past a normal context switch
-            self._loaded = True
-            with self._cls_lock:
-                self.concurrent_loads -= 1
+            try:
+                self.arrive()
+                if not self.all_arrived.wait(timeout=_RACE_RENDEZVOUS_TIMEOUT_S):
+                    self.all_arrived.set()  # let the other waiting threads fail fast too, not one timeout each
+                    raise RuntimeError(
+                        f"only {len(self._arrived)} of {self.expected_arrivals} threads arrived "
+                        f"within {_RACE_RENDEZVOUS_TIMEOUT_S} s"
+                    )
+                self._loaded = True
+            finally:
+                with self._cls_lock:
+                    self.concurrent_loads -= 1
         for _ in texts:
             yield np.ones(384, dtype=np.float32)
+
+
+class _ContentionSpyLock:
+    """A plain mutex (installed as `FastEmbedProvider._embed_lock`) that tells the
+    race stub when a thread is provably parked behind it: the non-blocking
+    acquire fails, so that thread cannot enter the stub until the holder is done.
+    Without it a correct (serialized) provider would leave the stub waiting for
+    arrivals that can never come."""
+
+    def __init__(self, stub: _LazyLoadRaceStubTextEmbedding) -> None:
+        self._stub = stub
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            self._stub.arrive()
+            self._lock.acquire()
+
+    def __exit__(self, *exc_info) -> None:
+        self._lock.release()
+
+
+def _race_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, n_threads: int
+) -> FastEmbedProvider:
+    """A FastEmbedProvider over the race stub, expecting `n_threads` callers, whose
+    instance lock reports threads parked behind it to the stub."""
+    monkeypatch.setattr("fastembed.TextEmbedding", _LazyLoadRaceStubTextEmbedding)
+    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+    provider._model.expected_arrivals = n_threads  # noqa: SLF001
+    provider._embed_lock = _ContentionSpyLock(provider._model)  # noqa: SLF001
+    return provider
 
 
 def test_fastembed_provider_embed_serializes_the_lazy_load_race_across_threads(
@@ -431,11 +495,12 @@ def test_fastembed_provider_embed_serializes_the_lazy_load_race_across_threads(
     (shared/cached) instance must not race fastembed's own unguarded
     check-then-act lazy-load — proven by `max_concurrent_loads` staying at 1
     under FastEmbedProvider's lock, using a stub that widens the real race
-    window (see _LazyLoadRaceStubTextEmbedding). Also asserts no
-    exception/deadlock and that every thread gets a correct, consistent
-    vector back."""
-    monkeypatch.setattr("fastembed.TextEmbedding", _LazyLoadRaceStubTextEmbedding)
-    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+    window (see _LazyLoadRaceStubTextEmbedding). The stub holds its load open
+    until all 8 threads have arrived (inside it, or parked behind the provider's
+    lock), so removing the lock makes this fail every time, not by luck. Also
+    asserts no exception/deadlock and that every thread gets a correct,
+    consistent vector back."""
+    provider = _race_provider(monkeypatch, tmp_path, n_threads=8)
 
     results: list[np.ndarray] = []
     errors: list[BaseException] = []
@@ -454,7 +519,8 @@ def test_fastembed_provider_embed_serializes_the_lazy_load_race_across_threads(
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10)
+        finish_threads(t)
+    assert not any(t.is_alive() for t in threads), "a worker thread never finished"
 
     assert not errors, f"concurrent embed() calls raised: {errors}"
     assert len(results) == 8
@@ -473,18 +539,27 @@ def test_stub_race_detector_actually_detects_the_race_when_unserialized(tmp_path
     real (not a test that could never fail) by calling the stub's embed()
     DIRECTLY from multiple threads with no FastEmbedProvider lock in the
     way — max_concurrent_loads must exceed 1 in that unserialized case,
-    which is exactly what FastEmbedProvider.embed()'s lock prevents."""
+    which is exactly what FastEmbedProvider.embed()'s lock prevents. The stub
+    keeps every caller inside its load until all 8 have arrived, so the
+    overlap always happens however slowly the machine starts threads."""
     stub = _LazyLoadRaceStubTextEmbedding(model_name="some/model", cache_dir=str(tmp_path))
+    stub.expected_arrivals = 8
+    errors: list[BaseException] = []
 
     def worker() -> None:
-        list(stub.embed(["hi"]))
+        try:
+            list(stub.embed(["hi"]))
+        except BaseException as exc:  # noqa: BLE001 — captured for the assertion, not swallowed
+            errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10)
+        finish_threads(t)
+    assert not any(t.is_alive() for t in threads), "a worker thread never finished"
 
+    assert not errors, f"the race stub's own rendezvous failed: {errors}"
     assert stub.max_concurrent_loads > 1, (
         "the race stub itself must race when nothing external serializes calls to it "
         "-- otherwise the serialization test above wouldn't actually be testing anything"
@@ -644,9 +719,10 @@ def test_fastembed_provider_embed_batch_serializes_against_embed_and_other_batch
     single and batch calls on one shared provider never overlap fastembed's
     unguarded lazy load (`max_concurrent_loads` stays 1). The control test
     above (`test_stub_race_detector_actually_detects_the_race_when_unserialized`)
-    shows this stub does race when nothing serializes it."""
-    monkeypatch.setattr("fastembed.TextEmbedding", _LazyLoadRaceStubTextEmbedding)
-    provider = FastEmbedProvider(model_id="some/model", cache_dir=tmp_path, dim=384)
+    shows this stub does race when nothing serializes it. Removing the lock from
+    either `embed` or `embed_batch` fails this test every time (see
+    _LazyLoadRaceStubTextEmbedding)."""
+    provider = _race_provider(monkeypatch, tmp_path, n_threads=8)
 
     errors: list[BaseException] = []
     lens: list[int] = []
@@ -668,7 +744,8 @@ def test_fastembed_provider_embed_batch_serializes_against_embed_and_other_batch
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10)
+        finish_threads(t)
+    assert not any(t.is_alive() for t in threads), "a worker thread never finished"
 
     assert not errors, f"concurrent embed/embed_batch calls raised: {errors}"
     assert sorted(lens) == [1, 1, 1, 1, 3, 3, 3, 3]

@@ -19,6 +19,7 @@ from brain.bridge.provider import ClaudeCliProvider
 from brain.ingest.buffer import ingest_turn, read_cursor, read_session
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +71,7 @@ def test_a_call_in_flight_at_the_stop_completes_and_is_persisted(tmp_path, monke
         assert started.wait(30)
         cli_throttle.request_shutdown()
         release.set()
-        t.join(30)
+        finish_threads(t)
     finally:
         release.set()
         store.close()

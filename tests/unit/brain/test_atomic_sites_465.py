@@ -343,6 +343,7 @@ def launchd_env(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "data" / "personas" / "nell").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Path.home() on Windows
     monkeypatch.setenv("KINDLED_HOME", str(home / "data"))
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
     nell = tmp_path / "nell"
@@ -466,8 +467,3 @@ def test_append_archive_new_segment_and_new_marker_fsync_the_directory(tmp_path,
     buffer.write_archive_marker(tmp_path, "sess1", "key-1")
     assert len(seen) >= 1 and all(p == marker_dir for p in seen)
 
-
-def test_the_old_private_directory_fsync_is_gone():
-    from brain.ingest import buffer
-
-    assert not hasattr(buffer, "_fsync_dir")

@@ -40,6 +40,7 @@ from brain.memory.reranker import (
     surviving_pair_token_lengths,
 )
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 
 _MODEL = "cost-scripted"
 _QUERY = "q"
@@ -375,28 +376,9 @@ def test_c1a_iv_short_message_after_a_long_one_gets_a_wider_rerank(clock: _Clock
 
 
 # ---------------------------------------------------------------------------
-# C1a (v): the hourly machinery is gone.
+# C1a (v): the RAM headroom reader stays. (The hourly width machinery that was removed is listed in
+# tests/unit/test_removed_names_stay_removed.py.)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "get_rerank_width",
-        "_latency_cache",
-        "_memory_cache",
-        "_warm_per_doc_latency",
-        "_warm_per_doc_memory",
-        "_measure_warm_per_doc_latency",
-        "_measure_warm_per_doc_memory",
-        "_LATENCY_RECOMPUTE_INTERVAL_SECONDS",
-        "_MEMORY_RECOMPUTE_INTERVAL_SECONDS",
-        "_MEASURE_RERANKS",
-        "CALIBRATION_SAMPLE_SIZE",
-    ],
-)
-def test_c1a_v_hourly_machinery_removed(name: str) -> None:
-    assert not hasattr(reranker_mod, name)
 
 
 def test_c1a_v_ram_headroom_reader_kept_for_judge_selftune() -> None:
@@ -639,8 +621,18 @@ def test_s75_the_recorded_sample_is_in_tokens(clock: _Clock) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pool", [0, 1, 4, 5, 6, 9, 30, 60])
-@pytest.mark.parametrize("seed_rate", [None, 1e-7, 1e-3, 1.0])
+# Pools below the minimum return before any cost is read (so one seed rate each); from 5 up, the seed rate sets the
+# width: 1.0 fits fewer than 5 (no rerank), 1e-3 a few more than 5, and (60, 1e-7) is the one case that hits both the
+# 50-document cap and the 8-anchor cap.
+_C2C_CASES = (
+    [(0, None), (4, None)]
+    + [(pool, rate) for pool in (5, 6, 9, 60) for rate in (None, 1e-3, 1.0)]
+    + [(60, 1e-7)]
+)
+
+
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize(("pool", "seed_rate"), _C2C_CASES)
 def test_c2c_every_rerank_has_five_real_and_two_anchors_and_is_normalized(
     clock: _Clock, pool: int, seed_rate: float | None
 ) -> None:
@@ -771,7 +763,7 @@ def test_recorded_samples_from_many_threads_are_all_counted_once() -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10.0)
+        finish_threads(t)
     groups = reranker_mod._ram_shapes.shape_groups(_STORE, _MODEL)
     assert sum(n for _x, n, _t in groups) == 400 and _window().n == 400
 
@@ -834,7 +826,7 @@ def test_cross_encoder_rerank_timed_excludes_time_waiting_for_the_lock(
     worker.join(timeout=0.2)  # the worker is now blocked on the lock
     clock.t += 10.0  # another thread's rerank holding the lock
     provider._rerank_lock.release()
-    worker.join(timeout=5.0)
+    finish_threads(worker)
 
     (scores, seconds, growth) = result[0]
     assert scores == [0.0, 0.0]

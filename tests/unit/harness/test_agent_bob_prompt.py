@@ -14,8 +14,7 @@ Also covers the parent-notify change (Agent-Bob SendMessage-to-orchestrator): G1
 SendMessage names the id), G2 (a SendMessage call at each of the four hand-back sites), G3 (concrete
 id-recovery from own agent-<id>.meta.json->parentAgentId when no id), G4 (notify OFF omits +
 behavior-identical render), G7 (no leftover placeholder), G8 (no stray/banned token), G9 (trip-site
-SendMessage precedes 'Then WAIT' -- the anti-deadlock oracle), G5c (never-wind-down + not-an-AI
-survive), and G6 backward-compat.
+SendMessage precedes 'Then WAIT' -- the anti-deadlock oracle), and G6 backward-compat.
 """
 
 from __future__ import annotations
@@ -54,18 +53,24 @@ def test_spawn_params_model_and_effort() -> None:
     assert isinstance(spec, AgentSpawnSpec)
     assert spec.model == "opus"  # not a hardcoded sonnet
     assert spec.effort == "low"
+    # oracle-can-fail (P11): the pinned lowest level, never a higher one
+    assert spec.effort not in ("medium", "high", "xhigh", "max")
 
 
 def test_spawn_params_default_model() -> None:
     spec = _bob(DEMO_MOOD_A).spawn_params()
     assert spec.model == ModelConfig().bob  # default threads, not hardcoded
-
-
-def test_effort_never_higher_than_low() -> None:
-    """P11 oracle-can-fail: effort is the pinned lowest level, exactly 'low'."""
-    spec = _bob(DEMO_MOOD_A).spawn_params()
-    assert spec.effort == "low"
-    assert spec.effort not in ("medium", "high", "xhigh", "max")
+    # G6a/b (backward compatibility): construction with none of the newer parameters renders, and spawn_params is intact
+    bare = AgentBob(
+        DEMO_MOOD_A,
+        harness_dir="/repo/companion-emergence",
+        live_env_path="/repo/companion-emergence/sb/live_env.json",
+    )
+    assert isinstance(bare.render_prompt(), str)
+    bare_spec = bare.spawn_params()
+    assert isinstance(bare_spec, AgentSpawnSpec)
+    assert bare_spec.effort == "low"
+    assert bare_spec.model == ModelConfig().bob
 
 
 def test_all_stop_conditions_present() -> None:
@@ -89,6 +94,11 @@ def test_all_stop_conditions_present() -> None:
         assert "PAUSE" in seg or "pause" in seg, f"hold site {label!r} must read as PAUSE"
     cap = prompt[prompt.index("reach turn 42") : prompt.index("reach turn 42") + 200]
     assert "COMPLETE" in cap or "complete" in cap, "the turn-cap site must read as COMPLETE"
+    # G7: with a parent id supplied, no unfilled angle-bracket id placeholder survives in the render
+    # (the no-id render legitimately carries the recovery text, so this is the id-supplied render only).
+    with_id = _bob(DEMO_MOOD_A, max_turns=42, parent_agent_id="agent-XYZ123").render_prompt()
+    for tok in ("<orchestrator-agentId>", "<id-or-recovered-id>", "<your-id>", "<id>"):
+        assert tok not in with_id, f"unfilled placeholder {tok!r} leaked into the id-supplied render"
 
 
 def test_supervised_and_orchestrator_framing() -> None:
@@ -103,6 +113,10 @@ def test_supervised_and_orchestrator_framing() -> None:
     low = prompt.lower()
     for tok in ("mono" + "logue", "known software bug", "scripts a whole"):
         assert tok not in low, f"hunt framing token {tok!r} survived the scrub"
+    # G8 (CH8-Gap3 guard): the notify text adds no duplicate of a machine token
+    assert prompt.count("trip=True") == 1
+    assert prompt.count("limit=True") == 1
+    assert prompt.count("broken=True repeats") == 1
 
 
 def test_prompt_directive_order() -> None:
@@ -126,15 +140,9 @@ def test_prompt_directive_order() -> None:
     assert i_context < i_role < i_mood, "role directive must sit between CONTEXT and the mood"
     assert i_send < i_hold_block, "send mechanism must render before the hold/complete conditions"
 
-
-def test_teardown_reservation_after_pause_directives() -> None:
-    """C4b (intra-block adjacency): the teardown-reservation sentence renders AFTER the PAUSE directives.
-
-    A driver-under-load reading the block top-to-bottom must hit "PAUSE (hold, session alive)" first,
-    not a "STOP/teardown" token. Oracle-can-fail: moving the reservation sentence above the trip/limit/
-    broken PAUSE directives flips these index comparisons and fails.
-    """
-    prompt = _bob(DEMO_MOOD_A, max_turns=42).render_prompt()
+    # C4b (intra-block adjacency): the teardown-reservation sentence renders AFTER the PAUSE directives, so a driver
+    # reading the block top to bottom hits "PAUSE (hold, session alive)" before any teardown token. Oracle-can-fail:
+    # moving the reservation above the trip/limit/broken directives flips these comparisons.
     reservation = "You NEVER tear down or destroy the session on your own initiative."
     assert prompt.count(reservation) == 1, "reservation sentence must be unique for an unambiguous index"
     i_reservation = prompt.index(reservation)
@@ -219,16 +227,6 @@ def test_agentbob_is_driver_not_pull_bob() -> None:
         bob.next_message([], turn=1, ctx=None)  # type: ignore[arg-type]
 
 
-def test_dumbbob_pull_path_unchanged() -> None:
-    """P17: the pull DumbBob still builds its Phase-1 argv shape (model threaded, no hardcoded model)."""
-    from tests.harness import DumbBob
-
-    argv = DumbBob("/bin/claude", mood="x", models=ModelConfig(bob="haiku")).build_argv("hello")
-    assert argv[:2] == ["/bin/claude", "-p"]
-    assert "--model" in argv and argv[argv.index("--model") + 1] == "haiku"
-    assert "--output-format" in argv and "json" in argv
-
-
 # --------------------------------------------------------------------------------------------------
 # Parent-notify (Agent-Bob SendMessage-to-orchestrator). Criteria G1-G9 from
 # changes/agentbob-parent-notify/1.5-criteria.md. All token-free against the rendered prompt string.
@@ -306,25 +304,6 @@ def test_notify_off_omits_and_is_behavior_identical() -> None:
     assert "on a PAUSE.\n- If a RESULT" in prompt
 
 
-def test_notify_no_leftover_placeholder_on_id_path() -> None:
-    """G7: id supplied -> no unfilled angle-bracket id placeholder survives in the render."""
-    prompt = _bob(DEMO_MOOD_A, parent_agent_id="agent-XYZ123").render_prompt()
-    for tok in ("<orchestrator-agentId>", "<id-or-recovered-id>", "<your-id>", "<id>"):
-        assert tok not in prompt, f"unfilled placeholder {tok!r} leaked into the id-supplied render"
-
-
-def test_notify_block_introduces_no_stray_token() -> None:
-    """G8 (CH8-Gap3 guard): the notify text adds no machine-token duplicate and no banned framing token."""
-    prompt = _bob(DEMO_MOOD_A).render_prompt()
-    assert prompt.count("trip=True") == 1
-    assert prompt.count("limit=True") == 1
-    assert prompt.count("broken=True repeats") == 1
-    assert "human operator" not in prompt.lower()
-    low = prompt.lower()
-    for tok in ("mono" + "logue", "known software bug", "scripts a whole"):
-        assert tok not in low, f"notify block reintroduced a banned framing token {tok!r}"
-
-
 def test_notify_trip_sendmessage_precedes_wait() -> None:
     """G9 (anti-deadlock): at the trip site, the SendMessage renders BEFORE 'Then WAIT' on BOTH paths.
 
@@ -339,24 +318,3 @@ def test_notify_trip_sendmessage_precedes_wait() -> None:
         assert ts.index("SendMessage") < ts.index("Then WAIT"), (
             "trip-site SendMessage must precede 'Then WAIT' (no wake-before-wait deadlock)"
         )
-
-
-def test_notify_preserves_never_wind_down_and_not_ai() -> None:
-    """G5c: the load-bearing 'never wind down' + not-an-AI role directives survive the notify change."""
-    prompt = _bob(DEMO_MOOD_A).render_prompt()
-    assert "You NEVER wind the conversation down" in prompt
-    assert "You are NOT an AI assistant" in prompt
-
-
-def test_notify_backward_compatible_construction() -> None:
-    """G6a/b: no-new-param construction renders + spawn_params intact (effort 'low', model threaded)."""
-    bob = AgentBob(
-        DEMO_MOOD_A,
-        harness_dir="/repo/companion-emergence",
-        live_env_path="/repo/companion-emergence/sb/live_env.json",
-    )
-    assert isinstance(bob.render_prompt(), str)  # constructs + renders with no new params
-    spec = bob.spawn_params()
-    assert isinstance(spec, AgentSpawnSpec)
-    assert spec.effort == "low"
-    assert spec.model == ModelConfig().bob

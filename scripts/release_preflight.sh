@@ -78,7 +78,7 @@ else bad "uv sync --locked failed (see $LOG_DIR/sync.log)"; fi
 # 3. Backend: full pytest, judged by exit status + FAILED/ERROR lines (#363)
 # ---------------------------------------------------------------------------
 step "backend pytest (full run, judged by exit status and FAILED/ERROR lines)"
-uv run pytest -q -p no:randomly >"$LOG_DIR/pytest.log" 2>&1
+uv run pytest -q >"$LOG_DIR/pytest.log" 2>&1
 pytest_rc=$?
 if verdict=$(bash scripts/pytest_verdict.sh "$LOG_DIR/pytest.log" "$pytest_rc" 2>&1); then ok "$verdict"
 else bad "pytest not green:"; printf '%s\n' "$verdict" | sed 's/^/     /' >&2; fi

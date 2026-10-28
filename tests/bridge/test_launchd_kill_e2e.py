@@ -215,6 +215,16 @@ def _wait_file(path: Path, timeout: float = 30.0) -> int:
     return int(path.read_text())
 
 
+def _wait_gone(pids: list[int], timeout: float) -> bool:
+    """True once none of ``pids`` is alive (a zombie counts as gone), polling until ``timeout``."""
+    deadline = time.monotonic() + timeout
+    while any(_alive(pid) for pid in pids):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def _no_bridge(pd: Path) -> bool:
     st = state_file.read(pd)
     return st is None or state_file.bridge_liveness(st, pd) != state_file.ALIVE
@@ -241,16 +251,20 @@ def test_a_launchd_owned_bridge_is_killed_with_its_tree_and_stays_down(env_pd, l
         for pid in (stub, child, grand):
             assert not _alive(pid), (mode, pid)
         assert kill.read_intent(pd)["state"] == "committed"
-        time.sleep(THROTTLE_S + 8.0)  # the respawn window: a respawn runs and the guard ends it
-        fake.advance_past_exit_timeout()
-        time.sleep(1.0)
-        for pid in (stub, child, grand):
-            assert not _alive(pid)
-        assert _no_bridge(pd)
         expected_respawns = 1 if mode in ("m2", "m3") else 0
+        if expected_respawns:
+            # The respawn window: the job is respawned THROTTLE_S after it exits, and the respawn guard ends it.
+            deadline = time.monotonic() + 20
+            while not (len(fake.respawns) == expected_respawns and _wait_gone(list(fake.respawns), 0.0)):
+                assert time.monotonic() < deadline, (mode, "the respawn did not run and end", fake.respawns)
+                time.sleep(0.05)
+        # Nothing further comes: a respawn would follow an exit by THROTTLE_S (0.5 s, the keepalive loop polls every
+        # 0.05 s), so this is four times that.
+        time.sleep(THROTTLE_S + 1.5)
+        fake.advance_past_exit_timeout()
+        assert _wait_gone([*fake.respawns, stub, child, grand], 5.0), (mode, "a process outlived ExitTimeOut")
+        assert _no_bridge(pd)
         assert len(fake.respawns) == expected_respawns, (mode, fake.respawns)
-        for pid in fake.respawns:
-            assert not _alive(pid)
         assert kill.read_intent(pd) is not None  # the guard never deletes it
     finally:
         fake.close()
@@ -282,6 +296,7 @@ def _stop(pd: Path, fake: FakeLaunchd) -> None:
         time.sleep(0.05)
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 11.8 s wall (serial run for #540, J12)')
 def test_every_start_path_after_a_kill_reaches_a_healthy_bridge(env_pd, launchd_seams, monkeypatch):
     """C62 (start half), C58 (c): after the kill (m2), each start path clears the stop intent and runs print ->
     bootstrap (when unloaded) -> plain kickstart, and the bridge is healthy (not stopped by the guard)."""

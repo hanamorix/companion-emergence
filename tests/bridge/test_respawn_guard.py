@@ -8,10 +8,8 @@ explicit start clears the intent and runs; a start for a persona whose service i
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -22,6 +20,7 @@ import pytest
 
 from brain import process_identity as pi
 from brain.bridge import daemon, kill, respawn_guard, shutdown_progress, state_file
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture
@@ -32,8 +31,10 @@ def pd(tmp_path, monkeypatch):
     return p
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def gone_pid():
+    """The pid of a process that has exited. Every test names it with a made-up token, which
+    ``process_identity.matches`` reports as GONE whatever process later takes the number."""
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     return p.pid
@@ -76,48 +77,48 @@ def test_a_committed_kill_of_this_boot_stops_a_service_respawn_before_the_lock(p
     assert kill.read_intent(pd) == it  # never deleted by the guard
 
 
-_HOLDER = textwrap.dedent(
-    """
-    import sys, time
-    from pathlib import Path
-    from brain.bridge.daemon import acquire_lock
-    pd, ready, go = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-    fd = acquire_lock(pd)
-    ready.write_text("held")
-    while not go.exists():
-        time.sleep(0.02)
-    """
-)
-
-
 @linux_only
-def test_a_respawn_already_waiting_for_the_lock_checks_again_after_it(pd, gone_pid, ran, monkeypatch, tmp_path):
+def test_a_respawn_already_waiting_for_the_lock_checks_again_after_it(pd, gone_pid, ran, monkeypatch):
     """C65 (b): the intent was written while this service process waited for the lock (D4)."""
     monkeypatch.setattr(respawn_guard, "_platform", lambda: "linux")
-    ready, go = tmp_path / "ready", tmp_path / "go"
-    holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(pd), str(ready), str(go)],
-                              env=dict(os.environ, PYTHONPATH=os.getcwd()))
+    holder_fd = daemon.acquire_lock(pd)  # the lock, held on a second descriptor of this process
+    assert holder_fd is not None
+    waiting = threading.Event()
+    real_acquire = daemon.acquire_lock
+
+    def _acquire(persona_dir, *, blocking=False):
+        if blocking:
+            waiting.set()  # cmd_run is about to block on the lock
+        return real_acquire(persona_dir, blocking=blocking)
+
+    monkeypatch.setattr(daemon, "acquire_lock", _acquire)
+    t = None
     try:
-        while not ready.exists():
-            time.sleep(0.02)
         out: dict = {}
-        t = threading.Thread(target=lambda: out.setdefault("rc", daemon.cmd_run(_run_args("systemd"))))
+        t = threading.Thread(target=lambda: out.setdefault("rc", daemon.cmd_run(_run_args("systemd"))), daemon=True)
         t.start()
-        time.sleep(1.0)
+        deadline = time.monotonic() + 30
+        while not waiting.wait(0.02):
+            assert t.is_alive(), f"cmd_run returned {out.get('rc')} instead of waiting for the lock"
+            assert time.monotonic() < deadline, "cmd_run never reached the lock wait"
+        t.join(0.3)
         assert t.is_alive()  # waiting for the lock
         it = _intent(pd, pid=gone_pid, token=f"linux:{pi.boot_id()}:{gone_pid}:1")
         (pd / shutdown_progress.PROGRESS_FILENAME).write_text("{}")  # a watcher file the start would delete
-        go.write_text("go")
-        t.join(30)
+        daemon.release_lock(pd, holder_fd)
+        holder_fd = None
+        finish_threads(t)
         assert out["rc"] == 0 and ran == []
         assert kill.read_intent(pd) == it
         assert (pd / shutdown_progress.PROGRESS_FILENAME).exists()  # checked BEFORE the watcher-file cleanup
-        fd = daemon.acquire_lock(pd)
+        fd = real_acquire(pd)
         assert fd is not None  # released
         daemon.release_lock(pd, fd)
     finally:
-        go.write_text("go")
-        holder.wait(10)
+        if holder_fd is not None:
+            daemon.release_lock(pd, holder_fd)
+        if t is not None:
+            finish_threads(t)
 
 
 @linux_only
@@ -262,7 +263,8 @@ def test_cmd_start_reports_a_failed_service_start_at_once(pd, monkeypatch, capsy
     assert "service start failed" in err and "Job for the unit failed." in err
 
 
-@pytest.mark.parametrize("origin", ["systemd", "launchd", "task-scheduler"])
+# `guard_fires` reads only the stop intent (a crash writes none) and never the origin, so one origin is enough.
+@pytest.mark.parametrize("origin", ["systemd"])
 def test_a_crashed_service_bridge_is_not_held_back_by_the_guard(pd, gone_pid, ran, monkeypatch, origin):
     """Review R2-S1: a crash writes no stop intent, so the service manager's restart (`supervisor run`) runs."""
     monkeypatch.setattr(respawn_guard, "_platform", lambda: "linux")

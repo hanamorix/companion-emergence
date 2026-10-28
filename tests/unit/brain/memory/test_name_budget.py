@@ -14,7 +14,6 @@ the filter judges advances the budget clock by a fixed cost per character
 
 from __future__ import annotations
 
-import inspect
 import sqlite3
 import sys
 import time
@@ -28,7 +27,6 @@ from brain.memory import store as store_mod
 from brain.memory.store import Memory, MemoryStore
 
 B = keyword_budget.recall_budget_seconds()
-BIG_ROWS = 40_000
 REJECTS = 200
 KEEPS = 5
 ROW = "i will see you at the harbour {i:04d}"  # a fixed width, lower-case modal: rejected
@@ -490,18 +488,6 @@ def test_cs8b3_the_walk_ends_when_the_cursor_is_exhausted_or_limit_rows_are_kept
     assert len(rows) == 2 and len(keep.texts) < PAGED_ROWS + 3
 
 
-def test_cs8b4_no_interrupt_machinery_is_left_in_the_store() -> None:
-    assert not hasattr(store_mod, "_Deadline")
-    assert "threading" not in vars(store_mod)
-    for obj in (
-        store_mod.MemoryStore.search_fts_scored,
-        store_mod.MemoryStore._fts_rows_kept,  # noqa: SLF001
-        store_mod.KeepBudget,
-    ):
-        text = inspect.getsource(obj).lower()
-        assert "interrupt" not in text and "deadline" not in text, obj
-
-
 class _Cursor:
     def __init__(self, cursor, log: list[str]) -> None:
         self._cursor = cursor
@@ -617,8 +603,11 @@ def test_cs8b5_a_per_row_figure_measured_four_times_too_low_still_ends_within_on
     assert len(keep.texts) - FIRST < PAGED_ROWS + 3 - FIRST, "the walk did not reach the end of the cursor"
 
 
-@pytest.mark.parametrize("ordering_over_first", [1.0, 1.25, 1.5, 2.0])
-@pytest.mark.parametrize("left_over_first", [1.0, 1.25, 1.5, 2.0])
+# (left, ordering) as multiples of the first page's execute: not run (no row affordable), the boundary (exactly one row
+# affordable), the maximal excess, and two larger budgets; the other pairs repeat one of these branches.
+@pytest.mark.parametrize(
+    ("left_over_first", "ordering_over_first"), [(1.0, 1.0), (1.25, 1.0), (1.25, 2.0), (2.0, 1.5), (2.0, 2.0)]
+)
 def test_cs8b5_the_residual_overshoot_is_the_ordering_statements_excess_over_the_first_pages_execute(
     paged: MemoryStore, clock: Clock, ordering_over_first: float, left_over_first: float
 ) -> None:

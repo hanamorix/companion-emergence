@@ -59,6 +59,7 @@ from brain.memory.semantic_recall import (
 )
 from brain.memory.store import CALIBRATION_SCORE_SCALE, COSINE_SCORE_SCALE, Memory, MemoryStore
 from brain.tools.dispatch import dispatch
+from tests.thread_support import finish_threads
 from tests.unit.brain.chat.test_recall_keyword_merge import _LONG, _active_rows, _render
 from tests.unit.brain.memory.test_monologue_last import (
     _EMBEDDER_ID,
@@ -1041,10 +1042,6 @@ _S97_ORDER = (
 )
 
 
-def test_the_group_order_is_one_list_in_dev_constants_in_the_s97_order() -> None:
-    assert dev_constants.RECALL_RESULT_GROUP_ORDER == _S97_ORDER
-
-
 def _six(store: MemoryStore | None = None):
     labels = {
         RERANKED_GENUINE: ("rg", "event"),
@@ -1292,7 +1289,7 @@ def test_a_put_while_the_stack_is_built_waits_and_the_next_reader_sees_it(
 
     monkeypatch.setattr(matrix_mod, "_stack_hook", _hook)
     ids, unit = matrix.stacked()
-    _hook.writer.join(timeout=5)  # type: ignore[attr-defined]
+    finish_threads(_hook.writer)  # type: ignore[attr-defined]
 
     assert done_inside == [False], "the put waited for the build's lock"
     assert ids == ("a",)
@@ -1500,18 +1497,6 @@ def test_a_reranker_that_cannot_load_is_tried_once_per_message(
     assert len(attempts) == 1
     assert result is not None
     assert [o.gated.path for o in result.paragraphs] == [COSINE_PATH] * 3
-
-
-def test_the_group_order_is_one_line_naming_each_group_once() -> None:
-    """S98 "a single line change": the six names sit on one source line; each
-    group appears exactly once (independent of the order chosen)."""
-    import inspect
-
-    source = inspect.getsource(dev_constants)
-    (line,) = [ln for ln in source.splitlines() if ln.startswith("RECALL_RESULT_GROUP_ORDER")]
-    assert all(f'"{name}"' in line for name in _S97_ORDER)
-    order = dev_constants.RECALL_RESULT_GROUP_ORDER
-    assert len(order) == 6 and set(order) == set(_S97_ORDER)
 
 
 def test_a_bad_group_list_fails_at_import_not_silently_per_turn(tmp_path: Path) -> None:

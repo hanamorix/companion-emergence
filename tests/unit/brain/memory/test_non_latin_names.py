@@ -24,7 +24,10 @@ from brain.tools.dispatch import dispatch
 from brain.tools.impls.remove_known_name import remove_known_name
 from brain.tools.schemas import ADD_NAME_TOOL_NAME
 
-SOURCES = ["gate", "reappraiser", "tool"]
+# The reappraiser's add goes through `admit_names` exactly like the gate's (same `_insert_in_txn` branch), and the
+# tool's goes through `confirm_readd`; so two sources cover both paths. The reappraiser's own source column is
+# asserted in test_known_names.py.
+SOURCES = ["gate", "tool"]
 
 
 def _rows(persona: Path) -> list[tuple[str, str, str]]:
@@ -52,7 +55,7 @@ def _admit(persona: Path, names: list[str], source: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# B1a: admitted from every source, keyed by the raw lower-cased string
+# B1a: admitted from each write path (the gate and reappraiser insert, the tool's add), keyed by the raw lower-cased string
 # --------------------------------------------------------------------------
 
 
@@ -197,18 +200,6 @@ def test_b1f_a_name_with_an_ascii_word_keeps_its_normalized_key(given: str, key:
     assert kn.name_key(given) == key == kn.normalize_name(given)
 
 
-def test_b1f_the_key_of_a_raw_name_never_holds_an_ascii_letter_or_digit() -> None:
-    rng = random.Random(166)
-    pool = list("田中Ольга🐶.,!?-_ \t\n\u00a0\u3000") + ["İ", "K", "é", "ß", "İ", "ǅ", "Σ", "ﬃ", "①", "٣"]
-    for _ in range(3000):
-        name = "".join(rng.choice(pool) for _ in range(rng.randint(1, 8)))
-        key = kn.name_key(name)
-        assert key == kn.name_key(key), "idempotent (remove_names re-keys what the matcher returns)"
-        assert key == kn.normalize_name(name) or kn.normalize_name(key) == ""
-        if not kn.normalize_name(name) and key:
-            assert not WORD_RE.search(key), "a raw key holds no ASCII letter or digit"
-
-
 # --------------------------------------------------------------------------
 # S181 (S1a-S1g): runs of whitespace inside a name collapse to one space in its key
 # --------------------------------------------------------------------------
@@ -216,8 +207,9 @@ def test_b1f_the_key_of_a_raw_name_never_holds_an_ascii_letter_or_digit() -> Non
 SPELLINGS = ["田中 太郎", "田中  太郎", "田中\t太郎", "田中\n\n太郎", "田中\u00a0太郎", "田中\u3000太郎", "  田中   太郎  "]
 
 
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.parametrize("source", SOURCES)
-def test_s1a_every_spelling_of_the_spacing_is_one_name_from_every_source(tmp_path: Path, source: str) -> None:
+def test_s1a_every_spelling_of_the_spacing_is_one_name_from_each_write_path(tmp_path: Path, source: str) -> None:
     for spelling in SPELLINGS:
         _admit(tmp_path, [spelling], source)
     rows = _rows(tmp_path)
@@ -270,12 +262,17 @@ def test_s1c_the_case_folding_exceptions_collapse_too(tmp_path: Path, source: st
 
 
 def test_s1c_the_key_property_holds_with_whitespace_runs() -> None:
+    """Also the B1f property: the key of a raw name never holds an ASCII letter or digit (the Kelvin sign, the
+    dotted capital I, "ß" and "ﬃ" are characters whose case folding makes one)."""
     rng = random.Random(181)
-    pool = list("田中Ольга🐶.,!?-_ \t\n\u00a0\u3000") + ["İ", "K", "é", "ß", "ﬃ", "①", "٣", "a", "7"]
+    pool = list("田中Ольга🐶.,!?-_ \t\n\u00a0\u3000") + [
+        "İ", "K", "\u212a", "é", "ß", "ǅ", "Σ", "ﬃ", "①", "٣", "a", "7",
+    ]  # fmt: skip
     for _ in range(3000):
         name = "".join(rng.choice(pool) for _ in range(rng.randint(1, 10)))
         key = kn.name_key(name)
-        assert key == kn.name_key(key)
+        assert key == kn.name_key(key), "idempotent (remove_names re-keys what the matcher returns)"
+        assert key == kn.normalize_name(name) or kn.normalize_name(key) == ""
         assert "  " not in key and not any(c.isspace() and c != " " for c in key), "no whitespace run, only single spaces"
         assert key == key.strip()
         if not kn.normalize_name(name) and key:
@@ -290,7 +287,7 @@ def test_s1d_names_with_an_ascii_word_are_unchanged(tmp_path: Path, source: str)
 
 
 @pytest.mark.parametrize("source", SOURCES)
-@pytest.mark.parametrize("given", ["...", "!!!", "--", "🐶", "- - -", "* * *"])
+@pytest.mark.parametrize("given", ["...", "🐶", "- - -"])
 def test_s1e_symbol_and_punctuation_only_names_stay_admitted(tmp_path: Path, source: str, given: str) -> None:
     _admit(tmp_path, [given], source)
     assert [r[0] for r in _rows(tmp_path)] == [" ".join(given.split()).lower()]

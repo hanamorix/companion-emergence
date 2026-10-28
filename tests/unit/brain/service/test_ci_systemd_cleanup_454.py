@@ -178,3 +178,45 @@ def test_the_integration_fixture_skips_when_the_failsafe_cannot_be_armed():
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     assert "FailsafeNotArmedError" in names
     assert "skip" in names
+
+
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
+@pytest.mark.parametrize(
+    ("environ", "allowed"),
+    [
+        ({"GITHUB_ACTIONS": "true"}, True),
+        ({sc.ALLOW_REAL_INSTALL_ENV: "1"}, True),
+        ({"GITHUB_ACTIONS": "true", sc.ALLOW_REAL_INSTALL_ENV: "0"}, True),
+        ({}, False),
+        ({"GITHUB_ACTIONS": "false"}, False),
+        ({"GITHUB_ACTIONS": "1"}, False),
+        ({sc.ALLOW_REAL_INSTALL_ENV: "0"}, False),
+        ({sc.ALLOW_REAL_INSTALL_ENV: "true"}, False),
+        ({sc.ALLOW_REAL_INSTALL_ENV: ""}, False),
+    ],
+)
+def test_a_real_unit_install_needs_github_actions_or_an_explicit_opt_in(environ, allowed):
+    """A bare pytest on a developer box with a reachable user systemd must not install the real test unit."""
+    reason = sc.real_install_blocked_reason(environ)
+    assert (reason is None) is allowed
+    if not allowed:
+        assert "GITHUB_ACTIONS" in reason and sc.ALLOW_REAL_INSTALL_ENV in reason
+
+
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
+def test_the_integration_fixture_checks_the_opt_in_before_anything_touches_systemd():
+    """The skip must come before the sweep, the fail-safe and the install: the first statements of the autouse fixture call the
+    opt-in check and skip, ahead of `unit_guard` and the `systemctl` availability probe."""
+    tree = ast.parse(_INTEGRATION_TEST.read_text(encoding="utf-8"))
+    fixture = next(
+        f for f in ast.walk(tree)
+        if isinstance(f, ast.FunctionDef) and f.name == "_systemd_unit_guard"
+    )
+    body = [ast.dump(stmt) for stmt in fixture.body if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))]
+    gate = next(i for i, text in enumerate(body) if "real_install_blocked_reason" in text)
+    skip = next(i for i, text in enumerate(body) if "attr='skip'" in text)
+    # the skip is conditional on what the opt-in check returned
+    assert "id='blocked'" in body[skip] and "If(" in body[skip][:4]
+    probe = next(i for i, text in enumerate(body) if "_systemd_user_available" in text)
+    guard = next(i for i, text in enumerate(body) if "unit_guard" in text)
+    assert gate <= skip < probe < guard

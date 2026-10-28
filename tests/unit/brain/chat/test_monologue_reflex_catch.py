@@ -111,7 +111,7 @@ def test_search_interleaves_with_record_monologue(tmp_path: Path, monkeypatch):
         assert monologue_rec.get("monologue_text", "").startswith("Searched")
         # Digest written synchronously.
         assert (persona_dir / "monologue_digest.jsonl").exists()
-        # Pass 2 now flows through the in-process pass2_queue (single worker, #27);
+        # Pass 2 work is saved in the persisted pass2_queue (no worker thread, #27);
         # drain it here (store still open) so the extraction's provider call lands.
         from brain.bridge import cli_throttle
         from brain.chat import pass2_queue

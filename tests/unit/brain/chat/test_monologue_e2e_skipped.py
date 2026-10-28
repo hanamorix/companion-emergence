@@ -1,7 +1,6 @@
 """End-to-end: trivial turn doesn't call record_monologue → no digest, no pass 2."""
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from brain.bridge.chat import ChatMessage, ChatResponse
@@ -23,6 +22,7 @@ class _TrivialProvider:
 
 
 def test_trivial_turn_no_monologue(tmp_path: Path):
+    from brain.chat import pass2_queue
     from brain.chat.tool_loop import run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
@@ -44,7 +44,7 @@ def test_trivial_turn_no_monologue(tmp_path: Path):
         )
         assert resp.content == "hi back"
 
-        time.sleep(0.2)
+        assert pass2_queue._queue_size(persona_dir) == 0  # nothing queued for a trivial turn
         assert not (persona_dir / "monologue_digest.jsonl").exists()
         assert provider.generate_calls == 0
     finally:

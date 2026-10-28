@@ -172,7 +172,17 @@ def test_group_b_appender_writes_ascii_json_lines(tmp_path: Path, name: str) -> 
     assert all(isinstance(json.loads(line), dict) for line in lines[:-1])
 
 
-@pytest.mark.parametrize("name", sorted(APPENDERS))
+# Every appender goes through `json_io.append_jsonl`, whose torn-tail behaviour is pinned by test_json_io.py's
+# test_ca3_*; four appenders (a plain audit, a model-call error log, a heartbeat log and an archive) show the wiring.
+_TORN_TAIL_APPENDERS = [
+    "files.audit.audit",
+    "detector._call_haiku",
+    "heartbeat._append_log",
+    "consolidation._archive_preimage",
+]
+
+
+@pytest.mark.parametrize("name", _TORN_TAIL_APPENDERS)
 def test_group_b_appender_after_a_torn_tail_loses_only_the_torn_record(tmp_path: Path, name: str) -> None:
     call, rel = APPENDERS[name]
     before = set(tmp_path.rglob("*.jsonl"))
@@ -326,17 +336,6 @@ def test_group_b_tunables_legacy_json_fold_renames_and_never_rewrites_the_json(t
     assert kept.read_bytes() == original  # the JSON was only renamed, never rewritten
     assert tunables.get_raw("keep") == 1 and tunables.get_raw("chat.idle_lull_seconds") == 5.0
     _no_temp_left(tmp_path)
-
-
-def test_group_b_migrator_cli_vocab_and_interests_use_the_module_writer() -> None:
-    """The two atomic writes in _run_migrate_locked go through write_json (no ``.new`` temp of their own)."""
-    import ast
-
-    src = (Path(__file__).resolve().parents[4] / "brain" / "migrator" / "cli.py").read_text()
-    assert "_vocab_tmp" not in src and "_interests_tmp" not in src
-    tree = ast.parse(src)
-    names = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "write_json" in names
 
 
 def test_group_b_db_health_event_log_appends_ascii_lines_and_never_raises(tmp_path: Path, monkeypatch) -> None:

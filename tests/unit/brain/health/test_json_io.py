@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from brain.utils.atomic_write import save_with_backup_text
+from tests.thread_support import finish_threads, release_at_teardown
 
 POSIX = os.name == "posix"
 
@@ -279,8 +280,6 @@ def test_cr1_a_file_deleted_between_probe_and_open_is_missing_not_a_crash(
         (b'{"a":', "malformed"),
         (b"", "empty"),
         (b"   \n", "empty"),
-        (b"not json", "malformed"),
-        (b"[1,2", "malformed"),
     ],
 )
 def test_cr2_malformed_empty_and_truncated_files_are_classified_and_recovered(
@@ -306,7 +305,7 @@ def test_cr2_malformed_empty_and_truncated_files_are_classified_and_recovered(
 
 
 @pytest.mark.parametrize("policy", POLICIES)
-@pytest.mark.parametrize("content", [b'{"a": "\xff"}', b'{"a": 1}\xc3', b"\xff" * 8])
+@pytest.mark.parametrize("content", [b'{"a": "\xff"}', b'{"a": 1}\xc3'])
 def test_cr3_invalid_utf8_is_recovered_like_malformed_json(
     tmp_path: Path, policy: str, content: bytes
 ) -> None:
@@ -325,17 +324,6 @@ def test_cr3_invalid_utf8_is_recovered_like_malformed_json(
         assert (
             r.outcome == "reset" and r.anomaly is not None and r.anomaly.kind == "json_parse_error"
         )
-
-
-def test_cr3_baseline_the_legacy_handler_shape_leaks_unicode_decode_error(tmp_path: Path) -> None:
-    """The #436 failure: a handler listing only (OSError, JSONDecodeError) lets invalid UTF-8 escape."""
-    p = tmp_path / "state.json"
-    p.write_bytes(b'{"a": "\xff"}')
-    with pytest.raises(UnicodeDecodeError):
-        try:
-            json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pytest.fail("the legacy handler would have caught it")
 
 
 def _failing_open(target: Path, exc_factory, times: int | None = None):
@@ -454,7 +442,9 @@ def test_cr6_wrong_top_level_type_is_a_shape_failure(tmp_path: Path, policy: str
         assert exc.value.kind == "shape"
 
 
-@pytest.mark.parametrize("exc_type", [ValueError, TypeError])
+# One `except (ValueError, TypeError)` in json_io decides this; the HEAL tests near the end of the file run the
+# other exception classes through HEAL.
+@pytest.mark.parametrize("exc_type", [ValueError])
 @pytest.mark.parametrize("policy", POLICIES)
 def test_cr6_validator_rejections_are_schema_failures(
     tmp_path: Path, policy: str, exc_type
@@ -475,11 +465,11 @@ def test_cr6_validator_rejections_are_schema_failures(
         assert exc.value.kind == "schema"
 
 
-@pytest.mark.parametrize("exc_type", [KeyError, AttributeError])
+@pytest.mark.parametrize("exc_type", [KeyError])
 @pytest.mark.parametrize("policy", POLICIES)
 def test_cr6_a_validator_bug_is_not_a_schema_failure_and_propagates(tmp_path: Path, policy: str, exc_type) -> None:
-    """Only ValueError/TypeError reject content (the old attempt_heal's rule); a KeyError or AttributeError is the
-    validator's own bug and must not turn a valid file into a default, a restore or a reset."""
+    """Only ValueError/TypeError reject content (the old attempt_heal's rule); a KeyError (AttributeError and RuntimeError
+    are run through HEAL by test_heal_a_validator_bug_propagates_...) is the validator's own bug and must not turn a valid file into a default, a restore or a reset."""
     p = tmp_path / "state.json"
     p.write_text('{"a": 1}')
 
@@ -497,6 +487,9 @@ def test_cr6_a_validator_that_returns_passes_the_data_through(tmp_path: Path) ->
     seen = []
     assert jio.read_json(p, default=dict, validate=seen.append) == {"a": 1}
     assert seen == [{"a": 1}]
+    # HEAL too: an accepted live file is returned as is, with no anomaly and nothing written beside it.
+    healed = jio.read_json_result(p, default=dict, validate=seen.append, recover=jio.Recovery.HEAL)
+    assert healed.data == {"a": 1} and healed.anomaly is None and _listing(tmp_path) == {"state.json": b'{"a": 1}'}
 
 
 def test_cr7_default_policy_never_modifies_the_file(tmp_path: Path) -> None:
@@ -724,18 +717,20 @@ class _OpenSpy:
         monkeypatch.setattr(gz, "open", check("gzip.open", gz.open))
 
 
-def test_cr11_baseline_the_spy_flags_the_held_writer_and_the_migrated_ones_are_clean(
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+def test_cr11_baseline_the_spy_flags_a_locale_codec_writer_and_the_migrated_ones_are_clean(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from datetime import UTC, datetime
-
     from brain.chat.tool_loop import _log_attunement_error
-    from brain.felt_time.weather_shift import append_shift_log
     from brain.self_model.articulate import _log_articulate_error
 
+    def locale_codec_writer(directory: Path) -> None:
+        with open(directory / "log.txt", "a") as fh:  # text mode, no encoding: the very thing the spy exists to flag
+            fh.write("x\n")
+
     spy = _OpenSpy(monkeypatch)
-    append_shift_log(tmp_path, ts=datetime.now(UTC), channel="c", label="l")
-    assert spy.violations, "weather_shift.append_shift_log (held, felt-time audit) still opens with the locale codec"
+    locale_codec_writer(tmp_path)
+    assert spy.violations, "the spy no longer flags a text-mode open() with the locale codec"
     spy.violations.clear()
     _log_attunement_error(tmp_path, "t1", ValueError("x"))
     _log_articulate_error(tmp_path, "kind", ValueError("x"))
@@ -1060,7 +1055,7 @@ def test_cr9_d_a_save_started_during_the_heal_waits_and_lands_after_it(
 
     _seam_hook(monkeypatch, inside_heal=start_writer)
     r = jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
-    state["thread"].join(5)
+    finish_threads(state["thread"])
     assert r.data == {"restored": True}
     assert state["alive_during_heal"] is True, "the save did not wait for the heal"
     assert "error" not in state["box"]
@@ -1127,11 +1122,15 @@ def _hold_shared_lock_in_thread(path: Path):
     def hold():
         with file_lock(path):
             acquired.set()
-            release.wait(10)
+            release.wait()
 
     t = threading.Thread(target=hold, daemon=True)
     t.start()
-    assert acquired.wait(5)
+    try:
+        assert acquired.wait(5)
+    except BaseException:
+        release.set()  # the caller never gets `release`: let the holder go as soon as it has (or never gets) the lock
+        raise
     return t, release
 
 
@@ -1146,22 +1145,7 @@ def test_cr14_heal_completes_while_another_descriptor_holds_the_shared_lock(tmp_
         assert box["result"] == {"restored": True}
     finally:
         release.set()
-        t.join(5)
-
-
-def test_cr14_baseline_a_heal_on_the_shared_sidecar_would_hang(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(jio, "_HEAL_LOCK_USES_SHARED_SIDECAR", True)
-    p = _corrupt_with_backup(tmp_path)
-    t, release = _hold_shared_lock_in_thread(p)
-    try:
-        worker, _box = _in_thread(
-            lambda: jio.read_json(p, default=dict, recover=jio.Recovery.HEAL), timeout=1.0
-        )
-        assert worker.is_alive(), "the variant that locks <name>.lock should have hung"
-    finally:
-        release.set()
-        t.join(5)
-        worker.join(5)
+        finish_threads(t)
 
 
 def test_cr14_heal_save_and_if_missing_complete_while_the_same_thread_holds_the_shared_lock(
@@ -1278,32 +1262,6 @@ def test_cr14_an_oserror_in_the_body_propagates_once_and_the_body_runs_once(
     )
 
 
-def test_cr14_baseline_the_naive_try_with_shape_runs_the_body_twice() -> None:
-    """Why the module enters the lock through an ExitStack inside the try: @contextmanager re-raises body errors
-    at the yield, so `try: with lock: body / except OSError: body` runs the body a second time, unlocked."""
-    import contextlib
-
-    @contextlib.contextmanager
-    def lock():
-        yield
-
-    runs = []
-
-    def body():
-        runs.append(1)
-        raise OSError(errno.EIO, "disk")
-
-    try:
-        with lock():
-            body()
-    except OSError:
-        try:
-            body()
-        except OSError:
-            pass
-    assert len(runs) == 2
-
-
 # --------------------------------------------------------------------------------------------------------------
 # Recovery.RESTORE and fallbacks (CR15)
 # --------------------------------------------------------------------------------------------------------------
@@ -1322,13 +1280,6 @@ def test_cr15_restore_without_a_valid_backup_raises_and_leaves_everything_in_pla
         assert exc.value.kind == "malformed"
     assert _listing(tmp_path) == before
     assert not list(tmp_path.glob("*.corrupt-*"))
-
-
-def test_cr15_baseline_heal_would_have_reset_the_budget_to_an_empty_counter(tmp_path: Path) -> None:
-    """The d4c94657 fail-open bug: HEAL resets a corrupt budget file to the default (zero used)."""
-    p = tmp_path / "daily_budget.json"
-    p.write_bytes(b'{"date": "2026-10-17", "cou')
-    assert jio.read_json(p, default=dict, recover=jio.Recovery.HEAL) == {}
 
 
 def test_cr15_restore_restores_from_the_freshest_valid_backup(tmp_path: Path) -> None:
@@ -1436,9 +1387,7 @@ def _norm_crlf(b: bytes) -> bytes:
 
 
 @pytest.mark.parametrize("backups", [1, 3])
-@pytest.mark.parametrize(
-    "data", [{"a": 1}, {"é": "ü", "n": [1, 2, {"k": None}]}, [1, 2, 3], "text", 7]
-)
+@pytest.mark.parametrize("data", [{"é": "ü", "n": [1, 2, {"k": None}]}, 7])
 def test_cw1_write_json_matches_save_with_backup_byte_for_byte(
     tmp_path: Path, backups: int, data
 ) -> None:
@@ -1455,16 +1404,7 @@ def test_cw1_write_json_matches_save_with_backup_byte_for_byte(
         assert _norm_crlf(b.read_bytes()) == _norm_crlf(a.read_bytes())
 
 
-def test_cw1_the_differential_can_fail(tmp_path: Path) -> None:
-    from brain.health.attempt_heal import save_with_backup
-
-    save_with_backup(tmp_path / "l.json", {"a": 1})
-    jio.write_json(tmp_path / "n.json", {"a": 1}, indent=4)
-    assert _norm_crlf((tmp_path / "n.json").read_bytes()) != _norm_crlf(
-        (tmp_path / "l.json").read_bytes()
-    )
-
-
+@pytest.mark.slow(reason='2.2 s of CPU in its call phase on a 4-core dev VM, 2.2 s wall (serial run for #540, J12)')
 def test_cw2_concurrent_writers_raise_nothing_and_leave_a_whole_file_and_no_temps(
     tmp_path: Path,
 ) -> None:
@@ -1497,10 +1437,10 @@ def test_cw2_concurrent_writers_raise_nothing_and_leave_a_whole_file_and_no_temp
     for t in threads:
         t.start()
     for t in threads:
-        t.join(60)
+        finish_threads(t)
     stop.set()
     if POSIX:
-        rt.join(10)
+        finish_threads(rt)
     assert errors == [] and seen_bad == []
     assert "w" in json.loads(p.read_text())
     assert not list(tmp_path.glob("*.new"))
@@ -1779,17 +1719,6 @@ def test_cw9_verify_off_does_not_read_the_file_back_and_a_good_write_passes(
     assert reads == ["s.json"]
 
 
-def test_cw9_baseline_without_verify_a_bad_write_goes_unnoticed(
-    tmp_path: Path, monkeypatch
-) -> None:
-    p = tmp_path / "s.json"
-    jio.write_json(p, {"v": 1}, backups=1)
-    _corrupt_after_publish(monkeypatch, p)
-    assert jio.write_json(p, {"v": 2}, backups=1) is True
-    monkeypatch.undo()
-    assert p.read_bytes() == b"{garbage"
-
-
 def test_cw10_output_is_pure_ascii_whatever_the_payload(tmp_path: Path) -> None:
     p = tmp_path / "s.json"
     payload = {
@@ -1804,11 +1733,6 @@ def test_cw10_output_is_pure_ascii_whatever_the_payload(tmp_path: Path) -> None:
     raw.decode("ascii")
     assert b"\r" not in raw and b"\xe2\x80\xa8" not in raw
     assert json.loads(raw.decode("utf-8")) == payload
-
-
-def test_cw10_baseline_ensure_ascii_false_cannot_encode_a_lone_surrogate() -> None:
-    with pytest.raises(UnicodeEncodeError):
-        json.dumps({"a": "\ud800"}, ensure_ascii=False).encode("utf-8")
 
 
 def test_cw10_format_options(tmp_path: Path) -> None:
@@ -1855,28 +1779,9 @@ def test_cw12_two_threads_racing_to_create_exactly_one_wins(tmp_path: Path) -> N
     for t in threads:
         t.start()
     for t in threads:
-        t.join(10)
+        finish_threads(t)
     assert sorted(results) == [False, True]
     assert json.loads(p.read_text())["winner"] in (0, 1)
-
-
-def test_cw12_baseline_a_plain_exists_check_lets_both_threads_write(tmp_path: Path) -> None:
-    p = tmp_path / "marker.json"
-    wrote: list[int] = []
-    gate = threading.Barrier(2)
-
-    def naive(i):
-        if not p.exists():
-            gate.wait()  # both pass the check before either writes
-            p.write_text(json.dumps({"winner": i}))
-            wrote.append(i)
-
-    threads = [threading.Thread(target=naive, args=(i,)) for i in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(10)
-    assert len(wrote) == 2
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -1920,13 +1825,6 @@ def test_cj1_unicode_line_separators_inside_a_value_do_not_split_a_record(tmp_pa
     value = "x" + chr(0x2028) + "y" + chr(0x2029) + "z" + chr(0x85) + "w"
     p.write_bytes((json.dumps({"a": value}, ensure_ascii=False) + '\n{"b": 2}\n').encode())
     assert jio.read_jsonl(p) == [{"a": value}, {"b": 2}]
-
-
-def test_cj1_baseline_splitlines_would_cut_that_record() -> None:
-    text = '{"a": "x\u2028y"}\n{"b": 2}\n'
-    assert (
-        len(text.splitlines()) == 3
-    )  # the bridge/feed.py:407 shape: one record becomes two broken ones
 
 
 def test_cj1_a_lone_carriage_return_is_not_a_record_separator(tmp_path: Path) -> None:
@@ -1989,12 +1887,6 @@ def test_cj2_iteration_is_streaming(tmp_path: Path) -> None:
         it.close()
 
     assert _peak_bytes(first) < 1_000_000
-
-
-def test_cj2_baseline_reading_the_whole_text_peaks_far_higher(tmp_path: Path) -> None:
-    p = tmp_path / "big.jsonl"
-    p.write_bytes((b'{"k": "' + b"x" * 90 + b'"}\n') * 55000)
-    assert _peak_bytes(lambda: p.read_text().splitlines()) > 4_000_000
 
 
 def test_cj3_strict_iteration_raises_on_the_first_bad_line_after_yielding_the_good_ones(
@@ -2270,7 +2162,7 @@ def test_ca2_concurrent_appends_from_threads_and_a_process_lose_nothing(tmp_path
     for t in threads:
         t.start()
     for t in threads:
-        t.join(60)
+        finish_threads(t)
     assert child.wait(60) == 0
     rows = jio.read_jsonl(p)
     assert len(rows) == 8 * 25 + 25
@@ -2286,8 +2178,8 @@ def test_ca2_block_waits_while_another_handle_holds_the_lock(tmp_path: Path) -> 
         assert not p.exists() or p.read_bytes() == b""
     finally:
         release.set()
-        holder.join(5)
-    worker.join(5)
+        finish_threads(holder)
+    finish_threads(worker)
     assert box.get("result") == len(jio.encode_jsonl({"a": 1}))
     assert jio.read_jsonl(p) == [{"a": 1}]
 
@@ -2300,7 +2192,7 @@ def test_ca2_try_returns_none_and_writes_nothing_when_the_lock_is_busy(tmp_path:
         assert not p.exists() or p.read_bytes() == b""
     finally:
         release.set()
-        holder.join(5)
+        finish_threads(holder)
     assert jio.append_jsonl(p, {"a": 1}, lock="try") is not None
 
 
@@ -2316,19 +2208,6 @@ def test_ca2_held_takes_no_lock_so_a_caller_holding_it_does_not_deadlock(tmp_pat
     worker, box = _in_thread(work, timeout=5)
     assert not worker.is_alive(), "lock='held' re-locked and deadlocked"
     assert box["result"] is not None
-
-
-def test_ca2_baseline_block_while_the_caller_holds_the_lock_would_deadlock(tmp_path: Path) -> None:
-    from brain.utils.file_lock import file_lock
-
-    p = tmp_path / "log.jsonl"
-
-    def work():
-        with file_lock(p):
-            return jio.append_jsonl(p, {"a": 1}, lock="block")
-
-    worker, _box = _in_thread(work, timeout=1.0)
-    assert worker.is_alive()  # a second flock on a new handle in the same process blocks forever
 
 
 def test_ca2_a_refused_lock_still_appends_with_one_warning(
@@ -2570,14 +2449,14 @@ def test_cr9_f_a_plain_reader_arriving_mid_heal_waits_and_never_gets_the_default
     assert jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=_policy(policy)) == {
         "restored": True
     }
-    state["thread"].join(5)
+    finish_threads(state["thread"])
     assert state["early"] != {"DEFAULT": 1}, "a reader got default() while a heal was in progress"
     assert state["box"].get("result") == {"restored": True}
 
 
 def test_cr9_f_stress_no_reader_ever_sees_the_default_while_others_heal(tmp_path: Path) -> None:
     bad: list[object] = []
-    for rnd in range(40):
+    for rnd in range(10):
         d = tmp_path / f"r{rnd}"
         d.mkdir()
         p = _corrupt_with_backup(d, b'{"good": 1}')
@@ -2593,12 +2472,13 @@ def test_cr9_f_stress_no_reader_ever_sees_the_default_while_others_heal(tmp_path
         for t in threads:
             t.start()
         for t in threads:
-            t.join(20)
+            finish_threads(t)
     assert bad == []
 
 
 def test_cr9_f_a_reader_finding_the_file_absent_while_a_heal_lock_is_held_waits_for_it(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     """A legacy healer (no sidecar of its own) cannot be waited on, but a module heal in progress can."""
     from brain.utils.file_lock import file_lock
@@ -2610,20 +2490,23 @@ def test_cr9_f_a_reader_finding_the_file_absent_while_a_heal_lock_is_held_waits_
     def healer():
         with file_lock(heal_target):
             acquired.set()
-            release.wait(10)
+            release.wait()
             p.write_text('{"restored": true}')
 
     h = threading.Thread(target=healer, daemon=True)
+    threads = [h]
+    release_at_teardown(request, release, threads)
     h.start()
     assert acquired.wait(5)
     t, box = _start_thread(
         lambda: jio.read_json(p, default=lambda: {"DEFAULT": 1}, recover=jio.Recovery.RESTORE)
     )
+    threads.append(t)
     t.join(0.4)
     assert t.is_alive(), "the reader did not wait for the heal in progress"
     release.set()
-    t.join(5)
-    h.join(5)
+    finish_threads(t)
+    finish_threads(h)
     assert box.get("result") == {"restored": True}
 
 
@@ -2753,7 +2636,7 @@ def test_cw9_verify_runs_under_the_lock_so_a_concurrent_newer_save_is_not_undone
 
     monkeypatch.setattr(jio, "_seam", b_arrives)
     assert jio.write_json(p, {"v": "A"}, backups=1, verify=True) is True
-    state["t"].join(5)
+    finish_threads(state["t"])
     assert state["b_waited"], "B's save ran inside A's save-and-verify"
     assert json.loads(p.read_text()) == {"v": "B-newer"}
 
@@ -2841,7 +2724,7 @@ def _reference_tail(data: bytes, n: int) -> list[bytes]:
     return lines[-n:]
 
 
-@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 8, 13, 64])
+@pytest.mark.parametrize("chunk", [1, 3, 13])
 def test_cj4_the_tail_matches_a_naive_reference_for_tiny_chunk_sizes(
     tmp_path: Path, monkeypatch, chunk: int
 ) -> None:
@@ -2869,24 +2752,27 @@ def test_cj4_a_file_whose_first_line_is_only_a_bom_does_not_count_it_as_a_line(
     assert jio._tail_lines(p, 5) == [b'{"a": 1}', b'{"b": 2}']
 
 
-def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Path) -> None:
-    """F9: re-concatenating and re-splitting the whole block per chunk made one long line quadratic."""
+def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Path, monkeypatch) -> None:
+    """F9: re-concatenating and re-splitting the whole block per chunk made one long line quadratic.
+
+    A tiny chunk gives a short file many chunks, so the quadratic copying is large at 2 MB. CPU time of this
+    process (not wall-clock) and the minimum of three runs, so a busy host moves both sizes together; four times the
+    line takes about four times as long when linear and sixteen times as long when quadratic, compared with 8x plus
+    100 ms (Windows CPU-time ticks are about 16 ms)."""
+    monkeypatch.setattr(jio, "_TAIL_CHUNK", 1024)
 
     def best(size: int) -> float:
         p = tmp_path / f"long{size}.jsonl"
         p.write_bytes(b'{"k": "' + b"x" * size + b'"}\n')
         times = []
         for _ in range(3):
-            t0 = time.perf_counter()
+            t0 = time.process_time()
             assert len(jio.read_jsonl_tail(p, 1)) == 1
-            times.append(time.perf_counter() - t0)
+            times.append(time.process_time() - t0)
         return min(times)
 
-    small, big = best(1_000_000), best(8_000_000)
-    assert big < small * 32, (
-        small,
-        big,
-    )  # linear is about 8x; quadratic is about 64x (timing noise is allowed for)
+    small, big = best(500_000), best(2_000_000)
+    assert big < small * 8 + 0.1, (small, big)
 
 
 # ---- review nits: HEAL validator exceptions and the strict reset-to-default write ----

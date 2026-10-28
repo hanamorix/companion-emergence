@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -109,6 +110,7 @@ def test_an_incomplete_registry_keeps_the_old_settings_file_for_the_next_start(t
     tunables._reset_for_tests()
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 2.6 s wall (serial run for #540, J12)')
 def test_a_fresh_process_boot_writes_every_registered_key_with_its_default(tmp_path):
     """A real bridge boot in a fresh interpreter that imports only the server: the file holds EVERY key that a fresh
     interpreter importing every registering module registers, each at its default (C56, generalising the seven model keys).

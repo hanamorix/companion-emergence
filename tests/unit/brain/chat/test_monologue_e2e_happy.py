@@ -96,7 +96,7 @@ def test_full_turn_updates_all_surfaces(tmp_path: Path, monkeypatch):
         assert digest_log.exists()
         assert "didn't pretend" in digest_log.read_text()
 
-        # Pass 2 now flows through the in-process pass2_queue (single worker, #27).
+        # Pass 2 work is saved in the persisted pass2_queue (no worker thread, #27).
         # Drain it synchronously so the memory write lands (cli_throttle idle in tests).
         from brain.bridge import cli_throttle
         from brain.chat import pass2_queue

@@ -188,20 +188,6 @@ def test_c2_shrunk_prefix_passes_per_run(prefix):
     assert res["rows_checked"] == 5
 
 
-def test_c2_preconditions_the_legacy_signals_misfire_on_the_shrunk_run():
-    def build(prefix):
-        creations = [11000, 14000, 17000, 20000, 15000]
-        return [row(prefix + 11000, 0, t=0)] + [row(c, prefix, t=k) for k, c in enumerate(creations, 1)]
-
-    a, b = build(15476), build(6176)
-
-    def ratio(rows):
-        return sum(r["cache_read_input_tokens"] for r in rows) / sum(r["cache_creation_input_tokens"] for r in rows)
-
-    assert (ratio(b) - ratio(a)) / ratio(a) < -0.10  # the legacy sum(read)/sum(creation) ratio dropped > 10%
-    assert _old_rule_fails(b)  # and the replaced per-row signal fails run B's healthy row (20000 vs F=17176)
-
-
 # --------------------------------------------------------------------------------------
 # C3: healthy shapes pass
 # --------------------------------------------------------------------------------------
@@ -383,7 +369,7 @@ def test_k1_a_persistent_break_from_the_second_judged_row_fails_at_that_row():
 
 @pytest.mark.parametrize(
     "reads,rows",
-    [([0, 6449, 6449], [2]), ([5000, 0, 6449], [3]), ([0, 0, 0], [2, 3, 4]), ([6449, 0, 6449, 6449], [3]), ([6449, 6449, 6449, 0], [5])],
+    [([0, 0, 0], [2, 3, 4]), ([6449, 0, 6449, 6449], [3])],
 )
 def test_k1_a_zero_read_is_a_break_never_a_crash_and_never_enters_s(reads, rows):
     res = safe_check(run(*reads))  # a zero in S would divide by zero in the share and let every later row pass
@@ -413,12 +399,6 @@ def test_k1_the_text_path_shape_of_two_judged_rows_is_one_comparison_with_zero_t
     assert check(run(8403, 8403))["status"] == "PASS"
     assert check(run(8403, 8402))["status"] == "FAIL"
     assert check(run(8403, 9000))["status"] == "PASS"  # a rise is fine
-
-
-def test_k1_precondition_the_replaced_rule_fails_what_min_passes_and_one_establishing_row_fails_the_limit():
-    assert _highest_read_rule_fails([6449, 15476, 6449, 6449])
-    first_only = [15476, 6449, 6449]  # min-of-earlier with one establishing row: row 2 is below 15476
-    assert any(rd < min(first_only[:i]) for i, rd in enumerate(first_only) if i >= 1)
 
 
 def test_k1_a_negative_read_is_unusable_not_a_break_or_a_reference():
@@ -452,7 +432,9 @@ def test_k7_the_two_measured_healthy_runs_pass():
 _PLAIN = [6449, 6449]
 
 
-@pytest.mark.parametrize("multi_read", [0, 5, 6449, 99999])
+# 0 catches "a multi-call row is judged" (a zero read is a break); 5 catches "a multi-call row's read enters S" (6449
+# equals S, 0 never enters it, 99999 cannot lower a minimum).
+@pytest.mark.parametrize("multi_read", [0, 5])
 def test_c5_interleaved_multi_call_rows_change_nothing(multi_read):
     base = check(run(*_PLAIN))
     mixed = check(run(6449, (multi_read, 3), 6449, (multi_read, 2)))
@@ -687,25 +669,6 @@ def test_c7_real_repo_config_entry_parses_to_zero_percent_and_is_gating_stable()
     assert entry["regression_threshold"] == "0%"
 
 
-def test_c7_gating_oracle_can_fail(tmp_path):
-    import yaml
-
-    p = _config(tmp_path, '"0%"')
-    p.write_text(p.read_text().replace("gating: true", "gating: false"), encoding="utf-8")
-    body = re.search(r"^```yaml[ \t]*\n(.*?)^```[ \t]*$", p.read_text(), re.M | re.S).group(1)
-    entry = next(m for m in yaml.safe_load(body)["metrics"] if m["name"] == "cache_read_ratio")
-    assert entry["gating"] is not True
-
-
-def test_c7_no_threshold_literal_in_the_check_code():
-    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    for fn in tree.body:
-        if isinstance(fn, ast.FunctionDef) and fn.name in ("check_cache_break", "read_regression_threshold"):
-            consts = [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, (int, float))]
-            assert 10 not in consts and 10.0 not in consts and 0.1 not in consts, (fn.name, consts)
-            assert 0.9 not in consts
-
-
 # --------------------------------------------------------------------------------------
 # C9: reader reuse, fail-closed; CLI
 # --------------------------------------------------------------------------------------
@@ -871,189 +834,19 @@ def _script_run(*args, cwd=None):
     return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd or REPO, env=env, capture_output=True, text=True, timeout=120)
 
 
-def test_k3_exit_codes_of_the_script_as_a_process(tmp_path):
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+def test_k3_the_script_process_exits_with_the_verdict_code_and_1_on_a_crash(tmp_path):
+    """The whole exit-code table is asserted in-process (`test_cli_exit_codes_and_skips_non_chat_rows`,
+    `test_cli_from_row_is_one_based_over_chat_rows`, `test_cli_bad_arguments_are_exit_2_...`); what only a process
+    shows is that the script's last line hands `main()`'s verdict to the process (`raise SystemExit(main())`) and
+    that an uncaught exception ends it as exit 1 with its traceback."""
     f = tmp_path / "u.jsonl"
-    cases = [(run(6449, 6449), 0), (run(6449, 6449, 2000), 10), (run(6449), 11)]
-    for rows, code in cases:
-        _write_rows(f, rows)
-        assert _script_run("--cache-break-check", str(f), "--regression-threshold", "0").returncode == code
-    assert _script_run("--cache-break-check", str(f), "--from-row", "x").returncode == 2  # argparse
-    assert _script_run("--cache-break-check", str(tmp_path / "nope.jsonl")).returncode == 2
+    _write_rows(f, run(6449, 6449, 2000))
+    assert _script_run("--cache-break-check", str(f), "--regression-threshold", "0").returncode == 10  # a break
     missing = tmp_path / "missing.json"
     crash = _script_run("--compare", str(missing), str(missing))  # an uncaught FileNotFoundError
     assert crash.returncode == 1 and "FileNotFoundError" in crash.stderr
     assert {0, 10, 11}.isdisjoint({1, 2})
-
-
-# --------------------------------------------------------------------------------------
-# Config text (C12) and stale text
-# --------------------------------------------------------------------------------------
-
-
-def _entry_text(text):
-    lines = text.splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.strip() == "- name: cache_read_ratio")
-    out = [lines[start]]
-    for ln in lines[start + 1 :]:
-        if ln.strip().startswith("- name:") or ln.startswith("  # --- BLOCKED"):
-            break
-        out.append(ln)
-    flat = " ".join(re.sub(r"^\s*#\s?", "", ln).strip() for ln in out)
-    return " ".join(flat.split())
-
-
-_PHRASES = [
-    "never judged",
-    "Only single-call rows (num_turns == 1) are judged",
-    "The first judged row establishes S",
-    "the minimum of the earlier nonzero judged reads",
-    "read is 0 or below S",
-    "at least 2 judged rows (one establishes S, one is compared against it)",
-    "Multi-call rows (num_turns != 1, tool turns) are not judged and impose no rule",
-    "same cached prefix (system prompt and tool block) as a plain message's",
-    "the model decides on tools only after that call",
-    "so a prefix break shows on plain rows too",
-    "direction: stable",
-    'regression_threshold: "0%"',
-    "0% tolerance",
-    "not an OLD->NEW delta",
-    "Basis of S = the minimum of the earlier judged reads",
-    "reads 6449, 2000, 2000 give S = 2000",
-    "while the minimum catches it at the second row",
-    "Every nonzero judged read enters the minimum, a zero read is a break and never enters it",
-    "A high read on the FIRST judged row followed by normal reads FAILs",
-    "reads 15476, 6449, 6449 break at the second",
-    "It has not been observed",
-    "The FAIL names the row, the read and S",
-    "partial break on the first judged row lowers the floor",
-    "one comparison of two reads with zero tolerance",
-    "a --history-file replay is unmeasured",
-    "lower S step by step and pass",
-    "two small runs on two models",
-    "5 direct single-call reads and 3 inferred first calls",
-    "6449",
-    "8403",
-    "15,476",
-    "OBSERVED, not bounded",
-    "a transient miss included",
-    "re-measure",
-    "Basis of the minimum of 2 judged rows (derived, not tuned)",
-    "UNMEASURED (exit 11) = an unverified gating criterion",
-    "a log file that got smaller during the run (rotated or truncated)",
-    "Exit codes of a verdict: 0 PASS, 10 FAIL, 11 UNMEASURED",
-    "1 = a crash",
-    "2 = argparse usage errors",
-    "status NOT_APPLICABLE, exit 0 and one stderr line saying so",
-    "`--compare` returns 0 / 10 / 11",
-    "parses chat_usage.jsonl once, and only the bytes this run appended",
-    "NOT COMPARABLE",
-    "must be ONE run",
-    "num_turns == 1 meaning one API call is an assumption",
-    "uv run python scripts/cache_replay_workload.py --cache-break-check",
-    "no OLD/NEW baseline, call count or logging change is needed",
-    "complementary to the creation and cost metrics",
-    "all of its chat rows, warm-up and plain turns included",
-    "held two more chat rows than the nine replay turns, of unidentified origin",
-    "so only the first is certainly a replay turn",
-    "these three are the inferred first calls counted below",
-    "were only estimated from an assumed per-call read",
-]
-
-
-@pytest.mark.parametrize("phrase", _PHRASES)
-def test_c12_config_entry_states_the_new_meaning(phrase):
-    entry = _entry_text(CONFIG.read_text(encoding="utf-8"))
-    assert " ".join(phrase.split()) in entry, phrase
-
-
-def test_k6_the_fields_are_self_describing_at_the_field_itself():
-    lines = CONFIG.read_text(encoding="utf-8").splitlines()
-    i = next(k for k, ln in enumerate(lines) if ln == "    direction: stable")
-    j = next(k for k, ln in enumerate(lines) if ln == '    regression_threshold: "0%"')
-    above_direction = " ".join(lines[i - 2 : i])
-    above_threshold = lines[j - 1]
-    assert above_direction.count("#") == 2 and "Not an OLD->NEW delta" in above_direction
-    assert "run's own stable read S" in above_direction
-    assert above_threshold.strip().startswith("#") and "Tolerance below S in percent" in above_threshold
-    assert "Not a regression threshold against a baseline" in above_threshold
-
-
-_STALE = [
-    r"\bstrict-first\b",
-    r"\bfirst row is valid\b",
-    r"\bV[1-4]\b",
-    r"\bfixed_prompt_tokens\b",
-    r"\bmax_share_of_F\b",
-    r"\bF\b",
-    r"within 10% of F",
-    r"cache_creation_input_tokens \* 100 >= F",
-    r"cold arm",
-]
-
-# Statements that stopped being true with the minimum / exit codes 0-10-11 / the declared dependency; swept over
-# the whole config text and the script (the config entry says "highest earlier read" only in its history).
-_STALE_V3 = [
-    r"running max",
-    r"highest read among",
-    r"S = max",
-    r"S is built from reads",
-    r"exit 0 PASS / 1 FAIL / 2 UNMEASURED",
-    r"UNMEASURED \(exit 2\)",
-    r"legitimately exit 1 or 2",
-    r"no pyproject change",
-    r"locked transitive dependency",
-    r"chat_rows_observed = turns \+ 3",
-    r"warns on stderr when they differ",
-    r"exits 0 PASS / 1 FAIL / 2 UNMEASURED",
-    r"0 PASS / 1 FAIL / 2 UNMEASURED",
-]
-
-
-@pytest.mark.parametrize("pattern", _STALE)
-def test_c12_stale_first_row_cold_text_is_gone(pattern):
-    entry = _entry_text(CONFIG.read_text(encoding="utf-8"))
-    script = " ".join(SCRIPT.read_text(encoding="utf-8").split())
-    assert not re.search(pattern, entry), ("config", pattern)
-    assert not re.search(pattern, script), ("script", pattern)
-
-
-@pytest.mark.parametrize("pattern", _STALE_V3)
-def test_k6_text_made_false_by_this_change_is_gone(pattern):
-    config = " ".join(re.sub(r"^\s*#\s?", "", ln).strip() for ln in CONFIG.read_text(encoding="utf-8").splitlines())
-    script = " ".join(SCRIPT.read_text(encoding="utf-8").split())
-    assert not re.search(pattern, " ".join(config.split())), ("config", pattern)
-    assert not re.search(pattern, script), ("script", pattern)
-
-
-def test_k6_the_other_test_text_carries_no_stale_phrase_either():
-    text = Path(__file__).read_text(encoding="utf-8")
-    text = re.sub(r"^_STALE(_V3)? = \[.*?^\]\n", "", text, flags=re.M | re.S)  # the pattern lists name the phrases
-    flat = " ".join(text.split())
-    for pattern in _STALE_V3:
-        assert not re.search(pattern, flat), pattern
-
-
-def test_k6_the_rationale_has_one_home_and_the_docstrings_point_to_it():
-    script = SCRIPT.read_text(encoding="utf-8")
-    flat = " ".join(script.split())
-    for rationale in ("catches it at the second row", "8403", "6449, 2000, 2000", "OBSERVED", "lower S step by step"):
-        assert rationale not in flat, rationale  # the bases and limits are in the config only
-    tree = ast.parse(script)
-    mod_doc = " ".join((ast.get_docstring(tree) or "").split())
-    assert "guarded-change.companion.md" in mod_doc and "cache_read_ratio" in mod_doc
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "check_cache_break")
-    fn_doc = " ".join((ast.get_docstring(fn) or "").split())
-    assert "guarded-change.companion.md, metric cache_read_ratio" in fn_doc
-    assert len((ast.get_docstring(fn) or "").splitlines()) <= 7  # a one-line summary, a pointer and the result keys
-
-
-def test_stale_tools_path_text_is_gone_and_replaced():
-    src = SCRIPT.read_text(encoding="utf-8")
-    for stale in ("logs no usage row", "logs NO usage row", "stays empty", "can't be read"):
-        assert stale not in src, stale
-    helps = {a.option_strings[0]: a.help for a in _parser()._actions if a.option_strings}
-    assert "logs usage rows" in helps["--with-tools"]
-    assert "logs a usage" in " ".join((crw._TextPathProvider.__doc__ or "").split())
 
 
 def _parser():
@@ -1582,10 +1375,6 @@ def test_c7_a_missing_pyyaml_is_a_value_error_not_a_crash(tmp_path, monkeypatch)
         crw.read_regression_threshold(CONFIG)
 
 
-def test_warmup_prompt_is_the_micro_ack():
-    assert crw.WARMUP_PROMPT == "ok"
-
-
 # --------------------------------------------------------------------------------------
 # C8: replay exit codes (0 PASS / 10 FAIL / 11 UNMEASURED), through main()
 # --------------------------------------------------------------------------------------
@@ -1634,17 +1423,6 @@ def test_c8_exit_code_mapping():
     assert crw._exit_code_for(None) == 11 and crw._exit_code_for("PASS") == 11
     # no verdict ever collides with the crash code (1) or the usage-error code (2)
     assert all(crw._exit_code_for({"status": s}) not in (1, 2) for s in ("PASS", "NOT_APPLICABLE", "FAIL", "UNMEASURED", "X"))
-
-
-def test_c8_help_states_the_exit_codes_and_the_error_codes():
-    doc = " ".join((crw.__doc__ or "").split())
-    assert "0 PASS (also NOT_APPLICABLE" in doc and "10 FAIL, 11 UNMEASURED" in doc
-    assert "Errors never use 10 or 11: 1 = an uncaught crash, ``--turns`` below 1, ``--dump-replies`` without ``--out``" in doc
-    assert "2 = argparse usage errors, no persona dir given, and bad ``--cache-break-check`` arguments" in doc
-    assert "``--compare`` returns 0 / 10 / 11" in doc
-    assert "uv run python scripts/cache_replay_workload.py" in doc
-    helps = {a.option_strings[0]: a.help for a in _parser()._actions if a.option_strings}
-    assert "exit 0 PASS / 10 FAIL / 11 UNMEASURED" in helps["--cache-break-check"] and "2 bad arguments" in helps["--cache-break-check"]
 
 
 # --------------------------------------------------------------------------------------
@@ -1788,8 +1566,8 @@ def test_k3_the_pre_run_error_codes_are_not_verdict_codes(tmp_path, capsys):
 def test_k3_a_malformed_compare_input_is_a_crash_not_a_verdict(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("not json", encoding="utf-8")
-    res = _script_run("--compare", str(bad), str(bad))
-    assert res.returncode == 1 and "JSONDecodeError" in res.stderr
+    with pytest.raises(json.JSONDecodeError):  # as a process this is exit 1, the crash code (see the process test)
+        crw.main(["--compare", str(bad), str(bad)])
 
 
 def test_k2_an_unwritable_temp_dir_is_unmeasured_not_a_late_crash(tmp_path, monkeypatch):

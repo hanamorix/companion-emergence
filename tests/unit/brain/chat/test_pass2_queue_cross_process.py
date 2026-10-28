@@ -53,8 +53,8 @@ def _write_records(persona_dir: Path, records: list[dict]) -> None:
 # C36(d): two real concurrent drainers on the same persona_dir
 # ---------------------------------------------------------------------------
 
-# This script holds pass2_drain.lock for `hold_seconds` (its "test_probe"
-# dispatch is monkeypatched to sleep) and writes side effects to a plain
+# This script holds pass2_drain.lock until the parent writes the `holder.release` file, capped at 30 s (its "test_probe"
+# dispatch is monkeypatched to wait) and writes side effects to a plain
 # JSON side-file so the parent can inspect exactly what ran, without either
 # subprocess needing real extraction machinery.
 _HOLDING_DRAINER_SCRIPT = r"""
@@ -63,14 +63,16 @@ from pathlib import Path
 
 persona_dir = Path(sys.argv[1])
 ready_path = Path(sys.argv[2])
-hold_seconds = float(sys.argv[3])
+release_path = Path(sys.argv[3])
 side_file = Path(sys.argv[4])
 
 from brain.chat import pass2_queue
 
 def _slow_dispatch(record, *, persona_dir):
     Path(ready_path).write_text("1")
-    time.sleep(hold_seconds)
+    deadline = time.monotonic() + 30.0
+    while not release_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
     existing = json.loads(side_file.read_text()) if side_file.exists() else []
     existing.append(record["id"])
     side_file.write_text(json.dumps(existing))
@@ -103,13 +105,14 @@ def test_two_concurrent_drainers_second_leaves_queue_untouched(tmp_path):
     ])
 
     ready_path = persona_dir / "holder.ready"
+    release_path = persona_dir / "holder.release"
     side_file = persona_dir / "side_effects.json"
     result_a_path = persona_dir / "result_a.txt"
     result_b_path = persona_dir / "result_b.txt"
 
     holder = subprocess.Popen([
         sys.executable, "-c", _HOLDING_DRAINER_SCRIPT,
-        str(persona_dir), str(ready_path), "2.0", str(side_file), str(result_a_path),
+        str(persona_dir), str(ready_path), str(release_path), str(side_file), str(result_a_path),
     ])
     try:
         _wait_for_file(ready_path, holder)  # holder now holds pass2_drain.lock
@@ -126,7 +129,8 @@ def test_two_concurrent_drainers_second_leaves_queue_untouched(tmp_path):
         on_disk = json.loads((persona_dir / "pass2_queue.json").read_text())
         assert {it["id"] for it in on_disk} == {"item-1", "item-2"}
 
-        holder.wait(timeout=10.0)
+        release_path.write_text("1")  # now let the holder finish both items
+        holder.wait(timeout=30.0)
         assert holder.returncode == 0
         assert result_a_path.read_text().strip() == "2"  # the winner drained both, unaffected
         ran_ids = json.loads(side_file.read_text())

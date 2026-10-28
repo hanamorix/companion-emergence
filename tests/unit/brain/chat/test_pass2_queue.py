@@ -15,10 +15,10 @@ INC-8-specific persistence/lock/at-least-once tests below.
 from __future__ import annotations
 
 import logging
-import time
 
 from brain.bridge import cli_throttle
 from brain.chat import pass2_queue
+from tests.thread_support import finish_threads
 
 
 def _make_recorder() -> tuple[list[str], callable]:
@@ -179,16 +179,10 @@ class TestNoWorkerThread:
         _records, make = _make_recorder()
         for label in ("a", "b", "c"):
             pass2_queue.enqueue(make(label), persona_dir=tmp_path)
-        time.sleep(0.05)
         after = threading.enumerate()
         assert {t.ident for t in after} <= before, "enqueue() started a thread"
         assert not any(t.name == "pass2-queue-worker" for t in after)
         assert pass2_queue._queue_size(tmp_path) == 3  # saved, waiting for a drainer
-
-    def test_module_has_no_worker_machinery(self):
-        for name in ("_ensure_worker", "_worker_loop", "_worker_thread", "_worker_inhibited"):
-            assert not hasattr(pass2_queue, name), name
-
 
 # ---------------------------------------------------------------------------
 # 4. A raising item must not kill the drain (error isolation)
@@ -331,7 +325,7 @@ class TestQueueFileLockFreshRead:
             t = threading.Thread(target=enqueue_b_from_another_thread)
             t.start()
             assert b_enqueued.wait(timeout=5.0), "second thread never finished enqueuing B"
-            t.join(timeout=5.0)
+            finish_threads(t)
 
         pass2_queue.register_test_side_effect(a_id, fn_a)
         pass2_queue.enqueue({"id": a_id, "kind": "test_probe"}, persona_dir=tmp_path)

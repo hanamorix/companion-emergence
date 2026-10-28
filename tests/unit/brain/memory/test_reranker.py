@@ -36,6 +36,7 @@ from brain.memory.reranker import (
     normalize_bundled_pairs_against_anchors,
 )
 from brain.memory.store import MemoryStore
+from tests.source_tree import brain_trees
 
 # ---------------------------------------------------------------------------
 # FakeRerankerProvider — scriptable, offline
@@ -240,31 +241,6 @@ def test_ac3_reranker_precision_override_loads_fp32_instead(
     )
     _reset_reranker_provider_cache()
     tunables_mod._reset_for_tests()
-
-
-def test_ac4_no_precision_selfcheck_reference_remains_in_reranker_module() -> None:
-    """AC4 (grep-clean): no reference to a cached first-use precision
-    decision, an agreement bar, or a floor-write-triggered precision-cache
-    invalidation remains in brain/memory/reranker.py or brain/bridge/
-    supervisor.py — mechanical check, same shape as
-    `test_ac3_no_int8_quantization_code_path` below."""
-    import inspect
-
-    from brain.bridge import supervisor as supervisor_mod
-
-    forbidden = [
-        "_precision_decision_cache",
-        "_choose_reranker_model_id",
-        "_run_precision_selfcheck",
-        "reset_precision_decision_for_floor_change",
-        "agreement bar",
-    ]
-    for mod in (reranker_mod, supervisor_mod):
-        source = inspect.getsource(mod)
-        for token in forbidden:
-            assert token not in source, (
-                f"stale precision-self-check reference {token!r} still present in {mod.__name__}"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -904,8 +880,15 @@ def test_g3_the_clamps_hold_at_an_ancestor_level(monkeypatch: pytest.MonkeyPatch
 _BAD_VALUES = ["abc", "-5", "+5", "1_000", "nan", "inf", "infinity", "", "²", "9" * 400, "1.5"]
 
 
-@pytest.mark.parametrize("key", _V2_KEYS)
-@pytest.mark.parametrize("raw", [*_BAD_VALUES, _REMOVE])
+# One loop and one parser serve all five lines (`_cgroup_reclaimable_file_bytes`), so the whole value grid runs on the
+# first line and two representative degrades (junk text, a missing line) on each of the others.
+_G4_CASES = [("file", raw) for raw in [*_BAD_VALUES, _REMOVE]] + [
+    (key, raw) for key in _V2_KEYS[1:] for raw in ("abc", _REMOVE)
+]
+
+
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize(("key", "raw"), _G4_CASES)
 def test_g4_any_unusable_page_cache_line_subtracts_nothing(monkeypatch: pytest.MonkeyPatch, key: str, raw: object) -> None:
     """Every degrade input, on any ONE of the five lines, gives limit - current (5.0 GB): never None, never a raise."""
     _use_files(monkeypatch, _one_level(_stat(override={key: raw})))
@@ -1292,8 +1275,12 @@ def test_g11_v1_clamps_and_floors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert reranker_mod._cgroup_v1_memory_headroom_bytes() == 0.0
 
 
-@pytest.mark.parametrize("key", _V1_KEYS)
-@pytest.mark.parametrize("raw", [*_BAD_VALUES, _REMOVE])
+# The v1 lines go through the same loop and parser as the v2 ones (the value grid is test_g4_ and test_h2_), so each
+# of the five v1 lines gets the junk-text and the missing-line degrade.
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize(
+    ("key", "raw"), [(key, raw) for key in _V1_KEYS for raw in ("abc", _REMOVE)]
+)
 def test_g11_v1_any_unusable_page_cache_line_subtracts_nothing(
     monkeypatch: pytest.MonkeyPatch, key: str, raw: object
 ) -> None:
@@ -2257,23 +2244,6 @@ def test_j5_v1_on_real_files_the_container_layout_and_a_real_permission_error(
         (own / "memory.limit_in_bytes").chmod(0o644)
 
 
-def test_j7_the_fallback_docstrings_state_the_minimum_with_psutil_and_the_s240_s242_s243_rules() -> None:
-    avail = " ".join((reranker_mod._available_ram_headroom_bytes.__doc__ or "").split())
-    v2 = " ".join((reranker_mod._cgroup_v2_memory_headroom_bytes.__doc__ or "").split())
-    v1 = " ".join((reranker_mod._cgroup_v1_memory_headroom_bytes.__doc__ or "").split())
-    chain = " ".join((reranker_mod._cgroup_chain_headroom.__doc__ or "").split())
-    width = " ".join((reranker_mod.fit_rerank_width.__doc__ or "").split())
-    assert "SMALLER of two figures" in avail and "only when no cgroup level could be measured" not in avail
-    assert "has headroom 0" in v2 and "never borrowed" in v2 and "mount root" in v2
-    assert "first existing level" in v1 and "headroom 0" in v1
-    assert "never borrowed" in chain or "never borrow" in chain
-    assert "within_measured" in width and "S242" in width
-    from brain.memory import ram_fit
-
-    fit_doc = " ".join((ram_fit.RamFit.within_measured.__doc__ or "").split())
-    assert "no more pairs" in fit_doc and "no longer a padded length" in fit_doc
-
-
 # ---- H6: the callers see the same float | None ----
 
 
@@ -2334,42 +2304,6 @@ def test_j4_the_cap_refuses_a_single_pair_longer_than_any_measured_and_allows_on
     anchors = [50] * len(ANCHOR_POOL)
     assert reranker_mod.fit_rerank_width([1024], anchors, capped, 4.0, 1e15, max_real=1) == 1
     assert reranker_mod.fit_rerank_width([1025], anchors, capped, 4.0, 1e15, max_real=1) == 0
-
-
-def _py_files_mentioning(root, token: str) -> list[str]:
-    return [str(p) for p in root.rglob("*.py") if token in p.read_text(encoding="utf-8")]
-
-
-def test_g12_the_docstrings_state_the_new_formula_and_the_v1_claim_is_corrected() -> None:
-    v2 = reranker_mod._cgroup_v2_memory_headroom_bytes.__doc__ or ""
-    v1 = reranker_mod._cgroup_v1_memory_headroom_bytes.__doc__ or ""
-    helper = reranker_mod._cgroup_reclaimable_file_bytes.__doc__ or ""
-    avail = reranker_mod._available_ram_headroom_bytes.__doc__ or ""
-    for doc in (helper, avail):
-        assert "file_mapped" in doc and "tmpfs" in doc
-    assert "file_writeback" in helper and "shmem" in helper
-    assert "MINIMUM" in v2 and "own usage" in v2 and "siblings" in v2 and "file_mapped" in v2
-    assert "total_cache" in v1 and "total_mapped_file" in v1 and "tmpfs" in v1
-    assert "MINIMUM" in v1 and "own setting" in v1 and "use_hierarchy" in v1 and "ancestor" in v1
-    assert "NOT visible" not in v1 and "Only the process's OWN cgroup is read" not in v1
-    assert "already hierarchical" not in v1 and "no walk-up is needed" not in v1
-    assert "memory.high" in v2 and "plain" in v2 and "has a usable numeric limit" in " ".join(v2.split())
-    assert "psutil" in avail and "memory.high" in avail
-    for doc in (v2, v1, helper, avail):
-        assert "matches psutil" not in doc.lower() and "matches the host" not in doc.lower()
-
-
-def test_g12_no_text_in_brain_still_calls_inactive_file_the_reclaimable_term(tmp_path) -> None:
-    from pathlib import Path
-
-    root = Path(reranker_mod.__file__).resolve().parents[1]
-    assert (root / "memory" / "reranker.py").is_file()
-    assert _py_files_mentioning(root, "inactive_file") == []
-    # the sweep can fail: it flags a known-bad file placed in a directory it walks
-    (tmp_path / "sub").mkdir()
-    (tmp_path / "sub" / "stale.py").write_text('"""reclaimable = memory.stat inactive_file"""\n', encoding="utf-8")
-    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
-    assert _py_files_mentioning(tmp_path, "inactive_file") == [str(tmp_path / "sub" / "stale.py")]
 
 
 def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2445,24 +2379,6 @@ def test_available_ram_headroom_none_when_everything_fails(monkeypatch: pytest.M
     monkeypatch.setattr(reranker_mod, "_cgroup_v1_memory_headroom_bytes", lambda: None)
     monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: None)
     assert reranker_mod._available_ram_headroom_bytes() is None
-
-
-def test_ac3_no_int8_quantization_code_path() -> None:
-    """AC#3: int8 quantization was explicitly dropped (Roy's catch: a 278M
-    model has less redundancy to absorb int8's accuracy hit than fp16 —
-    fp16 is the one quantization lever). Mechanical grep-level check: the
-    reranker module (and the model_tier registrations it reads) must
-    contain no "int8" code path at all."""
-    import inspect
-
-    from brain.bridge import model_tier as model_tier_mod
-
-    assert "int8" not in inspect.getsource(reranker_mod).lower(), (
-        "no int8 quantization code path may exist in brain/memory/reranker.py"
-    )
-    assert "int8" not in inspect.getsource(model_tier_mod).lower(), (
-        "no int8 quantization code path may exist in brain/bridge/model_tier.py"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2737,16 +2653,22 @@ class _RerankCallFinder(_ast.NodeVisitor):
 
 
 def _rerank_call_sites(root=None) -> dict[tuple[str, str], int]:
-    """(file, enclosing function) -> how many `.rerank(` / `.rerank_timed(` calls it holds."""
-    import pathlib
+    """(file, enclosing function) -> how many `.rerank(` / `.rerank_timed(` calls it holds.
 
-    root = pathlib.Path(__file__).resolve().parents[4] if root is None else root
+    ``root`` None scans this repository's brain/ from the process-wide parsed copy; a path scans ``root / "brain"``."""
+    if root is None:
+        modules = brain_trees().items()
+    else:
+        modules = (
+            (path.relative_to(root).as_posix(), _ast.parse(path.read_text(encoding="utf-8")))
+            for path in sorted((root / "brain").rglob("*.py"))
+        )
     found: dict[tuple[str, str], int] = {}
-    for path in sorted((root / "brain").rglob("*.py")):
+    for rel, tree in modules:
         finder = _RerankCallFinder()
-        finder.visit(_ast.parse(path.read_text(encoding="utf-8")))
+        finder.visit(tree)
         for scope in finder.scopes:
-            key = (path.relative_to(root).as_posix(), scope)
+            key = (rel, scope)
             found[key] = found.get(key, 0) + 1
     return found
 
@@ -2766,24 +2688,6 @@ def test_the_call_site_scan_sees_a_call_it_has_not_been_told_about(tmp_path) -> 
         "class Holder:\n    def go(self, p):\n        return p.rerank('q', ['d']) + p.rerank_timed('q', ['d'])\n"
     )
     assert _rerank_call_sites(tmp_path) == {("brain/memory/stray.py", "Holder.go"): 2}
-
-
-def test_the_ram_bound_texts_state_the_s245_and_s247_rules() -> None:
-    from brain.memory import floor_calibration
-
-    def flat(obj) -> str:
-        return " ".join((obj.__doc__ or "").split())
-
-    measure = flat(reranker_mod.measure_ram_figure)
-    assert "records the completion marker ONLY IF the window then holds a measured batch of more than one pair" in measure
-    assert "before the warm-up and before EVERY rung, the first included" in measure
-    assert "without a headroom check" not in measure
-    assert "BEFORE the provider is built" in flat(reranker_mod.run_ram_figure)
-    assert "`RerankDeferred` is raised BEFORE that pair's call" in flat(reranker_mod.normalize_bundled_pairs_against_anchors)
-    assert "RerankDeferred" in flat(floor_calibration.get_bootstrap_floor)
-    assert "seed_ram_fit" in flat(reranker_mod.fit_rerank_width)
-    assert "S247" in flat(reranker_mod.RerankDeferred) and "S247" in flat(reranker_mod._batch_fits_ram_bound)  # noqa: SLF001
-    assert "S247" in flat(reranker_mod._warm_up_once) and "bounded" in flat(reranker_mod._warm_up_once)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

@@ -350,6 +350,10 @@ def offline_load_kwargs(model_id_or_path: str, cache_dir: str | Path | None) -> 
     """The kwargs to splat into a `CrossEncoder(...)` construction at a judge
     load site (S2/S19, inc5) so a cached model makes ZERO Hugging Face
     requests — not merely "no full download", but no HEAD/GET at all (C3a).
+    (Not a model-load request: huggingface_hub 1.30.0 also fetches its own
+    `GET /api/agent-harnesses` when its cached copy is missing or a day old,
+    offline load or not, unless `HF_HUB_OFFLINE` or `HF_HUB_DISABLE_TELEMETRY`
+    is set; C3a's script takes that fetch out of the measured window.)
 
     A LOCAL checkpoint directory (a persona's own tuned judge,
     `judge_full_ft.load_full_scorer` / `judge_full_ft.build_full_ft_retrain_

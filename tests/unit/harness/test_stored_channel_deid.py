@@ -67,6 +67,14 @@ def test_user_logname_synthetic_in_restored_out(
     assert os.environ["USER"] == "realuser"          # restored
     assert "LOGNAME" not in os.environ               # 'was unset' → unset
 
+    # Both set on the host: each is restored exactly (not left as the synthetic value).
+    monkeypatch.setenv("USER", "realdev")
+    monkeypatch.setenv("LOGNAME", "realdev")
+    with sandbox(live_check="off"):
+        assert os.environ["USER"] == os.environ["LOGNAME"] == SYNTHETIC_USER
+    assert os.environ["USER"] == "realdev"
+    assert os.environ["LOGNAME"] == "realdev"
+
 
 # ─────────────────────────── C2 — HOME + cwd teardown symmetry ───────────────────────────
 def test_home_and_cwd_synthetic_in_restored_out(

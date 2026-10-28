@@ -20,8 +20,10 @@ import pytest
 from brain.bridge import daemon, respawn_guard, shutdown, start_backoff, state_file
 from brain.bridge import runner as _runner
 from brain.bridge.shutdown import POLL_S
+from tests.thread_support import finish_threads
 
 SERVICE_ORIGINS = ("systemd", "launchd", "task-scheduler")
+REPO = Path(__file__).resolve().parents[2]  # not the cwd: pytest may run from anywhere
 
 
 real_setup_runtime_logging = _runner._setup_runtime_logging  # captured before any fixture patches it
@@ -89,8 +91,13 @@ def _fake_run(monkeypatch, *, rc: int = 0, on_run=None) -> list[float]:
 # ---- C67 (a): the wait, per origin and per step --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("origin", SERVICE_ORIGINS)
-@pytest.mark.parametrize(("starts", "step"), [(1, 30), (2, 60), (3, 300), (4, 600), (5, 600)])
+# The ladder itself is test_start_backoff.py's; here every service origin waits the first step and one origin each
+# step after it (cmd_run has no per-origin ladder: the per-origin extras are stubbed by the `pd` fixture).
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize(
+    ("origin", "starts", "step"),
+    [(origin, 1, 30) for origin in SERVICE_ORIGINS] + [("systemd", 2, 60), ("systemd", 3, 300), ("systemd", 4, 600)],
+)
 def test_a_service_run_waits_out_the_step_in_poll_slices_then_runs(pd, clock, monkeypatch, origin, starts, step):
     _record(pd, starts, clock)
     ran = _fake_run(monkeypatch)
@@ -100,7 +107,7 @@ def test_a_service_run_waits_out_the_step_in_poll_slices_then_runs(pd, clock, mo
     assert sum(clock.slept) == pytest.approx(step, abs=POLL_S)
 
 
-@pytest.mark.parametrize("origin", SERVICE_ORIGINS)
+@pytest.mark.parametrize("origin", ["systemd"])
 def test_a_service_run_with_no_failures_runs_at_once(pd, clock, monkeypatch, origin):
     ran = _fake_run(monkeypatch)
     assert daemon.cmd_run(_args(origin)) == 0
@@ -251,7 +258,7 @@ def test_after_the_wait_a_held_lock_is_still_waited_for(pd, clock, monkeypatch):
     t.join(timeout=2.0)
     assert t.is_alive() and not ran, "the run did not wait for the lock"
     daemon.release_lock(pd, fd)
-    t.join(timeout=30)
+    finish_threads(t)
     assert not t.is_alive() and ran and result["rc"] == 0
 
 
@@ -424,6 +431,7 @@ def _manager_loop(pd: Path, clock: Clock, monkeypatch, runs: list[dict], restart
     return starts
 
 
+@pytest.mark.slow(reason='2.9 s of CPU in its call phase on a 4-core dev VM, 3.0 s wall (serial run for #540, J12)')
 def test_a_bridge_that_never_starts_is_spaced_on_the_apps_ladder_forever(pd, clock, monkeypatch):
     starts = _manager_loop(pd, clock, monkeypatch, [{"lived": 4}] * 10)
     gaps = [b - a for a, b in zip(starts, starts[1:], strict=False)]
@@ -493,7 +501,7 @@ def test_sigterm_during_the_wait_ends_the_process_at_once_with_nothing_held(tmp_
         f'{{"unproven_starts": 4, "at": {time.time()}}}', encoding="utf-8"
     )  # a 600 s wait
     err = tmp_path / "err.txt"
-    env = dict(os.environ, PYTHONPATH=os.getcwd(), KINDLED_HOME=str(home))
+    env = dict(os.environ, PYTHONPATH=str(REPO), KINDLED_HOME=str(home))
     with err.open("w") as ef:
         p = subprocess.Popen(
             [sys.executable, "-m", "brain.cli", "supervisor", "run", "--persona", "nell", "--client-origin", "systemd",

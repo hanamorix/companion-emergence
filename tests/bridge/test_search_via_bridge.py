@@ -47,6 +47,8 @@ from pathlib import Path
 import psutil
 import pytest
 
+from tests.thread_support import finish_threads
+
 pytestmark = [pytest.mark.requires_models, pytest.mark.integration]
 
 _FIXTURE = (
@@ -125,7 +127,7 @@ class _RssSampler:
     def __exit__(self, *exc) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            finish_threads(self._thread)
 
     @property
     def peak(self) -> int:

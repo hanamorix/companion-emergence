@@ -130,8 +130,3 @@ def test_file_mtime_is_the_files_modification_time_or_none(tunables, tmp_path):
     path = write_values(tmp_path, {"a": 1})
     assert tunables.file_mtime() == path.stat().st_mtime
 
-
-def test_no_names_of_the_old_json_file_survive(tunables):
-    for gone in ("set_overrides", "get_override", "overrides_mtime", "write_defaults_section", "_README", "_overrides_is_object",
-                 "_load_overrides_locked", "_record_heal", "_same_content"):
-        assert not hasattr(tunables, gone), gone

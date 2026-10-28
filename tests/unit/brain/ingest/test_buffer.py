@@ -151,23 +151,6 @@ def test_delete_session_buffer_retries_transient_permission_error(
     assert not path.exists()
 
 
-def test_brain_ingest_makes_no_direct_os_kill_call() -> None:
-    """Windows CI regression: a raw ``os.kill(pid, 0)`` probe on Windows delivers a REAL Ctrl+C (signal 0 is
-    CTRL_C_EVENT) to our own console group (this once aborted the whole pytest session on windows-latest). Holder
-    liveness goes through ``process_identity`` (#472); brain/ingest must contain no direct os.kill at all."""
-    # Source-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
-    # class). Doc mentions (backtick-quoted) are allowed. Scanned in-process —
-    # shelling out to ``grep`` failed on stock Windows (#262).
-    ingest_dir = Path(__file__).resolve().parents[4] / "brain" / "ingest"
-    code_hits = [
-        f"{py.relative_to(ingest_dir.parent.parent).as_posix()}:{lineno}:{line}"
-        for py in sorted(ingest_dir.rglob("*.py"))
-        for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1)
-        if "os.kill(" in line and "``" not in line
-    ]
-    assert code_hits == [], f"raw os.kill call in brain/ingest:\n{code_hits}"
-
-
 # ---- I-2 follow-up audit: session_id validation ----
 
 

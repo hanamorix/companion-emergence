@@ -130,6 +130,7 @@ def test_logs_once_per_transition(monkeypatch, caplog):
 
 
 # C7 — executed interleaving under one lock
+@pytest.mark.slow(reason='2.8 s of CPU in its call phase on a 4-core dev VM, 3.6 s wall (serial run for #540, J12)')
 def test_threaded_interleaving_keeps_state_consistent(monkeypatch):
     _clock(monkeypatch)
     errors: list[BaseException] = []

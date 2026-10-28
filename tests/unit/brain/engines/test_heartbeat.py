@@ -349,14 +349,6 @@ def test_heartbeat_engine_construction(tmp_path: Path) -> None:
     hebbian.close()
 
 
-def test_heartbeat_config_load_invalid_json_returns_defaults(tmp_path: Path) -> None:
-    """Malformed JSON in config → defaults, no crash."""
-    path = tmp_path / "cfg.json"
-    path.write_text("not json at all {[}")
-    c = HeartbeatConfig.load(path)
-    assert c.dream_every_hours == 24.0
-
-
 def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path) -> None:
     """Hand-edited config with wrong-type values (dream_every_hours={} etc.)
     must NOT crash the CLI with TypeError. Graceful degrade to defaults.
@@ -365,15 +357,6 @@ def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path)
     path.write_text(json.dumps({"dream_every_hours": {}}))
     c = HeartbeatConfig.load(path)
     assert c.dream_every_hours == 24.0
-
-
-def test_heartbeat_state_load_corrupt_returns_none(tmp_path: Path) -> None:
-    """A corrupt state file returns None (→ engine treats as first-ever tick
-    and reinitialises) rather than crashing with a traceback.
-    """
-    path = tmp_path / "state.json"
-    path.write_text("not json")
-    assert HeartbeatState.load(path) is None
 
 
 def test_heartbeat_state_load_missing_keys_returns_none(tmp_path: Path) -> None:
@@ -1726,8 +1709,9 @@ def test_heartbeat_config_load_corrupt_file_restores_from_bak(tmp_path: Path) ->
     assert "bak1" in anomaly.action
 
 
-def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
-    """Corrupt heartbeat_state.json → None returned + quarantine file present."""
+def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path, caplog) -> None:
+    """Corrupt heartbeat_state.json → None returned + quarantine file present; the public `load` returns None
+    too and logs the anomaly."""
     path = tmp_path / "heartbeat_state.json"
     path.write_text("{corrupt json{{", encoding="utf-8")
 
@@ -1738,6 +1722,13 @@ def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path
     assert anomaly.kind == "json_parse_error"
     corrupt_files = list(tmp_path.glob("heartbeat_state.json.corrupt-*"))
     assert len(corrupt_files) == 1
+
+    public = tmp_path / "public" / "heartbeat_state.json"
+    public.parent.mkdir()
+    public.write_text("not json", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert HeartbeatState.load(public) is None
+    assert any("HeartbeatState anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_heartbeat_state_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
@@ -2443,6 +2434,9 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         "brain.engines.heartbeat.build_tier_provider",
         lambda persona_dir, tier: provider,
     )
+    # The completion-candidate step builds its own classifier-tier provider (topic overlap); without this it starts the
+    # real claude CLI on a machine that has it (the CI guard, tests/claude_spawn_guard.py, caught it).
+    monkeypatch.setattr("brain.engines.research.build_tier_provider", lambda persona_dir, tier: FakeProvider())
 
     # On-disk so store.persona_dir == tmp_path (== interests_path.parent, the
     # heartbeat's persona_dir): the gated "research" candidate lands in that

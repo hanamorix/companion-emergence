@@ -1,7 +1,7 @@
 """Tests for the attunement pass-2 spawn from tool_loop.
 
 Verifies:
-- Spawns a daemon thread with a unique, identifiable name
+- Pass-2 work is queued (one item per spawn) for the central cadence to drain
 - Skip-list shortcuts (empty buffer, short message) honoured
 - Budget cap-reached defers without spawning
 - Errors isolated to attunement_errors.jsonl (don't crash main reply path)
@@ -11,14 +11,16 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from brain.attunement.store import BufferTurn
 from brain.chat.tool_loop import _spawn_pass2_attunement
+from tests.thread_support import finish_threads
 
 
-def _wait_for_attunement_threads(persona_dir, timeout: float = 5.0) -> None:
-    # Pass-2 now flows through the in-process pass2_queue (single worker, #27),
-    # not a per-turn daemon thread. Drain it synchronously (cli_throttle idle in
-    # tests via conftest). Kept the name so callers are unchanged.
+def _drain_pass2_queue(persona_dir) -> None:
+    # Pass-2 work is saved in the persisted pass2_queue (no worker thread, #27);
+    # drain it synchronously (cli_throttle is idle in tests via conftest).
     from brain.bridge import cli_throttle
     from brain.chat import pass2_queue
 
@@ -35,8 +37,25 @@ def test_spawn_skips_when_buffer_empty(tmp_path: Path):
             reply_text="hi",
             buffer_slice=[],
         )
-        _wait_for_attunement_threads(tmp_path)
+        _drain_pass2_queue(tmp_path)
         mock_detector.assert_not_called()
+
+
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize(("message", "queued"), [("yes that is fine", 0), ("yes that is totally fine", 1)])
+def test_the_spawn_gate_is_five_words(tmp_path: Path, message: str, queued: int):
+    """The call site honours the five-word default (the boundary rule itself is in test_detector_skip_list.py):
+    a 4-word message queues no pass-2 item, a 5-word message queues one. Nothing drains the queue here."""
+    from brain.chat import pass2_queue
+
+    _spawn_pass2_attunement(
+        tmp_path,
+        turn_id="t1",
+        user_message=message,
+        reply_text="ok",
+        buffer_slice=[BufferTurn(id="t1", content=message)],
+    )
+    assert pass2_queue._queue_size(tmp_path) == queued
 
 
 def test_spawn_defers_when_budget_exhausted(tmp_path: Path):
@@ -50,7 +69,7 @@ def test_spawn_defers_when_budget_exhausted(tmp_path: Path):
             reply_text="Tell me about it.",
             buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
         )
-        _wait_for_attunement_threads(tmp_path)
+        _drain_pass2_queue(tmp_path)
         mock_detector.assert_not_called()
 
 
@@ -63,7 +82,7 @@ def test_detector_exception_logged_to_errors_jsonl(tmp_path: Path):
             reply_text="Tell me about it.",
             buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
         )
-        _wait_for_attunement_threads(tmp_path)
+        _drain_pass2_queue(tmp_path)
     errors_path = tmp_path / "attunement_errors.jsonl"
     assert errors_path.exists()
     assert "boom" in errors_path.read_text()
@@ -114,7 +133,7 @@ def test_spawn_skips_when_message_too_short(tmp_path: Path):
             reply_text="ok",
             buffer_slice=[BufferTurn(id="t1", content="ok")],
         )
-        _wait_for_attunement_threads(tmp_path)
+        _drain_pass2_queue(tmp_path)
         mock_detector.assert_not_called()
 
 
@@ -174,16 +193,18 @@ def test_pass2_threads_user_name_from_persona_config(tmp_path: Path):
             reply_text="Tell me about it.",
             buffer_slice=[BufferTurn(id="t1", content="I had a long day today, love.")],
         )
-        _wait_for_attunement_threads(tmp_path)
+        _drain_pass2_queue(tmp_path)
     assert mock_detector.call_args.kwargs["user_name"] == "Alex"
 
 
 def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: Path):
     """Pre-merge review O-7: the budget is checked before the call and charged after it (D24), so the check and the
     charge must be one critical section: two callers with one call left must not both pass the check. The first
-    detector call waits (up to 2 s) for a second caller to reach its own call; with the lock, the second waits at the
-    check instead and then finds the day's budget spent."""
+    detector call waits (up to 5 s) until a second caller has arrived at the budget lock; with the lock, the second
+    waits there instead and then finds the day's budget spent. Without the lock around check and charge nobody ever
+    arrives at it, the second caller reaches the detector too, and the test fails."""
     import threading
+    from contextlib import contextmanager
     from datetime import UTC, datetime
 
     from brain.attunement import budget
@@ -193,6 +214,7 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
         CurrentRead,
         DetectorOutput,
     )
+    from brain.chat import tool_loop
     from brain.chat.tool_loop import _run_attunement_pass2
 
     now = datetime.now(UTC)
@@ -206,17 +228,22 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
         predicted_arc_shape="steady", schema_version=SCHEMA_VERSION,
     )
     calls: list[int] = []
-    second_entered = threading.Event()
-    lock = threading.Lock()
+    arrivals: list[int] = []
+    second_arrived = threading.Event()
+    real_lock = tool_loop._attunement_budget_lock
+
+    @contextmanager
+    def tracked_lock(persona_dir):
+        arrivals.append(1)
+        if len(arrivals) >= 2:
+            second_arrived.set()
+        with real_lock(persona_dir):
+            yield
 
     def detector(**_kw):
-        with lock:
-            calls.append(1)
-            n = len(calls)
-        if n == 1:
-            second_entered.wait(timeout=2.0)
-        else:
-            second_entered.set()
+        calls.append(1)
+        if len(calls) == 1:
+            second_arrived.wait(timeout=5.0)  # bounded on purpose: with the lock removed (the regression) nobody ever sets it
         return DetectorOutput(current_read=fake_read, pattern_candidates=[], addressed_pattern_ids=[])
 
     def run():
@@ -227,6 +254,7 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
 
     with (
         patch("brain.chat.tool_loop.run_detector", side_effect=detector),
+        patch("brain.chat.tool_loop._attunement_budget_lock", tracked_lock),
         patch("brain.chat.tool_loop.merge_into_learned"),
         patch("brain.chat.tool_loop.write_current_read"),
         patch("brain.chat.tool_loop.check_crystallisations"),
@@ -236,6 +264,6 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            finish_threads(t)
     assert len(calls) == 1
     assert budget._load(tmp_path)["count"] == DAILY_BUDGET_DEFAULT

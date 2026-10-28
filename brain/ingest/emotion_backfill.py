@@ -53,8 +53,6 @@ _INTER_CALL_DELAY_S = 1.5
 
 _SCHEMA_VERSION = "v1"
 
-_BACKFILL_TIMEOUT_SECONDS = 60
-
 
 # ---------------------------------------------------------------------------
 # State dataclass
@@ -177,18 +175,12 @@ _TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backf
 def _make_default_tagger(provider: LLMProvider | None, persona_dir: Path | None = None) -> Callable:
     """Return a tagger closure that calls ``provider.generate`` for each memory.
 
-    When ``provider`` is None, constructs a ``ClaudeCliProvider`` for the
-    background-classifier job (the model its setting in tunables.toml names), mirroring the
-    ``_call_haiku`` pattern in ``brain/attunement/detector.py``.
+    ``provider`` is required: the supervisor builds it for the background-classifier job. A None provider
+    raises here rather than failing later inside the tagger, whose ``except`` would turn it into an empty tag
+    for every memory.
     """
     if provider is None:
-        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
-        from brain.bridge.provider import ClaudeCliProvider
-
-        provider = ClaudeCliProvider(
-            TIER_BACKGROUND_CLASSIFIER,
-            timeout_seconds=_BACKFILL_TIMEOUT_SECONDS,
-        )
+        raise ValueError("emotion backfill needs a tagger_fn or a provider")
 
     def _tagger(memory) -> dict[str, float]:  # noqa: ANN001
         try:
@@ -336,8 +328,8 @@ def run_emotion_backfill(
       the one-shot idempotency flag having healed nothing).
 
     ``tagger_fn`` takes priority over ``provider``.  When ``tagger_fn`` is None
-    the default Haiku tagger is used; ``provider`` (if given) is passed to it so
-    tests can inject a stub without shelling out to the Claude CLI.
+    the default tagger is built on ``provider`` (the supervisor's classifier-tier provider; tests inject a stub so
+    nothing shells out to the Claude CLI); with neither given the call raises ``ValueError``.
 
     ``should_pause`` (ram-spike-fix INC-10, S14/S41/S65): checked between
     memories, same as the yield-gate always was; defaults to a bare

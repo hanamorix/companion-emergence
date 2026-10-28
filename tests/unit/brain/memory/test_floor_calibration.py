@@ -7,7 +7,7 @@ smoothing and bootstrap-CI stability gate that used to sit on top of the
 raw fit, and re-points the daily fit from the full multi-day retention pool
 to a single day (the most recently completed one). This file's coverage
 was rewritten accordingly: `ema_update`/`stability_gate_accepts`/
-`_bootstrap_ci` no longer exist (see the dead-code test below), and
+`_bootstrap_ci` no longer exist (listed in tests/unit/test_removed_names_stay_removed.py), and
 `derive_and_persist_floor`'s own cold-start branch (bundled-pair fit,
 unconditionally persisted) is gone, replaced by a data-starvation backstop.
 `get_bootstrap_floor` (the SEPARATE, still-standing rerank bootstrap, now computed at process start) and
@@ -29,8 +29,6 @@ import pytest
 from brain.memory.floor_calibration import (
     FLOOR_FIT_BETA,
     FLOOR_FIT_MIN_LABELED_PAIRS,
-    FLOOR_RETENTION_SAFETY_BUFFER_DAYS,
-    RETENTION_WINDOW_DAYS_DEFAULT,
     derive_and_persist_floor,
     derive_retention_window_days,
     fit_threshold_fbeta,
@@ -218,64 +216,6 @@ def test_derive_retention_window_days_never_collapses_below_two_days() -> None:
     against the registered tunable's own (non-negative) default, not just
     a hand-picked safe input."""
     assert derive_retention_window_days() >= 2.0
-
-
-def test_derive_retention_window_days_default_is_live_not_a_re_hardcoded_14() -> None:
-    """This must be a computed value tied to the registered tunables
-    (traceable back to `derive_retention_window_days()`'s own formula), not
-    a re-typed magic number (neither the old 14.0 placeholder nor a new
-    hardcoded replacement). Changing the buffer input changes the output —
-    proof it is a live derivation."""
-    assert RETENTION_WINDOW_DAYS_DEFAULT == derive_retention_window_days()
-    changed = derive_retention_window_days(safety_buffer_days=FLOOR_RETENTION_SAFETY_BUFFER_DAYS + 10.0)
-    assert changed != RETENTION_WINDOW_DAYS_DEFAULT
-    assert RETENTION_WINDOW_DAYS_DEFAULT != 14.0
-
-
-def test_retention_window_derivation_decoupled_from_removed_ema_symbols() -> None:
-    """I3/I7 coupling note (Change 1's Open Reconfirmation G): the old
-    formula's inputs (`FLOOR_FIT_MIN_LABELED_PAIRS`'s worst-case daily
-    yield, `FLOOR_EMA_WINDOW_DAYS`) no longer feed this derivation at all —
-    `derive_retention_window_days` takes only `safety_buffer_days` now."""
-    import inspect
-
-    sig = inspect.signature(derive_retention_window_days)
-    assert list(sig.parameters) == ["safety_buffer_days"]
-
-
-# ---------------------------------------------------------------------------
-# Dead code (acceptance criterion 6): the EMA layer, the bootstrap-CI
-# stability gate, and their now-unused constants must be genuinely GONE
-# from the module, not merely unused.
-# ---------------------------------------------------------------------------
-
-
-def test_ema_and_stability_gate_symbols_no_longer_exist() -> None:
-    from brain.memory import floor_calibration as fc_mod
-
-    for removed_symbol in (
-        "ema_update",
-        "stability_gate_accepts",
-        "_bootstrap_ci",
-        "FLOOR_EMA_WINDOW_DAYS",
-        "FLOOR_STABILITY_CI",
-        "FLOOR_STABILITY_BOOTSTRAP_ITERATIONS",
-        "_worst_case_daily_labeled_pairs",
-    ):
-        assert not hasattr(fc_mod, removed_symbol), (
-            f"{removed_symbol} must be removed entirely (Change 1), not just unused"
-        )
-
-
-def test_derive_and_persist_floor_no_longer_takes_provider_or_rng() -> None:
-    """The removed cold-start branch was the only thing here that ever
-    needed a live reranker provider; the removed stability gate was the
-    only thing that ever needed a bootstrap RNG. Neither parameter should
-    exist on the signature anymore."""
-    import inspect
-
-    sig = inspect.signature(derive_and_persist_floor)
-    assert list(sig.parameters) == ["store", "reranker_model_id"]
 
 
 # ---------------------------------------------------------------------------

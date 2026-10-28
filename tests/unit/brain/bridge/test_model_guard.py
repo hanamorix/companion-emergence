@@ -23,20 +23,18 @@ G5  key ownership (no ``model.`` key literal outside ``model_tier.py``; only ``s
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+from tests.source_tree import brain_sources
+
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_BRAIN_ROOT = _REPO_ROOT / "brain"
 _APP_SRC = _REPO_ROOT / "app" / "src"
 _APP_RUST = _REPO_ROOT / "app" / "src-tauri" / "src"
-
-
-def _iter_brain_py_files():
-    yield from sorted(_BRAIN_ROOT.rglob("*.py"))
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +102,7 @@ class Parsed:
     aliases: dict[str, str]
 
 
+@functools.lru_cache(maxsize=1)  # the five checks of one file run back to back: parse each file once (#540)
 def _parse(source: str) -> Parsed:
     tree = ast.parse(source)
     parents: dict[int, ast.AST] = {}
@@ -500,28 +499,36 @@ def check_all(source: str, relpath: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _rel(path: Path) -> str:
-    return path.relative_to(_BRAIN_ROOT).as_posix()
+@functools.cache
+def _scan_brain() -> tuple[tuple[str, ...], frozenset[tuple[str, str, str]]]:
+    """G1-G5 over every file of brain/ (paths relative to brain/): the offenders, and the allow-list entries that matched.
 
-
-def test_no_model_choice_outside_the_accessor_anywhere_in_brain() -> None:
-    """C16: G1-G5 pass on the final tree, provider.py included."""
+    Both tests below read it, so the tree is scanned once per process."""
     offenders: list[str] = []
     used: set[tuple[str, str, str]] = set()
-    for path in _iter_brain_py_files():
-        rel = _rel(path)
-        source = path.read_text(encoding="utf-8")
+    for full, source in brain_sources().items():
+        rel = full.removeprefix("brain/")
         offenders += check_g1(source, rel, used=used)
         for check in (check_g2, check_g3, check_g4, check_g5):
             offenders += check(source, rel)
-    assert offenders == [], "model choice outside the tunables accessor:\n" + "\n".join(offenders)
+    return tuple(offenders), frozenset(used)
 
 
-def test_every_allow_list_entry_still_matches_something_at_its_shape() -> None:
+@pytest.fixture(scope="module")
+def scanned() -> tuple[tuple[str, ...], frozenset[tuple[str, str, str]]]:
+    """The scan of the real tree, done in setup: it costs seconds of CPU, which belongs to neither test."""
+    return _scan_brain()
+
+
+def test_no_model_choice_outside_the_accessor_anywhere_in_brain(scanned) -> None:
+    """C16: G1-G5 pass on the final tree, provider.py included."""
+    offenders, _used = scanned
+    assert not offenders, "model choice outside the tunables accessor:\n" + "\n".join(offenders)
+
+
+def test_every_allow_list_entry_still_matches_something_at_its_shape(scanned) -> None:
     """C19: allow-lists cannot rot. An entry that matches nothing at its shape fails (delete it)."""
-    used: set[tuple[str, str, str]] = set()
-    for path in _iter_brain_py_files():
-        check_g1(path.read_text(encoding="utf-8"), _rel(path), used=used)
+    _offenders, used = scanned
     unused = [e for e in G1_ALLOW if e not in used]
     assert unused == [], f"stale allow-list entries (no match at their shape): {unused}"
 

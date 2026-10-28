@@ -19,13 +19,9 @@ def test_record_monologue_schema_built():
     assert params["properties"]["monologue"]["type"] == "string"
     assert params["properties"]["monologue"]["maxLength"] == 3000
     assert params["properties"]["feed_digest"]["maxLength"] == 400
-
-
-def test_record_monologue_description_mentions_tool_purpose():
-    from brain.tools.schemas import build_schemas
-    s = build_schemas("Nell")["record_monologue"]
-    desc = s["description"].lower()
-    assert any(token in desc for token in ("monologue", "thought", "drift"))
+    # `surface` is an optional boolean (it defaults to true at the handler): a property, not in `required`
+    assert params["properties"]["surface"]["type"] == "boolean"
+    assert "surface" not in params["required"]
 
 
 def test_record_monologue_description_includes_persona_name():

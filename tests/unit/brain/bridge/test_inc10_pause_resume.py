@@ -19,11 +19,14 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
+
 # brain.chat.rollover binds cascade_conversation when it is first imported. Import it here, before any test patches
 # brain.chat.compaction.cascade_conversation, or the first import happens under the patch and the fake stays bound
 # there for the rest of the process (it broke test_cascade_rollover_endpoints when this file ran first).
 import brain.chat.rollover  # noqa: F401
 from brain.bridge import job_progress
+from tests.thread_support import finish_threads
 
 
 def _persona(tmp_path: Path) -> Path:
@@ -86,8 +89,8 @@ def test_c31_save_progress_is_atomic_temp_rename(tmp_path: Path) -> None:
     t1, t2 = threading.Thread(target=_writer), threading.Thread(target=_reader)
     t1.start()
     t2.start()
-    t1.join(timeout=10)
-    t2.join(timeout=10)
+    finish_threads(t1)
+    finish_threads(t2)
     assert all("last_id" in d for d in seen), "every read must be a complete, valid JSON object"
 
 
@@ -216,7 +219,9 @@ def test_c8_emotion_backfill_pauses_between_memories_and_resumes(tmp_path: Path)
     store.close()
 
 
-def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(tmp_path: Path) -> None:
+def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A systematic tagger failure (processed candidates, tagged none) sets
     status='running' too, but for an UNRELATED reason -- supervisor.py's
     _emotion_backfill_job must only report JobOutcome.PAUSED for a REAL
@@ -224,12 +229,16 @@ def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(tmp_pa
     the whole S55 sequence for a tagger bug, not a chat-idle event) -- see
     test_supervisor.py::test_supervisor_tick_embeds_backlogged_memory for
     the end-to-end proof this exact confusion broke."""
+    from brain.bridge import supervisor
     from brain.bridge.central_cadence import JobOutcome
     from brain.bridge.events import EventBus
     from brain.bridge.provider import FakeProvider
     from brain.bridge.supervisor import _build_gated_jobs
     from brain.memory.store import Memory, MemoryStore
 
+    # The job builds its own classifier-tier provider: without this it starts the real claude CLI (and spends tokens) on a
+    # machine that has it, which is what the CI guard (tests/claude_spawn_guard.py) caught.
+    monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
     persona_dir = _persona(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     m = Memory.create_new(content="a memory long enough to tag", memory_type="conversation", domain="us")
@@ -270,6 +279,7 @@ def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(tmp_pa
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.0 s of CPU in its call phase on a 4-core dev VM, 2.1 s wall (serial run for #540, J12)')
 def test_c8_calibration_pauses_between_rows_releases_judge_resumes(tmp_path: Path) -> None:
     from brain.bridge.provider import FakeProvider
     from brain.bridge.supervisor import _run_calibration_tick

@@ -1,11 +1,9 @@
-"""Tests for the calibration_cadence.json persisted-cadence wiring (F2a #250
+"""Tests for the calibration tick and its persisted-cadence wiring (F2a #250
 inc5, spec Section 5).
 
-Mirrors test_compaction_cadence.py's coverage for the 4th sibling cadence:
-  - calibration_cadence.json is created and advances after a tick fires.
-  - is_due fires when the cadence is past its next_at (86400s interval).
-  - _run_calibration_tick is importable and has the expected signature.
-  - run_folded accepts calibration_interval_s as a keyword argument.
+  - run_folded takes calibration_interval_s and compaction_interval_s, each defaulting to a day.
+  (The cadence file itself, "last ran now" on a missing file, due-ness at the interval and the save/load round trip
+  are held by test_central_cadence.py and test_persisted_cadence.py, which every gated job shares.)
 
 Plus the acceptance-5b retention-pruning test: after simulating logs spanning
 more than the retention window, the tick prunes old rows while rows inside
@@ -17,81 +15,19 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.bridge import persisted_cadence as pc
+import pytest
 
 
-def test_run_calibration_tick_importable_and_callable():
-    from brain.bridge.supervisor import _run_calibration_tick
-
-    sig = inspect.signature(_run_calibration_tick)
-    params = list(sig.parameters)
-    # inc6 (#250 §6) adds the judge-labeling pass: `provider` (the Haiku
-    # tie-break's generation provider — None means "build one via
-    # build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER) inside
-    # this function", mirroring consolidation.run_consolidation's per-call
-    # construction) and `judge` (test-injection point for a
-    # RelevanceJudgeProvider — None means "build the real torch judge
-    # lazily"). Both keyword-only, both defaulted, so every existing
-    # zero-arg call site (run_folded's startup catch-up + periodic fire)
-    # keeps working unmodified.
-    # INC-10 (ram-spike-fix): adds keyword-only `should_pause` (the
-    # between-items pause hook, default None => never pauses — every
-    # existing zero-arg call site keeps working unmodified).
-    assert params == ["persona_dir", "is_session_busy", "provider", "judge", "should_pause"], (
-        f"expected (persona_dir, *, is_session_busy, provider, judge, should_pause), got {params}"
-    )
-    busy = sig.parameters["is_session_busy"]
-    assert busy.kind is inspect.Parameter.KEYWORD_ONLY
-    assert busy.default is None
-    provider_param = sig.parameters["provider"]
-    assert provider_param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert provider_param.default is None
-    judge_param = sig.parameters["judge"]
-    assert judge_param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert judge_param.default is None
-
-
-def test_calibration_cadence_missing_is_created_as_last_ran_now():
-    """ram-spike-fix INC-9 (S22/S69): calibration is a gated job, so a missing
-    cadence file is created as "last ran now" (next_at = now + interval) and
-    the job is NOT due — it first runs one full interval later."""
-    with tempfile.TemporaryDirectory() as d:
-        pd = Path(d)
-        now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state, created = pc.load_or_init_cadence(
-            pd, "calibration_cadence.json", now=now, interval_s=86400.0
-        )
-        assert created is True
-        assert state.next_at == now + timedelta(seconds=86400.0)
-        assert pc.is_due(state, now=now) is False
-        assert pc.load_cadence(pd, "calibration_cadence.json").next_at == state.next_at
-
-
-def test_calibration_cadence_not_due_after_advance_and_fires_at_86400():
-    now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-    state = pc.advance(now=now, interval_s=86400.0)
-    assert pc.is_due(state, now=now) is False
-    assert pc.is_due(state, now=now + timedelta(seconds=86400)) is True
-
-
-def test_calibration_cadence_save_load_round_trip():
-    with tempfile.TemporaryDirectory() as d:
-        pd = Path(d)
-        now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state = pc.advance(now=now, interval_s=86400.0)
-        pc.save_cadence(pd, "calibration_cadence.json", state)
-        loaded = pc.load_cadence(pd, "calibration_cadence.json")
-        assert loaded.next_at == state.next_at
-        assert not list(pd.glob("*.tmp")), "atomic write must leave no .tmp"
-
-
-def test_run_folded_accepts_calibration_interval_s():
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize("parameter", ["calibration_interval_s", "compaction_interval_s"])
+def test_run_folded_defaults_the_calibration_and_compaction_intervals_to_a_day(parameter):
     from brain.bridge.supervisor import run_folded
 
     sig = inspect.signature(run_folded)
-    assert "calibration_interval_s" in sig.parameters
-    param = sig.parameters["calibration_interval_s"]
-    assert param.default == 86400.0, f"expected default 86400.0, got {param.default!r}"
+    assert parameter in sig.parameters
+    assert sig.parameters[parameter].default == 86400.0, (
+        f"expected default 86400.0, got {sig.parameters[parameter].default!r}"
+    )
 
 
 def test_calibration_tick_skips_entirely_when_a_session_is_busy():
@@ -122,6 +58,7 @@ def test_calibration_tick_skips_entirely_when_a_session_is_busy():
         )
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on ubuntu in CI (wall 1.0 s); #540, J12')
 def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
     """Acceptance 5b: after simulating calibration_log rows spanning more than
     the retention window (many synthetic day_buckets), the daily tick prunes
@@ -181,6 +118,7 @@ def test_calibration_tick_prunes_old_rows_keeps_recent_rows_within_window():
         assert all(b >= cutoff for b in remaining_buckets)
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.4 s); #540, J12')
 def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committed(
     monkeypatch,
 ):
@@ -256,6 +194,7 @@ def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committ
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.5 s); #540, J12')
 def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkeypatch):
     """The tick must derive a floor for the CURRENT production reranker's
     model_id (`resolve_reranker_model_id()`), not a stale or
@@ -289,6 +228,7 @@ def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkey
         )
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.5 s); #540, J12')
 def test_calibration_tick_floor_derivation_failure_does_not_crash_the_tick(monkeypatch):
     """Spec Section 5/6's 'must not crash the tick or the bridge' fault-
     isolation posture extends to inc7's floor-derivation step too — wrapped

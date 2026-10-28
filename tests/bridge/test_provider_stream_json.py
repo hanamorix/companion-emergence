@@ -19,6 +19,7 @@ frames are ignored — content_block_delta is the source of incremental text.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -179,17 +180,16 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     """If no stdout line arrives within the per-event budget, surface idle_timeout."""
     provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
 
-    # An iterator that hangs forever — the reader thread will block in
-    # stdout.readline, so the consumer-side queue.get will time out first.
+    # An iterator that hangs until the child is stopped (a real child closes its pipe when it dies): the reader thread
+    # blocks in stdout.readline, so the consumer-side queue.get will time out first.
+    closed = threading.Event()
+
     class _SlowStdout:
         def __iter__(self):
             return self
 
         def __next__(self):
-            # Block long enough that the idle-timeout fires.
-            import time
-
-            time.sleep(5)
+            closed.wait(5)  # long enough that the idle-timeout fires; ends at once when terminate/kill is called
             raise StopIteration
 
     proc = MagicMock()
@@ -198,8 +198,8 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     proc.poll.return_value = None
     proc.wait.return_value = 0
     proc.returncode = 0
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
+    proc.terminate = MagicMock(side_effect=closed.set)
+    proc.kill = MagicMock(side_effect=closed.set)
     proc.stderr = MagicMock()
     proc.stderr.read.return_value = ""
 
@@ -207,8 +207,11 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
 
-    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
-        events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    try:
+        with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+            events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    finally:
+        closed.set()
     errs = [e for e in events if isinstance(e, StreamError)]
     assert len(errs) == 1
     assert errs[0].stage == "claude_cli_idle_timeout"
@@ -316,11 +319,12 @@ def _assistant_tool_use_line(tool_name: str) -> str:
 
 
 class _StallAfter:
-    """Yield the given lines, then block forever so the idle watchdog fires."""
+    """Yield the given lines, then block (until ``closed`` is set, at most 5 s) so the idle watchdog fires."""
 
-    def __init__(self, lines):
+    def __init__(self, lines, closed):
         self._lines = list(lines)
         self._i = 0
+        self._closed = closed
 
     def __iter__(self):
         return self
@@ -330,21 +334,22 @@ class _StallAfter:
             line = self._lines[self._i]
             self._i += 1
             return line
-        import time as _t
-
-        _t.sleep(5)
+        self._closed.wait(5)
         raise StopIteration
 
 
 def _stall_proc(lines):
+    """A fake child whose stdout stalls after ``lines``. A real child that is stopped closes its pipe, so terminate()
+    and kill() release the stalled read: the stream's cleanup does not wait out a reader that nothing will wake."""
+    closed = threading.Event()
     proc = MagicMock()
-    proc.stdout = _StallAfter(lines)
+    proc.stdout = _StallAfter(lines, closed)
     proc.stdin = MagicMock()
     proc.poll.return_value = None
     proc.wait.return_value = 0
     proc.returncode = 0
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
+    proc.terminate = MagicMock(side_effect=closed.set)
+    proc.kill = MagicMock(side_effect=closed.set)
     proc.stderr = MagicMock()
     proc.stderr.read.return_value = ""
     return proc
@@ -477,6 +482,8 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
     emits the result line then holds stdout open briefly before EOF."""
     provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
 
+    released = threading.Event()
+
     class _ResultThenHang:
         def __init__(self):
             self._sent = False
@@ -488,10 +495,8 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
             if not self._sent:
                 self._sent = True
                 return _result_line("done")
-            # Hold the pipe open past the (shrunk) idle budget before EOF.
-            import time
-
-            time.sleep(1.0)
+            # Hold the pipe open past the (shrunk, 0.1 s) idle budget before EOF.
+            released.wait(0.4)
             raise StopIteration
 
     proc = MagicMock()
@@ -508,8 +513,11 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
 
-    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
-        events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    try:
+        with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+            events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    finally:
+        released.set()
 
     dones = [e for e in events if isinstance(e, StreamDone)]
     errs = [e for e in events if isinstance(e, StreamError)]
