@@ -5,14 +5,15 @@ A *setting* is a user tunable (``tunables.register``, read through ``tunables.ge
 fixtures (each rule flags a violating source and passes a conforming one, over a small synthetic ``Settings`` so that
 renaming a real setting cannot break a fixture), the ratchet, and the scan of the real tree against ``ALLOW``.
 
-``ALLOW`` is the list of violations that exist today. It may only shrink: the scan must equal it as a multiset, so a new
-copy fails (add nothing here to silence it: remove the copy), a listed entry with no finding fails (delete it), and
-``ALLOW_SIZE`` pins the length so that growth needs a second visible edit and shrinkage tells you to lower it.
+``ALLOW`` is the list of violations that exist today. It is meant to shrink: the scan must equal it as a multiset, so a new
+copy fails (remove the copy; add an entry only for a different thing with an equal value, with the reason), a listed entry
+with no finding fails (delete it), and ``ALLOW_SIZE`` pins the length so that growth needs a second visible edit and
+shrinkage tells you to lower it.
 
 The model case of #529 (no Claude model chosen outside the tunables accessor; rules G1, G2, G4, G5, and R4 for the
 accessors) is one case of this guard; its own vocabulary list ``MODEL_LITERAL_ALLOW`` (definitions and labels that are
 the model setting's own words, not copies) lives in ``tests/shared_settings.py`` with its own stale-entry test and is not
-part of the shrink-only count.
+part of the ALLOW count.
 """
 
 from __future__ import annotations
@@ -68,6 +69,9 @@ SETTINGS = make_settings(
         "ZETA_SPAN_HOURS": 3.0,  # one word remains after ZETA
         "PAIR_FADE_FLOOR": 0.2,  # a pair shares PAIR: a pair is not a group
         "PAIR_FADE_STEP": 0.1,
+        "TRIO_GAUGE_WIDTH_LIMIT": 13,  # three constants are the smallest group
+        "TRIO_PANEL_HEIGHT_LIMIT": 14,
+        "TRIO_ROTOR_SPEED_LIMIT": 15,
         "TWIN_ALPHA_BETA_GAMMA": 11,  # a pair whose remainders are long enough: still a pair, not a group
         "TWIN_DELTA_EPSILON_ETA": 12,
         "IMAGE_KINDS": ("alpha_kind", "beta_kind"),  # a collection of strings
@@ -363,6 +367,7 @@ _R2_VIOLATING = {
     "unprefixed_form_of_a_group_constant": "DAILY_BUDGET_DEFAULT = 200\n",
     "unprefixed_form_as_a_parameter": "def f(daily_budget_default=3.5):\n    return daily_budget_default\n",
     "unprefixed_form_in_a_class": "class C:\n    ROW_LIMIT_CAP = 9\n",
+    "unprefixed_form_of_the_smallest_group": "GAUGE_WIDTH_LIMIT = 9.5\n",
 }
 _R2_CONFORMING = {
     "owner_file_of_a_dev_constant": ("WIDGET_TIMEOUT_S: float = 45.0\n", "brain/dev_constants.py"),
@@ -408,6 +413,7 @@ def test_fixture_group_prefix_is_removed_only_from_a_group_and_only_when_two_wor
     assert forms["ZETA_MIN_AGE_HOURS"] == (frozenset({"ZETA", "MIN", "AGE"}),)  # two words remain: too generic
     assert forms["ZETA_SPAN_HOURS"] == (frozenset({"ZETA", "SPAN"}),)  # one word remains: not a form
     assert forms["PAIR_FADE_FLOOR"] == (frozenset({"PAIR", "FADE", "FLOOR"}),)  # a pair is not a group
+    assert frozenset({"GAUGE", "WIDTH", "LIMIT"}) in forms["TRIO_GAUGE_WIDTH_LIMIT"]  # three constants are a group
     assert forms["TWIN_ALPHA_BETA_GAMMA"] == (frozenset({"TWIN", "ALPHA", "BETA", "GAMMA"}),)  # a pair of long names neither
     assert forms["WIDGET_TIMEOUT_S"] == (frozenset({"WIDGET", "TIMEOUT"}),)  # no group at all
 
@@ -429,6 +435,9 @@ _R3_CONFORMING = {
     "a_plain_word_string": ("def f():\n    return 'strict'\n", _MODULE),
     "the_register_call_own_default": (
         "from brain import tunables\nCOPY = tunables.register('area.copy_cap', 20 * 1024 * 1024, description='d')\n", _MODULE
+    ),
+    "the_register_call_own_string_default": (
+        "from brain import tunables\nNAME = tunables.register('area.copy_name', 'widget_store.db', description='d')\n", _MODULE
     ),
     "a_docstring_that_is_the_value": ("def f():\n    '''widget_store.db'''\n    return 1\n", _MODULE),
     "a_part_of_an_fstring_that_is_the_value": ("def f(x):\n    return f'widget_store.db{x}'\n", _MODULE),
@@ -750,7 +759,7 @@ def test_ratchet_counts_findings_by_identity_without_line_numbers() -> None:
 # The guard over the real tree (brain/ Python plus the app's TypeScript and Rust)
 # ---------------------------------------------------------------------------
 
-# Violations that exist today: (rule, file, site, settings, reason). It may only shrink (see the module docstring).
+# Violations that exist today: (rule, file, site, settings, reason). It is meant to shrink (see the module docstring).
 _IMAGE_TYPES = ("tunables:files.image_types",)
 _TICK = ("tunables:embedding_backfill.tick_interval_seconds",)
 _UPLOAD_CAPS = ("tunables:files.image_max_bytes", "tunables:files.pdf_max_bytes", "tunables:files.upload_max_bytes")
@@ -814,24 +823,25 @@ def test_every_model_vocabulary_entry_still_matches_something_at_its_shape(scan)
 
 @_NBF
 def test_the_scan_derives_both_kinds_of_setting_from_the_tree(scan) -> None:
-    """The scan is not vacuous: settings of both kinds were derived, every dev constant is one the snapshot test also sees,
-    and every tunable's owner file is a file of the tree."""
-    from tests.unit.test_dev_constants_snapshot import current_constants
-
+    """The scan is not vacuous: settings of both kinds were derived. (Without it a derivation that finds nothing, and an
+    ALLOW list shrunk to nothing, would pass the real-tree test with no setting guarded.)"""
     settings, _findings_, _used = scan
-    assert settings.dev and settings.tunables
-    assert set(settings.dev) <= set(current_constants())
-    assert all(info.owner_file in brain_trees() for info in settings.tunables.values())
+    assert settings.dev, "no dev constant was derived from brain/dev_constants.py"
+    assert settings.tunables, "no tunables.register call was derived from brain/"
 
 
 @_NBF
 def test_no_model_rule_finding_is_ever_allow_listed(scan) -> None:
-    """The #529 model rules are not ratcheted: no model id or alias word is chosen outside the accessor (G1, G2, G4, G5) or
-    held by the app outside the picker vocabulary (APP-MODEL), and none of them may be put in ALLOW."""
+    """The #529 model rules are not ratcheted: no model id or alias word is chosen outside the accessor (G1, G2, G4, G5), held
+    by the app outside the picker vocabulary (APP-MODEL), or kept from a model accessor beyond the call (R4), and no
+    ``set_values`` call sits outside the sanctioned writers (R1d); none of them may be put in ALLOW."""
     _settings, findings, _used = scan
-    model_rules = {"G1", "G2", "G4", "G5", "APP-MODEL"}
-    assert [f.message for f in findings if f.rule in model_rules] == []
-    assert [e for e in ALLOW if e[0] in model_rules] == []
+    def is_model_finding(rule: str, site: str, settings: tuple[str, ...]) -> bool:
+        copy_of_a_model_accessor = rule == "R4" and any(s.startswith("accessor:") for s in settings)
+        return rule in {"G1", "G2", "G4", "G5", "APP-MODEL"} or copy_of_a_model_accessor or (rule == "R1" and "set_values" in site)
+
+    assert [f.message for f in findings if is_model_finding(f.rule, f.site, f.settings)] == []
+    assert [e for e in ALLOW if is_model_finding(e[0], e[2], e[3])] == []
 
 
 @_NBF

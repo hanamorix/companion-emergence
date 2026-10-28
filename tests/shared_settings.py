@@ -40,8 +40,9 @@ APP-R3, APP-MODEL  the app (TypeScript and Rust, tests excluded): the distinctiv
 Thresholds. Each is derived from a measurement of the tree and says which:
 
 * Four significant digits. A literal's purpose is not in the AST, and round figures recur for unrelated reasons. The
-  counts of numeric literals equal to a setting's value over ``brain/*.py`` (folded exactly as this module folds, ``+ - *
-  **`` only; int and float equal; the definitions included), measured when this guard landed: 1.0: 1019, 2.0: 226,
+  counts of numeric literals equal to a setting's value over ``brain/**/*.py`` (each maximal constant expression counted once,
+  folded exactly as this module folds, ``+ - * **`` only; int and float equal; the definitions included), measured when this
+  guard landed: 1.0: 1019, 2.0: 226,
   5.0: 102, 3: 157, 30.0: 33, 200: 48, 8: 61, 20.0: 42. Every such figure has one or two significant digits. The shared
   value that separates three from four is ``86400`` ("864", three digits): the seconds in a day, written in 15 places of
   ``brain/`` for unrelated purposes and also the value of ``COST_SERIES_WINDOW_S``. Three would make it a source of false
@@ -61,7 +62,8 @@ Thresholds. Each is derived from a measurement of the tree and says which:
   remainder with no unrelated match on today's tree: with two words the rule flagged five unrelated constants,
   ``SCHEMA_VERSION`` (the attunement schema against the other schema versions in ``ingest/`` and ``works/``) and
   ``CADENCE_FILE`` (against two unrelated cadence files in ``kindled_link/``). The cost: a copy under these natural
-  names is not caught by name, the eight prefixed dev constants whose remainder is one or two words
+  names is not caught by name, the eight constants (of the families ``ATTUNEMENT_``, ``KINDLED_LINK_``, ``JUDGE_TUNE_``) whose
+  remainder is one or two words
   (``SCHEMA_VERSION``, ``ADDRESS_COOLDOWN``, ``SESSION_COOLDOWN``, ``BUDGET_MAX``, ``CADENCE_FILE``, ``INTERVAL``,
   ``GRADE_LORA``, ``GRADE_ORDER``); a copy of their value with four or more digits, or bound to the setting's words, still
   is.
@@ -73,8 +75,8 @@ spelled differently across a call (``datetime.timedelta(minutes=15)`` for 900 s)
 computed from a dev constant (``def f(x=dev_constants.Y * 3600.0)``); constant folding other than ``+ - * **`` (``/``,
 ``//``, ``<<`` are not folded); a collection that is not a literal of strings (a dict, a comprehension, a list built by a
 call); a tunable registered through ``from brain.tunables import register`` or ``brain.tunables.register(...)`` (the tree
-has the one spelling ``tunables.register``); a result of ``tunables.get_raw`` (the raw-file reader of the migration and the
-model writer) kept somewhere that outlives the call; a function that returns an accessor result and is called at module or
+has the one spelling ``tunables.register``); a result of ``tunables.get_raw`` (the raw-file reader of the migration and of the
+model setting's validators and writer) kept somewhere that outlives the call; a function that returns an accessor result and is called at module or
 class scope from ANOTHER file (the returner set is per file); and anything in a language the check does not parse. In the
 app also: a collection of strings (the accepted image kinds in ChatPanel.tsx), a value scaled to another unit
 (``HEARTBEAT_INTERVAL_MINUTES = 15`` against a 900 s setting, ``600_000`` ms against 600.0 s), a value spelled in prose
@@ -316,7 +318,7 @@ class Settings:
             bound = name_words(info.bound_name) if info.bound_name else frozenset()
             bound = bound if len(bound) >= MIN_FORM_WORDS else frozenset()  # one word names a kind of thing
             segments = key.split(".")
-            loose = [bound] if len(bound) >= MIN_FORM_WORDS else []
+            loose = [bound] if bound else []
             loose += [f for f in (name_words(".".join(segments[i:])) for i in range(len(segments))) if len(f) >= MIN_FORM_WORDS]
             value = None if key.startswith("model.") else info.default  # a model id is the model case's (G1)
             settings.append(
@@ -1286,7 +1288,7 @@ def scan_real_tree(settings: Settings) -> tuple[list[Finding], frozenset[tuple[s
 def ratchet_problems(
     findings: Sequence[Finding], allow: Sequence[tuple[str, str, str, tuple[str, ...], str]], allow_size: int
 ) -> list[str]:
-    """What is wrong between the findings and the shrink-only list ``allow`` (entries ``(rule, file, site, settings, reason)``).
+    """What is wrong between the findings and the list ``allow`` that is meant to shrink (entries ``(rule, file, site, settings, reason)``).
 
     The findings must equal the entries as a multiset; every entry carries a reason; ``allow_size`` equals ``len(allow)``.
     """
@@ -1307,7 +1309,7 @@ def ratchet_problems(
     if len(allow) != allow_size:
         if len(allow) > allow_size:
             problems.append(
-                f"ALLOW grew: it has {len(allow)} entries and ALLOW_SIZE is {allow_size}. The list may only shrink; growth needs review"
+                f"ALLOW grew: it has {len(allow)} entries and ALLOW_SIZE is {allow_size}. The list is meant to shrink; growth needs review"
             )
         else:
             problems.append(f"ALLOW shrank: it has {len(allow)} entries and ALLOW_SIZE is {allow_size}; lower ALLOW_SIZE to {len(allow)}")
