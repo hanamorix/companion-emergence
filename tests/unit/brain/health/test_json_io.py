@@ -1126,7 +1126,11 @@ def _hold_shared_lock_in_thread(path: Path):
 
     t = threading.Thread(target=hold, daemon=True)
     t.start()
-    assert acquired.wait(5)
+    try:
+        assert acquired.wait(5)
+    except BaseException:
+        release.set()  # the caller never gets `release`: let the holder go as soon as it has (or never gets) the lock
+        raise
     return t, release
 
 

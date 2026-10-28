@@ -243,7 +243,7 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
     def detector(**_kw):
         calls.append(1)
         if len(calls) == 1:
-            second_arrived.wait()
+            second_arrived.wait(timeout=5.0)  # bounded on purpose: with the lock regression gone nobody ever sets it
         return DetectorOutput(current_read=fake_read, pattern_candidates=[], addressed_pattern_ids=[])
 
     def run():
