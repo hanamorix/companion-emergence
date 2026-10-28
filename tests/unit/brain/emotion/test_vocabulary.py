@@ -261,7 +261,9 @@ def test_register_stores_under_canonical_name() -> None:
 def test_pool_by_canonical_name_collapses_spellings_to_the_max() -> None:
     from brain.emotion.vocabulary import pool_by_canonical_name
 
-    values = {"comfort-seeking": 4.0, "Comfort_Seeking": 7.0, "love": 2.0, "grief_love_blend": 3.0, "love_grief_blend": 5.0}
+    # the larger value comes first for one pair and last for the other, so neither first-wins nor last-wins passes
+
+    values = {"comfort-seeking": 7.0, "Comfort_Seeking": 4.0, "love": 2.0, "grief_love_blend": 3.0, "love_grief_blend": 5.0}
     before = dict(values)
 
     assert pool_by_canonical_name(values) == {"comfort_seeking": 7.0, "love": 2.0, "grief_love_blend": 5.0}
