@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import io
 import logging
-import shutil
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -254,7 +253,7 @@ def test_upload_with_an_unknown_size_reads_in_bounded_pieces(persona_dir: Path, 
             assert small.status_code == 200, (cap, small.text)
             assert rolled.status_code == 200, (cap, rolled.text)
     assert sizes, "the route never read the file"
-    assert max(sizes) <= shutil.COPY_BUFSIZE, max(sizes)  # no read is as large as a cap or a body
+    assert max(sizes) <= io.DEFAULT_BUFFER_SIZE, max(sizes)  # no read is as large as a cap or a body
 
 
 def _chunked_multipart(body: bytes, boundary: str) -> Iterator[bytes]:
@@ -318,13 +317,13 @@ def test_read_upload_capped_with_a_known_size_makes_one_read_no_larger_than_the_
         assert sizes == [min(cap + 1, length)], (cap, length, sizes)
 
 
-@pytest.mark.parametrize("length", [0, 1, 1024, 1025, 3 * shutil.COPY_BUFSIZE + 5])
+@pytest.mark.parametrize("length", [0, 1, 1024, 1025, 3 * io.DEFAULT_BUFFER_SIZE + 5])
 def test_read_upload_capped_with_no_size_reads_bounded_pieces_and_returns_the_same_bytes(length: int) -> None:
     data = (bytes(range(256)) * (length // 256 + 1))[:length]
-    for cap in (1024, shutil.COPY_BUFSIZE + 10, sys.maxsize - 1, sys.maxsize, sys.maxsize + 1):
+    for cap in (1024, io.DEFAULT_BUFFER_SIZE + 10, sys.maxsize - 1, sys.maxsize, sys.maxsize + 1):
         raw, sizes = _read_capped(data, None, cap)
         assert raw == data[: cap + 1], (cap, length)
-        assert max(sizes) <= shutil.COPY_BUFSIZE, (cap, length, sizes)
+        assert max(sizes) <= io.DEFAULT_BUFFER_SIZE, (cap, length, sizes)
 
 
 def test_upload_requires_auth_when_token_set(persona_dir: Path) -> None:

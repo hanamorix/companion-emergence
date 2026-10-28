@@ -22,12 +22,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import io
 import json
 import logging
 import math
 import os
 import re
-import shutil
 import sqlite3
 import threading
 import time
@@ -267,7 +267,7 @@ async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
     front (a ``MemoryError`` for a large one), so reading ``max_bytes + 1`` straight away would make a large
     ``files.upload_max_bytes`` fail every upload however small the body. ``UploadFile.size`` is the bytes written to the file
     (starlette's multipart parser creates it with ``size=0`` and ``write`` counts); when it is None the file is read in pieces
-    of at most ``shutil.COPY_BUFSIZE`` until ``max_bytes + 1`` bytes were read or the file ends.
+    of at most ``io.DEFAULT_BUFFER_SIZE`` until ``max_bytes + 1`` bytes were read or the file ends.
     """
     limit = max_bytes + 1
     if file.size is not None:
@@ -275,7 +275,7 @@ async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
     pieces: list[bytes] = []
     remaining = limit
     while remaining > 0:
-        piece = await file.read(min(remaining, shutil.COPY_BUFSIZE))
+        piece = await file.read(min(remaining, io.DEFAULT_BUFFER_SIZE))
         if not piece:
             break
         pieces.append(piece)
