@@ -445,3 +445,103 @@ def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
         buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "x"}])
     assert path.read_text(encoding="utf-8") == before  # old buffer untouched
     assert not path.with_suffix(".jsonl.tmp").exists()  # no litter
+
+
+# --- archive_once: the one archive-with-dedup write (#556) ------------------------------------------------------
+
+
+def _turns(n: int, *, tag: str = "t") -> list[dict]:
+    return [
+        {"session_id": "s1", "speaker": "user" if i % 2 == 0 else "assistant", "text": f"{tag}-{i}", "ts": f"2026-01-01T00:00:{i:02d}+00:00"}
+        for i in range(n)
+    ]
+
+
+def test_archive_once_writes_a_batch_once_per_marker_key(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    rows = _turns(3)
+    assert archive_once(tmp_path, "s1", rows, new_gen=1) > 0
+    # The identical batch again (a crash-retry) is proven archived by the marker: no second write, still success.
+    assert archive_once(tmp_path, "s1", rows, new_gen=1) > 0
+    assert read_archive(tmp_path, "s1") == rows
+
+
+def test_archive_once_writes_a_different_batch(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    rows = _turns(3)
+    archive_once(tmp_path, "s1", rows, new_gen=1)
+    archive_once(tmp_path, "s1", rows, new_gen=2)  # same rows, other generation: a different batch
+    more = _turns(2, tag="u")
+    archive_once(tmp_path, "s1", more, new_gen=2)
+    assert read_archive(tmp_path, "s1") == rows + rows + more
+
+
+def test_archive_once_empty_batch_writes_nothing(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive, read_archive_marker
+
+    assert archive_once(tmp_path, "s1", [], new_gen=1) == 0
+    assert read_archive(tmp_path, "s1") == []
+    assert read_archive_marker(tmp_path, "s1") is None
+
+
+def test_archive_once_keeps_two_byte_identical_turns(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    row = _turns(1)[0]
+    archive_once(tmp_path, "s1", [row, dict(row)], new_gen=1)
+    assert read_archive(tmp_path, "s1") == [row, row]
+
+
+# --- session_append_lock (#556) ---------------------------------------------------------------------------------
+
+
+def test_session_append_lock_excludes_a_lock_respecting_appender(tmp_path):
+    from brain.health.json_io import append_jsonl
+    from brain.ingest.buffer import session_append_lock
+
+    sid = "sess_lock"
+    path = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    with session_append_lock(tmp_path, sid):
+        assert append_jsonl(path, {"text": "while held"}, lock="try") is None
+    assert append_jsonl(path, {"text": "after"}, lock="try") > 0
+    assert [r["text"] for r in read_session(tmp_path, sid)] == ["after"]
+
+
+@pytest.mark.parametrize("raise_on", ["call", "enter"])
+def test_session_append_lock_runs_the_body_once_unlocked_when_the_lock_is_refused(tmp_path, monkeypatch, caplog, raise_on):
+    from contextlib import contextmanager
+
+    from brain.ingest import buffer as buf
+
+    if raise_on == "call":
+
+        def refuse(path, **kw):
+            raise OSError("no locks here")
+
+    else:
+
+        @contextmanager
+        def refuse(path, **kw):
+            raise OSError("no locks here")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(buf, "file_lock", refuse)
+    runs: list[int] = []
+    with caplog.at_level("WARNING", logger=buf.logger.name):
+        with buf.session_append_lock(tmp_path, "sess_lock"):
+            runs.append(1)
+    assert runs == [1]
+    assert any("without it" in r.getMessage() for r in caplog.records)
+
+
+def test_session_append_lock_propagates_a_body_error_once(tmp_path):
+    from brain.ingest.buffer import session_append_lock
+
+    runs: list[int] = []
+    with pytest.raises(OSError, match="body failed"):
+        with session_append_lock(tmp_path, "sess_lock"):
+            runs.append(1)
+            raise OSError("body failed")
+    assert runs == [1]
