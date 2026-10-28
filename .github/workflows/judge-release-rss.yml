@@ -36,7 +36,21 @@ on:
       # silently until caught by an unrelated network-in-CI failure.
       - pyproject.toml
       - uv.lock
+  # Manual run to reproduce an order (the `seed` is what pytest-randomly prints at the top and bottom of a run).
   workflow_dispatch:
+    inputs:
+      tests:
+        description: >-
+          Test node ids, separated by spaces (default: the whole judge-release-rss file).
+        type: string
+        required: false
+        default: ""
+      seed:
+        description: >-
+          pytest-randomly seed to reproduce an order (digits only; empty = a fresh random seed).
+        type: string
+        required: false
+        default: ""
 
 jobs:
   judge-release-rss:
@@ -89,6 +103,28 @@ jobs:
           "
 
       - name: Judge release RSS tests (C2 finish arms, C3 offline load, C14 3-OS)
+        shell: bash
         env:
           KINDLED_RUN_JUDGE_RSS: "1"  # opt-in; without it the module skips (#405)
-        run: uv run pytest -p no:randomly -m requires_models tests/unit/brain/memory/test_judge_release_rss.py -v -s
+          TESTS: ${{ inputs.tests }}  # workflow_dispatch inputs only; empty on a pull_request run
+          SEED: ${{ inputs.seed }}
+        run: |
+          set -f
+          selected=($TESTS)
+          set +f
+          if [ "${#selected[@]}" -eq 0 ]; then
+            selected=(tests/unit/brain/memory/test_judge_release_rss.py)
+          fi
+          for word in "${selected[@]}"; do
+            case "$word" in
+              -*) echo "::error::refusing '$word': pass test paths or node ids only, not pytest options"; exit 1 ;;
+            esac
+          done
+          seed=()
+          if [ -n "$SEED" ]; then
+            case "$SEED" in
+              *[!0-9]*) echo "::error::refusing seed '$SEED': digits only"; exit 1 ;;
+            esac
+            seed=("--randomly-seed=$SEED")
+          fi
+          uv run pytest -m requires_models -v -s "${seed[@]}" "${selected[@]}"

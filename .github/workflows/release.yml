@@ -155,7 +155,7 @@ jobs:
         run: uv sync --all-extras --locked
 
       - name: Run pytest
-        run: uv run pytest -q -p no:randomly
+        run: uv run pytest -q
 
       - name: Lint with ruff
         run: uv run ruff check .

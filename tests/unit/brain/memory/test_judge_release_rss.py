@@ -529,11 +529,34 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
     Fail-first (pre-INC-5): `CrossEncoder(model_id, cache_folder=...)` with
     no offline kwargs at all issues real HEAD/GET requests to the Hub (O15)
     -> connect_calls > 0.
+
+    The measured window is the MODEL load. huggingface_hub 1.30.0 also builds an
+    "is an AI agent calling me" user-agent for every request, which reads a
+    registry file in the HF home (`$HF_HOME/.agent_harnesses.json`, younger than
+    24 h) and otherwise does `GET {endpoint}/api/agent-harnesses` and writes it
+    -- before the offline short-circuit, so even a `local_files_only` load makes
+    that one GET. The HF home is not in the CI model cache, so on a cache hit the
+    first judge load of a run made the GET and wrote the file, and this test
+    passed or failed depending on whether an earlier test had loaded a judge
+    first (random order exposed it, #540). The script therefore points that
+    constant at a fresh, empty registry under the test's own scratch directory:
+    the library's daily telemetry fetch is out of the window, every request the
+    model load itself makes is still counted.
     """
     script = textwrap.dedent(
         """
         import json
+        import os
         import socket
+
+        # See the test docstring. Reading the constant first fails loudly (AttributeError) if the library renames it.
+        import huggingface_hub.constants as hf_constants
+
+        assert hf_constants.AGENT_HARNESSES_PATH
+        _scratch_registry = os.path.join(os.environ["RSS_TEST_SCRATCH_DIR"], "agent-harnesses.json")
+        with open(_scratch_registry, "w", encoding="utf-8") as f:
+            json.dump({"standardEnvVars": [], "harnesses": {}}, f)
+        hf_constants.AGENT_HARNESSES_PATH = _scratch_registry
 
         _connect_calls = [0]
         _orig_connect = socket.socket.connect
@@ -553,6 +576,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
         import huggingface_hub.utils._http as hf_http
 
         _hf_session_calls = [0]
+        _hf_session_requests = []
         _orig_get_session = hf_http.get_session
 
         def _counting_get_session():
@@ -562,6 +586,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
 
                 def _counting_request(*a, **kw):
                     _hf_session_calls[0] += 1
+                    _hf_session_requests.append([repr(x) for x in a[:2]])
                     return _orig_request(*a, **kw)
 
                 session.request = _counting_request
@@ -578,6 +603,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
         print(json.dumps({
             "connect_calls": _connect_calls[0],
             "hf_session_calls": _hf_session_calls[0],
+            "hf_session_requests": _hf_session_requests,
             "model_id": provider.model_id(),
             "score_is_float": isinstance(score, float),
             # S81 (owner ruling, "CPU everywhere (Recommended)"): every
@@ -601,7 +627,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
     )
     assert result["hf_session_calls"] == 0, (
         f"expected zero huggingface_hub HTTP-session calls for a cached judge load, "
-        f"got {result['hf_session_calls']}"
+        f"got {result['hf_session_calls']}: {result['hf_session_requests']}"
     )
     assert result["connect_calls"] == 0, (
         f"expected zero network connects for a cached judge load, got {result['connect_calls']}"
