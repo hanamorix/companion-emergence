@@ -7,7 +7,7 @@ Scope: the co-maintainer's parts are not redrawn; her boundaries are fixed by st
 ## 1. The owner's parts
 
 ### 1.0 Step 0, interface and stub (level 1)
-- **Status:** designed (v3, unanimous, the owner's rulings 2026-10-14; the note to the co-maintainer sent 2026-10-15). Step 0 v3 is agreed by both maintainers. [maintainer ruling 2026-10-14 | H]
+- **Status:** designed (v3, unanimous, the owner's rulings 2026-10-14; the note to the co-maintainer sent 2026-10-15). The co-maintainer accepted step 0 v3 on 2026-10-15; the change note sent the same day drew no objection. [maintainer ruling 2026-10-14 | H]
 - **Owns:** the nine calls (the eight of step 0 v3: `on_memory_committed`, `on_emotions_assigned`, `fold_change`, `on_memory_shown`, `read`, `oldest_entry_at`, `is_live`, `half_life`; plus `note_active(now)`, which the sent note added), the event shape, the counted-type tests, the research field name (`metadata.engagement_rating`), the modifier inputs, the half-life order, the switch flag in its own file `<persona_dir>/emotion_switch.json` (not a field of `emotion_state.json`). [step0 I-1 to I-7; step0-chg 2, 4 | H]
 - **Changes:** a stub module only. **The stub is not at origin/main**: a grep for `on_memory_committed`, `fold_change`, `ensure_engine_ready` and `emotion_state.json` over `brain/` and `tests/` returns nothing, and `brain/emotion/` has no engine file. Plan:279 says the stub is "merged first", so the co-maintainer's B1 work has nothing to build against yet. [plan:276-281, :279; grep at 44af2447 | H for the fact]
 - **Gives:** the stub both halves build against. **Needs:** nothing.
