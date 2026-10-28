@@ -128,7 +128,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from brain import tunables
+from brain import dev_constants, tunables
 from brain.health.json_io import read_json, write_json
 from brain.memory.store import MemoryStore
 from brain.paths import cadence_state_path
@@ -142,13 +142,6 @@ logger = logging.getLogger(__name__)
 # embed-worthiness — so kept as its own constant rather than imported, so
 # the two thresholds can diverge independently later).
 MIN_CHARS_TO_EMBED = 20
-
-# Bounds how many candidate rows are even *examined* (read from `memories`)
-# in one tick — cheap (an indexed WHERE-clause row), independent of
-# `batch_size` which bounds actual embed *compute* (the expensive part).
-# Keeps a corpus with a long run of skip-worthy short/failing rows from
-# spinning CPU scanning without also embedding anything.
-DEFAULT_SCAN_CAP = 500
 
 _CURSOR_FILE = "embedding_backfill_cursor.json"
 
@@ -416,7 +409,7 @@ def run_embedding_backfill_tick(
     store: MemoryStore,
     *,
     batch_size: int | None = None,
-    scan_cap: int = DEFAULT_SCAN_CAP,
+    scan_cap: int | None = None,
 ) -> BackfillTickResult:
     """Embed up to `batch_size` un-embedded active memories, off the hot path.
 
@@ -429,7 +422,8 @@ def run_embedding_backfill_tick(
     `_get_batch_size` (measured once per process per model_id — see module
     docstring); pass an explicit value to override (tests do this for
     deterministic bounds). `scan_cap` separately bounds how many rows are
-    even read from `memories` this call.
+    even read from `memories` this call; when omitted it is
+    `dev_constants.DEFAULT_SCAN_CAP`.
 
     Backlog is exactly `MemoryStore.list_unembedded_since`'s definition:
     active, long-enough rows with `embedding IS NULL` OR
@@ -443,6 +437,8 @@ def run_embedding_backfill_tick(
     """
     from brain.memory import embeddings as embeddings_mod
 
+    if scan_cap is None:
+        scan_cap = dev_constants.DEFAULT_SCAN_CAP
     provider = embeddings_mod.build_embedding_provider()
     model_id = provider.model_id()
     effective_batch_size = (
@@ -591,7 +587,7 @@ def run_embedding_backfill_to_completion(
     store: MemoryStore,
     *,
     batch_size: int | None = None,
-    scan_cap: int = DEFAULT_SCAN_CAP,
+    scan_cap: int | None = None,
     progress_cb: ProgressCallback | None = None,
 ) -> BackfillDrainResult:
     """Drain the embedding backlog to completion in ONE call, for the
@@ -674,6 +670,8 @@ def run_embedding_backfill_to_completion(
     """
     from brain.memory import embeddings as embeddings_mod
 
+    if scan_cap is None:
+        scan_cap = dev_constants.DEFAULT_SCAN_CAP
     total_embedded = 0
     total_failed_attempts = 0
     total_scanned = 0

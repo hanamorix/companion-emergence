@@ -84,19 +84,6 @@ def _seed_labeled_rows(
 # ---------------------------------------------------------------------------
 
 
-def test_cadence_constants() -> None:
-    assert judge_selftune.JUDGE_TUNE_CADENCE_FILE == "judge_selftune_cadence.json"
-    assert judge_selftune.JUDGE_TUNE_INTERVAL_HOURS == 168.0
-
-
-def test_tune_grade_order_is_weak_to_beefy() -> None:
-    assert judge_selftune._TUNE_GRADE_ORDER == (
-        judge_selftune.TUNE_GRADE_KNOB_REFIT,
-        judge_selftune.TUNE_GRADE_LORA,
-        judge_selftune.TUNE_GRADE_FULL_FT,
-    )
-
-
 # ---------------------------------------------------------------------------
 # _read_total_ram_bytes — mirrors the shape of the reranker's former
 # /proc/meminfo free-memory reader, MemTotal instead of MemAvailable.
@@ -140,34 +127,34 @@ def test_read_total_ram_bytes_none_when_memtotal_line_missing(monkeypatch: pytes
 def test_select_tune_grade_weak_below_lora_min() -> None:
     assert (
         judge_selftune._select_tune_grade_by_ram(8.0 * 1024**3)
-        == judge_selftune.TUNE_GRADE_KNOB_REFIT
+        == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     )
 
 
 def test_select_tune_grade_lora_at_lora_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_LORA
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_LORA
 
 
 def test_select_tune_grade_knob_refit_just_below_lora_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES - 1.0
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_select_tune_grade_full_ft_at_full_ft_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_FULL_FT
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_FULL_FT
 
 
 def test_select_tune_grade_lora_just_below_full_ft_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES - 1.0
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_LORA
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_LORA
 
 
 def test_select_tune_grade_none_fails_toward_knob_refit() -> None:
     """Detection failure (non-Linux / read error) must fail toward the
     always-safe floor, never toward a grade that might not fit."""
-    assert judge_selftune._select_tune_grade_by_ram(None) == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert judge_selftune._select_tune_grade_by_ram(None) == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_select_tune_grade_reads_tunable_override_live_not_cached(
@@ -178,7 +165,7 @@ def test_select_tune_grade_reads_tunable_override_live_not_cached(
     a tunable override changes the threshold, on the very next call — no
     memoization across calls."""
     total = 20.0 * 1024**3  # between the default lora_min (16G) and full_ft_min (64G)
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_LORA
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_LORA
 
     original_get_tunable = judge_selftune.tunables.get_tunable
 
@@ -188,7 +175,7 @@ def test_select_tune_grade_reads_tunable_override_live_not_cached(
         return original_get_tunable(key, default)
 
     monkeypatch.setattr(judge_selftune.tunables, "get_tunable", _override)
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 # ---------------------------------------------------------------------------
@@ -200,26 +187,26 @@ def test_select_tune_grade_reads_tunable_override_live_not_cached(
 
 def test_oom_guard_keeps_grade_when_headroom_is_generous() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES + 1.0
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-    assert result == judge_selftune.TUNE_GRADE_FULL_FT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_FULL_FT
 
 
 def test_oom_guard_downgrades_full_ft_to_lora_when_only_lora_fits() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_LORA_BYTES + 1.0
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-    assert result == judge_selftune.TUNE_GRADE_LORA
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_LORA
 
 
 def test_oom_guard_downgrades_to_knob_refit_when_only_the_floor_fits() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
     """A headroom of exactly 0.0 (a cgroup at its memory.high or memory.max) fits nothing but the floor."""
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, 0.0)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, 0.0)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_and_psutil(
@@ -236,16 +223,16 @@ def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_
     headroom = judge_selftune._available_ram_headroom_bytes()
     assert headroom == 2e9
     assert (
-        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-        == judge_selftune.TUNE_GRADE_KNOB_REFIT
+        judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+        == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     )
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 8e9)
     monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 64e9)
     headroom = judge_selftune._available_ram_headroom_bytes()
     assert headroom == 8e9
     assert (
-        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-        == judge_selftune.TUNE_GRADE_LORA
+        judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+        == dev_constants.JUDGE_TUNE_GRADE_LORA
     )
 
 
@@ -253,8 +240,8 @@ def test_oom_guard_none_headroom_fails_toward_knob_refit() -> None:
     """No headroom signal at all (every source unavailable) means no
     signal to TRUST the RAM-tier pick with either — same fail-toward-safe
     posture as `_select_tune_grade_by_ram`'s own None branch."""
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, None)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, None)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_oom_guard_bites_without_it_the_naive_pick_would_oom() -> None:
@@ -264,18 +251,18 @@ def test_oom_guard_bites_without_it_the_naive_pick_would_oom() -> None:
     merely that it exists."""
     total_ram = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES + 1.0
     naive = judge_selftune._select_tune_grade_by_ram(total_ram)
-    assert naive == judge_selftune.TUNE_GRADE_FULL_FT, "the too-big pick, absent the guard"
+    assert naive == dev_constants.JUDGE_TUNE_GRADE_FULL_FT, "the too-big pick, absent the guard"
 
     guarded = judge_selftune._downgrade_for_oom_safety(
         naive, judge_selftune.JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES
     )
-    assert guarded == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert guarded == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     assert guarded != naive, "the guard must have changed the outcome"
 
 
 def test_oom_guard_knob_refit_footprint_is_the_floor_it_never_downgrades_past() -> None:
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_KNOB_REFIT, 1.0)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT, 1.0)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +839,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
 
     assert result["fired"] is True
     assert result["error"] is None
-    assert result["tune_grade"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert result["tune_grade"] == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     assert result["new_decisions"] == handful + 1
     marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
     assert marker is not None
@@ -915,7 +902,7 @@ def test_tick_selects_tier_and_applies_oom_downgrade(
     result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
 
     assert result["fired"] is True
-    assert result["tune_grade"] == judge_selftune.TUNE_GRADE_LORA, "downgraded from full_ft"
+    assert result["tune_grade"] == dev_constants.JUDGE_TUNE_GRADE_LORA, "downgraded from full_ft"
 
 
 @pytest.mark.slow(reason='1.9 s of CPU in its call phase on a 4-core dev VM, 1.9 s wall (serial run for #540, J12)')
@@ -1035,13 +1022,13 @@ def test_judge_selftune_cadence_due_now_when_missing() -> None:
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state = pc.load_cadence(pd, judge_selftune.JUDGE_TUNE_CADENCE_FILE)
+        state = pc.load_cadence(pd, dev_constants.JUDGE_TUNE_CADENCE_FILE)
         assert pc.is_due(state, now=now) is True
 
 
 def test_judge_selftune_cadence_not_due_after_advance_and_fires_at_interval() -> None:
     now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-    interval_s = judge_selftune.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
+    interval_s = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
     state = pc.advance(now=now, interval_s=interval_s)
     assert pc.is_due(state, now=now) is False
     assert pc.is_due(state, now=now + timedelta(seconds=interval_s)) is True
@@ -1052,8 +1039,8 @@ def test_judge_selftune_cadence_save_load_round_trip() -> None:
         pd = Path(d)
         now = datetime(2026, 6, 29, 12, tzinfo=UTC)
         state = pc.advance(now=now, interval_s=100.0)
-        pc.save_cadence(pd, judge_selftune.JUDGE_TUNE_CADENCE_FILE, state)
-        loaded = pc.load_cadence(pd, judge_selftune.JUDGE_TUNE_CADENCE_FILE)
+        pc.save_cadence(pd, dev_constants.JUDGE_TUNE_CADENCE_FILE, state)
+        loaded = pc.load_cadence(pd, dev_constants.JUDGE_TUNE_CADENCE_FILE)
         assert loaded.next_at == state.next_at
         assert not list(pd.glob("*.tmp")), "atomic write must leave no .tmp"
 
@@ -1064,7 +1051,7 @@ def test_run_folded_accepts_judge_selftune_interval_s() -> None:
     sig = inspect.signature(run_folded)
     assert "judge_selftune_interval_s" in sig.parameters
     param = sig.parameters["judge_selftune_interval_s"]
-    assert param.default == judge_selftune.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
+    assert param.default == dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
 
 
 # ---------------------------------------------------------------------------

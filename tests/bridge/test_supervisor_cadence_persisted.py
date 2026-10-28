@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.bridge.supervisor import run_folded
 from brain.memory import judge_selftune
@@ -477,7 +478,7 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     would stay absent."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+    (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
@@ -512,7 +513,7 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
 
     assert calls[0] >= 1, "persisted past-due judge self-tune must fire on a fresh process"
     saved = json.loads(
-        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+        (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).read_text()
     )
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
 
@@ -550,7 +551,7 @@ def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advan
     the tick re-checks next week, not on the very next base tick."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+    (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -583,7 +584,7 @@ def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advan
 
     assert calls[0] >= 1
     saved = json.loads(
-        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+        (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).read_text()
     )
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
         "cadence must advance even when the gate does not fire"
@@ -603,7 +604,7 @@ def test_judge_selftune_cadence_advances_even_when_tick_raises(
     above, pinned separately for judge self-tune's own block."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+    (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -634,7 +635,7 @@ def test_judge_selftune_cadence_advances_even_when_tick_raises(
 
     assert raised[0] >= 1, "the raising tick must have fired"
     saved = json.loads(
-        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+        (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).read_text()
     )
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
         "advance+save must run in finally even when the tick raises"
@@ -673,6 +674,6 @@ def test_judge_selftune_disabled_cadence_writes_no_state_file(
     )
     watchdog.cancel()
 
-    assert not (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).exists(), (
+    assert not (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).exists(), (
         "judge_selftune_interval_s=None must never write its cadence state file"
     )

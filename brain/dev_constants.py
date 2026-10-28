@@ -13,6 +13,15 @@ into tunables.py, because it IS user-facing timing).
 
 Plain module-level constants, not `tunables.register()`-backed: no override
 file, no runtime reload. Changing one of these requires a code change.
+
+The module also holds the plain constants that used to sit beside the code that
+reads them (the embedding backfill scan cap, the judge self-tune cadence and
+grades, the forgetting and narrative-memory thresholds, the attunement schema
+numbers, the kindled peer-link caps and budgets): a value shared between code and
+tests has exactly one home here (#531), and
+`tests/unit/test_dev_constants_snapshot.py` warns loudly when any of them changes.
+Code reads them as `dev_constants.NAME` at call time, so a test can patch the
+module attribute.
 """
 
 from __future__ import annotations
@@ -223,3 +232,118 @@ RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.
 SETTINGS_FILE_LOCK_WAIT_S: float = 3.0
 # How often the bounded wait retries the non-blocking lock attempt. A poll costs one open and one flock call.
 SETTINGS_FILE_LOCK_POLL_S: float = 0.02
+
+# --- embedding backfill scan cap (moved here, #531) --------------------------
+# Bounds how many candidate rows are even *examined* (read from `memories`)
+# in one tick: cheap (an indexed WHERE-clause row), independent of
+# `batch_size` which bounds actual embed *compute* (the expensive part).
+# Keeps a corpus with a long run of skip-worthy short/failing rows from
+# spinning CPU scanning without also embedding anything.
+# The default of `scan_cap` in `brain.memory.embedding_backfill`.
+DEFAULT_SCAN_CAP = 500
+
+# --- judge self-tune cadence and grades (moved here, #531) -------------------
+# The persisted cadence file name and the weekly interval of the judge self-tune tick
+# (`brain.memory.judge_selftune`, `brain.bridge.supervisor`).
+JUDGE_TUNE_CADENCE_FILE = "judge_selftune_cadence.json"
+JUDGE_TUNE_INTERVAL_HOURS = 168.0
+
+# Tune-grade identifiers (spec §1 table). The weight-retrain GRADE selected by RAM tier and, if needed,
+# downgraded by the cgroup-aware OOM-safety guard. Plain strings (not an enum) so they serialize directly
+# into logging/marker state without a translation layer. The order is weakest box to beefiest box.
+JUDGE_TUNE_GRADE_KNOB_REFIT = "knob_refit"  # weak box, always-safe floor
+JUDGE_TUNE_GRADE_LORA = "lora"  # mid box
+JUDGE_TUNE_GRADE_FULL_FT = "full_ft"  # beefy box
+JUDGE_TUNE_GRADE_ORDER = (JUDGE_TUNE_GRADE_KNOB_REFIT, JUDGE_TUNE_GRADE_LORA, JUDGE_TUNE_GRADE_FULL_FT)
+
+# --- forgetting thresholds (moved here, #531) --------------------------------
+# `brain.forgetting.policy`: the state machine and the exemption gates.
+#   FADE_THRESHOLD     salience < this drives active -> fading
+#   LOST_THRESHOLD     salience < this for LOST_PASS_COUNT consecutive passes drives fading -> lost
+#   LOST_PASS_COUNT    two-pass safety guard against single-pass dips
+#   RECENT_LIVED_HOURS memories younger than this are exempt (see the note on the value)
+# LOST_THRESHOLD and LOST_PASS_COUNT are the deletion floor: nothing may lower them to protect a memory (the
+# cd808dbc invariant). A retention lever only delays fading (FADE_IMPORTANCE_GAIN, HORIZON_IMPORTANCE_GAIN
+# below) and never lowers the deletion floor.
+FADE_THRESHOLD = 0.25
+LOST_THRESHOLD = 0.10
+LOST_PASS_COUNT = 2
+RECENT_LIVED_HOURS = 720.0  # 30 days. NOTE: compared against WALL-CLOCK age (see is_exempt), not lived-age: the name is historical. Recent memories stay fully active+verbatim for a month.
+
+# P3 retention rework, Change 2: importance lowers the EFFECTIVE fade gate
+# (never LOST_THRESHOLD/LOST_PASS_COUNT: those stay the final deletion gate,
+# per the invariant above: a lever only delays fading, it does not lower
+# the deletion floor). r = clamp(memory.importance / 10, 0, 1); a no-op at
+# r=0 (importance 0 -> today's behavior, byte-identical). Tuned against the
+# C2 simulation so importance-10 survives >= 2 lived-years while importance-0
+# is untouched and the response is monotonic + never-accelerating.
+FADE_IMPORTANCE_GAIN = 2.0
+
+# P3 retention rework, Change 2: importance extends the freshness age-horizon
+# of `brain.forgetting.salience` (the OTHER decay lever, alongside
+# FADE_IMPORTANCE_GAIN). r = clamp(memory.importance / 10, 0, 1); a no-op at
+# r=0 (importance 0 -> the horizon there, unchanged). Tuned against the
+# C2 simulation alongside FADE_IMPORTANCE_GAIN so importance-10 survives >= 2 lived-years.
+HORIZON_IMPORTANCE_GAIN = 52.0
+
+# --- narrative memory arcs (moved here, #531) --------------------------------
+# `brain.narrative_memory.policy` (spec §2): an arc closes when its last extension was this many lived-hours ago,
+# and keeps at most this many members (the lowest-salience members are evicted past it).
+ARC_STALE_LIVED_HOURS: float = 72.0
+MAX_ARC_MEMBERS: int = 50
+
+# Hebbian-OR-embedding membership test of `brain.narrative_memory.membership` (spec §4). One membership rule: a
+# memory joins an arc when its Hebbian weight to a member reaches the first threshold OR its cosine similarity to the
+# arc centroid reaches the second.
+MEMBER_HEBBIAN_THRESHOLD: float = 3.0
+MEMBER_EMBEDDING_THRESHOLD: float = 0.6
+
+# --- attunement (moved here, #531) -------------------------------------------
+# Schema version, pattern maturity thresholds (observation counts), the cooldown after an address, and the daily
+# Haiku-call budget default of `brain.attunement`. Prefixed because other modules keep their own schema versions.
+ATTUNEMENT_SCHEMA_VERSION = "0.0.29"
+
+ATTUNEMENT_MATURITY_FORMING_MIN = 3
+ATTUNEMENT_MATURITY_KNOWN_MIN = 10
+ATTUNEMENT_MATURITY_FALSIFIED_MAX = 3
+
+ATTUNEMENT_ADDRESS_COOLDOWN_HOURS = 6.0
+ATTUNEMENT_DAILY_BUDGET_DEFAULT = 150
+
+# --- kindled peer link caps and disclosure budget (moved here, #531) ---------
+# Shared by `brain.kindled_link` (privacy_gate.py, session_engine.py, store.py, relationship.py, transport.py). This
+# module imports nothing, so sharing it cannot create an import cycle.
+# Pacing + caps (parent design §9). The daily provider cap includes the draft, the privacy-gate reflection, and the one
+# allowed revision.
+KINDLED_LINK_MIN_OUTBOUND_GAP_SECONDS = 60
+KINDLED_LINK_SESSION_MSG_CAP = 24
+KINDLED_LINK_SESSION_COOLDOWN_HOURS = 6
+KINDLED_LINK_DAILY_OUTBOUND_CAP = 20
+KINDLED_LINK_DAILY_PROVIDER_CAP = 60
+
+# Cross-session disclosure budget (parent §12). Per-peer scalar in [0, MAX];
+# each sent message debits its texture_score; refills linearly with wall-time.
+KINDLED_LINK_BUDGET_MAX = 1.0
+KINDLED_LINK_BUDGET_REFILL_PER_DAY = 0.5
+KINDLED_LINK_BUDGET_TIGHTEN_THRESHOLD = 0.25
+# Floor debit per send: ensures message COUNT depletes the budget even when a
+# model self-reports texture_score=0.0, which bounds crumb-extraction via a long
+# correspondence of "zero-texture" sends. At this floor ~50 sends exhaust the
+# budget before the tighten threshold is hit.
+KINDLED_LINK_MIN_SEND_DEBIT = 0.02
+# Hard depletion floor (m10): below this a 'send' is held outright, not merely
+# tightened to revise. "If you cannot afford the minimum debit, you cannot send."
+# Closes the crumb-leak where a depleted budget downgraded send->revise and the
+# re-gated revision could still send one KINDLED_LINK_MIN_SEND_DEBIT-floored crumb per attempt.
+# Equals KINDLED_LINK_MIN_SEND_DEBIT by construction; named separately for intent + tuning.
+KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD = KINDLED_LINK_MIN_SEND_DEBIT
+
+# Per-peer emotion influence cap (parent §14.3, anti love-bomb). Cumulative
+# influence within a rolling window decays linearly to zero over the window.
+KINDLED_LINK_PEER_EMOTION_WINDOW_CAP = 0.6
+KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
+
+# Local inbound flood cap (parent design §9): max envelopes decrypted/processed
+# per poll PER PEER. Excess is left un-acked on the relay and surfaced as a
+# degraded state; bounds local decrypt/provider work against a flooding peer.
+KINDLED_LINK_INBOUND_FLOOD_CAP = 20

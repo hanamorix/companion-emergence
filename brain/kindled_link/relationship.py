@@ -18,11 +18,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from brain import prompt_strings
+from brain import dev_constants, prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
 from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
-from brain.kindled_link import limits
 from brain.state_compat import from_known_fields
 
 log = logging.getLogger(__name__)
@@ -194,7 +193,7 @@ def run_relationship_reflection(
     # gate/reflection call for the same peer); refund if the LLM call never
     # completes so only completed calls net-count (defer ≠ failure). Mirrors the
     # privacy gate.
-    if not store.try_reserve_provider(peer_id, today, cap=limits.DAILY_PROVIDER_CAP):
+    if not store.try_reserve_provider(peer_id, today, cap=dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP):
         return state
     # Slot reserved — the try spans the prompt build too, so any raise before the
     # call releases it (no leaked reservation; fail-soft to unchanged state).
@@ -366,7 +365,7 @@ def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: dateti
     if not math.isfinite(magnitude) or magnitude <= 0:
         return {}
     current = store.get_peer_emotion_accumulated(peer_id, now)
-    headroom = max(0.0, limits.PEER_EMOTION_WINDOW_CAP - current)
+    headroom = max(0.0, dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_CAP - current)
     if headroom <= 0:
         return {}
     scale = min(1.0, headroom / magnitude)

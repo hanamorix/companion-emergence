@@ -44,18 +44,6 @@ from brain.memory.reranker import _available_ram_headroom_bytes
 
 logger = logging.getLogger(__name__)
 
-JUDGE_TUNE_CADENCE_FILE = "judge_selftune_cadence.json"
-JUDGE_TUNE_INTERVAL_HOURS = 168.0
-
-# --- Tune-grade identifiers (spec §1 table) -------------------------------
-# The weight-retrain GRADE selected by RAM tier and, if needed, downgraded
-# by the cgroup-aware OOM-safety guard. Plain strings (not an enum) so they
-# serialize directly into logging/marker state without a translation layer.
-TUNE_GRADE_KNOB_REFIT = "knob_refit"  # weak box — always-safe floor
-TUNE_GRADE_LORA = "lora"  # mid box
-TUNE_GRADE_FULL_FT = "full_ft"  # beefy box
-_TUNE_GRADE_ORDER = (TUNE_GRADE_KNOB_REFIT, TUNE_GRADE_LORA, TUNE_GRADE_FULL_FT)
-
 # --- Tunables (I3/I7 — every threshold below is a registered tunable, never
 # a bare hardcoded constant) --------------------------------------------
 
@@ -162,12 +150,12 @@ def _select_tune_grade_by_ram(total_ram_bytes: float | None) -> str:
         "judge_selftune.ram_tier_full_ft_min_bytes", JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES
     )
     if total_ram_bytes is None:
-        return TUNE_GRADE_KNOB_REFIT
+        return dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     if total_ram_bytes >= full_ft_min:
-        return TUNE_GRADE_FULL_FT
+        return dev_constants.JUDGE_TUNE_GRADE_FULL_FT
     if total_ram_bytes >= lora_min:
-        return TUNE_GRADE_LORA
-    return TUNE_GRADE_KNOB_REFIT
+        return dev_constants.JUDGE_TUNE_GRADE_LORA
+    return dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float | None) -> str:
@@ -196,24 +184,24 @@ def _downgrade_for_oom_safety(tune_grade: str, effective_headroom_bytes: float |
     `_available_ram_headroom_bytes` itself was fixed to prevent).
     """
     footprints = {
-        TUNE_GRADE_KNOB_REFIT: tunables.get_tunable(
+        dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT: tunables.get_tunable(
             "judge_selftune.footprint_knob_refit_bytes", JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES
         ),
-        TUNE_GRADE_LORA: tunables.get_tunable(
+        dev_constants.JUDGE_TUNE_GRADE_LORA: tunables.get_tunable(
             "judge_selftune.footprint_lora_bytes", JUDGE_TUNE_FOOTPRINT_LORA_BYTES
         ),
-        TUNE_GRADE_FULL_FT: tunables.get_tunable(
+        dev_constants.JUDGE_TUNE_GRADE_FULL_FT: tunables.get_tunable(
             "judge_selftune.footprint_full_ft_bytes", JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES
         ),
     }
     if effective_headroom_bytes is None:
-        return TUNE_GRADE_KNOB_REFIT
-    start_idx = _TUNE_GRADE_ORDER.index(tune_grade)
+        return dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
+    start_idx = dev_constants.JUDGE_TUNE_GRADE_ORDER.index(tune_grade)
     for idx in range(start_idx, -1, -1):
-        grade = _TUNE_GRADE_ORDER[idx]
+        grade = dev_constants.JUDGE_TUNE_GRADE_ORDER[idx]
         if footprints[grade] <= effective_headroom_bytes:
             return grade
-    return TUNE_GRADE_KNOB_REFIT  # last-resort: footprint estimates misconfigured; the floor still fits
+    return dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT  # last-resort: footprint estimates misconfigured; the floor still fits
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +436,7 @@ def _select_retrain(tune_grade: str, start: str, staged: Path) -> Callable[..., 
     monkeypatch is honored."""
     from brain.memory import judge_full_ft, judge_lora
 
-    if tune_grade == TUNE_GRADE_FULL_FT:
+    if tune_grade == dev_constants.JUDGE_TUNE_GRADE_FULL_FT:
         return judge_full_ft.build_full_ft_retrain_fn(start, save_full_dir=staged)
     return judge_lora.build_lora_retrain_fn(
         start,
@@ -732,7 +720,7 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
         tune_grade = _downgrade_for_oom_safety(tune_grade, effective_headroom)
         result["tune_grade"] = tune_grade
 
-        if tune_grade == TUNE_GRADE_KNOB_REFIT or persona_dir is None:
+        if tune_grade == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT or persona_dir is None:
             # Weak tier: knob-refit only (spec §5), inc3 behavior unchanged.
             # `persona_dir is None` (no per-persona store available) is a safe
             # floor: without a place to persist a checkpoint, a mid/beefy box
@@ -740,12 +728,12 @@ def _run_judge_selftune_tick(*, store, now: datetime, persona_dir: Path | None =
             # knob-refit (the supervisor always passes persona_dir; None only
             # arises in unit tests exercising the weak path or the gate/tier
             # logic).
-            if tune_grade != TUNE_GRADE_KNOB_REFIT and persona_dir is None:
+            if tune_grade != dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT and persona_dir is None:
                 logger.info(
                     "judge self-tune: tune_grade=%s but no persona_dir — floor to knob-refit",
                     tune_grade,
                 )
-            result["method"] = TUNE_GRADE_KNOB_REFIT
+            result["method"] = dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
             from brain.memory.relevance_judge import judge_knob_key
 
             cur = None

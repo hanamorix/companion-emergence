@@ -4,15 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import pytest
-
 from brain.narrative_memory.arc import Arc, ArcMember
-from brain.narrative_memory.policy import (
-    ARC_STALE_LIVED_HOURS,
-    MAX_ARC_MEMBERS,
-    should_close,
-    should_open,
-)
+from brain.narrative_memory.policy import should_close, should_open
 
 
 @dataclass
@@ -49,11 +42,6 @@ def _arc(
         lived_age_at_close=None,
         members=members,
     )
-
-
-def test_constants_match_spec():
-    assert ARC_STALE_LIVED_HOURS == pytest.approx(72.0)
-    assert MAX_ARC_MEMBERS == 50
 
 
 def test_should_close_at_exactly_72_hours_lived():

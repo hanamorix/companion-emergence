@@ -87,7 +87,7 @@ def _haiku_decision_count(haiku_label_json: str | None) -> int:
 
 def _selftune_week_cutoff(now: datetime | None) -> str:
     """The rolling one-week cutoff (F2c inc8, spec §3/AC14): `now` minus ONE
-    weekly self-tune cadence (`judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`, read
+    weekly self-tune cadence (`dev_constants.JUDGE_TUNE_INTERVAL_HOURS`, read
     at call time — derived from the weekly cadence, not a second hand-typed
     "7 days"), rendered in the exact text format SQLite's `CURRENT_TIMESTAMP`
     writes into `calibration_log.logged_at` (`YYYY-MM-DD HH:MM:SS`, UTC), so a
@@ -97,16 +97,11 @@ def _selftune_week_cutoff(now: datetime | None) -> str:
     compare would keep a row up to ~8 days, and the owner's rule is that
     nothing is kept past a week. Note: this follows the weekly-cadence
     CONSTANT; `supervisor.run_folded`'s `judge_selftune_interval_s` defaults
-    to that same constant and differs from it only in tests.
-
-    Imported lazily so this module gains no import-time dependency on
-    `judge_selftune` (which imports this module's siblings)."""
-    from brain.memory import judge_selftune
-
+    to that same constant and differs from it only in tests."""
     ref = now if now is not None else datetime.now(UTC)
     if ref.tzinfo is not None:
         ref = ref.astimezone(UTC)
-    return (ref - timedelta(hours=judge_selftune.JUDGE_TUNE_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    return (ref - timedelta(hours=dev_constants.JUDGE_TUNE_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _coerce_utc(ts: str) -> datetime:
