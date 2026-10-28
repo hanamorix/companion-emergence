@@ -55,6 +55,7 @@ _ST_REF = "108bb6c5 fix(recall): per-message rerank width, always-merged keyword
 _TIER_REF = "44af2447 Choose each job's model with one line in the user tunables file"
 _IDLE_REF = "1f69f189 feat(ram-spike-fix): one shared chat-idle lull + is_chat_idle gate for every background caller (INC-6)"
 _DEVCONST_REF = "#531 shared-settings guard, the constants move into brain/dev_constants.py (draft PR #553)"
+_GUARD_REF = "#531 shared-settings guard (draft PR #553)"
 _JSON_REF = "b826f01b refactor(brain): one shared JSON reader/writer for every JSON file read and write (#439)"
 
 # Every public writer and helper of brain/utils/atomic_write.py except save_with_backup_text (attempt_heal imports that).
@@ -502,6 +503,12 @@ REMOVED: tuple[Removed, ...] = (
         ref=_DEVCONST_REF,
         kind="code",
         scope=("brain/memory", "brain/bridge"),
+    ),
+    Removed(
+        names=("tests/unit/brain/bridge/test_model_guard.py",),
+        why="the model guard is the model case of the shared-settings guard (tests/shared_settings.py and tests/unit/test_shared_settings_guard.py); one guard, not two",
+        ref=_GUARD_REF,
+        kind="file",
     ),
 )
 
