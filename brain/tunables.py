@@ -133,12 +133,15 @@ def get_tunable(key: str, default: Any) -> Any:
     return value
 
 
-def positive_or_default(key: str, value: Any, default: Any) -> Any:
+def positive_or_default(key: str, value: Any, default: Any, largest: float | None = None) -> Any:
     """Return *value* (what ``get_tunable`` returned for *key*) when it is an int or a float that is finite and above 0, else *default*.
 
     For a setting that is a duration or a size cap: ``get_tunable`` checks the type only, so a hand-edited ``0``, a
     negative number, ``nan`` or ``inf`` reaches the code (a loop that never waits, an upload cap that refuses everything).
-    A rejected value (a bool or a non-number too, for a direct caller) is logged once per key and value, naming both.
+    *largest*, when a reader has one, is the biggest value it can use (inclusive, for example the longest wait the platform
+    allows); a value above it is rejected the same way, not clamped. Without it any finite number above 0 is kept, so a reader
+    whose consumer has a limit passes it. A rejected value (a bool or a non-number too, for a direct caller) is logged once
+    per key and value, naming both and the limit.
     *default* is the setting's registered default, which the caller passes the same way it passes it to ``get_tunable``.
     Only the readers that need it call this; ``register`` takes no bounds.
     """
@@ -147,6 +150,7 @@ def positive_or_default(key: str, value: Any, default: Any) -> Any:
         and not isinstance(value, bool)
         and value > 0
         and (not isinstance(value, float) or math.isfinite(value))
+        and (largest is None or value <= largest)
     ):
         return value
     try:
@@ -159,8 +163,8 @@ def positive_or_default(key: str, value: Any, default: Any) -> Any:
         _warned_keys.add(seen)
     if first:
         logger.warning(
-            "tunables: value %r=%s is not a finite number above 0; using the default %r",
-            key, shown, default,
+            "tunables: value %r=%s is not a finite number above 0%s; using the default %r",
+            key, shown, "" if largest is None else f" and at most {largest!r}", default,
         )
     return default
 

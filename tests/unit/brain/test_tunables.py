@@ -172,3 +172,51 @@ def test_positive_or_default_never_raises_on_a_value_that_cannot_be_printed(tuna
         assert tunables.positive_or_default("a.b", _NoRepr(), 60.0) == 60.0
         assert tunables.positive_or_default("a.b", -(10**5000), 60.0) == 60.0  # longer than int-to-str allows
     assert len(caplog.records) == 2
+
+
+# --- positive_or_default with `largest`: a value above the limit the reader can use is invalid, like one not above 0 (#531) ---
+
+_LIMIT = 100.0
+
+
+@pytest.mark.parametrize("value", [_LIMIT, int(_LIMIT), math.nextafter(_LIMIT, 0), 1e-9, 7])
+def test_positive_or_default_with_a_limit_keeps_a_value_up_to_and_including_it(tunables, value, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", value, 60.0, largest=_LIMIT) == value
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("value", [math.nextafter(_LIMIT, math.inf), int(_LIMIT) + 1, 10**400, 1e300])
+def test_positive_or_default_with_a_limit_returns_the_default_above_it_and_says_why(tunables, value, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", value, 60.0, largest=_LIMIT) == 60.0
+        assert tunables.positive_or_default("a.b", value, 60.0, largest=_LIMIT) == 60.0
+    texts = [r.getMessage() for r in caplog.records]
+    assert len(texts) == 1, texts  # once per key and value
+    assert "a.b" in texts[0] and "60.0" in texts[0] and repr(_LIMIT) in texts[0] and "above 0" in texts[0], texts
+
+
+@pytest.mark.parametrize("value", [0, -1, math.nan, math.inf, True, "fast", None])
+def test_positive_or_default_with_a_limit_still_rejects_what_it_rejected_without_one(tunables, value, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", value, 60.0, largest=_LIMIT) == 60.0
+    assert len(caplog.records) == 1
+
+
+def test_positive_or_default_without_a_limit_does_not_mention_one(tunables, caplog):
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", -1, 60.0) == 60.0
+        assert tunables.positive_or_default("a.c", 10**400, 60.0, largest=None) == 10**400
+    texts = [r.getMessage() for r in caplog.records]
+    assert len(texts) == 1 and "at most" not in texts[0], texts
+
+
+def test_positive_or_default_with_a_limit_never_raises_on_a_value_that_cannot_be_printed(tunables, caplog):
+    class _NoRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("no repr")
+
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", _NoRepr(), 60.0, largest=_LIMIT) == 60.0
+        assert tunables.positive_or_default("a.b", 10**5000, 60.0, largest=_LIMIT) == 60.0  # longer than int-to-str allows
+    assert len(caplog.records) == 2

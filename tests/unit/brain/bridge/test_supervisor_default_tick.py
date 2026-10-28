@@ -8,6 +8,7 @@ the setting"; an explicit value, including ``0.0``, still wins.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from pathlib import Path
 
@@ -118,4 +119,62 @@ def test_a_bad_tick_setting_reads_as_the_default_and_is_logged_once(monkeypatch,
         tunables.set_values({_KEY: 7.5})
         caplog.clear()
         assert embedding_backfill.tick_interval_seconds() == 7.5
+    assert caplog.records == []
+
+
+# A tick above threading.TIMEOUT_MAX is a value the platform does not allow as a wait timeout: Event.wait raises OverflowError
+# for it and ends the supervisor, so it reads as the registered default too (#531). The limit differs per platform, so the
+# tests build every value from the constant.
+def _over_the_wait_limit() -> tuple[float, ...]:
+    return (
+        math.nextafter(threading.TIMEOUT_MAX, math.inf),
+        threading.TIMEOUT_MAX * 2,
+        threading.TIMEOUT_MAX * 1e3,
+    )
+
+
+def test_a_tick_above_the_wait_limit_runs_the_loop_at_the_registered_default(tmp_path, monkeypatch) -> None:
+    persona_dir = tmp_path / "persona"
+    (persona_dir / "active_conversations").mkdir(parents=True)
+    default = embedding_backfill._TICK_INTERVAL_SECONDS_DEFAULT  # noqa: SLF001
+    tunables.set_values({_KEY: 7.5})
+    waits = _waits_of_one_loop(persona_dir, monkeypatch)
+    assert 7.5 in waits and default not in waits, waits  # the loop follows the setting, so the next phases mean something
+
+    for too_long in _over_the_wait_limit():
+        tunables.set_values({_KEY: too_long})
+        waits = _waits_of_one_loop(persona_dir, monkeypatch)
+        assert default in waits and too_long not in waits, (too_long, waits)
+
+    for allowed in (threading.TIMEOUT_MAX, math.nextafter(threading.TIMEOUT_MAX, 0)):
+        tunables.set_values({_KEY: allowed})
+        waits = _waits_of_one_loop(persona_dir, monkeypatch)
+        assert allowed in waits and default not in waits, (allowed, waits)  # the limit itself is allowed
+
+    # The platform really accepts the limit as a wait timeout (a timer ends the wait at once; no OverflowError).
+    event = threading.Event()
+    timer = threading.Timer(0.05, event.set)
+    timer.start()
+    try:
+        assert event.wait(timeout=threading.TIMEOUT_MAX) is True
+    finally:
+        timer.cancel()
+        timer.join()
+
+
+def test_a_tick_above_the_wait_limit_reads_as_the_default_and_is_logged_once(monkeypatch, caplog) -> None:
+    default = embedding_backfill._TICK_INTERVAL_SECONDS_DEFAULT  # noqa: SLF001
+    monkeypatch.setattr(tunables, "_warned_keys", set())
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        for too_long in _over_the_wait_limit():
+            tunables.set_values({_KEY: too_long})
+            caplog.clear()
+            assert embedding_backfill.tick_interval_seconds() == default
+            assert embedding_backfill.tick_interval_seconds() == default
+            texts = [r.getMessage() for r in caplog.records]
+            assert len(texts) == 1 and _KEY in texts[0] and repr(too_long) in texts[0], (too_long, texts)
+            assert repr(threading.TIMEOUT_MAX) in texts[0], texts  # the text names the limit
+        tunables.set_values({_KEY: threading.TIMEOUT_MAX})
+        caplog.clear()
+        assert embedding_backfill.tick_interval_seconds() == threading.TIMEOUT_MAX
     assert caplog.records == []

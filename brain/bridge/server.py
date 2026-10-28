@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -256,6 +257,30 @@ def _resolve_image_ext(images_dir: Path, sha: str) -> str | None:
         if (images_dir / f"{sha}.{ext}").exists():
             return ext
     return None
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
+    """Read an upload, at most ``max_bytes + 1`` bytes: one over the cap, so the caller can tell the body overran it.
+
+    Never asks the file for more than it holds. A read of a spooled file converts its size argument to a C ``Py_ssize_t``
+    (an ``OverflowError`` above ``sys.maxsize``) and, for a body that rolled to a disk file, allocates that many bytes up
+    front (a ``MemoryError`` for a large one), so reading ``max_bytes + 1`` straight away would make a large
+    ``files.upload_max_bytes`` fail every upload however small the body. ``UploadFile.size`` is the bytes written to the file
+    (starlette's multipart parser creates it with ``size=0`` and ``write`` counts); when it is None the file is read in pieces
+    of at most ``shutil.COPY_BUFSIZE`` until ``max_bytes + 1`` bytes were read or the file ends.
+    """
+    limit = max_bytes + 1
+    if file.size is not None:
+        return await file.read(min(limit, file.size))
+    pieces: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        piece = await file.read(min(remaining, shutil.COPY_BUFSIZE))
+        if not piece:
+            break
+        pieces.append(piece)
+        remaining -= len(piece)
+    return b"".join(pieces)
 
 
 def _respond_blocking(
@@ -2698,10 +2723,11 @@ def build_app(
         s: BridgeAppState = app.state.bridge
         declared_media_type = (file.content_type or "").lower()
         # Read up to the cap + 1 so overrun is detectable without buffering
-        # arbitrarily large payloads in memory. One cap for images and files:
-        # the files.upload_max_bytes setting.
+        # arbitrarily large payloads in memory, and never more than the body
+        # holds (a large cap must not reach the read). One cap for images and
+        # files: the files.upload_max_bytes setting.
         max_bytes = file_store.upload_max_bytes()
-        raw = await file.read(max_bytes + 1)
+        raw = await _read_upload_capped(file, max_bytes)
         if len(raw) > max_bytes:
             raise HTTPException(
                 status_code=413,
