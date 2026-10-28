@@ -1,7 +1,5 @@
 from datetime import UTC, datetime
 
-import pytest
-
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.engine import _apply_memory_restores, _build_restore_plan, _repair_edges
@@ -12,7 +10,6 @@ def _mem(mid):
                   created_at=datetime(2026, 4, 1, tzinfo=UTC))
 
 
-@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_repair_restores_and_sweeps(tmp_path):
     persona = tmp_path / "P"
     persona.mkdir()

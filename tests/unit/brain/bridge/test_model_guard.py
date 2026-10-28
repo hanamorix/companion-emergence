@@ -514,7 +514,7 @@ def _scan_brain() -> tuple[tuple[str, ...], frozenset[tuple[str, str, str]]]:
     return tuple(offenders), frozenset(used)
 
 
-@pytest.mark.slow(reason='6.0 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='4.8 s of CPU in its call phase on a 4-core dev VM, 4.8 s wall (serial run for #540, J12)')
 def test_no_model_choice_outside_the_accessor_anywhere_in_brain() -> None:
     """C16: G1-G5 pass on the final tree, provider.py included."""
     offenders, _used = _scan_brain()

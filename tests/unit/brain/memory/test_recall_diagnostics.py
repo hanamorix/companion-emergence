@@ -386,7 +386,6 @@ def test_prune_default_window_is_the_calibration_logs_retention_tunable(tmp_path
 # --- INV-I13a: os.replace failure is fail-soft, original intact --------------
 
 
-@pytest.mark.slow(reason='2.1 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("exc", [PermissionError("held open (Windows)"), OSError("disk error")])
 def test_prune_survives_os_replace_raising_and_leaves_the_original_intact(
     tmp_path, monkeypatch, caplog, exc

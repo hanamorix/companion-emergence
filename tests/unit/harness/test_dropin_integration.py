@@ -41,7 +41,6 @@ def build(tmp_path_factory: pytest.TempPathFactory):
     return ingest_version(_worktree_root(), dest, on_existing="delete", deps="auto", install_guard=True)
 
 
-@pytest.mark.slow(reason='52.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c7_real_brain_positive_resolves_under_copy_and_boots(build, tmp_path: Path) -> None:
     # POSITIVE: the venv python imports the REAL brain + brain.mcp_server, resolving under the copy
     # (hook ran and passed; deps installed so the import succeeds).

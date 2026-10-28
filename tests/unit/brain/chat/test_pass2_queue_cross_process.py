@@ -96,7 +96,6 @@ Path(result_path).write_text(str(done))
 """
 
 
-@pytest.mark.slow(reason='2.2 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_two_concurrent_drainers_second_leaves_queue_untouched(tmp_path):
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
@@ -191,7 +190,6 @@ def _run_killable_drain(persona_dir: Path, side_file: Path, mode: str, ready_pat
     ])
 
 
-@pytest.mark.slow(reason='2.0 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize("mode", ["before", "mid_item"])
 def test_sigkill_then_restart_none_lost(tmp_path, mode):
     persona_dir = tmp_path / "persona"

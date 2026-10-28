@@ -174,7 +174,6 @@ def _sum_model_width(cand: list[int], anchors: list[int], rate: float, budget: f
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c1a_i_first_rerank_is_five_real_plus_two_anchors_after_two_discarded_warmups(
     clock: _Clock,
 ) -> None:
@@ -278,7 +277,6 @@ def test_no_estimate_before_any_measurement() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c1a_iii_long_candidate_inside_short_prefix_stops_the_width(clock: _Clock) -> None:
     """Six short candidates, then one long one: padding the batch to the long
     pair makes the 7-candidate prefix cost 10 x 1000 tokens, although the
@@ -335,7 +333,6 @@ def test_c1a_iii_fit_matches_the_independent_reference(
     )
 
 
-@pytest.mark.slow(reason='5.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_fit_is_the_minimum_before_the_first_measurement() -> None:
     assert fit_rerank_width([5000] * 50, _anchor_pair_tokens(), None, 0.001, None) == 5
     assert fit_rerank_width([10] * 3, _anchor_pair_tokens(), None, 4.0, None) == 3
@@ -588,7 +585,6 @@ def test_s75_cjk_and_emoji_candidates_are_costed_by_tokens_not_characters(clock:
     assert width_cjk < width_latin, "a CJK-heavy pool gets a narrower rerank than a Latin one"
 
 
-@pytest.mark.slow(reason='5.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_s75_rerank_for_recall_sizes_the_width_in_tokens(clock: _Clock) -> None:
     """End to end through `rerank_for_recall` with a seeded estimate: the same
     ten candidates, equal in characters, get a wide rerank as Latin text and a
@@ -802,7 +798,6 @@ def test_inflated_first_sample_absorbs_every_message_without_the_remeasure_job(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='3.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_cross_encoder_rerank_timed_excludes_time_waiting_for_the_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -976,7 +971,6 @@ def test_s203_with_an_empty_database_and_a_readable_rss_the_first_rerank_waits_f
     _assert_held_back(provider, rerank_for_recall(provider, _QUERY, _docs(50, 100), budget_seconds=4.0))
 
 
-@pytest.mark.slow(reason='5.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_s206_with_an_unreadable_rss_the_turn_is_not_held_back_and_the_first_rerank_is_time_bound(
     clock: _Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

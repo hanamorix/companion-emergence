@@ -14,8 +14,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from brain.bridge.supervisor import _run_calibration_tick
 from brain.memory import judge_lora, relevance_judge
 from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
@@ -100,7 +98,6 @@ def test_tick_ignores_a_legacy_full_sub_store(monkeypatch) -> None:
         assert seen == [None], f"a legacy full/ sub-store must not be served, got {seen}"
 
 
-@pytest.mark.slow(reason='4.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_no_cross_persona_bleed(monkeypatch) -> None:
     seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:

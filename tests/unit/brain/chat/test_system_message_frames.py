@@ -110,7 +110,6 @@ def test_deferred_d2_prompt_size_canary(system_message: str):
     assert system_message.rstrip().endswith("the answer needs room.")
 
 
-@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_deferred_d2_volatile_tail_stays_small(persona_dir: Path):
     """Canary (D2), TEXT path: bound what actually precedes the reboot.
 

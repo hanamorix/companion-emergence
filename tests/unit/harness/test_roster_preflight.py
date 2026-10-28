@@ -90,7 +90,6 @@ def test_live_roster_raises_on_exited_child() -> None:
         rp._live_roster(dead, timeout=10.0)
 
 
-@pytest.mark.slow(reason='2.6 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_live_roster_raises_on_nonhandshaking_child() -> None:
     hang = [sys.executable, "-P", "-c", "import time; time.sleep(60)"]
     with pytest.raises(DropinMismatch, match="did not serve tools/list"):
@@ -100,7 +99,6 @@ def test_live_roster_raises_on_nonhandshaking_child() -> None:
 # --- C3: passes on a correctly-wired live child; ordering exercised in-process --------------------
 
 
-@pytest.mark.slow(reason='1.8 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_preflight_passes_on_live_child(tmp_path: Path, monkeypatch) -> None:
     persona = _seed_persona(tmp_path)
     build = _worktree_build()

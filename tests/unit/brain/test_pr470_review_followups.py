@@ -418,6 +418,7 @@ def _reference_find_json_object_block(text: str, prefer_key: str | None = None) 
     return first_object if first_object is not None else first_balanced
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_find_json_object_block_gives_the_same_result_as_before_on_every_short_reply():
     # PIN (passes before and after): every string up to 6 characters over the characters that matter to the scan (braces,
     # quotes, a backslash, a letter, a colon), for no preferred key and for one that can match.

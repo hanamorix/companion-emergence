@@ -202,7 +202,6 @@ def test_n19_the_reappraiser_message_fences_the_memory_and_escapes_known_names(p
     assert "x; rm" not in _listed(tmp), "an obeyed injection with a forbidden character is refused"
 
 
-@pytest.mark.slow(reason='3.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_n19_the_whole_text_is_still_sent(persona):
     tmp, store, _h = persona
     text = ("filler words " * 470) + "ENDMARKER"
@@ -218,7 +217,6 @@ def test_n19_the_whole_text_is_still_sent(persona):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='10.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_n20_known_names_are_the_listed_names_in_the_memory_as_display_forms(persona):
     tmp, store, _h = persona
     kn.admit_names(tmp, ["Tuesday"], "gate")

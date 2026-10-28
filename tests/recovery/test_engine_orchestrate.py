@@ -40,7 +40,6 @@ def _source_with_v(tmp_path):
 
 def test_source_equals_target_refused(tmp_path):
     p = _persona_with_dangling(tmp_path)
-    import pytest
     with pytest.raises(ValueError):
         run_recovery(p, source_dir=p, dry_run=False)
 
@@ -64,7 +63,6 @@ def test_real_run_restores_links_and_preserves_source(tmp_path):
     assert hashlib.sha256((src / "memories.db").read_bytes()).hexdigest() == src_before
 
 
-@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_recover_backup_includes_emotion_vocabulary(tmp_path):
     """The recover backup must preserve emotion_vocabulary.json, not just
     memories.db + hebbian.db. Omitting it is how `nell recover` silently dropped

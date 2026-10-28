@@ -28,6 +28,7 @@ def _iter_call_nodes(tree: ast.AST):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 2.0 s wall (serial run for #540, J12)')
 def test_lull_tunable_key_read_in_exactly_one_place() -> None:
     """AST-based functional-read count — a docstring/comment mentioning the key (tunables.py's own fence
     note, cli_throttle.py's module docstring, server.py's lifespan comment,

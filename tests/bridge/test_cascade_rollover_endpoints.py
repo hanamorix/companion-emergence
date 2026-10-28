@@ -23,7 +23,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -123,7 +122,6 @@ class _ExtractStub:
 
 
 # --------------------------------------------------------------------------- C8
-@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c8_idle_rollover_sync_and_selection(persona_dir: Path, tmp_path: Path, monkeypatch) -> None:
     _patch_fake_provider(monkeypatch)
     now = datetime.now(UTC)

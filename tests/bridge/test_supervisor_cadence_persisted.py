@@ -465,7 +465,6 @@ def _seed_labeled_calibration_rows(persona_dir: Path, n: int) -> None:
         store.close()
 
 
-@pytest.mark.slow(reason='5.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

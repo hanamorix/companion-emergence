@@ -223,7 +223,7 @@ def test_live_path_never_missing_at_any_step_boundary(tmp_path: Path, monkeypatc
     assert _version(p) == 6 and _version(d / "x.json.bak1") == 5
 
 
-@pytest.mark.slow(reason='1.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 0.7 s wall (serial run for #540, J12)')
 @pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.skipif(
     os.name == "nt",
@@ -273,7 +273,6 @@ def test_concurrent_reader_never_sees_live_path_missing(tmp_path: Path, monkeypa
     assert stats["missing"] == 0 and stats["bad"] == 0 and stats["backwards"] == 0, stats
 
 
-@pytest.mark.slow(reason='2.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_crash_at_every_step_leaves_a_complete_live_file(tmp_path: Path, monkeypatch) -> None:
     """C3: kill at every before/after boundary of every mutation, and mid-write of the temp file.
     Live is always one complete version, every backup at a final name is complete, the heal sees
@@ -747,7 +746,7 @@ def test_a_second_save_during_a_save_leaves_the_first_ones_temp_alone(
         _version(tmp_path / f"x.json.bak{i}")  # each backup is a complete version
 
 
-@pytest.mark.slow(reason='1.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.9 s of CPU in its call phase on a 4-core dev VM, 1.2 s wall (serial run for #540, J12)')
 @pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.skipif(
     os.name == "nt",

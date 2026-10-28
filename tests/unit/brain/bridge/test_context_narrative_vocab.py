@@ -12,6 +12,8 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from brain.bridge import provider
 from tests.source_tree import brain_trees
 
@@ -55,6 +57,7 @@ def _old_wording_hits(bound: list[str], docs: list[str]) -> list[str]:
     return hits
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on a 4-core dev VM, 1.3 s wall (serial run for #540, J12)')
 def test_c6_two_call_sites_of_the_print_prompt_formatter_both_pass_user_name() -> None:
     tree = ast.parse((_BRAIN / "bridge" / "provider.py").read_text(encoding="utf-8"))
     calls = [

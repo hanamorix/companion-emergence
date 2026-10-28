@@ -217,7 +217,7 @@ def scan_repo() -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='7.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='5.3 s of CPU in its call phase on a 4-core dev VM, 5.3 s wall (serial run for #540, J12)')
 def test_no_toml_io_outside_the_helper() -> None:
     offenders = scan_repo()
     assert not offenders, (

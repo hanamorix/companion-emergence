@@ -11,8 +11,6 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 import brain.bridge.daemon as daemon
 from brain.bridge import state_file
 
@@ -57,7 +55,6 @@ def test_cmd_start_leaves_lock_free_for_child_runner(tmp_path, monkeypatch):
 _WORKER_SCRIPT = str(Path(__file__).parent / "_runner_lock_worker.py")
 
 
-@pytest.mark.slow(reason='2.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c19a_two_cmd_starts_forced_into_handoff_window(tmp_path, monkeypatch, capsys):
     """C19(a): two `cmd_start` runs forced into the handoff window — the
     second launched after the first parent released its own pre-flight lock

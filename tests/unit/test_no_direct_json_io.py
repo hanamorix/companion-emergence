@@ -456,7 +456,7 @@ def format_observed(observed: dict[str, Counter[str]]) -> str:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='1.9 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_cs2_a_the_tree_matches_the_allowlist() -> None:
     allow = parse_allowlist(ALLOWLIST.read_text(encoding="utf-8"))
     errors, warns = compare(REPO, scan_repo(), allow)

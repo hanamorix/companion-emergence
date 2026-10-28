@@ -12,8 +12,6 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 from brain.bridge.provider import FakeProvider
 from brain.bridge.supervisor import _run_self_model_tick
 
@@ -501,7 +499,6 @@ def _clear_emotion_memories(persona_dir: Path) -> None:
         store.close()
 
 
-@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
     tmp_path: Path,
 ) -> None:

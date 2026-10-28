@@ -252,7 +252,6 @@ def test_c15d_due_needs_a_warmed_cached_provider(clock: _Clock, monkeypatch: pyt
     assert not _due(1.0), "not warmed: the session has not run"
 
 
-@pytest.mark.slow(reason='5.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c15d_conc9_once_per_lull_per_model_id(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
     # The estimate stays stuck after the run (one 1.2 s sample against a 40x
     # inflated one), and the run is within the budget (no "too long" verdict,
@@ -447,7 +446,6 @@ def _first_fit(predict, limit: int = 1000) -> int:
     raise AssertionError
 
 
-@pytest.mark.slow(reason='5.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c15f_1_first_period_single_size(clock: _Clock, monkeypatch: pytest.MonkeyPatch) -> None:
     t = Fraction(3, 10) * Fraction(_B)
     provider = _true_cost_provider(clock, float(t))

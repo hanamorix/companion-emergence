@@ -824,6 +824,7 @@ def test_judge_knob_calibration_per_persona_store_isolation() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore) -> None:
     """AC3 (gate): NOT more than a handful -> no fire. Exactly at the
     threshold is the boundary case (`> handful`, not `>=`)."""
@@ -836,6 +837,7 @@ def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore)
     assert store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE) is None, "marker untouched on no-fire"
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3 (gate): MORE than a handful -> fires, the marker records the
     firing timestamp, and every scanned row is marked consumed (red-team
@@ -868,7 +870,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     assert sorted(r["id"] for r in consumed_rows) == sorted(ids)
 
 
-@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.1 s of CPU in its call phase on a 4-core dev VM, 3.1 s wall (serial run for #540, J12)')
 def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -892,6 +894,7 @@ def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     )
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_tick_selects_tier_and_applies_oom_downgrade(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -915,6 +918,7 @@ def test_tick_selects_tier_and_applies_oom_downgrade(
     assert result["tune_grade"] == judge_selftune.TUNE_GRADE_LORA, "downgraded from full_ft"
 
 
+@pytest.mark.slow(reason='1.9 s of CPU in its call phase on a 4-core dev VM, 1.9 s wall (serial run for #540, J12)')
 def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*a, **k):
         raise RuntimeError("disk full")
@@ -935,6 +939,7 @@ def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: py
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.8 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: MemoryStore) -> None:
     """Scripted 'no-train' case: every seeded row is judge-labeled and has
     a non-None haiku_label position (the gate fires, `new_decisions` is
@@ -960,6 +965,7 @@ def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: Memor
     assert sorted(post_row_ids) == sorted(ids)
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_tick_fault_during_fit_leaves_rows_unconsumed(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

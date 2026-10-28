@@ -97,7 +97,7 @@ _FIXED_EVAL_ITEMS = [("query", "relevant"), ("tiny query", "irrelevant document"
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='25.8 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='17.2 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_full_ft_retrain_fn_trains_and_persists_a_full_model(
     tiny_model_dir: Path, tmp_path: Path
 ) -> None:
@@ -203,7 +203,7 @@ def test_full_ft_construction_sites_force_cpu_even_if_mps_reported_available(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='13.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='10.6 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_full_model_train_save_reload_reproduces_scores(tiny_model_dir: Path, tmp_path: Path) -> None:
     """The AC7 ANALOGUE for the full-FT tier: training a FULL CrossEncoder,
     saving it, and reloading via `load_full_scorer` reproduces the trained
@@ -262,7 +262,7 @@ def test_full_model_train_save_reload_reproduces_scores(tiny_model_dir: Path, tm
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='1.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.6 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_full_ft_retrain_fn_matches_champion_challenger_contract(tiny_model_dir: Path) -> None:
     retrain_fn = build_full_ft_retrain_fn(tiny_model_dir, epochs=1)
 
@@ -289,7 +289,7 @@ def test_full_ft_retrain_fn_matches_champion_challenger_contract(tiny_model_dir:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='2.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.6 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_full_ft_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Path) -> None:
     import torch
 
@@ -317,7 +317,7 @@ def _m3_logits(d: Path) -> np.ndarray:
     return np.array([float(ce.predict([p], activation_fn=lambda x: x)[0]) for p in _M3_EVAL])
 
 
-@pytest.mark.slow(reason='4.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.8 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_full_ft_continues_from_a_checkpoint(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

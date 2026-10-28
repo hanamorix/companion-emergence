@@ -173,7 +173,7 @@ def _test_files():
             yield path
 
 
-@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
     """C2 and C20: every removed name has zero hits, code AND comments/docstrings, in brain, the app, scripts and tests."""
     names = [n for n in _REMOVED_EVERYWHERE if n != "model_override"]

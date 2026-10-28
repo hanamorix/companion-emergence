@@ -1673,7 +1673,6 @@ def test_forced_final_pass_runs_the_json_text_branch_and_writes_nothing(tmp_path
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='3.0 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
 @pytest.mark.skipif(
     sys.platform == "win32",

@@ -219,6 +219,7 @@ def _hammer(*, duration_s: float) -> list[BaseException]:
     return errors
 
 
+@pytest.mark.slow(reason='3.4 s of CPU in its call phase on a 4-core dev VM, 3.5 s wall (serial run for #540, J12)')
 def test_c31c_registry_survives_concurrent_running_and_snapshot() -> None:
     """6 writer threads (each entering/exiting `running()` for its own name in
     a tight loop) plus 4 reader threads (`snapshot()` in a tight loop) for

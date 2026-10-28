@@ -206,7 +206,7 @@ def _no_adapter_files(d: Path) -> bool:
     return not any(d.rglob("adapter_config.json")) and not any(d.rglob("adapter_model*"))
 
 
-@pytest.mark.slow(reason='3.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.2 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_lora_then_merge_on_base_saves_a_plain_checkpoint_that_reproduces(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -238,7 +238,7 @@ def test_lora_then_merge_on_base_saves_a_plain_checkpoint_that_reproduces(
     assert [label_fn(p) for p in _EVAL_PAIRS] == [label_for_score(float(x))[0] for x in _logits(save)]
 
 
-@pytest.mark.slow(reason='1.8 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.8 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_save_dir_none_writes_nothing(tiny_model_dir: Path, tmp_path: Path) -> None:
     label_fn = build_lora_retrain_fn(
         tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
@@ -248,7 +248,7 @@ def test_save_dir_none_writes_nothing(tiny_model_dir: Path, tmp_path: Path) -> N
     assert not any(tmp_path.iterdir())
 
 
-@pytest.mark.slow(reason='2.9 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.4 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 @pytest.mark.parametrize("start_kind", ["merged", "full_ft"])
 def test_lora_then_merge_on_a_plain_checkpoint_starts_from_it(
     start_kind: str, tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -430,7 +430,7 @@ def test_retrain_fn_matches_judge_eval_champion_challenger_contract(tiny_model_d
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='2.2 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.2 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Path) -> None:
     """Same tiny model + same scripted triples + a fixed `torch.manual_seed`
     before each `retrain_fn` call -> reproducible-enough trained scores

@@ -47,6 +47,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
     if not slow_budget.enabled():
         return
+    if getattr(session.config.option, "numprocesses", None) and not hasattr(session.config, "workerinput"):
+        return  # the xdist controller runs no test; only the workers need the libraries
     import importlib
 
     for name in ("torch", "sentence_transformers", "onnxruntime", "fastembed"):
@@ -56,19 +58,39 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             pass
 
 
+_CALL_CPU = pytest.StashKey[float]()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
+    """Remember the CPU time (this process, all threads) the call phase used, for the slow-test budget."""
+    import time
+
+    start = time.process_time()
+    yield
+    item.stash[_CALL_CPU] = time.process_time() - start
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Iterator[None]:
-    """The slow-test budget (tests/slow_budget.py): a passing call phase over the budget, without a ``slow`` mark, fails."""
+    """The slow-test budget (tests/slow_budget.py): a passing call phase over the CPU budget, without a ``slow`` mark, fails."""
     outcome = yield
     from tests import slow_budget
 
     if call.when != "call" or not slow_budget.enabled():
         return
+    cpu = item.stash.get(_CALL_CPU, 0.0)
+    log = os.environ.get("KINDLED_SLOW_BUDGET_LOG")
+    if log and cpu > 0.5:
+        import json
+
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": item.nodeid, "cpu": round(cpu, 3), "wall": round(call.duration, 3)}) + "\n")
     report = outcome.get_result()
     if report.outcome != "passed" or hasattr(report, "wasxfail"):
         return
     message = slow_budget.over_budget(
-        call.duration,
+        cpu,
         slow_budget.budget_s(),
         has_slow_mark=item.get_closest_marker("slow") is not None,
         exempt=any(item.get_closest_marker(name) is not None for name in slow_budget.EXEMPT_MARKERS),

@@ -371,7 +371,7 @@ def impure_findings(tree: ast.AST, allowed: frozenset[str]) -> list[str]:
     return found
 
 
-@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 @pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
 def test_the_body_state_module_imports_only_pure_modules_and_calls_no_io() -> None:
     trees = brain_trees()

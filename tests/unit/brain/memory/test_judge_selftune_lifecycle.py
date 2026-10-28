@@ -236,6 +236,7 @@ GRADES = [judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT]
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on a 4-core dev VM, 1.3 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_accept_swaps_in_plain_checkpoint_rescores_knob_and_consumes_doc_having_only(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -288,6 +289,7 @@ def test_accept_swaps_in_plain_checkpoint_rescores_knob_and_consumes_doc_having_
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_revert_keeps_champion_uses_logged_knob_and_consumes_full_set(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -315,6 +317,7 @@ def test_revert_keeps_champion_uses_logged_knob_and_consumes_full_set(
     assert result["current"] == prior.name and result["start"] == prior.name
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_thin_haiku_data_falls_through_to_weak_knob_refit(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -340,6 +343,7 @@ def test_thin_haiku_data_falls_through_to_weak_knob_refit(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.8 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_fault_before_swap_leaves_pointer_reaps_staged_and_rows_unconsumed(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -361,6 +365,7 @@ def test_fault_before_swap_leaves_pointer_reaps_staged_and_rows_unconsumed(
     assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_knob_write_fault_leaves_prior_serving(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -383,6 +388,7 @@ def test_knob_write_fault_leaves_prior_serving(
     assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_first_ever_tune_knob_write_fault_leaves_base_serving(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -401,6 +407,7 @@ def test_first_ever_tune_knob_write_fault_leaves_base_serving(
     assert not any(_consumed(store, rid) for rid in _all_ids(ids))
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -432,7 +439,7 @@ def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='2.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.2 s of CPU in its call phase on a 4-core dev VM, 3.3 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize(
     ("week1", "week2"),
     [
@@ -466,7 +473,7 @@ def test_week_two_starts_from_week_one_champion_and_trains_on_its_own_rows(
     assert _current(tmp_path) == Path(env.builds[1]["staged"])
 
 
-@pytest.mark.slow(reason='2.5 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.3 s of CPU in its call phase on a 4-core dev VM, 2.3 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_week_after_a_revert_starts_from_the_unchanged_champion(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -492,6 +499,7 @@ def test_week_after_a_revert_starts_from_the_unchanged_champion(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.9 s of CPU in its call phase on a 4-core dev VM, 1.9 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("has_checkpoint", [False, True])
 @pytest.mark.parametrize(
     "grade",
@@ -531,7 +539,7 @@ def test_dispatch_matrix(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='2.4 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.2 s of CPU in its call phase on a 4-core dev VM, 3.3 s wall (serial run for #540, J12)')
 def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -559,7 +567,7 @@ def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     assert all(_consumed(store, rid) for rid in tick_rows) and set(_all_ids(ids)) <= set(tick_rows)
 
 
-@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.3 s of CPU in its call phase on a 4-core dev VM, 3.3 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("accept_week2", [True, False])
 def test_beefy_to_mid_drop_runs_lora_on_the_same_model(
     accept_week2: bool, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -592,7 +600,7 @@ def test_beefy_to_mid_drop_runs_lora_on_the_same_model(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='5.7 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='8.1 s of CPU in its call phase on a 4-core dev VM, 8.1 s wall (serial run for #540, J12)')
 def test_stored_dir_set_across_a_week_sequence(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -625,7 +633,7 @@ def test_stored_dir_set_across_a_week_sequence(
     assert _current(tmp_path).name == c3
 
 
-@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.4 s of CPU in its call phase on a 4-core dev VM, 3.4 s wall (serial run for #540, J12)')
 def test_refused_delete_is_not_raised_and_a_later_tick_reaps_it(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -660,6 +668,7 @@ def test_refused_delete_is_not_raised_and_a_later_tick_reaps_it(
     assert _current(tmp_path) == new and _stored_dirs(tmp_path) == {new.name}
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_pointer_to_a_legacy_adapter_dir_trains_from_base_and_is_not_reaped_early(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -687,6 +696,7 @@ def test_pointer_to_a_legacy_adapter_dir_trains_from_base_and_is_not_reaped_earl
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_one_personas_accept_does_not_touch_another_personas_store(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

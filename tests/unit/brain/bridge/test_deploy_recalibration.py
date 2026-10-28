@@ -195,6 +195,7 @@ def test_deploy_recalibration_does_not_refire_on_a_second_startup(monkeypatch):
         assert calls == ["fake-reranker"], "must fire on the first call only, never twice"
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_deploy_recalibration_does_not_refire_after_a_normal_daily_tick(monkeypatch):
     """AC10: once the out-of-cycle pass has landed a normalized floor, a
     SUBSEQUENT normal daily-cadence tick (`_run_calibration_tick`, which

@@ -145,7 +145,6 @@ def test_http_cors_allows_tauri_dev_origin(persona_dir_for_auth: Path, monkeypat
         assert "Authorization" in r.headers["access-control-allow-headers"]
 
 
-@pytest.mark.slow(reason='3.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_http_cors_allows_private_network_preflight_for_tauri_origin(
     persona_dir_for_auth: Path,
     monkeypatch,

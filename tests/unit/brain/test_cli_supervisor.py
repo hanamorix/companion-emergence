@@ -40,7 +40,6 @@ def test_supervisor_action_parses_with_required_persona(action: str) -> None:
     assert rc == 0
 
 
-@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize(
     "action",
     ["start", "run", "stop", "status", "restart", "tail-events", "tail-log"],
@@ -155,7 +154,6 @@ def test_supervisor_help_lists_all_seven_actions(capsys: pytest.CaptureFixture[s
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='2.6 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize(
     "origin",
     ["cli", "tauri", "tests", "launchd", "systemd", "task-scheduler"],
@@ -179,7 +177,6 @@ def _origin_in_service_text(text: str) -> str:
     return m.group(1)
 
 
-@pytest.mark.slow(reason='2.7 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_generated_service_files_use_origins_the_parser_accepts(tmp_path) -> None:
     """Contract test: whatever origin each platform's service-file generator
     emits, the supervisor CLI must accept it. Guards the generator↔parser seam

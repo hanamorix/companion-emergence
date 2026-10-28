@@ -742,7 +742,7 @@ def test_cs3d_the_machine_id_is_created_through_an_atomic_exclusive_link(
     assert (real_machine_id / "machine_id").read_text() == ident
 
 
-@pytest.mark.slow(reason='2.4 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 0.9 s wall (serial run for #540, J12)')
 def test_cs6c_concurrent_records_and_flushes_lose_no_sample(store: MemoryStore, series: CostSeries) -> None:
     """Threads recording while another flushes: after a final flush every sample
     is in the database exactly once (the buffer's take-out and the appends are

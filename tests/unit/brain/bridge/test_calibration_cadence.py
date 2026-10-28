@@ -192,7 +192,6 @@ def test_calibration_tick_judge_failure_does_not_crash_and_prune_already_committ
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_calibration_tick_derives_floor_for_the_current_reranker_model_id(monkeypatch):
     """The tick must derive a floor for the CURRENT production reranker's
     model_id (`resolve_reranker_model_id()`), not a stale or

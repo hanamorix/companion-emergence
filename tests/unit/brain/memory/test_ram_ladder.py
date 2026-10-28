@@ -618,7 +618,6 @@ def test_the_dominating_shapes_growth_is_its_mean_over_its_samples(store, monkey
     assert provider.timed and provider.timed[0] == (1, 512)
 
 
-@pytest.mark.slow(reason='1.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_headroom_is_read_fresh_before_every_rung(store, monkeypatch) -> None:
     readings = iter([5e12, 5e12])  # the warm-up check and the first rung's; every later read is 0.0
     monkeypatch.setattr(reranker_mod, "_available_ram_headroom_bytes", lambda: next(readings, 0.0))
@@ -1110,7 +1109,6 @@ def _first_batch_rung_prediction(store, monkeypatch) -> float:
     return rungs[0]
 
 
-@pytest.mark.slow(reason='2.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_phase_two_rungs_are_sized_by_the_prediction_times_the_factor(tmp_path, monkeypatch) -> None:
     def pass_at(name: str, factor: float, headroom: float | None) -> ScriptedLadderProvider | float:
         monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", factor)

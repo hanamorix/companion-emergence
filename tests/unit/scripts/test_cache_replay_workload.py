@@ -1099,7 +1099,6 @@ def test_k2_a_corrupt_line_inside_the_runs_rows_is_unmeasured_with_one_warning_f
     assert summary["c9_history_caching"]["last_turn_cache_creation"] is None  # attribution failed, run ends with a plain turn
 
 
-@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k2_the_old_file_ending_without_a_newline_does_not_hide_the_runs_first_row(tmp_path, monkeypatch):
     def before(pd):
         _usage_file(pd).write_text("{torn", encoding="utf-8")  # no newline: the first run row is glued to it in the file
@@ -1114,7 +1113,6 @@ class _DebugWriter(_Scripted):
             fh.write(json.dumps({"call_type": "chat", "system_sha256": "run"}) + "\n")
 
 
-@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k2_the_debug_log_uses_the_same_slice_and_never_crashes_the_replay(tmp_path, monkeypatch):
     def before(pd):
         (pd / "cache_debug.jsonl").write_text(json.dumps({"call_type": "chat", "system_sha256": "old"}) + "\n", encoding="utf-8")
@@ -1139,7 +1137,6 @@ class _TruncatesAt1(_Scripted):
             _usage_file(self.persona_dir).write_text("", encoding="utf-8")
 
 
-@pytest.mark.slow(reason='1.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k2_a_log_that_shrinks_during_the_run_is_unmeasured_for_every_provider(tmp_path, monkeypatch):
     big_old = "".join(json.dumps(row(5, 5, call_type="generate")) + "\n" for _ in range(60))  # far bigger than the run
     summary, _, _ = _replay(
@@ -1172,7 +1169,6 @@ class _WritesOnlyATornLine(_Scripted):
         return self._fake.chat(messages, tools=tools, options=options)
 
 
-@pytest.mark.slow(reason='2.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k2_a_skipped_line_beats_not_applicable(tmp_path, monkeypatch):
     for provider in ("fake", "ollama"):
         summary, _, _ = _replay(
@@ -1313,7 +1309,6 @@ def test_k4_last_turn_cache_creation_is_the_last_content_turn_for_every_flag_com
     assert summary["chat_rows_observed"] == len(script)
 
 
-@pytest.mark.slow(reason='2.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_k4_attribution_follows_the_byte_boundaries_not_positions(tmp_path, monkeypatch):
     # a content turn logging two chat rows: the last chat row of the last content turn counts
     two_rows = [(12003, 6449, 1), (12099, 6449, 1)]

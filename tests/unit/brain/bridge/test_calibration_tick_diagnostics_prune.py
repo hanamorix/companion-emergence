@@ -160,7 +160,7 @@ def test_a_tick_that_defers_for_a_busy_session_does_not_prune(
     assert _tags(tmp_path) == {"old", "today"}
 
 
-@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_the_window_is_the_calibration_retention_tunable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -218,6 +218,7 @@ def _prune_call_sites(root: Path) -> set[str]:
     return sites
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 def test_the_prune_has_no_call_site_outside_the_supervisor() -> None:
     """The diagnostics prune is a tick job, never a recall-path call (the calibration
     prune's own rule: off the hot path, I6). The scan sees every import spelling."""

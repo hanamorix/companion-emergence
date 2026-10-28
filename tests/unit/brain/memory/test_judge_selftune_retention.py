@@ -119,6 +119,7 @@ def _tick(store: MemoryStore, now: datetime = NOW) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_r1_five_day_old_haiku_decisions_survive_prune_are_counted_and_trained_on(store) -> None:
     n = HANDFUL + 5
     ids = _seed_many(store, n, timedelta(days=5))
@@ -138,6 +139,7 @@ def test_r1_five_day_old_haiku_decisions_survive_prune_are_counted_and_trained_o
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 def test_r2a_week_old_haiku_decisions_are_not_counted_even_without_a_prune(store) -> None:
     ids = _seed_many(store, HANDFUL + 5, _week() + timedelta(hours=1))
 
@@ -148,6 +150,7 @@ def test_r2a_week_old_haiku_decisions_are_not_counted_even_without_a_prune(store
     assert not any(_consumed(store, rid) for rid in ids)
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_r2b_gate_boundary_is_rolling_on_logged_at(store) -> None:
     young = _seed(store, _week() - timedelta(hours=1))
     _seed(store, _week() + timedelta(hours=1))
@@ -204,6 +207,7 @@ def test_r3_rows_without_an_untrained_haiku_decision_keep_the_three_day_window(s
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_r4_tick_clears_the_held_rows_it_trained_on_and_keeps_in_window_rows(store) -> None:
     # The daily prune has run (it sets F2a's window); the rows it would hold are
     # then inserted directly, so this setup is identical at every commit.
@@ -249,6 +253,7 @@ def test_r4_clear_is_a_noop_before_any_prune(store) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", [judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT])
 def test_r4b_accept_week_clears_doc_having_rows_and_holds_the_2b_doc_absent_row(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -351,6 +356,7 @@ def test_r8_week_follows_the_weekly_cadence_constant(store, monkeypatch: pytest.
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.8 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 def test_r13_clear_fault_does_not_mark_the_tune_failed(store, monkeypatch: pytest.MonkeyPatch) -> None:
     ids = _seed_many(store, HANDFUL + 5, timedelta(days=1))
 
@@ -503,7 +509,7 @@ def test_b1ii_backward_clock_loses_nothing(store) -> None:
     assert _ids(store) == kept_forward | {during_skew}
 
 
-@pytest.mark.slow(reason='2.1 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='3.4 s of CPU in its call phase on a 4-core dev VM, 3.5 s wall (serial run for #540, J12)')
 def test_b1iii_backward_clock_never_double_counts(store) -> None:
     """Part (iii): rows a tick at the true `now` consumed (including rows
     logged after the backward `now`, i.e. "in the future" to it) are neither

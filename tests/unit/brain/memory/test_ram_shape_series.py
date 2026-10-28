@@ -188,7 +188,7 @@ def test_the_retired_per_token_series_is_deleted_by_the_first_shape_flush(
     )
 
 
-@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_the_flush_of_many_large_packed_shapes_does_not_overflow_sqlite(
     store, shapes, clock
 ) -> None:

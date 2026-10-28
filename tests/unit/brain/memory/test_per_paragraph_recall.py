@@ -321,7 +321,6 @@ def _base_coarse_cut(store: MemoryStore, embedder: _AxisEmbedder, query: str):
     return genuine_first_coarse_cut(scored, pool)
 
 
-@pytest.mark.slow(reason='3.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_one_paragraph_embeds_once_and_its_pool_equals_the_per_row_computation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

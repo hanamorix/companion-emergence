@@ -370,7 +370,7 @@ def test_c14c_a_cut_first_call_does_not_stop_the_rollover_and_the_replay_gets_th
     assert _json(replay)["session_id"] not in (None, _STALE)
 
 
-@pytest.mark.slow(reason='3.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on a 4-core dev VM, 1.2 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("failure", ["raises", "shutdown", "refused-registration"])
 def test_c14d_a_failed_rollover_answers_null(persona, stub, monkeypatch, raw_app, caplog, failure):
     from brain.bridge.cli_throttle import ShutdownDeferred
@@ -419,7 +419,6 @@ def _scan_blocked_until_health(monkeypatch, scan_threads: list[int], order: list
     monkeypatch.setattr(buffer, "list_active_sessions", _blocked_list)
 
 
-@pytest.mark.slow(reason='3.3 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, monkeypatch, raw_app):
     """While the launch decision's buffer scan is blocked, ``/health`` on the same loop completes; only then is the scan let go.
     So /health finishing first proves the loop was free; the scan's thread is not the loop's."""

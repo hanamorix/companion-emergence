@@ -64,7 +64,7 @@ def test_every_lean_invocation_site_is_classified():
     assert not (_BACKGROUND_SITES & _CHAT_SITES)
 
 
-@pytest.mark.slow(reason='2.1 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_chat_sites_are_reached_only_from_a_chat_turn():
     """The chat entry points are not refused (a running chat turn finishes, D21), so their callers must be the chat
     turn only: chat/tool_loop.py, the server's _StreamingProxy, and Ollama's own generate -> chat delegation (refused

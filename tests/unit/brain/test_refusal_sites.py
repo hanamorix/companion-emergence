@@ -470,7 +470,6 @@ def test_backfill_other_failure_is_charged_to_the_budget(backfill_env, persona, 
     assert budget.get_remaining(persona, now=now) == before - det.calls
 
 
-@pytest.mark.slow(reason='2.6 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_supplementary_budget_exhausted_defers_as_supplementary(backfill_env, persona, monkeypatch):
     """C39(e)."""
     from brain.attunement import budget

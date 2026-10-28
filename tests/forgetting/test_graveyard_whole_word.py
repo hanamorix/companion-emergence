@@ -207,7 +207,6 @@ def test_a_listed_name_found_only_in_the_domain_matches_nothing(tmp_path):
     assert _ids(search(tmp_path, "", names=["al"])) == ["name"]
 
 
-@pytest.mark.slow(reason='5.0 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_tool_does_not_match_the_domain_either(tmp_path):
     _domain_world(tmp_path)
     kn.admit_names(tmp_path, ["Al"], "tool")
@@ -338,7 +337,6 @@ def test_search_with_loss_passes_names_and_searches_a_name_only_turn(tmp_path):
 
 
 # G21 tool
-@pytest.mark.slow(reason='3.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_the_tool_is_whole_word_with_names_first(tmp_path):
     kn.admit_names(tmp_path, ["Al"], "tool")
     _write(tmp_path, [("a", "the rain came", "chat"), ("b", "a training day", "chat"), ("c", "Al waved", "chat"),

@@ -107,7 +107,6 @@ def test_hard_exit_with_calls_in_flight_stores_nothing_and_leaves_no_descendant(
     assert st.phase == "hard_exit" and not st.shutdown_clean
 
 
-@pytest.mark.slow(reason='2.3 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups")
 def test_sigint_to_the_process_group_leaves_the_claude_call_to_finish(tmp_path, bridges, monkeypatch):
     """C59 (D23): SIGINT to the runner's whole process group during an in-flight call: the fake claude is not killed,
@@ -126,7 +125,6 @@ def test_sigint_to_the_process_group_leaves_the_claude_call_to_finish(tmp_path, 
     assert st.phase == "stopped" and st.shutdown_clean and st.stop_reason == "os_signal"
 
 
-@pytest.mark.slow(reason='2.7 s on macos in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_sighup_leaves_the_claude_call_to_finish(tmp_path, bridges):
     """C64 (`claude` half): SIGHUP starts a graceful stop and does not kill the fake claude child."""
     b = Bridge(tmp_path, calls=(CALLS["generate"],), provider="claude-cli")

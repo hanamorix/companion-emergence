@@ -213,7 +213,6 @@ def test_the_picker_switch_ignores_the_old_id_until_it_is_configured_again(tmp_p
     assert "claude-opus-4-9" not in [r["model"] for r in model_error.state()]
 
 
-@pytest.mark.slow(reason='2.8 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_concurrent_saves_run_their_checks_one_at_a_time(tmp_path, monkeypatch) -> None:
     live = {"now": 0, "max": 0}
     lock = threading.Lock()

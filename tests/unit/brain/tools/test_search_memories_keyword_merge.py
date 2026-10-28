@@ -333,7 +333,6 @@ _QUERY_LIMITS = [
 ]
 
 
-@pytest.mark.slow(reason='1.5 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 @pytest.mark.parametrize(("query", "limit"), _QUERY_LIMITS)
 def test_lexical_results_equal_today_s_ranker_output(tmp_path: Path, query: str, limit: int) -> None:
     """The base-equality pin: with no listed name in the query, lexical mode

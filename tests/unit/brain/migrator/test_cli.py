@@ -687,7 +687,6 @@ def test_run_migrate_refuses_force_clobber_of_non_migrator_directory(
     assert (sub / "main.rs").exists()
 
 
-@pytest.mark.slow(reason='1.7 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_run_migrate_force_clobber_succeeds_when_marker_present(
     og_dir: Path, tmp_path: Path
 ) -> None:
@@ -713,7 +712,6 @@ def _migrate_lock_for(path: Path) -> Path:
     return path.parent / f".{path.name}.migrate.lock"
 
 
-@pytest.mark.slow(reason='1.9 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_run_migrate_releases_lock_on_success(og_dir: Path, tmp_path: Path) -> None:
     """A successful run leaves no migrate lockfile behind."""
     out = tmp_path / "migrated"

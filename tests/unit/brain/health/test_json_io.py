@@ -1399,7 +1399,7 @@ def test_cw1_write_json_matches_save_with_backup_byte_for_byte(
         assert _norm_crlf(b.read_bytes()) == _norm_crlf(a.read_bytes())
 
 
-@pytest.mark.slow(reason='5.2 s on windows in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
+@pytest.mark.slow(reason='2.2 s of CPU in its call phase on a 4-core dev VM, 2.2 s wall (serial run for #540, J12)')
 def test_cw2_concurrent_writers_raise_nothing_and_leave_a_whole_file_and_no_temps(
     tmp_path: Path,
 ) -> None:

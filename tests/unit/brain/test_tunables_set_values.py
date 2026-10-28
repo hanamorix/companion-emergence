@@ -257,7 +257,6 @@ def test_a_failed_verify_before_the_replace_leaves_the_file_unchanged(t, tmp_pat
     assert _bytes(tmp_path) == b'"a" = 1\n'
 
 
-@pytest.mark.slow(reason='4.0 s on ubuntu in CI runs 40593062549 and 40596717161 (junit time: setup, call and teardown); not yet reduced')
 def test_a_reader_polling_during_many_writes_never_sees_a_torn_or_default_value(t, tmp_path) -> None:
     """Replacement is atomic: an unchanged key never flickers to its default while another key is written many times."""
     write_text(tmp_path, '"keep" = 7\n')
