@@ -346,8 +346,9 @@ def test_scope_stops_the_real_header_build_from_asking_for_the_registry(
     with rj.offline_load_scope({"local_files_only": True}):
         headers = build_hf_headers(token=False)
     assert fresh_day == [], f"header building under the scope made requests: {fresh_day}"
-    assert "agent/" not in headers["user-agent"]
+    assert "torch/" not in headers["user-agent"], "the library still built its telemetry user agent under the scope"
 
     monkeypatch.setattr(detect_agent, "_registry", None, raising=True)
-    build_hf_headers(token=False)
+    outside = build_hf_headers(token=False)
+    assert "torch/" in outside["user-agent"]
     assert _registry_requests(fresh_day), "outside the scope the library no longer asks for the registry; this test would prove nothing"
