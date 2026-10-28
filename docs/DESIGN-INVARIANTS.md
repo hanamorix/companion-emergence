@@ -2,7 +2,7 @@
 
 Status: reviewed 2026-09-15 by ThinkerOfThoughts. I4 amended 2026-09-28 and 2026-09-29. I8 amended 2026-09-29 and 2026-10-22; the last clause of I8 was corrected on 2026-10-23 to match ThinkerOfThoughts's wording ("purely a crash recovery measure").
 
-These are standing architectural rules set by ThinkerOfThoughts. Every plan, spec, review and drift check for a change is checked against them, row by row. A line is added only with a recorded decision by ThinkerOfThoughts and its date; a line is removed only by ThinkerOfThoughts. The invariants were seeded on 2026-09-15 from recorded rulings by ThinkerOfThoughts and reviewed the same day. The emotion rework spec (`docs/source-spec/2026-10-28-emotion-rework-owner-half-design.md`, section 5) checks I1 to I14 against the rework.
+These are standing architectural rules set by ThinkerOfThoughts. Every plan, spec, review and drift check for a change is checked against them, row by row. A line is added only with a recorded decision by ThinkerOfThoughts and its date; a line is removed only by ThinkerOfThoughts. The invariants were seeded on 2026-09-15 from recorded rulings by ThinkerOfThoughts and reviewed the same day. The emotion rework spec (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`, section 5) checks I1 to I14 against the rework.
 
 | # | Invariant (one checkable sentence) | Why (ThinkerOfThoughts's reasoning, date, issues) |
 |---|---|---|
