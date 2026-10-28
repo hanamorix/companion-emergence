@@ -1191,7 +1191,7 @@ def _tracked_sync(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
 def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
-    tick_interval_s: float = 60.0,
+    tick_interval_s: float | None = None,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
@@ -1208,6 +1208,9 @@ def build_app(
     allowed_origins: WebSocket Origin header allowlist (extra defense
     against browser-based attacks if someone proxies localhost). "null"
     matches CLI/non-browser clients; "tauri://localhost" matches SP-8.
+
+    tick_interval_s: the supervisor's tick in seconds. None (default) leaves it to
+    ``run_folded``, which reads the ``embedding_backfill.tick_interval_seconds`` setting.
 
     background_threads: start the supervisor + compaction-backlog-migration
     threads in the lifespan. None (default) → ``not _background_threads_inhibited``,
@@ -2659,9 +2662,9 @@ def build_app(
         return {"ok": True}
 
     # ── POST /upload — file upload (images + non-image files) ──────────────
-    # Image upload limit (matches the spec D2 default; per-persona override
-    # via PersonaConfig.image_max_bytes can come later if needed).
-    _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # noqa: N806 — local frozen constant
+    # The kinds of image the byte sniff (brain.images.sniff_media_type) can recognise: the declared type of an upload
+    # is only cross-checked against the sniffed one for these. Not files.image_types, which says which images the
+    # read_file tool opens and can only narrow this set.
     _ALLOWED_UPLOAD_MEDIA_TYPES = frozenset(  # noqa: N806
         {"image/png", "image/jpeg", "image/webp", "image/gif"}
     )
@@ -2694,9 +2697,10 @@ def build_app(
 
         s: BridgeAppState = app.state.bridge
         declared_media_type = (file.content_type or "").lower()
-        # Read up to the larger of the two caps + 1 so overrun is detectable
-        # without buffering arbitrarily large payloads in memory.
-        max_bytes = max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes())
+        # Read up to the cap + 1 so overrun is detectable without buffering
+        # arbitrarily large payloads in memory. One cap for images and files:
+        # the files.upload_max_bytes setting.
+        max_bytes = file_store.upload_max_bytes()
         raw = await file.read(max_bytes + 1)
         if len(raw) > max_bytes:
             raise HTTPException(
@@ -2720,7 +2724,7 @@ def build_app(
                     status_code=422,
                     detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
                 )
-            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the 20 MB cap.
+            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the upload cap.
             record = await tracked_to_thread("upload", save_image_bytes, s.persona_dir, raw, sniffed)
             return {
                 "kind": "image",

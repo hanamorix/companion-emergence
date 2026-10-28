@@ -2,7 +2,8 @@
 
 run_folded() is a synchronous loop running two cadences:
 
-  * every ``tick_interval_s`` (default 60s): close stale sessions
+  * every ``tick_interval_s`` (default: the ``embedding_backfill.tick_interval_seconds``
+    setting, 60s): close stale sessions
   * every ``heartbeat_interval_s`` (default 900s = 15min): fire a
     heartbeat tick — memory decay, dream gate, reflex, growth, research
 
@@ -120,6 +121,9 @@ from brain.memory.embedding_backfill import (
 )
 from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
+)
+from brain.memory.embedding_backfill import (
+    tick_interval_seconds as _backfill_tick_interval_seconds,
 )
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.hebbian import HebbianMatrix
@@ -240,7 +244,7 @@ def run_folded(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus,
-    tick_interval_s: float = 60.0,
+    tick_interval_s: float | None = None,
     heartbeat_interval_s: float | None = 900.0,
     soul_review_interval_s: float | None = 6 * 3600.0,
     finalize_after_hours: float = 24.0,
@@ -326,6 +330,10 @@ def run_folded(
     ``judge_selftune._run_judge_selftune_tick``'s docstring for the scope
     note.
     """
+    # ``tick_interval_s`` None = the ``embedding_backfill.tick_interval_seconds`` setting, read once per entry. An
+    # explicit value, ``0.0`` included, wins (the tests pass tiny ones).
+    if tick_interval_s is None:
+        tick_interval_s = _backfill_tick_interval_seconds()
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
         persona_dir.name,

@@ -31,8 +31,9 @@ from brain.utils.atomic_write import save_blob_once
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
-# General upload cap. Defaults to >= the 20 MB /upload image cap so the
-# two caps are coherent (no "upload succeeds but store refuses" dead zone).
+# The upload cap: the one size limit of POST /upload, for images and other
+# files alike. read_file.py's image and PDF caps default to the same 20 MiB
+# (they are separate settings), so an image or PDF uploaded at the default is readable.
 _UPLOAD_MAX_BYTES = tunables.register(
     "files.upload_max_bytes", 20 * 1024 * 1024,
     description="Largest file you can upload, in bytes.",

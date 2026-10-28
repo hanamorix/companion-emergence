@@ -92,8 +92,8 @@ SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S: float = 0.1
 # meaningful drift signal and so calibration does not react to background
 # noise, not to shape user-visible behaviour the way the chat-idle lull
 # does — the behaviour threshold that DOES belong to I3 is the calibration's
-# own result, not this gate. See `brain.memory.judge_selftune.
-# JUDGE_TUNE_GATE_HANDFUL_DECISIONS`, which re-exports this value.
+# own result, not this gate. Read by `brain.memory.judge_selftune` where the
+# weekly tick applies it.
 JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
 
 # --- heartbeat decay batch time budget (S24, S45, S47) ---------------------

@@ -326,7 +326,7 @@ def test_count_new_haiku_decisions_all_none_rows_do_not_count(store: MemoryStore
     contribute ZERO to the count. The OLD `haiku_label IS NOT NULL` ROW
     count would have wrongly read this as `handful + 1` and fired the gate
     on zero new Haiku signal — exactly the bug AC3 requires closed."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     for _ in range(handful + 1):
         _seed_row_with_haiku_labels(store, [None, None, None])
     count, row_ids = store.count_new_haiku_decisions()
@@ -810,7 +810,7 @@ def test_judge_knob_calibration_per_persona_store_isolation() -> None:
 def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore) -> None:
     """AC3 (gate): NOT more than a handful -> no fire. Exactly at the
     threshold is the boundary case (`> handful`, not `>=`)."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_rows(store, handful)
     result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
     assert result["fired"] is False
@@ -824,7 +824,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     """AC3 (gate): MORE than a handful -> fires, the marker records the
     firing timestamp, and every scanned row is marked consumed (red-team
     fix F-1: per-row consumed marker, not a MAX(id) cursor)."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1)
     monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: 8.0 * 1024**3)  # weak box
     monkeypatch.setattr(judge_selftune, "_available_ram_headroom_bytes", lambda: None)
@@ -862,7 +862,7 @@ def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     fire's rows must not be double-counted (consume-once, F-1)."""
     monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: 8.0 * 1024**3)
     monkeypatch.setattr(judge_selftune, "_available_ram_headroom_bytes", lambda: None)
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_rows(store, handful + 1)
 
     r1 = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
@@ -883,7 +883,7 @@ def test_tick_selects_tier_and_applies_oom_downgrade(
     """End-to-end scaffold BITE: a beefy host-total RAM would naively pick
     full_ft, but a cgroup-capped effective headroom that only fits LoRA
     must downgrade the tick's actual selection."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_rows(store, handful + 1)
     monkeypatch.setattr(
         judge_selftune, "_read_total_ram_bytes",
@@ -930,7 +930,7 @@ def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: Memor
     pairs` returns `[]`, `fit_platt_knob` raises, and the tick's own
     try/except must catch that and leave every row unconsumed rather than
     silently losing the Haiku signal these rows carry."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1, raw_score=None)
 
     result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
@@ -956,7 +956,7 @@ def test_tick_fault_during_fit_leaves_rows_unconsumed(
     `test_tick_is_fault_isolated_never_raises`'s injection style), and the
     fault must still leave the rows unconsumed -- not just the "zero pairs"
     degenerate path above."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1, raw_score=2.0)
 
     def _boom(pairs):
@@ -996,14 +996,9 @@ def test_every_judge_selftune_threshold_is_a_registered_tunable() -> None:
 
 def test_gate_handful_decisions_is_a_dev_constant_not_a_tunable() -> None:
     """S26 (owner ruling): the self-tune gate is dev-level, not user-facing
-    — it must NOT be tunables.register()-ed, and its value must come from
-    brain.dev_constants (a different literal reintroduced in this module would not equal it). The value
-    itself is pinned by test_selftune_gate_is_200 in test_dev_constants.py and by the dev-constants snapshot."""
+    — it must NOT be tunables.register()-ed. The value itself is pinned by test_selftune_gate_is_200 in
+    test_dev_constants.py and by the dev-constants snapshot."""
     assert "judge_selftune.gate_handful_decisions" not in judge_selftune.tunables._registry
-    assert (
-        judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
-        == dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
-    )
 
 
 # ---------------------------------------------------------------------------

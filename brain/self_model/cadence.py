@@ -35,8 +35,9 @@ _CATCHUP_INTERVAL_S = 30 * 60.0
 # Backoff base: 30 min, then doubles (1h, 2h, …) capped at normal interval.
 _BACKOFF_BASE_S = 30 * 60.0
 
-# Throttle-deferral retry: matches run_folded's own tick_interval_s default
-# (brain/bridge/supervisor.py) - any value at or below that granularity is
+# Throttle-deferral retry: matches the supervisor's default tick, 60 s (the
+# embedding_backfill.tick_interval_seconds setting, read by run_folded in
+# brain/bridge/supervisor.py) - any value at or below that granularity is
 # equivalent, since the next real retry opportunity is gated by the
 # supervisor's own loop cadence regardless of a finer-grained number here.
 _DEFERRED_RETRY_INTERVAL_S = 60.0

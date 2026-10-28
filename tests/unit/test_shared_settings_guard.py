@@ -761,40 +761,27 @@ def test_ratchet_counts_findings_by_identity_without_line_numbers() -> None:
 
 # Violations that exist today: (rule, file, site, settings, reason). It is meant to shrink (see the module docstring).
 _IMAGE_TYPES = ("tunables:files.image_types",)
-_TICK = ("tunables:embedding_backfill.tick_interval_seconds",)
 _UPLOAD_CAPS = ("tunables:files.image_max_bytes", "tunables:files.pdf_max_bytes", "tunables:files.upload_max_bytes")
 ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
-    # The four kinds of image written out again beside files.image_types. The setting says which images the read_file tool
-    # opens; these constants say which images chat and upload accept. Same four, written independently.
+    # The four kinds of image written out beside files.image_types. Different purpose, decided from the code in #531: the
+    # setting says which images the read_file tool opens and can only narrow the set (the byte sniff recognises exactly these
+    # four and only they have a file extension), while these constants say which images chat, upload and the image store
+    # accept. Sharing one setting would let a user who drops a kind from the viewing list break storing it.
     ("R3-collection", "brain/bridge/chat.py", "assign _ALLOWED_MEDIA_TYPES", _IMAGE_TYPES,
-     "equal value, possibly a different purpose (the setting lists what the read_file tool opens, this lists what chat accepts); "
-     "whether they should share one setting is an owner call; predates the guard"),
+     "different purpose: the four kinds the byte sniff can recognise, which ImageBlock accepts; files.image_types is the "
+     "read_file viewing list and can only narrow it"),
     ("R3-collection", "brain/bridge/server.py", "assign _ALLOWED_UPLOAD_MEDIA_TYPES", _IMAGE_TYPES,
-     "equal value, possibly a different purpose (what upload accepts, a local constant of build_app); whether it should share "
-     "the setting is an owner call; predates the guard"),
+     "different purpose: the kinds an upload's declared type is cross-checked against the sniffed type for; "
+     "files.image_types is the read_file viewing list"),
     ("R3-collection", "brain/images.py", "assign _ALLOWED_MEDIA_TYPES", _IMAGE_TYPES,
-     "equal value, possibly a different purpose (what may be saved as an image blob); whether it should share the setting is "
-     "an owner call; predates the guard"),
-    # The 20 MiB upload cap, written out again where the upload route compares against it.
-    ("R3", "brain/bridge/server.py", "assign _IMAGE_MAX_BYTES", _UPLOAD_CAPS,
-     "real copy of the 20 MiB upload default, used as max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes()); predates the guard"),
-    # The supervisor's tick: embedding_backfill.tick_interval_seconds is documented as the assumed supervisor tick
-    # cadence, and the supervisor's own default of 60.0 is the same quantity written out a second time.
-    ("R3-loose", "brain/bridge/server.py", "param build_app.tick_interval_s", _TICK,
-     "same quantity (the supervisor tick; the tunable is its assumed cadence) written as a literal default; predates the guard"),
-    ("R3-loose", "brain/bridge/supervisor.py", "param run_folded.tick_interval_s", _TICK,
-     "same quantity (the supervisor tick; the tunable is its assumed cadence) written as a literal default; predates the guard"),
-    # Existing second names for a dev constant.
-    ("R5a", "brain/memory/judge_selftune.py", "assign JUDGE_TUNE_GATE_HANDFUL_DECISIONS",
-     ("dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS",),
-     "an existing re-export alias kept so that callers and tests read it under the old name; predates the guard"),
-    ("R5a", "brain/utils/sqlite_open.py", "assign busy_timeout_s", ("dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S",),
-     "frozen-dataclass field default holds the dev constant, frozen at import; predates the guard (the spec lists this one)"),
-    # The app mirrors the same cap.
+     "different purpose: the kinds the image store can save (beside _MEDIA_TYPE_TO_EXT); files.image_types is the "
+     "read_file viewing list"),
+    # The app mirrors the upload cap.
     ("APP-R3", "app/src/components/ChatPanel.tsx", "number 20971520", _UPLOAD_CAPS,
-     "real mirror of the 20 MiB upload cap (MAX_BYTES, applied to every staged file); predates the guard"),
+     "real copy of the 20 MiB upload cap (MAX_BYTES, applied to every staged file) that cannot read the setting: the "
+     "TypeScript cannot import the Python tunable; see the draft issue in the #531 records"),
 )
-ALLOW_SIZE = 9
+ALLOW_SIZE = 4
 
 
 @pytest.fixture(scope="module")

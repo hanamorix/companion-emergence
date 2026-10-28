@@ -64,6 +64,13 @@ def test_integrity_check_is_a_required_keyword() -> None:
         open_store_connection(":memory:", caller="TestStore")  # type: ignore[call-arg]
 
 
+def test_a_profile_has_no_default_timeout_of_its_own() -> None:
+    """The timeout is stated by whoever builds a profile (the two module profiles read the dev constant): a field
+    default would be a second copy frozen at class definition (#531)."""
+    with pytest.raises(TypeError):
+        OpenProfile()  # type: ignore[call-arg]
+
+
 def test_the_profile_is_two_fields_frozen_and_sourced_from_the_constant() -> None:
     assert [f.name for f in dataclasses.fields(OpenProfile)] == ["busy_timeout_s", "wal_fallback"]
     assert DEFAULT_PROFILE == OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, True)

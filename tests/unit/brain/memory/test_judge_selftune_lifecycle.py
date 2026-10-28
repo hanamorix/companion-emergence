@@ -118,10 +118,10 @@ def _set_tier(monkeypatch: pytest.MonkeyPatch, grade: str) -> None:
 
 def _small_tunables(monkeypatch: pytest.MonkeyPatch, *, gate: int = 2, min_n: int = 2) -> None:
     # The gate is a dev-level constant (not a tunable, S26) since the
-    # RAM-spike-fix INC-1 move — override the module attribute directly so
-    # the tick's plain-global read (`gate_handful = JUDGE_TUNE_GATE_HANDFUL_
+    # RAM-spike-fix INC-1 move — override the constant on brain.dev_constants
+    # so the tick's call-time read (`dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_
     # DECISIONS`) picks it up.
-    monkeypatch.setattr(judge_selftune, "JUDGE_TUNE_GATE_HANDFUL_DECISIONS", gate)
+    monkeypatch.setattr(dev_constants, "JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS", gate)
 
     real = judge_selftune.tunables.get_tunable
 

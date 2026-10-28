@@ -37,7 +37,7 @@ from tests.unit.brain.memory.test_judge_selftune_lifecycle import (
 )
 
 NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
-HANDFUL = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+HANDFUL = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
 
 
 def _week() -> timedelta:

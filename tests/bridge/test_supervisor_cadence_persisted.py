@@ -481,7 +481,7 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_calibration_rows(persona_dir, handful + 1)
     _neutralise(monkeypatch)
     stop = threading.Event()

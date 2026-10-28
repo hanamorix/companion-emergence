@@ -149,18 +149,21 @@ _CURSOR_FILE = "embedding_backfill_cursor.json"
 # Runtime-derived batch size (F1 #259 increment 3) — see module docstring.
 # ---------------------------------------------------------------------------
 
-# I7: the tick's own time budget and the assumed supervisor tick cadence are
-# ops tunables, not inline literals — registered like the existing
-# `throttle.*` keys (see brain/bridge/cli_throttle.py). `batch_budget_seconds`
-# leaves ~half of `tick_interval_seconds` as headroom so a slow entry (or a
-# tick that ran a little long already) still fits inside one supervisor tick.
+# I7: the tick's own time budget and the supervisor's tick are ops tunables,
+# not inline literals — registered like the existing `throttle.*` keys (see
+# brain/bridge/cli_throttle.py). `tick_interval_seconds` is the supervisor's
+# tick: `run_folded` waits that long between passes (read once per run), and
+# `_derive_batch_size` warns when the batch budget is not shorter than it.
+# `batch_budget_seconds` should leave ~half of it as headroom so a slow entry
+# (or a tick that ran a little long already) still fits inside one supervisor
+# tick.
 _BATCH_BUDGET_SECONDS_DEFAULT = tunables.register(
     "embedding_backfill.batch_budget_seconds", 30.0,
     description="Seconds one background pass may spend preparing older memories for search.",
 )
 _TICK_INTERVAL_SECONDS_DEFAULT = tunables.register(
     "embedding_backfill.tick_interval_seconds", 60.0,
-    description="How often, in seconds, the app assumes its background passes run. Used to size each batch.",
+    description="How often, in seconds, the app's background passes run.",
 )
 
 
@@ -170,7 +173,7 @@ def _batch_budget_seconds() -> float:
     )
 
 
-def _tick_interval_seconds() -> float:
+def tick_interval_seconds() -> float:
     return tunables.get_tunable(
         "embedding_backfill.tick_interval_seconds", _TICK_INTERVAL_SECONDS_DEFAULT
     )
@@ -254,7 +257,7 @@ def _derive_batch_size(per_embed_seconds: float, scan_cap: int) -> int:
     """
     global _warned_no_headroom
     budget = _batch_budget_seconds()
-    tick = _tick_interval_seconds()
+    tick = tick_interval_seconds()
     if budget >= tick and not _warned_no_headroom:
         _warned_no_headroom = True
         logger.warning(

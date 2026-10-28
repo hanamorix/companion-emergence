@@ -510,6 +510,12 @@ REMOVED: tuple[Removed, ...] = (
         ref=_GUARD_REF,
         kind="file",
     ),
+    Removed(
+        names=("JUDGE_TUNE_GATE_HANDFUL_DECISIONS",),
+        why="a second name for dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS in judge_selftune.py; readers use the dev constant",
+        ref=_GUARD_REF,
+        scope=("brain",),
+    ),
 )
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from brain import file_store, tunables
 from brain.bridge.server import build_app
 
 # Minimal 1×1 transparent PNG.
@@ -96,6 +97,27 @@ def test_upload_rejects_oversized_file(persona_dir: Path) -> None:
             files={"file": ("big.png", huge, "image/png")},
         )
     assert r.status_code == 413
+
+
+def test_upload_honours_a_lowered_upload_cap(persona_dir: Path) -> None:
+    """`files.upload_max_bytes` is the one cap of /upload (#531): lowered below 20 MiB it binds images and files alike.
+
+    The route used to compare against ``max(<its own 20 MiB literal>, upload_max_bytes())``, so a lowered setting
+    was silently ignored.
+    """
+    tunables.set_values({"files.upload_max_bytes": 1024})
+    assert file_store.upload_max_bytes() == 1024
+    png_of_the_cap = _TINY_PNG + b"\x00" * (1024 - len(_TINY_PNG))
+    client = _client(persona_dir)
+    with client:
+        too_big_file = client.post("/upload", files={"file": ("big.bin", b"a" * 1025, "application/octet-stream")})
+        too_big_image = client.post("/upload", files={"file": ("big.png", png_of_the_cap + b"\x00", "image/png")})
+        file_at_the_cap = client.post("/upload", files={"file": ("ok.bin", b"b" * 1024, "application/octet-stream")})
+        image_at_the_cap = client.post("/upload", files={"file": ("ok.png", png_of_the_cap, "image/png")})
+    assert too_big_file.status_code == 413, too_big_file.text
+    assert too_big_image.status_code == 413, too_big_image.text
+    assert file_at_the_cap.status_code == 200, file_at_the_cap.text
+    assert image_at_the_cap.status_code == 200, image_at_the_cap.text
 
 
 def test_upload_requires_auth_when_token_set(persona_dir: Path) -> None:
