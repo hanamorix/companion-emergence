@@ -1,6 +1,6 @@
 """SP-4 pipeline driver: extracts a session's conversation rows into memories.
 
-close_session()             extract every row after the cursor, chunk by chunk, then delete the buffer, cursor and backoff.
+close_session()             extract every row after the cursor, chunk by chunk, archive the whole buffer (fsync), then delete the buffer, cursor and backoff.
 extract_session_snapshot()  non-destructive: extract the rows after the cursor sidecar, chunk by chunk; the buffer stays.
 close_stale_sessions()      destructive sweep (close_session for every silent session); for explicit close callers only.
 snapshot_stale_sessions()   non-destructive sweep of the supervisor's session-snapshot job, one chunk per session per pass
@@ -34,6 +34,7 @@ from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.health.json_io import append_jsonl
 from brain.ingest.buffer import (
+    archive_once,
     delete_backoff,
     delete_cursor,
     delete_session_buffer,
@@ -43,6 +44,7 @@ from brain.ingest.buffer import (
     read_cursor,
     read_session,
     read_session_after,
+    session_append_lock,
     session_silence_minutes,
     write_backoff,
     write_cursor,
@@ -426,6 +428,23 @@ def _row_key(turn: dict) -> tuple:
     return (turn.get("ts"), turn.get("speaker"), turn.get("text"))
 
 
+# ``archive_once`` keys its commit marker on a batch generation (the summary generation a compaction or a rollover batch
+# belongs to). A close folds nothing and its batch is identified by the ordered turn identities alone, so it passes this one value.
+_CLOSE_BATCH_GEN = 0
+
+
+def _archive_buffer(persona_dir: Path, session_id: str) -> list[dict]:
+    """Archive every row now in the buffer and return those rows.
+
+    Uses ``archive_once`` (fsync, durable commit marker), the writer compaction, the cascade and the rollover also use, so the rows
+    are durable before the caller removes the buffer and a retry of the same batch after a crash does not write it twice. An error
+    propagates and the caller has removed nothing. A malformed line is skipped by ``read_session`` like everywhere else.
+    """
+    rows = read_session(persona_dir, session_id)
+    archive_once(persona_dir, session_id, rows, new_gen=_CLOSE_BATCH_GEN)
+    return rows
+
+
 def _close_session_locked(
     persona_dir: Path,
     session_id: str,
@@ -435,7 +454,7 @@ def _close_session_locked(
     provider: LLMProvider,
     config: dict | None = None,
 ) -> IngestReport:
-    """Extract every row after the session's cursor, chunk by chunk, then delete its buffer, cursor and backoff.
+    """Extract every row after the session's cursor, chunk by chunk, archive the whole buffer, then delete its buffer, cursor and backoff.
 
     Reads only the rows after the cursor (summary rows dropped), like the snapshot, so a buffer a snapshot already extracted
     in part is not extracted twice, and runs the chunk loop to the end with a cursor write per committed chunk: a close that
@@ -444,7 +463,17 @@ def _close_session_locked(
 
     Before deleting, the rows after the cursor are read again: a row that arrived during the pass (it was never extracted)
     keeps the buffer, logged ``conversation_close_late_rows``, and the report does not reach the end. Nothing after the
-    cursor at the start: the buffer is deleted and the report reaches the end.
+    cursor at the start: the report reaches the end.
+
+    Then every row of the buffer (user and assistant turns, rows at or before the cursor, the summary row) is appended to the
+    conversation archive with ``archive_once``, fsynced, before the buffer is removed, so the newest turns do not survive only
+    as extracted memories (#555). An archive error propagates with the buffer, cursor and backoff untouched; a crash
+    after the archive and before the removal leaves the buffer, and the retry finds the batch already archived. The late-rows
+    check, the archive, a confirming re-read and the removal run under the buffer's append lock (``session_append_lock``),
+    so an ``ingest_turn`` row cannot land between the check and the removal. A buffer that a writer without that lock
+    (compaction's rewrite) changed during the archive write is kept (``conversation_close_changed_during_archive``, the report
+    does not reach the end) and the retry archives it again. An unparseable line is skipped by the buffer reader and is
+    dropped with the file, as compaction and the rollover drop it.
 
     ``config`` knobs: see ``run_chunk_stages``.
     """
@@ -494,24 +523,38 @@ def _close_session_locked(
         )
         return report
 
-    # The pass took one or more model calls; a row persisted meanwhile is after the cursor and was never
-    # extracted. The rows the pass itself extracted are excluded by identity, so a failed cursor write cannot hold a buffer.
-    seen = {_row_key(t) for t in turns}
-    late = [
-        t
-        for t in read_session_after(persona_dir, session_id, read_cursor(persona_dir, session_id))
-        if t.get("speaker") != "summary" and _row_key(t) not in seen
-    ]
-    if late:
-        report.reached_end = False
-        logger.warning(
-            "conversation_close_late_rows session=%s rows=%d: rows arrived during the close; buffer retained", session_id, len(late)
-        )
-        return report
+    # The buffer's append lock (the one ``ingest_turn`` takes) is held from the late-rows check to the removal, so a row an
+    # appender adds in between waits and cannot be removed unseen; it lands in a freshly created buffer afterwards.
+    with session_append_lock(persona_dir, session_id):
+        # The pass took one or more model calls; a row persisted meanwhile is after the cursor and was never
+        # extracted. The rows the pass itself extracted are excluded by identity, so a failed cursor write cannot hold a buffer.
+        seen = {_row_key(t) for t in turns}
+        late = [
+            t
+            for t in read_session_after(persona_dir, session_id, read_cursor(persona_dir, session_id))
+            if t.get("speaker") != "summary" and _row_key(t) not in seen
+        ]
+        if late:
+            report.reached_end = False
+            logger.warning(
+                "conversation_close_late_rows session=%s rows=%d: rows arrived during the close; buffer retained", session_id, len(late)
+            )
+            return report
 
-    delete_session_buffer(persona_dir, session_id)
-    delete_cursor(persona_dir, session_id)
-    delete_backoff(persona_dir, session_id)
+        archived = _archive_buffer(persona_dir, session_id)
+        # A writer that takes no append lock (compaction's whole-file rewrite) may have changed the buffer since the archive read.
+        if read_session(persona_dir, session_id) != archived:
+            report.reached_end = False
+            logger.warning(
+                "conversation_close_changed_during_archive session=%s rows=%d: the buffer changed while it was archived; buffer retained",
+                session_id,
+                len(archived),
+            )
+            return report
+
+        delete_session_buffer(persona_dir, session_id)
+        delete_cursor(persona_dir, session_id)
+        delete_backoff(persona_dir, session_id)
     return report
 
 
@@ -853,7 +896,7 @@ def close_stale_sessions(
     """Iterate active sessions; close any whose last turn is older than silence_minutes.
 
     Destructive — runs the full close_session pipeline (extract every chunk after the
-    cursor + delete buffer + delete cursor sidecar) for every match. Retained for
+    cursor + archive the buffer + delete buffer + delete cursor sidecar) for every match. Retained for
     explicit close callers only. A bridge stop runs no session sweep at all (#456,
     Q-B): open conversations are saved by the supervisor's snapshot job at the
     first idle pass after the next start.

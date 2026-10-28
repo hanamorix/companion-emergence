@@ -12,7 +12,7 @@ items are queued for SP-5 (soul module), and the cursor moves past each committe
 Public API:
     ingest_turn(persona_dir, turn) -> str
     close_session(persona_dir, session_id, *, store, hebbian, provider, ...) -> IngestReport
-        Extracts every chunk after the cursor, then deletes the buffer (CLI --close, /sessions/close).
+        Extracts every chunk after the cursor, archives the whole buffer, then deletes it (CLI --close, /sessions/close).
     close_stale_sessions(persona_dir, *, silence_minutes, store, ...) -> list[IngestReport]
         Destructive sweep (close_session per silent session); explicit close callers only (a bridge stop runs no sweep).
     extract_session_snapshot(persona_dir, session_id, *, store, hebbian, provider, ...) -> IngestReport

@@ -620,6 +620,7 @@ def test_c7_a_row_that_arrives_during_the_last_chunk_is_kept(world) -> None:
     assert "sess_c7l" in list_active_sessions(persona)
     assert any(r["text"] == "late zibbit row" for r in read_session(persona, "sess_c7l"))
     assert not report.completed and not report.reached_end
+    assert read_archive(persona, "sess_c7l") == []  # a close that keeps the buffer archives nothing (#555)
 
 
 def test_c8_compaction_mid_pass_loses_nothing(world) -> None:

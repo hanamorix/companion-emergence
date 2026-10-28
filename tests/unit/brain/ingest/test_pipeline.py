@@ -13,10 +13,16 @@ import pytest
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import LLMProvider
 from brain.engines.consolidation import Decision, run_consolidation
+from brain.health.json_io import append_jsonl
+from brain.ingest import pipeline
 from brain.ingest.buffer import (
+    append_archive,
     ingest_turn,
+    read_archive,
     read_backoff,
     read_cursor,
+    read_session,
+    rewrite_session_atomic,
     write_backoff,
     write_cursor,
 )
@@ -257,6 +263,7 @@ def test_close_session_with_extraction_failure_counts_error_and_retains_buffer(
     assert report.committed == 0
     assert report.errors == 1
     assert (tmp_path / "active_conversations" / "sess_fail.jsonl").exists()
+    assert read_archive(tmp_path, "sess_fail") == []  # a held close archives nothing (#555)
 
 
 def test_close_session_valid_empty_extraction_deletes_buffer_without_error(
@@ -1068,6 +1075,8 @@ def test_close_session_empty_path_also_deletes_cursor(
 
     cursor_file = tmp_path / "active_conversations" / f"{sid}.cursor"
     assert not cursor_file.exists()
+    archive_dir = tmp_path / "archived_conversations"
+    assert not archive_dir.exists() or not any(archive_dir.iterdir())  # an empty buffer writes no archive file (#555)
 
 
 # ---------------------------------------------------------------------------
@@ -1394,3 +1403,296 @@ def test_session_snapshot_records_an_unparseable_extraction(
         provider=_GarbageProvider(), config={"extraction_max_retries": 0},
     )
     assert [r["site"] for r in _parse_failure_rows(tmp_path)] == ["ingest_extract"]
+
+
+# ---------------------------------------------------------------------------
+# close_session archives the buffer before it removes it (#555)
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_SID = "sess_arch"
+
+
+def _archive_rows(sid: str, count: int, *, start: datetime, with_summary: bool = False) -> list[dict]:
+    """``count`` alternating user/assistant rows with fixed timestamps, optionally led by a summary row."""
+    rows: list[dict] = []
+    if with_summary:
+        rows.append(
+            {
+                "session_id": sid,
+                "speaker": "summary",
+                "text": "They talked about gardens.",
+                "ts": start.isoformat(timespec="seconds"),
+                "compaction": {"gen": 1, "folded": False, "covers_until_ts": start.isoformat(timespec="seconds")},
+            }
+        )
+    for i in range(count):
+        rows.append(
+            {
+                "session_id": sid,
+                "speaker": "user" if i % 2 == 0 else "assistant",
+                "text": f"row {i} of {sid}",
+                "ts": (start + timedelta(seconds=10 * (i + 1))).isoformat(timespec="seconds"),
+            }
+        )
+    return rows
+
+
+def _seed_closable(persona: Path, sid: str, rows: list[dict]) -> list[dict]:
+    """Write ``rows`` as the buffer, a cursor at the last non-summary row (extraction is a no-op) and a backoff sidecar."""
+    rewrite_session_atomic(persona, sid, rows)
+    write_cursor(persona, sid, [r for r in rows if r["speaker"] != "summary"][-1]["ts"])
+    write_backoff(persona, sid, failures=1, first_failure_at=datetime.now(UTC).isoformat())
+    return read_session(persona, sid)
+
+
+def _close_noop(persona: Path, sid: str, store: MemoryStore, hebbian: HebbianMatrix):
+    return close_session(persona, sid, store=store, hebbian=hebbian, provider=_CannedProvider([]))
+
+
+def _sidecars(persona: Path, sid: str) -> dict[str, Path]:
+    d = persona / "active_conversations"
+    return {"buffer": d / f"{sid}.jsonl", "cursor": d / f"{sid}.cursor", "backoff": d / f"{sid}.backoff"}
+
+
+def test_close_archives_every_buffer_row_before_removing_it(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """C1: user, assistant and summary rows, those at or before the cursor and those after it, reach the archive verbatim."""
+    start = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    rows = _seed_closable(tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 6, start=start, with_summary=True))
+    # a cursor in the middle: rows after it are extracted by this close, rows at or before it never are
+    write_cursor(tmp_path, _ARCHIVE_SID, rows[3]["ts"])
+
+    report = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert report.reached_end
+    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert not any(p.exists() for p in _sidecars(tmp_path, _ARCHIVE_SID).values())
+
+
+def test_close_keeps_an_earlier_archived_batch_first(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """C1: what compaction left in the archive stays intact and first; the close's rows follow it."""
+    start = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    earlier = _archive_rows(_ARCHIVE_SID, 3, start=start - timedelta(hours=2))
+    append_archive(tmp_path, _ARCHIVE_SID, earlier)
+    rows = _seed_closable(tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=start, with_summary=True))
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+
+    assert read_archive(tmp_path, _ARCHIVE_SID) == earlier + rows
+    assert not _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
+
+
+def test_close_after_a_real_compaction_archives_every_row_once(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """C1: the realistic order. Compaction folds and archives the old rows; the close archives what compaction left (summary + newest 40)."""
+    from brain.chat.compaction import compact_conversation
+
+    class _SummaryProvider:
+        def generate(self, prompt=None, *, system=None, **kw) -> str:
+            return "They talked about gardens for a long while."
+
+    start = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
+    original = _archive_rows(_ARCHIVE_SID, 120, start=start)
+    _seed_closable(tmp_path, _ARCHIVE_SID, original)
+    result = compact_conversation(
+        tmp_path, _ARCHIVE_SID, older_than=timedelta(0), fold_existing_summary=False, provider=_SummaryProvider()
+    )
+    assert result.compacted
+    after_compaction = read_archive(tmp_path, _ARCHIVE_SID)
+    left_in_buffer = read_session(tmp_path, _ARCHIVE_SID)
+    assert len(after_compaction) == 80 and len(left_in_buffer) == 41  # 80 folded, summary + newest 40 kept
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+
+    archive = read_archive(tmp_path, _ARCHIVE_SID)
+    assert archive[: len(after_compaction)] == after_compaction  # compaction's batch first, intact
+    assert archive[len(after_compaction) :] == left_in_buffer  # the close's batch after it
+    assert [r["text"] for r in archive if r["speaker"] != "summary"] == [r["text"] for r in original]  # each turn once, in order
+
+
+def test_close_has_archived_everything_when_it_removes_the_buffer(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2: at the instant the buffer is removed the archive already holds all of its rows."""
+    rows = _seed_closable(
+        tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
+    )
+    seen_at_delete: list[list[dict]] = []
+    real_delete = pipeline.delete_session_buffer
+
+    def _delete(persona_dir, session_id):
+        seen_at_delete.append(read_archive(persona_dir, session_id))
+        real_delete(persona_dir, session_id)
+
+    monkeypatch.setattr(pipeline, "delete_session_buffer", _delete)
+
+    _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert seen_at_delete == [rows]
+
+
+def test_close_keeps_buffer_cursor_and_backoff_when_the_archive_write_fails(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C3: an archive failure propagates before anything is removed; the three files are byte-identical."""
+    _seed_closable(tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC)))
+    paths = _sidecars(tmp_path, _ARCHIVE_SID)
+    before = {name: p.read_bytes() for name, p in paths.items()}
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline, "archive_once", _boom, raising=False)
+
+    with pytest.raises(OSError, match="disk full"):
+        _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert {name: p.read_bytes() for name, p in paths.items()} == before
+
+
+def test_a_crash_between_the_archive_and_the_removal_loses_nothing_and_archives_once(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C4: the buffer survives a failure at the removal, the retry completes, and the archive holds each row exactly once."""
+    rows = _seed_closable(
+        tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
+    )
+    real_delete = pipeline.delete_session_buffer
+    calls: list[int] = []
+
+    def _delete_once_raising(persona_dir, session_id):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("killed at the removal")
+        real_delete(persona_dir, session_id)
+
+    monkeypatch.setattr(pipeline, "delete_session_buffer", _delete_once_raising)
+
+    with pytest.raises(OSError, match="killed at the removal"):
+        _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+    assert not _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
+    assert read_archive(tmp_path, _ARCHIVE_SID) == rows  # once, not twice
+
+
+def test_a_crash_between_the_archive_append_and_its_marker_loses_no_row(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C14: the window inside archive_once. Nothing is removed, and the retry leaves every row in the archive (a repeat is possible here, a loss is not)."""
+    from brain.ingest import buffer as buffer_mod
+
+    rows = _seed_closable(
+        tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
+    )
+    paths = _sidecars(tmp_path, _ARCHIVE_SID)
+    before = {name: p.read_bytes() for name, p in paths.items()}
+    real_marker = buffer_mod.write_archive_marker
+    calls: list[int] = []
+
+    def _marker_once_raising(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("killed before the marker")
+        return real_marker(*args, **kwargs)
+
+    monkeypatch.setattr(buffer_mod, "write_archive_marker", _marker_once_raising)
+
+    with pytest.raises(OSError, match="killed before the marker"):
+        _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+    assert {name: p.read_bytes() for name, p in paths.items()} == before
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+    assert not paths["buffer"].exists()
+    archive = read_archive(tmp_path, _ARCHIVE_SID)
+    assert all(archive.count(r) >= 1 for r in rows)
+
+
+def test_a_writer_that_takes_no_append_lock_keeps_the_buffer_and_the_retry_archives_its_row(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C5: compaction's whole-file rewrite takes no append lock; a row it leaves in the buffer during the archive write is never removed unarchived."""
+    from brain.ingest import buffer as buffer_mod
+
+    rows = _seed_closable(
+        tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
+    )
+    added = {
+        "session_id": _ARCHIVE_SID,
+        "speaker": "user",
+        "text": "a row the rewrite added",
+        "ts": datetime(2026, 10, 1, 9, 30, tzinfo=UTC).isoformat(timespec="seconds"),
+    }
+    fired: list[int] = []
+
+    def _archive_then_rewrite(persona_dir, session_id, records, **kwargs):
+        written = buffer_mod.archive_once(persona_dir, session_id, records, **kwargs)
+        if not fired:
+            fired.append(1)
+            rewrite_session_atomic(persona_dir, session_id, [*records, added])
+        return written
+
+    monkeypatch.setattr(pipeline, "archive_once", _archive_then_rewrite, raising=False)
+    paths = _sidecars(tmp_path, _ARCHIVE_SID)
+
+    first = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert first.reached_end is False
+    assert read_session(tmp_path, _ARCHIVE_SID) == [*rows, added]
+    assert paths["cursor"].exists() and paths["backoff"].exists()
+
+    second = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert second.reached_end
+    assert not paths["buffer"].exists()
+    archive = read_archive(tmp_path, _ARCHIVE_SID)
+    assert added in archive and all(r in archive for r in rows)
+
+
+def test_the_close_holds_the_append_lock_from_the_late_rows_check_to_the_removal(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C13: a lock-respecting appender is refused at the late-rows read, in the archive write and at the removal; an ingest_turn afterwards is not lost."""
+    from brain.ingest import buffer as buffer_mod
+
+    _seed_closable(tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC)))
+    buffer_path = _sidecars(tmp_path, _ARCHIVE_SID)["buffer"]
+    probe_row = {"session_id": _ARCHIVE_SID, "speaker": "user", "text": "probe", "ts": "2026-10-01T10:00:00+00:00"}
+    at_late_read: list[int | None] = []
+    at_archive: list[int | None] = []
+    at_delete: list[int | None] = []
+    real_read_after = pipeline.read_session_after
+    real_delete = pipeline.delete_session_buffer
+    reads: list[int] = []
+
+    def _read_after(persona_dir, session_id, after_ts):
+        out = real_read_after(persona_dir, session_id, after_ts)
+        reads.append(1)
+        if len(reads) > 1:  # the first read opens the close, before the lock; every later one is the late-rows check
+            at_late_read.append(append_jsonl(buffer_path, probe_row, lock="try"))
+        return out
+
+    def _archive(persona_dir, session_id, records, **kwargs):
+        at_archive.append(append_jsonl(buffer_path, probe_row, lock="try"))
+        return buffer_mod.archive_once(persona_dir, session_id, records, **kwargs)
+
+    def _delete(persona_dir, session_id):
+        at_delete.append(append_jsonl(buffer_path, probe_row, lock="try"))
+        real_delete(persona_dir, session_id)
+
+    monkeypatch.setattr(pipeline, "read_session_after", _read_after)
+    monkeypatch.setattr(pipeline, "archive_once", _archive, raising=False)
+    monkeypatch.setattr(pipeline, "delete_session_buffer", _delete)
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+
+    assert (at_late_read, at_archive, at_delete) == ([None], [None], [None])
+    assert not buffer_path.exists()
+    ingest_turn(tmp_path, {"session_id": _ARCHIVE_SID, "speaker": "user", "text": "after the close"})
+    assert [r["text"] for r in read_session(tmp_path, _ARCHIVE_SID)] == ["after the close"]
