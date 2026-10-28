@@ -1,4 +1,4 @@
-"""The slow-test budget (#540, J12): in CI a test's call phase may use at most 2 s of CPU unless it says why it is slow.
+"""The slow-test budget (#540, J12): in CI (the ubuntu job) a test's call phase may use at most 2 s of CPU unless it says why.
 
 A slow test is not wrong, but an unmarked one is how a suite becomes slow without anyone choosing it: each new
 two-second test is invisible in a diff and adds up. Where the budget applies, a test that PASSED but whose call phase used
@@ -13,9 +13,13 @@ phase (all its threads, not its child processes) does not grow when the test wai
 a test that is slow because it WAITS (a fixed sleep, a subprocess it waits for): its wall time is shown in the weekly
 timing report (`.github/workflows/timing.yml`), not gated here.
 
-Where it applies: only when `KINDLED_SLOW_BUDGET` is set. `.github/workflows/test.yml` sets it for its python job (the
-push and pull-request run and the manual run); the other workflows that run pytest (release gate, mutation testing,
-the weekly timing report, the 3.13 bridge job) deliberately do not, and a developer sets it to try the budget locally.
+Where it applies: only when `KINDLED_SLOW_BUDGET` is set. `.github/workflows/test.yml` sets it for its python job on
+UBUNTU only (the push and pull-request run and the manual run): CPU time is not contention-proof either, and on the
+shared macOS and Windows runners a fixed line failed unmarked tests at random (the same code's median test used 2.1x
+the CPU between two runs, the worst 14x). The CPU time of every test over 0.5 s is logged on all three systems
+(`KINDLED_SLOW_BUDGET_LOG`, uploaded as `slow-budget-cpu-<os>`) whether or not the budget is enforced there. The other
+workflows that run pytest (release gate, mutation testing, the weekly timing report, the 3.13 bridge job) do not enforce
+it, and a developer sets the variable to try the budget locally.
 `KINDLED_SLOW_BUDGET_S` overrides the 2.0 s (the planted tests use a small one). `KINDLED_SLOW_BUDGET_LOG=<file>` appends
 one JSON line per test that used more than 0.5 s of CPU (node id, CPU seconds, wall seconds): the data the marks come from.
 
