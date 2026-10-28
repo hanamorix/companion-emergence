@@ -200,9 +200,9 @@ def perform_rollover(
 
     The raw turns the seed does not carry (in ``tiers_plus_tail``, those before the last 40 that the cascade
     has not archived) are archived, fsynced, before the successor, the pointer or the delete exist. An archive
-    failure raises with the old buffer, its cursor and the session list unchanged; a rerun after a crash
-    archives the same batch once (the archive commit marker). The old buffer's append lock is held from the
-    final read to the unlink.
+    failure raises before any of those: the old buffer, its cursor and the session list stay as they were; a
+    rerun after a crash archives the same batch once (the archive commit marker). The old buffer's append
+    lock is held from the final read to the unlink.
     """
     now = now or datetime.now(UTC)
     persona_dir = Path(persona_dir)
@@ -335,8 +335,8 @@ def perform_rollover(
             delete_cursor(persona_dir, old_sid)
             delete_backoff(persona_dir, old_sid)
         logger.info(
-            "rollover: session=%s → %s mode=%s seeded=%d",
-            old_sid, new_sid, seed_mode, len(reseeded),
+            "rollover: session=%s → %s mode=%s seeded=%d archived=%d",
+            old_sid, new_sid, seed_mode, len(reseeded), len(not_carried),
         )
         return new_sid
     finally:

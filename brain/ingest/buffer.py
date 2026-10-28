@@ -515,8 +515,8 @@ def _archive_batch_key(records: list[dict], new_gen: int) -> str:
 
 def archive_once(persona_dir: Path, session_id: str, records: list[dict], *, new_gen: int) -> int:
     """The one archive-with-dedup write: archive ``records`` exactly once for this batch, proven by a
-    durable commit marker (Bug 3). Every path that removes turns from a conversation buffer (compaction,
-    the cascade, the session rollover) archives through this, before it removes anything.
+    durable commit marker (Bug 3). Compaction, the cascade and the session rollover archive the turns they
+    remove from a conversation buffer through this, before they remove anything.
 
     ``new_gen`` is the generation the batch belongs to (the summary generation being written, or the one
     the rollover carries); it is part of the batch key. Skips the append ONLY when the marker key matches

@@ -470,7 +470,7 @@ REMOVED: tuple[Removed, ...] = (
     # --- the archive-with-dedup write moved to the conversation buffer (#556) -------------------------------------------
     Removed(
         names=("_archive_once", "_archive_batch_key", "_turn_identity"),
-        why="the dedup archive write and the turn identity moved to brain/ingest/buffer.py (archive_once, turn_identity) so the rollover and the session close archive through the same path as compaction; compaction keeps no private copy",
+        why="the dedup archive write and the turn identity moved to brain/ingest/buffer.py (archive_once, turn_identity) so the rollover archives through the same path as compaction and compaction keeps no private copy of it",
         ref="#556 rollover keeps every recent turn (the pull request that moved them)",
         kind="code",
         scope=("brain/chat",),

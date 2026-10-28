@@ -25,9 +25,11 @@ from brain.ingest.buffer import (
     ingest_turn,
     list_active_sessions,
     read_archive,
+    read_backoff,
     read_cursor,
     read_rolled_to,
     read_session,
+    write_backoff,
     write_cursor,
 )
 from brain.ingest.pipeline import extract_session_snapshot, finalize_stale_sessions
@@ -697,6 +699,7 @@ def test_rollover_keeps_every_turn_556(tmp_path: Path, aged: int, recent: int) -
     persona_dir = _persona(tmp_path)
     sid = "sess_556"
     all_texts = _seed_556(persona_dir, sid, aged=aged, recent=recent)
+    write_backoff(persona_dir, sid, 1, "2026-01-01T00:00:00+00:00")
     try:
         new_sid = perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
     finally:
@@ -711,6 +714,7 @@ def test_rollover_keeps_every_turn_556(tmp_path: Path, aged: int, recent: int) -
     )
     assert not _old_path(persona_dir, sid).exists()
     assert read_cursor(persona_dir, sid) is None
+    assert read_backoff(persona_dir, sid) is None
 
 
 def test_rollover_archives_before_deleting_556(tmp_path: Path, monkeypatch) -> None:
@@ -819,6 +823,7 @@ def test_rollover_holds_buffer_append_lock_to_unlink_556(tmp_path: Path, monkeyp
     real_archive = getattr(rollover_mod, "archive_once", None)
     real_delete = rollover_mod.delete_session_buffer
     raced: list[threading.Thread] = []
+    still_waiting: list[bool] = []
 
     def read_spy(pd, s):
         out = real_read(pd, s)
@@ -838,6 +843,7 @@ def test_rollover_holds_buffer_append_lock_to_unlink_556(tmp_path: Path, monkeyp
         t.start()
         raced.append(t)
         t.join(0.2)  # a deliberate probe: the append must still be waiting on the lock
+        still_waiting.append(t.is_alive())
         real_delete(pd, s)
 
     monkeypatch.setattr(rollover_mod, "read_session", read_spy)
@@ -850,6 +856,7 @@ def test_rollover_holds_buffer_append_lock_to_unlink_556(tmp_path: Path, monkeyp
         reset_registry()
     assert new_sid is not None
     assert probes == {"read": [None], "archive": [None], "delete": [None]}, "the append lock was not held"
+    assert still_waiting == [True], "the ordinary append did not wait for the unlink"
     assert "RACED-556" in _raw_texts(read_session(persona_dir, sid)), "the raced row was deleted unseen"
     assert "RACED-556" not in _raw_texts(read_session(persona_dir, new_sid))
     assert "RACED-556" not in _raw_texts(read_archive(persona_dir, sid))
