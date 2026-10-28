@@ -56,6 +56,11 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             importlib.import_module(name)
         except Exception:  # noqa: BLE001 - an extra that is not installed is fine
             pass
+    # the parsed source trees (tests/source_tree.py) are shared by about thirty tests; whichever is first would pay them
+    from tests import source_tree
+
+    source_tree.brain_trees()
+    source_tree.brain_sources()
 
 
 _CALL_CPU = pytest.StashKey[float]()

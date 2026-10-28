@@ -75,13 +75,15 @@ jobs:
       # xdist_group mark's tests on one worker (the tests sharing a real resource: the Hugging Face cache, the
       # systemd user manager, a network install); `-p no:tdd-guard` stops the tdd-guard plugin, which every worker
       # would otherwise load and make write the same status file. KINDLED_SLOW_BUDGET switches on the slow-test
-      # budget (tests/slow_budget.py): a test over 2 s must say why with @pytest.mark.slow(reason=...). Test order is
+      # budget (tests/slow_budget.py): a test that uses more than 2 s of CPU must say why with
+      # @pytest.mark.slow(reason=...). Test order is
       # random (pytest-randomly): the seed is printed in the header and at the end; to reproduce a red order run
       # serially with `--randomly-seed=N`, or switch it off with `-p no:randomly`.
       - name: Run pytest
         if: github.event_name != 'workflow_dispatch'
         env:
           KINDLED_SLOW_BUDGET: "1"
+          KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
         run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml
 
       # Manual run only. The inputs reach the shell as environment variables (never
@@ -101,6 +103,7 @@ jobs:
           WORKERS: ${{ inputs.workers }}
           SEED: ${{ inputs.seed }}
           KINDLED_SLOW_BUDGET: "1"
+          KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
         run: |
           case "$WORKERS" in
             1|2|4|auto) ;;
@@ -136,6 +139,16 @@ jobs:
           name: pytest-junit-${{ matrix.os }}
           path: pytest-junit.xml
           if-no-files-found: warn
+
+      # The CPU time of every test that used more than 0.5 s (tests/slow_budget.py), per OS: the data the
+      # @pytest.mark.slow marks are made from.
+      - name: Upload the slow-test CPU log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: slow-budget-cpu-${{ matrix.os }}
+          path: slow-budget-cpu.jsonl
+          if-no-files-found: ignore
 
       - name: Lint with ruff
         if: github.event_name != 'workflow_dispatch'
