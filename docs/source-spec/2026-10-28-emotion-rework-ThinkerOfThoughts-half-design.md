@@ -25,16 +25,16 @@ Today "how does she feel" is answered separately at each surface: the prompt, th
 
 After the rework a per-persona **emotion engine** keeps two moving averages per emotion, a short one (about the last day) and a long one (about the last month). Memories she lives through, makes or opens, and emotion changes from events, are folded into those averages. Every reader asks the engine. Values stored on memories are no longer rewritten by a decay pass; they are faded when read.
 
-The rework runs in two phases:
-- **Phase B (shadow).** The engine is built and runs beside today's code: writes queue events, drains fold them into a shadow state, and nothing reads it. Every reader is changed to `if engine.is_live(): <new> else: <today, unchanged>`. No persona is live in phase B.
-- **Phase C (switch-over).** At a persona's first start under phase C a start-up step fixes the scale of old nudge rows, rebuilds the engine's state from the last 30 days of memories, and writes a switch file. From then on the persona is live, the old decay pass is gone, and the old reader branches are deleted.
+The rework runs in two stages:
+- **Shadow stage.** The engine is built and runs beside today's code: writes queue events, drains fold them into a shadow state, and nothing reads it. Every reader is changed to `if engine.is_live(): <new> else: <today, unchanged>`. No persona is live in the shadow stage.
+- **Switch-over stage.** At a persona's first start in the switch-over stage a start-up step fixes the scale of old nudge rows, rebuilds the engine's state from the last 30 days of memories, and writes a switch file. From then on the persona is live, the old decay pass is gone, and the old reader branches are deleted.
 
 ### 1.2 The parts of this half
 
 | Part | What it is | PRs |
 |---|---|---|
-| The engine | The engine itself, built in slices S0 to S7, including the gate work (S5) and the switch-over (S6) | eight, one per slice |
-| The readers | Every reader of "how does she feel" moved onto the engine (phase B), then the old paths deleted (phase C) | two |
+| The engine | The engine itself, built in eight parts, Engine 0 to Engine 7, including the gate work (Engine 5) and the switch-over (Engine 6) | eight, one per slice |
+| The readers | Every reader of "how does she feel" moved onto the engine (Readers 1), then the old paths deleted (Readers 2) | two |
 | The reader-side safety net | Tests that pin what the readers do today, an exact pin of the gate-bypass list, and timings of three old paths; no `brain/` code | one |
 | The access fixes | Every full open of a memory sets last-accessed and reports the showing to the engine; three background reads stop counting as accesses | one |
 
@@ -98,7 +98,7 @@ Which memories count, and their source modifier:
 
 Nothing else counts: the monologue family, emotion-only rows, journal entries, grief breadcrumbs, dreams, heartbeat, reflex output, file writes and `self_model_resolved`.
 
-Peer trust is read through one engine-internal function, `engine_files.peer_trust`. Until the switch-over slice it returns 0.0, so every peer memory the shadow engine folds weighs the floor of 0.1; that reaches phase B's shadow state only, because nothing reads the engine before the switch. S6 replaces its body with a call to hanamorix's accessor `peer_trust(persona_dir, peer_id)`.
+Peer trust is read through one engine-internal function, `engine_files.peer_trust`. Until the switch-over slice it returns 0.0, so every peer memory the shadow engine folds weighs the floor of 0.1; that reaches the shadow state only, because nothing reads the engine before the switch. Engine 6 replaces its body with a call to hanamorix's accessor `peer_trust(persona_dir, peer_id)`.
 
 ### 2.3 Active days, quiet days and off days
 
@@ -210,7 +210,7 @@ Which writers fire which hook:
 
 **Where drains run.** Each call site calls `note_active` bare; it catches and logs its own failures.
 - the end of the supervisor's `run_folded` pass, when no reply is in flight;
-- the bridge `lifespan` at start-up (after the start-up step in phase C);
+- the bridge `lifespan` at start-up (after the start-up step, in the switch-over stage);
 - the WebSocket `stream` handler after `ws.close(code=1000)`, in a worker thread via `tracked_to_thread`, so a waiting lock never stalls the event loop;
 - the HTTP `chat` handler through FastAPI `BackgroundTasks`, after the response;
 - `nell chat --no-bridge` (`_chat_direct_mode`), after each reply and after each `_drain_pass2_at_exit`;
@@ -220,7 +220,7 @@ So events from inside a reply reach the averages right after the reply is sent; 
 
 **The lock.** One `file_lock` on `state/emotion_state.json` (sidecar `emotion_state.json.lock`) guards all four engine files. It blocks with no timeout and is not re-entrant, so no code path takes it twice. Hooks and drains hold it briefly; a rebuild and a catch-up hold it for their whole run, and anything arriving waits (about a second on the measured database).
 
-**Phase B.** Hooks queue, drains fold and close days and append snapshot days into a shadow state under `state/`. No change-log lines are written, `faded_value` returns stored values, nothing rebuilds, and an unreadable state on a persona that is not live simply starts empty. Nothing reads the shadow state. The first rebuild at the switch-over discards it.
+**Shadow stage.** Hooks queue, drains fold and close days and append snapshot days into a shadow state under `state/`. No change-log lines are written, `faded_value` returns stored values, nothing rebuilds, and an unreadable state on a persona that is not live simply starts empty. Nothing reads the shadow state. The first rebuild at the switch-over discards it.
 
 ### 2.9 The engine's files
 
@@ -247,7 +247,7 @@ A chat change or self-correction is stored today as a memory row with its sign l
 - At each day close the drain lists the folder and deletes whole each file whose day is before the label 30 calendar days before the active day as it stood at the start of that drain. Nothing is scanned or rewritten. Anchoring on the pre-drain active day means a clock set far forward cannot delete the folder in the same drain that jumps the day.
 - A missing file anywhere in the series, a missing folder, a corrupt line or a torn tail adds nothing and is not an error; the readable lines are used. A folder that cannot be listed is logged and treated as missing; it never stops start-up.
 - A failed append is logged; the change still folds through the queue, so only a later rebuild loses it.
-- Phase B writes no change log, so the first rebuild replays none.
+- The shadow stage writes no change log, so the first rebuild replays none.
 
 ### 2.11 The rebuild and the catch-up
 
@@ -280,7 +280,7 @@ The prototype on the synthetic database (19,413 rows, 684 counted rows in the wi
 3. Take the lock, and return if the switch file now exists (two processes starting one persona cannot both rebuild).
 4. Call `rebuild` in the first mode with the lock held; it writes the switch as its last step. Release.
 
-It raises `EngineStartupError(what, cause)` on a failed check, an error, or an x10 error or rollback, and the failure stops start-up; no switch is written, so the next start runs the step again. From the CLI the error escapes `main` and lands in the existing `cli-crash.log`. A persona created under phase C runs the same step over zero memories and gets its switch at once.
+It raises `EngineStartupError(what, cause)` on a failed check, an error, or an x10 error or rollback, and the failure stops start-up; no switch is written, so the next start runs the step again. From the CLI the error escapes `main` and lands in the existing `cli-crash.log`. A persona created in the switch-over stage runs the same step over zero memories and gets its switch at once.
 
 **Where it runs.** In the bridge `lifespan`, between the vocabulary load and the backlog migration, before the supervisor starts and before its own drain; and in each CLI handler that opens a persona, after its own `load_persona_vocabulary`: `_chat_direct_mode`, `_heartbeat_handler`, `_dream_handler`, `_reflex_handler`, `_research_handler`, `_soul_review_handler`. On a persona with no switch file a `--dry-run` skips the step, runs no reader, writes nothing, prints a plain message to stderr asking for one normal start, and returns non-zero; on a live persona a dry run works as today. The per-turn tool process is always spawned from a session that has run the step.
 
@@ -288,7 +288,7 @@ It raises `EngineStartupError(what, cause)` on a failed check, an error, or an x
 - rows of type `initiate_outbound`, `kindled_peer` or `making` whose `peak_emotion_intensity` is below 1 (one threshold for all three; the peak test keeps out rows the emotion backfill re-tagged on the 0 to 10 scale, and decay never lowers the peak);
 - `emotions_json`, `score` and `peak_emotion_intensity` multiplied by 10 (a fixed row then looks like a new-scale row; the peak is below 1, so every channel stays below 10);
 - the done-check, the row writes and the marker in one `BEGIN IMMEDIATE` transaction; the marker is `PRAGMA user_version` = 1 (a later migration takes 2); rolled back if the number of rows changed differs from the number selected;
-- no cutoff time: the fix runs before the switch exists, and every writer change is gated on the switch, so at that moment every row of those types is on the old scale. This relies on hanamorix's nudge-scale change being gated (asked in S6's PR body).
+- no cutoff time: the fix runs before the switch exists, and every writer change is gated on the switch, so at that moment every row of those types is on the old scale. This relies on hanamorix's nudge-scale change being gated (asked in Engine 6's PR body).
 
 Why a `user_version` marker: it is transactional and adds nothing to the schema. A file marker leaves a crash window that would scale rows twice; a per-row flag adds a column to every row; and a value test cannot tell a fixed row from an unfixed one (0.05 × 10 is still below 1). The file carries a comment flagging it for the backwards-compatibility cleanup (#388).
 
@@ -300,7 +300,7 @@ Why a `user_version` marker: it is transactional and adds nothing to the schema.
 | A queue event is invalid (no memory id on a showing, no emotions on a commit or assigned event, an unknown kind, a missing time, a non-finite amount) | Dropped with a log line saying why; the others fold |
 | The queue file does not parse | Discarded with a log line; no rebuild |
 | A drain fails (disk, permission) | Logged; the queue stays and the next drain retries |
-| The state is unreadable | The walk tries the backups; a backup is caught up; with nothing readable a live persona gets a recovery rebuild, a phase B persona starts empty |
+| The state is unreadable | The walk tries the backups; a backup is caught up; with nothing readable a live persona gets a recovery rebuild, a shadow-stage persona starts empty |
 | A catch-up fails | Logged; `read()` is empty until a state write; recovery rebuild |
 | The first rebuild or the x10 fix fails | Start-up stops with `EngineStartupError`; the next start retries |
 | A recovery rebuild fails | Logged once per active day; retried at each quiet moment; readers show absent |
@@ -316,14 +316,14 @@ The memories are the truth; the engine is derived from them. A failed engine upd
 - **One simulation of the shift rule end to end on a known history**, instead of piece-by-piece tests, plus the live test of section 8. Its cases include the start gate: a persona whose oldest memory is under 30 days old is gated; one whose first rows are of an uncounted type opens 30 days after the oldest of them; at a first rebuild an existing persona whose oldest memory is 90 days old with entries on its last 5 days only is not gated, and one whose oldest memory is 10 days old is.
 - **Start order:** the call order of the start-up step, the dry-run cases, and a first start on a fresh persona that completes (so the lock is taken once).
 - **x10 fix tests**, and one test that a peer at trust 1.0 takes modifier 1.0 once trust is wired.
-- **Sizing check:** the shift rule as built must reproduce the sizing numbers of 2.6 on the synthetic database (up to the effect of the oldest-day edge in section 6); the slice that completes the shift (S4) states any difference.
-- New tests in the store go in `tests/unit/brain/emotion/` and `tests/unit/brain/memory/`; a shared settable engine stub (`emotion_engine_stub`) and an autouse fixture that resets the engine registry go in `tests/conftest.py` (S3).
+- **Sizing check:** the shift rule as built must reproduce the sizing numbers of 2.6 on the synthetic database (up to the effect of the oldest-day edge in section 6); the part that completes the shift (Engine 4) states any difference.
+- New tests in the store go in `tests/unit/brain/emotion/` and `tests/unit/brain/memory/`; a shared settable engine stub (`emotion_engine_stub`) and an autouse fixture that resets the engine registry go in `tests/conftest.py` (Engine 3).
 
 ---
 
 ## 3. The other parts
 
-### 3.1 Gate work (slice S5)
+### 3.1 Gate work (Engine 5)
 
 **The gate merge keeps emotions.** When the consolidation gate merges a candidate into an existing memory (`consolidation.py`, the merge branch of `_dispatch`) and the engine is live, it writes the merged content and merged emotions in one `store.update(target.id, content=merged, emotions=..., fold=False)`: an emotion on both memories takes the average of the two (joy 5 and 7 give 6), an emotion on one side is copied unchanged. A merge is not a new memory, so it folds nothing. Today the merge writes content only and drops the candidate's emotions. Not live, the merge stays as it is. The merge target is now pre-read with `bump=False`, live or not, so a merge does not count as an access of the target.
 
@@ -333,30 +333,30 @@ Every reader of `created_at` now sees a recalled memory as new: its shown date i
 
 **Tests:** a live merge averages and calls no hook; a merge that is not live keeps today's behaviour; the merge leaves the target's `recall_count` and `last_accessed_at` unchanged; the write-back writes faded values and a new `created_at`, also for empty emotions; a raising write-back is logged and not requeued; and the store method's own cases.
 
-### 3.2 Days since the user last spoke (slice S6)
+### 3.2 Days since the user last spoke (Engine 6)
 
-Because the write-back moves `created_at` forward, memory dates can no longer say when the user last spoke. A new function, `brain/ingest/buffer.py: last_user_turn_ts(persona_dir)`, reads the active conversation files backward with a doubling window until it finds a row with `speaker == "user"`, falls back to the archive only when no active file has one, and returns None when there is none. `days_since_human` uses it, returns 999.0 for None, and reads no memory and no presence file. `_latest_user_turn_in_buffers` and `_latest_conversation_memory_ts` are deleted, and the stale comment in `extraction_backfill.py` is fixed. In S7 the now-unused `store` parameter of `days_since_human` goes, with its eight call lines and the store opens that only fed it.
+Because the write-back moves `created_at` forward, memory dates can no longer say when the user last spoke. A new function, `brain/ingest/buffer.py: last_user_turn_ts(persona_dir)`, reads the active conversation files backward with a doubling window until it finds a row with `speaker == "user"`, falls back to the archive only when no active file has one, and returns None when there is none. `days_since_human` uses it, returns 999.0 for None, and reads no memory and no presence file. `_latest_user_turn_in_buffers` and `_latest_conversation_memory_ts` are deleted, and the stale comment in `extraction_backfill.py` is fixed. In Engine 7 the now-unused `store` parameter of `days_since_human` goes, with its eight call lines and the store opens that only fed it.
 
 **Tests:** the existing tests that built a "last user turn" from memory dates are rewritten (`test_memory_utils.py`, `test_buffer.py`, the reflex, extraction-backfill and migrated tests that depend on it).
 
-### 3.3 The switch-over and the removals (slices S6 and S7)
+### 3.3 The switch-over and the removals (Engine 6 and Engine 7)
 
-**S6** lands the switch, the live fade and the end of the old decay pass together, so no memory is faded twice or not at all. It adds `rebuild`, `ensure_engine_ready`, the x10 fix, the recovery job and their call sites (2.11, 2.12); turns on change-log lines from `fold_change` and the fade in `faded_value`; wires peer trust to hanamorix's accessor; and adds `last_user_turn_ts` (3.2).
+**Engine 6** lands the switch, the live fade and the end of the old decay pass together, so no memory is faded twice or not at all. It adds `rebuild`, `ensure_engine_ready`, the x10 fix, the recovery job and their call sites (2.11, 2.12); turns on change-log lines from `fold_change` and the fade in `faded_value`; wires peer trust to hanamorix's accessor; and adds `last_user_turn_ts` (3.2).
 
 It removes: `heartbeat._apply_emotion_decay` with its `protected` check, `emotion/decay.py`, and what they leave unused (`HEARTBEAT_DECAY_BATCH_BUDGET_S`, `_DECAY_PAGE_SIZE`, `DecayCursor` and its resume path, `memories_decayed` and its readers including the heartbeat prompt segments built around it and the system segment's "decay applied", `update_emotions_batch`, `list_active_since`, and their tests), each name grepped again first. The prompt segments are edited as working text (section 7). The two safety-net test files that pass `memories_decayed=0` drop it, keeping their test ids. The dev-constants snapshot is re-approved.
 
-**Timing in the S6 PR.** The safety net's timing script (3.6) runs on the parent commit and on the S6 commit, same host and same database copy, and both sets of numbers go in the PR description. On the S6 commit it starts the copy through `ensure_engine_ready` (untimed) after its vocabulary step and before its `state` timing, confirms `is_live()`, skips the decay timing (the pass is gone), and states its rebuild count. The first rebuild is also timed in this PR, before it is flipped: one cold run and warm repeats on a local copy of the synthetic database on the low-end host, with the first-load count of registered names. If the cold run is materially above the roughly 1.2 s the design assumed, it goes to ThinkerOfThoughts before the flip.
+**Timing in the Engine 6 PR.** The safety net's timing script (3.6) runs on the parent commit and on the Engine 6 commit, same host and same database copy, and both sets of numbers go in the PR description. On the Engine 6 commit it starts the copy through `ensure_engine_ready` (untimed) after its vocabulary step and before its `state` timing, confirms `is_live()`, skips the decay timing (the pass is gone), and states its rebuild count. The first rebuild is also timed in this PR, before it is flipped: one cold run and warm repeats on a local copy of the synthetic database on the low-end host, with the first-load count of registered names. If the cold run is materially above the roughly 1.2 s the design assumed, it goes to ThinkerOfThoughts before the flip.
 
-**S7** deletes what is left of the old design, after hanamorix's old `aggregate_state` reader branches are gone (4.2):
+**Engine 7** deletes what is left of the old design, after hanamorix's old `aggregate_state` reader branches are gone (4.2):
 - `brain/emotion/aggregate.py` last, with `test_aggregate.py`, `test_climax_reset.py` and the importers of `_warned_unregistered` (the harness sandbox, its registry-leak test, the conftest registry-restore fixture and its test), after `git grep -E 'emotion\.aggregate|emotion import aggregate|_warned_unregistered'`;
 - `protected` out of `store.py` (the dataclass, the INSERT, `update`, the row mapper; the column stays for old databases);
 - `monologue_emotion` and `self_model_reconcile` out of `GATE_BYPASS_TYPES`, with the safety net's pin edited to `{journal_entry, initiate_outbound}` in the same step, and a dead-code check on `SALIENCE_ELIGIBLE_TYPES` and `MONOLOGUE_FAMILY_TYPES`;
 - the emotion-only row writes in `chat/extractor.py` and `self_model/reconcile.py` (their changes go through `fold_change` instead);
 - the unused `store` parameter of `days_since_human` (3.2).
 
-### 3.4 The readers (phase B and phase C)
+### 3.4 The readers (Readers 1 and Readers 2)
 
-**Phase B: one PR.** Every reader of "how does she feel" takes its number from the engine behind the switch, in the shape `if engine.engine_for(persona_dir).is_live(): <new> else: <today, unchanged>`. An in-memory store reads as not live. Rules at every site:
+**Readers 1: one PR.** Every reader of "how does she feel" takes its number from the engine behind the switch, in the shape `if engine.engine_for(persona_dir).is_live(): <new> else: <today, unchanged>`. An in-memory store reads as not live. Rules at every site:
 - sites take `short`, `long`, `difference` and `shift` by name; they never filter names and never clamp (the engine's validator is the one boundary);
 - an absent emotion is left out of thresholds, sums, summaries and top-N lists, never read as 0; a present 0 is real data;
 - no threshold is retuned; the existing ones are measured instead (below);
@@ -393,11 +393,11 @@ It removes: `heartbeat._apply_emotion_decay` with its `protected` check, `emotio
 
 With the shift rule, nothing is shifted for a persona's first 30 days, so no gap opens, no block renders and no articulation call or reconcile offer happens then; this replaces the earlier "silent on day one" rule.
 
-**Threshold measurement**, run in the phase B PR: a script (not a pytest) on a copy of the synthetic database runs the engine with the live fold rules, quiet-day zeros included, twice: once with every day active and once with some days off. It reports, old against new, how often each threshold fires: body 5, 7 and 8; love 8 and the arousal 7 temperature bump; reflex arcs; the research peak 7.0; the rest gate; `body_strain`; and the maker's discharge rate (the maker feeds the short peak into `charge.accumulate`). The numbers go in the PR description for ThinkerOfThoughts to read before S6 merges; a large shift is raised straight away.
+**Threshold measurement**, run in the Readers 1 PR: a script (not a pytest) on a copy of the synthetic database runs the engine with the live fold rules, quiet-day zeros included, twice: once with every day active and once with some days off. It reports, old against new, how often each threshold fires: body 5, 7 and 8; love 8 and the arousal 7 temperature bump; reflex arcs; the research peak 7.0; the rest gate; `body_strain`; and the maker's discharge rate (the maker feeds the short peak into `charge.accumulate`). The numbers go in the PR description for ThinkerOfThoughts to read before Engine 6 merges; a large shift is raised straight away.
 
-**Phase B tests:** reflex, heartbeat, the persona panels, the summary, the tools, a new `test_body_state_from_short.py`, felt-time, the faded-value readers, a narrowed same-numbers test for the summary and the monologue frame; and for the self-model, cooldown pruning, `gap_from_read`, the round trip of `directions` and `reset_seen`, the live ambient render, and the articulation text. `update_baseline` and `Baseline` stay in `felt_time/weather_shift.py`; moving `update_baseline` into `chat_log.py` is left to the felt-time project.
+**Readers 1 tests:** reflex, heartbeat, the persona panels, the summary, the tools, a new `test_body_state_from_short.py`, felt-time, the faded-value readers, a narrowed same-numbers test for the summary and the monologue frame; and for the self-model, cooldown pruning, `gap_from_read`, the round trip of `directions` and `reset_seen`, the live ambient render, and the articulation text. `update_baseline` and `Baseline` stay in `felt_time/weather_shift.py`; moving `update_baseline` into `chat_log.py` is left to the felt-time project.
 
-**Phase C: one PR**, after S6. It deletes every else-branch, `is_live` test, old query (the nine copied "newest 200 memories with emotions" queries), import used only by the old path, the reflex `.get(name, 0.0)` defaults, the heartbeat sums, the self-model windows, floors, `compute_gap`, `compute_derived`, `DerivedRead`, `_CHANNEL_FLOOR`, the `live` parameter, and the old-path comments. It keeps the old `emotional_intensity` computation as a private function that is never called, commented "dormant until #386", with its own 200-row query and its `update_baseline` import from `weather_shift.py`, and retargets the four felt-time tests that cover it. It fixes the prompt comments that describe the old paths. `_build_emotion_summary` and `_current_emotional_summary` take `persona_dir`. It re-points the safety net's same-answer cells at the engine read (3.6): the capture is each site's derived map, the reference the stub's short averages, the exact-window check is deleted, all 12 `xfail` marks and the old-path imports go, and the `no_base_failure` reason is reworded. It deletes the safety net's old-branch pin files (found with `git ls-files '*test_old_branch_*'`), edits `test_body_panel_smoke.py`, and deletes the tests of removed windows, floors and the old render. Acceptance: `git grep aggregate_state brain/` lists only hanamorix's callers and comments.
+**Readers 2: one PR**, after Engine 6. It deletes every else-branch, `is_live` test, old query (the nine copied "newest 200 memories with emotions" queries), import used only by the old path, the reflex `.get(name, 0.0)` defaults, the heartbeat sums, the self-model windows, floors, `compute_gap`, `compute_derived`, `DerivedRead`, `_CHANNEL_FLOOR`, the `live` parameter, and the old-path comments. It keeps the old `emotional_intensity` computation as a private function that is never called, commented "dormant until #386", with its own 200-row query and its `update_baseline` import from `weather_shift.py`, and retargets the four felt-time tests that cover it. It fixes the prompt comments that describe the old paths. `_build_emotion_summary` and `_current_emotional_summary` take `persona_dir`. It re-points the safety net's same-answer cells at the engine read (3.6): the capture is each site's derived map, the reference the stub's short averages, the exact-window check is deleted, all 12 `xfail` marks and the old-path imports go, and the `no_base_failure` reason is reworded. It deletes the safety net's old-branch pin files (found with `git ls-files '*test_old_branch_*'`), edits `test_body_panel_smoke.py`, and deletes the tests of removed windows, floors and the old render. Acceptance: `git grep aggregate_state brain/` lists only hanamorix's callers and comments.
 
 ### 3.5 The access fixes (one PR, three commits)
 
@@ -411,16 +411,16 @@ Effects she will notice: a memory shown in full restarts its freshness, so it is
 
 **Tests:** `test_recall_open.py` (the old two-mode cases flipped, renamed or deleted; a new test that every full open is reported to the engine once, four cases, using the engine stub); `test_review.py` (a fixed stub signature; the context reads do not tick); `test_resonance.py` (the tick reads without ticking). None of these new tests passes on base, so none needs `no_base_failure`. The related reads in hanamorix's files are in her issue (1.3); vocab repair's search and the `add_memory` read are her vocabulary work.
 
-**GitHub:** the tracking issue first, then hanamorix's issue (assigned to her, `severity:high`), then the tracking issue edited with her issue's number. Phase C deletes nothing in this part.
+**GitHub:** the tracking issue first, then hanamorix's issue (assigned to her, `severity:high`), then the tracking issue edited with her issue's number. The switch-over stage deletes nothing in this part.
 
 ### 3.6 The reader-side safety net (one PR)
 
 Before any reader changes, tests pin what the readers do today, so a reader edit that changes behaviour unnoticed fails. Two permanent test files, seven `test_old_branch_*` files, a timing script with its shell wrapper, and one inventory entry in `scripts/README.md`. No `brain/` file and no existing test file is edited.
 
-- **Same answer on every surface** (`tests/unit/brain/test_every_surface_same_answer.py`). It compares the emotion-to-strength map each strength reader pools (captured by wrapping `aggregate_state` at each site, and `_peak_emotion` for the heartbeat summary) against one reference, `aggregate_state` over the full dataset. Rendered text is not compared. Two datasets in file-backed stores: one (231 rows) with an emotive memory older than the newest 200 emotion-bearing rows, which every 200-row window misses; one (62 rows) with more than 50 newest memories without emotion, which soul review's 50-row window misses. 13 surfaces, 24 cells, one test per cell; each cell first checks the capture happened, that the dataset shows the case and that the window is exact (each failing with `pytest.fail`), then makes its one assertion. 12 cells are strict `xfail(raises=AssertionError)` (they disagree today) and 12 are plain. At phase C the readers' PR points the cells at the engine read (the reference becomes the stub's short averages, the stub giving distinct short, long and difference values and a nonzero gap since the last fold), removes the marks and the old imports, and the test stays as the one cross-surface test.
-- **Bypass pin** (`tests/unit/brain/memory/test_gate_bypass_types.py`): `GATE_BYPASS_TYPES == frozenset({"journal_entry", "initiate_outbound", "monologue_emotion", "self_model_reconcile"})`, exactly. S7 edits it.
-- **Old-branch pins**: every old path the reader edits keep until the switch is pinned; existing tests that already pin one are named in the PR's table, and 17 new pin tests fill the gaps (including exact boundary cases for the `>=` comparisons and the 0.5 floor). Phase B edits two of them for the new call shapes (3.4); phase C deletes the files.
-- **Timing script** (`scripts/time_old_emotion_paths.py` and `.sh`): it refuses a database path under the app home, aborts if a `-wal` file has content, and copies only the main database file. It registers the database's feeling names through `load_persona_vocabulary` (printing the first-load count), prints a host line (including AVX2), and times three old paths in order: the current-state read (`get_emotional_state`), the trace write and the decay pass. Each is one labelled cold run plus 9 warm, reported as minimum, median and maximum with no pass/fail; the decay timing is 10 consecutive passes with the rows changed per pass. It reads the decay interval with `inspect`, and reports its rebuild count (0 in this PR). S6 extends it (3.3).
+- **Same answer on every surface** (`tests/unit/brain/test_every_surface_same_answer.py`). It compares the emotion-to-strength map each strength reader pools (captured by wrapping `aggregate_state` at each site, and `_peak_emotion` for the heartbeat summary) against one reference, `aggregate_state` over the full dataset. Rendered text is not compared. Two datasets in file-backed stores: one (231 rows) with an emotive memory older than the newest 200 emotion-bearing rows, which every 200-row window misses; one (62 rows) with more than 50 newest memories without emotion, which soul review's 50-row window misses. 13 surfaces, 24 cells, one test per cell; each cell first checks the capture happened, that the dataset shows the case and that the window is exact (each failing with `pytest.fail`), then makes its one assertion. 12 cells are strict `xfail(raises=AssertionError)` (they disagree today) and 12 are plain. In Readers 2 the PR points the cells at the engine read (the reference becomes the stub's short averages, the stub giving distinct short, long and difference values and a nonzero gap since the last fold), removes the marks and the old imports, and the test stays as the one cross-surface test.
+- **Bypass pin** (`tests/unit/brain/memory/test_gate_bypass_types.py`): `GATE_BYPASS_TYPES == frozenset({"journal_entry", "initiate_outbound", "monologue_emotion", "self_model_reconcile"})`, exactly. Engine 7 edits it.
+- **Old-branch pins**: every old path the reader edits keep until the switch is pinned; existing tests that already pin one are named in the PR's table, and 17 new pin tests fill the gaps (including exact boundary cases for the `>=` comparisons and the 0.5 floor). Readers 1 edits two of them for the new call shapes (3.4); Readers 2 deletes the files.
+- **Timing script** (`scripts/time_old_emotion_paths.py` and `.sh`): it refuses a database path under the app home, aborts if a `-wal` file has content, and copies only the main database file. It registers the database's feeling names through `load_persona_vocabulary` (printing the first-load count), prints a host line (including AVX2), and times three old paths in order: the current-state read (`get_emotional_state`), the trace write and the decay pass. Each is one labelled cold run plus 9 warm, reported as minimum, median and maximum with no pass/fail; the decay timing is 10 consecutive passes with the rows changed per pass. It reads the decay interval with `inspect`, and reports its rebuild count (0 in this PR). Engine 6 extends it (3.3).
 - **The PR description** has four parts: what is added, the pin table, the cell table with observed results, and the timing numbers with host, database checksum and commit. Commits run from the bypass pin first to the timing script last. Every new test function carries `@pytest.mark.no_base_failure(reason=...)` (one mark on a parametrised function), and `scripts/new_tests_fail_on_base.py --base origin/main --workers 0` must list exactly these functions as exempt.
 
 ### 3.7 Alternatives that were considered
@@ -449,46 +449,46 @@ Before any reader changes, tests pin what the readers do today, so a reader edit
 | PR | Contents | Owner |
 |---|---|---|
 | Plan PR | the coordination draft PR (4.5) | ThinkerOfThoughts |
-| S0 | the engine module as a stub with the real half-life lookup | ThinkerOfThoughts |
-| S1 | the pure functions and the rest of the engine constants | ThinkerOfThoughts |
-| S2 | the files, the read-only walk and the validator | ThinkerOfThoughts |
-| S3 | the hooks, the `fold` flag and the test stub | ThinkerOfThoughts |
-| S4 | the drain, `read()` with the shift, the catch-up and the shadow engine | ThinkerOfThoughts |
-| S5 | the gate work (3.1) | ThinkerOfThoughts |
-| Safety net | 3.6, one branch and one draft PR | ThinkerOfThoughts |
+| Engine 0: interface stub | the engine module as a stub with the real half-life lookup | ThinkerOfThoughts |
+| Engine 1: constants and fold maths | the pure functions and the rest of the engine constants | ThinkerOfThoughts |
+| Engine 2: state and queue files | the files, the read-only walk and the validator | ThinkerOfThoughts |
+| Engine 3: memory-write hooks | the hooks, the `fold` flag and the test stub | ThinkerOfThoughts |
+| Engine 4: drain and shadow engine | the drain, `read()` with the shift, the catch-up and the shadow engine | ThinkerOfThoughts |
+| Engine 5: gate merge and write-back | the gate work (3.1) | ThinkerOfThoughts |
+| Reader safety net | 3.6, one branch and one draft PR | ThinkerOfThoughts |
 | Access fixes | 3.5, one PR, three commits | ThinkerOfThoughts |
-| Readers phase B | 3.4 | ThinkerOfThoughts |
-| S6 | the switch-over (3.2, 3.3) | ThinkerOfThoughts |
-| Readers phase C | 3.4 | ThinkerOfThoughts |
-| S7 | the removals (3.3) | ThinkerOfThoughts |
+| Readers 1: move onto the engine | 3.4 | ThinkerOfThoughts |
+| Engine 6: the switch-over | the switch-over (3.2, 3.3) | ThinkerOfThoughts |
+| Readers 2: delete the old paths | 3.4 | ThinkerOfThoughts |
+| Engine 7: removals | the removals (3.3) | ThinkerOfThoughts |
 | #562, #563 | fixes for #555 (`close_session` unlinks without archiving) and #556 (the weekly rollover gap) | bug-fix PRs |
 | #565 | `canonical_name` pooling in `aggregate.py` now | bug-fix PR |
 | Her writer, vocabulary, cleanup and weather-shift PRs, and her access-fix issue | 1.3 | hanamorix |
 
 **What each engine slice contains.**
-- **S0.** `brain/emotion/engine.py` with every call of 2.7 as a stub: hooks and `fold_change` record their arguments in `recorded_calls`; `read()` returns `{}`; `is_live()` False; `status()` `(True, None)`; `faded_value()` the stored value; `oldest_entry_at()` None. `half_life()` is real from the start, because hanamorix's vocabulary work builds blend half-lives from it and can land before S1: S0 adds the half-life constants (`EMOTION_HALF_LIFE_DAYS`, `EMOTION_DEFAULT_HALF_LIFE_DAYS = 14.0`) and the persona-vocabulary-file cache in `engine_files.py`, with the half-life tests.
-- **S1.** `engine_utils.py`: `day_of`, `fold_entry`, `fold_event`, `close_days`, `apply_climax_reset`, `run_tracker`, `shift_for`, `fade`, `counted_kind`, `source_modifier`; and the rest of the engine constants (`EMOTION_SHORT_HALF_LIFE_H = 24.0`, `EMOTION_LONG_HALF_LIFE_D = 30.0`, the climax numbers, `EMOTION_VALUE_CAP = 10.0`, `EMOTION_FADE_FLOOR_FRACTION`, `EMOTION_REPEAT_WINDOW_H = 24.0`, `EMOTION_REPEAT_FACTOR = 0.5`, file and folder names). `HORIZON_IMPORTANCE_GAIN` is imported inside `faded_value` to avoid an import cycle. The quiet-day zero's value 0 and weight 1 are written once in the module, not as tunables. The 30 days of the rebuild window, the change-log retention, the snapshot and the start gate are all the long half-life, not separate constants; the lock, queue, drain and day close have no constants. S1 edits none of hanamorix's files.
-- **S2.** The rest of `engine_files.py`, `read_json_walk`, `state_dir`, the validator, the stat-key cache, and the queue, change-log and switch I/O.
-- **S3.** The hooks and the `fold` flag on `create` and `update`; `fold=False` in recovery's restore branch and the two migrators; the peer-trust stand-in; the conftest fixtures.
-- **S4.** The drain and its call sites, `read()` with the snapshot, the shift and the refresh call, `status()`, `engine_rebuild.replay` and `catch_up`, and three store methods: `list_engine_window(since)`, `creation_stamps_since(since)` and `oldest_created_at()` (plain SELECTs, explicit columns, no bump).
-- **S5, S6, S7.** Sections 3.1 and 3.3.
+- **Engine 0.** `brain/emotion/engine.py` with every call of 2.7 as a stub: hooks and `fold_change` record their arguments in `recorded_calls`; `read()` returns `{}`; `is_live()` False; `status()` `(True, None)`; `faded_value()` the stored value; `oldest_entry_at()` None. `half_life()` is real from the start, because hanamorix's vocabulary work builds blend half-lives from it and can land before Engine 1: Engine 0 adds the half-life constants (`EMOTION_HALF_LIFE_DAYS`, `EMOTION_DEFAULT_HALF_LIFE_DAYS = 14.0`) and the persona-vocabulary-file cache in `engine_files.py`, with the half-life tests.
+- **Engine 1.** `engine_utils.py`: `day_of`, `fold_entry`, `fold_event`, `close_days`, `apply_climax_reset`, `run_tracker`, `shift_for`, `fade`, `counted_kind`, `source_modifier`; and the rest of the engine constants (`EMOTION_SHORT_HALF_LIFE_H = 24.0`, `EMOTION_LONG_HALF_LIFE_D = 30.0`, the climax numbers, `EMOTION_VALUE_CAP = 10.0`, `EMOTION_FADE_FLOOR_FRACTION`, `EMOTION_REPEAT_WINDOW_H = 24.0`, `EMOTION_REPEAT_FACTOR = 0.5`, file and folder names). `HORIZON_IMPORTANCE_GAIN` is imported inside `faded_value` to avoid an import cycle. The quiet-day zero's value 0 and weight 1 are written once in the module, not as tunables. The 30 days of the rebuild window, the change-log retention, the snapshot and the start gate are all the long half-life, not separate constants; the lock, queue, drain and day close have no constants. Engine 1 edits none of hanamorix's files.
+- **Engine 2.** The rest of `engine_files.py`, `read_json_walk`, `state_dir`, the validator, the stat-key cache, and the queue, change-log and switch I/O.
+- **Engine 3.** The hooks and the `fold` flag on `create` and `update`; `fold=False` in recovery's restore branch and the two migrators; the peer-trust stand-in; the conftest fixtures.
+- **Engine 4.** The drain and its call sites, `read()` with the snapshot, the shift and the refresh call, `status()`, `engine_rebuild.replay` and `catch_up`, and three store methods: `list_engine_window(since)`, `creation_stamps_since(since)` and `oldest_created_at()` (plain SELECTs, explicit columns, no bump).
+- **Engine 5, Engine 6, Engine 7.** Sections 3.1 and 3.3.
 
 ### 4.2 What waits on what
 
-- **S0** needs nothing and lands first, so hanamorix's writers build against it.
-- **S1** needs S0; **S2** needs S1; **S3** needs S1 and S2; **S4** needs S3; **S5** needs S1 and S3 (independent of S4; it may land beside S3). **S3 and S4 land in the same window**: S3 alone queues events that nothing drains until S4.
-- **The safety net** needs nothing from the engine and lands before the first reader edit in phase B.
-- **The access fixes** need S0 to S4 (the stub, the hooks and fixtures, the drain), and must not land between S3 and S4.
-- **Readers phase B** needs S0 to S5 and the safety net's pin for each old branch, and rebases onto the access fixes for the files both touch (soul review and its test, `read_full_memory.py`, `search_memories.py`). Nothing in it waits for #385 or for hanamorix's weather-shift work.
-- **S6** needs: S4; readers phase B (including the self-model tick and the threshold measurement, whose numbers are read before S6 merges); hanamorix's writer work (her `peer_trust` accessor); the fixes for the reads that stamp last-accessed without a showing: the recall-resonance read (access fixes), the merge-target pre-read (S5), `add_memory` (her vocabulary work), and the ingest and research reads (her issue); and #555 and #556 fixed. There is no date wait after those fixes land: a fix being merged does not mean every install has it, so a persona's first rebuild may still see old false stamps, which is accepted (section 6). The dream read is not a prerequisite; it waits for the dream rework.
-- **Readers phase C** needs S6.
-- **S7** needs S6, readers phase C, hanamorix's removal after the switch of her five old `aggregate_state` reader branches (in the dream, monologue trace, growth scheduler, creative-DNA and reflex-crystallizer code), her cleanup that takes `protected` out of her files, and her writer change for the extractor and reconcile. Her plan has no item that deletes those branches, so S6's PR body asks which of her PRs does it and when. `aggregate.py` is deleted last.
-- **The phase C PRs (S6, readers phase C, S7) are flipped to ready only after hanamorix has answered** on the PR that introduced each interface change they depend on (4.7). Work and draft PRs go ahead before that.
+- **Engine 0** needs nothing and lands first, so hanamorix's writers build against it.
+- **Engine 1** needs Engine 0; **Engine 2** needs Engine 1; **Engine 3** needs Engine 1 and Engine 2; **Engine 4** needs Engine 3; **Engine 5** needs Engine 1 and Engine 3 (independent of Engine 4; it may land beside Engine 3). **Engine 3 and Engine 4 land in the same window**: Engine 3 alone queues events that nothing drains until Engine 4.
+- **The safety net** needs nothing from the engine and lands before the first reader edit in Readers 1.
+- **The access fixes** need Engine 0 to Engine 4 (the stub, the hooks and fixtures, the drain), and must not land between Engine 3 and Engine 4.
+- **Readers 1** needs Engine 0 to Engine 5 and the safety net's pin for each old branch, and rebases onto the access fixes for the files both touch (soul review and its test, `read_full_memory.py`, `search_memories.py`). Nothing in it waits for #385 or for hanamorix's weather-shift work.
+- **Engine 6** needs: Engine 4; Readers 1 (including the self-model tick and the threshold measurement, whose numbers are read before Engine 6 merges); hanamorix's writer work (her `peer_trust` accessor); the fixes for the reads that stamp last-accessed without a showing: the recall-resonance read (access fixes), the merge-target pre-read (Engine 5), `add_memory` (her vocabulary work), and the ingest and research reads (her issue); and #555 and #556 fixed. There is no date wait after those fixes land: a fix being merged does not mean every install has it, so a persona's first rebuild may still see old false stamps, which is accepted (section 6). The dream read is not a prerequisite; it waits for the dream rework.
+- **Readers 2** needs Engine 6.
+- **Engine 7** needs Engine 6, Readers 2, hanamorix's removal after the switch of her five old `aggregate_state` reader branches (in the dream, monologue trace, growth scheduler, creative-DNA and reflex-crystallizer code), her cleanup that takes `protected` out of her files, and her writer change for the extractor and reconcile. Her plan has no item that deletes those branches, so Engine 6's PR body asks which of her PRs does it and when. `aggregate.py` is deleted last.
+- **The three switch-over-stage PRs (Engine 6, Readers 2, Engine 7) are flipped to ready only after hanamorix has answered** on the PR that introduced each interface change they depend on (4.7). Work and draft PRs go ahead before that.
 - **#565 and her writer-side pin** "spelling variants pool as separate channels": #565 flips that pin, so whichever lands second edits the pin in its own PR and says so in its body.
 
 ### 4.3 Merge order
 
-S0, then S1 to S5, then (the safety net and the access fixes, anywhere before what needs them), then readers phase B, then S6 (with the decay-pass removal), then readers phase C, then S7. hanamorix's writer PRs can land any time after S0 and before S6, in any order.
+Engine 0, then Engine 1 to Engine 5, then (the safety net and the access fixes, anywhere before what needs them), then Readers 1, then Engine 6 (with the decay-pass removal), then Readers 2, then Engine 7. hanamorix's writer PRs can land any time after Engine 0 and before Engine 6, in any order.
 
 ### 4.4 How each PR is run
 
@@ -496,7 +496,7 @@ S0, then S1 to S5, then (the safety net and the access fixes, anywhere before wh
 - Before each PR: a collision check (`gh pr list`, `gh issue list`); the item's sub-issue of #240, assigned to ThinkerOfThoughts (created first if missing, listing what, why, files and dependencies); then an empty first commit, push, and the DRAFT PR opened before any code.
 - A PR is flipped (`gh pr ready`, reviewer hanamorix) only when every CI job is green, including the new-tests-must-fail job, with nothing pending, on a branch that has merged `origin/main` after its prerequisites landed. hanamorix merges.
 - One `Closes #N` line per issue in the PR description.
-- A PR that adds, changes or removes a constant in `brain/dev_constants.py` re-approves the dev-constants snapshot in the same PR (`uv run python tests/unit/test_dev_constants_snapshot.py --approve`): S0's half-life constants, S1's engine constants and phase B's summary constants add entries; S6 removes some.
+- A PR that adds, changes or removes a constant in `brain/dev_constants.py` re-approves the dev-constants snapshot in the same PR (`uv run python tests/unit/test_dev_constants_snapshot.py --approve`): Engine 0's half-life constants, Engine 1's engine constants and Readers 1's summary constants add entries; Engine 6 removes some.
 - Every new test that passes on the base code carries `@pytest.mark.no_base_failure(reason=...)` on the test function, with the reason it passes on base; `scripts/new_tests_fail_on_base.py --base origin/main --workers 0` lists the exempt tests.
 - A Discord heads-up at each point where a PR's "needs" line names another PR that must land first.
 - Every interface change is written in the body of the PR that introduces it, with its question (4.7).
@@ -504,7 +504,7 @@ S0, then S1 to S5, then (the safety net and the access fixes, anywhere before wh
 
 ### 4.5 The plan PR
 
-One draft PR whose description is the plan as a checklist of ThinkerOfThoughts's twelve PRs in build order (S0, S1, S2, S3, S4, S5, the safety net, the access fixes, readers phase B, S6, readers phase C, S7), each ticked with a link to the PR that did it. It lists only this half and links hanamorix's branch and documents; the other lanes' work an item needs is in that item's "needs" line (4.2), not an item. It carries this document, `docs/DESIGN-INVARIANTS.md`, and the synthetic database with its build and check scripts in `test-data/synthetic-db/`, all scrubbed of personal details and shown to ThinkerOfThoughts as exact files before the push; ThinkerOfThoughts also sends hanamorix the database directly. #240 points to it. No build step waits for it to merge (the timings use a local copy of the database), and when it merges is not set.
+One draft PR whose description is the plan as a checklist of ThinkerOfThoughts's twelve PRs in build order (Engine 0, Engine 1, Engine 2, Engine 3, Engine 4, Engine 5, the safety net, the access fixes, Readers 1, Engine 6, Readers 2, Engine 7), each ticked with a link to the PR that did it. It lists only this half and links hanamorix's branch and documents; the other lanes' work an item needs is in that item's "needs" line (4.2), not an item. It carries this document, `docs/DESIGN-INVARIANTS.md`, and the synthetic database with its build and check scripts in `test-data/synthetic-db/`, all scrubbed of personal details and shown to ThinkerOfThoughts as exact files before the push; ThinkerOfThoughts also sends hanamorix the database directly. #240 points to it. No build step waits for it to merge (the timings use a local copy of the database), and when it merges is not set.
 
 ### 4.6 Answers to hanamorix's questions about the engine interface
 
@@ -520,19 +520,19 @@ One draft PR whose description is the plan as a checklist of ThinkerOfThoughts's
 
 ### 4.7 Interface changes and questions, by PR
 
-Each item is written in the body of the PR that introduces it. A question here is what that PR asks hanamorix; a phase C PR is flipped only after her answer.
+Each item is written in the body of the PR that introduces it. A question here is what that PR asks hanamorix; a switch-over-stage PR is flipped only after her answer.
 
-- **S0.** The engine is `brain/emotion/engine.py`; calls take the receiver form `engine.engine_for(persona_dir).<call>` (the earlier interface listed them without a persona); import the module so one test patch reaches every site. `read()` returns four values per feeling, `Reading(short, long, difference, shift)`, only for names in the vocabulary registry. **Question: does any caller of hers unpack `read()` as three values?** New: `status()`, `note_active(now)`. `oldest_entry_at()` has no reader any more and stays. The stub records calls in `recorded_calls`. `half_life()` is the real lookup from S0, so a blend her vocabulary work mints gets a real half-life.
-- **S1.** The built-in half-life table is `EMOTION_HALF_LIFE_DAYS` in `dev_constants.py` from S0, so the table's literals in her vocabulary files (`_BASELINE`, `_canonical_personal_emotions.py`) leave with her vocabulary work; S1 edits none of her files. The line in `cli.py` that prints a growth-log event's own `decay_half_life_days`, and the persona-entry field `decay_half_life_days` in `persona_loader.py`, are hers and stay in phase B because the old decay pass still reads the field. **If the build finds the table move forces an edit in either, S1's PR body asks her for it.**
-- **S2.** The engine's files are under `<persona_dir>/state/`; the switch is `state/emotion_switch.json` written with `write_json` (not `save_with_backup`); the state is read with the no-heal walk `read_json_walk` (not `attempt_heal`).
-- **S3.** `create(..., fold=True)` and `update(memory_id, *, fold=True, **fields)`; hooks fire after the commit and never raise. **Question: is she content with the `fold=False` edits in her files (`recovery/engine.py` and the two migrators)?** Ingest passes `fold=False` only if she departs from the shared plan (the default folds). Peer trust is read through `engine_files.peer_trust`, 0.0 until S6 wires it to her accessor, expected to open `KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)` and return `get_relationship_state(...).trust_score`, 0.0 for no database or no row. `tests/conftest.py` gains `emotion_engine_stub` and the registry-reset fixture. From S3 every counted `create` in a file-backed test writes `state/emotion_pending.json`, and an uncounted one writes a start-only event there when the stored start date is null or later.
-- **S4.** Hooks only append; folding happens in drains after each reply and in the supervisor pass. **The per-reply drain in the CLI chat without the bridge is ThinkerOfThoughts's edit in `cli.py`: is that fine?** `read()` calls `persona_loader.refresh_if_changed(<path of the persona vocabulary file>)`, expecting one path argument and a None return, in its own `try`. **Question: does her function match that signature, and does it re-read only a vocabulary file this process has already loaded?** `store.py` is shared: S3's `fold` flag, S4's three methods, S5's `refresh_faded_emotions` and her `list_recent_emotions` are plain additions, and whichever lands second rebases.
-- **S5.** The gate merge now writes averaged emotions (`fold=False`); the temp-gate write-back resets `created_at` and writes faded values for every recalled type, so a stored value means "as of the last time this memory was written or remembered".
-- **S6.** `ensure_engine_ready` runs in `_dream_handler` (her dreams) and five other CLI handlers, with the dry-run rule. The x10 fix multiplies her writers' old rows with no cutoff, which relies on her nudge-scale change being behind `is_live()`. **Question: is it?** The decay pass is gone. **Question: will her per-memory emotion readers (grief, and the dream average over member memories) read through `faded_value`?** The peer-trust stand-in is wired to her `peer_trust(persona_dir, peer_id)`. **Question: which of her PRs deletes her five old `aggregate_state` reader branches after the switch, and when?** (S7 waits on it.)
-- **S7.** `aggregate.py` is deleted (her old branches must be gone first); the emotion-only row writes in her `chat/extractor.py` and `self_model/reconcile.py` are removed; `protected` leaves `store.py` (after her cleanup takes it out of the migrator transform and the recovery source reader); `GATE_BYPASS_TYPES` loses two entries (ingest imports it).
-- **Readers phase B.** `_mem_to_result` gains a required `persona_dir`; `tools/impls/_common.py` is shared with her `_write_gate_check` and `_calc_importance_from_emotions`. **Question: how is it ordered with her writer PRs?** `faded_value` is available for her per-memory readers. `update_baseline` and `Baseline` stay where her plan keeps them.
+- **Engine 0.** The engine is `brain/emotion/engine.py`; calls take the receiver form `engine.engine_for(persona_dir).<call>` (the earlier interface listed them without a persona); import the module so one test patch reaches every site. `read()` returns four values per feeling, `Reading(short, long, difference, shift)`, only for names in the vocabulary registry. **Question: does any caller of hers unpack `read()` as three values?** New: `status()`, `note_active(now)`. `oldest_entry_at()` has no reader any more and stays. The stub records calls in `recorded_calls`. `half_life()` is the real lookup from Engine 0, so a blend her vocabulary work mints gets a real half-life.
+- **Engine 1.** The built-in half-life table is `EMOTION_HALF_LIFE_DAYS` in `dev_constants.py` from Engine 0, so the table's literals in her vocabulary files (`_BASELINE`, `_canonical_personal_emotions.py`) leave with her vocabulary work; Engine 1 edits none of her files. The line in `cli.py` that prints a growth-log event's own `decay_half_life_days`, and the persona-entry field `decay_half_life_days` in `persona_loader.py`, are hers and stay in place in the shadow stage because the old decay pass still reads the field. **If the build finds the table move forces an edit in either, Engine 1's PR body asks her for it.**
+- **Engine 2.** The engine's files are under `<persona_dir>/state/`; the switch is `state/emotion_switch.json` written with `write_json` (not `save_with_backup`); the state is read with the no-heal walk `read_json_walk` (not `attempt_heal`).
+- **Engine 3.** `create(..., fold=True)` and `update(memory_id, *, fold=True, **fields)`; hooks fire after the commit and never raise. **Question: is she content with the `fold=False` edits in her files (`recovery/engine.py` and the two migrators)?** Ingest passes `fold=False` only if she departs from the shared plan (the default folds). Peer trust is read through `engine_files.peer_trust`, 0.0 until Engine 6 wires it to her accessor, expected to open `KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)` and return `get_relationship_state(...).trust_score`, 0.0 for no database or no row. `tests/conftest.py` gains `emotion_engine_stub` and the registry-reset fixture. From Engine 3 every counted `create` in a file-backed test writes `state/emotion_pending.json`, and an uncounted one writes a start-only event there when the stored start date is null or later.
+- **Engine 4.** Hooks only append; folding happens in drains after each reply and in the supervisor pass. **The per-reply drain in the CLI chat without the bridge is ThinkerOfThoughts's edit in `cli.py`: is that fine?** `read()` calls `persona_loader.refresh_if_changed(<path of the persona vocabulary file>)`, expecting one path argument and a None return, in its own `try`. **Question: does her function match that signature, and does it re-read only a vocabulary file this process has already loaded?** `store.py` is shared: Engine 3's `fold` flag, Engine 4's three methods, Engine 5's `refresh_faded_emotions` and her `list_recent_emotions` are plain additions, and whichever lands second rebases.
+- **Engine 5.** The gate merge now writes averaged emotions (`fold=False`); the temp-gate write-back resets `created_at` and writes faded values for every recalled type, so a stored value means "as of the last time this memory was written or remembered".
+- **Engine 6.** `ensure_engine_ready` runs in `_dream_handler` (her dreams) and five other CLI handlers, with the dry-run rule. The x10 fix multiplies her writers' old rows with no cutoff, which relies on her nudge-scale change being behind `is_live()`. **Question: is it?** The decay pass is gone. **Question: will her per-memory emotion readers (grief, and the dream average over member memories) read through `faded_value`?** The peer-trust stand-in is wired to her `peer_trust(persona_dir, peer_id)`. **Question: which of her PRs deletes her five old `aggregate_state` reader branches after the switch, and when?** (Engine 7 waits on it.)
+- **Engine 7.** `aggregate.py` is deleted (her old branches must be gone first); the emotion-only row writes in her `chat/extractor.py` and `self_model/reconcile.py` are removed; `protected` leaves `store.py` (after her cleanup takes it out of the migrator transform and the recovery source reader); `GATE_BYPASS_TYPES` loses two entries (ingest imports it).
+- **Readers 1.** `_mem_to_result` gains a required `persona_dir`; `tools/impls/_common.py` is shared with her `_write_gate_check` and `_calc_importance_from_emotions`. **Question: how is it ordered with her writer PRs?** `faded_value` is available for her per-memory readers. `update_baseline` and `Baseline` stay where her plan keeps them.
 - **Access fixes.** The one door reports every full open to the engine; the background reads in her files are in her issue; vocab repair's search and the `add_memory` read are her vocabulary work.
-- **Safety net, readers phase C.** No interface change for her.
+- **Reader safety net.** No interface change for her.
 
 ---
 
@@ -549,7 +549,7 @@ Checked against `docs/DESIGN-INVARIANTS.md`.
 | I5 opened memory gets the full bump and reappraisal | Every full open goes through the door: one `get(bump=True)` plus the reappraisal enqueue and the engine report. |
 | I6 bulk work off the hot path | Drains run after the reply, off the event loop; the recovery rebuild runs at a quiet moment; up to 8 showing hooks per reply is a bounded per-turn step. |
 | I7 constants and strings outside code | Engine and reader constants in `dev_constants.py`; new strings in `prompt_strings.toml`. |
-| I8 no emotions store; crash-recovery log only | The state holds averages, not entries; the change log is read only by a rebuild or a catch-up, and phase B writes none. |
+| I8 no emotions store; crash-recovery log only | The state holds averages, not entries; the change log is read only by a rebuild or a catch-up, and the shadow stage writes none. |
 | I9 legacy import and run-once verified migration | The x10 fix has a run-once marker, one transaction and a row-count rollback; the first rebuild checks before it replaces anything; migrators and recovery keep working with `fold=False`; the `protected` column stays. |
 | I10 persona strings | No persona wording is final; every string is listed in section 7. |
 | I11 live persona never a fixture | Tests use temporary persona dirs; the timing script refuses paths under the app home; live tests use the synthetic user. |
@@ -565,33 +565,33 @@ Each gets a code comment at the place named and a note in the commit message tha
 
 | Edge | Where the comment goes | Slice |
 |---|---|---|
-| An install's first rebuild may count memories whose `last_accessed_at` was stamped without a showing (old resonance stamps, the reads in hanamorix's issue until fixed, dream dry-run or denied-slot reads). A fix being shipped does not mean it is installed, so a guard period cannot help. | directly above `rebuild`'s `replay(...)` call | S6 |
-| A lost queue entry: a failed append, a raising hook, a crash between commit and append, a dropped invalid event; at most one turn's worth, and the memories from that turn still fold when committed | the hook append | S3 |
-| An unparseable queue file is discarded, with no rebuild | the queue read | S2 |
-| x10: a backfilled row whose strongest new value is below 1 is multiplied once (one odd day at most, then it sinks back) | `nudge_scale_fix.py` | S6 |
-| x10: a channel the old decay pass deleted at 0.01 stays deleted | `nudge_scale_fix.py` | S6 |
-| x10: `memories.db` restored alone under a surviving switch keeps unfixed rows | `nudge_scale_fix.py` | S6 |
-| Readers of `created_at` see a recalled memory as new | no comment | S5 |
-| The oldest snapshot day is a pending first day against the run and the next day is also against: that day's kind cannot be read (it has no previous day), so it is read as a move the other way, and the new run starts on that oldest day with length 2 where a zero first day would have started it a day later with length 1; a bar can move by 1. No issue | `run_tracker`, at the seeded-pending branch | S1 |
-| An absent comfort_seeking or rest_need gets no climax +2 | `apply_climax_reset` | S1 |
-| A clock set forward: day closes freeze until real time catches up, and change-log files pile up meanwhile. Issue (telling a corrected clock from a long absence needs a new rule or a chosen number) | `close_days` | S1 |
-| An entry dated in an already-closed day: the day holds both its zero and the entry (a late-gated memory; a hook still resolving or waiting for the lock at midnight) | `close_days` and `fold_event` | S1 |
-| A rollover is noticed only at the next supervisor pass; a read in between lacks the closed day's zeros | the supervisor drain call | S4 |
-| Events with the same time fold in read order; catch-up and live can differ in a tie | `replay` | S4 |
-| Catch-up: a late-dated queued event narrows the replay window; an append that straddles a save is missed. Issue | `catch_up` | S4 |
-| A catch-up holds the lock while it replays, so a post-reply drain may wait | `catch_up` | S4 |
-| A crash between the state write and the queue delete applies those events twice | `note_active` | S4 |
-| A hook waiting during a rebuild or catch-up folds its row a second time (and a commit's climax reset again) | the hook append | S4, S6 |
-| A day whose only rows were refreshed by the write-back counts as off in a later rebuild | `replay`'s past-day scan | S6 |
-| Missing or corrupt change-log parts lose those changes at a rebuild | the change-log replay | S6 |
-| A change still queued at a rebuild with no log line (a failed append, or from phase B) is lost | `rebuild`'s queue discard | S6 |
-| The first rebuild has no chat-change history (phase B writes no change log) | `rebuild`, at the change-log replay | S6 |
-| A rebuilt persona's snapshot is a fresh 30-day history; flags after a rebuild or catch-up may differ | `rebuild` | S6 |
-| Repeat showings beyond the first within 24 hours are not restored by a rebuild | `rebuild` | S6 |
-| A recovery rebuild with no readable old state has only `MIN(created_at)` for `persona_start_at`, which write-backs move forward: the gate can only stay shut longer, by at most 30 days. No other source exists (ids are random; the switch time would open a new persona's gate early). No issue | `rebuild` | S6 |
-| The spare rule's clear drops a cleared gap's reconcile cooldowns, so a just-reconciled channel can come back next tick. Issue | `_self_model_reflect` | readers phase B |
-| Readers show absent while a recovery rebuild is pending | the reader sites | readers phase B |
-| A hand-edited reflex arc with threshold 0 no longer fires on a missing emotion | `reflex._trigger_met` | readers phase B |
+| An install's first rebuild may count memories whose `last_accessed_at` was stamped without a showing (old resonance stamps, the reads in hanamorix's issue until fixed, dream dry-run or denied-slot reads). A fix being shipped does not mean it is installed, so a guard period cannot help. | directly above `rebuild`'s `replay(...)` call | Engine 6 |
+| A lost queue entry: a failed append, a raising hook, a crash between commit and append, a dropped invalid event; at most one turn's worth, and the memories from that turn still fold when committed | the hook append | Engine 3 |
+| An unparseable queue file is discarded, with no rebuild | the queue read | Engine 2 |
+| x10: a backfilled row whose strongest new value is below 1 is multiplied once (one odd day at most, then it sinks back) | `nudge_scale_fix.py` | Engine 6 |
+| x10: a channel the old decay pass deleted at 0.01 stays deleted | `nudge_scale_fix.py` | Engine 6 |
+| x10: `memories.db` restored alone under a surviving switch keeps unfixed rows | `nudge_scale_fix.py` | Engine 6 |
+| Readers of `created_at` see a recalled memory as new | no comment | Engine 5 |
+| The oldest snapshot day is a pending first day against the run and the next day is also against: that day's kind cannot be read (it has no previous day), so it is read as a move the other way, and the new run starts on that oldest day with length 2 where a zero first day would have started it a day later with length 1; a bar can move by 1. No issue | `run_tracker`, at the seeded-pending branch | Engine 1 |
+| An absent comfort_seeking or rest_need gets no climax +2 | `apply_climax_reset` | Engine 1 |
+| A clock set forward: day closes freeze until real time catches up, and change-log files pile up meanwhile. Issue (telling a corrected clock from a long absence needs a new rule or a chosen number) | `close_days` | Engine 1 |
+| An entry dated in an already-closed day: the day holds both its zero and the entry (a late-gated memory; a hook still resolving or waiting for the lock at midnight) | `close_days` and `fold_event` | Engine 1 |
+| A rollover is noticed only at the next supervisor pass; a read in between lacks the closed day's zeros | the supervisor drain call | Engine 4 |
+| Events with the same time fold in read order; catch-up and live can differ in a tie | `replay` | Engine 4 |
+| Catch-up: a late-dated queued event narrows the replay window; an append that straddles a save is missed. Issue | `catch_up` | Engine 4 |
+| A catch-up holds the lock while it replays, so a post-reply drain may wait | `catch_up` | Engine 4 |
+| A crash between the state write and the queue delete applies those events twice | `note_active` | Engine 4 |
+| A hook waiting during a rebuild or catch-up folds its row a second time (and a commit's climax reset again) | the hook append | Engine 4, Engine 6 |
+| A day whose only rows were refreshed by the write-back counts as off in a later rebuild | `replay`'s past-day scan | Engine 6 |
+| Missing or corrupt change-log parts lose those changes at a rebuild | the change-log replay | Engine 6 |
+| A change still queued at a rebuild with no log line (a failed append, or from the shadow stage) is lost | `rebuild`'s queue discard | Engine 6 |
+| The first rebuild has no chat-change history (the shadow stage writes no change log) | `rebuild`, at the change-log replay | Engine 6 |
+| A rebuilt persona's snapshot is a fresh 30-day history; flags after a rebuild or catch-up may differ | `rebuild` | Engine 6 |
+| Repeat showings beyond the first within 24 hours are not restored by a rebuild | `rebuild` | Engine 6 |
+| A recovery rebuild with no readable old state has only `MIN(created_at)` for `persona_start_at`, which write-backs move forward: the gate can only stay shut longer, by at most 30 days. No other source exists (ids are random; the switch time would open a new persona's gate early). No issue | `rebuild` | Engine 6 |
+| The spare rule's clear drops a cleared gap's reconcile cooldowns, so a just-reconciled channel can come back next tick. Issue | `_self_model_reflect` | Readers 1 |
+| Readers show absent while a recovery rebuild is pending | the reader sites | Readers 1 |
+| A hand-edited reflex arc with threshold 0 no longer fires on a missing emotion | `reflex._trigger_met` | Readers 1 |
 | A crash between the door's bump commit and the showing append loses that showing | `recall_open.py`, at the `try` around the engine call | access fixes |
 
 A new persona whose first rows are of an uncounted type would have opened its gate late; that is fixed, not accepted (the start-only event, 2.8).
@@ -609,7 +609,7 @@ Working text only while building; the final wording is ThinkerOfThoughts's byte-
 6. Tools: the `get_emotional_state` description and empty-return text, `format_emotion_summary`'s line form, and `get_body_state`'s "the six body emotions".
 7. Research: the "How you feel right now" header and "Your current emotional state:".
 8. The maker and notes `peak intensity` line; soul review's "neutral" and "unknown".
-9. The heartbeat prompt segments built around `memories_decayed` and the system segment's "decay applied", which S6 edits when it removes them.
+9. The heartbeat prompt segments built around `memories_decayed` and the system segment's "decay applied", which Engine 6 edits when it removes them.
 10. The live-test variants of the summary and the block framing (section 8).
 11. The research rating line: hanamorix writes the rating code; the wording of the prompt line that asks for the rating is ThinkerOfThoughts's.
 
@@ -622,7 +622,7 @@ Not persona-facing: the CLI dry-run message, the soul-review docstring sentence,
 Run with the synthetic test user and a test persona, never a live persona, once the code exists:
 1. **Mood summary variants:** top 3 against top 5; long against long and short against long and difference; all emotions, both ways. Switched by `EMOTION_SUMMARY_COUNT` and `EMOTION_SUMMARY_MODE`, with no code edit.
 2. **The self-model block's framing and prompt**, decided once the machinery is built.
-3. **The shift rule's effect on its readers:** how often the block renders, how often `reconcile_self_read` is offered, articulation calls per day (with direction), resolution memories, and how often a flagged feeling's rising or fading label disagrees with the average over the run; compared with the sizing numbers of 2.6. The maker's discharge rate is measured in the phase B threshold script instead.
+3. **The shift rule's effect on its readers:** how often the block renders, how often `reconcile_self_read` is offered, articulation calls per day (with direction), resolution memories, and how often a flagged feeling's rising or fading label disagrees with the average over the run; compared with the sizing numbers of 2.6. The maker's discharge rate is measured in the Readers 1 threshold script instead.
 
 ---
 
@@ -632,20 +632,20 @@ Run with the synthetic test user and a test persona, never a live persona, once 
 - Each item's #240 sub-issue exists before its PR opens.
 - Which new tests pass on base and so carry `no_base_failure`, and the dev-constants snapshot in each PR that touches a constant.
 - An import cycle check: `utils/memory.py` and `initiate/user_pattern.py` importing `ingest/buffer.py`.
-- #555 and #556 fixed before S6.
-- The first rebuild's timing in the S6 PR (3.3).
+- #555 and #556 fixed before Engine 6.
+- The first rebuild's timing in the Engine 6 PR (3.3).
 - A writer survey: every writer whose emotion constants are below 1. Another such writer changes the x10 type list.
 - A record that the memory-database rework must keep `PRAGMA user_version`.
 - A grep of readers of `score` for a "10 at most" assumption; a hit is fixed in the change.
 - One grep of engine readers on the memory-backfill-extraction and interest-list handlers.
 - The Ollama reachability check (no design effect).
-- The shift-rule sizing rebuilt from its method and run with the run record as built, reproducing the numbers of 2.6 up to the oldest-day edge (S4).
-- Before the felt-time edit in phase B: a collision check with #385, #386 and #387 and open PRs touching `prompt.py`, `supervisor.py`, `schemas.py` and `dev_constants.py`; the spike emitter's comment cites #569.
+- The shift-rule sizing rebuilt from its method and run with the run record as built, reproducing the numbers of 2.6 up to the oldest-day edge (Engine 4).
+- Before the felt-time edit in Readers 1: a collision check with #385, #386 and #387 and open PRs touching `prompt.py`, `supervisor.py`, `schemas.py` and `dev_constants.py`; the spike emitter's comment cites #569.
 - Safety net: re-run the 24 cells, the 17 new pins and the bypass pin at the build commit (and again after #565 lands) and set the marks to what is observed; take the record timing run on the low-end host with its AVX2 line; confirm the cells pass under `pytest -n 2 --dist loadgroup`.
-- Access fixes: whether the tracking issue already exists; the stub's `recorded_calls` entry shape at S3; a grep of `recall_count` and `last_accessed_at` readers for a ranker (if one exists, the "feeds no ranker" reasoning is redone); one timed loop of 8 `on_memory_shown` calls if the engine records no hook timing (PR text only); `new_tests_fail_on_base.py` clean on the branch after `origin/main` is merged in.
-- S1 and hanamorix's files: read the `cli.py` line and the persona-entry field (4.7, S1).
+- Access fixes: whether the tracking issue already exists; the stub's `recorded_calls` entry shape at Engine 3; a grep of `recall_count` and `last_accessed_at` readers for a ranker (if one exists, the "feeds no ranker" reasoning is redone); one timed loop of 8 `on_memory_shown` calls if the engine records no hook timing (PR text only); `new_tests_fail_on_base.py` clean on the branch after `origin/main` is merged in.
+- Engine 1 and hanamorix's files: read the `cli.py` line and the persona-entry field (4.7, Engine 1).
 
-These come back to ThinkerOfThoughts only if they happen: another sub-1 writer is found (the x10 list changes); hanamorix's nudge-scale change is not behind the switch (the "no cutoff" rule fails); the cold first rebuild on the low-end host is materially above about 1.2 s; or the half-life table move forces an edit in her files and she declines it on S1's PR.
+These come back to ThinkerOfThoughts only if they happen: another sub-1 writer is found (the x10 list changes); hanamorix's nudge-scale change is not behind the switch (the "no cutoff" rule fails); the cold first rebuild on the low-end host is materially above about 1.2 s; or the half-life table move forces an edit in her files and she declines it on Engine 1's PR.
 
 ---
 
@@ -658,8 +658,8 @@ Where the shared emotion rework plan says otherwise, this design holds. Any corr
 - There is no 24-hour rule: the shift is off until 30 days after the persona's oldest memory, which affects a new persona only.
 - The first rebuild finishes before the persona starts; a recovery rebuild runs at a quiet moment.
 - Hooks append events to `state/emotion_pending.json` and a drain after the reply folds them; one lock guards the engine's four files.
-- `update_baseline` stays in `felt_time/weather_shift.py`; nothing in this rework removes it. The "prompt comments" the plan mentions are fixed in readers phase C.
-- The phase C removals are the lists of S6, S7 and readers phase C, without `update_baseline`.
+- `update_baseline` stays in `felt_time/weather_shift.py`; nothing in this rework removes it. The "prompt comments" the plan mentions are fixed in Readers 2.
+- The switch-over-stage removals are the lists of Engine 6, Engine 7 and Readers 2, without `update_baseline`.
 - There is no recorded cutoff for the x10 fix; it runs before the switch.
 - The engine interface said `read()` returns three values per feeling; it returns four.
 - hanamorix writes the research rating code; the wording of its prompt line is ThinkerOfThoughts's, at the end.
@@ -670,7 +670,7 @@ Where the shared emotion rework plan says otherwise, this design holds. Any corr
 
 Filed and related:
 - #549 the recall count never fades; #550 memories surfaced by length.
-- #555 `close_session` unlinks without archiving, and #556 the weekly rollover gap (fixes in #562 and #563; S6 waits for them); #565 `canonical_name` pooling.
+- #555 `close_session` unlinks without archiving, and #556 the weekly rollover gap (fixes in #562 and #563; Engine 6 waits for them); #565 `canonical_name` pooling.
 - #557 (high), #558 (medium), #559 (low): audit bycatch. #571: the meaning-search candidate pool loads every memory in full on every chat turn. #572: the conversation-memory listing reads the whole table even when the caller wants ten.
 - #548 wizard fixture names; #125 reassigned to hanamorix; #382 one integrity check at start-up and every 24 hours; #388 backwards compatibility in one place (the x10 file is flagged for it); #385 paused (it gets the note about `read_json_walk`); #386 the felt-time drivers (the unplugged `emotional_intensity` waits for it); #240 the umbrella.
 
