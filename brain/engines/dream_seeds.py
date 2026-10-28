@@ -11,6 +11,7 @@ import re
 from datetime import datetime
 
 from brain.emotion.state import EmotionalState
+from brain.emotion.vocabulary import pool_by_canonical_name
 from brain.memory.store import Memory
 from brain.soul.crystallization import Crystallization
 
@@ -24,10 +25,16 @@ W_REFRACTORY = 2.0
 
 
 def emotional_congruence(memory: Memory, mood: EmotionalState) -> float:
-    """Sum over emotions shared by mood and memory of (mood_intensity * memory_value)."""
+    """Sum over emotions shared by mood and memory of (mood_intensity * memory_value).
+
+    The mood's channels are canonical emotion names (``aggregate_state`` pools by canonical name),
+    so the memory's stored emotions are read by canonical name too; two spellings of one emotion in
+    a memory count their larger value once.
+    """
+    memory_values = pool_by_canonical_name(memory.emotions)
     total = 0.0
     for name, intensity in mood.emotions.items():
-        mv = memory.emotions.get(name, 0.0)
+        mv = memory_values.get(name, 0.0)
         if mv > 0.0:
             total += intensity * mv
     return total
