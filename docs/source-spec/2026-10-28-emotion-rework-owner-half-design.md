@@ -213,7 +213,7 @@ Which writers fire which hook:
 - the bridge `lifespan` at start-up (after the start-up step in phase C);
 - the WebSocket `stream` handler after `ws.close(code=1000)`, in a worker thread via `tracked_to_thread`, so a waiting lock never stalls the event loop;
 - the HTTP `chat` handler through FastAPI `BackgroundTasks`, after the response;
-- the CLI chat without the bridge (`_chat_direct_mode`), after each reply and after each `_drain_pass2_at_exit`;
+- `nell chat --no-bridge` (`_chat_direct_mode`), after each reply and after each `_drain_pass2_at_exit`;
 - the CLI heartbeat (`_heartbeat_handler`), after `run_tick`.
 
 So events from inside a reply reach the averages right after the reply is sent; events outside a reply (a gate commit in a heartbeat tick, a pass-2 change after the lull) are drained by the supervisor pass. At most one turn's worth of events is ever waiting while drains succeed.
