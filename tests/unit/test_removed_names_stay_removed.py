@@ -479,13 +479,12 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=(
-            "limits",
             "MIN_OUTBOUND_GAP_SECONDS", "SESSION_MSG_CAP", "SESSION_COOLDOWN_HOURS", "DAILY_OUTBOUND_CAP", "DAILY_PROVIDER_CAP",
             "BUDGET_MAX", "BUDGET_REFILL_PER_DAY", "BUDGET_TIGHTEN_THRESHOLD", "MIN_SEND_DEBIT", "BUDGET_DEPLETED_THRESHOLD",
             "PEER_EMOTION_WINDOW_CAP", "PEER_EMOTION_WINDOW_HOURS", "INBOUND_FLOOD_CAP",
             "_MIN_OUTBOUND_GAP_SECONDS", "_SESSION_MSG_CAP", "_SESSION_COOLDOWN_HOURS", "_DAILY_OUTBOUND_CAP", "_DAILY_PROVIDER_CAP",
         ),
-        why="the peer-link constants are read as dev_constants.KINDLED_LINK_*; no module `limits` and no local alias of a constant (#531)",
+        why="the peer-link constants are read as dev_constants.KINDLED_LINK_*; no local alias of a constant (#531)",
         ref=_DEVCONST_REF,
         kind="code",
         scope=("brain/kindled_link",),

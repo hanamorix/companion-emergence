@@ -1,4 +1,4 @@
-"""Policy thresholds + open/close gates."""
+"""Policy open/close gates."""
 
 from __future__ import annotations
 

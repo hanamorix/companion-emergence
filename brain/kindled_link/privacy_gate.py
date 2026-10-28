@@ -5,7 +5,7 @@ reflection. No peer-derived content may flip a hold/revise into a send (parent
 §5). Fails closed to hold on any uncertainty.
 
 Tool-path isolation (carried from Phase 3): this module imports ONLY stdlib +
-{gate, dev_constants, cli_throttle}. The conformance oracle enforces it by AST."""
+{gate, dev_constants, cli_throttle}. The conformance oracle checks its `from brain.X import Y` imports by AST."""
 from __future__ import annotations
 
 import json

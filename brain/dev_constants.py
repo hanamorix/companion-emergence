@@ -5,7 +5,8 @@ Sibling of `brain.tunables` (ops tier, user-facing, editable in
 value here is EITHER not a runtime behaviour threshold (it exists to make a
 mechanism correct or well-sized — a timeout, a batch budget) OR is a
 behaviour-adjacent knob the owner has explicitly ruled is dev-level, not
-user-tunable (S26: the self-tune gate). Nothing in this module is registered
+user-tunable (S26: the self-tune gate; Q4/#531: the forgetting and narrative-memory thresholds, the
+attunement numbers, the peer-link caps). Nothing in this module is registered
 with `tunables.register` and nothing here is read via `tunables.get_tunable`
 — a value moves to `tunables.py` only on an explicit owner decision to make
 it user-facing (S6/S47 precedent: the chat-idle lull went the other way,
@@ -262,9 +263,8 @@ JUDGE_TUNE_GRADE_ORDER = (JUDGE_TUNE_GRADE_KNOB_REFIT, JUDGE_TUNE_GRADE_LORA, JU
 #   LOST_THRESHOLD     salience < this for LOST_PASS_COUNT consecutive passes drives fading -> lost
 #   LOST_PASS_COUNT    two-pass safety guard against single-pass dips
 #   RECENT_LIVED_HOURS memories younger than this are exempt (see the note on the value)
-# LOST_THRESHOLD and LOST_PASS_COUNT are the deletion floor: nothing may lower them to protect a memory (the
-# cd808dbc invariant). A retention lever only delays fading (FADE_IMPORTANCE_GAIN, HORIZON_IMPORTANCE_GAIN
-# below) and never lowers the deletion floor.
+# LOST_THRESHOLD and LOST_PASS_COUNT are the deletion floor (the cd808dbc invariant): a retention lever only delays
+# fading, it does not lower the deletion floor. FADE_IMPORTANCE_GAIN and HORIZON_IMPORTANCE_GAIN below are such levers.
 FADE_THRESHOLD = 0.25
 LOST_THRESHOLD = 0.10
 LOST_PASS_COUNT = 2
