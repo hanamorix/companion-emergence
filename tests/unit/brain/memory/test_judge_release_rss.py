@@ -544,7 +544,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
     written there for the library to find. The library's own opt-outs are removed from
     the environment first (a runner that exports one would pass without the fix), `brain`
     is imported before the library as every entry point does, and the telemetry flag is
-    checked on before the load.
+    checked on before and after the load.
     """
     script = textwrap.dedent(
         """
@@ -616,6 +616,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
             "hf_session_requests": _hf_session_requests,
             "model_id": provider.model_id(),
             "score_is_float": isinstance(score, float),
+            "telemetry_flag_after": hf_constants.HF_HUB_DISABLE_TELEMETRY,
             # S81 (owner ruling, "CPU everywhere (Recommended)"): every
             # judge construction site passes device="cpu" explicitly now
             # (relevance_judge.py), so this assertion measures the actual
@@ -631,6 +632,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> No
     result = _run_subprocess_script(script, tmp_path)
     assert result["model_id"] == "BAAI/bge-reranker-v2-m3"
     assert result["score_is_float"]
+    assert result["telemetry_flag_after"] is True, "the offline load switched the library's telemetry back on"
     assert result["device"] == "cpu", (
         f"expected the S81 device='cpu' construction to land the judge on cpu, "
         f"got {result['device']!r}"
