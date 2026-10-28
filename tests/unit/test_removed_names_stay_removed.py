@@ -467,6 +467,14 @@ REMOVED: tuple[Removed, ...] = (
         why="no module reaches a moved writer through attempt_heal: no import of one, no dotted name, no star import, no alias of the module (#465, G20b)",
         ref=_ATOMIC_REF,
     ),
+    # --- the archive-with-dedup write moved to the conversation buffer (#556) -------------------------------------------
+    Removed(
+        names=("_archive_once", "_archive_batch_key", "_turn_identity"),
+        why="the dedup archive write and the turn identity moved to brain/ingest/buffer.py (archive_once, turn_identity) so the rollover and the session close archive through the same path as compaction; compaction keeps no private copy",
+        ref="#556 rollover keeps every recent turn (the pull request that moved them)",
+        kind="code",
+        scope=("brain/chat",),
+    ),
 )
 
 

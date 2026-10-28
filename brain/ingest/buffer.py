@@ -10,11 +10,15 @@ Reads tolerate corrupt lines via brain.health.json_io.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +32,9 @@ from brain.health.json_io import (
     write_jsonl,
 )
 from brain.utils.atomic_write import fsync_dir, save_with_backup_text
+from brain.utils.file_lock import file_lock
+
+logger = logging.getLogger(__name__)
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -109,6 +116,30 @@ def ingest_turn(persona_dir: Path, turn: dict) -> str:
         record["image_shas"] = list(image_shas)
     append_jsonl(_session_path(persona_dir, session_id), record)
     return session_id
+
+
+@contextmanager
+def session_append_lock(persona_dir: Path, session_id: str) -> Iterator[None]:
+    """Hold the buffer's append lock: the lock ``ingest_turn`` takes (through ``append_jsonl``) for this session.
+
+    A caller that reads the buffer and then removes it (the session rollover) holds this across the read,
+    the archive write and the removal, so a row appended in between waits and cannot be removed unseen.
+    Not re-entrant: an ``ingest_turn`` of the same session inside the block, on any thread of this process,
+    waits for the block to end. Lock order: take the chat registry lock (``brain.chat.session.registry_lock``)
+    first when a caller needs both, and never take the registry lock while holding this one.
+
+    When the sidecar lock cannot be taken (``OSError``: a filesystem that refuses the lock) a warning is logged
+    and the block runs unlocked, as ``append_jsonl`` does, since the appenders are unlocked there too and
+    refusing would stop the caller for good. An exception raised by the block propagates once."""
+    stack = ExitStack()
+    try:
+        stack.enter_context(file_lock(_session_path(persona_dir, session_id)))
+    except OSError as exc:
+        logger.warning(
+            "could not take the append lock for session %s (%s); continuing without it", session_id, exc
+        )
+    with stack:
+        yield
 
 
 def list_active_sessions(persona_dir: Path) -> list[str]:
@@ -458,6 +489,51 @@ def write_archive_marker(persona_dir: Path, session_id: str, key: str) -> None:
         # fsync the containing dir so the new sidecar's directory entry is durable
         # (crash-mid-create), matching append_archive's new-segment durability.
         fsync_dir(path.parent)
+
+
+def turn_identity(t: dict) -> tuple:
+    """A stable identity for a buffer turn, used to match archived turns against
+    a re-read buffer (race-safe rewrite). (ts, speaker, text) is unique enough;
+    a collision means two byte-identical turns in the same second, where keeping
+    or dropping one is harmless."""
+    return (t.get("ts"), t.get("speaker"), t.get("text"))
+
+
+def _archive_batch_key(records: list[dict], new_gen: int) -> str:
+    """A stable identity for one archive-append batch: sha256 over ``new_gen`` and
+    the ORDERED ``(ts, speaker, text)`` identity of every record — never any
+    generated fold text. Two invocations that recompute the identical batch (a
+    crash-retry over an unchanged buffer) hash to the SAME key; a later,
+    genuinely-different batch (different ``new_gen`` or different records) never
+    collides (Bug 3)."""
+    h = hashlib.sha256()
+    h.update(str(new_gen).encode("utf-8"))
+    for r in records:
+        h.update(repr(turn_identity(r)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def archive_once(persona_dir: Path, session_id: str, records: list[dict], *, new_gen: int) -> int:
+    """The one archive-with-dedup write: archive ``records`` exactly once for this batch, proven by a
+    durable commit marker (Bug 3). Every path that removes turns from a conversation buffer (compaction,
+    the cascade, the session rollover) archives through this, before it removes anything.
+
+    ``new_gen`` is the generation the batch belongs to (the summary generation being written, or the one
+    the rollover carries); it is part of the batch key. Skips the append ONLY when the marker key matches
+    — i.e. the marker PROVES a completed prior append of this exact batch — never by inferring from turn
+    identity, so two byte-identical raw turns are always both archived (or both re-archived on a true
+    partial-write retry), never silently collapsed (L2). Returns the byte count written, or ``1`` as a
+    skip sentinel (a proven-already-archived batch; still ``> 0`` for the caller's write-verify). An
+    empty batch writes nothing and returns 0. A crash between the append and the marker write repeats
+    the batch on the retry (repeats, never a missing row)."""
+    if not records:
+        return 0
+    key = _archive_batch_key(records, new_gen)
+    if read_archive_marker(persona_dir, session_id) == key:
+        return 1  # proven already archived this pass -> skip append (no dup, no loss)
+    n = append_archive(persona_dir, session_id, records)
+    write_archive_marker(persona_dir, session_id, key)
+    return n
 
 
 def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:

@@ -13,14 +13,20 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.chat.rollover import perform_rollover
+from brain.health.json_io import append_jsonl
 from brain.ingest.buffer import (
     ingest_turn,
     list_active_sessions,
+    read_archive,
     read_cursor,
+    read_rolled_to,
     read_session,
     write_cursor,
 )
@@ -562,6 +568,14 @@ def test_summary_only_carries_residual_raw_not_dropped(
     ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "summary", "text": "[folded]"})
     ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "user", "text": "fresh-user"})
     ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "assistant", "text": "fresh-asst"})
+    # More residual raw rows than the 40-row tail of tiers_plus_tail: summary_only carries them ALL
+    # and archives none (#556: only the tail split archives what it does not carry).
+    extra = [f"extra-{i}" for i in range(43)]
+    for i, text in enumerate(extra):
+        ingest_turn(
+            persona_dir,
+            {"session_id": old_sid, "speaker": "user" if i % 2 == 0 else "assistant", "text": text},
+        )
     try:
         new_sid = perform_rollover(
             persona_dir, old_sid, _PERSONA_NAME, seed_mode="summary_only", provider=None,
@@ -572,6 +586,8 @@ def test_summary_only_carries_residual_raw_not_dropped(
         assert "fresh-user" in texts and "fresh-asst" in texts, (
             "residual raw turns were dropped — summary_only rollover data loss (r4)"
         )
+        assert texts[1:] == ["fresh-user", "fresh-asst", *extra], "every residual raw row is carried, in order"
+        assert read_archive(persona_dir, old_sid) == [], "summary_only carries every raw row, so nothing is archived"
         # The summary still leads the seed (order preserved).
         assert texts[0] == "[folded]"
         assert old_sid not in list_active_sessions(persona_dir)
@@ -641,5 +657,201 @@ def test_persist_during_summary_only_rollover_window_not_orphaned(
     assert "so-raced-user" in texts and "so-raced-asst" in texts, (
         "racing persist orphaned instead of threading into the successor"
     )
+
+
+# --------------------------------------------------------------------------- #556
+# The weekly (tiers_plus_tail) rollover carries the last 40 raw turns and the cascade archives only turns older
+# than 24h, so a turn outside the last 40 and younger than 24h used to be in neither file when the buffer was
+# deleted. The rollover now archives what it does not carry, durably, before it creates the successor.
+
+
+def _raw_texts(rows: list[dict]) -> list[str]:
+    return [r["text"] for r in rows if r.get("speaker") != "summary"]
+
+
+def _seed_556(persona_dir: Path, sid: str, *, aged: int = 0, recent: int = 60) -> list[str]:
+    """`aged` turns 48h old (the cascade archives those), then `recent` turns inside the last 2 hours.
+    The cursor is set at the last turn (everything extracted). Returns every turn text, oldest first."""
+    now = datetime.now(UTC)
+    tss: list[str] = []
+    texts: list[str] = []
+    if aged:
+        tss += _seed(persona_dir, sid, aged, base=now - timedelta(hours=48), step=timedelta(minutes=1), marker="OLD")
+        texts += [f"OLD-{i}" for i in range(aged)]
+    tss += _seed(persona_dir, sid, recent, base=now - timedelta(hours=2), step=timedelta(minutes=1), marker="NEW")
+    texts += [f"NEW-{i}" for i in range(recent)]
+    write_cursor(persona_dir, sid, tss[-1])
+    return texts
+
+
+def _old_path(persona_dir: Path, sid: str) -> Path:
+    return persona_dir / "active_conversations" / f"{sid}.jsonl"
+
+
+@pytest.mark.parametrize(("aged", "recent"), [(0, 60), (30, 50)], ids=["recent-only", "aged-and-recent"])
+def test_rollover_keeps_every_turn_556(tmp_path: Path, aged: int, recent: int) -> None:
+    """C1: every raw turn is in the successor or in the old session's archive, each exactly once."""
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_556"
+    all_texts = _seed_556(persona_dir, sid, aged=aged, recent=recent)
+    try:
+        new_sid = perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
+    finally:
+        reset_registry()
+    assert new_sid is not None
+
+    carried = _raw_texts(read_session(persona_dir, new_sid))
+    archived = _raw_texts(read_archive(persona_dir, sid))
+    assert carried == all_texts[-40:], "the successor carries the last 40 raw turns"
+    assert sorted(carried + archived) == sorted(all_texts), (
+        f"turns in neither the successor nor the archive: {sorted(set(all_texts) - set(carried) - set(archived))}"
+    )
+    assert not _old_path(persona_dir, sid).exists()
+    assert read_cursor(persona_dir, sid) is None
+
+
+def test_rollover_archives_before_deleting_556(tmp_path: Path, monkeypatch) -> None:
+    """C2: when the rollover removes the old buffer, the archive already holds every turn it does not carry."""
+    import brain.chat.rollover as rollover_mod
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_556_order"
+    all_texts = _seed_556(persona_dir, sid)
+    real_delete = rollover_mod.delete_session_buffer
+    seen: dict[str, list[str]] = {}
+
+    def spy(pd, s):
+        seen["archived"] = _raw_texts(read_archive(pd, s))
+        real_delete(pd, s)
+
+    monkeypatch.setattr(rollover_mod, "delete_session_buffer", spy)
+    try:
+        assert perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail") is not None
+    finally:
+        reset_registry()
+    assert seen["archived"] == all_texts[:-40]
+
+
+def test_rollover_archive_failure_keeps_buffer_556(tmp_path: Path, monkeypatch) -> None:
+    """C3: an archive failure raises out of the rollover and leaves the buffer, the cursor and the session list
+    untouched, with no successor and no rolled_to pointer."""
+    import brain.ingest.buffer as buffer_mod
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_556_fail"
+    _seed_556(persona_dir, sid)
+    before = _old_path(persona_dir, sid).read_bytes()
+    cursor_before = read_cursor(persona_dir, sid)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(buffer_mod, "append_archive", boom)
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
+    finally:
+        reset_registry()
+    assert _old_path(persona_dir, sid).read_bytes() == before
+    assert read_cursor(persona_dir, sid) == cursor_before
+    assert list_active_sessions(persona_dir) == [sid], "no successor session file was created"
+    assert read_rolled_to(persona_dir, sid) is None
+
+
+def test_rollover_retry_after_crash_archives_once_556(tmp_path: Path, monkeypatch) -> None:
+    """C4: a crash between the archive and the removal leaves every turn in the buffer and the archive; the rerun
+    completes and the archive holds each dropped turn exactly once (the commit marker dedups the batch)."""
+    import brain.chat.rollover as rollover_mod
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_556_retry"
+    all_texts = _seed_556(persona_dir, sid)
+    real_delete = rollover_mod.delete_session_buffer
+    crashes: list[int] = []
+
+    def crash_once(pd, s):
+        if not crashes:
+            crashes.append(1)
+            raise RuntimeError("crash before the unlink")
+        real_delete(pd, s)
+
+    monkeypatch.setattr(rollover_mod, "delete_session_buffer", crash_once)
+    try:
+        with pytest.raises(RuntimeError, match="crash before the unlink"):
+            perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
+        assert _raw_texts(read_session(persona_dir, sid)) == all_texts, "the buffer still holds every turn"
+        assert _raw_texts(read_archive(persona_dir, sid)) == all_texts[:-40]
+        assert perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail") is not None
+    finally:
+        reset_registry()
+    assert not _old_path(persona_dir, sid).exists()
+    assert _raw_texts(read_archive(persona_dir, sid)) == all_texts[:-40], "each dropped turn archived once"
+
+
+def test_rollover_holds_buffer_append_lock_to_unlink_556(tmp_path: Path, monkeypatch) -> None:
+    """C5: the buffer's append lock is held from the read to the unlink. A lock-respecting appender is refused
+    right after the read, inside the archive write and inside the unlink; a row an ordinary `ingest_turn` appends
+    during the unlink step waits and is kept (recreated file), not deleted unseen."""
+    import brain.chat.rollover as rollover_mod
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_556_lock"
+    _seed_556(persona_dir, sid)
+    path = _old_path(persona_dir, sid)
+    probes: dict[str, list] = {"read": [], "archive": [], "delete": []}
+
+    def probe(label: str) -> None:
+        row = {"session_id": sid, "speaker": "user", "text": f"PROBE-{label}", "ts": "2026-01-01T00:00:00+00:00"}
+        probes[label].append(append_jsonl(path, row, lock="try"))
+
+    real_read = rollover_mod.read_session
+    real_archive = getattr(rollover_mod, "archive_once", None)
+    real_delete = rollover_mod.delete_session_buffer
+    raced: list[threading.Thread] = []
+
+    def read_spy(pd, s):
+        out = real_read(pd, s)
+        probe("read")
+        return out
+
+    def archive_spy(*a, **k):
+        probe("archive")
+        return real_archive(*a, **k)
+
+    def delete_spy(pd, s):
+        probe("delete")
+        t = threading.Thread(
+            target=lambda: ingest_turn(persona_dir, {"session_id": sid, "speaker": "user", "text": "RACED-556"}),
+            name="raced-append",
+        )
+        t.start()
+        raced.append(t)
+        t.join(0.2)  # a deliberate probe: the append must still be waiting on the lock
+        real_delete(pd, s)
+
+    monkeypatch.setattr(rollover_mod, "read_session", read_spy)
+    monkeypatch.setattr(rollover_mod, "archive_once", archive_spy, raising=False)
+    monkeypatch.setattr(rollover_mod, "delete_session_buffer", delete_spy)
+    try:
+        new_sid = perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
+    finally:
+        finish_threads(*raced)
+        reset_registry()
+    assert new_sid is not None
+    assert probes == {"read": [None], "archive": [None], "delete": [None]}, "the append lock was not held"
+    assert "RACED-556" in _raw_texts(read_session(persona_dir, sid)), "the raced row was deleted unseen"
+    assert "RACED-556" not in _raw_texts(read_session(persona_dir, new_sid))
+    assert "RACED-556" not in _raw_texts(read_archive(persona_dir, sid))
 
 
