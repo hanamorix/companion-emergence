@@ -125,6 +125,7 @@ def test_full_ft_save_full_dir_none_leaves_no_save(tiny_model_dir: Path, tmp_pat
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on ubuntu in CI (wall 1.8 s); #540, J12')
 def test_full_ft_save_writes_no_adapter_config(tiny_model_dir: Path, tmp_path: Path) -> None:
     staged = tmp_path / "staged_full"
     build_full_ft_retrain_fn(tiny_model_dir, epochs=1, save_full_dir=staged)(_TRAIN_TRIPLES)
@@ -134,6 +135,7 @@ def test_full_ft_save_writes_no_adapter_config(tiny_model_dir: Path, tmp_path: P
     )
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.1 s); #540, J12')
 def test_load_full_scorer_does_not_use_peft_reload(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -155,6 +157,7 @@ def test_load_full_scorer_does_not_use_peft_reload(
     assert isinstance(result, float) and result == result  # finite, no peft path taken
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.6 s); #540, J12')
 def test_full_ft_construction_sites_force_cpu_even_if_mps_reported_available(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

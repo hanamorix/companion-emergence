@@ -52,6 +52,7 @@ def test_sonnet_writes_the_chat_default_id_over_another_value_and_asks_no_claude
     assert capture_claude_argv.argvs == []
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.3 s); #540, J12')
 def test_sonnet_when_the_value_already_is_the_default_writes_nothing_and_does_not_touch_the_file(tmp_path) -> None:
     client, _ = _make_client(tmp_path)
     with client:

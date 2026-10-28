@@ -343,6 +343,7 @@ def launchd_env(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "data" / "personas" / "nell").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Path.home() on Windows
     monkeypatch.setenv("KINDLED_HOME", str(home / "data"))
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
     nell = tmp_path / "nell"

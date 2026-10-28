@@ -170,7 +170,7 @@ def test_c10_payload_text_caps_scan_and_bounds_redos():
     assert len(text) <= MAX_SCAN_CHARS + 512  # body capped (+ small hint headroom)
     t0 = _time.perf_counter()
     _prefilter(text)
-    assert _time.perf_counter() - t0 < 0.5  # bounded, no catastrophic backtracking
+    assert _time.perf_counter() - t0 < 5.0  # bounded, no catastrophic backtracking (uncapped it is ~O(n^2) on 200k chars: minutes); the bound is loose so a contended parallel runner does not fail it
 
 
 def test_c10_unserialisable_hint_sentinel_survives_body_cap():

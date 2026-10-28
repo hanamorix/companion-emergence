@@ -286,6 +286,7 @@ def test_lora_then_merge_on_a_plain_checkpoint_starts_from_it(
     assert _file_hashes(c) == c_hashes, "the start checkpoint is not rewritten"
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_training_wraps_the_loaded_model_once(
     tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -309,6 +310,7 @@ def test_training_wraps_the_loaded_model_once(
     assert loads == [str(tiny_model_dir)]
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_lora_construction_site_forces_cpu_even_if_mps_reported_available(
     tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -395,6 +397,7 @@ def test_label_fn_boundary_matches_relevance_judge_label_for_score(
     assert label_fn(_FIXED_EVAL_ITEMS[0]) == "relevant"
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.5 s); #540, J12')
 def test_retrain_fn_matches_judge_eval_champion_challenger_contract(tiny_model_dir: Path) -> None:
     """`build_lora_retrain_fn`'s output plugs directly into `judge_eval.
     run_champion_challenger`'s `retrain_fn` parameter (AC6's orchestration
@@ -478,6 +481,7 @@ def test_bge_lora_module_names_are_grounded_xlm_roberta_values() -> None:
     assert BGE_RERANKER_LORA_MODULES_TO_SAVE == ("classifier",)
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.2 s); #540, J12')
 def test_merged_checkpoint_carries_the_lora_max_length_to_the_serve_loader(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -1100,6 +1101,7 @@ def test_sessions_snapshot_preserves_buffer(persona_dir: Path, monkeypatch):
         assert buffer_path.exists(), "snapshot must preserve replay buffer"
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_health_reports_brain_version(persona_dir: Path):
     """The version handshake (spec 2026-06-12) — frontend compares this
     against the app version to detect a stale pre-update bridge."""

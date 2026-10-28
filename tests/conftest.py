@@ -82,15 +82,17 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Itera
     outcome = yield
     from tests import slow_budget
 
-    if call.when != "call" or not slow_budget.enabled():
+    if call.when != "call":
         return
     cpu = item.stash.get(_CALL_CPU, 0.0)
     log = os.environ.get("KINDLED_SLOW_BUDGET_LOG")
-    if log and cpu > 0.5:
+    if log and cpu > 0.5:  # collected on every OS, whether or not the budget is enforced there
         import json
 
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"id": item.nodeid, "cpu": round(cpu, 3), "wall": round(call.duration, 3)}) + "\n")
+    if not slow_budget.enabled():
+        return
     report = outcome.get_result()
     if report.outcome != "passed" or hasattr(report, "wasxfail"):
         return

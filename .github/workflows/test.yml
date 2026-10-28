@@ -75,14 +75,15 @@ jobs:
       # xdist_group mark's tests on one worker (the tests sharing a real resource: the Hugging Face cache, the
       # systemd user manager, a network install); `-p no:tdd-guard` stops the tdd-guard plugin, which every worker
       # would otherwise load and make write the same status file. KINDLED_SLOW_BUDGET switches on the slow-test
-      # budget (tests/slow_budget.py): a test that uses more than 2 s of CPU must say why with
-      # @pytest.mark.slow(reason=...). Test order is
+      # budget (tests/slow_budget.py), on ubuntu only: a test that uses more than 2 s of CPU must say why with
+      # @pytest.mark.slow(reason=...); the CPU time of every test over 0.5 s is logged on all three systems (uploaded
+      # below). Test order is
       # random (pytest-randomly): the seed is printed in the header and at the end; to reproduce a red order run
       # serially with `--randomly-seed=N`, or switch it off with `-p no:randomly`.
       - name: Run pytest
         if: github.event_name != 'workflow_dispatch'
         env:
-          KINDLED_SLOW_BUDGET: "1"
+          KINDLED_SLOW_BUDGET: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
           KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
         run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml
 
@@ -102,7 +103,7 @@ jobs:
           TESTS: ${{ inputs.tests }}
           WORKERS: ${{ inputs.workers }}
           SEED: ${{ inputs.seed }}
-          KINDLED_SLOW_BUDGET: "1"
+          KINDLED_SLOW_BUDGET: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
           KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
         run: |
           case "$WORKERS" in
