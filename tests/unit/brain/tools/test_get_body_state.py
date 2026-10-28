@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import MemoryStore
+from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls import get_body_state as body_tool
 from brain.tools.impls.get_body_state import get_body_state
 
@@ -76,6 +76,23 @@ def test_session_hours_passed_through(store, hebbian, tmp_path):
         session_hours=2.5,
     )
     assert out["session_hours"] == 2.5
+
+
+def test_body_state_reads_a_variant_spelled_stored_emotion(store, hebbian, tmp_path):
+    """A feeling stored as `comfort-seeking` shows up as comfort_seeking in body state (#557)."""
+    memory = Memory.create_new(
+        content="held",
+        memory_type="conversation",
+        domain="us",
+        emotions={"comfort-seeking": 7.0},
+    )
+    store.create(memory)
+
+    out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
+
+    assert out["body_emotions"]["comfort_seeking"] == 7.0
+    # Reading must not rewrite the stored spelling.
+    assert store.get(memory.id).emotions == {"comfort-seeking": 7.0}
 
 
 def test_recomputes_each_call(store, hebbian, tmp_path, monkeypatch):

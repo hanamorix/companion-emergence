@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.emotion.aggregate import aggregate_state
 from brain.emotion.state import EmotionalState
 from brain.memory.store import Memory
@@ -63,3 +65,101 @@ def test_dropped_unregistered_emotion_warns_once(caplog):
     assert len(warnings) == 1, (
         f"expected exactly one warning for the dropped stored emotion, got {len(warnings)}"
     )
+
+
+# --- spelling variants pool under their canonical name (#557) ---
+
+
+def test_aggregate_pools_a_variant_spelling_under_its_canonical_name():
+    mem = _mem({"comfort-seeking": 7.0})
+    result = aggregate_state([mem])
+    assert result.emotions == {"comfort_seeking": 7.0}
+    # Read-only over the input: the stored spelling is not rewritten.
+    assert mem.emotions == {"comfort-seeking": 7.0}
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("comfort-seeking", "Comfort_Seeking"), ("comfort_seeking", "comfort-seeking")],
+)
+@pytest.mark.parametrize(
+    ("first_value", "second_value", "expected"),
+    [(7.0, 3.0, 7.0), (3.0, 7.0, 7.0), (5.0, 5.0, 5.0)],
+)
+def test_aggregate_two_variants_of_one_emotion_pool_to_the_max(
+    first, second, first_value, second_value, expected
+):
+    # The pooling rule is the max per emotion (module docstring), so two spellings
+    # of one emotion give one channel holding the larger value.
+    memories = [_mem({first: first_value}), _mem({second: second_value})]
+    assert aggregate_state(memories).emotions == {"comfort_seeking": expected}
+    assert aggregate_state(list(reversed(memories))).emotions == {"comfort_seeking": expected}
+
+
+def test_aggregate_blend_part_order_variants_share_one_channel():
+    from brain.emotion import vocabulary
+
+    for name in ("grief_love_blend", "calm_grief_love_blend"):
+        vocabulary.register(
+            vocabulary.Emotion(
+                name=name,
+                description="x",
+                category="persona_extension",
+                decay_half_life_days=14.0,
+                intensity_clamp=10.0,
+            )
+        )
+    try:
+        two_part = [_mem({"love_grief_blend": 6.0}), _mem({"grief_love_blend": 4.0})]
+        assert aggregate_state(two_part).emotions == {"grief_love_blend": 6.0}
+        three_part = [_mem({"love_calm_grief_blend": 3.0}), _mem({"Calm-Grief-Love_blend": 8.0})]
+        assert aggregate_state(three_part).emotions == {"calm_grief_love_blend": 8.0}
+    finally:
+        vocabulary._unregister("grief_love_blend")
+        vocabulary._unregister("calm_grief_love_blend")
+
+
+def test_aggregate_unknown_names_are_neither_kept_nor_merged():
+    from brain.emotion import vocabulary
+    from brain.emotion.vocabulary import canonical_name
+
+    # "comfort" is a prefix look-alike of a registered name but is not registered itself.
+    assert vocabulary.get("comfort") is None
+    assert vocabulary.get("not-a-real-emotion") is None
+    memories = [
+        _mem(
+            {
+                "not-a-real-emotion": 9.0,
+                "Not_A_Real_Emotion": 4.0,
+                "comfort": 8.0,
+                "comfort-seeking": 7.0,
+            }
+        )
+    ]
+    # Unregistered names stay dropped, none of them joins or removes the registered channel.
+    assert aggregate_state(memories).emotions == {"comfort_seeking": 7.0}
+    # Both spellings of an unknown name collapse to one key, distinct from the look-alike
+    # and from every registered name.
+    unknown = canonical_name("not-a-real-emotion")
+    assert canonical_name("Not_A_Real_Emotion") == unknown
+    assert unknown != canonical_name("comfort")
+    assert vocabulary.get(unknown) is None
+
+
+@pytest.mark.parametrize(
+    ("emotions", "expected"),
+    [
+        (
+            {"climax": 8.0, "comfort-seeking": 5.0},
+            {"comfort_seeking": 7.0, "rest_need": 2.0},
+        ),
+        (
+            {"Climax": 8.0, "arousal": 6.0},
+            {"arousal": pytest.approx(1.2), "comfort_seeking": 2.0, "rest_need": 2.0},
+        ),
+    ],
+)
+def test_climax_reset_sees_a_variant_spelled_channel(emotions, expected):
+    # The reset adds 2.0 to comfort_seeking and acts on climax; a variant spelling of
+    # either must land on the same channel instead of leaving a second key beside it.
+    assert aggregate_state([_mem(emotions)]).emotions == expected

@@ -5,7 +5,10 @@ current emotional state, synthesized across recent memories.
 
 Strategy: max-pool per emotion. The strongest signal across the
 input memories wins — matches how OG reflex_engine read peaks,
-not averages, for threshold evaluation.
+not averages, for threshold evaluation. An emotion is identified by
+its canonical name, so spelling variants of one emotion
+(`comfort-seeking`, `Comfort_Seeking`) share one channel and the
+strongest of them wins. Stored keys are never rewritten.
 
 After max-pooling, _apply_climax_reset is called: when aggregated
 `climax >= 7` it dampens arousal + desire and raises comfort_seeking
@@ -19,6 +22,7 @@ import logging
 from collections.abc import Iterable
 
 from brain.emotion.state import EmotionalState
+from brain.emotion.vocabulary import canonical_name
 from brain.emotion.vocabulary import get as _get_emotion
 from brain.memory.store import Memory
 
@@ -40,6 +44,9 @@ _INTENSITY_CLAMP = 10.0
 
 def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
     """Return an EmotionalState that is the per-emotion max across inputs.
+
+    Emotions are pooled under their canonical name, so every spelling
+    variant of one emotion reads as one channel in the returned state.
 
     Unknown emotions (not in the registered vocabulary) are silently
     skipped — a persona's old memories may contain retired emotion
@@ -67,8 +74,9 @@ def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
                         value,
                     )
                 continue
-            if value > pooled.get(name, 0.0):
-                pooled[name] = value
+            key = canonical_name(name)
+            if value > pooled.get(key, 0.0):
+                pooled[key] = value
 
     state = EmotionalState()
     for name, value in pooled.items():
