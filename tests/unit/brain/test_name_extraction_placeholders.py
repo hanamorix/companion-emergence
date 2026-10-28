@@ -1,12 +1,11 @@
-"""Names increment (name-recall fix): the persona-facing strings are the approved
-wording, byte-exact, and no placeholder is left (S107; criteria N18, N23-N25).
+"""Names increment (name-recall fix): the persona-facing strings carry no em-dash or other LLM tell, and the app's
+job labels are the approved ones (S107; criteria N18, N23-N25).
 
-This file held N2's PLACEHOLDER-marker test; the owner's wording now replaces
-every placeholder (the last one, the `rerank_width_remeasure` label, is final: wording
-file section 8). The texts below are copied from
-``~/.claude/plans/name-recall-fix-wording.md`` sections 1, 4, 7 and 8; the stage-8
-harness additionally compares them with that file. The two consolidation prompts
-are pinned in ``tests/unit/brain/engines/test_names_increment_consolidation.py``.
+The approved wording itself (the texts of ``~/.claude/plans/name-recall-fix-wording.md`` sections 1, 4, 7 and 8, the two
+consolidation prompts, the emitted schema entries) is held by ``tests/unit/test_persona_wording_snapshot.py``, which fails
+with a diff when it changes. The owner's wording replaced every placeholder (the last one, the `rerank_width_remeasure`
+label, is final: wording file section 8); that no placeholder comes back is listed in
+tests/unit/test_removed_names_stay_removed.py.
 """
 
 from __future__ import annotations
@@ -20,95 +19,35 @@ from brain.tools import schemas
 
 _REPO = Path(__file__).resolve().parents[3]
 
-ADD_DESCRIPTION = (
-    "Add a name to your list of known names: a person, a pet, a place, or anything else with a "
-    "proper name. When a known name comes up in conversation, even in passing, memories that "
-    "mention it are found. If the name is also an everyday word (like Will), it is only matched "
-    "when written with a capital letter. Names can be up to 100 characters long."
-)
-ADD_PARAM = "The name, spelled the way you want it kept."
-REMOVE_DESCRIPTION = (
-    "Remove a name from your list of known names, for example an ordinary word that was added "
-    "by mistake. Removing a name does not change any memories."
-)
-REMOVE_PARAM = "The name to remove, as it appears on your list."
-REJECTED_REPLY = (
-    "{name} was previously removed from your list of known names, if you want to add it back, "
-    "call add_name again with the same name as your next tool call."
-)
-
-TOO_LONG_REPLY = "The name {name} is over the 100 character limit and was not added."
-
 _TELLS = ("—", "–", "delve", "tapestry", "it's not just", "not just a", "testament")
 
-
-def test_the_tool_identifiers_and_texts_are_the_approved_wording():
-    assert schemas.ADD_NAME_TOOL_NAME == "add_name"
-    assert schemas.REMOVE_NAME_TOOL_NAME == "remove_name"
-    assert schemas.ADD_NAME_TOOL_DESCRIPTION == ADD_DESCRIPTION
-    assert schemas.ADD_NAME_PARAM_DESCRIPTION == ADD_PARAM
-    assert schemas.REMOVE_NAME_TOOL_DESCRIPTION == REMOVE_DESCRIPTION
-    assert schemas.REMOVE_NAME_PARAM_DESCRIPTION == REMOVE_PARAM
-
-
-@pytest.mark.parametrize(
-    ("tool", "description", "param"),
-    [("add_name", ADD_DESCRIPTION, ADD_PARAM), ("remove_name", REMOVE_DESCRIPTION, REMOVE_PARAM)],
-)
-def test_the_schema_entries_carry_the_texts(tool, description, param):
-    for table in (schemas.SCHEMAS, schemas.build_schemas("Canary")):
-        entry = table[tool]
-        assert entry["name"] == tool
-        assert entry["description"] == description
-        assert entry["parameters"]["properties"]["name"]["description"] == param
-        assert entry["parameters"]["required"] == ["name"]
+# The persona-facing texts, read from the live code (the approved wording itself is held by
+# tests/unit/test_persona_wording_snapshot.py; these checks keep the claudism rule on whatever text is there).
+_LIVE_TEXTS = {
+    "add_name description": schemas.ADD_NAME_TOOL_DESCRIPTION,
+    "add_name param": schemas.ADD_NAME_PARAM_DESCRIPTION,
+    "remove_name description": schemas.REMOVE_NAME_TOOL_DESCRIPTION,
+    "remove_name param": schemas.REMOVE_NAME_PARAM_DESCRIPTION,
+    "rejected reply": prompt_strings.get("tools.add_name.rejected_reply"),
+    "too long reply": prompt_strings.get("tools.add_name.too_long_reply"),
+    "reappraiser prompt": prompt_strings.get("engines.consolidation.reappraiser_prompt"),
+    "classifier prompt": prompt_strings.get("engines.consolidation.classifier_prompt"),
+}
 
 
-def test_the_rejected_reply_is_the_approved_text():
-    assert prompt_strings.get("tools.add_name.rejected_reply") == REJECTED_REPLY
-
-
-def test_the_over_100_reply_is_the_approved_text():
-    assert prompt_strings.get("tools.add_name.too_long_reply") == TOO_LONG_REPLY
-
-
-@pytest.mark.parametrize(
-    "text", [ADD_DESCRIPTION, ADD_PARAM, REMOVE_DESCRIPTION, REMOVE_PARAM, REJECTED_REPLY, TOO_LONG_REPLY]
-)
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+@pytest.mark.parametrize("text", list(_LIVE_TEXTS.values()), ids=list(_LIVE_TEXTS))
 def test_no_em_dash_or_llm_tell(text):
     for tell in _TELLS:
         assert tell not in text.lower(), tell
 
 
-def _consolidation_toml_section() -> str:
-    text = (_REPO / "brain/prompt_strings.toml").read_text(encoding="utf-8")
-    start = text.index("[engines.consolidation]")
-    return text[start : text.index("\n[", start + 1)]
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "brain/tools/schemas.py",
-        "brain/tools/impls/add_known_name.py",
-        "brain/tools/impls/remove_known_name.py",
-        "brain/chat/tool_recruit.py",
-    ],
-)
-def test_no_placeholder_left_in_the_name_tool_files(path):
-    assert "placeholder" not in (_REPO / path).read_text(encoding="utf-8").lower()
-
-
-def test_no_placeholder_left_in_the_consolidation_prompts():
-    assert "placeholder" not in _consolidation_toml_section().lower()
-
-
-def test_app_job_descriptors_carry_the_three_final_labels_and_no_placeholder():
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+def test_app_job_descriptors_carry_the_three_final_labels():
     """Wording file section 4 (two labels) and section 8 (`rerank_width_remeasure`, final):
-    each label is present at its site, and no PLACEHOLDER marker is left in App.tsx."""
+    each label is present at its site."""
     lines = (_REPO / "app/src/App.tsx").read_text(encoding="utf-8").splitlines()
     stripped = [line.strip() for line in lines]
     assert 'cosine_floor_bootstrap: "similarity pass mark setup",' in stripped
     assert 'rerank_floor_bootstrap: "re-scoring pass mark setup",' in stripped
     assert 'rerank_width_remeasure: "re-scoring cost check",' in stripped
-    assert [n for n, line in enumerate(lines) if "PLACEHOLDER" in line] == []

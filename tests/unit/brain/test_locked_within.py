@@ -21,6 +21,32 @@ def test_timeout_raises_and_the_body_never_runs(tmp_path: Path, wedged_lock) -> 
     assert ran == []
 
 
+@pytest.mark.no_base_failure(reason='#540 test of a test-only helper or fixture that wraps product code which already exists; it has no predecessor and the old code passes it')
+def test_held_lock_contends_with_a_second_acquirer_in_the_same_process_and_releases(tmp_path: Path, held_lock) -> None:
+    """The in-process holder is a real contender (each ``file_lock`` opens its own descriptor), and it lets go on exit."""
+    target = tmp_path / "data.json"
+    with held_lock(target):
+        with file_lock(target, blocking=False) as acquired:
+            assert acquired is False
+        with pytest.raises(TimeoutError), locked_within(target, 0.2):
+            pytest.fail("the body must not run while the lock is held")  # pragma: no cover
+    with file_lock(target, blocking=False) as acquired:
+        assert acquired is True
+
+
+@pytest.mark.no_base_failure(reason='#540 test of a test-only helper or fixture that wraps product code which already exists; it has no predecessor and the old code passes it')
+def test_held_lock_releases_when_the_body_raises(tmp_path: Path, held_lock) -> None:
+    target = tmp_path / "data.json"
+
+    class BoomError(Exception):
+        pass
+
+    with pytest.raises(BoomError), held_lock(target):
+        raise BoomError
+    with file_lock(target, blocking=False) as acquired:
+        assert acquired is True
+
+
 def test_success_enters_the_body_exactly_once(tmp_path: Path) -> None:
     """C42 (b)."""
     target = tmp_path / "data.json"
@@ -31,7 +57,7 @@ def test_success_enters_the_body_exactly_once(tmp_path: Path) -> None:
 
 
 def test_a_body_exception_propagates_once_and_releases_the_lock(tmp_path: Path) -> None:
-    """C42 (c): no retry of the body, and a second acquirer gets the lock at once afterwards."""
+    """C42 (c): no retry of the body, and a second acquirer gets the lock afterwards (within its wait)."""
     target = tmp_path / "data.json"
     calls: list[int] = []
 
@@ -42,10 +68,9 @@ def test_a_body_exception_propagates_once_and_releases_the_lock(tmp_path: Path) 
         calls.append(1)
         raise BoomError
     assert calls == [1]
-    started = time.monotonic()
+    # Had the lock not been released this would raise TimeoutError after its 2 s wait.
     with locked_within(target, 2.0):
         pass
-    assert time.monotonic() - started < 1.0
 
 
 def test_a_false_flag_from_the_nonblocking_form_never_runs_the_body(tmp_path: Path, monkeypatch) -> None:
@@ -70,21 +95,22 @@ def test_the_real_nonblocking_lock_is_released_between_polls(tmp_path: Path) -> 
     import threading
 
     target = tmp_path / "data.json"
-    released = threading.Event()
+    held = threading.Event()
+    order: list[str] = []
 
     def holder() -> None:
         with file_lock(target):
+            held.set()
             time.sleep(0.3)
-        released.set()
+            order.append("holder done")  # still inside the lock
 
     t = threading.Thread(target=holder)
     t.start()
-    time.sleep(0.05)
-    started = time.monotonic()
+    assert held.wait(timeout=10)  # the holder has the lock now, so the call below has to wait for it
     with locked_within(target, 5.0):
-        assert time.monotonic() - started >= 0.1  # it waited for the holder, then got the lock
+        order.append("body")
     t.join()
-    assert released.is_set()
+    assert order == ["holder done", "body"]  # it waited for the holder, then got the lock
 
 
 def test_wait_constant_covers_the_live_retry_constants_and_stays_under_the_webview_cut() -> None:

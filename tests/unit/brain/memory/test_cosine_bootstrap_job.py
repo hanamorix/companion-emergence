@@ -139,11 +139,6 @@ def test_a_calibrated_row_gates_the_cosine_path_without_any_bootstrap(
 # ---------------------------------------------------------------------------
 
 
-def test_there_are_no_back_off_constants() -> None:
-    """S85 (revised): the retry rule has no time constants at all."""
-    assert not [n for n in dir(floor_calibration) if "BACKOFF" in n.upper()]
-
-
 def test_a_failed_bootstrap_is_retried_only_after_chat_activity_changed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

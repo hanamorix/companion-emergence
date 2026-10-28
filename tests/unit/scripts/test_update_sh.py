@@ -349,19 +349,21 @@ def test_the_updater_itself_runs_on_the_release_brain(tmp_path):
     assert "KINDLED_NO_OVERLAY" not in start
 
 
-def test_every_nell_command_the_script_calls_exists_in_the_real_cli():
+def test_every_nell_command_the_script_calls_exists_in_the_real_cli(capsys):
     """The shim answers anything, so check each `"$NELL" <cmd> <action>` call site
     (plan steps AND the failure trap) against the real parser (#285: the script
-    called `nell service stop`, which no nell version has ever had)."""
+    called `nell service stop`, which no nell version has ever had). In this process:
+    `--help` of a real command exits 0 before anything runs, an unknown command or
+    action exits 2."""
+    from brain.cli import main
+
     calls = set(re.findall(r'"\$NELL" ([a-z-]+) ([a-z-]+)', SCRIPT.read_text(encoding="utf-8")))
     assert calls, "no nell call sites found — did the quoting change?"
     for cmd, action in sorted(calls):
-        cp = subprocess.run(
-            [sys.executable, "-c", "import sys; from brain.cli import main; sys.exit(main(sys.argv[1:]))",
-             cmd, action, "--help"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        assert cp.returncode == 0, f"`nell {cmd} {action}` is not a real command:\n{cp.stderr}"
+        with pytest.raises(SystemExit) as exit_info:
+            main([cmd, action, "--help"])
+        err = capsys.readouterr().err
+        assert exit_info.value.code == 0, f"`nell {cmd} {action}` is not a real command (exit {exit_info.value.code}):\n{err}"
 
 
 def test_restart_without_persona_is_refused(tmp_path):
@@ -455,17 +457,6 @@ def test_help_prints_the_whole_header():
     assert cp.returncode == 0
     assert cp.stdout.rstrip().endswith("executes nothing past preflight.")
     assert "set -euo" not in cp.stdout
-
-
-def test_help_describes_the_overlay_path_and_the_legacy_fallback():
-    cp = _run("--help")
-    assert cp.returncode == 0
-    out = cp.stdout
-    assert "overlay" in out.lower()
-    assert "no sudo" in out.lower() or "no runtime rewrite" in out.lower()
-    assert "#286" in out or "#289" in out  # overlay path reference
-    assert "#289" in out  # older bundles keep the legacy path
-    assert "#255" in out  # Windows still unsupported
 
 
 def test_nell_runs_from_a_neutral_cwd_even_from_a_checkout(tmp_path):

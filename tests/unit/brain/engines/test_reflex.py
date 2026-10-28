@@ -117,13 +117,6 @@ def test_reflex_arc_set_load_missing_logs_info_not_warning(tmp_path: Path, caplo
         )
 
 
-def test_reflex_arc_set_load_corrupt_falls_back_to_defaults(tmp_path: Path):
-    bad = tmp_path / "arcs.json"
-    bad.write_text("not valid json{{{", encoding="utf-8")
-    loaded = ReflexArcSet.load(bad, default_path=DEFAULT_ARCS_PATH)
-    assert len(loaded.arcs) == 4
-
-
 def test_reflex_arc_set_load_valid_file(tmp_path: Path):
     path = tmp_path / "arcs.json"
     path.write_text(
@@ -172,8 +165,9 @@ def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Pat
     assert len(corrupt_files) == 1
 
 
-def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path):
-    """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default."""
+def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path, caplog):
+    """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default; the public
+    `load` returns the same default arcs and logs the anomaly."""
     path = tmp_path / "reflex_arcs.json"
     path.write_text("{corrupt{{", encoding="utf-8")
 
@@ -183,6 +177,14 @@ def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path):
     assert anomaly.action == "reset_to_default"
     # default_path arcs loaded (4 OG arcs)
     assert len(result.arcs) == 4
+
+    public = tmp_path / "public" / "reflex_arcs.json"
+    public.parent.mkdir()
+    public.write_text("not valid json{{{", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        loaded = ReflexArcSet.load(public, default_path=DEFAULT_ARCS_PATH)
+    assert len(loaded.arcs) == 4
+    assert any("ReflexArcSet anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_reflex_log_save_with_backup_creates_bak(tmp_path: Path):
@@ -206,13 +208,6 @@ def test_reflex_log_save_with_backup_creates_bak(tmp_path: Path):
 
 def test_reflex_log_load_missing_returns_empty(tmp_path: Path):
     log = ReflexLog.load(tmp_path / "nope.json")
-    assert log.fires == ()
-
-
-def test_reflex_log_load_corrupt_returns_empty(tmp_path: Path):
-    path = tmp_path / "log.json"
-    path.write_text("{{{not json", encoding="utf-8")
-    log = ReflexLog.load(path)
     assert log.fires == ()
 
 

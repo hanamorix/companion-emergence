@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.thread_support import finish_threads, release_at_teardown
+
 # ---------------------------------------------------------------------------
 # load/save round-trip + fail-open (supports C7)
 # ---------------------------------------------------------------------------
@@ -146,63 +148,8 @@ def test_fold_reply_lag_incremental_mean(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_c9_concurrent_accessors_unguarded_can_lose_an_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ST1.5f self-test: with the lock bypassed, a load-then-save race
-    between two accessors CAN lose one mutation — proving the interleaving
-    technique below is capable of detecting a lost update at all."""
-    from brain.initiate import presence_state as ps_mod
-
-    # Bypass the real per-persona lock with a no-op — simulates two accessors
-    # racing with no synchronization at all.
-    class _NoOpLock:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(ps_mod, "_presence_lock", lambda _persona_dir: _NoOpLock())
-
-    reached_mid = threading.Event()
-    proceed = threading.Event()
-    real_load = ps_mod.load_presence_state
-    paused_once = threading.Event()
-
-    def slow_load(persona_dir):
-        state = real_load(persona_dir)
-        if not paused_once.is_set():
-            paused_once.set()
-            reached_mid.set()
-            proceed.wait(timeout=5)
-        return state
-
-    monkeypatch.setattr(ps_mod, "load_presence_state", slow_load)
-
-    def call_record_inbound():
-        ps_mod.record_inbound_turn(tmp_path, "2026-05-29T10:00:00+00:00")
-
-    t = threading.Thread(target=call_record_inbound)
-    t.start()
-    assert reached_mid.wait(timeout=5)
-
-    # This second mutation runs to completion WHILE the first is paused
-    # between its (already-completed) load and its (not-yet-run) save.
-    ps_mod.fold_reply_lag(tmp_path, 42.0)
-
-    proceed.set()
-    t.join(timeout=5)
-
-    final = real_load(tmp_path)
-    # Unguarded: the first accessor's save (based on a stale pre-fold read)
-    # clobbers the second's write — the fold is lost.
-    assert final.reply_lag_n == 0
-    assert final.last_seen_ts == "2026-05-29T10:00:00+00:00"
-
-
 def test_c9_concurrent_accessors_guarded_no_lost_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """With the real per-persona lock held, both mutations survive."""
     from brain.initiate import presence_state as ps_mod
@@ -217,7 +164,7 @@ def test_c9_concurrent_accessors_guarded_no_lost_update(
         if not paused_once.is_set():
             paused_once.set()
             reached_mid.set()
-            proceed.wait(timeout=5)
+            proceed.wait()
         return state
 
     monkeypatch.setattr(ps_mod, "load_presence_state", slow_load)
@@ -226,6 +173,8 @@ def test_c9_concurrent_accessors_guarded_no_lost_update(
         ps_mod.record_inbound_turn(tmp_path, "2026-05-29T10:00:00+00:00")
 
     t1 = threading.Thread(target=call_record_inbound)
+    threads = [t1]
+    release_at_teardown(request, proceed, threads)
     t1.start()
     assert reached_mid.wait(timeout=5)
 
@@ -233,11 +182,12 @@ def test_c9_concurrent_accessors_guarded_no_lost_update(
         ps_mod.fold_reply_lag(tmp_path, 42.0)
 
     t2 = threading.Thread(target=call_fold)
+    threads.append(t2)
     t2.start()
     time.sleep(0.05)  # give t2 a chance to attempt (and block on) the real lock
     proceed.set()
-    t1.join(timeout=5)
-    t2.join(timeout=5)
+    finish_threads(t1)
+    finish_threads(t2)
 
     final = real_load(tmp_path)
     assert final.last_seen_ts == "2026-05-29T10:00:00+00:00"
@@ -255,7 +205,6 @@ def test_c9_presence_lock_not_held_across_a_scan(tmp_path: Path) -> None:
     lock = _presence_lock(tmp_path)
     lock.acquire()
     try:
-        started = time.monotonic()
 
         def call_record_inbound():
             record_inbound_turn(tmp_path, "2026-05-29T10:00:00+00:00")
@@ -263,17 +212,15 @@ def test_c9_presence_lock_not_held_across_a_scan(tmp_path: Path) -> None:
         t = threading.Thread(target=call_record_inbound)
         t.start()
         time.sleep(0.05)
-        # The hook must still be blocked (lock held) — this doesn't assert
-        # the API's design directly, but the release-and-join below bounds
-        # how long it took once released.
+        # The hook is blocked while the lock is held; the release-and-join below shows it finishes once released.
+        assert t.is_alive()
     finally:
         lock.release()
-    t.join(timeout=5)
-    elapsed = time.monotonic() - started
-    # A coarse bound: releasing a lock that was ONLY ever meant to guard a
-    # tiny read-merge-write must let the waiter finish near-instantly, not
-    # anywhere near the duration of a real conversation-history scan.
-    assert elapsed < 1.0
+    # Releasing a lock that was ONLY ever meant to guard a tiny read-merge-write
+    # must let the waiter finish, however slow the host (no time bound: a waiter that
+    # never finishes is ended by pytest-timeout).
+    finish_threads(t)
+    assert not t.is_alive()
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import prompt_strings
 from brain.memory import known_names as kn
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -27,10 +28,7 @@ from brain.tools.impls.remove_known_name import remove_known_name
 from brain.tools.schemas import ADD_NAME_TOOL_NAME, REMOVE_NAME_TOOL_NAME
 
 _REPO = Path(__file__).resolve().parents[4]
-ASK = (
-    "Tuesday was previously removed from your list of known names, if you want to add it back, "
-    "call add_name again with the same name as your next tool call."
-)
+ASK = prompt_strings.get("tools.add_name.rejected_reply").format(name="Tuesday")  # wording: test_persona_wording_snapshot.py
 
 
 @pytest.fixture(autouse=True)

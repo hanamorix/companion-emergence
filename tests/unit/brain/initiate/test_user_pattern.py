@@ -124,9 +124,9 @@ def test_compute_likely_active_peak_hour_true_offpeak_false(tmp_path: Path) -> N
 
     # Inject _now at UTC 02:00 — 12 hours away, that bucket has 0 turns
     now_off = datetime(2026, 1, 15, 2, 0, 0, tzinfo=UTC)
-    # Guard: confirm these map to different local hours (always true since 12h apart)
-    if now_off.astimezone().hour != now_peak.astimezone().hour:
-        assert _compute_likely_active(tmp_path, _now=now_off) is False
+    # The code buckets by the host's local hour; two instants 12 h apart never share one, in any zone.
+    assert now_off.astimezone().hour != now_peak.astimezone().hour
+    assert _compute_likely_active(tmp_path, _now=now_off) is False
 
 
 def test_compute_response_lag_p50_no_file_returns_none(tmp_path: Path) -> None:
@@ -251,40 +251,6 @@ def test_c1_no_full_scan_when_daily_cadence_not_due(
     up.compute_user_presence(tmp_path, _now=now1)
 
     assert calls["n"] == 0, "no full-directory/full-file reader call expected on the cheap path"
-
-
-def test_c1_self_test_spy_would_catch_the_old_every_call_full_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ST1.5f: the same spy DOES detect a call when the reference (pre-#225)
-    full-scan implementations are invoked directly — proving the spy in the
-    test above is actually discriminating, not vacuously passing."""
-    import brain.initiate.user_pattern as up
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(hours=1))
-
-    calls = {"n": 0}
-    real_read, real_iter = up.read_jsonl, up.iter_jsonl
-
-    def spy_read(*a, **k):
-        calls["n"] += 1
-        return real_read(*a, **k)
-
-    def spy_iter(*a, **k):
-        calls["n"] += 1
-        return real_iter(*a, **k)
-
-    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
-    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
-
-    # The OLD reference implementation (kept as an oracle, no longer on the
-    # hot path) calls the full reader every time it's invoked directly.
-    up._compute_silence_days(tmp_path)
-    up._compute_likely_active(tmp_path)
-
-    assert calls["n"] > 0, "the spy must be capable of detecting a full-scan call"
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +507,7 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     import brain.initiate.user_pattern as up
 
     rows = []
-    for i in range(10_000):
+    for i in range(1_000):  # well past the primary window (window_n + tie margin = 350 rows)
         rows.append({
             "audit_id": f"old_{i}", "ts": f"2026-01-{(i % 27) + 1:02d}T00:00:{i % 60:02d}+00:00",
             "decision": "send_notify", "delivery": {"current_state": "dismissed"},
@@ -582,10 +548,14 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     assert oracle == result
 
 
-def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(tmp_path: Path) -> None:
+def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No resolution in the primary window_n rows, but one exists further
     back within window_n_max: the widened read must find it and match the
-    oracle's exact count."""
+    oracle's exact count, and the widen step (a second, larger read) must
+    really fire, not merely leave the count right by some other means."""
+    import brain.initiate.user_pattern as up
     from brain.initiate.user_pattern import _compute_ignore_streak, _compute_ignore_streak_bounded
 
     rows = [
@@ -601,29 +571,6 @@ def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(tmp_path: Path)
 
     oracle = _compute_ignore_streak(tmp_path)
     assert oracle == 29
-    bounded = _compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
-    assert bounded == oracle
-
-
-def test_c20a_widen_path_is_actually_exercised(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Confirms the widen step (a second, larger read) actually fires when
-    the primary window has no resolution — not merely that the final count
-    happens to be right by some other means."""
-    import brain.initiate.user_pattern as up
-
-    rows = [
-        {"audit_id": "resolved", "ts": "2026-05-01T00:00:00+00:00", "decision": "send_notify",
-         "delivery": {"current_state": "replied_explicit"}},
-    ]
-    for i in range(29):
-        rows.append({
-            "audit_id": f"d_{i}", "ts": f"2026-05-{2 + i:02d}T00:00:00+00:00",
-            "decision": "send_notify", "delivery": {"current_state": "dismissed"},
-        })
-    _write_audit_rows(tmp_path, rows)
-
     seen_ns: list[int] = []
     real_window = up._read_ignore_streak_window
 
@@ -632,7 +579,8 @@ def test_c20a_widen_path_is_actually_exercised(
         return real_window(persona_dir, n)
 
     monkeypatch.setattr(up, "_read_ignore_streak_window", spy)
-    up._compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
+    bounded = _compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
+    assert bounded == oracle
     assert seen_ns == [5, 30]  # primary window, then the widened read
 
 
@@ -814,8 +762,8 @@ def test_c5_likely_active_flips_across_hour_boundary_without_a_new_recompute(
     assert presence_peak.likely_active is True
 
     now_off = now_peak + timedelta(hours=12)  # well within the 24h cadence -> NOT due
-    if now_off.astimezone().hour == now_peak.astimezone().hour:
-        pytest.skip("12h-apart hours coincide on this host's local zone")
+    # The code buckets by the host's local hour; two instants 12 h apart never share one, in any zone.
+    assert now_off.astimezone().hour != now_peak.astimezone().hour
     presence_off = compute_user_presence(tmp_path, _now=now_off)
     assert presence_off.likely_active is False, (
         "classification must reflect the CURRENT hour, not a boolean frozen "

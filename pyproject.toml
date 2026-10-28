@@ -73,6 +73,13 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.5",
+    # #540: lets the suite run in parallel (`-n N --dist loadgroup`). `-n` is deliberately not in addopts: the caller (the CI workflow) chooses it.
+    "pytest-xdist>=3.6",
+    # #540: a hung test would stall one xdist worker and then the whole job; this bounds each test.
+    "pytest-timeout>=2.3",
+    # #540: random test order (prints its seed; `-p no:randomly` turns it off) so an order dependence shows up as a failure
+    # with a seed to reproduce it, not as a mystery on a parallel run.
+    "pytest-randomly>=3.15",
 ]
 
 [project.scripts]
@@ -113,13 +120,18 @@ testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 pythonpath = ["."]
 tdd_guard_project_root = "the project root"
+# #540: per-test ceiling (seconds). The slowest ordinary tests take far less; the real-model and network-install
+# modules raise it for themselves with @pytest.mark.timeout(3600).
+timeout = 600
 markers = [
+    "no_base_failure(reason): a new test that passes on the code the PR started from by design (a refactor guard, test infrastructure); exempt from the new-tests-must-fail-on-base check (#540, CONTRIBUTING.md). The reason is mandatory.",
+    "slow(reason): a test whose call phase legitimately uses more than 2 s of CPU time; without it the CI slow-test budget (ubuntu job) (tests/slow_budget.py) fails the test. The reason is mandatory and the number of marks is pinned and can only go down (#540).",
     "unit: unit tests",
     "integration: integration tests (deselect with '-m \"not integration\"')",
     "requires_claude_cli: marks tests that require the claude CLI to be on PATH",
     "live: token-spending live-harness runs (needs claude auth; exclude from default CI with -m 'not live')",
     "requires_network: marks tests that need real network access (e.g. downloading the real local embedding model) — excluded by the default fake-embedding-provider autouse fixture",
-    "requires_models: marks tests that need real, already-cached local models (embedder/reranker/judge) — no network download, but heavy; also marked `integration` so the local pre-check gate (-m 'not integration') excludes them",
+    "requires_models: marks tests that need real local models (embedder/reranker/judge) — heavy; the model files are downloaded when absent unless the test is cache-only; also marked `integration` so the local pre-check gate (-m 'not integration') excludes them",
 ]
 
 [tool.ruff]

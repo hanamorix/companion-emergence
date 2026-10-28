@@ -465,6 +465,7 @@ def _seed_labeled_calibration_rows(persona_dir: Path, n: int) -> None:
         store.close()
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on ubuntu in CI (wall 1.5 s); #540, J12')
 def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -538,6 +539,7 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     assert post_row_ids == []
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

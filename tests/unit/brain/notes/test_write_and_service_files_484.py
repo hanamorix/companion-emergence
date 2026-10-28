@@ -71,6 +71,7 @@ def _sandbox_windows_paths(monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Path.home() on Windows
     monkeypatch.setenv("NELLBRAIN_HOME", str(home / "data"))
     monkeypatch.setenv("KINDLED_HOME", str(home / "data"))
     monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData/Local"))
@@ -87,6 +88,7 @@ def test_the_systemd_unit_survives_a_write_that_dies_before_the_replace(tmp_path
     from brain.service import systemd
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Path.home() on Windows
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     nell = tmp_path / "nell"
     nell.write_text("#!/bin/sh\n")
@@ -108,6 +110,7 @@ def test_the_systemd_unit_is_still_written_whole(tmp_path, monkeypatch):
     from brain.service import systemd
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Path.home() on Windows
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     nell = tmp_path / "nell"
     nell.write_text("#!/bin/sh\n")

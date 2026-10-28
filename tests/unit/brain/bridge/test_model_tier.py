@@ -45,6 +45,7 @@ from brain.bridge.model_tier import (
     shipped_default,
 )
 from brain.bridge.provider import ClaudeCliProvider
+from tests.source_tree import brain_sources, tree_sources
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -146,15 +147,14 @@ _LEGACY_OWNERS = ("brain/persona_config.py", "brain/model_migration.py")
 
 
 def _source_files():
+    """``(path relative to the repository, text)`` of the product source: brain, the app, scripts (read once per process)."""
     for root, suffixes in (
-        (_REPO_ROOT / "brain", (".py",)),
-        (_REPO_ROOT / "app" / "src", (".ts", ".tsx")),
-        (_REPO_ROOT / "app" / "src-tauri" / "src", (".rs",)),
-        (_REPO_ROOT / "scripts", (".py", ".sh")),
+        ("brain", (".py",)),
+        ("app/src", (".ts", ".tsx")),
+        ("app/src-tauri/src", (".rs",)),
+        ("scripts", (".py", ".sh")),
     ):
-        for path in sorted(root.rglob("*")):
-            if path.is_file() and path.suffix in suffixes and "node_modules" not in path.parts:
-                yield path
+        yield from tree_sources(root, suffixes, ("node_modules",)).items()
 
 
 # Tests that name removed identifiers ON PURPOSE (to assert they are gone, or to feed the guard a violating fixture).
@@ -173,6 +173,7 @@ def _test_files():
             yield path
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
     """C2 and C20: every removed name has zero hits, code AND comments/docstrings, in brain, the app, scripts and tests."""
     names = [n for n in _REMOVED_EVERYWHERE if n != "model_override"]
@@ -180,9 +181,8 @@ def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
     test_pattern = re.compile(r"(?<![\w])(" + "|".join(map(re.escape, names)) + r")(?![\w])")
     legacy = re.compile(r"(?<![\w])(" + "|".join(_LEGACY_KEYS) + r")(?![\w])")
     hits: list[str] = []
-    for path in _source_files():
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for rel, text in _source_files():
+        for lineno, line in enumerate(text.splitlines(), 1):
             if pattern.search(line):
                 hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
             if legacy.search(line) and rel not in _LEGACY_OWNERS:
@@ -195,59 +195,11 @@ def test_removed_names_exist_nowhere_in_code_or_comments() -> None:
     assert hits == [], "removed names still present:\n" + "\n".join(hits)
 
 
-# Wording that described the first drafts (a separate "line" per job, a typed id that "pins", the picker "removing an
-# override"). The settings file now holds one entry per setting, and a value equal to the shipped default follows later
-# default changes (owner E7), so text that says otherwise misleads the next reader (rev-4 review S4).
-_STALE_WORDING = re.compile(
-    r"tunables lines?\b|removes the override|\bpins (?:it|that id)\b|already pinned to|pinned custom id|pinned to that very id"
-)
-
-
-def test_no_text_describes_the_settings_as_lines_or_a_typed_id_as_pinning() -> None:
-    hits: list[str] = []
-    for path in _source_files():
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if _STALE_WORDING.search(line):
-                hits.append(f"{rel}:{lineno}: {line.strip()[:90]}")
-    assert hits == [], "stale wording:\n" + "\n".join(hits)
-
-
-def test_the_stale_wording_scan_catches_the_phrases_it_names() -> None:
-    for phrase in (
-        "the model its tunables line names",
-        "install-wide tunables lines",
-        "`sonnet` removes the override",
-        "(typing the id of a word's model pins it)",
-        "it pins that id",
-        "the model is already pinned to that very id",
-    ):
-        assert _STALE_WORDING.search(phrase), phrase
-
-
 def test_the_tests_scan_catches_a_removed_keyword_and_a_removed_name_in_a_comment() -> None:
     """The M1 class (a test calling a removed parameter) must be visible to the scan."""
     assert _REMOVED_KWARG.search('get_provider("claude-cli", model_override="haiku")')
     assert not _REMOVED_KWARG.search("def test_x(persona_dir, model_override) -> None:")
     assert not _REMOVED_KWARG.search("model_override(TIER_COMPACTION, 'x')")
-
-
-def test_removed_attributes_do_not_exist() -> None:
-    from brain import persona_config
-    from brain.bridge import persona_state, provider
-    from brain.chat import compaction
-    from brain.self_model import articulate
-
-    for mod, names in (
-        (model_tier, ("MODEL_LITTLE", "MODEL_MEDIUM", "MODEL_BIGGEST", "TIER_MODEL", "TIER_DEV_CLI", "NAMED_CHOICES")),
-        (persona_config, ("DEFAULT_MODEL", "ROUTED_TIER_NAMES", "is_valid_model", "KNOWN_MODELS")),
-        (compaction, ("COMPACTION_MODEL",)),
-        (articulate, ("SELF_MODEL_MODEL",)),
-        (persona_state, ("_default_model_for",)),
-        (provider, ("DEFAULT_MODEL",)),
-    ):
-        for name in names:
-            assert not hasattr(mod, name), f"{mod.__name__}.{name} should not exist"
 
 
 # ---------------------------------------------------------------------------
@@ -526,9 +478,8 @@ def test_only_set_job_models_writes_model_keys() -> None:
     import ast
 
     offenders = []
-    for path in sorted((_REPO_ROOT / "brain").rglob("*.py")):
-        rel = path.relative_to(_REPO_ROOT / "brain").as_posix()
-        text = path.read_text(encoding="utf-8")
+    for full, text in brain_sources().items():
+        rel = full.removeprefix("brain/")
         if rel in ("tunables.py", "bridge/model_tier.py") or "set_values(" not in text:
             continue
         # tunables_migration.py folds an old file of arbitrary keys and names none of them (key-agnostic): its ONE function

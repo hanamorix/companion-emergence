@@ -1,6 +1,8 @@
 import hashlib
 from datetime import UTC, datetime
 
+import pytest
+
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.recovery.engine import preflight_recovery, run_recovery
@@ -38,7 +40,6 @@ def _source_with_v(tmp_path):
 
 def test_source_equals_target_refused(tmp_path):
     p = _persona_with_dangling(tmp_path)
-    import pytest
     with pytest.raises(ValueError):
         run_recovery(p, source_dir=p, dry_run=False)
 

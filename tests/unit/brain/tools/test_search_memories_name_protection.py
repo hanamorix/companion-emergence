@@ -236,6 +236,9 @@ def test_lexical_family_name_hits_follow_genuine_hits(tmp_path: Path) -> None:
     ids = _ids(_lexical(ctx, "pretzel zorblax quixotic"))
     assert ids.index(fam.id) > ids.index(general.id), "spec §4: keyword family after every keyword genuine hit"
     assert ids.index(fam.id) > max(ids.index(m.id) for m in pretzel)
+    # the tool stays bump-free with name hits in the result
+    rows = ctx["store"]._conn.execute("SELECT SUM(recall_count) FROM memories").fetchone()  # noqa: SLF001
+    assert rows[0] == 0
 
 
 # --------------------------------------------------------------------------
@@ -283,16 +286,6 @@ def test_semantic_name_hits_fill_only_the_slots_semantic_leaves(
     ids = _ids(dispatch("search_memories", {"query": query, "limit": 4}, **ctx))
     assert ids[:3] == [m.id for m in sems]
     assert len(ids) == 4 and ids[3] in {m.id for m in pretzel}, "no slot is reserved for name hits"
-
-
-def test_the_tool_stays_bump_free_with_name_hits(tmp_path: Path) -> None:
-    persona = tmp_path / "listed"
-    ctx, _, pretzel, _, _ = _world(persona)
-    _list(persona, "Pretzel")
-    _lexical(ctx, "pretzel zorblax quixotic")
-    rows = ctx["store"]._conn.execute("SELECT SUM(recall_count) FROM memories").fetchone()  # noqa: SLF001
-    assert rows[0] == 0
-    del pretzel
 
 
 def test_a_failing_names_lookup_leaves_the_tool_working(tmp_path: Path) -> None:

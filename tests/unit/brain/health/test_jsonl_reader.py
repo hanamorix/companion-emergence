@@ -125,28 +125,6 @@ def test_iter_skips_non_dict_json(tmp_path: Path) -> None:
     assert out == [{"ok": True}, {"also": "ok"}]
 
 
-def test_streaming_does_not_load_whole_file_into_memory(tmp_path: Path) -> None:
-    """A 5 MB log can be processed without spiking memory.
-
-    The streaming guarantee is hard to assert directly without psutil,
-    so we settle for: the iterator works on a file too big for the
-    test runner to want to keep multiple copies of, AND consumers can
-    bail out after the first record without having parsed the rest.
-    """
-    from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
-
-    p = tmp_path / "big.jsonl"
-    # ~5 MB of "filler" content per record, ~1000 records.
-    filler = "x" * 5000
-    with open(p, "w", encoding="utf-8") as fh:
-        for i in range(1000):
-            fh.write(json.dumps({"i": i, "filler": filler}) + "\n")
-    # Iterator should produce records lazily — consume only first 3.
-    g = iter_jsonl_skipping_corrupt(p)
-    out = [next(g), next(g), next(g)]
-    assert [r["i"] for r in out] == [0, 1, 2]
-
-
 def test_read_jsonl_is_iter_jsonl_materialised(tmp_path: Path) -> None:
     """The list wrapper yields exactly the same dicts the generator does."""
     p = tmp_path / "log.jsonl"

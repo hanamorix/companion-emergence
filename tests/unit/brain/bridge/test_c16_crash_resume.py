@@ -33,6 +33,8 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 from brain.bridge import job_progress
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -45,7 +47,9 @@ def _persona(tmp_path: Path) -> Path:
     return p
 
 
-def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: Path) -> None:
+def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     persona_dir = _persona(tmp_path)
     marker = tmp_path / "scored.log"
     ids_file = tmp_path / "own_ids.txt"
@@ -161,17 +165,11 @@ def test_c16_forgetting_sigkill_mid_item_resumes_without_redoing_done(tmp_path: 
             foreign.append((memory.id, threading.current_thread().name))
         return 5.0
 
-    policy_mod.is_exempt = _fake_is_exempt
-    policy_mod.is_within_import_grace = lambda *a, **kw: False
-    salience_mod.score = _counting_score
-    try:
-        run_pass(persona_dir, event_bus=EventBus())
-    finally:
-        # Restore module functions for any other test in this process.
-        import importlib
-
-        importlib.reload(policy_mod)
-        importlib.reload(salience_mod)
+    # monkeypatch puts the three functions back at teardown (same objects, no module reload).
+    monkeypatch.setattr(policy_mod, "is_exempt", _fake_is_exempt)
+    monkeypatch.setattr(policy_mod, "is_within_import_grace", lambda *a, **kw: False)
+    monkeypatch.setattr(salience_mod, "score", _counting_score)
+    run_pass(persona_dir, event_bus=EventBus())
 
     assert scored_id_1 not in scored_order, "item 1 (already scored+persisted before the kill) must not be redone"
     assert sorted(scored_order) == sorted(own_ids - {scored_id_1}), (

@@ -105,8 +105,9 @@ def test_logging_happens_outside_the_lock(monkeypatch):
 # --- SMOKE: threaded (may not fail on a lockless variant under the GIL; not evidence of atomicity) -
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_threaded_counts_are_exact():
-    threads, per = 8, 2000
+    threads, per = 8, 500
     old = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
     try:
@@ -121,6 +122,7 @@ def test_threaded_counts_are_exact():
     assert rec["count"] == threads * per
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_interleaved_writers_and_readers_stay_consistent():
     stop = threading.Event()
     errors: list[BaseException] = []

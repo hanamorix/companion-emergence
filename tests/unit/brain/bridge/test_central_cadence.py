@@ -33,6 +33,7 @@ from brain.chat import pass2_queue
 from brain.engines import interest_sweep
 from brain.memory.judge_selftune import JUDGE_TUNE_CADENCE_FILE
 from brain.self_model import cadence as sm_cadence
+from tests.thread_support import finish_threads
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
@@ -347,7 +348,9 @@ def test_c15a_all_17_due_run_in_s55_order_real_table(tmp_path, stubs):
     assert runs == list(GATED_JOB_ORDER)
 
 
-@pytest.mark.parametrize("j", range(len(GATED_JOB_ORDER)))
+# The loop asks is-chat-idle in one place before every job (no per-job branch), so the first and second job, one in
+# the middle and the last stand for all 21; the real-table test below pins the calibration boundary.
+@pytest.mark.parametrize("j", [0, 1, len(GATED_JOB_ORDER) // 2, len(GATED_JOB_ORDER) - 1])
 def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     log: list[str] = []
     asked: list[int] = []
@@ -360,6 +363,33 @@ def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     assert log == list(GATED_JOB_ORDER[:j])
     assert len(asked) == j + 1, "is-chat-idle must be asked again before every job"
     assert (decisions[-1].job, decisions[-1].action) == (GATED_JOB_ORDER[j], "skip-no-lull")
+
+
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tmp_path, stubs, monkeypatch):
+    """The real emotion_backfill job hands the backfill a provider built for the background-classifier tier
+    (#154: the backfill used to receive the bare shared provider)."""
+    from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
+
+    persona_dir = _persona(tmp_path)
+    built: list[tuple] = []
+    given: dict = {}
+    provider = FakeProvider()
+
+    def build(pd, tier, *a, **k):
+        built.append((pd, tier))
+        return provider
+
+    def run(pd, **kwargs):
+        given.update(kwargs)
+        return SimpleNamespace(status="complete")
+
+    monkeypatch.setattr(supervisor, "build_tier_provider", build)
+    monkeypatch.setattr(supervisor, "_emotion_backfill_run", run)
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "emotion_backfill")
+    assert job.run() is JobOutcome.COMPLETED
+    assert built == [(persona_dir, TIER_BACKGROUND_CLASSIFIER)]
+    assert given["provider"] is provider
 
 
 def test_c15a_idle_flip_real_table_stops_before_calibration(tmp_path, stubs):
@@ -664,6 +694,34 @@ def test_c21_a_raising_job_still_advances_its_cadence(tmp_path, stubs, monkeypat
     assert state.next_at == NOW + timedelta(seconds=interval)
 
 
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stubs, monkeypatch):
+    """The central function is the fault-isolation wrapper of deploy recalibration (the supervisor-thread test that
+    pinned "the loop survives" is gone). A raising run counts as a completed run (S44), the next due job still runs in
+    the same pass, and the next pass tries the raising job again while it stays due. (Here the due predicate is
+    stubbed true; in production a no-row raise is rate-limited by the job's own retry cadence file.)"""
+    persona_dir = _persona(tmp_path)
+    for k in stubs.work:
+        stubs.work[k] = False
+    stubs.work["deploy_recalibration"] = True
+    filename, _interval = INTERVAL_JOBS["daily_calibration"]
+    _seed(persona_dir, filename, NOW - timedelta(hours=1))  # the job after it in the S55 order is overdue
+    attempts: list[tuple] = []
+
+    def boom(*args, **_k):
+        attempts.append(args)
+        raise RuntimeError("simulated deploy recalibration failure")
+
+    monkeypatch.setattr(supervisor, "_run_deploy_recalibration", boom)
+    jobs = [j for j in _real_jobs(persona_dir) if j.name in ("deploy_recalibration", "daily_calibration")]
+    decisions = _pass(persona_dir, jobs)
+    assert ("deploy_recalibration", "completed") in [(d.job, d.action) for d in decisions]
+    assert ("daily_calibration", "completed") in [(d.job, d.action) for d in decisions]
+    assert stubs.order == ["daily_calibration"]
+    _pass(persona_dir, jobs)
+    assert attempts == [(persona_dir,)] * 2, "a job that stays due is tried again at the next pass, on this persona"
+
+
 def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch):
     """Self-model keeps its own cadence (S29): a reflect that raises is
     caught by its own handler and backs off (still an advance, S44)."""
@@ -720,11 +778,6 @@ def test_c22_due_but_no_lull_leaves_the_cadence_file_unchanged(tmp_path, stubs):
     assert sm_cadence._state_path(persona_dir).read_bytes() == before  # noqa: SLF001
     _pass(persona_dir, _self_model_only(persona_dir))
     assert stubs.order == ["self_model_articulation"]
-
-
-def test_c22_code_comment_names_the_future_absorption():
-    src = inspect.getsource(supervisor._run_self_model_tick).replace("#", " ")
-    assert "absorbed later by the expanded central cadence function" in " ".join(src.split())
 
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +1102,14 @@ def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", NO_INTERVAL_JOBS)
+# The jobs that run at every idle pass while their "has work" predicate holds: the interval-less jobs, and deploy
+# recalibration (due while the stored floor is stale). Kept apart from NO_INTERVAL_JOBS, which other tests read as the
+# set of jobs with no due-predicate of their own.
+_WORK_PREDICATE_JOBS = (*NO_INTERVAL_JOBS, "deploy_recalibration")
+
+
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+@pytest.mark.parametrize("name", _WORK_PREDICATE_JOBS)
 def test_c39_no_interval_job_runs_every_idle_pass_while_it_has_work(tmp_path, stubs, name):
     persona_dir = _persona(tmp_path)
     for k in stubs.work:
@@ -1276,16 +1336,6 @@ def test_load_or_init_cadence_present_file_is_returned_unchanged(tmp_path):
     assert _cadence_path(tmp_path, "x.json").read_bytes() == before
 
 
-def test_run_central_pass_logs_decisions(tmp_path, caplog):
-    import logging
-
-    log: list[str] = []
-    with caplog.at_level(logging.INFO, logger="brain.bridge.central_cadence"):
-        _pass(tmp_path, _fake_jobs(["pass2"], log))
-    assert any("job=pass2 action=run" in r.getMessage() for r in caplog.records)
-    assert any("job=pass2 action=completed" in r.getMessage() for r in caplog.records)
-
-
 def test_paused_outcome_stops_the_sequence_without_advancing(tmp_path):
     """INC-10 seam: a job reporting PAUSED ends the sequence and its cadence
     is not advanced."""
@@ -1429,15 +1479,34 @@ def test_s84_leaves_time_since_last_message_and_is_chat_idle_untouched(tmp_path,
         reset_registry()
 
 
-def test_s84_run_folded_captures_bridge_start_before_the_loop():
-    """Live wiring: run_folded records bridge start once, at entry, and hands
-    it to the job table."""
-    src = inspect.getsource(supervisor.run_folded)
-    assert "bridge_started_at = datetime.now(UTC)" in src
-    assert src.index("bridge_started_at = datetime.now(UTC)") < src.index(
-        "while not stop_event.is_set():"
-    )
-    assert "bridge_started_at=bridge_started_at" in src
+def _folded_kwargs(persona_dir, ticks: list[int], **extra) -> dict:
+    """Keyword arguments for a real run_folded thread with every cadence off (one tick per pass lands in ``ticks``)."""
+    return {
+        "persona_dir": persona_dir,
+        "provider": FakeProvider(),
+        # EventBus drops events when no event loop is bound, so the bus here is a recorder.
+        "event_bus": SimpleNamespace(
+            publish=lambda event: ticks.append(1) if event.get("type") == "supervisor_tick" else None
+        ),
+        "tick_interval_s": 0.05,
+        "heartbeat_interval_s": None,
+        "soul_review_interval_s": None,
+        "finalize_interval_s": None,
+        "log_rotation_interval_s": None,
+        "initiate_review_interval_s": None,
+        "voice_reflection_interval_s": None,
+        "self_model_interval_s": None,
+        "compaction_interval_s": None,
+        "calibration_interval_s": None,
+        "interest_sweep_interval_s": None,
+        "judge_selftune_interval_s": None,
+        "clustering_interval_s": None,
+        "vocab_repair_interval_s": None,
+        "maker_enabled": False,
+        "notes_enabled": False,
+        "kindled_link_enabled": False,
+        **extra,
+    }
 
 
 def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_path):
@@ -1449,54 +1518,89 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
 
     from brain.chat.session import all_sessions, create_session, reset_registry
 
+    # Caps, not expected durations: every wait below returns as soon as its event happens. The first idle pass opens
+    # the stores and builds the provider on a cold worker, which took over 10 s on a loaded 4-worker Windows runner.
+    cap_s = 60.0
     persona_dir = _persona(tmp_path)
     reset_registry()
     cli_throttle.reset()
     old = create_session(persona_dir.name)
     old.created_at = datetime.now(UTC) - timedelta(hours=1)
     stop = threading.Event()
+    ticks: list[int] = []  # one per supervisor pass
     t = threading.Thread(
-        target=supervisor.run_folded,
-        args=(stop,),
-        kwargs={
-            "persona_dir": persona_dir,
-            "provider": FakeProvider(),
-            "event_bus": EventBus(),
-            "tick_interval_s": 0.05,
-            "heartbeat_interval_s": None,
-            "soul_review_interval_s": None,
-            "finalize_interval_s": None,
-            "log_rotation_interval_s": None,
-            "initiate_review_interval_s": None,
-            "voice_reflection_interval_s": None,
-            "self_model_interval_s": None,
-            "compaction_interval_s": None,
-            "calibration_interval_s": None,
-            "interest_sweep_interval_s": None,
-            "judge_selftune_interval_s": None,
-            "clustering_interval_s": None,
-            "vocab_repair_interval_s": None,
-            "maker_enabled": False,
-            "notes_enabled": False,
-            "kindled_link_enabled": False,
-        },
-        daemon=True,
+        target=supervisor.run_folded, args=(stop,), kwargs=_folded_kwargs(persona_dir, ticks), daemon=True
     )
     try:
         t.start()
-        deadline = _time.monotonic() + 10.0
+        deadline = _time.monotonic() + cap_s
         while _time.monotonic() < deadline and any(
             s.session_id == old.session_id for s in all_sessions()
         ):
             _time.sleep(0.02)
         assert all(s.session_id != old.session_id for s in all_sessions()), "pre-start session kept"
         new = create_session(persona_dir.name)  # opened after bridge start
-        _time.sleep(0.3)  # several 0.05 s passes
+        after = len(ticks)
+        deadline = _time.monotonic() + cap_s
+        while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after it was opened
+            _time.sleep(0.02)
+        assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
         assert any(s.session_id == new.session_id for s in all_sessions()), (
             "post-start session pruned"
         )
     finally:
         stop.set()
-        t.join(timeout=10.0)
+        finish_threads(t)
+        reset_registry()
+    assert not t.is_alive()
+
+
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+def test_s84_run_folded_prunes_by_the_bridge_start_it_is_given(tmp_path):
+    """The bridge hands run_folded the moment it captured before starting the supervisor thread (S84, so the app-mount
+    session cannot race it). Given a start two hours ago, an empty session from three hours ago predates it and is
+    pruned at an idle pass; one from an hour ago does not and is kept. A run_folded that took its own "now" instead
+    would prune both."""
+    import threading
+    import time as _time
+
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    cap_s = 60.0
+    persona_dir = _persona(tmp_path)
+    reset_registry()
+    cli_throttle.reset()
+    now = datetime.now(UTC)
+    before_start = create_session(persona_dir.name)
+    before_start.created_at = now - timedelta(hours=3)
+    after_start = create_session(persona_dir.name)
+    after_start.created_at = now - timedelta(hours=1)
+    stop = threading.Event()
+    ticks: list[int] = []
+    t = threading.Thread(
+        target=supervisor.run_folded,
+        args=(stop,),
+        kwargs=_folded_kwargs(persona_dir, ticks, bridge_started_at=now - timedelta(hours=2)),
+        daemon=True,
+    )
+    try:
+        t.start()
+        deadline = _time.monotonic() + cap_s
+        while _time.monotonic() < deadline and any(
+            s.session_id == before_start.session_id for s in all_sessions()
+        ):
+            _time.sleep(0.02)
+        assert all(s.session_id != before_start.session_id for s in all_sessions()), "the idle pass never pruned"
+        after = len(ticks)
+        deadline = _time.monotonic() + cap_s
+        while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after the prune
+            _time.sleep(0.02)
+        assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
+        assert any(s.session_id == after_start.session_id for s in all_sessions()), (
+            "a session opened after the given bridge start was pruned: run_folded used its own start"
+        )
+    finally:
+        stop.set()
+        finish_threads(t)
         reset_registry()
     assert not t.is_alive()

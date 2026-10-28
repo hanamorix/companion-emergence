@@ -1975,6 +1975,7 @@ def test_peak_captured_on_create(store):
     store.create(mem)
     got = store.get(mem.id)
     assert got.peak_emotion_intensity == 6.0
+    assert isinstance(mem.peak_emotion_intensity, float)  # one scalar, not a per-emotion vector (deferred D3 design)
 
 
 def test_peak_is_monotone_under_update(store):
@@ -2094,17 +2095,6 @@ def test_peak_migration_skips_seeding_on_pre_emotions_json_schema(tmp_path):
         assert row[0] == 0.0
     finally:
         store.close()
-
-
-def test_deferred_d3_peak_is_scalar(store: MemoryStore) -> None:
-    """Pin (D3): peak_emotion_intensity is one REAL scalar, not a per-emotion
-    vector. A which-emotion-mattered use-case needs the deferred vector design —
-    ledger: project_companion_emergence_deferred.md."""
-    cols = {row[1]: row[2] for row in store._conn.execute(
-        "PRAGMA table_info(memories)").fetchall()}
-    assert cols["peak_emotion_intensity"] == "REAL"
-    mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 2.0})
-    assert isinstance(mem.peak_emotion_intensity, float)
 
 
 # ---------------------------------------------------------------------------
@@ -3189,18 +3179,6 @@ def test_get_persisted_reranker_floor_returns_the_row_when_one_exists(store: Mem
     assert result["raw_fit_floor"] == 1.25
     assert result["sample_pairs"] == 250
     assert result["is_cold_start"] is False
-
-
-def test_get_reranker_floor_delegates_persisted_case_to_get_persisted_reranker_floor(
-    store: MemoryStore,
-) -> None:
-    """The refactor (Change 1) must not change `get_reranker_floor`'s own
-    persisted-row behavior — it now just reads through `get_persisted_
-    reranker_floor` first, same values either way."""
-    store.write_reranker_floor(
-        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
-    )
-    assert store.get_reranker_floor("model-a") == store.get_persisted_reranker_floor("model-a")
 
 
 def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:

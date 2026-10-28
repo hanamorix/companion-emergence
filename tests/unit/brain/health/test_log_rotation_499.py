@@ -405,21 +405,6 @@ def test_the_year_archive_is_written_with_lf_and_keeps_every_row(tmp_path):
     assert [e for e in os.listdir(tmp_path) if e.endswith((".tmp", ".new"))] == []
 
 
-def test_the_rolling_compress_still_goes_through_gzip_open_and_shutil_copyfileobj():
-    """The two seams that existing tests pin (test_log_rotation.py, test_log_rotation_locking_476.py)."""
-    import ast
-
-    src = Path(lr.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    fn = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_rotate_rolling_locked"
-    )
-    called = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
-    assert "gzip.open" in called and "shutil.copyfileobj" in called
-
-
 def test_the_directory_is_fsynced_after_the_publish_and_before_the_truncation(
     tmp_path, monkeypatch
 ):

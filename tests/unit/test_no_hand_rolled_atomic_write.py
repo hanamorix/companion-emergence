@@ -44,9 +44,9 @@ OS_FUNCS = {"replace", "rename", "renames"}
 EXPECTED_MARKERS = 21
 
 
-def flagged_calls(source: str) -> list[tuple[int, int, str]]:
-    """(first line, last line, kind) of each flagged call in ``source``."""
-    tree = ast.parse(source)
+def flagged_calls(source: str, tree: ast.Module | None = None) -> list[tuple[int, int, str]]:
+    """(first line, last line, kind) of each flagged call in ``source`` (``tree``: its parse, to skip parsing again)."""
+    tree = ast.parse(source) if tree is None else tree
     bound: dict[str, str] = {}  # local name -> flagged kind, for from-imports of os / tempfile / shutil
     module_alias: dict[str, str] = {}  # local name -> "os" / "tempfile" / "shutil" for `import os as _os`
     for node in ast.walk(tree):
@@ -99,8 +99,8 @@ def _path_form(call: ast.Call) -> bool:
     return not call.args and [k.arg for k in call.keywords] == ["target"]
 
 
-def check_source(source: str, rel: str) -> tuple[list[str], int]:
-    """(errors, number of valid markers) for one file."""
+def check_source(source: str, rel: str, tree: ast.Module | None = None) -> tuple[list[str], int]:
+    """(errors, number of valid markers) for one file (``tree``: its parse, to skip parsing again)."""
     errors: list[str] = []
     lines = source.splitlines()
     marker_lines: dict[int, str | None] = {}
@@ -111,7 +111,7 @@ def check_source(source: str, rel: str) -> tuple[list[str], int]:
     for ln, reason in marker_lines.items():
         if not reason:
             errors.append(f"{rel}:{ln}: atomic-write marker without a reason")
-    calls = flagged_calls(source)
+    calls = flagged_calls(source, tree)
     covered: set[int] = set()
     for first, last, kind in calls:
         own = [ln for ln in marker_lines if first <= ln <= last]
@@ -127,14 +127,17 @@ def check_source(source: str, rel: str) -> tuple[list[str], int]:
     return errors, len(covered)
 
 
-def scan_tree(root: Path = REPO) -> tuple[list[str], int]:
+def scan_tree() -> tuple[list[str], int]:
+    """``check_source`` over every file of ``brain/``, from the process-wide parsed copy (tests/source_tree.py)."""
+    from tests.source_tree import brain_sources, brain_trees
+
+    trees = brain_trees()
     errors: list[str] = []
     markers = 0
-    for path in sorted((root / "brain").rglob("*.py")):
-        rel = path.relative_to(root).as_posix()
+    for rel, source in brain_sources().items():
         if rel == SHARED_WRITER:
             continue
-        errs, n = check_source(path.read_text(encoding="utf-8"), rel)
+        errs, n = check_source(source, rel, trees[rel])
         errors += errs
         markers += n
     return errors, markers

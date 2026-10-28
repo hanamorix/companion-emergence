@@ -20,6 +20,9 @@ def test_dumbbob_argv_uses_configured_model() -> None:
     assert argv[argv.index("--model") + 1] == "opus"
     # default (sonnet) is NOT present — the toggle actually replaced it.
     assert "sonnet" not in argv
+    # P17: the pull DumbBob still builds its Phase-1 argv shape (model threaded, no hardcoded model)
+    assert argv[:2] == ["/fake/claude", "-p"]
+    assert "--output-format" in argv and "json" in argv
 
 
 def test_dumbbob_default_model_is_sonnet() -> None:

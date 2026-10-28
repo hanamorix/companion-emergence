@@ -23,7 +23,6 @@ Also maps to changes/compaction-defects-fix/1.5-criteria.md:
   C-B4a/b/c/f/g  tier-3 replacement/eviction, idempotence-preserved, the
            emergency_fold_24h backstop also evicts, and a degenerate
            all-evicted pass installs cleanly (Bug 4)
-  C-B4d    stale retain-forever docstrings replaced with the replacement model
   C14 (updated)  the two pre-existing gating tests below are updated to the
            owner's replacement model (retired "terminal, re-compacted forever")
 
@@ -1011,29 +1010,6 @@ def test_cb4c_idempotent_rerun_same_now_is_noop(tmp_path: Path) -> None:
     r2 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
     assert r2.compacted is False
     assert r2.reason == "nothing_aged"
-
-
-def test_cb4d_docstrings_reflect_replacement_model() -> None:
-    """Bug 4 (C-B4d, docs match code): the retain-forever docstrings/comments no
-    longer say "terminal / re-compacted forever" or "leaving tiers 2/3
-    untouched", and the replacement model wording is present instead. Fails on
-    pre-change code (which contains the stale phrases)."""
-    import inspect
-
-    import brain.chat.compaction as comp
-
-    source = inspect.getsource(comp)
-    stale_phrases = [
-        "STAYS in tier 3 (terminal, re-compacted forever",
-        "a terminal, multi-input tier 3",
-        "then stays in tier 3 (terminal, re-compacted forever)",
-        "Tier 3 is a terminal, multi-input",
-        "leaving tiers 2/3 untouched",
-    ]
-    for phrase in stale_phrases:
-        assert phrase not in source, f"stale retain-forever wording still present: {phrase!r}"
-    assert "evicted" in source.lower()
-    assert "replaced" in source.lower() or "replacement" in source.lower()
 
 
 def test_cb4f_emergency_fold_evicts_stale_section(tmp_path: Path) -> None:

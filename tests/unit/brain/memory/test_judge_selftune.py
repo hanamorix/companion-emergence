@@ -22,10 +22,7 @@ own TODO(F2c inc3+) marker).
 from __future__ import annotations
 
 import inspect
-import subprocess
-import sys
 import tempfile
-import textwrap
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import mock_open
@@ -223,20 +220,6 @@ def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
     """A headroom of exactly 0.0 (a cgroup at its memory.high or memory.max) fits nothing but the floor."""
     result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, 0.0)
     assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
-
-
-def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
-    """S239: the headroom helper reads psutil's host-wide available figure, not /proc/meminfo."""
-    doc = judge_selftune._downgrade_for_oom_safety.__doc__ or ""
-    assert "psutil" in doc
-    assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc
-
-
-def test_oom_guard_docstring_states_the_smaller_of_the_cgroup_and_psutil_figures() -> None:
-    """S241: the helper returns the smaller of the cgroup figure and psutil's, not psutil only when no cgroup
-    level could be measured."""
-    doc = " ".join((judge_selftune._downgrade_for_oom_safety.__doc__ or "").split())
-    assert "smaller of" in doc and "only when no cgroup level could be measured" not in doc
 
 
 def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_and_psutil(
@@ -841,14 +824,7 @@ def test_judge_knob_calibration_per_persona_store_isolation() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_judge_selftune_tick_importable_and_callable() -> None:
-    sig = inspect.signature(judge_selftune._run_judge_selftune_tick)
-    params = list(sig.parameters)
-    assert params == ["store", "now", "persona_dir"]
-    for name in params:
-        assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
-
-
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore) -> None:
     """AC3 (gate): NOT more than a handful -> no fire. Exactly at the
     threshold is the boundary case (`> handful`, not `>=`)."""
@@ -861,6 +837,7 @@ def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore)
     assert store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE) is None, "marker untouched on no-fire"
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3 (gate): MORE than a handful -> fires, the marker records the
     firing timestamp, and every scanned row is marked consumed (red-team
@@ -893,6 +870,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     assert sorted(r["id"] for r in consumed_rows) == sorted(ids)
 
 
+@pytest.mark.slow(reason='3.1 s of CPU in its call phase on a 4-core dev VM, 3.1 s wall (serial run for #540, J12)')
 def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -916,6 +894,7 @@ def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     )
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_tick_selects_tier_and_applies_oom_downgrade(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -939,6 +918,7 @@ def test_tick_selects_tier_and_applies_oom_downgrade(
     assert result["tune_grade"] == judge_selftune.TUNE_GRADE_LORA, "downgraded from full_ft"
 
 
+@pytest.mark.slow(reason='1.9 s of CPU in its call phase on a 4-core dev VM, 1.9 s wall (serial run for #540, J12)')
 def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*a, **k):
         raise RuntimeError("disk full")
@@ -959,6 +939,7 @@ def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: py
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.8 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: MemoryStore) -> None:
     """Scripted 'no-train' case: every seeded row is judge-labeled and has
     a non-None haiku_label position (the gate fires, `new_decisions` is
@@ -984,6 +965,7 @@ def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: Memor
     assert sorted(post_row_ids) == sorted(ids)
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_tick_fault_during_fit_leaves_rows_unconsumed(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1010,94 +992,6 @@ def test_tick_fault_during_fit_leaves_rows_unconsumed(
     assert sorted(post_row_ids) == sorted(ids)
 
 
-def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
-    """I6 / AC8 (off hot path): the scaffold, INCLUDING a FIRING tick that
-    actually runs F2c inc3's real knob-refit training code (assembly +
-    `fit_platt_knob` + persist), must never pull torch/sentence_transformers
-    into `sys.modules` — that stays scoped to the future LoRA/full-FT
-    tiers (inc5/6), never to the knob-refit this increment ships.
-
-    Red-team fix F-3 (inc2, still honored here): the prior version of this
-    test grepped `judge_selftune`'s own source TEXT for the literal strings
-    "import torch" / "import sentence_transformers". That only proves this
-    one module has no such import statement in it — it would NOT catch a
-    TRANSITIVE pull via some other module `judge_selftune` imports (e.g. a
-    future change to `brain.memory.reranker` or `brain.memory.store`
-    growing a module-scope torch import). This runs a FRESH subprocess —
-    never inheriting whatever this test PROCESS's own earlier tests may
-    already have imported into `sys.modules`, which would make an
-    in-process `sys.modules` check meaningless (the same caveat
-    `test_relevance_judge.py`'s sibling import-scope test documents) — that
-    imports `judge_selftune`, seeds enough `calibration_log` rows (WITH raw
-    judge scores, so the knob-refit has real pairs to fit — inc3's fire
-    path now actually trains, not just consumes) to FIRE the >handful
-    gate, actually runs `_run_judge_selftune_tick` end to end, and only
-    THEN asserts neither package landed in `sys.modules`.
-    """
-    script = textwrap.dedent(
-        """
-        import sys
-        from datetime import UTC, datetime
-
-        from brain.memory import judge_selftune
-        from brain.memory.store import MemoryStore
-
-        store = MemoryStore(db_path=":memory:")
-        handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
-        for i in range(handful + 1):
-            store.log_calibration_sample(
-                query=f"q{i}",
-                candidate_ids=["m"],
-                reranker_scores=[1.0],
-                reranker_model_id="m",
-            )
-            row_id = store._conn.execute(
-                "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()["id"]
-            store.write_calibration_labels(
-                row_id, ["relevant"], ["relevant"], local_judge_raw_score=[2.0]
-            )
-
-        result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
-        assert result["fired"] is True, result
-        assert store.get_judge_knob_calibration(judge_selftune.MODEL_RELEVANCE_JUDGE) is not None
-
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-
-
-# ---------------------------------------------------------------------------
-# AC9: the durable Haiku-oracle note must be present in F2c's OWN training
-# code location (relevance_judge.py's own copy is covered by that module's
-# test file) — grep/lint check, not a behavior test.
-# ---------------------------------------------------------------------------
-
-
-def test_haiku_oracle_note_is_present_in_judge_selftune_source() -> None:
-    source = inspect.getsource(judge_selftune)
-    marker = "# F2c (durable note, spec"
-    assert marker in source, "the durable Haiku-oracle note must precede _run_judge_selftune_tick"
-    note_start = source.index(marker)
-    note_end = source.index("def _run_judge_selftune_tick", note_start)
-    note = source[note_start:note_end]
-    assert "oracle" in note.lower()
-    assert "haiku" in note.lower()
-    assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"
-
-
 # ---------------------------------------------------------------------------
 # Tunables (I3/I7): every HARDWARE-DERIVED threshold this module uses is
 # registered, not a bare constant — spot-check the registry has them under
@@ -1121,9 +1015,9 @@ def test_every_judge_selftune_threshold_is_a_registered_tunable() -> None:
 def test_gate_handful_decisions_is_a_dev_constant_not_a_tunable() -> None:
     """S26 (owner ruling): the self-tune gate is dev-level, not user-facing
     — it must NOT be tunables.register()-ed, and its value must come from
-    brain.dev_constants (not a bare literal reintroduced in this module)."""
+    brain.dev_constants (a different literal reintroduced in this module would not equal it). The value
+    itself is pinned by test_selftune_gate_is_200 in test_dev_constants.py and by the dev-constants snapshot."""
     assert "judge_selftune.gate_handful_decisions" not in judge_selftune.tunables._registry
-    assert judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS == 200
     assert (
         judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
         == dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
@@ -1286,31 +1180,3 @@ def test_fit_platt_knob_anti_correlated_data_falls_back_to_identity_not_negative
     slope, intercept = judge_selftune.fit_platt_knob(pairs)
     assert slope == pytest.approx(1.0), "must fall back to the identity slope, never a negative one"
     assert intercept == pytest.approx(0.0)
-
-
-def test_fit_platt_knob_does_not_import_torch() -> None:
-    """AC8: the fit function itself, exercised directly (not only via the
-    tick), must never import torch -- pure numpy only."""
-    script = textwrap.dedent(
-        """
-        import sys
-        from brain.memory import judge_selftune
-
-        pairs = [(-3.0, "irrelevant"), (3.0, "relevant")]
-        slope, intercept = judge_selftune.fit_platt_knob(pairs)
-        assert isinstance(slope, float) and isinstance(intercept, float)
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"

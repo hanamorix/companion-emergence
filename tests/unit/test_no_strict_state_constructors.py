@@ -12,9 +12,8 @@ needs its own canary there, not just a clean run of this guard."""
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+from tests.source_tree import brain_trees
 
 # `**` of these names is keyword-argument plumbing, not a persisted record.
 _KWARG_NAMES = {"kwargs", "kw", "opts", "options", "params", "overrides", "defaults",
@@ -34,9 +33,7 @@ _ALLOWED = {
 
 def _strict_constructions() -> list[str]:
     found = []
-    for path in sorted((REPO / "brain").rglob("*.py")):
-        rel = path.relative_to(REPO).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for rel, tree in brain_trees().items():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

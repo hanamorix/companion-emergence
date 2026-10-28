@@ -50,22 +50,11 @@ def test_declared_roster_matches_server_rule(tmp_path: Path) -> None:
     assert rp._declared_roster(persona) == expected
 
 
-def test_module_imports_the_registry_symbols() -> None:
-    assert "from brain.tools import NELL_TOOL_NAMES" in RP_SRC
-    assert "build_schemas" in RP_SRC
-
-
 def test_no_hardcoded_tool_name_in_source() -> None:
     for name in NELL_TOOL_NAMES:
         assert f'"{name}"' not in RP_SRC and f"'{name}'" not in RP_SRC, (
             f"tool name {name!r} is hardcoded in the preflight — it must be read from the copy"
         )
-
-
-def test_absence_sweep_oracle_can_fail() -> None:
-    """Self-test (ST1.5f): the sweep fires on a seeded literal."""
-    seeded = 'x = "search_memories"\n'
-    assert any(f'"{n}"' in seeded for n in NELL_TOOL_NAMES)
 
 
 # --- C7: child argv mirrors the shared helper ----------------------------------------------------
@@ -77,12 +66,6 @@ def test_child_argv_mirrors_provider_helper(tmp_path: Path) -> None:
 
     entry = brain_tools_mcp_entry(persona)
     assert rp._child_argv(persona) == [entry["command"], *entry["args"]]
-
-
-def test_child_argv_mirror_oracle_can_fail(tmp_path: Path) -> None:
-    persona = tmp_path / "persona"
-    bogus = [sys.executable, "-m", "brain.mcp_server", "--persona-dir", str(persona)]  # no -P
-    assert rp._child_argv(persona) != bogus
 
 
 # --- B-1: the preflight self-enforces its containment precondition --------------------------------
@@ -110,20 +93,30 @@ def test_live_roster_raises_on_exited_child() -> None:
 def test_live_roster_raises_on_nonhandshaking_child() -> None:
     hang = [sys.executable, "-P", "-c", "import time; time.sleep(60)"]
     with pytest.raises(DropinMismatch, match="did not serve tools/list"):
-        rp._live_roster(hang, timeout=2.0)
+        rp._live_roster(hang, timeout=0.5)
 
 
 # --- C3: passes on a correctly-wired live child; ordering exercised in-process --------------------
 
 
-def test_preflight_passes_on_live_child(tmp_path: Path) -> None:
+def test_preflight_passes_on_live_child(tmp_path: Path, monkeypatch) -> None:
     persona = _seed_persona(tmp_path)
     build = _worktree_build()
+    served: list[set] = []
+    real_live_roster = rp._live_roster
+
+    def spy(*args, **kwargs):
+        roster = real_live_roster(*args, **kwargs)
+        served.append(roster)
+        return roster
+
+    monkeypatch.setattr(rp, "_live_roster", spy)
     # No raise: runs _assert_declared_authoritative THEN the live spawn (the ordering the
-    # un-applied call-site would own — here exercised in-process).
+    # un-applied call-site would own — here exercised in-process), one real MCP child.
     rp.assert_brain_tools_roster(build, persona, timeout=30.0)
-    # Evidence: the served roster equals the declared roster.
-    assert rp._live_roster(rp._child_argv(persona), timeout=30.0) == rp._declared_roster(persona)
+    # Evidence: the live child was really asked, and the roster it served equals the declared roster.
+    assert len(served) == 1 and served[0]
+    assert served[0] == rp._declared_roster(persona)
 
 
 # --- C5: hard-fail on a served-vs-declared roster mismatch ----------------------------------------

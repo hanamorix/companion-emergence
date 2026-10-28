@@ -8,10 +8,12 @@ about layout. Tests may use ``toml_io`` (they are outside the enforcement scan) 
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import Any
 
 from brain.utils import toml_io
+from tests.source_tree import brain_sources, brain_trees
 
 FILE_NAME = "tunables.toml"
 
@@ -53,7 +55,7 @@ def _dotted(node: ast.AST) -> str | None:
     return ".".join(reversed(parts))
 
 
-def register_calls_in_source(source: str, rel: str) -> list[ast.Call]:
+def register_calls_in_source(source: str, rel: str, tree: ast.Module | None = None) -> list[ast.Call]:
     """Every call of ``brain.tunables.register`` in ``source`` (a file at ``rel`` inside the repo), resolved by AST.
 
     Imported names are followed, so these all count: ``tunables.register(...)`` after ``from brain import tunables``, an
@@ -62,8 +64,10 @@ def register_calls_in_source(source: str, rel: str) -> list[ast.Call]:
     and any of them inside a function. The bare ``register(...)`` inside ``brain/tunables.py`` itself counts. Not followed:
     a name passed around as a value, or ``importlib`` at run time (the descriptions test and the boot test would not see
     those; no brain module does either).
+
+    ``tree`` is ``source`` already parsed (``ast.parse(source)`` when omitted).
     """
-    tree = ast.parse(source)
+    tree = ast.parse(source) if tree is None else tree
     package = rel.split("/")[:-1]
     aliases: dict[str, str] = {}
     star = False
@@ -112,8 +116,22 @@ def register_calls(repo_root: Path) -> list[tuple[str, int, ast.Call]]:
     return out
 
 
+@functools.cache
+def repo_register_calls() -> tuple[tuple[str, int, ast.Call], ...]:
+    """``register_calls`` of this repository, from the process-wide parsed copy of ``brain/`` (tests/source_tree.py)."""
+    trees = brain_trees()
+    return tuple(
+        (rel, call.lineno, call)
+        for rel, source in brain_sources().items()
+        for call in register_calls_in_source(source, rel, trees[rel])
+    )
+
+
 def registered_literal_keys(repo_root: Path) -> set[str]:
-    """The literal first arguments of those calls (a registration with a non-literal key is not in the set)."""
+    """The literal first arguments of those calls (a registration with a non-literal key is not in the set).
+
+    Parses ``repo_root/brain`` afresh and keeps no tree: the conftest teardown asks for it after every test, so it must not
+    pin the process-wide parsed copy (tests/source_tree.py) in every worker."""
     return {
         call.args[0].value
         for _rel, _line, call in register_calls(repo_root)

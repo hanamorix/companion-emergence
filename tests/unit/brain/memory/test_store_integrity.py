@@ -24,6 +24,12 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retry path sleeps ``SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S`` between attempts; no test here is about the delay."""
+    monkeypatch.setattr(dev_constants, "SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S", 0.0)
+
+
 def _patch_integrity_check_execute(
     monkeypatch: pytest.MonkeyPatch,
     side_effect,

@@ -1344,19 +1344,6 @@ def test_recall_snippet_invitation_not_in_static_prefix(tmp_path: Path) -> None:
     assert _RECALL_SNIPPET_INVITATION not in msg
 
 
-def test_recall_snippet_invitation_wording_is_byte_exact() -> None:
-    """Owner+persona approved wording (no em-dash — 'invitation. Use', not
-    'invitation — use'). Locks the exact string so a future edit can't
-    silently reword it."""
-    from brain.chat.prompt import _RECALL_SNIPPET_INVITATION
-
-    assert _RECALL_SNIPPET_INVITATION == (
-        "These are fragments of your memories. Use read_full_memory to reach into "
-        "any that might touch this turn, or spark curiosity in you. Skip only if "
-        "you can name why."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Recall block memory ids — active entries render "<id>: " so
 # read_full_memory(<id>) is callable; fading/lost entries (not expandable)

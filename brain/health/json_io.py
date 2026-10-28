@@ -90,7 +90,6 @@ _DETAIL = 500  # anomaly detail cap (as attempt_heal)
 # inject an interleaving or to run a guard switched off (the failing baseline).
 _HEAL_REVALIDATE = True
 _SAVE_TAKES_HEAL_LOCK = True
-_HEAL_LOCK_USES_SHARED_SIDECAR = False
 
 
 def _seam(name: str, path: Path) -> None:
@@ -408,7 +407,7 @@ def _heal_guard(path: Path) -> Iterator[bool]:
     """
     stack = ExitStack()
     locked = False
-    target = path if _HEAL_LOCK_USES_SHARED_SIDECAR else path.with_name(path.name + ".heal")
+    target = path.with_name(path.name + ".heal")
     try:
         stack.enter_context(file_lock(target))
         locked = True
