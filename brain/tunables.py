@@ -134,7 +134,7 @@ def get_tunable(key: str, default: Any) -> Any:
 
 
 def positive_or_default(key: str, value: Any, default: Any) -> Any:
-    """Return *value* (what ``get_tunable`` returned for *key*) when it is a number that is finite and above 0, else *default*.
+    """Return *value* (what ``get_tunable`` returned for *key*) when it is an int or a float that is finite and above 0, else *default*.
 
     For a setting that is a duration or a size cap: ``get_tunable`` checks the type only, so a hand-edited ``0``, a
     negative number, ``nan`` or ``inf`` reaches the code (a loop that never waits, an upload cap that refuses everything).
@@ -149,14 +149,18 @@ def positive_or_default(key: str, value: Any, default: Any) -> Any:
         and (not isinstance(value, float) or math.isfinite(value))
     ):
         return value
-    seen = f"{key}={value!r}:not-positive-finite"
+    try:
+        shown = repr(value)
+    except Exception:  # an object whose repr raises, or an int too long to print: reading a setting never raises
+        shown = f"<{type(value).__name__}>"
+    seen = f"{key}={shown}:not-positive-finite"
     with _lock:
         first = seen not in _warned_keys
         _warned_keys.add(seen)
     if first:
         logger.warning(
-            "tunables: value %r=%r is not a finite number above 0; using the default %r",
-            key, value, default,
+            "tunables: value %r=%s is not a finite number above 0; using the default %r",
+            key, shown, default,
         )
     return default
 
@@ -256,7 +260,7 @@ def file_mtime() -> float | None:
 
 
 def _reset_values_cache() -> None:
-    """Forget the cached values but keep the registry and the warn-once flags (only ``_reset_for_tests`` clears those)."""
+    """Forget the cached values and the per-file-change log flags but keep the registry and ``_warned_keys`` (only ``_reset_for_tests`` clears those)."""
     global _values_cache, _cache_sig, _io_noted_sig, _logged_sig
     with _lock:
         _values_cache, _cache_sig, _io_noted_sig, _logged_sig = {}, None, None, None

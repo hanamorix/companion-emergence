@@ -133,7 +133,6 @@ def test_file_mtime_is_the_files_modification_time_or_none(tunables, tmp_path):
     assert tunables.file_mtime() == path.stat().st_mtime
 
 
-
 # --- positive_or_default (#531): a duration or size cap that is not a finite number above 0 reads as its registered default ---
 
 
@@ -162,3 +161,14 @@ def test_positive_or_default_warns_once_per_key_and_value_naming_both(tunables, 
     assert "a.b" in texts[0] and "nan" in texts[0] and "60.0" in texts[0]
     assert "a.b" in texts[1] and "-1" in texts[1]
     assert "a.c" in texts[2]
+
+
+def test_positive_or_default_never_raises_on_a_value_that_cannot_be_printed(tunables, caplog):
+    class _NoRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("no repr")
+
+    with caplog.at_level(logging.WARNING, logger="brain.tunables"):
+        assert tunables.positive_or_default("a.b", _NoRepr(), 60.0) == 60.0
+        assert tunables.positive_or_default("a.b", -(10**5000), 60.0) == 60.0  # longer than int-to-str allows
+    assert len(caplog.records) == 2
