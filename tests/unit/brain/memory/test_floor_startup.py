@@ -30,6 +30,7 @@ from brain.memory.embeddings import build_embedding_provider
 from brain.memory.reranker import build_reranker_provider, resolve_reranker_model_id
 from brain.memory.semantic_recall import run_semantic_recall
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads, release_at_teardown, wait_at_gate
 from tests.unit.brain.memory.test_embeddings import _StubTextEmbedding
 from tests.unit.brain.memory.test_monologue_last import (
     _QUERY,
@@ -53,42 +54,6 @@ def background_on(monkeypatch: pytest.MonkeyPatch):
     """Let the on-need / on-message starters spawn real daemon threads (the
     suite-wide default inhibits them)."""
     monkeypatch.setattr(floor_startup, "_background_inhibited", False)
-
-
-def _finish(*threads: threading.Thread) -> None:
-    """Wait for background threads to FINISH, however slow the machine is.
-
-    `Thread.join(timeout=...)` returns silently when the time is up, so on a loaded
-    runner the asserts after it ran on half-written state and the still-running thread
-    leaked into the next test on the worker, calling that test's monkeypatched compute
-    function (CI run 40639503385: a retry thread that needed more than 10 s). No bound
-    here on purpose: every thread these tests start ends on its own (a gate is released
-    first), and a thread that really never ends is a deadlock that pytest-timeout
-    (`timeout` in pyproject.toml) ends, on Windows by killing the xdist worker."""
-    for thread in threads:
-        thread.join()
-
-
-def _wait_at_gate(gate: threading.Event, owner: threading.Thread) -> None:
-    """A background body parks on `gate` until the test opens it. Never on the test's own
-    thread (`owner`): a regression that ran the body inline there would otherwise wait for a
-    gate only that same thread can open, and hang instead of failing the test's asserts."""
-    if threading.current_thread() is not owner:
-        gate.wait()
-
-
-def _release_at_teardown(
-    request: pytest.FixtureRequest, gate: threading.Event, threads: list
-) -> None:
-    """Whatever assert ends the test early, open `gate` and wait for every thread in
-    `threads` (None entries are skipped) before the test's patches are undone (finalizers
-    run last-in first), so a parked body can never wake up inside the next test."""
-
-    def _release() -> None:
-        gate.set()
-        _finish(*(t for t in threads if t is not None))
-
-    request.addfinalizer(_release)
 
 
 _COSINE_ID = "startup-cosine-id"
@@ -276,7 +241,7 @@ def test_start_background_runs_the_computation_on_a_daemon_thread(
 ) -> None:
     thread = floor_startup.start_background(tmp_path, name="floor-bootstrap-test")
 
-    _finish(thread)
+    finish_threads(thread)
 
     assert thread.daemon and not thread.is_alive()
     assert ("end", "cosine") in computes
@@ -287,7 +252,7 @@ def test_start_background_forwards_the_activity_marker_to_the_thread(
 ) -> None:
     monkeypatch.setattr(floor_calibration, "get_cosine_bootstrap_floor", lambda _id: None)
 
-    _finish(floor_startup.start_background(tmp_path, activity_marker=lambda: 7.0))
+    finish_threads(floor_startup.start_background(tmp_path, activity_marker=lambda: 7.0))
 
     assert not floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=7.0)
     assert floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=8.0)
@@ -419,7 +384,7 @@ def test_the_first_reranked_turn_with_no_floor_takes_the_cosine_path_flags_it_an
 
     def _bootstrap(model_id: str):
         threads_seen.append(threading.current_thread().name)
-        _wait_at_gate(gate, owner)
+        wait_at_gate(gate, owner)
         floor_calibration._bootstrap_floor_cache[model_id] = _floor_row(  # noqa: SLF001
             model_id, "reranker_model_id", 1.0
         )
@@ -427,7 +392,7 @@ def test_the_first_reranked_turn_with_no_floor_takes_the_cosine_path_flags_it_an
 
     monkeypatch.setattr(floor_calibration, "get_bootstrap_floor", _bootstrap)
     started: list = []
-    _release_at_teardown(request, gate, started)
+    release_at_teardown(request, gate, started)
     real_request = floor_startup.request_rerank_bootstrap
     monkeypatch.setattr(
         floor_startup,
@@ -449,7 +414,7 @@ def test_the_first_reranked_turn_with_no_floor_takes_the_cosine_path_flags_it_an
     assert second_while_running.path == "cosine"
     assert started[-1] is None, "one at a time"
     gate.set()
-    _finish(thread)
+    finish_threads(thread)
     assert threads_seen == [thread.name] and threading.current_thread().name not in threads_seen
     assert not floor_startup.inflight("rerank")
 
@@ -509,7 +474,7 @@ def _fail_then_succeed(monkeypatch, kind: str, model_id: str):
     def _compute(mid: str):
         state["calls"].append(threading.current_thread().name)
         if state["gate"] is not None:
-            _wait_at_gate(state["gate"], owner)
+            wait_at_gate(state["gate"], owner)
         if not state["ok"]:
             return None
         row = _floor_row(mid, "embedder_model_id" if kind == "cosine" else "reranker_model_id")
@@ -541,13 +506,13 @@ def test_a_failed_bootstrap_is_retried_in_the_background_on_each_message_until_i
     for _ in range(3):
         threads = floor_startup.on_incoming_message(tmp_path)
         assert len(threads) == 1
-        _finish(threads[0])
+        finish_threads(threads[0])
         assert state["calls"][-1] == threads[0].name != me, "off the reply path"
     assert len(state["calls"]) == 3, "one attempt per message while it keeps failing"
 
     state["ok"] = True
     (thread,) = floor_startup.on_incoming_message(tmp_path)
-    _finish(thread)
+    finish_threads(thread)
     assert not floor_calibration.bootstrap_failed(kind, model_id)
 
     state["calls"].clear()
@@ -571,7 +536,7 @@ def test_never_more_than_one_bootstrap_in_flight_per_floor(
     state["calls"].clear()
     state["gate"] = threading.Event()
     spawned: list[threading.Thread] = []
-    _release_at_teardown(request, state["gate"], spawned)
+    release_at_teardown(request, state["gate"], spawned)
 
     first = floor_startup.on_incoming_message(tmp_path)
     spawned.extend(first)
@@ -582,7 +547,7 @@ def test_never_more_than_one_bootstrap_in_flight_per_floor(
         assert extra == [], "already in flight"
     assert floor_startup.inflight(kind)
     state["gate"].set()
-    _finish(first[0])
+    finish_threads(first[0])
 
     assert len(state["calls"]) == 1, "no concurrent duplicates"
     assert not floor_startup.inflight(kind)
@@ -603,7 +568,7 @@ def test_the_two_floors_retry_independently_each_at_most_one_in_flight(
 
     threads = floor_startup.on_incoming_message(tmp_path)
     for t in threads:
-        _finish(t)
+        finish_threads(t)
 
     assert len(threads) == 2
     assert len(cosine["calls"]) == 1 and len(rerank_calls) == 1
@@ -622,7 +587,7 @@ def test_a_message_retry_skips_a_floor_that_is_calibrated(
     store.close()
 
     for t in floor_startup.on_incoming_message(tmp_path):
-        _finish(t)
+        finish_threads(t)
 
     assert state["calls"] == [], "a calibrated row makes the failed bootstrap moot"
 
@@ -877,7 +842,7 @@ def test_the_bridge_lifespan_starts_the_floor_bootstrap_thread_once(
     with TestClient(app):
         # the lifespan starts the floor thread before it yields, so the call is already recorded
         assert len(started) == 1, "the lifespan did not start the floor bootstrap thread"
-        _finish(*spy_threads)
+        finish_threads(*spy_threads)
         assert app.state.bridge.floor_bootstrap_thread is not None
 
     assert len(started) == 1
@@ -1091,7 +1056,7 @@ def test_the_repl_still_runs_the_floor_bootstrap_on_its_background_thread(
 
     for thread in threading.enumerate():
         if thread.name == "floor-bootstrap-direct-chat":
-            _finish(thread)
+            finish_threads(thread)
     assert len(calls) == 1
     persona_dir, name, daemon, registered, tables = calls[0]
     assert persona_dir == d
@@ -1217,7 +1182,7 @@ def test_start_background_claims_the_cosine_slot_before_the_thread_runs(
     seen: list[bool] = []
 
     def _slow(persona_dir, *, activity_marker, **kw):
-        _wait_at_gate(gate, owner)
+        wait_at_gate(gate, owner)
 
     monkeypatch.setattr(floor_startup, "compute_missing_floors", _slow)
     thread = floor_startup.start_background(tmp_path)
@@ -1225,7 +1190,7 @@ def test_start_background_claims_the_cosine_slot_before_the_thread_runs(
         seen.append(floor_startup.startup_compute_active())
     finally:
         gate.set()
-        _finish(thread)
+        finish_threads(thread)
 
     assert seen == [True]
 
@@ -1295,7 +1260,7 @@ def test_the_first_need_request_is_not_repeated_per_rerank_once_a_bootstrap_fail
 
     first = floor_startup.request_rerank_bootstrap()
     assert first is not None
-    _finish(first)
+    finish_threads(first)
     assert len(calls) == 1 and floor_calibration.bootstrap_failed("rerank", _RERANK_ID)
 
     for _ in range(4):
@@ -1316,7 +1281,7 @@ def test_a_startup_that_could_not_even_try_is_recorded_so_the_message_retry_pick
     assert floor_calibration.bootstrap_failed("cosine", _COSINE_ID), "recorded, not silent"
     monkeypatch.setattr(MemoryStore, "__init__", real_init)
     for t in floor_startup.on_incoming_message(tmp_path):
-        _finish(t)
+        finish_threads(t)
     assert ("end", "cosine") in computes, "the next message computed it"
 
 
@@ -1331,7 +1296,7 @@ def test_a_moot_failed_record_is_cleared_once_a_calibrated_row_exists(
     store.close()
 
     (thread,) = floor_startup.on_incoming_message(tmp_path)
-    _finish(thread)
+    finish_threads(thread)
 
     assert not floor_calibration.bootstrap_failed("cosine", _COSINE_ID)
     assert floor_startup.on_incoming_message(tmp_path) == [], "later messages start nothing"
@@ -1349,7 +1314,7 @@ def test_the_retry_body_closes_its_store(
     floor_calibration._record_attempt("cosine", _COSINE_ID, False, 1.0)  # noqa: SLF001
 
     for t in floor_startup.on_incoming_message(tmp_path):
-        _finish(t)
+        finish_threads(t)
 
     assert closed, "the retry's store was closed"
 
@@ -1363,9 +1328,9 @@ def test_a_background_attempt_records_the_registered_activity_marker(
     floor_calibration._record_attempt("cosine", _COSINE_ID, False, 1.0)  # noqa: SLF001
 
     for t in floor_startup.on_incoming_message(tmp_path):
-        _finish(t)
+        finish_threads(t)
     request = floor_startup.request_rerank_bootstrap()
-    _finish(request)
+    finish_threads(request)
 
     assert not floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=9.0)
     assert floor_calibration.cosine_bootstrap_due(_COSINE_ID, activity_marker=10.0)
@@ -1385,7 +1350,7 @@ def test_start_background_registers_the_marker_provider_and_refuses_a_taken_slot
 
     thread = floor_startup.start_background(tmp_path, activity_marker=lambda: 4.0)
     assert thread is not None
-    _finish(thread)
+    finish_threads(thread)
     assert floor_startup._current_marker() == 4.0  # noqa: SLF001
 
 
@@ -1394,7 +1359,7 @@ def test_slots_are_always_released_and_a_taken_slot_is_refused(
 ) -> None:
     # a spawned body that raises releases its slot
     thread = floor_startup._spawn("cosine", lambda: 1 / 0, name="boom")  # noqa: SLF001
-    _finish(thread)
+    finish_threads(thread)
     assert not floor_startup.inflight("cosine")
 
     # run_guarded releases on an exception, and refuses when the slot is taken

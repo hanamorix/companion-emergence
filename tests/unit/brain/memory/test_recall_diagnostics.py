@@ -20,6 +20,7 @@ import pytest
 
 from brain import dev_constants
 from brain.memory import recall_diagnostics as rd
+from tests.thread_support import finish_threads
 
 NOW = datetime(2026, 9, 29, 12, 0, 0, tzinfo=UTC)
 
@@ -194,7 +195,7 @@ def test_concurrent_appends_all_land_as_intact_lines(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=30)
+        finish_threads(t)
     assert not errors
     rd.flush_pending(path)  # an append that met a held lock is buffered until the next write or lull
     recs = _read_records(path)
@@ -463,7 +464,7 @@ def test_append_attempted_inside_the_prune_window_does_not_wait_and_lands_after_
     state = _append_inside_prune_window(monkeypatch, path, point, settle_s=30.0)
     assert rd.prune(path, window_days=2.0, now=NOW) == 1
     monkeypatch.undo()
-    state["thread"].join(timeout=10)
+    finish_threads(state["thread"])
     assert not state["thread"].is_alive()
     assert state["done_in_window"] is True  # S189: it did not wait for the prune's lock
     assert [r["n"] for r in _read_records(path)] == [1, 999]  # not lost, and after the rewrite
@@ -487,7 +488,7 @@ def test_the_lock_is_what_protects_the_append_a_lockless_prune_loses_it(
     state = _append_inside_prune_window(monkeypatch, path, point, settle_s=30.0)
     assert rd.prune(path, window_days=2.0, now=NOW) == 1
     monkeypatch.undo()
-    state["thread"].join(timeout=10)
+    finish_threads(state["thread"])
     assert state["done_in_window"] is True  # not blocked
     assert [r["n"] for r in _read_records(path)] == [1]  # the append (999) was overwritten
 

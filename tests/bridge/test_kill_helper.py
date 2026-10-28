@@ -20,6 +20,7 @@ import pytest
 
 from brain import process_identity as pi
 from brain.bridge import kill, shutdown_progress, state_file
+from tests.thread_support import finish_threads
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and suspend; Windows leg in CI")
 
@@ -330,7 +331,7 @@ def test_a_call_off_the_main_thread_installs_no_handlers(tmp_path, fake, monkeyp
     out: dict = {}
     t = threading.Thread(target=lambda: out.setdefault("r", kill.kill_bridge(b.pd, timeout=10)))
     t.start()
-    t.join(30)
+    finish_threads(t)
     assert out["r"].outcome == "killed" and installed == []
 
 

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from brain.bridge import cli_throttle, shutdown_progress
 from brain.bridge.server import build_app
 from brain.bridge.shutdown import BridgeShutdownController
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -125,7 +126,7 @@ def test_a_turn_admitted_before_the_stop_finishes_its_tool_loop(persona_dir: Pat
         assert c.post("/supervisor/shutdown", json={"reason": "app_restart"}).status_code == 202
         assert "chat reply" in shutdown_progress.registry.snapshot()
         release.set()
-        t.join(30)
+        finish_threads(t)
         assert result["r"].status_code == 200 and result["r"].json()["reply"] == "the rain again"
     assert len(calls) == 2
     buffer = (persona_dir / "active_conversations" / f"{sid}.jsonl").read_text(encoding="utf-8")

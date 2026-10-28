@@ -20,6 +20,7 @@ import pytest
 from brain.bridge import daemon, respawn_guard, shutdown, start_backoff, state_file
 from brain.bridge import runner as _runner
 from brain.bridge.shutdown import POLL_S
+from tests.thread_support import finish_threads
 
 SERVICE_ORIGINS = ("systemd", "launchd", "task-scheduler")
 REPO = Path(__file__).resolve().parents[2]  # not the cwd: pytest may run from anywhere
@@ -257,7 +258,7 @@ def test_after_the_wait_a_held_lock_is_still_waited_for(pd, clock, monkeypatch):
     t.join(timeout=2.0)
     assert t.is_alive() and not ran, "the run did not wait for the lock"
     daemon.release_lock(pd, fd)
-    t.join(timeout=30)
+    finish_threads(t)
     assert not t.is_alive() and ran and result["rc"] == 0
 
 

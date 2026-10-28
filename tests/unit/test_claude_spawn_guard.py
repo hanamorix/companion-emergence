@@ -220,7 +220,7 @@ _errors = []
 
 
 def _spawn_when_told():
-    _go.wait(10)
+    _go.wait()
     try:
         subprocess.run(["claude"], env={"PATH": ""}, check=False)
     except Exception as exc:  # noqa: BLE001
@@ -249,7 +249,7 @@ def test_a_thread_started_by_the_test_is_blamed():
 
     thread = threading.Thread(target=spawn)
     thread.start()
-    thread.join(10)
+    thread.join()
     assert errors == ["RuntimeError"]
 """
 

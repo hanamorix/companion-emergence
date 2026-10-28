@@ -23,6 +23,7 @@ from brain.bridge.server import build_app
 from brain.health.json_io import JsonFileError
 from brain.model_migration import MARKER_NAME, migrate_persona_models, pending_legacy
 from brain.persona_config import PersonaConfig
+from tests.thread_support import finish_threads
 
 _CHAT = "model.interactive_chat"
 _CHAT_JOB = "interactive-chat"
@@ -606,7 +607,7 @@ def test_a_cli_write_during_the_migration_and_the_migration_both_survive(monkeyp
         migrate_persona_models(_home(), None)
     finally:
         tunables._LOCKED_WINDOW_HOOK = None
-    cli_thread.join(timeout=20)
+    finish_threads(cli_thread)
     assert inside == [True]  # it could not get in while the migration's window was open
     assert _overrides() == {_CHAT: "claude-opus-5", "model.compaction": "claude-haiku-4-5"}
 

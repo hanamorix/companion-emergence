@@ -30,6 +30,7 @@ from brain.bridge.central_cadence import JobOutcome
 from brain.memory import cost_series
 from brain.memory.store import MemoryStore
 from tests.source_tree import brain_sources, brain_trees
+from tests.thread_support import finish_threads
 from tests.unit.brain.bridge.test_central_cadence import (
     _denying_slot,
     _granting_slot,
@@ -1124,7 +1125,7 @@ def test_conc8_a_new_record_during_the_run_survives(clock: _Clock, monkeypatch: 
 
         t = threading.Thread(target=_record)
         t.start()
-        t.join(5.0)
+        finish_threads(t)
 
     monkeypatch.setattr(reranker_mod, "_remeasure_hook", _chat_records_a_miss)
     assert _remeasure(1.0)

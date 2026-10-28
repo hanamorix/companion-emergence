@@ -26,6 +26,7 @@ import pytest
 # there for the rest of the process (it broke test_cascade_rollover_endpoints when this file ran first).
 import brain.chat.rollover  # noqa: F401
 from brain.bridge import job_progress
+from tests.thread_support import finish_threads
 
 
 def _persona(tmp_path: Path) -> Path:
@@ -88,8 +89,8 @@ def test_c31_save_progress_is_atomic_temp_rename(tmp_path: Path) -> None:
     t1, t2 = threading.Thread(target=_writer), threading.Thread(target=_reader)
     t1.start()
     t2.start()
-    t1.join(timeout=10)
-    t2.join(timeout=10)
+    finish_threads(t1)
+    finish_threads(t2)
     assert all("last_id" in d for d in seen), "every read must be a complete, valid JSON object"
 
 

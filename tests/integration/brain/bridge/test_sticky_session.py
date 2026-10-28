@@ -21,6 +21,7 @@ from brain.chat.session import create_session, get_session, reset_registry
 from brain.ingest.buffer import ingest_turn
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 
 
 class _CapturingBus:
@@ -171,7 +172,7 @@ def test_sticky_session_survives_snapshot_sweep(tmp_path: Path) -> None:
     ):
         time.sleep(0.05)
     stop.set()
-    t.join(timeout=10.0)
+    finish_threads(t)
 
     # Session still alive, buffer intact.
     assert get_session(sid) is not None, "session evicted from _SESSIONS"

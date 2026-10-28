@@ -12,6 +12,7 @@ import threading
 import pytest
 
 from brain.bridge import cli_throttle
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +113,7 @@ def _waiter() -> tuple[threading.Thread, threading.Event]:
 def test_the_wait_returns_at_once_when_no_reply_is_in_flight():
     thread, returned = _waiter()
     assert returned.wait(5.0)
-    thread.join(5.0)
+    finish_threads(thread)
 
 
 def test_the_wait_blocks_until_the_reply_ends():
@@ -124,7 +125,7 @@ def test_the_wait_blocks_until_the_reply_ends():
         assert returned.wait(5.0), "the end of the reply wakes the waiter"
     finally:
         cli_throttle.reset()  # releases a stuck waiter if an assertion failed
-        thread.join(5.0)
+        finish_threads(thread)
 
 
 def test_the_wait_ends_only_when_every_overlapping_reply_has_ended():
@@ -138,7 +139,7 @@ def test_the_wait_ends_only_when_every_overlapping_reply_has_ended():
         assert returned.wait(5.0)
     finally:
         cli_throttle.reset()
-        thread.join(5.0)
+        finish_threads(thread)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +171,7 @@ def test_the_callback_runs_on_the_thread_that_starts_the_reply_not_the_registeri
     watch.on_reply_start(lambda: where.append(threading.get_ident()))
     replier = threading.Thread(target=cli_throttle.note_user_message)
     replier.start()
-    replier.join(5.0)
+    finish_threads(replier)
     assert where == [replier.ident]
 
 

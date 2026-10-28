@@ -13,6 +13,7 @@ import time
 import pytest
 
 from brain.bridge import cli_throttle, shutdown_progress
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +40,7 @@ def test_concurrent_registrations_are_all_counted(_fresh):
     reg._between = _between
     reg.register("first")
     reg._between = None
-    other.join(5)
+    finish_threads(other)
     assert reg.count() == 2
     assert sorted(reg.snapshot()) == ["first", "other"]
 
@@ -70,13 +71,16 @@ def test_start_tracked_thread_counts_the_thread_and_starts_nothing_after_the_fla
     """C9."""
     reg = _fresh
     release = threading.Event()
-    t = shutdown_progress.start_tracked_thread("backlog migration", lambda: release.wait(10), name="mig")
-    assert t is not None
-    assert reg.snapshot() == ["backlog migration"]
-    cli_throttle.request_shutdown()
-    assert shutdown_progress.start_tracked_thread("backlog migration", lambda: None, name="mig2") is None
-    release.set()
-    t.join(5)
+    t = shutdown_progress.start_tracked_thread("backlog migration", lambda: release.wait(), name="mig")
+    try:
+        assert t is not None
+        assert reg.snapshot() == ["backlog migration"]
+        cli_throttle.request_shutdown()
+        assert shutdown_progress.start_tracked_thread("backlog migration", lambda: None, name="mig2") is None
+    finally:
+        release.set()  # whatever assert ended the test early, the parked body is let go and waited for
+        if t is not None:
+            finish_threads(t)
     assert reg.count() == 0
 
 
@@ -89,19 +93,21 @@ def test_a_worker_stays_counted_after_its_request_task_is_cancelled(_fresh):
 
     def work():
         started.set()
-        release.wait(10)
+        release.wait()
         done.append(1)
 
     async def main():
         task = asyncio.create_task(shutdown_progress.tracked_to_thread("session close", work))
-        while not started.is_set():
-            await asyncio.sleep(0.01)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert reg.snapshot() == ["session close"]
-        assert reg.seal() is False
-        release.set()
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert reg.snapshot() == ["session close"]
+            assert reg.seal() is False
+        finally:
+            release.set()  # a failed assert must not leave the worker parked: asyncio.run waits for it on the way out
         for _ in range(500):
             if reg.count() == 0:
                 break

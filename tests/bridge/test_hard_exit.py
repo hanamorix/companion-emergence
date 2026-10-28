@@ -22,6 +22,7 @@ import psutil
 import pytest
 
 from brain.bridge import shutdown_progress, state_file
+from tests.thread_support import finish_threads
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree; Windows leg in CI")
 
@@ -195,7 +196,7 @@ def test_while_abandoning_no_claude_is_spawned(site, monkeypatch):
                 assert not run.called and not popen.called
             finally:
                 release.set()
-                t.join(10)
+                finish_threads(t)
             assert not t.is_alive()
             assert outcome == ["released"], outcome  # it left the gate only through the test's release
             assert not run.called and not popen.called

@@ -25,6 +25,7 @@ from brain.emotion.state import EmotionalState
 from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from tests.thread_support import finish_threads
 
 _SEED = 20260927  # deterministic (F-small fixture rule)
 
@@ -451,7 +452,7 @@ def test_c17_chat_write_waits_for_open_decay_batch_then_succeeds(tmp_path: Path)
         elapsed = time.monotonic() - start
     finally:
         waiter_store.close()
-        holder.join(timeout=_HOLD_SECONDS + 10.0)
+        finish_threads(holder)
 
     assert not holder.is_alive()
     assert not holder_errors, f"the holder failed: {holder_errors[0]!r}"

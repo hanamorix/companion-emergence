@@ -17,6 +17,7 @@ import brain.bridge.provider as provider_mod
 import brain.bridge.supervisor as sup
 from brain.bridge import cli_throttle
 from brain.bridge.events import EventBus
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -79,7 +80,7 @@ def _run(pd: Path, monkeypatch, *, saves, stop_after_iterations: int = 3, startu
     t.start()
     t.join(20)
     stop.set()
-    t.join(10)
+    finish_threads(t)
     assert not t.is_alive()
     return status, calls
 
@@ -156,7 +157,7 @@ def test_invalid_utf8_cadence_files_and_a_failing_save_do_not_end_the_loop(pd, m
     t.start()
     t.join(20)
     stop.set()
-    t.join(10)
+    finish_threads(t)
     assert status.iterations >= 3 and status.restarts == 0 and status.state == "stopped"
 
 

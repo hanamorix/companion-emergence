@@ -23,6 +23,7 @@ import pytest
 
 from brain.memory import db_health
 from brain.memory.store import Memory, MemoryStore
+from tests.thread_support import finish_threads, release_at_teardown
 
 
 def _mem(content: str) -> Memory:
@@ -532,7 +533,7 @@ def test_c34_per_turn_open_takes_no_transaction_while_a_writer_holds_one(tmp_hom
     assert elapsed <= 2.0
 
 
-def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeypatch):
+def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeypatch, request):
     """Same property as the synthetic-holder test above, proven against the
     REAL, unmodified `set_cluster_memberships` write path instead of a
     hand-rolled `BEGIN IMMEDIATE` stand-in.
@@ -579,6 +580,9 @@ def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeyp
             # deadlock/misattribute.
             if target_conn and target_conn[0] is self:
                 started.set()
+                # Bounded on purpose: a reader open that blocked on this writer would wait for a gate only the test
+                # thread (the reader) opens; expiry lets the commit finish, so that regression ends as the `elapsed`
+                # assert below.
                 proceed.wait(timeout=5)
             return super().commit()
 
@@ -603,6 +607,7 @@ def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeyp
         done.set()
 
     t = threading.Thread(target=_run_clustering)
+    release_at_teardown(request, proceed, [t])
     t.start()
     assert started.wait(timeout=5), (
         "the writer's real commit should have been reached (and blocked) within 5s"
@@ -614,7 +619,7 @@ def test_c34_per_turn_open_fast_during_a_real_clustering_write(tmp_path, monkeyp
     reader.close()
 
     proceed.set()
-    t.join(timeout=5)
+    finish_threads(t)
 
-    assert done.is_set(), "clustering write should have completed within the join timeout"
+    assert done.is_set(), "clustering write should have completed once the commit was let go"
     assert elapsed <= 2.0  # the blocked open waited up to the 30 s busy timeout; 2 s leaves room for a busy host

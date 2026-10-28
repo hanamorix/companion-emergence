@@ -28,6 +28,7 @@ from brain.memory.embeddings import (
     build_embedding_provider,
     cosine_similarity,
 )
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture
@@ -381,7 +382,6 @@ def test_build_embedding_provider_cache_reset_hook_forces_a_fresh_build(
 # How long the race stub waits for every expected thread to arrive. A FAILURE bound, never a delay the
 # passing path pays: the wait is released the moment the last thread arrives, and running out raises.
 _RACE_RENDEZVOUS_TIMEOUT_S = 20.0
-_RACE_JOIN_TIMEOUT_S = 30.0
 
 
 class _LazyLoadRaceStubTextEmbedding:
@@ -519,7 +519,7 @@ def test_fastembed_provider_embed_serializes_the_lazy_load_race_across_threads(
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=_RACE_JOIN_TIMEOUT_S)
+        finish_threads(t)
     assert not any(t.is_alive() for t in threads), "a worker thread never finished"
 
     assert not errors, f"concurrent embed() calls raised: {errors}"
@@ -556,7 +556,7 @@ def test_stub_race_detector_actually_detects_the_race_when_unserialized(tmp_path
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=_RACE_JOIN_TIMEOUT_S)
+        finish_threads(t)
     assert not any(t.is_alive() for t in threads), "a worker thread never finished"
 
     assert not errors, f"the race stub's own rendezvous failed: {errors}"
@@ -744,7 +744,7 @@ def test_fastembed_provider_embed_batch_serializes_against_embed_and_other_batch
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=_RACE_JOIN_TIMEOUT_S)
+        finish_threads(t)
     assert not any(t.is_alive() for t in threads), "a worker thread never finished"
 
     assert not errors, f"concurrent embed/embed_batch calls raised: {errors}"

@@ -33,6 +33,7 @@ from brain.chat import pass2_queue
 from brain.engines import interest_sweep
 from brain.memory.judge_selftune import JUDGE_TUNE_CADENCE_FILE
 from brain.self_model import cadence as sm_cadence
+from tests.thread_support import finish_threads
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
@@ -1549,7 +1550,7 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
         )
     finally:
         stop.set()
-        t.join(timeout=cap_s)
+        finish_threads(t)
         reset_registry()
     assert not t.is_alive()
 
@@ -1600,6 +1601,6 @@ def test_s84_run_folded_prunes_by_the_bridge_start_it_is_given(tmp_path):
         )
     finally:
         stop.set()
-        t.join(timeout=cap_s)
+        finish_threads(t)
         reset_registry()
     assert not t.is_alive()

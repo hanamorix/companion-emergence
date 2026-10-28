@@ -20,6 +20,7 @@ from brain.chat import compaction_migration as mig
 from brain.chat.compaction import CompactionResult, compact_conversation
 from brain.chat.compaction_migration import _marker_path, run_backlog_migration
 from brain.ingest.buffer import read_archive, read_session, write_cursor
+from tests.thread_support import finish_threads
 
 FIXTURE_SID = "30cd3047-3d47-45b9-a48f-e27f9f2a9bee"
 
@@ -747,8 +748,9 @@ def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypa
     migration saw pre-fix, and the RE-READ before the rewrite detects the now-
     sectioned row and no-ops → the fold survives → GREEN.
 
-    Deterministic (Event barriers + bounded 5s timeouts); cannot hang CI (the
-    writer thread is joined and asserted finished).
+    Deterministic (Event barriers, no time bound: the writer commits only after migration
+    has read, and the test thread releases it in a `finally`); the writer thread is joined
+    and asserted finished.
     """
     import threading
 
@@ -778,17 +780,18 @@ def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypa
     def writer() -> None:
         # Commit the fold ONLY after migration has captured its stale snapshot, so
         # the fold lands strictly inside migration's read→write window.
-        if not migration_has_read.wait(timeout=5.0):
-            return
-        rewrite_session_atomic(tmp_path, sid, [fold_row])
-        fold_committed.set()
+        migration_has_read.wait()
+        try:
+            rewrite_session_atomic(tmp_path, sid, [fold_row])
+        finally:
+            fold_committed.set()  # even if the write raised: migration holds on this, and the test fails on the missing fold
 
     def read_barrier(persona_dir, session_id, *a, **kw):
         snapshot = real_read(persona_dir, session_id, *a, **kw)
         if not state["fired"] and session_id == sid:
             state["fired"] = True          # only the FIRST (stale) read barriers
             migration_has_read.set()        # release the writer to commit the fold
-            fold_committed.wait(timeout=5.0)  # hold migration until the fold lands
+            fold_committed.wait()  # hold migration until the fold lands
         return snapshot
 
     monkeypatch.setattr(mig, "read_session", read_barrier)
@@ -797,7 +800,8 @@ def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypa
     try:
         run_sections_migration(tmp_path, now=now)
     finally:
-        t.join(timeout=5.0)
+        migration_has_read.set()  # a migration that never read leaves the writer parked here
+        finish_threads(t)
         monkeypatch.undo()
     assert not t.is_alive(), "writer thread did not finish (barrier deadlock)"
 

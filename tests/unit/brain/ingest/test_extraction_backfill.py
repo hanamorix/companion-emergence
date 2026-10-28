@@ -24,6 +24,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.utils.time import lenient_utc
+from tests.thread_support import finish_threads
 
 _PROMOTE_ALL = lambda _cand, _ctx: Decision("new")  # noqa: E731
 
@@ -380,14 +381,17 @@ def _b5(persona, store, hebbian) -> dict:
     eb._TEST_SEAMS["between_read_and_write"] = _inside_rmw
 
     def _s():
-        s_may_go.wait(timeout=5)
+        s_may_go.wait()
         eb.stop(persona)
         s_done.set()
 
     t = threading.Thread(target=_s)
     t.start()
-    step = _run(persona, store, hebbian, _Stub())
-    t.join(timeout=10)
+    try:
+        step = _run(persona, store, hebbian, _Stub())
+    finally:
+        s_may_go.set()  # a run that never reached the seam (or raised) must not leave S parked
+        finish_threads(t)
     assert step.advanced
     return eb.load_state(persona)
 
