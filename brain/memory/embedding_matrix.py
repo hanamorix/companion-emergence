@@ -264,6 +264,9 @@ class EmbeddingMatrix:
         `EmbeddingMatrix.put()` is the backstop against a genuinely wrong-dim
         vector reaching `_vectors` (see that method).
         """
+        # memdb-single-writer reader exception: this only SELECTs id and embedding from
+        # memories.db (plus PRAGMA busy_timeout). It stays outside MemoryStore for now (owner
+        # ruling); the scanner is tests/unit/test_memories_db_single_writer.py.
         conn = sqlite3.connect(
             str(self._db_path), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S
         )

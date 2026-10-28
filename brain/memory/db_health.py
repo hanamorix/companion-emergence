@@ -20,6 +20,12 @@ first `MemoryStore` open for that persona (S74): the per-turn MCP child, CLI
 commands, `nell chat --no-bridge` and `cmd_start`'s parent-side recovery never
 call this — a problem on one of those paths is caught at the next bridge
 start instead.
+
+This module decides what a result means (classify, once-per-process, log, end
+the transaction). The SQL that opens the connection and writes (the
+integrity-check, the schema-and-backfill, the rebuild) lives in `MemoryStore`
+(`connect_for_fts_health`, `fts_*`): the store is the only writer of
+memories.db, and `tests/unit/test_memories_db_single_writer.py` keeps it so.
 """
 
 from __future__ import annotations
@@ -30,8 +36,8 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain import dev_constants
 from brain.health.json_io import append_jsonl
+from brain.memory.store import MemoryStore
 from brain.paths import get_log_dir
 
 logger = logging.getLogger(__name__)
@@ -135,11 +141,8 @@ def _create_and_backfill_fts(conn: sqlite3.Connection) -> tuple[str, str | None]
     every existing row via `rebuild`, so this persona's pre-existing
     memories don't silently sit outside the FTS index for this process's
     whole lifetime (code-red-team pass 1, M2)."""
-    from brain.memory.store import _SCHEMA
-
     try:
-        conn.executescript(_SCHEMA)
-        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        MemoryStore.fts_create_schema_and_rebuild(conn)
     except sqlite3.DatabaseError as exc:
         _end_txn(conn)
         msg = str(exc)
@@ -152,7 +155,7 @@ def _classify_and_run(conn: sqlite3.Connection) -> tuple[str, str | None]:
     """Run the FTS5 integrity-check in its own short transaction and
     classify the outcome (S60). Ends the transaction on every branch."""
     try:
-        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+        MemoryStore.fts_integrity_check(conn)
     except sqlite3.DatabaseError as exc:
         msg = str(exc)
         low = msg.lower()
@@ -224,15 +227,12 @@ def run_fts_health_check_once(db_path: str | Path) -> None:
         _checked_paths.add(resolved)
 
     persona = resolved.parent.name
-    conn = sqlite3.connect(str(resolved), timeout=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S)
+    conn = MemoryStore.connect_for_fts_health(resolved)
     try:
-        conn.execute(
-            f"PRAGMA busy_timeout = {int(dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
-        )
         result, error = _classify_and_run(conn)
         if result in _REBUILD_ON:
             try:
-                conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+                MemoryStore.fts_rebuild(conn)
                 _end_txn(conn)
             except sqlite3.DatabaseError as exc:
                 _end_txn(conn)

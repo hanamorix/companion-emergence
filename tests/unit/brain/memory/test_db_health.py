@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.memory import db_health
 from brain.memory.store import Memory, MemoryStore
 
@@ -150,7 +151,7 @@ def test_c37b_lock_timeout_is_could_not_check_no_rebuild(tmp_home, monkeypatch):
     blocker.execute("BEGIN IMMEDIATE")
     blocker.execute("CREATE TABLE IF NOT EXISTS _lock_holder(x)")
     try:
-        monkeypatch.setattr(db_health.dev_constants, "MEMORIES_DB_BUSY_TIMEOUT_S", 0.3)
+        monkeypatch.setattr(dev_constants, "MEMORIES_DB_BUSY_TIMEOUT_S", 0.3)
         t0 = time.time()
         db_health.run_fts_health_check_once(db)
         elapsed = time.time() - t0
@@ -416,7 +417,7 @@ def test_non_corruption_database_error_end_to_end_logs_but_does_not_rebuild(tmp_
     assert lines[0]["result"] == "could_not_check"
     assert lines[0]["error"] == "disk I/O error"
     expected_pragma = (
-        f"PRAGMA busy_timeout = {int(db_health.dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
+        f"PRAGMA busy_timeout = {int(dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S * 1000)}"
     )
     assert fake.executed == [
         expected_pragma,

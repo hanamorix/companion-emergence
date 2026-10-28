@@ -61,6 +61,9 @@ def _count_rows(db: Path, table: str) -> int:
     if not db.is_file():
         return 0
     try:
+        # memdb-single-writer reader exception: only a SELECT COUNT(*) of a SOURCE persona's
+        # tables (memories.db among them) for the migrate preflight. It stays outside
+        # MemoryStore for now (owner ruling); the scanner is tests/unit/test_memories_db_single_writer.py.
         conn = sqlite3.connect(db)
         try:
             return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
