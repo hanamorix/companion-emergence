@@ -48,9 +48,9 @@ def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
     Emotions are pooled under their canonical name, so every spelling
     variant of one emotion reads as one channel in the returned state.
 
-    Unknown emotions (not in the registered vocabulary) are silently
-    skipped — a persona's old memories may contain retired emotion
-    names that no longer validate via EmotionalState.set.
+    Unknown emotions (not in the registered vocabulary) are skipped,
+    with one warning per name — a persona's old memories may contain
+    retired emotion names that no longer validate via EmotionalState.set.
 
     After max-pooling, applies the climax reset hook (§2.2). All
     callers (chat, reflex, body-state) get the post-reset state.
