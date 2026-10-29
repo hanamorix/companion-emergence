@@ -31,8 +31,9 @@ from __future__ import annotations
 # Applied at BOTH `sqlite3.connect(..., timeout=...)` and
 # `PRAGMA busy_timeout = ...`. MemoryStore gets it from `memories_profile()` in
 # store.py, which `brain.utils.sqlite_open.open_store_connection` applies at both
-# places; embedding_matrix.py's `_load_from_db` and db_health.py connect directly
-# and apply it themselves.
+# places; `MemoryStore.connect_for_fts_health` (the once-per-process FTS check in
+# db_health.py) applies it the same way, and embedding_matrix.py's `_load_from_db`
+# connects directly and applies it itself.
 # Sized above the longest single memories.db write transaction measured in
 # 2-plan.md §4.3: clustering's `set_cluster_memberships` at 6.7 s on
 # F-bob20k on the dev host; Phoebe-class hardware is 3-30x slower and was
