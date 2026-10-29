@@ -969,21 +969,22 @@ _follow_should_stop: threading.Event | None = None
 
 
 def cmd_tail_log(args) -> int:
-    """Print the last N lines of the bridge log; -f to follow.
+    """Print the last N lines of the runtime log; -f to follow.
 
     Cross-platform: pure Python loop, no shell `tail` (Windows CI lacks it).
     Follow mode polls every 200ms. KeyboardInterrupt is treated as a clean
     exit (returns 0). Tests can interrupt the loop by setting the module-level
     `_follow_should_stop` Event before the call.
     """
-    from brain.paths import get_log_dir, get_persona_dir
+    from brain.paths import get_persona_dir, runtime_log_path
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+    # The runtime log, where logging goes (#558); bridge-<persona>.log only has the child's raw stdout/stderr.
+    log_path = runtime_log_path(persona_dir.name)
     if not log_path.exists():
         print(
             f"bridge log not found at {log_path} — has the supervisor ever started?",

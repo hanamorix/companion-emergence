@@ -3328,7 +3328,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     s_tail_log = s_actions.add_parser(
         "tail-log",
-        help="Tail the bridge log file (cross-platform).",
+        help="Tail the bridge's runtime log, runtime-<persona>.log (cross-platform).",
     )
     _add_persona_arg(s_tail_log)
     s_tail_log.add_argument(

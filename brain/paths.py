@@ -180,6 +180,12 @@ def get_log_dir() -> Path:
     return _dirs.user_log_path.resolve()
 
 
+def runtime_log_path(persona_name: str) -> Path:
+    """The bridge's logging output for a persona (warnings, errors, ticks). ``bridge-<persona>.log`` beside it holds
+    only the detached child's raw stdout/stderr."""
+    return get_log_dir() / f"runtime-{persona_name}.log"
+
+
 _CADENCE_SUBDIR = "cadence"
 
 

@@ -143,11 +143,11 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
     try:
         from logging.handlers import RotatingFileHandler
 
-        from brain.paths import get_log_dir
+        from brain.paths import get_log_dir, runtime_log_path
 
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        path = log_dir / f"runtime-{persona_dir.name}.log"
+        path = runtime_log_path(persona_dir.name)
         root = logging.getLogger()
         if any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(path.resolve()) for h in root.handlers):
             return  # already set up (``supervisor run`` sets it up before the start back-off wait, D26)
@@ -186,11 +186,11 @@ def _attach_transient_runtime_log(persona_dir: Path) -> logging.Handler | None:
     closes per record, so the back-off's lines reach the log while nothing keeps it open. The caller removes it before
     ``_setup_runtime_logging`` attaches the persistent one (once the bridge lock is held). Best-effort."""
     try:
-        from brain.paths import get_log_dir
+        from brain.paths import get_log_dir, runtime_log_path
 
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        handler = _AppendThenCloseHandler(log_dir / f"runtime-{persona_dir.name}.log", encoding="utf-8", delay=True)
+        handler = _AppendThenCloseHandler(runtime_log_path(persona_dir.name), encoding="utf-8", delay=True)
         handler.setFormatter(logging.Formatter(_RUNTIME_LOG_FORMAT, datefmt=_RUNTIME_LOG_DATEFMT))
         handler.setLevel(logging.INFO)
         root = logging.getLogger()

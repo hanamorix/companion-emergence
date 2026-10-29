@@ -283,11 +283,25 @@ def _tail_args(persona: str, **kw) -> argparse.Namespace:
     return ns
 
 
+def test_cmd_tail_log_reads_the_runtime_log_where_warnings_go(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#558: logging goes to runtime-<persona>.log; bridge-<persona>.log only holds the child's raw stdout/stderr,
+    which is empty on a healthy install, so tailing it showed nothing."""
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    (log_dir / "bridge-nell.log").write_text("", encoding="utf-8")
+    (log_dir / "runtime-nell.log").write_text("2026-10-29 21:44:00 WARNING brain.x: something wedged\n", encoding="utf-8")
+
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=5))
+    assert rc == 0
+    assert "WARNING brain.x: something wedged" in capsys.readouterr().out
+
+
 def test_cmd_tail_log_prints_last_n_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
 
     rc = daemon.cmd_tail_log(_tail_args("nell", lines=3))
@@ -303,7 +317,7 @@ def test_cmd_tail_log_default_50_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
 
     rc = daemon.cmd_tail_log(_tail_args("nell"))  # lines=50 default
@@ -317,7 +331,7 @@ def test_cmd_tail_log_n_zero_prints_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("alpha\nbeta\n")
 
     rc = daemon.cmd_tail_log(_tail_args("nell", lines=0))
@@ -366,7 +380,7 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     import threading
 
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("seed\n")
 
     stop_event = threading.Event()
