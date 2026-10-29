@@ -16,6 +16,7 @@ Decay half-lives per spec Section 10.1:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -140,6 +141,20 @@ def canonical_name(name: str) -> str:
         parts = key[: -len(_BLEND_SUFFIX)].split("_")
         key = "_".join(sorted(parts)) + _BLEND_SUFFIX
     return key
+
+
+def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
+    """Key a name-to-value mapping by canonical name; spellings of one emotion keep the larger value.
+
+    The same max-per-emotion rule ``aggregate_state`` applies across memories. Names outside the
+    vocabulary are only normalised, so unrelated names stay separate keys. Returns a new dict.
+    """
+    pooled: dict[str, float] = {}
+    for name, value in values.items():
+        key = canonical_name(name)
+        if key not in pooled or value > pooled[key]:
+            pooled[key] = value
+    return pooled
 
 
 def get(name: str) -> Emotion | None:
