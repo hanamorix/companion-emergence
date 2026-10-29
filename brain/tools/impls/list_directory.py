@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from brain.files.read_guard import PROTECTED, is_read_denied
 from brain.tools.impls.read_file import _audit
 
 _LIST_ENTRY_CAP = 200
@@ -16,6 +17,10 @@ def list_directory(path: str, *, persona_dir: Path, **_) -> dict:
     except Exception as exc:  # noqa: BLE001
         _audit(persona_dir, tool="list_directory", path=raw, resolved="", bytes_=0, ok=False, error=str(exc))
         return {"error": f"bad path: {exc}"}
+
+    if is_read_denied(p, persona_dir=persona_dir):
+        _audit(persona_dir, tool="list_directory", path=raw, resolved=str(p), bytes_=0, ok=False, error=PROTECTED)
+        return {"error": f"refused: {p} is in a {PROTECTED}"}
 
     if not p.exists():
         _audit(persona_dir, tool="list_directory", path=raw, resolved=str(p), bytes_=0, ok=False, error="not found")
