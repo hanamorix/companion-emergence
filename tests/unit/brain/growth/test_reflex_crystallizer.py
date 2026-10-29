@@ -695,14 +695,10 @@ def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_loaded_arc
     assert result.emergences == []
     assert any("gate 8" in r.getMessage() for r in caplog.records)
 
-
-def test_crystallize_reflex_accepts_a_disjoint_trigger_beside_a_loaded_arc(
-    persona_dir: Path, store: MemoryStore
-):
-    # Positive control for the test above: same setup, only the trigger keys differ.
-    arc = _loaded_arc("comfort_arc", {"Comfort_Seeking": 5.0, "love": 5.0})
-    result = _run_crystallizer_with_proposal(persona_dir, store, [arc], {"creative_hunger": 7.0})
-    assert [e.name for e in result.emergences] == ["manuscript_obsession"]
+    # Control, same setup: a proposal whose keys do not overlap the arc's is accepted, so the
+    # rejection above came from gate 8 and not from some other gate or a broken harness.
+    control = _run_crystallizer_with_proposal(persona_dir, store, [arc], {"creative_hunger": 7.0})
+    assert [e.name for e in control.emergences] == ["manuscript_obsession"]
 
 
 def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_directly_built_arc(
