@@ -32,6 +32,8 @@ import httpx
 
 from brain.bridge import respawn_guard, start_backoff, state_file
 from brain.bridge.shutdown import REASON_USER_STOP
+from brain.health.log_rotation import rotate_rolling_size
+from brain.paths import RUNTIME_LOG_BACKUPS, RUNTIME_LOG_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +256,12 @@ def spawn_detached(
     reports alive, and ``poll()`` is also what reaps it.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Outside launchd nothing else bounds this file (#559). The previous child is gone (the caller holds the bridge
+    # lock), so rotating before the new child opens it is safe; a failed rotation never blocks a start.
+    try:
+        rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not rotate %s; starting the bridge anyway", log_path, exc_info=True)
     log_fh = open(log_path, "ab")  # noqa: SIM115
     python, env = bridge_python()
     popen_extra: dict[str, object] = {} if env is None else {"env": env}

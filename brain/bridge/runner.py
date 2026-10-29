@@ -118,8 +118,6 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
     shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
 
 
-_RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-_RUNTIME_LOG_BACKUPS = 3
 _RUNTIME_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _RUNTIME_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
@@ -143,7 +141,12 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
     try:
         from logging.handlers import RotatingFileHandler
 
-        from brain.paths import get_log_dir, runtime_log_path
+        from brain.paths import (
+            RUNTIME_LOG_BACKUPS,
+            RUNTIME_LOG_MAX_BYTES,
+            get_log_dir,
+            runtime_log_path,
+        )
 
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -153,8 +156,8 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
             return  # already set up (``supervisor run`` sets it up before the start back-off wait, D26)
         handler = RotatingFileHandler(
             path,
-            maxBytes=_RUNTIME_LOG_MAX_BYTES,
-            backupCount=_RUNTIME_LOG_BACKUPS,
+            maxBytes=RUNTIME_LOG_MAX_BYTES,
+            backupCount=RUNTIME_LOG_BACKUPS,
             encoding="utf-8",
         )
         handler.setFormatter(

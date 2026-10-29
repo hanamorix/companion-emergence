@@ -795,6 +795,27 @@ def test_release_lock_is_idempotent_after_external_unlink(
 # ---------- spawn_detached (lines 117-148) ----------
 
 
+def test_spawn_detached_rotates_an_oversize_bridge_log_before_the_child_appends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#559: outside launchd nothing else bounds bridge-<persona>.log; each start rotates it past the runtime log's cap."""
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    log_path = tmp_path / "logs" / "bridge-nell.log"
+    log_path.parent.mkdir()
+    log_path.write_bytes(b"x" * (6 * 1024 * 1024))
+
+    class FakeProc:
+        pid = 4242
+
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: FakeProc())
+    daemon.spawn_detached(persona_dir, idle_shutdown_seconds=300.0, client_origin="cli", log_path=log_path)
+
+    assert (tmp_path / "logs" / "bridge-nell.log.1.gz").exists()
+    assert log_path.stat().st_size == 0
+
+
 def test_spawn_detached_invokes_popen_with_detach_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
