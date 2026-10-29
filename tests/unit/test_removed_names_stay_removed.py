@@ -530,6 +530,13 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/chat",),
     ),
+    Removed(
+        names=("_summary_gen",),
+        why="the summary generation reader is public as summary_gen in brain/chat/compaction.py because the rollover reads it too; no private name and no alias",
+        ref="#556 review follow-up (the pull request that made it public)",
+        kind="code",
+        scope=("brain/chat",),
+    ),
 )
 
 

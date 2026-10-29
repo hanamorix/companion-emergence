@@ -21,7 +21,8 @@ deletes buffers (see brain/ingest/pipeline.finalize_stale_sessions).
 Every raw turn of the old buffer is carried into the seed or archived: the
 cascade archives only extracted turns older than 24h, the 1c-B seed carries only
 the last 40, so the rollover archives, durably and before it creates the
-successor, the raw turns it does not carry (#556). The old buffer's append lock
+successor, the raw turns it does not carry (#556), and then drops those rows
+from the old buffer so no turn is in both. The old buffer's append lock
 (``session_append_lock``) is held from the final read to the unlink, so a row
 appended in between cannot be deleted unseen.
 """
@@ -36,10 +37,10 @@ from pathlib import Path
 
 from brain.bridge.provider import LLMProvider
 from brain.chat.compaction import (
-    _summary_gen,
     build_compaction_provider,
     cascade_conversation,
     compact_conversation,
+    summary_gen,
 )
 from brain.chat.session import create_session, registry_lock, remove_session
 from brain.ingest.buffer import (
@@ -200,9 +201,13 @@ def perform_rollover(
 
     The raw turns the seed does not carry (in ``tiers_plus_tail``, those before the last 40 that the cascade
     has not archived) are archived, fsynced, before the successor, the pointer or the delete exist. An archive
-    failure raises before any of those: the old buffer, its cursor and the session list stay as they were; a
-    rerun after a crash archives the same batch once (the archive commit marker). The old buffer's append
-    lock is held from the final read to the unlink.
+    failure raises before any of those: the old buffer, its cursor and the session list stay as they were. Once
+    the archive is durable the archived rows are dropped from the old buffer, so a failure at any later step
+    leaves no turn in both files and a retry (whatever changed meanwhile) archives nothing twice; until a rollover
+    succeeds the still-live old session shows only its summary and the carried tail. The repeats left: a crash or
+    an error between the archive append and its commit marker, or between the marker and that buffer rewrite, may
+    archive the batch again on a later run (an immediate retry is skipped by the marker); a turn is never missing.
+    The old buffer's append lock is held from the final read to the unlink.
     """
     now = now or datetime.now(UTC)
     persona_dir = Path(persona_dir)
@@ -296,11 +301,20 @@ def perform_rollover(
                     # Nothing to seed → abort (nothing lost; old buffer stays).
                     return None
 
-                # Archive what the seed does not carry BEFORE anything else changes: the archive write is
-                # fsynced (and de-duplicated across a retry by its commit marker), so a failure here raises
-                # with the old buffer, its cursor and the session list untouched, and a crash after it leaves
-                # every turn in the buffer or the archive.
-                archive_once(persona_dir, old_sid, not_carried, new_gen=_summary_gen(summary_row))
+                # Archive what the seed does not carry BEFORE the old buffer, the successor or the pointer change:
+                # the archive write is fsynced (and de-duplicated across an immediate retry by its commit marker),
+                # so a failure here raises with the old buffer, its cursor and the session list untouched, and a
+                # crash after it leaves every turn in the buffer or the archive.
+                if not_carried:
+                    written = archive_once(persona_dir, old_sid, not_carried, new_gen=summary_gen(summary_row))
+                    if written <= 0:
+                        raise OSError("archive append wrote zero bytes")
+                    # Only now that the batch is durable, drop it from the old buffer (the append lock is held, so
+                    # `turns` is the whole buffer): a later step that raises leaves no row in both the buffer and the
+                    # archive, so a retry, or the daily tick's cascade on this still-live session, cannot archive it
+                    # again whatever changed in between.
+                    archived = {id(t) for t in not_carried}
+                    rewrite_session_atomic(persona_dir, old_sid, [t for t in turns if id(t) not in archived])
 
                 old_cursor = read_cursor(persona_dir, old_sid)
 
