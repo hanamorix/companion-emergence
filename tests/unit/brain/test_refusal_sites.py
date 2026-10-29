@@ -426,7 +426,7 @@ def test_supplementary_refused_at_first_window_keeps_the_complete_record(backfil
 @pytest.mark.parametrize("kind", REFUSALS)
 def test_supplementary_refused_after_some_windows_resumes_as_supplementary(backfill_env, persona, monkeypatch, kind):
     backfill = backfill_env
-    from brain.attunement.schemas import SCHEMA_VERSION
+    from brain import dev_constants
 
     backfill._state_path(persona).write_text(
         json.dumps({
@@ -451,7 +451,7 @@ def test_supplementary_refused_after_some_windows_resumes_as_supplementary(backf
     final = backfill.run_supplementary_backfill(persona, delay_s=0)
     assert det2.calls >= 1
     assert all(c == backfill._NEW_CATEGORIES for c in det2.categories)
-    assert final.status == "complete" and final.schema_version == SCHEMA_VERSION
+    assert final.status == "complete" and final.schema_version == dev_constants.ATTUNEMENT_SCHEMA_VERSION
     sampled = backfill.select_sample(backfill.window_buffer(backfill._read_buffer_turns(persona)))
     assert det2.calls == len(sampled) - backfill._cursor_index(sampled, cursor)
 

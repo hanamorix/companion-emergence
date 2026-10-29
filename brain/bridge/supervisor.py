@@ -2,7 +2,8 @@
 
 run_folded() is a synchronous loop running two cadences:
 
-  * every ``tick_interval_s`` (default 60s): close stale sessions
+  * every ``tick_interval_s`` (default: the ``embedding_backfill.tick_interval_seconds``
+    setting, 60s): close stale sessions
   * every ``heartbeat_interval_s`` (default 900s = 15min): fire a
     heartbeat tick — memory decay, dream gate, reflex, growth, research
 
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
     from brain.memory.relevance_judge import RelevanceJudgeProvider
 
-from brain import prompt_strings
+from brain import dev_constants, prompt_strings
 from brain.attunement.backfill import (
     run_backfill as _attunement_run_backfill,
 )
@@ -121,13 +122,12 @@ from brain.memory.embedding_backfill import (
 from brain.memory.embedding_backfill import (
     run_embedding_backfill_tick as _embedding_backfill_run_tick,
 )
+from brain.memory.embedding_backfill import (
+    tick_interval_seconds as _backfill_tick_interval_seconds,
+)
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.judge_selftune import (
-    JUDGE_TUNE_CADENCE_FILE,
-    JUDGE_TUNE_INTERVAL_HOURS,
-    _run_judge_selftune_tick,
-)
+from brain.memory.judge_selftune import _run_judge_selftune_tick
 from brain.memory.store import MemoryStore
 from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
@@ -244,7 +244,7 @@ def run_folded(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus,
-    tick_interval_s: float = 60.0,
+    tick_interval_s: float | None = None,
     heartbeat_interval_s: float | None = 900.0,
     soul_review_interval_s: float | None = 6 * 3600.0,
     finalize_after_hours: float = 24.0,
@@ -259,7 +259,7 @@ def run_folded(
     compaction_interval_s: float | None = 86400.0,
     calibration_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
-    judge_selftune_interval_s: float | None = JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
+    judge_selftune_interval_s: float | None = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     pending_reconcile_interval_s: float | None = 900.0,
@@ -322,7 +322,7 @@ def run_folded(
     identically to ``interest_sweep_interval_s`` immediately above (own
     persisted ``judge_selftune_cadence.json``, own fault-isolated tick, NO
     startup catch-up). Default matches
-    ``brain.memory.judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly).
+    ``dev_constants.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly).
     This increment (inc2) is a SCAFFOLD ONLY: the cadence, the >handful
     gate, runtime RAM tier-detection and the cgroup-aware OOM-safety
     downgrade are built and wired; the actual tuning (knob-refit / LoRA /
@@ -330,6 +330,10 @@ def run_folded(
     ``judge_selftune._run_judge_selftune_tick``'s docstring for the scope
     note.
     """
+    # ``tick_interval_s`` None = the ``embedding_backfill.tick_interval_seconds`` setting, read once per entry. An
+    # explicit value, ``0.0`` included, wins.
+    if tick_interval_s is None:
+        tick_interval_s = _backfill_tick_interval_seconds()
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
         persona_dir.name,
@@ -1523,7 +1527,7 @@ def _build_gated_jobs(
             GatedJob(
                 "weekly_selftune",
                 run=_selftune_run,
-                cadence_file=JUDGE_TUNE_CADENCE_FILE,
+                cadence_file=dev_constants.JUDGE_TUNE_CADENCE_FILE,
                 interval_s=judge_selftune_interval_s,
             )
         )

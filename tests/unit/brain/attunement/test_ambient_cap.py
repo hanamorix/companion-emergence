@@ -1,8 +1,9 @@
 """Test that build_attunement_block caps rendered patterns at _ATTUNEMENT_RENDER_CAP."""
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.ambient import _ATTUNEMENT_RENDER_CAP, build_attunement_block
-from brain.attunement.schemas import SCHEMA_VERSION, LearnedPattern
+from brain.attunement.schemas import LearnedPattern
 from brain.attunement.store import _append_pattern
 
 
@@ -21,7 +22,7 @@ def _make_pattern(idx: int, maturity: str, evidence_count: int) -> LearnedPatter
         crystallised_at="2026-05-15T00:00:00Z" if maturity == "known" else None,
         falsified_at=None,
         examples=[],
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
 
 

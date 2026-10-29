@@ -1,17 +1,8 @@
-"""Schemas and constants for the attunement subsystem."""
+"""Schemas for the attunement subsystem. Its constants (schema version, maturity thresholds, cooldown, budget) live in `brain.dev_constants`."""
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-
-SCHEMA_VERSION = "0.0.29"
-
-MATURITY_FORMING_MIN = 3
-MATURITY_KNOWN_MIN = 10
-MATURITY_FALSIFIED_MAX = 3
-
-ADDRESS_COOLDOWN_HOURS = 6.0
-DAILY_BUDGET_DEFAULT = 150
 
 # All five categories shipped across alpha.1 → v0.0.28; the schema validates all of them now
 # so future tasks don't have to expand the enum repeatedly. alpha.1 only emits tone + cadence.

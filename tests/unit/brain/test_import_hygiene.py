@@ -41,10 +41,11 @@ _SCRIPT = textwrap.dedent(
 
     # The firing self-tune tick: enough labelled calibration rows (with raw judge scores) to pass the >handful gate,
     # so the knob refit really trains and persists.
+    from brain import dev_constants
     from brain.memory.store import MemoryStore
 
     store = MemoryStore(db_path=":memory:")
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     for i in range(handful + 1):
         store.log_calibration_sample(
             query=f"q{i}", candidate_ids=["m"], reranker_scores=[1.0], reranker_model_id="m"

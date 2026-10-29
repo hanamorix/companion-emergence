@@ -25,13 +25,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge import central_cadence, cli_throttle, persisted_cadence, supervisor
 from brain.bridge.central_cadence import GATED_JOB_ORDER, GatedJob, JobOutcome
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.chat import pass2_queue
 from brain.engines import interest_sweep
-from brain.memory.judge_selftune import JUDGE_TUNE_CADENCE_FILE
 from brain.self_model import cadence as sm_cadence
 from tests.thread_support import finish_threads
 
@@ -44,7 +44,7 @@ INTERVAL_JOBS: dict[str, tuple[str, float]] = {
     "compaction": ("compaction_cadence.json", 86400.0),
     "clustering": ("clustering_cadence.json", 6 * 3600.0),
     "daily_calibration": ("calibration_cadence.json", 86400.0),
-    "weekly_selftune": (JUDGE_TUNE_CADENCE_FILE, 7 * 86400.0),
+    "weekly_selftune": (dev_constants.JUDGE_TUNE_CADENCE_FILE, 7 * 86400.0),
     "finalize": ("finalize_cadence.json", 3600.0),
     "initiate_review": ("initiate_review_cadence.json", 900.0),
 }
