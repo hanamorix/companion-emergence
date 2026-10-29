@@ -136,10 +136,23 @@ Marker split (case-insensitive, line-anchored). Fail-soft ladder:
 - All three markers found → normal path.
 - Markers missing → whole output appended as NOTES, verdict = `continue`, no memory created.
 
+What counts as a marker (#591; tolerance lives in the parser, never the prompt). A bare marker is `NAME:` alone on its
+line, any case, and always splits. A marker may also carry its text on the same line (`MEMORY: text`) or be written in
+bold or underscores (`**MEMORY:** text`, `**MEMORY**: text`, `__MEMORY:__`): case-insensitive when followed by a colon.
+The one colon-less form, the name in bold or underscores alone on its line (`**MEMORY**`), is upper case only. Such an
+extended marker splits only when the reply has no bare marker of that name, it is in prompt order (NOTES, MEMORY,
+VERDICT) relative to every accepted marker, and it is the last of its name; a NOTES marker must be the first non-blank
+line, so no preamble is cut off; a VERDICT marker must be the last content of the reply (whatever its value) or carry a
+verdict the prompt offers (`close`, `continue`, `spawn:`), so a prose "Verdict: ..." line with text after it cannot end a
+section and drop that text. A reply with all three bare markers parses exactly as before. A reply with notes but no
+memory or no verdict text is recorded as a `parse_failures.jsonl` row (site `research_session`), so a layout the parser
+does not read is visible. Fires whose memory was lost to the old rule are recovered once, from the stored notes, by
+`brain/engines/research_recovery.py` (the close verdict and spawned topics of those fires are not replayed).
+
 Then, in order:
 1. Append NOTES block to `research/<id>.md` under the dated session header (atomic).
 2. `store.create` the MEMORY as `memory_type='research'` with the existing metadata shape
-   (`_create_research_memory`) — feed and daemon-state contracts intact. Skipped if MEMORY
+   (`build_research_memory`) — feed and daemon-state contracts intact. Skipped if MEMORY
    section absent.
 3. Apply VERDICT:
    - `continue` — nothing beyond the normal cooldown update.
