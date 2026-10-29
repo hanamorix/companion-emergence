@@ -78,8 +78,8 @@ logger = logging.getLogger(__name__)
 # the re-measure and the RAM figure so their samples are saved the same lull), then the recall
 # diagnostics flush (S189: records buffered while the log's lock was held), then the extraction
 # backfill (#523: one chunk per pass, after embedding backfill so the vectors its dedup reads are
-# current), and the research recovery (#591: one interest's lost research memories per pass, after the emotion backfill).
-# Names are the job table's keys and the log's `job=` values.
+# current). The research recovery (#591: one interest's lost research memories per pass) runs right after the emotion
+# backfill. Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
     "session_snapshot_prune",

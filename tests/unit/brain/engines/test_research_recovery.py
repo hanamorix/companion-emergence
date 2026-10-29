@@ -471,3 +471,76 @@ def test_a_notes_file_that_cannot_be_read_is_deferred_and_the_others_are_recover
     state = json.loads((tmp_path / research_recovery.STATE_FILE).read_text(encoding="utf-8"))
     assert state["done"] is False and state["counts"]["errors"] == 1
     assert research_recovery.has_recovery_work(tmp_path) is False
+
+
+# ---- the second layer of duplicate protection, and the stall on an unexpected error ------------------------------------------
+
+
+def _journal_fails_once(monkeypatch):
+    real = research_recovery.append_jsonl
+    state = {"fail": True}
+
+    def flaky(path, records, **kwargs):
+        if state["fail"]:
+            state["fail"] = False
+            raise OSError("journal not writable")
+        return real(path, records, **kwargs)
+
+    monkeypatch.setattr(research_recovery, "append_jsonl", flaky)
+
+
+def test_a_candidate_whose_journal_line_was_lost_is_found_in_the_queue_and_linked(tmp_path, store, monkeypatch):
+    fires = _three_interests(tmp_path)
+    _journal_fails_once(monkeypatch)
+    counts = research_recovery.run_recovery(tmp_path, store)
+    assert counts["errors"] == 1 and counts["recovered"] == 1   # the queue has both candidates, the journal one line
+    assert len(_queued_ids(tmp_path)) == 2
+    research_recovery._DEFERRED.clear()  # a new process
+    research_recovery._STALLED.clear()
+    counts = research_recovery.run_recovery(tmp_path, store)
+    # The first interest's second fire was journaled and linked by the first pass; the first fire (no journal line) is
+    # found in the queue by its deterministic id and only linked.
+    assert counts["resumed"] == 1 and counts["recovered"] == 0
+    assert len(_queued_ids(tmp_path)) == 2                      # no duplicate
+    _drain(store)
+    _run_to_the_end(store)
+    assert store.count() == len(fires)
+    assert all(v is not None for v in _log(tmp_path).values())
+
+
+def test_a_candidate_whose_journal_line_was_lost_is_found_in_the_store_when_the_gate_promoted_it(tmp_path, store, monkeypatch):
+    fires = _three_interests(tmp_path)
+    _journal_fails_once(monkeypatch)
+    research_recovery.run_recovery(tmp_path, store)
+    _drain(store)                                               # promoted before the restart
+    assert store.count() == 2
+    research_recovery._DEFERRED.clear()
+    research_recovery._STALLED.clear()
+    _run_to_the_end(store)
+    assert store.count() == len(fires)
+    assert len(set(_log(tmp_path).values())) == len(fires)
+
+
+def test_an_unexpected_error_stalls_the_job_until_the_next_start_even_with_an_empty_queue(tmp_path, store, monkeypatch):
+    _three_interests(tmp_path)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(research_recovery, "_pair", boom)
+    assert research_recovery.has_recovery_work(tmp_path) is True and _queued_ids(tmp_path) == []
+    with pytest.raises(RuntimeError):
+        research_recovery.run_recovery(tmp_path, store)
+    assert research_recovery.has_recovery_work(tmp_path) is False
+    research_recovery._STALLED.clear()
+    assert research_recovery.has_recovery_work(tmp_path) is True
+
+
+@pytest.mark.parametrize("state", [{"counts": [1, 2], "skipped": "x", "done": "yes"}, {"counts": {"recovered": "many"}}, [1, 2]])
+def test_a_foreign_or_damaged_state_file_does_not_wedge_recovery(tmp_path, store, state):
+    fires = _three_interests(tmp_path)
+    (tmp_path / research_recovery.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+    assert research_recovery.has_recovery_work(tmp_path) is True
+    _run_to_the_end(store)
+    assert store.count() == len(fires)
+    assert json.loads((tmp_path / research_recovery.STATE_FILE).read_text(encoding="utf-8"))["done"] is True

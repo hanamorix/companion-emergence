@@ -82,8 +82,17 @@ def _fire_date(fire: ResearchFire) -> str:
 
 
 def _load_state(persona_dir: Path) -> dict:
+    """The state file, read tolerantly: an unknown key is ignored and a value of the wrong type counts as absent."""
     data = read_json(persona_dir / STATE_FILE, default=dict)
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    counts = data.get("counts")
+    skipped = data.get("skipped")
+    return {
+        "done": data.get("done") is True,
+        "counts": counts if isinstance(counts, dict) else {},
+        "skipped": [k for k in skipped if isinstance(k, str)] if isinstance(skipped, list) else [],
+    }
 
 
 def _queued_recovered(persona_dir: Path) -> list:
@@ -176,7 +185,8 @@ def _run_pass(persona_dir: Path, store: MemoryStore, now: datetime) -> dict[str,
     remaining = [
         f for f in ResearchLog.load(log_path).fires if f.output_memory_id is None and _fire_key(f) not in skipped
     ] if log_path.exists() else []
-    totals = {k: int(state.get("counts", {}).get(k, 0)) + counts[k] for k in _COUNTERS}
+    before = state["counts"]
+    totals = {k: (before[k] if isinstance(before.get(k), int) else 0) + counts[k] for k in _COUNTERS}
     done = not remaining
     write_json(
         persona_dir / STATE_FILE,

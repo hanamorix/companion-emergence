@@ -8,7 +8,8 @@ marker with its text on the same line (``MEMORY: text``), or in bold or undersco
 ``**MEMORY**: text``, ``__MEMORY:__``), name in any case because a colon follows it; or the name in bold or underscores
 alone on its line with no colon (``**MEMORY**``), upper case only. An extended marker splits only when the reply has no
 bare marker of that name, it sits in prompt order (NOTES, MEMORY, VERDICT) relative to every accepted marker, and it is the
-last of its name; a NOTES marker must also be the first non-blank line, so no preamble is ever cut off. Everything else
+last of its name; a NOTES marker must also be the first non-blank line, so no preamble is ever cut off, and a VERDICT
+marker must carry a verdict the prompt offers (close, continue, spawn:), so prose cannot end a section. Everything else
 (``MEMORY's``, ``VERDICT- x``, a marker word mid-line) is text. A reply with all three bare markers parses exactly as it
 did before extended markers existed.
 """
@@ -30,6 +31,7 @@ _EXT_UPPER = re.compile(
 )
 _ORDER = ("NOTES", "MEMORY", "VERDICT")
 _SPAWN_CAP = 2
+_FIRST_LINE = re.compile(r"\s*([^\n]*)")
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,13 @@ class SessionOutput:
     degraded: bool
     # The sections of MEMORY and VERDICT that carry no text in the reply (both for a degraded reply). A reply with notes
     # and a non-empty ``missing`` is a layout the parser did not read; the caller records it.
-    missing: tuple[str, ...] = ()
+    missing: tuple[str, ...]
+
+
+def _is_verdict_value(raw: str, body_start: int) -> bool:
+    """True when the line a VERDICT section would start with is a verdict the prompt offers: close, continue or spawn:."""
+    value = _FIRST_LINE.match(raw, body_start).group(1).strip().lower()
+    return value in ("close", "continue") or value.startswith("spawn:")
 
 
 def _find_markers(raw: str) -> list[tuple[str, int, int]]:
@@ -73,11 +81,15 @@ def _find_markers(raw: str) -> list[tuple[str, int, int]]:
         lo = max(earlier, default=-1)
         hi = min(later, default=len(raw) + 1)
         index = bisect_left([start for start, _ in candidates], hi) - 1
-        if index < 0 or candidates[index][0] <= lo:
-            continue
-        start, body_start = candidates[index]
-        accepted_start[name] = start
-        markers.append((name, start, body_start))
+        # A VERDICT section keeps only its first line, so a prose "Verdict: ..." line must not become the marker: an
+        # extended VERDICT marker has to carry one of the verdicts the prompt offers.
+        while index >= 0 and candidates[index][0] > lo:
+            start, body_start = candidates[index]
+            if name != "VERDICT" or _is_verdict_value(raw, body_start):
+                accepted_start[name] = start
+                markers.append((name, start, body_start))
+                break
+            index -= 1
     markers.sort(key=lambda marker: marker[1])
     return markers
 

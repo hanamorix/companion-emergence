@@ -142,7 +142,8 @@ bold or underscores (`**MEMORY:** text`, `**MEMORY**: text`, `__MEMORY:__`): cas
 The one colon-less form, the name in bold or underscores alone on its line (`**MEMORY**`), is upper case only. Such an
 extended marker splits only when the reply has no bare marker of that name, it is in prompt order (NOTES, MEMORY,
 VERDICT) relative to every accepted marker, and it is the last of its name; a NOTES marker must be the first non-blank
-line, so no preamble is cut off. A reply with all three bare markers parses exactly as before. A reply with notes but no
+line, so no preamble is cut off; a VERDICT marker must carry a verdict the prompt offers (`close`, `continue`, `spawn:`),
+so a prose "Verdict: ..." line cannot end a section. A reply with all three bare markers parses exactly as before. A reply with notes but no
 memory or no verdict text is recorded as a `parse_failures.jsonl` row (site `research_session`), so a layout the parser
 does not read is visible. Fires whose memory was lost to the old rule are recovered once, from the stored notes, by
 `brain/engines/research_recovery.py` (the close verdict and spawned topics of those fires are not replayed).

@@ -141,9 +141,10 @@ def is_exempt(
     Three exemption classes per spec §4 (ordered cheapest first):
       1. Soul-crystallised
       2. Under soul-candidate review
-      3. Recent buffer — created within RECENT_LIVED_HOURS hours, measured by
-         WALL-CLOCK age (despite the constant's historical name). During
-         cold-start (now_lived_age_hours <= 0) all memories are exempt.
+      3. Recent buffer — created (or, for a memory recovered from a stored note,
+         recovered) within RECENT_LIVED_HOURS hours, measured by WALL-CLOCK age
+         (despite the constant's historical name). During cold-start
+         (now_lived_age_hours <= 0) all memories are exempt.
     """
     if memory.id in soul_crystallised_ids:
         return True
@@ -157,7 +158,8 @@ def is_exempt(
     # but at cold-start (no rate established) treat as fully recent.
     if now_lived_age_hours <= 0.0:
         return True
-    # Recent-buffer grace is wall-clock: a memory created within
-    # RECENT_LIVED_HOURS hours of now is exempt regardless of lived-rate.
+    # Recent-buffer grace is wall-clock: a memory created (or recovered, see
+    # _recent_buffer_anchor) within RECENT_LIVED_HOURS hours of now is exempt
+    # regardless of lived-rate.
     wall_age_hours = wall_age_s / 3600.0
     return wall_age_hours <= RECENT_LIVED_HOURS

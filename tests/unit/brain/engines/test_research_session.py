@@ -244,6 +244,45 @@ def test_title_case_verdict_line_ahead_of_a_bare_memory_does_not_split():
     assert out.verdict == "close"
 
 
+# ---- a prose "Verdict:" line is never taken for the marker (a VERDICT section keeps only its first line) --------------------
+
+
+def test_a_prose_verdict_line_does_not_end_the_notes_and_loses_nothing():
+    raw = "NOTES:\nfinding one\nVerdict: this approach is promising\nfinding two\nfinding three\n"
+    out = parse_session_output(raw)
+    assert out.notes == "finding one\nVerdict: this approach is promising\nfinding two\nfinding three"
+    assert out.missing == ("MEMORY", "VERDICT")  # recorded by the caller as an unread layout
+
+
+def test_a_prose_verdict_line_does_not_end_a_bare_memory():
+    raw = "NOTES:\nn\nMEMORY:\nA trial changed how I think.\nVerdict: the evidence convinced me.\nIt stayed with me.\n"
+    out = parse_session_output(raw)
+    assert out.memory == "A trial changed how I think.\nVerdict: the evidence convinced me.\nIt stayed with me."
+    assert out.missing == ("VERDICT",)
+
+
+@pytest.mark.parametrize("value", ["close", "continue", "spawn: a topic", "Close", "CONTINUE"])
+def test_an_inline_verdict_must_be_one_the_prompt_offers(value):
+    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVerdict: {value}\n")
+    assert out.missing == () and out.memory == "m"
+
+
+@pytest.mark.parametrize("value", ["close.", "**close**", "maybe", "mixed", "this approach is promising"])
+def test_an_inline_verdict_that_is_not_one_the_prompt_offers_is_text(value):
+    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVERDICT: {value}\n")
+    assert out.missing == ("VERDICT",) and out.memory == f"m\nVERDICT: {value}"
+
+
+def test_the_last_inline_verdict_line_that_is_a_verdict_is_the_marker():
+    out = parse_session_output("NOTES:\nn\nMEMORY: m\nVERDICT: close\nVerdict: because it was done\n")
+    assert out.verdict == "close" and out.memory == "m"
+
+
+def test_an_inline_marker_after_a_later_bare_marker_is_not_a_marker():
+    out = parse_session_output("NOTES:\nn\nVERDICT:\nclose\nMemory: afterthought")
+    assert out.memory is None and out.verdict == "close" and out.missing == ("MEMORY",)
+
+
 # ---- the missing-section record ---------------------------------------------------------------------------------------
 
 
@@ -373,6 +412,8 @@ def test_a_missing_section_with_an_inline_line_of_it_splits_there():
     "the fold-case names that made a draft of the new parser raise KeyError"
 )
 def test_parser_never_raises_and_stays_linear():
+    # The bound is wall-clock because the failure it guards is super-linear time (a draft of the ordering rule took 39 s
+    # on 40k lines); a linear parser needs well under half a second for any input below.
     inputs = [
         "",
         "NOTES:",
@@ -428,9 +469,13 @@ def test_documented_drops_are_exactly_these():
     out = parse_session_output("NOTES:\nn\nMEMORY: m\nVERDICT: close\na postscript the model added\n")
     assert out.verdict == "close"
     assert "postscript" not in out.notes and "postscript" not in (out.memory or "")
-    # A VERDICT line inside the memory text, with no bare VERDICT, ends the memory there (second residual).
-    out = parse_session_output("NOTES:\nn\nMEMORY: m1\nVERDICT: x\nm2 is dropped\n")
+    # A verdict line inside the memory text, with no bare VERDICT, ends the memory there (second residual): the model
+    # wrote a line that is exactly a verdict the prompt offers.
+    out = parse_session_output("NOTES:\nn\nMEMORY: m1\nVERDICT: continue\nm2 is dropped\n")
     assert out.memory == "m1" and out.verdict == "continue"
+    # A prose line that merely starts with the word is not a verdict, so nothing after it is lost.
+    out = parse_session_output("NOTES:\nn\nMEMORY: m1\nVERDICT: x\nm2 is kept\n")
+    assert out.memory == "m1\nVERDICT: x\nm2 is kept" and out.missing == ("VERDICT",)
     # Text before a BARE NOTES marker is dropped (today's rule, unchanged).
     out = parse_session_output("preamble\nNOTES:\nn\nMEMORY: m\nVERDICT: close")
     assert out.notes == "n" and "preamble" not in out.notes
