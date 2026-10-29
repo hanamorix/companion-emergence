@@ -11,7 +11,7 @@ from brain.migrator.companion_emergence import (
 )
 
 
-def _make_v012_persona(root: Path, name: str = "phoebe") -> Path:
+def _make_v012_persona(root: Path, name: str = "canary") -> Path:
     """Build a minimal but valid v0.0.12-shaped persona dir."""
     persona_dir = root / name
     persona_dir.mkdir(parents=True)
@@ -25,7 +25,7 @@ def _make_v012_persona(root: Path, name: str = "phoebe") -> Path:
     sqlite3.connect(persona_dir / "hebbian.db").close()
     sqlite3.connect(persona_dir / "crystallizations.db").close()
     (persona_dir / "persona_config.json").write_text(json.dumps({
-        "persona_name": name, "user_name": "zero",
+        "persona_name": name, "user_name": "bob",
         "voice_template": "nell-example", "provider": "claude-cli", "model": "sonnet",
     }))
     return persona_dir
@@ -35,8 +35,8 @@ def test_preflight_happy_path(tmp_path):
     src = _make_v012_persona(tmp_path)
     result = preflight_companion_emergence(src)
     assert result["ok"] is True
-    assert result["persona_name"] == "phoebe"
-    assert result["imported_user_name"] == "zero"
+    assert result["persona_name"] == "canary"
+    assert result["imported_user_name"] == "bob"
     assert result["imported_voice_template"] == "nell-example"
     assert result["memory_count"] == 1
     assert result["crystallization_count"] == 0
@@ -67,12 +67,12 @@ def test_preflight_no_memories_db(tmp_path):
 
 
 def test_preflight_pointed_at_parent(tmp_path):
-    _make_v012_persona(tmp_path, "phoebe")
+    _make_v012_persona(tmp_path, "canary")
     _make_v012_persona(tmp_path, "nell")
     r = preflight_companion_emergence(tmp_path)
     errs = [e for e in r["errors"] if e["code"] == "pointed_at_parent"]
     assert errs
-    assert set(errs[0]["detail"]["suggested_subdirs"]) == {"phoebe", "nell"}
+    assert set(errs[0]["detail"]["suggested_subdirs"]) == {"canary", "nell"}
 
 
 def test_preflight_missing_persona_config(tmp_path):
@@ -100,23 +100,23 @@ def test_preflight_unusable_persona_config_is_the_domain_error_not_a_traceback(t
 
 
 def test_migrate_copies_dir_and_writes_app_config(tmp_path, monkeypatch):
-    src = _make_v012_persona(tmp_path / "src", name="phoebe")
+    src = _make_v012_persona(tmp_path / "src", name="canary")
     kindled_home = tmp_path / "home"
     monkeypatch.setenv("KINDLED_HOME", str(kindled_home))
 
     args = CompanionEmergenceMigrateArgs(
-        input_dir=src, install_as="phoebe", force=False,
+        input_dir=src, install_as="canary", force=False,
     )
     report = migrate_companion_emergence(args)
 
-    target = kindled_home / "personas" / "phoebe"
+    target = kindled_home / "personas" / "canary"
     assert target.is_dir()
     assert (target / "memories.db").is_file()
     assert (target / "persona_config.json").is_file()
     assert (target / "source-manifest.json").is_file()
 
     app_cfg = json.loads((kindled_home / "app_config.json").read_text())
-    assert app_cfg["selected_persona"] == "phoebe"
+    assert app_cfg["selected_persona"] == "canary"
 
     assert report.memories_migrated == 1
     assert report.bytes_copied > 0
@@ -124,31 +124,31 @@ def test_migrate_copies_dir_and_writes_app_config(tmp_path, monkeypatch):
 
 
 def test_migrate_refuses_without_force_on_existing_target(tmp_path, monkeypatch):
-    src = _make_v012_persona(tmp_path / "src", name="phoebe")
+    src = _make_v012_persona(tmp_path / "src", name="canary")
     kindled_home = tmp_path / "home"
     monkeypatch.setenv("KINDLED_HOME", str(kindled_home))
-    (kindled_home / "personas" / "phoebe").mkdir(parents=True)
+    (kindled_home / "personas" / "canary").mkdir(parents=True)
 
     with pytest.raises(FileExistsError, match="already exists"):
         migrate_companion_emergence(CompanionEmergenceMigrateArgs(
-            input_dir=src, install_as="phoebe", force=False,
+            input_dir=src, install_as="canary", force=False,
         ))
 
 
 def test_migrate_force_backs_up_then_replaces(tmp_path, monkeypatch):
-    src = _make_v012_persona(tmp_path / "src", name="phoebe")
+    src = _make_v012_persona(tmp_path / "src", name="canary")
     kindled_home = tmp_path / "home"
     monkeypatch.setenv("KINDLED_HOME", str(kindled_home))
-    target = kindled_home / "personas" / "phoebe"
+    target = kindled_home / "personas" / "canary"
     target.mkdir(parents=True)
     (target / "marker.txt").write_text("old")
 
     migrate_companion_emergence(CompanionEmergenceMigrateArgs(
-        input_dir=src, install_as="phoebe", force=True,
+        input_dir=src, install_as="canary", force=True,
     ))
 
     assert (target / "memories.db").is_file()
     assert not (target / "marker.txt").exists()
-    backups = list(target.parent.glob("phoebe.backup-*"))
+    backups = list(target.parent.glob("canary.backup-*"))
     assert len(backups) == 1
     assert (backups[0] / "marker.txt").read_text() == "old"

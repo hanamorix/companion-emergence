@@ -28,7 +28,7 @@ from brain.migrator.companion_emergence import (
 )
 
 
-def _build_v012_persona(root: Path, name: str = "phoebe", memory_count: int = 50) -> Path:
+def _build_v012_persona(root: Path, name: str = "canary", memory_count: int = 50) -> Path:
     """Build a v0.0.12-shaped persona dir with ``memory_count`` memories.
 
     Uses the minimal column set that v0.0.12 produced — MemoryStore's
@@ -56,7 +56,7 @@ def _build_v012_persona(root: Path, name: str = "phoebe", memory_count: int = 50
             "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 f"mem-{i:05d}",
-                f"memory content for index {i}: phoebe recalls the shape of the evening",
+                f"memory content for index {i}: canary recalls the shape of the evening",
                 5 + (i % 5),
                 "conversation",
                 "us",
@@ -76,7 +76,7 @@ def _build_v012_persona(root: Path, name: str = "phoebe", memory_count: int = 50
     (persona_dir / "persona_config.json").write_text(
         json.dumps({
             "persona_name": name,
-            "user_name": "zero",
+            "user_name": "bob",
             "voice_template": "nell-example",
             "provider": "claude-cli",
             "model": "sonnet",
@@ -88,14 +88,14 @@ def _build_v012_persona(root: Path, name: str = "phoebe", memory_count: int = 50
 
 def test_existing_ce_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """50-memory v0.0.12 persona migrates intact; MemoryStore reads 50 back."""
-    src = _build_v012_persona(tmp_path / "old_install", name="phoebe", memory_count=50)
+    src = _build_v012_persona(tmp_path / "old_install", name="canary", memory_count=50)
 
     new_home = tmp_path / "new_kindled_home"
     monkeypatch.setenv("KINDLED_HOME", str(new_home))
 
     args = CompanionEmergenceMigrateArgs(
         input_dir=src,
-        install_as="phoebe",
+        install_as="canary",
         force=False,
     )
     report = migrate_companion_emergence(args)
@@ -106,7 +106,7 @@ def test_existing_ce_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert report.bytes_copied > 0
 
     # --- persona dir structure ---
-    target = new_home / "personas" / "phoebe"
+    target = new_home / "personas" / "canary"
     assert target.is_dir(), f"persona dir not created: {target}"
     assert (target / "memories.db").is_file()
     assert (target / "persona_config.json").is_file()
@@ -128,7 +128,7 @@ def test_existing_ce_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     app_cfg_path = new_home / "app_config.json"
     assert app_cfg_path.is_file(), "app_config.json not written by migrator"
     cfg = json.loads(app_cfg_path.read_text(encoding="utf-8"))
-    assert cfg["selected_persona"] == "phoebe"
+    assert cfg["selected_persona"] == "canary"
 
     # --- source-manifest.json correctness ---
     manifest = json.loads((target / "source-manifest.json").read_text(encoding="utf-8"))
