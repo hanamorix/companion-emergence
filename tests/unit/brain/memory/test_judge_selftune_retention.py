@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory import floor_calibration, judge_selftune
 from brain.memory.store import MemoryStore
@@ -36,11 +37,11 @@ from tests.unit.brain.memory.test_judge_selftune_lifecycle import (
 )
 
 NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
-HANDFUL = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+HANDFUL = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
 
 
 def _week() -> timedelta:
-    return timedelta(hours=judge_selftune.JUDGE_TUNE_INTERVAL_HOURS)
+    return timedelta(hours=dev_constants.JUDGE_TUNE_INTERVAL_HOURS)
 
 
 @pytest.fixture
@@ -254,7 +255,7 @@ def test_r4_clear_is_a_noop_before_any_prune(store) -> None:
 
 
 @pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
-@pytest.mark.parametrize("grade", [judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT])
+@pytest.mark.parametrize("grade", [dev_constants.JUDGE_TUNE_GRADE_LORA, dev_constants.JUDGE_TUNE_GRADE_FULL_FT])
 def test_r4b_accept_week_clears_doc_having_rows_and_holds_the_2b_doc_absent_row(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -344,7 +345,7 @@ def test_r8_week_follows_the_weekly_cadence_constant(store, monkeypatch: pytest.
     rid = _seed(store, timedelta(days=5))
     assert store.count_new_haiku_decisions(now=NOW) == (1, [rid])
 
-    monkeypatch.setattr(judge_selftune, "JUDGE_TUNE_INTERVAL_HOURS", 96.0)
+    monkeypatch.setattr(dev_constants, "JUDGE_TUNE_INTERVAL_HOURS", 96.0)
 
     assert store.count_new_haiku_decisions(now=NOW) == (0, [])
     store.prune_calibration_log(now=NOW)

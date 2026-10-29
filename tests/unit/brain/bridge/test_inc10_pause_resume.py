@@ -419,7 +419,7 @@ def test_c8_forgetting_resume_cursor_survives_the_anchor_item_being_lost(
         ids.append(m.id)
     ids.sort()
     # Seed memory 1 as already "fading" with one prior low-salience pass
-    # (LOST_PASS_COUNT=2, brain/forgetting/policy.py) so THIS pass's
+    # (LOST_PASS_COUNT=2, brain/dev_constants.py) so THIS pass's
     # low score pushes it straight to LOSE (hard_delete).
     store._conn.execute("UPDATE memories SET state='fading' WHERE id=?", (ids[1],))
     store._conn.commit()

@@ -133,11 +133,7 @@ def _apply_memory_restores(persona_dir: Path, plan: RestorePlan) -> dict[str, in
             counts["restored_summary"] += 1
         for mid, original in plan.unfade.items():
             store.update(mid, content=original)
-            store._conn.execute(
-                "UPDATE memories SET state='active', content_snapshot=NULL WHERE id=?",
-                (mid,),
-            )
-            store._conn.commit()
+            store.set_active_clear_snapshot(mid)
             counts["unfaded"] += 1
     finally:
         store.close()

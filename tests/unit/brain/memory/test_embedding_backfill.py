@@ -22,9 +22,9 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.memory import embedding_backfill
 from brain.memory.embedding_backfill import (
-    DEFAULT_SCAN_CAP,
     MIN_CHARS_TO_EMBED,
     _load_cursor,
     delete_legacy_embeddings_db,
@@ -324,9 +324,20 @@ def test_scan_cap_bounds_rows_examined(tmp_path: Path) -> None:
     assert result.embedded == 5
 
 
-def test_default_scan_cap_is_reasonable() -> None:
-    """Sanity: the module constant is a genuine bound, not accidentally unlimited."""
-    assert 0 < DEFAULT_SCAN_CAP < 100_000
+def test_tick_without_scan_cap_reads_the_dev_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omitting scan_cap means `dev_constants.DEFAULT_SCAN_CAP`, read when the tick runs (so a patched value bites)."""
+    monkeypatch.setattr(dev_constants, "DEFAULT_SCAN_CAP", 5)
+    _seed(tmp_path, 50)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_tick(tmp_path, store, batch_size=100)
+    finally:
+        store.close()
+
+    assert result.scanned == 5
+    assert result.embedded == 5
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +991,32 @@ def test_drain_embeds_every_row_and_terminates_with_empty_backlog(
         assert store2.count_unembedded(current_model_id=provider.model_id(), min_chars=1) == 0
     finally:
         store2.close()
+
+
+def test_drain_without_scan_cap_reads_the_dev_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain resolves an omitted scan_cap to `dev_constants.DEFAULT_SCAN_CAP` itself: each of its ticks is bounded by
+    it, and its own stall check compares against the same figure."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setattr(dev_constants, "DEFAULT_SCAN_CAP", 3)
+
+    _seed(tmp_path, 11)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_to_completion(tmp_path, store, batch_size=100)
+    finally:
+        store.close()
+
+    assert result.embedded == 11
+    assert result.stopped_reason == "no_more_candidates"
+    # The batch size would take all 11 rows in one tick: only a scan window of 3 forces at least four ticks that embed.
+    assert result.ticks >= 4
 
 
 def test_drain_terminates_when_a_row_permanently_fails_without_looping_forever(

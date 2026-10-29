@@ -3,12 +3,9 @@
 
 Pure functions. The orchestrator (ForgettingPass.run_pass) drives these.
 
-Spec § for tunability:
-    FADE_THRESHOLD   — salience < this drives active → fading
-    LOST_THRESHOLD   — salience < this for LOST_PASS_COUNT consecutive
-                       passes drives fading → lost
-    LOST_PASS_COUNT  — two-pass safety guard against single-pass dips
-    RECENT_LIVED_HOURS — memories younger than this in lived-age are exempt
+The thresholds (FADE_THRESHOLD, LOST_THRESHOLD, LOST_PASS_COUNT, RECENT_LIVED_HOURS,
+FADE_IMPORTANCE_GAIN) live in `brain.dev_constants`, with what each one means; this
+module reads them as `dev_constants.NAME` at call time.
 """
 
 from __future__ import annotations
@@ -17,22 +14,10 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from brain import dev_constants
 from brain.memory.store import Memory
 
-FADE_THRESHOLD = 0.25
-LOST_THRESHOLD = 0.10
-LOST_PASS_COUNT = 2
-RECENT_LIVED_HOURS = 720.0  # 30 days. NOTE: compared against WALL-CLOCK age (see is_exempt), not lived-age — the name is historical. Recent memories stay fully active+verbatim for a month.
 IMPORT_GRACE_LIVED_HOURS = 168.0  # 7 lived-days — settling window for migrated memories
-
-# P3 retention rework, Change 2: importance lowers the EFFECTIVE fade gate
-# (never LOST_THRESHOLD/LOST_PASS_COUNT — those stay the final deletion gate,
-# per the cd808dbc invariant: a lever only delays fading, it does not lower
-# the deletion floor). r = clamp(memory.importance / 10, 0, 1); a no-op at
-# r=0 (importance 0 → today's behavior, byte-identical). Tuned against the
-# C2 simulation so importance-10 survives >= 2 lived-years while importance-0
-# is untouched and the response is monotonic + never-accelerating.
-FADE_IMPORTANCE_GAIN = 2.0
 
 
 class Transition(StrEnum):
@@ -71,7 +56,7 @@ def next_state(
     # reusing the same divisor idiom. narrative_weight=0 and memory.importance=0
     # → baseline (unchanged); either pressure source lowers the gate further.
     r = min(1.0, max(0.0, memory.importance / 10.0))
-    effective_fade = FADE_THRESHOLD / (1.0 + narrative_weight + FADE_IMPORTANCE_GAIN * r)
+    effective_fade = dev_constants.FADE_THRESHOLD / (1.0 + narrative_weight + dev_constants.FADE_IMPORTANCE_GAIN * r)
     if memory.state == "active":
         if salience < effective_fade:
             return Transition.FADE
@@ -79,7 +64,7 @@ def next_state(
     if memory.state == "fading":
         if salience >= effective_fade:
             return Transition.UNFADE
-        if salience < LOST_THRESHOLD and consecutive_low_passes >= LOST_PASS_COUNT:
+        if salience < dev_constants.LOST_THRESHOLD and consecutive_low_passes >= dev_constants.LOST_PASS_COUNT:
             return Transition.LOSE
         return Transition.NONE
     # state == "lost" is impossible — lost memories have rows deleted.
@@ -140,4 +125,4 @@ def is_exempt(
     # Recent-buffer grace is wall-clock: a memory created within
     # RECENT_LIVED_HOURS hours of now is exempt regardless of lived-rate.
     wall_age_hours = wall_age_s / 3600.0
-    return wall_age_hours <= RECENT_LIVED_HOURS
+    return wall_age_hours <= dev_constants.RECENT_LIVED_HOURS

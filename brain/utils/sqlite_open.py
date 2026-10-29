@@ -39,14 +39,14 @@ logger = logging.getLogger(__name__)
 class OpenProfile:
     """What differs between stores: the busy timeout and the WAL-failure policy."""
 
-    busy_timeout_s: float = dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S
+    busy_timeout_s: float
     # True: a failing `PRAGMA journal_mode = WAL` is ignored (in-memory databases
     # reject WAL). False: the failure propagates.
     wal_fallback: bool = True
 
 
-DEFAULT_PROFILE = OpenProfile()
-STRICT_WAL_PROFILE = OpenProfile(wal_fallback=False)
+DEFAULT_PROFILE = OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S)
+STRICT_WAL_PROFILE = OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, wal_fallback=False)
 
 
 @contextmanager

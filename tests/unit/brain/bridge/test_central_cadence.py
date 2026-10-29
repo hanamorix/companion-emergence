@@ -25,13 +25,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge import central_cadence, cli_throttle, persisted_cadence, supervisor
 from brain.bridge.central_cadence import GATED_JOB_ORDER, GatedJob, JobOutcome
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.chat import pass2_queue
 from brain.engines import interest_sweep
-from brain.memory.judge_selftune import JUDGE_TUNE_CADENCE_FILE
 from brain.self_model import cadence as sm_cadence
 from tests.thread_support import finish_threads
 
@@ -44,11 +44,18 @@ INTERVAL_JOBS: dict[str, tuple[str, float]] = {
     "compaction": ("compaction_cadence.json", 86400.0),
     "clustering": ("clustering_cadence.json", 6 * 3600.0),
     "daily_calibration": ("calibration_cadence.json", 86400.0),
-    "weekly_selftune": (JUDGE_TUNE_CADENCE_FILE, 7 * 86400.0),
+    "weekly_selftune": (dev_constants.JUDGE_TUNE_CADENCE_FILE, 7 * 86400.0),
     "finalize": ("finalize_cadence.json", 3600.0),
     "initiate_review": ("initiate_review_cadence.json", 900.0),
 }
-NO_INTERVAL_JOBS = ("pass2", "session_snapshot_prune", "emotion_backfill", "embedding_backfill", "extraction_backfill")
+NO_INTERVAL_JOBS = (
+    "pass2",
+    "session_snapshot_prune",
+    "emotion_backfill",
+    "research_recovery",
+    "embedding_backfill",
+    "extraction_backfill",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +191,10 @@ def stubs(monkeypatch):
         rec("emotion_backfill", SimpleNamespace(status="complete")),
     )
     monkeypatch.setattr(
+        supervisor.research_recovery, "has_recovery_work", lambda _pd: work["research_recovery"]
+    )
+    monkeypatch.setattr(supervisor.research_recovery, "run_recovery", rec("research_recovery"))
+    monkeypatch.setattr(
         supervisor, "_embedding_backfill_has_work_probe", lambda _s: work["embedding_backfill"]
     )
     monkeypatch.setattr(
@@ -282,10 +293,11 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_21_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_22_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    assert len(names) == 21  # #523: the extraction backfill joined after the recall diagnostics flush
+    # #523: the extraction backfill joined after the recall diagnostics flush; #591: the research recovery after the emotion backfill
+    assert len(names) == 22
     # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
     # name-recall fix S100: the stuck-width re-measure follows them, and S164's
     # cost-series flush follows that (the re-measure's own sample is saved the
@@ -349,7 +361,7 @@ def test_c15a_all_17_due_run_in_s55_order_real_table(tmp_path, stubs):
 
 
 # The loop asks is-chat-idle in one place before every job (no per-job branch), so the first and second job, one in
-# the middle and the last stand for all 21; the real-table test below pins the calibration boundary.
+# the middle and the last stand for all 22; the real-table test below pins the calibration boundary.
 @pytest.mark.parametrize("j", [0, 1, len(GATED_JOB_ORDER) // 2, len(GATED_JOB_ORDER) - 1])
 def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     log: list[str] = []
@@ -392,6 +404,24 @@ def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tm
     assert given["provider"] is provider
 
 
+def test_the_research_recovery_job_is_due_while_it_has_work_and_runs_one_pass_on_the_tick_store(tmp_path, monkeypatch):
+    """#591: the job is wired to the recovery module's own predicate and pass, with the per-tick store, and needs no user step."""
+    persona_dir = _persona(tmp_path)
+    due = {"work": True}
+    ran: list[tuple] = []
+    monkeypatch.setattr(supervisor.research_recovery, "has_recovery_work", lambda pd: due["work"] and pd == persona_dir)
+    monkeypatch.setattr(
+        supervisor.research_recovery, "run_recovery", lambda pd, store, **_k: ran.append((pd, type(store).__name__))
+    )
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "research_recovery")
+    assert job.cadence_file is None and job.has_work is not None
+    assert job.has_work() is True
+    due["work"] = False
+    assert job.has_work() is False
+    assert job.run() is JobOutcome.COMPLETED
+    assert ran == [(persona_dir, "MemoryStore")]
+
+
 def test_c15a_idle_flip_real_table_stops_before_calibration(tmp_path, stubs):
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
@@ -431,7 +461,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 21 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all 22 due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -543,7 +573,7 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 21
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 22
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)

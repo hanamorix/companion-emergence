@@ -9,8 +9,8 @@ long as the constraints hold:
 """
 from datetime import UTC, datetime, timedelta
 
+from brain import dev_constants
 from brain.felt_time.state import FeltTimeState
-from brain.forgetting.policy import FADE_THRESHOLD
 from brain.forgetting.salience import DEFAULT_WEIGHTS, _emotion_input, _peak_input
 from brain.memory.store import Memory, MemoryStore
 
@@ -36,16 +36,15 @@ def _emotion_term(mem: Memory) -> float:
 
 
 def test_peak5_above_fade_at_45_days():
-    assert _emotion_term(_mem(peak=5.0, days_old=45)) >= FADE_THRESHOLD
+    assert _emotion_term(_mem(peak=5.0, days_old=45)) >= dev_constants.FADE_THRESHOLD
 
 
 def test_peak1_below_fade_by_14_days():
-    assert _emotion_term(_mem(peak=1.0, days_old=14)) < FADE_THRESHOLD
+    assert _emotion_term(_mem(peak=1.0, days_old=14)) < dev_constants.FADE_THRESHOLD
 
 
 def test_peak5_reaches_lose_within_six_months():
-    from brain.forgetting.policy import LOST_THRESHOLD
-    assert _emotion_term(_mem(peak=5.0, days_old=180)) < LOST_THRESHOLD
+    assert _emotion_term(_mem(peak=5.0, days_old=180)) < dev_constants.LOST_THRESHOLD
 
 
 def test_blend_takes_living_feeling_when_hotter():

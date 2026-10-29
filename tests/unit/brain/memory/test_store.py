@@ -1142,6 +1142,68 @@ def test_unfade_restores_content_and_clears_snapshot() -> None:
     store.close()
 
 
+def test_set_active_clear_snapshot_touches_only_that_row_and_is_committed(tmp_path) -> None:
+    """Recovery's step after it writes the source's content back: state back to
+    active, snapshot cleared, nothing else changed, visible to another connection."""
+    db = tmp_path / "memories.db"
+    store = MemoryStore(db)
+    a = Memory.create_new(content="a original", memory_type="episodic", domain="chat", emotions={})
+    b = Memory.create_new(content="b original", memory_type="episodic", domain="chat", emotions={})
+    store.create(a)
+    store.create(b)
+    store.fade(a.id, summary="a short")
+    store.fade(b.id, summary="b short")
+
+    store.set_active_clear_snapshot(a.id)
+
+    other = sqlite3.connect(str(db))
+    other.row_factory = sqlite3.Row
+    try:
+        rows = {
+            r["id"]: r
+            for r in other.execute("SELECT id, content, content_snapshot, state FROM memories")
+        }
+    finally:
+        other.close()
+    assert rows[a.id]["state"] == "active"
+    assert rows[a.id]["content_snapshot"] is None
+    assert rows[a.id]["content"] == "a short", "only state and snapshot change"
+    assert rows[b.id]["state"] == "fading"
+    assert rows[b.id]["content_snapshot"] == "b original"
+    store.close()
+
+
+def test_connect_for_fts_health_applies_the_memories_busy_timeout_read_at_call_time(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "MEMORIES_DB_BUSY_TIMEOUT_S", 0.7)
+    conn = MemoryStore.connect_for_fts_health(tmp_path / "memories.db")
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 700
+    finally:
+        conn.close()
+
+
+def test_connect_for_fts_health_closes_the_connection_once_when_the_pragma_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+
+    class _Doomed:
+        def execute(self, sql: str):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        def close(self) -> None:
+            closed.append(1)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: _Doomed())
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        MemoryStore.connect_for_fts_health(tmp_path / "memories.db")
+    assert closed == [1]
+
+
 def test_hard_delete_drops_the_row() -> None:
     store = MemoryStore(":memory:")
     m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})

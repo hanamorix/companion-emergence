@@ -2,7 +2,8 @@
 
 One tunables line per Claude job decides its model; ``model_for_tier`` reads it on every call. The behaviours that need
 a spawned ``claude`` (argv per job, live edits, fallback after a rejection) are in test_model_tier_resolution.py; the
-guard that nothing outside this module chooses a model is in test_model_guard.py.
+guard that nothing outside this module chooses a model is the model case of the shared-settings guard
+(tests/unit/test_shared_settings_guard.py).
 """
 
 from __future__ import annotations
@@ -161,7 +162,8 @@ def _source_files():
 _TESTS_NAMING_REMOVED_NAMES = (
     "tests/unit/brain/bridge/test_model_tier.py",
     "tests/unit/brain/bridge/test_model_tier_resolution.py",
-    "tests/unit/brain/bridge/test_model_guard.py",
+    "tests/shared_settings.py",
+    "tests/unit/test_shared_settings_guard.py",
 )
 # In tests, `model_override` is the live conftest fixture's name; only the removed KEYWORD form is a leftover.
 _REMOVED_KWARG = re.compile(r"(?<![\w])model_override\s*=(?!=)")
