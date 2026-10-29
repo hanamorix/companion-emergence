@@ -67,7 +67,7 @@ def test_peer_modules_reference_no_tool_path():
 _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.gate",       # gate protocol types only — no tool surface
     "brain.kindled_link.peer_prompt",  # peer prompt builder — no tool surface
-    "brain.kindled_link.limits",     # shared caps and budget constants — no tool surface
+    "brain.dev_constants",           # shared caps and budget constants — no tool surface; imports only __future__, so it adds nothing to the peer modules' reachable set
     "brain.kindled_link.privacy_gate",  # privacy reflection gate — no tool surface
     "brain.kindled_link.store",      # persistence layer — no tool surface (session_engine imports)
     "brain.kindled_link.relationship",  # relationship state + maturation — no tool surface (session_engine imports)

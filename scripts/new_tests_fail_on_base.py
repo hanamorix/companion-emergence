@@ -278,12 +278,31 @@ def _swap_product_code(head_tree: Path, base: str) -> list[str]:
     return swapped
 
 
-def _read_outcomes(path: Path) -> dict[str, list[tuple[str, str]]]:
+def canonical_id(recorded: str, known: set[str]) -> str:
+    """The collected id a recorded report id stands for.
+
+    With ``--dist loadgroup`` pytest-xdist renames every test that carries ``@pytest.mark.xdist_group`` to
+    ``<id>@<group names joined by "_">`` (``xdist/remote.py``, ``pytest_collection_modifyitems``), and every report of
+    the run then carries that suffixed id. The suffix is cut at the last ``@`` that leaves a known collected id. An id
+    that matches no known id is returned as recorded.
+    """
+    node = recorded
+    while node not in known:
+        stem, sep, _ = node.rpartition("@")
+        if not sep:
+            return recorded
+        node = stem
+    return node
+
+
+def _read_outcomes(path: Path, known_ids: Iterable[str] = ()) -> dict[str, list[tuple[str, str]]]:
+    """Reports per test id; ids renamed by an xdist group are read back under their collected id (``known_ids``)."""
+    known = set(known_ids)
     out: dict[str, list[tuple[str, str]]] = {}
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             rec = json.loads(line)
-            out.setdefault(rec["id"], []).append((rec["when"], rec["outcome"]))
+            out.setdefault(canonical_id(rec["id"], known), []).append((rec["when"], rec["outcome"]))
     return out
 
 
@@ -381,7 +400,7 @@ def _judge_pr(py, repo, base, head, workers, expr, files, renamed, entries, scra
         print(f"base run: {tail}")
         if res.returncode not in (0, 1):
             raise CheckError(f"the base run exited {res.returncode}:\n{(res.stdout + res.stderr)[-1500:]}")
-        outcomes = _read_outcomes(Path(env_extra["NTFOB_OUTCOME_FILE"]))
+        outcomes = _read_outcomes(Path(env_extra["NTFOB_OUTCOME_FILE"]), runnable)
         if not outcomes:
             raise CheckError("the base run recorded no test report at all")
 

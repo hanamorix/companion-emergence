@@ -54,6 +54,8 @@ _FLOOR_REF = "0c4e7b23 fold pre-flip revision F2a fixes into #274"
 _ST_REF = "108bb6c5 fix(recall): per-message rerank width, always-merged keyword search, known-names list (#321)"
 _TIER_REF = "44af2447 Choose each job's model with one line in the user tunables file"
 _IDLE_REF = "1f69f189 feat(ram-spike-fix): one shared chat-idle lull + is_chat_idle gate for every background caller (INC-6)"
+_DEVCONST_REF = "#531 shared-settings guard, the constants move into brain/dev_constants.py (draft PR #553)"
+_GUARD_REF = "#531 shared-settings guard (draft PR #553)"
 _JSON_REF = "b826f01b refactor(brain): one shared JSON reader/writer for every JSON file read and write (#439)"
 
 # Every public writer and helper of brain/utils/atomic_write.py except save_with_backup_text (attempt_heal imports that).
@@ -467,11 +469,71 @@ REMOVED: tuple[Removed, ...] = (
         why="no module reaches a moved writer through attempt_heal: no import of one, no dotted name, no star import, no alias of the module (#465, G20b)",
         ref=_ATOMIC_REF,
     ),
+    # --- shared constants moved to brain/dev_constants.py (#531) ----------------------------------------------------------
+    # Only names that CHANGED are listed. A constant that kept its name (FADE_THRESHOLD, MAX_ARC_MEMBERS, ...) is the same
+    # identifier in its new home, so a name scan cannot tell the old definition from the new read.
+    Removed(
+        names=("brain/kindled_link/limits.py",),
+        why="the peer-link caps and disclosure-budget constants live in brain/dev_constants.py under a KINDLED_LINK_ prefix; the constants-only module is gone, no shim",
+        ref=_DEVCONST_REF,
+        kind="file",
+    ),
+    Removed(
+        names=(
+            "MIN_OUTBOUND_GAP_SECONDS", "SESSION_MSG_CAP", "SESSION_COOLDOWN_HOURS", "DAILY_OUTBOUND_CAP", "DAILY_PROVIDER_CAP",
+            "BUDGET_MAX", "BUDGET_REFILL_PER_DAY", "BUDGET_TIGHTEN_THRESHOLD", "MIN_SEND_DEBIT", "BUDGET_DEPLETED_THRESHOLD",
+            "PEER_EMOTION_WINDOW_CAP", "PEER_EMOTION_WINDOW_HOURS", "INBOUND_FLOOD_CAP",
+            "_MIN_OUTBOUND_GAP_SECONDS", "_SESSION_MSG_CAP", "_SESSION_COOLDOWN_HOURS", "_DAILY_OUTBOUND_CAP", "_DAILY_PROVIDER_CAP",
+        ),
+        why="the peer-link constants are read as dev_constants.KINDLED_LINK_*; no local alias of a constant (#531)",
+        ref=_DEVCONST_REF,
+        kind="code",
+        scope=("brain/kindled_link",),
+    ),
+    Removed(
+        names=("SCHEMA_VERSION", "MATURITY_FORMING_MIN", "MATURITY_KNOWN_MIN", "MATURITY_FALSIFIED_MAX", "ADDRESS_COOLDOWN_HOURS", "DAILY_BUDGET_DEFAULT"),
+        why="the attunement constants live in brain/dev_constants.py under an ATTUNEMENT_ prefix (#531)",
+        ref=_DEVCONST_REF,
+        kind="code",
+        scope=("brain/attunement",),
+    ),
+    Removed(
+        names=("TUNE_GRADE_KNOB_REFIT", "TUNE_GRADE_LORA", "TUNE_GRADE_FULL_FT", "_TUNE_GRADE_ORDER"),
+        why="the judge self-tune grades and their order live in brain/dev_constants.py as JUDGE_TUNE_GRADE_* (#531)",
+        ref=_DEVCONST_REF,
+        kind="code",
+        scope=("brain/memory", "brain/bridge"),
+    ),
+    Removed(
+        names=("tests/unit/brain/bridge/test_model_guard.py",),
+        why="the model guard is the model case of the shared-settings guard (tests/shared_settings.py and tests/unit/test_shared_settings_guard.py); one guard, not two",
+        ref=_GUARD_REF,
+        kind="file",
+    ),
+    Removed(
+        names=("JUDGE_TUNE_GATE_HANDFUL_DECISIONS",),
+        why="a second name for dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS in judge_selftune.py; readers use the dev constant",
+        ref=_GUARD_REF,
+        scope=("brain",),
+    ),
+    Removed(
+        names=("offline_load_scope", "_hf_telemetry_lock", "_hf_telemetry_depth", "_hf_telemetry_before"),
+        why="huggingface_hub's telemetry opt-out is one process-wide default set in brain/__init__.py, not a scoped flip of the library's flag around each offline load (#554)",
+        ref="#554 (PR #561): the first commits of that PR added a scoped flip of the flag around each offline load, replaced by the process-wide default before merge",
+        kind="code",
+    ),
     # --- the archive-with-dedup write moved to the conversation buffer (#556) -------------------------------------------
     Removed(
         names=("_archive_once", "_archive_batch_key", "_turn_identity"),
         why="the dedup archive write and the turn identity moved to brain/ingest/buffer.py (archive_once, turn_identity) so the rollover archives through the same path as compaction and compaction keeps no private copy of it",
         ref="#556 rollover keeps every recent turn (the pull request that moved them)",
+        kind="code",
+        scope=("brain/chat",),
+    ),
+    Removed(
+        names=("_summary_gen",),
+        why="the summary generation reader is public as summary_gen in brain/chat/compaction.py because the rollover reads it too; no private name and no alias",
+        ref="#556 review follow-up (the pull request that made it public)",
         kind="code",
         scope=("brain/chat",),
     ),

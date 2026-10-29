@@ -84,9 +84,8 @@ JUDGE_EVAL_ALPHA_DEFAULT: float = tunables.register(
 # Held-out test-set size floor (spec §4 "DEGENERATE FLOOR"): below this,
 # there is too little data to evaluate the challenger at all, so the
 # orchestration REVERTS unconditionally rather than deploying on thin data.
-# A build-time judgment call (same posture as `judge_selftune.
-# JUDGE_TUNE_GATE_HANDFUL_DECISIONS`'s own docstring: not hardware-derived,
-# so a dry-run doesn't set it either) — 30 is the conventional rule-of-thumb
+# A build-time judgment call (not hardware-derived, so a dry-run doesn't set
+# it either) — 30 is the conventional rule-of-thumb
 # floor for a binomial-family test to have any meaningful power at all.
 JUDGE_EVAL_MIN_TEST_N_DEFAULT: int = tunables.register(
     "judge_selftune.eval_min_test_n", 30,

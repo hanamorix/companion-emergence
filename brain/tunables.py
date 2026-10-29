@@ -133,6 +133,42 @@ def get_tunable(key: str, default: Any) -> Any:
     return value
 
 
+def positive_or_default(key: str, value: Any, default: Any, largest: float | None = None) -> Any:
+    """Return *value* (what ``get_tunable`` returned for *key*) when it is an int or a float that is finite and above 0, else *default*.
+
+    For a setting that is a duration or a size cap: ``get_tunable`` checks the type only, so a hand-edited ``0``, a
+    negative number, ``nan`` or ``inf`` reaches the code (a loop that never waits, an upload cap that refuses everything).
+    *largest*, when a reader has one, is the biggest value it can use (inclusive, for example the longest wait the platform
+    allows); a value above it is rejected the same way, not clamped. Without it any finite number above 0 is kept, so a reader
+    whose consumer has a limit passes it. A rejected value (a bool or a non-number too, for a direct caller) is logged once
+    per key and value, naming both and the limit.
+    *default* is the setting's registered default, which the caller passes the same way it passes it to ``get_tunable``.
+    Only the readers that need it call this; ``register`` takes no bounds.
+    """
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+        and (not isinstance(value, float) or math.isfinite(value))
+        and (largest is None or value <= largest)
+    ):
+        return value
+    try:
+        shown = repr(value)
+    except Exception:  # an object whose repr raises, or an int too long to print: reading a setting never raises
+        shown = f"<{type(value).__name__}>"
+    seen = f"{key}={shown}:not-positive-finite"
+    with _lock:
+        first = seen not in _warned_keys
+        _warned_keys.add(seen)
+    if first:
+        logger.warning(
+            "tunables: value %r=%s is not a finite number above 0%s; using the default %r",
+            key, shown, "" if largest is None else f" and at most {largest!r}", default,
+        )
+    return default
+
+
 def get_raw(key: str) -> Any:
     """The raw value for *key* exactly as the file holds it (any type), or None when the file has none.
 
@@ -228,7 +264,7 @@ def file_mtime() -> float | None:
 
 
 def _reset_values_cache() -> None:
-    """Forget the cached values (and the warn-once flags) but keep the registry."""
+    """Forget the cached values and the per-file-change log flags but keep the registry and ``_warned_keys`` (only ``_reset_for_tests`` clears those)."""
     global _values_cache, _cache_sig, _io_noted_sig, _logged_sig
     with _lock:
         _values_cache, _cache_sig, _io_noted_sig, _logged_sig = {}, None, None, None

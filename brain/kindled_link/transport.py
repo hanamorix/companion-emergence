@@ -12,9 +12,9 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from brain import dev_constants
 from brain.kindled_link.audit import log_transport
 from brain.kindled_link.identity import KindledIdentity
-from brain.kindled_link.limits import INBOUND_FLOOD_CAP
 from brain.kindled_link.protocol import (
     build_envelope,
     parse_key_rotation_notice,
@@ -224,8 +224,8 @@ def poll_and_ingest(
                 now=now,
             )
             continue
-        if len(items) > INBOUND_FLOOD_CAP:
-            excess = len(items) - INBOUND_FLOOD_CAP
+        if len(items) > dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP:
+            excess = len(items) - dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP
             log_transport(
                 persona_dir,
                 event="flood_clamped",
@@ -234,8 +234,8 @@ def poll_and_ingest(
                 now=now,
             )
             degraded.add(sender_id)
-            # Process only the first INBOUND_FLOOD_CAP; leave the rest un-acked.
-            items = items[:INBOUND_FLOOD_CAP]
+            # Process only the first dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP; leave the rest un-acked.
+            items = items[:dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP]
 
         # Within a peer-group, handle session_open (handshake) envelopes before
         # message envelopes (stable — arrival order preserved within each class).

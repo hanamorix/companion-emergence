@@ -5,7 +5,7 @@ reflection. No peer-derived content may flip a hold/revise into a send (parent
 §5). Fails closed to hold on any uncertainty.
 
 Tool-path isolation (carried from Phase 3): this module imports ONLY stdlib +
-{gate, limits, cli_throttle}. The conformance oracle enforces it by AST."""
+{gate, dev_constants, cli_throttle}. The conformance oracle checks its `from brain.X import Y` imports by AST."""
 from __future__ import annotations
 
 import json
@@ -14,9 +14,9 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from brain import dev_constants
 from brain.bridge import cli_throttle as _default_throttle
 from brain.health.parse_failures import record_parse_failure
-from brain.kindled_link import limits
 from brain.kindled_link.gate import GateDecision, OutboundPayload
 
 log = logging.getLogger(__name__)
@@ -172,13 +172,13 @@ def _apply_budget(decision: GateDecision, *, budget: float) -> GateDecision:
         # m10: a fully depleted budget hard-stops to hold (more restrictive than
         # the tighten band). Checked FIRST — DEPLETED (0.02) < TIGHTEN (0.25), so a
         # sub-floor budget also satisfies the tighten test; the hold must win.
-        if budget < limits.BUDGET_DEPLETED_THRESHOLD:
+        if budget < dev_constants.KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD:
             return GateDecision(
                 action="hold",
                 reason="budget: disclosure budget depleted; holding",
                 texture_score=decision.texture_score,
             )
-        if budget < limits.BUDGET_TIGHTEN_THRESHOLD:
+        if budget < dev_constants.KINDLED_LINK_BUDGET_TIGHTEN_THRESHOLD:
             return GateDecision(
                 action="revise",
                 reason="budget: disclosure budget low; reduce user-referencing texture",
@@ -223,7 +223,7 @@ class PrivacyGate:
         # gate/reflection call for the same peer); refund below if the LLM call
         # never completes, so only completed calls net-count (defer ≠ failure).
         if not self._store.try_reserve_provider(
-            peer_id, today, cap=limits.DAILY_PROVIDER_CAP
+            peer_id, today, cap=dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP
         ):
             return GateDecision(action="hold", reason="gate: provider cap spent")
         # Slot reserved — from here, EVERY non-completing exit must release it.
@@ -237,7 +237,7 @@ class PrivacyGate:
                 relationship_hint_json=json.dumps(payload.relationship_hint or {},
                                                   sort_keys=True),
                 transcript_summary=transcript_summary, reason=reason, stage=stage,
-                budget_ok=budget >= limits.BUDGET_TIGHTEN_THRESHOLD,
+                budget_ok=budget >= dev_constants.KINDLED_LINK_BUDGET_TIGHTEN_THRESHOLD,
             )
             with self._throttle.background_slot() as granted:
                 if not granted:

@@ -160,11 +160,11 @@ def _git(cwd: Path, *args: str) -> str:
     return done.stdout.strip()
 
 
-def _run_script(repo: Path, base: str, tmp_path: Path) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_script(repo: Path, base: str, tmp_path: Path, workers: str = "1") -> tuple[subprocess.CompletedProcess, Path]:
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     done = subprocess.run(
-        [sys.executable, str(REPO / "scripts" / "new_tests_fail_on_base.py"), "--base", base, "--repo", str(repo), "--workers", "1"],
+        [sys.executable, str(REPO / "scripts" / "new_tests_fail_on_base.py"), "--base", base, "--repo", str(repo), "--workers", workers],
         cwd=tmp_path,
         env={**os.environ, "TMPDIR": str(scratch), "TEMP": str(scratch), "TMP": str(scratch), "PYTEST_ADDOPTS": "-qq"},  # must not be inherited
         capture_output=True,
@@ -230,6 +230,63 @@ def test_the_script_refuses_to_pass_when_collection_itself_fails(tmp_path: Path)
     assert "CHECK COULD NOT JUDGE THIS PR" in done.stdout
     assert "nothing to check" not in done.stdout
     assert list(scratch.iterdir()) == []
+
+
+_GROUPED_TESTS = textwrap.dedent(
+    """
+    import brain
+    import pytest
+
+
+    @pytest.mark.xdist_group("shared-resource")
+    def test_grouped_always_passes():
+        assert True
+
+
+    @pytest.mark.xdist_group("shared-resource")
+    @pytest.mark.parametrize("n", [1, 2], ids=["one", "two"])
+    def test_grouped_new_function_works(n):
+        assert brain.new() == n
+
+
+    def test_ungrouped_new_function_works():
+        assert brain.new() == 2
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the check runs on the ubuntu PR job; it uses git worktrees and POSIX paths")
+def test_a_test_in_an_xdist_group_is_judged_by_its_own_id_when_the_base_run_is_parallel(tmp_path: Path) -> None:
+    """`--dist loadgroup` renames a grouped test to ``<id>@<group>`` in the reports; that must not read as "did not run"."""
+    repo, base = _base_repo(tmp_path)
+    (repo / "brain" / "__init__.py").write_text("def old():\n    return 1\n\n\ndef new():\n    return 2\n", encoding="utf-8")
+    (repo / "tests" / "unit" / "test_grouped.py").write_text(_GROUPED_TESTS, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "head")
+
+    done, _ = _run_script(repo, base, tmp_path, workers="2")
+    out = done.stdout
+    assert done.returncode == 1, out + done.stderr
+    assert "did not run" not in out, out
+    assert "checked 4: 3 bite, 1 do not, 0 exempt" in out, out
+    assert "tests/unit/test_grouped.py::test_grouped_always_passes: passes against the base code" in out
+    assert "test_grouped_new_function_works" not in out.split("do NOT fail")[-1]
+
+
+def test_reports_recorded_under_an_xdist_group_suffix_are_read_back_under_the_collected_id(tmp_path: Path) -> None:
+    path = tmp_path / "outcomes.jsonl"
+    lines = [
+        '{"id": "t.py::a[x]@torch-training", "when": "call", "outcome": "failed"}',
+        '{"id": "t.py::b", "when": "call", "outcome": "passed"}',
+        '{"id": "t.py::c@odd@names_and_more", "when": "setup", "outcome": "failed"}',
+        '{"id": "t.py::unknown@g", "when": "call", "outcome": "passed"}',
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    got = ntf._read_outcomes(path, {"t.py::a[x]", "t.py::b", "t.py::c@odd"})
+    assert got["t.py::a[x]"] == [("call", "failed")]
+    assert got["t.py::b"] == [("call", "passed")]
+    assert got["t.py::c@odd"] == [("setup", "failed")]
+    assert "t.py::unknown@g" in got, "an id that matches no collected id is kept as recorded, never dropped"
 
 
 def test_the_collected_count_is_read_from_pytests_last_line() -> None:

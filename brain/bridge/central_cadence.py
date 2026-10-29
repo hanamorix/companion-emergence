@@ -9,7 +9,8 @@ background job whether it runs now. A gated job runs only when BOTH:
 * the job is due: an interval job's persisted ``next_at`` has passed
   (S23/S34), or a no-interval job has work (pass 2, session snapshot/prune,
   emotion backfill, embedding backfill: S53/S66; the extraction backfill,
-  #523: an armed plan with an open target), or a predicate job's own
+  #523: an armed plan with an open target; the research recovery, #591: lost
+  research memories still to be recovered), or a predicate job's own
   condition holds (deploy recalibration: the stored floor is stale, S70/S73;
   self-model articulation: its own cadence module, S29).
 
@@ -77,11 +78,13 @@ logger = logging.getLogger(__name__)
 # the re-measure and the RAM figure so their samples are saved the same lull), then the recall
 # diagnostics flush (S189: records buffered while the log's lock was held), then the extraction
 # backfill (#523: one chunk per pass, after embedding backfill so the vectors its dedup reads are
-# current). Names are the job table's keys and the log's `job=` values.
+# current). The research recovery (#591: one interest's lost research memories per pass) runs right after the emotion
+# backfill. Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
     "pass2",
     "session_snapshot_prune",
     "emotion_backfill",
+    "research_recovery",
     "embedding_backfill",
     "cosine_floor_bootstrap",
     "rerank_floor_bootstrap",

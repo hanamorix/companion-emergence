@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from brain.kindled_link import limits
+from brain import dev_constants
 from brain.kindled_link.gate import GateDecision, OutboundPayload
 from brain.kindled_link.privacy_gate import PrivacyGate, _apply_budget
 from brain.kindled_link.store import KindledLinkStore
@@ -14,7 +14,7 @@ from brain.kindled_link.store import KindledLinkStore
 def test_m10_apply_budget_holds_when_depleted():
     # C-m10-1: below the depletion floor, a model 'send' becomes hold (not revise).
     d = GateDecision(action="send", texture_score=0.3)
-    out = _apply_budget(d, budget=limits.BUDGET_DEPLETED_THRESHOLD - 0.001)
+    out = _apply_budget(d, budget=dev_constants.KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD - 0.001)
     assert out.action == "hold"
 
 
@@ -34,7 +34,7 @@ def test_m10_apply_budget_sends_when_ample():
 def test_m10_floor_is_exclusive_below():
     # C-m10-5: exactly at the floor you can still afford the min debit -> revise.
     d = GateDecision(action="send", texture_score=0.3)
-    out = _apply_budget(d, budget=limits.BUDGET_DEPLETED_THRESHOLD)
+    out = _apply_budget(d, budget=dev_constants.KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD)
     assert out.action == "revise"
 
 

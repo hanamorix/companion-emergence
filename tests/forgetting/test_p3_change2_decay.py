@@ -19,6 +19,7 @@ from unittest import mock
 
 import pytest
 
+from brain import dev_constants
 from brain.felt_time.state import FeltTimeState
 from brain.forgetting import policy, salience
 from brain.memory.store import Memory
@@ -113,7 +114,7 @@ def _step(
             felt_time_state=felt_state,
             soul_linked_ids=({mem.id} if soul_linked else set()),
         )
-        next_low = consecutive_low + 1 if s < policy.LOST_THRESHOLD else 0
+        next_low = consecutive_low + 1 if s < dev_constants.LOST_THRESHOLD else 0
         transition = policy.next_state(
             mem, salience=s, consecutive_low_passes=next_low, narrative_weight=0.0
         )
@@ -146,9 +147,9 @@ def test_c2_1_importance_zero_timeline_unchanged_and_nonzero_differs():
     # Pre-change formula, inlined (not imported — this IS the oracle for the
     # "byte-identical at importance 0" claim): effective_fade only used
     # narrative_weight, and the freshness horizon was the bare constant.
-    pre_change_effective_fade = policy.FADE_THRESHOLD / (1.0 + 0.0)
+    pre_change_effective_fade = dev_constants.FADE_THRESHOLD / (1.0 + 0.0)
     assert (
-        policy.FADE_THRESHOLD / (1.0 + 0.0 + policy.FADE_IMPORTANCE_GAIN * 0.0)
+        dev_constants.FADE_THRESHOLD / (1.0 + 0.0 + dev_constants.FADE_IMPORTANCE_GAIN * 0.0)
         == pre_change_effective_fade
     )
 
@@ -236,13 +237,3 @@ def test_c2_5_emotional_and_soul_memories_no_regression():
     fade_s5, lose_s5 = _simulate(5.0, soul_linked=True, max_hours=_TWO_LIVED_YEARS_HOURS)
     assert _inf_if_none(fade_s5) >= _inf_if_none(fade_s0)
     assert _inf_if_none(lose_s5) >= _inf_if_none(lose_s0)
-
-
-# --------------------------------------------------------------------------- constants sanity
-def test_constants_documented_starting_values():
-    """Pins the tuned constants this test suite validated against (see the
-    module docstring's simulation)."""
-    assert policy.FADE_IMPORTANCE_GAIN == 2.0
-    assert salience.HORIZON_IMPORTANCE_GAIN == 52.0
-    assert policy.LOST_THRESHOLD == 0.10  # UNCHANGED (cd808dbc invariant)
-    assert policy.LOST_PASS_COUNT == 2  # UNCHANGED

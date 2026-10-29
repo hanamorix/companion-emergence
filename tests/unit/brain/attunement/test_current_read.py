@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from brain.attunement.schemas import SCHEMA_VERSION, CurrentRead
+from brain import dev_constants
+from brain.attunement.schemas import CurrentRead
 from brain.attunement.store import read_current_read, write_current_read
 
 
@@ -18,7 +19,7 @@ def _make_read(ts: str = "2026-05-31T12:00:00Z") -> CurrentRead:
         mood_valence=0.4,
         mood_intensity=0.5,
         predicted_arc_shape="settling in",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
 
 

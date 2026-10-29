@@ -26,6 +26,7 @@ from typing import Any
 
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider, ProviderError
+from brain.emotion.vocabulary import pool_by_canonical_name
 from brain.engines.reflex import ArcFire, ReflexArc
 from brain.growth.arc_storage import read_removed_arcs
 from brain.growth.log import read_growth_log
@@ -408,7 +409,7 @@ def crystallize_reflex(
     # Validate emergences
     accepted_emergences: list[ReflexArcProposal] = []
     current_arc_names = {a.name for a in current_arcs}
-    existing_trigger_keysets = [frozenset(a.trigger.keys()) for a in current_arcs]
+    existing_trigger_keysets = [frozenset(pool_by_canonical_name(a.trigger)) for a in current_arcs]
 
     for prop_dict in raw_emergences:
         if not isinstance(prop_dict, dict):
@@ -646,7 +647,8 @@ def _validate_emergence_proposal(
         return False, "gate 5: prompt_template fails format_map smoke test"
 
     # Gate 8: trigger non-overlap with existing arcs (strict subset/superset)
-    proposed_keyset = frozenset(trigger_typed.keys())
+    # Both sides are keyed by canonical name, so a proposal spelled differently from an arc still overlaps it.
+    proposed_keyset = frozenset(pool_by_canonical_name(trigger_typed))
     for existing_keyset in existing_trigger_keysets:
         if proposed_keyset == existing_keyset:
             # Exact match — would have been gate 2 caught if same name; if

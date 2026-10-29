@@ -460,7 +460,8 @@ def _summary_text(row: dict | None) -> str:
     return (row or {}).get("text", "") or ""
 
 
-def _summary_gen(row: dict | None) -> int:
+def summary_gen(row: dict | None) -> int:
+    """The compaction generation recorded on a summary row (``compaction.gen``); 0 for no row or a row without one."""
     if not row:
         return 0
     try:
@@ -503,7 +504,7 @@ def compact_conversation(
         cursor = read_cursor(persona_dir, session_id)
         if cursor is None:
             return CompactionResult(
-                False, 0, _summary_gen(existing_summary), False, reaped,
+                False, 0, summary_gen(existing_summary), False, reaped,
                 reason="cursor_none",
             )
         cursor_dt = _parse_ts(cursor)
@@ -524,7 +525,7 @@ def compact_conversation(
 
         if not removable:
             return CompactionResult(
-                False, 0, _summary_gen(existing_summary), False, reaped,
+                False, 0, summary_gen(existing_summary), False, reaped,
                 reason="nothing_aged",
             )
 
@@ -616,7 +617,7 @@ def compact_conversation(
             # Tool append (fold=False, prior exists): keep prior verbatim, append.
             new_text = f"{prior_text}\n\n{new_part}" if prior_text else new_part
 
-        new_gen = _summary_gen(existing_summary) + 1
+        new_gen = summary_gen(existing_summary) + 1
         covers_until = removable[-1].get("ts") or cutoff.isoformat()
         summary_row = {
             "session_id": session_id,
@@ -646,7 +647,7 @@ def compact_conversation(
                 session_id,
             )
             return CompactionResult(
-                False, 0, _summary_gen(existing_summary), fell_soft, reaped,
+                False, 0, summary_gen(existing_summary), fell_soft, reaped,
                 reason="archive_failed",
             )
 
@@ -853,7 +854,7 @@ def _install_cascade_row(
     """Archive (removed raw + old summary) BEFORE rewrite, then install the new
     sectioned summary row + retained tail in ONE atomic rewrite. Returns the new
     gen, or ``None`` on an archive failure (buffer left untouched)."""
-    new_gen = _summary_gen(existing_summary) + 1
+    new_gen = summary_gen(existing_summary) + 1
     all_untils = [_parse_ts(s.get("covers_until_ts")) for s in new_sections.values()]
     covers_until = _iso_seconds(max([u for u in all_untils if u], default=now))
     summary_row = {
@@ -931,7 +932,7 @@ def cascade_conversation(
 
         cursor = read_cursor(persona_dir, session_id)
         if cursor is None:
-            return CascadeResult(False, 0, _summary_gen(existing_summary), reason="cursor_none")
+            return CascadeResult(False, 0, summary_gen(existing_summary), reason="cursor_none")
         cursor_dt = _parse_ts(cursor)
         age_cutoff = now - _AGE_24H
 
@@ -984,7 +985,7 @@ def cascade_conversation(
         # → no-op.
         if not removable and not needs_graduate:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="nothing_aged"
+                False, 0, summary_gen(existing_summary), reason="nothing_aged"
             )
 
         # Assemble oldest-first (72 → 48 → 24). Tier 3 is REPLACED each pass: the
@@ -1023,7 +1024,7 @@ def cascade_conversation(
         )
         if new_gen is None:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="archive_failed"
+                False, 0, summary_gen(existing_summary), reason="archive_failed"
             )
         logger.info(
             "cascade: session=%s gen=%d compacted_n=%d tiers=%s evicted=%d",
@@ -1067,7 +1068,7 @@ def emergency_fold_24h(
 
         cursor = read_cursor(persona_dir, session_id)
         if cursor is None:
-            return CascadeResult(False, 0, _summary_gen(existing_summary), reason="cursor_none")
+            return CascadeResult(False, 0, summary_gen(existing_summary), reason="cursor_none")
         cursor_dt = _parse_ts(cursor)
 
         protected = set(range(max(0, len(raw_turns) - min_keep_tail), len(raw_turns)))
@@ -1081,7 +1082,7 @@ def emergency_fold_24h(
             removable.append(t)  # older_than=0: any extracted turn beyond the tail
         if not removable:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="nothing_aged"
+                False, 0, summary_gen(existing_summary), reason="nothing_aged"
             )
 
         existing_sections = _read_sections(existing_summary, now)
@@ -1114,7 +1115,7 @@ def emergency_fold_24h(
         )
         if new_gen is None:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="archive_failed"
+                False, 0, summary_gen(existing_summary), reason="archive_failed"
             )
         logger.info(
             "cascade: emergency_fold session=%s gen=%d compacted_n=%d evicted=%d",
