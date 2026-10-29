@@ -294,6 +294,21 @@ class ResearchEngine:
             raw = self.provider.generate(prompt, system=self._render_system_prompt())
             session = parse_session_output(raw)
 
+            # A reply with notes but no memory or no verdict is a layout the parser did not read (the prompt asks for
+            # all three every time): the memory, the close and the spawned topics of the fire are lost without a trace
+            # unless it is recorded (#591). The fire itself carries on unchanged.
+            if session.notes and session.missing:
+                record_parse_failure(
+                    self.interests_path.parent,
+                    site="research_session",
+                    raw=raw,
+                    error=(
+                        "no NOTES marker, reply kept as notes"
+                        if session.degraded
+                        else "no " + " or ".join(session.missing) + " text in the reply"
+                    ),
+                )
+
             if session.notes:
                 try:
                     append_session_notes(
@@ -304,7 +319,8 @@ class ResearchEngine:
 
             # Persist memory — only when the session actually produced one.
             # The degraded (no-markers) path still counts as a fire (notes may
-            # have been captured above) but leaves output_memory_id None.
+            # have been captured above) but leaves output_memory_id None, and
+            # is recorded as a parse failure above.
             # Fail-soft per spec §5.3: a create failure (SQLite lock past
             # busy_timeout, disk full, ...) must not abort the tick — the
             # cooldown burn + log append below still need to run, or the same
@@ -312,10 +328,13 @@ class ResearchEngine:
             mem_id = None
             if session.memory:
                 try:
-                    mem = _create_research_memory(
+                    mem = build_research_memory(
                         content=session.memory,
-                        interest=winner,
-                        web_results=web_results,
+                        interest_id=winner.id,
+                        interest_topic=winner.topic,
+                        scope=winner.scope,
+                        web_urls=[r.url for r in web_results[:5]],
+                        web_result_count=len(web_results),
                         web_used=web_used,
                         trigger=trigger,
                         provider_name=self.provider.name(),
@@ -574,17 +593,24 @@ class ResearchEngine:
 # ---------- Module-level helpers ----------
 
 
-def _create_research_memory(
+def build_research_memory(
     *,
     content: str,
-    interest: Interest,
-    web_results: list,
+    interest_id: str,
+    interest_topic: str,
+    scope: str,
+    web_urls: list[str],
+    web_result_count: int,
     web_used: bool,
     trigger: str,
-    provider_name: str,
+    provider_name: str | None,
     searcher_name: str | None,
 ) -> Memory:
-    """Factory helper — Memory.create_new with research-specific metadata shape."""
+    """Factory helper — Memory.create_new with research-specific metadata shape.
+
+    Shared by the live fire and by the recovery of fires whose reply was not split (brain/engines/research_recovery.py),
+    so both build the same fields.
+    """
     return Memory.create_new(
         content=content,
         memory_type="research",
@@ -596,12 +622,12 @@ def _create_research_memory(
         importance=5.0,
         metadata={
             "schema_version": RESEARCH_SCHEMA_VERSION,
-            "interest_id": interest.id,
-            "interest_topic": interest.topic,
-            "scope": interest.scope,
+            "interest_id": interest_id,
+            "interest_topic": interest_topic,
+            "scope": scope,
             "web_used": web_used,
-            "web_result_count": len(web_results),
-            "web_urls": [r.url for r in web_results[:5]],
+            "web_result_count": web_result_count,
+            "web_urls": web_urls,
             "triggered_by": trigger,
             "provider": provider_name,
             "searcher": searcher_name,

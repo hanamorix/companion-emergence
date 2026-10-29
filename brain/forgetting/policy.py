@@ -109,6 +109,26 @@ def is_within_import_grace(
     return elapsed < IMPORT_GRACE_LIVED_HOURS
 
 
+def _recent_buffer_anchor(memory: Memory) -> datetime:
+    """The moment the recent buffer counts from: ``created_at``, or the later ``metadata["recovered_at"]``.
+
+    A memory recovered from a stored note (brain/engines/research_recovery.py) keeps the date of the event it records
+    in ``created_at`` but only arrived in the store at ``recovered_at``. Counting its age from the event would put every
+    recovered memory older than the buffer straight into the next pass (a research memory's salience is far below the
+    fade gate), so the recovery would undo itself. Counting from ``recovered_at`` gives it the same buffer as any new
+    memory; after that the normal rules apply. An absent or unparseable value is ignored.
+    """
+    raw = memory.metadata.get("recovered_at") if isinstance(memory.metadata, dict) else None
+    if isinstance(raw, str):
+        try:
+            recovered_at = datetime.fromisoformat(raw)
+        except ValueError:
+            return memory.created_at
+        if recovered_at.tzinfo is not None and recovered_at > memory.created_at:
+            return recovered_at
+    return memory.created_at
+
+
 def is_exempt(
     memory: Memory,
     *,
@@ -132,7 +152,7 @@ def is_exempt(
     # Recent-buffer check.
     if memory.created_at is None:
         return False
-    wall_age_s = (datetime.now(UTC) - memory.created_at).total_seconds()
+    wall_age_s = (datetime.now(UTC) - _recent_buffer_anchor(memory)).total_seconds()
     # Approximation: lived_hours since creation ≈ wall_age_s * (lived/wall ratio)
     # but at cold-start (no rate established) treat as fully recent.
     if now_lived_age_hours <= 0.0:

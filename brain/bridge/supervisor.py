@@ -77,7 +77,7 @@ from brain.chat.session import (
     prune_empty_sessions,
     remove_session,
 )
-from brain.engines import interest_sweep
+from brain.engines import interest_sweep, research_recovery
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.forgetting import run_pass as forgetting_run_pass
@@ -962,7 +962,7 @@ def _build_gated_jobs(
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
     test/dev disable knob) is left out. Pass 2, session snapshot/prune,
-    emotion backfill, embedding backfill and the extraction backfill (#523)
+    emotion backfill, research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
     the extraction backfill takes one chunk per pass). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
@@ -1140,6 +1140,22 @@ def _build_gated_jobs(
             "emotion_backfill",
             run=_emotion_backfill_job,
             has_work=_emotion_backfill_job_has_work,
+        )
+    )
+
+    # 3b. research recovery — #591: the research memories lost to an unread reply layout, recovered once from the stored
+    # notes, one interest per pass (brain/engines/research_recovery.py). No model call of its own: the consolidation gate
+    # classifies what it enqueues, so it waits until the gate has dealt with the previous pass.
+    def _research_recovery_job() -> JobOutcome:
+        with _tick_store() as store:
+            research_recovery.run_recovery(persona_dir, store)
+        return JobOutcome.COMPLETED
+
+    jobs.append(
+        GatedJob(
+            "research_recovery",
+            run=_research_recovery_job,
+            has_work=lambda: research_recovery.has_recovery_work(persona_dir),
         )
     )
 
