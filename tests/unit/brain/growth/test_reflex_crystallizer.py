@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -614,6 +615,103 @@ def test_emergence_gate_8_accepts_partial_overlap(persona_dir):
         total_cap=16,
     )
     assert accepted is True
+
+
+def test_emergence_gate_8_compares_canonical_keys_for_a_subset(persona_dir):
+    """Existing arcs are keyed by canonical name; a differently spelled proposal is still a subset."""
+    proposal = _good_proposal(name="new_arc", trigger={"comfort-seeking": 7.0})
+    accepted, reason = _validate_emergence_proposal(
+        proposal_dict=proposal,
+        current_arc_names={"existing"},
+        removed_arc_names=set(),
+        emotion_vocabulary={"comfort-seeking", "love"},
+        existing_trigger_keysets=[frozenset({"comfort_seeking", "love"})],
+        active_arc_count=4,
+        total_cap=16,
+    )
+    assert accepted is False
+    assert "gate 8" in reason and "subset" in reason
+
+
+def test_emergence_gate_8_compares_canonical_keys_for_a_superset(persona_dir):
+    proposal = _good_proposal(
+        name="new_arc",
+        trigger={"comfort-seeking": 7.0, "Love": 7.0, "creative_hunger": 7.0},
+    )
+    accepted, reason = _validate_emergence_proposal(
+        proposal_dict=proposal,
+        current_arc_names={"existing"},
+        removed_arc_names=set(),
+        emotion_vocabulary={"comfort-seeking", "Love", "creative_hunger"},
+        existing_trigger_keysets=[frozenset({"comfort_seeking", "love"})],
+        active_arc_count=4,
+        total_cap=16,
+    )
+    assert accepted is False
+    assert "gate 8" in reason and "superset" in reason
+
+
+def _loaded_arc(name: str, trigger: dict[str, float]) -> ReflexArc:
+    """An arc as the production loader builds it (`from_dict` keys the trigger by canonical name)."""
+    return ReflexArc.from_dict(
+        {
+            "name": name,
+            "description": f"description of {name}",
+            "trigger": trigger,
+            "days_since_human_min": 0.0,
+            "cooldown_hours": 12.0,
+            "action": "generate_journal",
+            "output_memory_type": "reflex_journal",
+            "prompt_template": "You are nell. {emotion_summary}",
+            "created_by": "og_migration",
+            "created_at": "2026-04-28T00:00:00+00:00",
+        }
+    )
+
+
+def _run_crystallizer_with_proposal(persona_dir, store, current_arcs, trigger):
+    _seed_vocab(persona_dir, ["comfort-seeking", "love", "creative_hunger"])
+    response = _json.dumps({"emergences": [_good_proposal(trigger=trigger)], "prunings": []})
+    return crystallize_reflex(
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=current_arcs,
+        removed_arc_names=set(),
+        provider=_FakeProvider(response),
+        persona_name="nell",
+        persona_pronouns="she/her",
+    )
+
+
+def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_loaded_arc(
+    persona_dir: Path, store: MemoryStore, caplog
+):
+    arc = _loaded_arc("comfort_arc", {"Comfort_Seeking": 5.0, "love": 5.0})
+    assert set(arc.trigger) == {"comfort_seeking", "love"}
+    with caplog.at_level(logging.INFO, logger="brain.growth.crystallizers.reflex"):
+        result = _run_crystallizer_with_proposal(
+            persona_dir, store, [arc], {"comfort-seeking": 7.0}
+        )
+    assert result.emergences == []
+    assert any("gate 8" in r.getMessage() for r in caplog.records)
+
+
+def test_crystallize_reflex_accepts_a_disjoint_trigger_beside_a_loaded_arc(
+    persona_dir: Path, store: MemoryStore
+):
+    # Positive control for the test above: same setup, only the trigger keys differ.
+    arc = _loaded_arc("comfort_arc", {"Comfort_Seeking": 5.0, "love": 5.0})
+    result = _run_crystallizer_with_proposal(persona_dir, store, [arc], {"creative_hunger": 7.0})
+    assert [e.name for e in result.emergences] == ["manuscript_obsession"]
+
+
+def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_directly_built_arc(
+    persona_dir: Path, store: MemoryStore
+):
+    # `ReflexArc` accepts any keys when built directly; the gate must not depend on the loader.
+    arc = _arc("comfort_arc", trigger={"Comfort_Seeking": 5.0, "love": 5.0})
+    result = _run_crystallizer_with_proposal(persona_dir, store, [arc], {"comfort-seeking": 7.0})
+    assert result.emergences == []
 
 
 def test_emergence_gate_9_rejects_when_at_total_cap(persona_dir):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -163,3 +165,74 @@ def test_climax_reset_sees_a_variant_spelled_channel(emotions, expected):
     # The reset adds 2.0 to comfort_seeking and acts on climax; a variant spelling of
     # either must land on the same channel instead of leaving a second key beside it.
     assert aggregate_state([_mem(emotions)]).emotions == expected
+
+
+# --- a value above its emotion's clamp is judged per stored spelling, before spellings merge (#557) ---
+
+_OVER_RANGE_AND_TWO_IN_RANGE_SPELLINGS = [
+    {"comfort-seeking": 12.0},
+    {"comfort_seeking": 5.0},
+    {"Comfort_Seeking": 3.0},
+]
+
+
+@pytest.mark.parametrize(
+    "order",
+    list(itertools.permutations(range(3))),
+    ids=lambda order: "".join(str(i) for i in order),
+)
+def test_aggregate_keeps_the_in_range_spelling_when_another_is_out_of_range(order):
+    # Dream memories store unclamped sums. The spelling whose strongest value is above the
+    # clamp is skipped on its own, as before spellings shared a channel; it must not take
+    # the in-range spellings of the same emotion down with it.
+    memories = [_mem(_OVER_RANGE_AND_TWO_IN_RANGE_SPELLINGS[i]) for i in order]
+    assert aggregate_state(memories).emotions == {"comfort_seeking": 5.0}
+
+
+@pytest.mark.parametrize(
+    ("over_value", "expected"),
+    [(10.0, 10.0), (10.5, 4.0)],
+    ids=["exactly-at-the-clamp-is-kept", "above-the-clamp-is-skipped"],
+)
+def test_aggregate_range_limit_is_inclusive_of_the_clamp(over_value, expected):
+    memories = [_mem({"comfort-seeking": over_value}), _mem({"Comfort_Seeking": 4.0})]
+    assert aggregate_state(memories).emotions == {"comfort_seeking": expected}
+
+
+def test_aggregate_range_limit_is_the_emotions_own_clamp():
+    from brain.emotion import vocabulary
+
+    vocabulary.register(
+        vocabulary.Emotion(
+            name="tight_clamp",
+            description="x",
+            category="persona_extension",
+            decay_half_life_days=14.0,
+            intensity_clamp=5.0,
+        )
+    )
+    try:
+        # 6.0 is inside the module-wide 10.0 but above this emotion's own clamp of 5.0.
+        memories = [
+            _mem({"tight-clamp": 6.0}),
+            _mem({"tight_clamp": 5.0}),
+            _mem({"Tight_Clamp": 2.0}),
+        ]
+        assert aggregate_state(memories).emotions == {"tight_clamp": 5.0}
+    finally:
+        vocabulary._unregister("tight_clamp")
+
+
+def test_aggregate_out_of_range_spelling_leaves_other_emotions_alone():
+    memories = [_mem({"comfort-seeking": 12.0, "love": 4.0}), _mem({"Love": 2.0})]
+    assert aggregate_state(memories).emotions == {"love": 4.0}
+
+
+def test_aggregate_ignores_infinite_and_nan_values_without_raising():
+    memories = [
+        _mem({"comfort-seeking": math.inf}),
+        _mem({"Comfort_Seeking": math.nan}),
+        _mem({"comfort_seeking": 4.0}),
+        _mem({"COMFORT_SEEKING": 2.0}),
+    ]
+    assert aggregate_state(memories).emotions == {"comfort_seeking": 4.0}

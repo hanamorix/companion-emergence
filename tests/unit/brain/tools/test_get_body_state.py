@@ -95,6 +95,34 @@ def test_body_state_reads_a_variant_spelled_stored_emotion(store, hebbian, tmp_p
     assert store.get(memory.id).emotions == {"comfort-seeking": 7.0}
 
 
+def test_body_state_keeps_the_in_range_spelling_when_another_is_out_of_range(
+    store, hebbian, tmp_path
+):
+    """A dream-sized value in one spelling must not hide the in-range spellings of the emotion (#557)."""
+    stored = {
+        "comfort-seeking": 12.0,
+        "comfort_seeking": 5.0,
+        "Comfort_Seeking": 6.0,
+    }
+    ids = {}
+    for spelling, value in stored.items():
+        memory = Memory.create_new(
+            content=f"held {spelling}",
+            memory_type="conversation",
+            domain="us",
+            emotions={spelling: value},
+        )
+        store.create(memory)
+        ids[spelling] = memory.id
+
+    out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
+
+    assert out["body_emotions"]["comfort_seeking"] == 6.0
+    # Reading must not rewrite any stored spelling or value.
+    for spelling, value in stored.items():
+        assert store.get(ids[spelling]).emotions == {spelling: value}
+
+
 def test_recomputes_each_call(store, hebbian, tmp_path, monkeypatch):
     """Inviolate property #8 from spec §7.1 — no cache."""
     calls = 0

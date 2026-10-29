@@ -5,10 +5,12 @@ current emotional state, synthesized across recent memories.
 
 Strategy: max-pool per emotion. The strongest signal across the
 input memories wins — matches how OG reflex_engine read peaks,
-not averages, for threshold evaluation. An emotion is identified by
-its canonical name, so spelling variants of one emotion
-(`comfort-seeking`, `Comfort_Seeking`) share one channel and the
-strongest of them wins. Stored keys are never rewritten.
+not averages, for threshold evaluation. The maximum is first taken
+per stored spelling; a spelling whose maximum is above its emotion's
+clamp is skipped; the remaining spellings of one emotion
+(`comfort-seeking`, `Comfort_Seeking`) then share one channel, keyed
+by canonical name, and the strongest of them wins. Stored keys are
+never rewritten.
 
 After max-pooling, _apply_climax_reset is called: when aggregated
 `climax >= 7` it dampens arousal + desire and raises comfort_seeking
@@ -22,7 +24,7 @@ import logging
 from collections.abc import Iterable
 
 from brain.emotion.state import EmotionalState
-from brain.emotion.vocabulary import canonical_name
+from brain.emotion.vocabulary import Emotion, canonical_name
 from brain.emotion.vocabulary import get as _get_emotion
 from brain.memory.store import Memory
 
@@ -45,8 +47,12 @@ _INTENSITY_CLAMP = 10.0
 def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
     """Return an EmotionalState that is the per-emotion max across inputs.
 
-    Emotions are pooled under their canonical name, so every spelling
-    variant of one emotion reads as one channel in the returned state.
+    The maximum is taken per stored spelling first. A spelling whose
+    maximum is above its emotion's clamp is skipped, so it cannot hide
+    another spelling of the same emotion that is in range. The remaining
+    spellings are then pooled under their canonical name, so every
+    spelling variant of one emotion reads as one channel in the returned
+    state.
 
     Unknown emotions (not in the registered vocabulary) are skipped,
     with one warning per name — a persona's old memories may contain
@@ -55,7 +61,8 @@ def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
     After max-pooling, applies the climax reset hook (§2.2). All
     callers (chat, reflex, body-state) get the post-reset state.
     """
-    pooled: dict[str, float] = {}
+    by_spelling: dict[str, float] = {}
+    registered: dict[str, Emotion] = {}
     for mem in memories:
         for name, intensity in mem.emotions.items():
             try:
@@ -64,7 +71,8 @@ def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
                 continue
             if value <= 0.0:
                 continue
-            if _get_emotion(name) is None:
+            emotion = _get_emotion(name)
+            if emotion is None:
                 if name not in _warned_unregistered:
                     _warned_unregistered.add(name)
                     logger.warning(
@@ -74,17 +82,21 @@ def aggregate_state(memories: Iterable[Memory]) -> EmotionalState:
                         value,
                     )
                 continue
-            key = canonical_name(name)
-            if value > pooled.get(key, 0.0):
-                pooled[key] = value
+            if value > by_spelling.get(name, 0.0):
+                by_spelling[name] = value
+                registered[name] = emotion
+
+    pooled: dict[str, float] = {}
+    for name, value in by_spelling.items():
+        if value > registered[name].intensity_clamp:
+            continue
+        key = canonical_name(name)
+        if value > pooled.get(key, 0.0):
+            pooled[key] = value
 
     state = EmotionalState()
-    for name, value in pooled.items():
-        try:
-            state.set(name, value)
-        except (KeyError, ValueError):
-            # clamp violation or validation failure — skip
-            continue
+    for key, value in pooled.items():
+        state.set(key, value)
     return _apply_climax_reset(state)
 
 
