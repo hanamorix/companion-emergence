@@ -466,8 +466,14 @@ def _plant(tmp_path: Path, files: dict[str, str]) -> Path:
     return tmp_path
 
 
-def test_real_tree_has_no_memories_db_writer_outside_the_store():
-    result = scan_tree(REPO)
+@pytest.fixture(scope="module")
+def real_scan() -> ScanResult:
+    """The scan of the real tree, done once in setup: it costs seconds of CPU on CI, which belongs to no one test."""
+    return scan_tree(REPO)
+
+
+def test_real_tree_has_no_memories_db_writer_outside_the_store(real_scan):
+    result = real_scan
     assert not result.findings, (
         "Only brain/memory/store.py may write memories.db (see this file's docstring).\n"
         + "\n".join(str(f) for f in result.findings)
@@ -475,8 +481,8 @@ def test_real_tree_has_no_memories_db_writer_outside_the_store():
 
 
 @pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
-def test_registry_entries_all_match_a_real_call(tmp_path):
-    assert not registry_problems(scan_tree(REPO))
+def test_registry_entries_all_match_a_real_call(tmp_path, real_scan):
+    assert not registry_problems(real_scan)
     # the oracle can fail: on a tree with no brain/ files every entry is reported stale
     assert len(registry_problems(scan_tree(tmp_path))) == len(OPENERS) + len(READER_EXCEPTIONS)
 
