@@ -178,6 +178,6 @@ def test_the_tick_appender_waits_for_the_logs_lock(tmp_path):
         )
         t.start()
         assert not done.wait(timeout=0.4), "the append did not wait for the log's lock"
-    assert done.wait(timeout=5)
     finish_threads(t)
+    assert done.is_set(), "the append thread ended without finishing the append"
     assert log_path.read_text(encoding="utf-8").count("\n") == 1
