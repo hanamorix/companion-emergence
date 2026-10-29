@@ -101,6 +101,7 @@ def test_secret_file_names_refused_anywhere(env, name):
     assert _refused(read_file(path=str(f), persona_dir=env["persona"]))
 
 
+@pytest.mark.no_base_failure(reason="#597 over-blocking guard: ordinary files read on the old code too, and must keep reading")
 @pytest.mark.parametrize("rel", [
     "home/Desktop/notes.txt",
     "home/proj/environment.md",
@@ -123,6 +124,7 @@ def test_list_directory_secret_dir_refused(env, rel):
     assert "entries" not in out and "protected" in out.get("error", "")
 
 
+@pytest.mark.no_base_failure(reason="#597: needs a case-insensitive volume; it skips on case-sensitive CI, and on macOS fails on the old code")
 def test_case_variant_refused(env):
     _plant(env["home"] / ".claude" / ".credentials.json")
     variant = env["home"] / ".CLAUDE" / ".credentials.json"
@@ -161,6 +163,7 @@ def test_refusal_is_audited(env):
     assert line["tool"] == "read_file" and line["ok"] is False and "protected" in line["error"]
 
 
+@pytest.mark.no_base_failure(reason="#597 over-blocking guard: listing home works on the old code too, and must keep working")
 def test_listing_home_still_works(env):
     _plant(env["home"] / ".ssh" / "id_rsa")
     _plant(env["home"] / "Desktop" / "a.txt")
