@@ -306,7 +306,7 @@ def test_a_latch_or_a_warning_while_a_sampler_runs_does_not_deadlock(forced) -> 
     worker = threading.Thread(target=_go, daemon=True)
     worker.start()
     finish_threads(worker)
-    assert done.is_set(), "stop() joins outside the lock; the sampler never takes it"
+    assert done.is_set(), "the worker ended without finishing; stop() joins outside the lock and the sampler never takes it"
 
 
 def test_without_the_force_linux_keeps_the_exact_reading(monkeypatch, tmp_path) -> None:

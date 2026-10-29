@@ -66,7 +66,6 @@ def _waits_of_one_loop(persona_dir: Path, monkeypatch, **tick) -> list[float | N
     thread = threading.Thread(target=lambda: supervisor_mod.run_folded(**kwargs), daemon=True)
     thread.start()
     finish_threads(thread)
-    assert not thread.is_alive()
     return stop_event.waits
 
 
