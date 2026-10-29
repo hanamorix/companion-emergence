@@ -516,6 +516,12 @@ REMOVED: tuple[Removed, ...] = (
         ref=_GUARD_REF,
         scope=("brain",),
     ),
+    Removed(
+        names=("offline_load_scope", "_hf_telemetry_lock", "_hf_telemetry_depth", "_hf_telemetry_before"),
+        why="huggingface_hub's telemetry opt-out is one process-wide default set in brain/__init__.py, not a scoped flip of the library's flag around each offline load (#554)",
+        ref="#554 (PR #561): the first commits of that PR added a scoped flip of the flag around each offline load, replaced by the process-wide default before merge",
+        kind="code",
+    ),
 )
 
 
