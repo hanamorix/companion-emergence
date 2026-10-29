@@ -30,7 +30,7 @@ import numpy as np
 from brain import dev_constants, tunables
 from brain.memory import cost_series
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
-from brain.utils.sqlite_open import OpenProfile, open_store_connection
+from brain.utils.sqlite_open import OpenProfile, close_on_error, open_store_connection
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ def _haiku_decision_count(haiku_label_json: str | None) -> int:
 
 def _selftune_week_cutoff(now: datetime | None) -> str:
     """The rolling one-week cutoff (F2c inc8, spec §3/AC14): `now` minus ONE
-    weekly self-tune cadence (`judge_selftune.JUDGE_TUNE_INTERVAL_HOURS`, read
+    weekly self-tune cadence (`dev_constants.JUDGE_TUNE_INTERVAL_HOURS`, read
     at call time — derived from the weekly cadence, not a second hand-typed
     "7 days"), rendered in the exact text format SQLite's `CURRENT_TIMESTAMP`
     writes into `calibration_log.logged_at` (`YYYY-MM-DD HH:MM:SS`, UTC), so a
@@ -97,16 +97,11 @@ def _selftune_week_cutoff(now: datetime | None) -> str:
     compare would keep a row up to ~8 days, and the owner's rule is that
     nothing is kept past a week. Note: this follows the weekly-cadence
     CONSTANT; `supervisor.run_folded`'s `judge_selftune_interval_s` defaults
-    to that same constant and differs from it only in tests.
-
-    Imported lazily so this module gains no import-time dependency on
-    `judge_selftune` (which imports this module's siblings)."""
-    from brain.memory import judge_selftune
-
+    to that same constant and differs from it only in tests."""
     ref = now if now is not None else datetime.now(UTC)
     if ref.tzinfo is not None:
         ref = ref.astimezone(UTC)
-    return (ref - timedelta(hours=judge_selftune.JUDGE_TUNE_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    return (ref - timedelta(hours=dev_constants.JUDGE_TUNE_INTERVAL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _coerce_utc(ts: str) -> datetime:
@@ -842,6 +837,10 @@ class MemoryStore:
 
     Pass `":memory:"` as db_path for in-memory databases (used in tests).
     Any filesystem path creates or opens a persistent database.
+
+    This class is the only code that writes memories.db. A module that needs a
+    new write adds a method here; `tests/unit/test_memories_db_single_writer.py`
+    fails on any other writer and names the few read-only exceptions.
     """
 
     def __init__(self, db_path: str | Path, *, integrity_check: bool = True) -> None:
@@ -988,6 +987,43 @@ class MemoryStore:
     def close(self) -> None:
         """Close the underlying connection. Safe to call multiple times."""
         self._conn.close()
+
+    # --- FTS health check (brain.memory.db_health) -----------------------------
+    # The once-per-process FTS check runs on a connection of its own BEFORE any
+    # MemoryStore exists for the persona: constructing one would run the integrity
+    # check (raising instead of classifying) and create the schema (hiding the
+    # `no_schema` and `fts_missing_backfilled` outcomes). So these are static, take
+    # that raw connection, and hold the SQL; db_health decides what the result
+    # means and when to end the transaction.
+
+    @staticmethod
+    def connect_for_fts_health(db_path: str | Path) -> sqlite3.Connection:
+        """Open `db_path` for the FTS health check: the long memories busy timeout at
+        connect and as a pragma, and nothing else (no integrity check, no schema, no WAL
+        change). The connection is closed if the pragma raises."""
+        timeout_s = dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S
+        conn = sqlite3.connect(str(db_path), timeout=timeout_s)
+        with close_on_error(conn):
+            conn.execute(f"PRAGMA busy_timeout = {int(timeout_s * 1000)}")
+        return conn
+
+    @staticmethod
+    def fts_integrity_check(conn: sqlite3.Connection) -> None:
+        """Run the FTS5 integrity-check command; raises `sqlite3.DatabaseError` on damage."""
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+
+    @staticmethod
+    def fts_rebuild(conn: sqlite3.Connection) -> None:
+        """Rebuild the FTS5 index from the `memories` table. The caller ends the transaction."""
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+
+    @staticmethod
+    def fts_create_schema_and_rebuild(conn: sqlite3.Connection) -> None:
+        """Create the schema (the same idempotent statements `__init__` runs) and backfill the
+        FTS index from the existing rows, for a legacy persona that has `memories` rows but no
+        `memories_fts` yet. The caller ends the transaction."""
+        conn.executescript(_SCHEMA)
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
 
     @property
     def db_path(self) -> Path:
@@ -2933,6 +2969,20 @@ class MemoryStore:
         # docstring). On failure the row is already NULL (self-healing) —
         # that clear-on-failure branch is now belt-and-suspenders.
         self._reembed_or_clear(memory_id, restored_content)
+
+    def set_active_clear_snapshot(self, memory_id: str) -> None:
+        """Set `state='active'` and clear `content_snapshot` on one row, then commit.
+
+        For recovery, which writes the source persona's content back with `update()`
+        and then needs the row out of the faded state. `unfade()` cannot do that: it
+        restores content FROM the snapshot. Does not touch content, the embedding
+        or any other row, and does not check that the id exists.
+        """
+        self._conn.execute(
+            "UPDATE memories SET state='active', content_snapshot=NULL WHERE id=?",
+            (memory_id,),
+        )
+        self._conn.commit()
 
     def hard_delete(self, memory_id: str) -> None:
         """Drop the row. Caller MUST write the graveyard entry first.

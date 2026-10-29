@@ -9,9 +9,9 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from brain import prompt_strings
+from brain import dev_constants, prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
-from brain.kindled_link import limits, relationship
+from brain.kindled_link import relationship
 from brain.kindled_link.gate import OutboundPayload
 from brain.kindled_link.peer_prompt import build_peer_prompt
 from brain.kindled_link.privacy_gate import PrivacyGate
@@ -43,11 +43,6 @@ def _check_day(now: datetime, today: str) -> None:
         )
 
 
-_MIN_OUTBOUND_GAP_SECONDS = limits.MIN_OUTBOUND_GAP_SECONDS
-_SESSION_MSG_CAP = limits.SESSION_MSG_CAP
-_SESSION_COOLDOWN_HOURS = limits.SESSION_COOLDOWN_HOURS
-_DAILY_OUTBOUND_CAP = limits.DAILY_OUTBOUND_CAP
-_DAILY_PROVIDER_CAP = limits.DAILY_PROVIDER_CAP
 _DEFAULT_STAGE = "stranger"
 # (Phase 3 has no inbound/poll path; the inbound flood cap lands with the
 # relay-poll/wiring phase — see spec §10 Deferred.)
@@ -75,16 +70,16 @@ class SessionEngine:
         if last_dt is None:  # an unusable stamp cannot hold a send back: due now (as kindled_link/cadence.py does, #485)
             return True
         elapsed = (lenient_utc(now) - last_dt).total_seconds()
-        return elapsed >= _MIN_OUTBOUND_GAP_SECONDS
+        return elapsed >= dev_constants.KINDLED_LINK_MIN_OUTBOUND_GAP_SECONDS
 
     def under_session_cap(self, peer_id: str, session_id: str) -> bool:
         sess = self._store.get_session(peer_id, session_id)
-        return bool(sess) and sess["msg_count"] < _SESSION_MSG_CAP
+        return bool(sess) and sess["msg_count"] < dev_constants.KINDLED_LINK_SESSION_MSG_CAP
 
     def under_daily_caps(self, peer_id: str, today: str) -> bool:
         c = self._store.get_counters(peer_id, today)
-        return (c["outbound_count"] < _DAILY_OUTBOUND_CAP
-                and c["provider_call_count"] < _DAILY_PROVIDER_CAP)
+        return (c["outbound_count"] < dev_constants.KINDLED_LINK_DAILY_OUTBOUND_CAP
+                and c["provider_call_count"] < dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP)
 
     def can_start_session(self, peer_id: str, now: datetime) -> bool:
         peer = self._store.get_peer(peer_id)
@@ -128,7 +123,7 @@ class SessionEngine:
                 return None
             # Reserve the cap slot atomically before the irreversible provider call.
             if not self._store.try_reserve_provider(peer_id, today,
-                                                    cap=_DAILY_PROVIDER_CAP):
+                                                    cap=dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP):
                 return None  # cap spent — cannot generate; caller defers
             draft = self._provider.complete(prompt)
         return draft
@@ -193,17 +188,17 @@ class SessionEngine:
             # under_daily_caps (in _send_allowed) is the cheap pre-gate; this is
             # the authoritative atomic gate. If we lose the race, treat as hold.
             if not self._store.try_reserve_outbound(peer_id, today,
-                                                    cap=_DAILY_OUTBOUND_CAP):
+                                                    cap=dev_constants.KINDLED_LINK_DAILY_OUTBOUND_CAP):
                 return "hold"  # cap exhausted under race — safe direction
             send_fn(payload)
             self._store.bump_session_outbound(peer_id, session_id, now)
             self._store.debit_disclosure_budget(
-                peer_id, max(limits.MIN_SEND_DEBIT, decision.texture_score), now)
+                peer_id, max(dev_constants.KINDLED_LINK_MIN_SEND_DEBIT, decision.texture_score), now)
             return "send"
         if action == "end_or_pause":
             self._store.end_session(
                 peer_id, session_id, now=now,
-                cooldown_until=now + timedelta(hours=_SESSION_COOLDOWN_HOURS))
+                cooldown_until=now + timedelta(hours=dev_constants.KINDLED_LINK_SESSION_COOLDOWN_HOURS))
             return "end_or_pause"
         if action == "revise" and allow_revision:
             revised = self._regenerate(payload, decision.revision_constraints,
@@ -252,7 +247,7 @@ class SessionEngine:
                     return None  # deferred → hold
                 # Reserve the cap slot atomically before the irreversible provider call.
                 if not self._store.try_reserve_provider(peer_id, today,
-                                                        cap=_DAILY_PROVIDER_CAP):
+                                                        cap=dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP):
                     return None  # cap spent — cannot revise; hold
                 revised_body = self._provider.complete(prompt)
         except Exception:  # noqa: BLE001 — fail closed

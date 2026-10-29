@@ -129,14 +129,15 @@ def test_c1_1_add_journal_above_floor(tmp_path):
 
 
 def test_c1_1_research_memory_above_floor():
-    from brain.engines.research import _create_research_memory
+    from brain.engines.research import build_research_memory
 
-    mem = _create_research_memory(
+    mem = build_research_memory(
         content="notes on a topic",
-        interest=type(
-            "I", (), {"id": "i1", "topic": "topic", "scope": "general"}
-        )(),
-        web_results=[],
+        interest_id="i1",
+        interest_topic="topic",
+        scope="general",
+        web_urls=[],
+        web_result_count=0,
         web_used=False,
         trigger="scheduled",
         provider_name="fake",

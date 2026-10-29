@@ -23,8 +23,8 @@ from unittest.mock import patch
 
 import pytest
 
+from brain import dev_constants
 from brain.attunement.schemas import (
-    SCHEMA_VERSION,
     CurrentRead,
     DetectorOutput,
     Evidence,
@@ -61,7 +61,7 @@ def _fake_detector_output(source_turn_id: str = "msg-0") -> DetectorOutput:
         mood_valence=0.6,
         mood_intensity=0.5,
         predicted_arc_shape="leisurely exchange",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     candidate = PatternCandidate(
         category="tone",
@@ -301,7 +301,7 @@ def test_ambient_block_injected_when_current_read_exists(tmp_path: Path):
         mood_valence=0.6,
         mood_intensity=0.5,
         predicted_arc_shape="leisurely exchange",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     write_current_read(persona_dir, read)
 
@@ -341,7 +341,7 @@ def test_attunement_block_in_build_system_message(tmp_path: Path):
         mood_valence=0.7,
         mood_intensity=0.8,
         predicted_arc_shape="banter arc",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     write_current_read(persona_dir, read)
 
@@ -379,7 +379,7 @@ def _seed_forming_pattern(persona_dir: Path, canonical_key: str = "warm_engaged"
         crystallised_at=None,
         falsified_at=None,
         examples=["long day today"] * 5,
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     (persona_dir / "attunement").mkdir(parents=True, exist_ok=True)
     _append_pattern(persona_dir, p)
@@ -420,7 +420,7 @@ def test_crystallisation_forming_to_known_on_10th_evidence(tmp_path: Path):
             mood_valence=0.6,
             mood_intensity=0.5,
             predicted_arc_shape="",
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
         pattern_candidates=[candidate],
     )
@@ -476,7 +476,7 @@ def test_crystallisation_emits_feed_event(tmp_path: Path):
         crystallised_at=None,  # not yet stamped
         falsified_at=None,
         examples=["long day today"] * 5,
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     _append_pattern(persona_dir, promoted)
 
@@ -516,7 +516,7 @@ def test_crystallise_only_fires_once_for_known_pattern(tmp_path: Path):
         crystallised_at="2026-05-15T12:00:00Z",  # already stamped
         falsified_at=None,
         examples=["example"],
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     (persona_dir / "attunement").mkdir(parents=True, exist_ok=True)
     _append_pattern(persona_dir, stamped)
@@ -575,20 +575,19 @@ def _exhaust_budget(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from datetime import UTC, datetime
 
     from brain.attunement.budget import _today_local_str, consume_call, get_remaining
-    from brain.attunement.schemas import DAILY_BUDGET_DEFAULT
 
     fixed_now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
     for name, real in (("_attunement_consume_call", consume_call), ("_attunement_budget_remaining", get_remaining)):
         monkeypatch.setattr(
             f"brain.chat.tool_loop.{name}",
-            lambda persona_dir, *, now, cap=DAILY_BUDGET_DEFAULT, _real=real: _real(persona_dir, now=fixed_now, cap=cap),
+            lambda persona_dir, *, now, cap=dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT, _real=real: _real(persona_dir, now=fixed_now, cap=cap),
         )
 
     budget_dir = persona_dir / "attunement"
     budget_dir.mkdir(parents=True, exist_ok=True)
     today = _today_local_str(fixed_now)
     budget_path = budget_dir / "daily_budget.json"
-    budget_path.write_text(json.dumps({"date": today, "count": DAILY_BUDGET_DEFAULT}))
+    budget_path.write_text(json.dumps({"date": today, "count": dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT}))
 
 
 def test_budget_exhausted_defers_without_calling_detector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

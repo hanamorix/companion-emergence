@@ -256,3 +256,31 @@ def test_register_stores_under_canonical_name() -> None:
         assert stored.name == "grief_love_blend"
     finally:
         vocabulary._unregister("grief_love_blend")
+
+
+def test_pool_by_canonical_name_collapses_spellings_to_the_max() -> None:
+    from brain.emotion.vocabulary import pool_by_canonical_name
+
+    # the larger value comes first for one pair and last for the other, so neither first-wins nor last-wins passes
+
+    values = {"comfort-seeking": 7.0, "Comfort_Seeking": 4.0, "love": 2.0, "grief_love_blend": 3.0, "love_grief_blend": 5.0}
+    before = dict(values)
+
+    assert pool_by_canonical_name(values) == {"comfort_seeking": 7.0, "love": 2.0, "grief_love_blend": 5.0}
+    assert values == before  # the input is not mutated
+    assert pool_by_canonical_name({}) == {}
+
+
+def test_pool_by_canonical_name_leaves_unknown_names_apart() -> None:
+    from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
+
+    unknown = "not_a_real_emotion"
+    assert vocabulary.get(unknown) is None
+    assert canonical_name(unknown) == unknown  # already canonical: unchanged
+
+    pooled = pool_by_canonical_name(
+        {unknown: 1.0, "Not-A-Real-Emotion": 2.0, "comfort": 3.0, "comfort_seeking_extra": 4.0, "comfort-seeking": 5.0}
+    )
+
+    # Two spellings of the unknown name share one key; look-alikes of a registered name stay their own keys.
+    assert pooled == {unknown: 2.0, "comfort": 3.0, "comfort_seeking_extra": 4.0, "comfort_seeking": 5.0}

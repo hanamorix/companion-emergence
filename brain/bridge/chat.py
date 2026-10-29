@@ -18,6 +18,8 @@ from typing import Any, Literal
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 
+# The four kinds of image the byte sniff in brain.images can recognise. Not the `files.image_types` setting, which says
+# which images the read_file tool opens and can only narrow this set.
 _ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 

@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory import judge_full_ft, judge_lora, judge_selftune, relevance_judge
 from brain.memory.relevance_judge import FakeRelevanceJudgeProvider, label_for_score
@@ -95,7 +96,7 @@ def _seed_serving_knob(store: MemoryStore, monkeypatch: pytest.MonkeyPatch, pers
     1.0/1.0 (P's knob)."""
     _small_tunables(monkeypatch)
     _seed_scenario(store, "w0")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT)
     result = _tick(store, persona_dir)
     assert result["fired"] is True and result["error"] is None
     n = store._conn.execute("SELECT COUNT(*) AS n FROM judge_knob_calibration").fetchone()["n"]
@@ -284,7 +285,7 @@ def test_k3b_first_ever_crash_before_swap_keeps_base_and_reaps_orphan(
     _seed_serving_knob(store, monkeypatch, tmp_path)  # base judge's knob week
     env = Env(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     real_swap = judge_lora.swap_champion_pointer
     monkeypatch.setattr(judge_lora, "swap_champion_pointer", _raise)
 
@@ -354,7 +355,7 @@ def test_k7b_pre_inc9_base_keyed_knob_is_not_applied_and_heals(
     Env(monkeypatch)
     _small_tunables(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT)
     assert _tick(store, tmp_path)["fired"] is True
     knob = store.get_judge_knob_calibration(_key(prior))
     assert knob is not None, "the knob week binds a knob to the serving checkpoint"
@@ -425,7 +426,7 @@ def test_k10a_reap_keeps_the_served_checkpoints_row_after_an_accept(
     env = Env(monkeypatch)
     _small_tunables(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     assert _tick(store, tmp_path)["accepted"] is True
     new = Path(env.builds[-1]["staged"])
     _gate_off(monkeypatch)
@@ -465,7 +466,7 @@ def test_k11_faulted_post_commit_row_delete_is_swept_next_tick(
     _seed_serving_knob(store, monkeypatch, tmp_path)
     env = Env(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_FULL_FT)
     real_delete = store.delete_judge_knob_calibration
     monkeypatch.setattr(store, "delete_judge_knob_calibration", _raise)
 
