@@ -44,7 +44,7 @@ def test_compose_subject_excludes_emotion_from_prompt() -> None:
     provider = MagicMock()
     provider.complete = MagicMock(return_value="the dream from this morning")
     cand = _candidate()
-    result = compose_subject(provider, cand, semantic_memory_excerpts=["the workshop"])
+    result = compose_subject(provider, cand, semantic_memory_excerpts=["the workshop"], companion_name="Nell")
     # Inspect what was sent to the provider.
     args, kwargs = provider.complete.call_args
     prompt_text = args[0] if args else kwargs.get("prompt", "")
@@ -57,7 +57,7 @@ def test_compose_subject_excludes_emotion_from_prompt() -> None:
 def test_compose_subject_includes_linked_memories() -> None:
     provider = MagicMock(complete=MagicMock(return_value="x"))
     cand = _candidate()
-    compose_subject(provider, cand, semantic_memory_excerpts=["the workshop bench"])
+    compose_subject(provider, cand, semantic_memory_excerpts=["the workshop bench"], companion_name="Nell")
     args, _ = provider.complete.call_args
     assert "workshop bench" in args[0]
 
@@ -73,6 +73,7 @@ def test_compose_tone_receives_subject_immutable() -> None:
         subject="the dream from this morning",
         candidate=cand,
         voice_template="be warm and direct",
+        companion_name="Nell",
     )
     args, _ = provider.complete.call_args
     assert "the dream from this morning" in args[0]
@@ -91,6 +92,7 @@ def test_compose_tone_uses_user_name_not_hana() -> None:
         candidate=cand,
         voice_template="warm",
         user_name="Henryk",
+        companion_name="Nell",
     )
     args, _ = provider.complete.call_args
     prompt_text = args[0]
@@ -117,6 +119,7 @@ def test_compose_tone_handles_none_snapshot_gracefully() -> None:
         subject="subject text",
         candidate=cand,
         voice_template="voice",
+        companion_name="Nell",
     )
     args, _ = provider.complete.call_args
     prompt_text = args[0]
@@ -136,6 +139,7 @@ def test_compose_decision_excludes_candidate_metadata() -> None:
         recent_send_history=[],
         current_local_time=datetime(2026, 5, 11, 22, 30, tzinfo=UTC),
         voice_edit_acceptance_rate=None,
+        companion_name="Nell",
     )
     args, _ = provider.complete.call_args
     prompt_text = args[0]
@@ -160,6 +164,7 @@ def test_compose_decision_parses_all_four_outcomes() -> None:
             recent_send_history=[],
             current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
             voice_edit_acceptance_rate=None,
+            companion_name="Nell",
         )
         assert result.decision == expected
 
@@ -173,6 +178,7 @@ def test_compose_decision_handles_malformed_json_as_hold() -> None:
         recent_send_history=[],
         current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
         voice_edit_acceptance_rate=None,
+        companion_name="Nell",
     )
     assert result.decision == "hold"
     assert "malformed" in result.reasoning.lower() or "parse" in result.reasoning.lower()
@@ -196,6 +202,7 @@ def test_compose_decision_voice_edit_carries_gravity_framing() -> None:
         current_voice_template="full voice template content",
         recent_voice_evolutions=[],
         current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+        companion_name="Nell",
     )
     args, _ = provider.complete.call_args
     prompt_text = args[0]
@@ -292,6 +299,7 @@ def test_compose_decision_reads_a_fenced_reply() -> None:
         MagicMock(complete=MagicMock(return_value=fenced)), rendered_message="x",
         recent_send_history=[], current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
         voice_edit_acceptance_rate=None,
+        companion_name="Nell",
     )
     assert result.decision == "send_quiet"
 
@@ -301,6 +309,7 @@ def test_compose_decision_records_a_malformed_reply(tmp_path) -> None:
         MagicMock(complete=MagicMock(return_value="I'd hold off.")), rendered_message="x",
         recent_send_history=[], current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
         voice_edit_acceptance_rate=None, persona_dir=tmp_path,
+        companion_name="Nell",
     )
     assert result.decision == "hold"
     (row,) = _rows(tmp_path)
@@ -312,8 +321,9 @@ def test_compose_decision_voice_edit_reads_fenced_and_records_malformed(tmp_path
         "proposal": {"old_text": "a", "new_text": "b", "rationale": "r", "evidence": []},
         "current_voice_template": "v", "recent_voice_evolutions": [],
         "current_local_time": datetime(2026, 5, 11, 12, 0, tzinfo=UTC), "persona_dir": tmp_path,
+        "companion_name": "Nell",
     }
-    fenced = '```json\n{"decision": "drop", "reasoning": "no"}\n```'
+    fenced ='```json\n{"decision": "drop", "reasoning": "no"}\n```'
     assert compose_decision_voice_edit(MagicMock(complete=MagicMock(return_value=fenced)), **common).decision == "drop"
     assert _rows(tmp_path) == []
     held = compose_decision_voice_edit(MagicMock(complete=MagicMock(return_value="no json")), **common)
@@ -329,5 +339,6 @@ def test_compose_decision_reads_a_reply_whose_reasoning_quotes_a_fenced_object()
         MagicMock(complete=MagicMock(return_value=raw)), rendered_message="x",
         recent_send_history=[], current_local_time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
         voice_edit_acceptance_rate=None,
+        companion_name="Nell",
     )
     assert result.decision == "send_quiet"

@@ -45,6 +45,7 @@ def test_compose_draft_fragment_calls_provider_once(tmp_path: Path) -> None:
         source="dream",
         source_id="dream_001",
         linked_memory_excerpts=["bench", "tools"],
+        companion_name="Nell",
     )
     assert provider.complete.call_count == 1
     assert result == "composed fragment text"
@@ -58,6 +59,7 @@ def test_compose_draft_fragment_falls_back_to_template_on_error(tmp_path: Path) 
         source="dream",
         source_id="dream_001",
         linked_memory_excerpts=["bench"],
+        companion_name="Nell",
     )
     assert isinstance(result, str)
     assert len(result) > 0
@@ -88,6 +90,7 @@ def test_compose_draft_fragment_uses_user_name_not_hana() -> None:
         source_id="dr_001",
         linked_memory_excerpts=["the workshop bench"],
         user_name="Henryk",
+        companion_name="Nell",
     )
     args, _ = provider.complete.call_args
     prompt_text = args[0]
@@ -193,3 +196,21 @@ def test_save_and_load_draft_review_cursor_roundtrip(tmp_path: Path) -> None:
     iso = "2026-06-04T10:30:00+00:00"
     save_draft_review_cursor(tmp_path, iso)
     assert load_draft_review_cursor(tmp_path) == iso
+
+
+def test_composers_require_companion_name() -> None:
+    """#135: a missing companion_name silently became "Nell" (the emotion-spike draft did that for every persona).
+    Without a default, a caller that forgets the name fails at once instead."""
+    import inspect
+
+    from brain.initiate import compose, draft, review, voice_reflection
+    from brain.soul import review as soul_review
+
+    functions = [
+        compose.compose_subject, compose.compose_tone, compose.compose_decision, compose.compose_decision_voice_edit,
+        draft.compose_draft_fragment, review._process_one_candidate, voice_reflection.run_voice_reflection_tick,
+        soul_review._build_messages,
+    ]
+    with_default = [f.__qualname__ for f in functions
+                    if inspect.signature(f).parameters["companion_name"].default is not inspect.Parameter.empty]
+    assert with_default == []
