@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import inspect
 import tempfile
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import mock_open
@@ -1041,7 +1042,31 @@ def test_run_folded_accepts_judge_selftune_interval_s() -> None:
     sig = inspect.signature(run_folded)
     assert "judge_selftune_interval_s" in sig.parameters
     param = sig.parameters["judge_selftune_interval_s"]
-    assert param.default == dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
+    assert param.default == "dev_constant"  # resolved inside run_folded (#602)
+
+
+def test_run_folded_reads_the_judge_interval_dev_constant_when_it_runs(tmp_path, monkeypatch) -> None:
+    """#602: the default is resolved inside run_folded, not frozen when the function is defined."""
+    from brain.bridge import supervisor as sup
+    from brain.bridge.events import EventBus
+    from brain.bridge.provider import FakeProvider
+
+    class _StopError(Exception):
+        pass
+
+    seen: dict = {}
+
+    def capture(**kwargs):  # noqa: ANN003, ANN202
+        seen.update(kwargs)
+        raise _StopError
+
+    monkeypatch.setattr(sup, "_build_gated_jobs", capture)
+    monkeypatch.setattr(dev_constants, "JUDGE_TUNE_INTERVAL_HOURS", 2.0)
+    persona_dir = tmp_path / "personas" / "canary"
+    persona_dir.mkdir(parents=True)
+    with pytest.raises(_StopError):
+        sup.run_folded(threading.Event(), persona_dir=persona_dir, provider=FakeProvider(), event_bus=EventBus())
+    assert seen["judge_selftune_interval_s"] == 2.0 * 3600.0
 
 
 # ---------------------------------------------------------------------------
