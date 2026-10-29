@@ -522,6 +522,21 @@ REMOVED: tuple[Removed, ...] = (
         ref="#554 (PR #561): the first commits of that PR added a scoped flip of the flag around each offline load, replaced by the process-wide default before merge",
         kind="code",
     ),
+    # --- the archive-with-dedup write moved to the conversation buffer (#556) -------------------------------------------
+    Removed(
+        names=("_archive_once", "_archive_batch_key", "_turn_identity"),
+        why="the dedup archive write and the turn identity moved to brain/ingest/buffer.py (archive_once, turn_identity) so the rollover archives through the same path as compaction and compaction keeps no private copy of it",
+        ref="#556 rollover keeps every recent turn (the pull request that moved them)",
+        kind="code",
+        scope=("brain/chat",),
+    ),
+    Removed(
+        names=("_summary_gen",),
+        why="the summary generation reader is public as summary_gen in brain/chat/compaction.py because the rollover reads it too; no private name and no alias",
+        ref="#556 review follow-up (the pull request that made it public)",
+        kind="code",
+        scope=("brain/chat",),
+    ),
 )
 
 
