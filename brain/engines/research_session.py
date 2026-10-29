@@ -9,7 +9,8 @@ marker with its text on the same line (``MEMORY: text``), or in bold or undersco
 alone on its line with no colon (``**MEMORY**``), upper case only. An extended marker splits only when the reply has no
 bare marker of that name, it sits in prompt order (NOTES, MEMORY, VERDICT) relative to every accepted marker, and it is the
 last of its name; a NOTES marker must also be the first non-blank line, so no preamble is ever cut off, and a VERDICT
-marker must carry a verdict the prompt offers (close, continue, spawn:), so prose cannot end a section. Everything else
+marker must be the last content of the reply or carry a verdict the prompt offers (close, continue, spawn:), so a prose
+line with text after it cannot end a section and lose that text. Everything else
 (``MEMORY's``, ``VERDICT- x``, a marker word mid-line) is text. A reply with all three bare markers parses exactly as it
 did before extended markers existed.
 """
@@ -31,7 +32,6 @@ _EXT_UPPER = re.compile(
 )
 _ORDER = ("NOTES", "MEMORY", "VERDICT")
 _SPAWN_CAP = 2
-_FIRST_LINE = re.compile(r"\s*([^\n]*)")
 
 
 @dataclass(frozen=True)
@@ -46,9 +46,18 @@ class SessionOutput:
     missing: tuple[str, ...]
 
 
-def _is_verdict_value(raw: str, body_start: int) -> bool:
-    """True when the line a VERDICT section would start with is a verdict the prompt offers: close, continue or spawn:."""
-    value = _FIRST_LINE.match(raw, body_start).group(1).strip().lower()
+def _is_taken_verdict(raw: str, body_start: int) -> bool:
+    """True when an inline VERDICT marker whose text starts at ``body_start`` may end its section without losing text.
+
+    A VERDICT section keeps only its first line, so what follows that line is dropped. The marker is therefore taken when
+    nothing but white space follows its value line (the last content of the reply, whatever the value says), or when the
+    value is a verdict the prompt offers (close, continue, spawn:). A prose "Verdict: ..." line with text after it is
+    neither, stays text, and loses nothing. The value line is the one ``parse_session_output`` keeps (same ``splitlines``).
+    """
+    lines = raw[body_start:].strip().splitlines()
+    if len(lines) <= 1:
+        return True
+    value = lines[0].strip().lower()
     return value in ("close", "continue") or value.startswith("spawn:")
 
 
@@ -81,15 +90,15 @@ def _find_markers(raw: str) -> list[tuple[str, int, int]]:
         lo = max(earlier, default=-1)
         hi = min(later, default=len(raw) + 1)
         index = bisect_left([start for start, _ in candidates], hi) - 1
-        # A VERDICT section keeps only its first line, so a prose "Verdict: ..." line must not become the marker: an
-        # extended VERDICT marker has to carry one of the verdicts the prompt offers.
-        while index >= 0 and candidates[index][0] > lo:
-            start, body_start = candidates[index]
-            if name != "VERDICT" or _is_verdict_value(raw, body_start):
-                accepted_start[name] = start
-                markers.append((name, start, body_start))
-                break
-            index -= 1
+        if index < 0 or candidates[index][0] <= lo:
+            continue
+        start, body_start = candidates[index]
+        # Only the last candidate counts, for every name: when it is rejected the earlier ones are prose too, and falling
+        # back to one would apply a verdict (a `close`) that the reply's own last verdict line did not give.
+        if name == "VERDICT" and not _is_taken_verdict(raw, body_start):
+            continue
+        accepted_start[name] = start
+        markers.append((name, start, body_start))
     markers.sort(key=lambda marker: marker[1])
     return markers
 

@@ -305,7 +305,7 @@ class ResearchEngine:
                     error=(
                         "no NOTES marker, reply kept as notes"
                         if session.degraded
-                        else "no " + " or ".join(session.missing) + " text in the reply"
+                        else "no readable " + " or ".join(session.missing) + " section in the reply"
                     ),
                 )
 

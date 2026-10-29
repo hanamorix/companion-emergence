@@ -12,8 +12,9 @@ This module makes the memory the fire would have made, for every such fire, once
   otherwise it is skipped and counted, never guessed.
 * What is made: the memory the live fire builds (``build_research_memory``), dated at the fire (``created_at``), written
   through ``route_write(source="research")`` exactly as the live path does, so the consolidation gate decides and the memory
-  store stays the only writer of memories.db. ``metadata["recovered_at"]`` lets the forgetting pass count its recent buffer
-  from now (brain/forgetting/policy.py). The close verdict, the spawned topics and the research-completion initiate
+  store stays the only writer of memories.db. ``metadata["recovered_from_notes"]`` marks it. It ages from its ``created_at``
+  like any research memory, so a memory from a fire older than the forgetting window can fade soon after recovery, as it
+  would have had it been created on time. The close verdict, the spawned topics and the research-completion initiate
   candidate of those old fires are NOT replayed: the interest's state has moved on since and an old ``close`` could shut a
   live thread.
 * Pacing: the gate classifies each candidate with one model call and has no batch cap, so a pass hands it ONE interest's
@@ -178,7 +179,7 @@ def _run_pass(persona_dir: Path, store: MemoryStore, now: datetime) -> dict[str,
                 fresh.append(fire)
         if fresh:
             pairs = _pair(persona_dir, interest_id, fresh, log, skipped, deferred, counts)
-            _write_pairs(persona_dir, store, pairs, now, linked, journal_path, deferred, counts, _scopes(persona_dir))
+            _write_pairs(persona_dir, store, pairs, linked, journal_path, deferred, counts, _scopes(persona_dir))
     if linked:
         _link(persona_dir, log_path, linked)
 
@@ -256,7 +257,6 @@ def _write_pairs(
     persona_dir: Path,
     store: MemoryStore,
     pairs: list[_Pair],
-    now: datetime,
     linked: dict[str, str],
     journal_path: Path,
     deferred: set[str],
@@ -291,7 +291,7 @@ def _write_pairs(
                     memory,
                     id=memory_id,
                     created_at=fire.fired_at,
-                    metadata={**memory.metadata, "recovered_from_notes": True, "recovered_at": iso_utc(now)},
+                    metadata={**memory.metadata, "recovered_from_notes": True},
                 )
                 route_write(store, memory, source="research")
                 append_jsonl(journal_path, {"key": _fire_key(fire), "memory_id": memory_id})

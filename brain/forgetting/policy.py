@@ -109,26 +109,6 @@ def is_within_import_grace(
     return elapsed < IMPORT_GRACE_LIVED_HOURS
 
 
-def _recent_buffer_anchor(memory: Memory) -> datetime:
-    """The moment the recent buffer counts from: ``created_at``, or the later ``metadata["recovered_at"]``.
-
-    A memory recovered from a stored note (brain/engines/research_recovery.py) keeps the date of the event it records
-    in ``created_at`` but only arrived in the store at ``recovered_at``. Counting its age from the event would put every
-    recovered memory older than the buffer straight into the next pass (a research memory's salience is far below the
-    fade gate), so the recovery would undo itself. Counting from ``recovered_at`` gives it the same buffer as any new
-    memory; after that the normal rules apply. An absent or unparseable value is ignored.
-    """
-    raw = memory.metadata.get("recovered_at") if isinstance(memory.metadata, dict) else None
-    if isinstance(raw, str):
-        try:
-            recovered_at = datetime.fromisoformat(raw)
-        except ValueError:
-            return memory.created_at
-        if recovered_at.tzinfo is not None and recovered_at > memory.created_at:
-            return recovered_at
-    return memory.created_at
-
-
 def is_exempt(
     memory: Memory,
     *,
@@ -141,10 +121,9 @@ def is_exempt(
     Three exemption classes per spec §4 (ordered cheapest first):
       1. Soul-crystallised
       2. Under soul-candidate review
-      3. Recent buffer — created (or, for a memory recovered from a stored note,
-         recovered) within RECENT_LIVED_HOURS hours, measured by WALL-CLOCK age
-         (despite the constant's historical name). During cold-start
-         (now_lived_age_hours <= 0) all memories are exempt.
+      3. Recent buffer — created within RECENT_LIVED_HOURS hours, measured by
+         WALL-CLOCK age (despite the constant's historical name). During
+         cold-start (now_lived_age_hours <= 0) all memories are exempt.
     """
     if memory.id in soul_crystallised_ids:
         return True
@@ -153,13 +132,12 @@ def is_exempt(
     # Recent-buffer check.
     if memory.created_at is None:
         return False
-    wall_age_s = (datetime.now(UTC) - _recent_buffer_anchor(memory)).total_seconds()
+    wall_age_s = (datetime.now(UTC) - memory.created_at).total_seconds()
     # Approximation: lived_hours since creation ≈ wall_age_s * (lived/wall ratio)
     # but at cold-start (no rate established) treat as fully recent.
     if now_lived_age_hours <= 0.0:
         return True
-    # Recent-buffer grace is wall-clock: a memory created (or recovered, see
-    # _recent_buffer_anchor) within RECENT_LIVED_HOURS hours of now is exempt
-    # regardless of lived-rate.
+    # Recent-buffer grace is wall-clock: a memory created within
+    # RECENT_LIVED_HOURS hours of now is exempt regardless of lived-rate.
     wall_age_hours = wall_age_s / 3600.0
     return wall_age_hours <= RECENT_LIVED_HOURS

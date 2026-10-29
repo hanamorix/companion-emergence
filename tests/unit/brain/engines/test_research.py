@@ -920,6 +920,18 @@ def _session_rows(persona_dir: Path) -> list[str]:
     return [raw for site, raw in _pf_sites(persona_dir) if site == "research_session"]
 
 
+def _session_errors(persona_dir: Path) -> list[str]:
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    if not path.exists():
+        return []
+    rows = map(_json.loads, path.read_text(encoding="utf-8").splitlines())
+    return [r["error"] for r in rows if r["site"] == "research_session"]
+
+
 def test_inline_reply_creates_the_memory_applies_close_and_saves_clean_notes(tmp_path: Path):
     reply = (
         "NOTES:\nread two papers about light\nsecond finding\n"
@@ -954,13 +966,24 @@ def test_inline_spawn_verdict_creates_side_quest_interests(tmp_path: Path):
         "NOTES:\nfound stuff\n\nVERDICT:\ncontinue",
         "NOTES:\nfound stuff\n\nMEMORY:\n\nVERDICT:\ncontinue",
         "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.",
+        "NOTES:\nfound stuff\nMEMORY: I explored it today.\nVERDICT: maybe later\nand a closing remark\n",
     ],
-    ids=["degraded", "no-memory", "empty-memory", "no-verdict"],
+    ids=["degraded", "no-memory", "empty-memory", "no-verdict", "inline-verdict-line-not-taken"],
 )
 def test_a_reply_the_parser_could_not_read_is_recorded_as_a_parse_failure(tmp_path: Path, reply: str):
     _engine, result, _memory = _fire_with_reply(tmp_path, reply)
     assert result.fired is not None  # the fire itself is unchanged
     assert _session_rows(tmp_path) == [reply]
+    (error,) = _session_errors(tmp_path)
+    if "NOTES:" in reply:
+        assert error.startswith("no readable ") and error.endswith(" section in the reply")
+    else:
+        assert error == "no NOTES marker, reply kept as notes"
+
+
+def test_the_parse_failure_error_names_the_missing_section(tmp_path: Path):
+    _fire_with_reply(tmp_path, "NOTES:\nfound stuff\n\nVERDICT:\ncontinue")
+    assert _session_errors(tmp_path) == ["no readable MEMORY section in the reply"]
 
 
 @pytest.mark.no_base_failure(

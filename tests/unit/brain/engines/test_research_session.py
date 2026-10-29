@@ -183,6 +183,19 @@ def test_inline_verdict_line_ahead_of_a_bare_memory_is_not_a_marker():
     assert out.verdict == "close"
 
 
+def test_an_offered_inline_verdict_ahead_of_a_bare_memory_is_not_a_marker():
+    # The only inline VERDICT candidate, a value the prompt offers: only the order guard (the `lo` half) keeps it in notes.
+    out = parse_session_output("NOTES:\nn\nVERDICT: close\nmore notes\n\nMEMORY:\nI felt it.\n")
+    assert out.notes == "n\nVERDICT: close\nmore notes"
+    assert out.memory == "I felt it." and out.verdict == "continue" and out.missing == ("VERDICT",)
+
+
+def test_an_inline_memory_ahead_of_a_bare_notes_marker_is_not_a_marker():
+    # The only inline MEMORY candidate, sitting before a bare NOTES: the order guard (the `lo` half) rejects it.
+    out = parse_session_output("NOTES:\nx\nMEMORY: x\nNOTES:\nn\nVERDICT:\nclose\n")
+    assert out.memory is None and out.verdict == "close" and out.missing == ("MEMORY",)
+
+
 def test_two_inline_lines_of_one_name_only_the_last_splits():
     raw = "NOTES:\nn1\nMEMORY: first, a mention\nn2\nMEMORY: the real one\nVERDICT: close\n"
     out = parse_session_output(raw)
@@ -262,20 +275,80 @@ def test_a_prose_verdict_line_does_not_end_a_bare_memory():
 
 
 @pytest.mark.parametrize("value", ["close", "continue", "spawn: a topic", "Close", "CONTINUE"])
-def test_an_inline_verdict_must_be_one_the_prompt_offers(value):
-    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVerdict: {value}\n")
+def test_an_inline_verdict_the_prompt_offers_is_the_marker_even_with_text_after_it(value):
+    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVerdict: {value}\na postscript\n")
     assert out.missing == () and out.memory == "m"
 
 
+# The VERDICT value shapes seen in the lost blocks (counts and shapes only; the text here is invented): the line is the last
+# content of the reply, and whatever its value it is the marker, so the memory text stays clean and nothing is flagged.
+@pytest.mark.parametrize(
+    ("value", "verdict", "spawn"),
+    [
+        ("continue", "continue", ()),
+        ("close", "close", ()),
+        ("spawn: topic a; topic b", "continue", ("topic a", "topic b")),
+        ("continue; text after the value", "continue", ()),
+        ("continue.", "continue", ()),
+        ("**close**", "continue", ()),
+        ("maybe", "continue", ()),
+        ("keep going", "continue", ()),
+        ("continue - more to find", "continue", ()),
+    ],
+)
+@pytest.mark.parametrize("tail", ["", "\n", "\n\n  \n", "\r\n"], ids=["eof", "nl", "blank-lines", "crlf"])
+def test_an_inline_verdict_that_is_the_last_content_is_the_marker_whatever_its_value(value, verdict, spawn, tail):
+    out = parse_session_output(f"NOTES:\nn\nMEMORY: I felt it.\nVERDICT: {value}{tail}")
+    assert out.memory == "I felt it."
+    assert out.notes == "n"
+    assert out.missing == ()
+    assert (out.verdict, out.spawn_topics) == (verdict, spawn)
+
+
 @pytest.mark.parametrize("value", ["close.", "**close**", "maybe", "mixed", "this approach is promising"])
-def test_an_inline_verdict_that_is_not_one_the_prompt_offers_is_text(value):
-    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVERDICT: {value}\n")
-    assert out.missing == ("VERDICT",) and out.memory == f"m\nVERDICT: {value}"
+def test_an_inline_verdict_with_text_after_it_and_no_offered_value_is_text(value):
+    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVERDICT: {value}\nand more of the memory\n")
+    assert out.missing == ("VERDICT",)
+    assert out.memory == f"m\nVERDICT: {value}\nand more of the memory"
 
 
-def test_the_last_inline_verdict_line_that_is_a_verdict_is_the_marker():
+def test_a_bold_verdict_marker_alone_on_its_line_uses_the_next_non_blank_line_as_its_value():
+    out = parse_session_output("NOTES:\nn\nMEMORY: m\n**VERDICT:**\n\nclose.\n")
+    assert out.memory == "m" and out.missing == () and out.verdict == "continue"
+    out = parse_session_output("NOTES:\nn\nMEMORY: m\n**VERDICT:**\nmaybe\nmore\n")
+    assert out.memory == "m\n**VERDICT:**\nmaybe\nmore" and out.missing == ("VERDICT",)
+
+
+@pytest.mark.parametrize("separator", ["\r", "\x0b", "\x0c", "\x85", " "])
+def test_the_rule_and_the_parse_read_the_same_value_line(separator):
+    # The section keeps its first line as splitlines() sees it; the rule must judge that same line, not the text up to "\n".
+    out = parse_session_output(f"NOTES:\nn\nMEMORY: m\nVERDICT: close{separator}more\n")
+    assert out.memory == "m" and out.verdict == "close" and out.missing == ()
+
+
+def test_only_the_last_inline_verdict_candidate_counts_so_an_earlier_close_is_not_applied():
+    # The last candidate is prose with text after it, so there is no VERDICT marker; the earlier `close` stays text.
+    raw = "NOTES:\nn\nMEMORY: m1\nVERDICT: close\nm2 more memory\nVerdict: mixed on this\nm3\n"
+    out = parse_session_output(raw)
+    assert out.verdict == "continue" and out.missing == ("VERDICT",)
+    assert out.memory == "m1\nVERDICT: close\nm2 more memory\nVerdict: mixed on this\nm3"
+
+
+def test_a_prose_verdict_line_ahead_of_the_real_last_verdict_stays_text():
+    out = parse_session_output("NOTES:\nn\nMEMORY: m1\nVerdict: mixed\nm2\nVERDICT: close\n")
+    assert out.memory == "m1\nVerdict: mixed\nm2" and out.verdict == "close" and out.missing == ()
+
+
+# The owner-accepted consequence of the rule (spec delta, residual (i)): a verdict-labelled LAST line is the verdict, even prose.
+def test_a_verdict_labelled_last_line_is_taken_as_the_verdict_even_when_it_is_prose():
+    out = parse_session_output("NOTES:\nfinding\nVerdict: promising\n")
+    assert out.notes == "finding" and out.verdict == "continue" and out.missing == ("MEMORY",)
+
+
+def test_with_two_verdict_labelled_last_lines_the_last_is_taken_and_the_close_before_it_is_not_applied():
     out = parse_session_output("NOTES:\nn\nMEMORY: m\nVERDICT: close\nVerdict: because it was done\n")
-    assert out.verdict == "close" and out.memory == "m"
+    assert out.verdict == "continue" and out.missing == ()
+    assert out.memory == "m\nVERDICT: close"
 
 
 def test_an_inline_marker_after_a_later_bare_marker_is_not_a_marker():
@@ -437,6 +510,9 @@ def test_parser_never_raises_and_stays_linear():
         "20k NOTES then 20k MEMORY": "NOTES:\n" * 20_000 + "MEMORY: x\n" * 20_000,
         "interleaved x5000": "NOTES:\nMEMORY: a\n**VERDICT:** b\nMEMORY:\n" * 5000,
         "100k bold lines": "NOTES:\n" + "**MEMORY**\n" * 100_000,
+        # The trailing line makes the last VERDICT candidate rejected, so a scan that walked back over the candidates
+        # would visit all 40000 (40.9 s in a draft); without the trailing line it would stop at the first.
+        "40k prose verdict lines then text": "NOTES:\nn\nMEMORY: m\n" + "VERDICT: prose line\n" * 40_000 + "trailing\n",
     }
     for name, raw in big.items():
         start = time.perf_counter()

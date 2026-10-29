@@ -142,7 +142,7 @@ def test_every_lost_memory_is_recovered_as_the_live_fire_would_have_made_it(tmp_
         assert memory.content == expected
         assert memory.memory_type == "research" and memory.domain == "us" and memory.importance == 5.0
         assert memory.created_at == fire.fired_at
-        assert set(memory.metadata) == live_keys | {"recovered_from_notes", "recovered_at"}
+        assert set(memory.metadata) == live_keys | {"recovered_from_notes"}
         assert memory.metadata["interest_id"] == fire.interest_id
         assert memory.metadata["interest_topic"] == fire.topic
         assert memory.metadata["scope"] == "external"
@@ -189,6 +189,29 @@ def test_only_memory_less_fires_with_an_inline_memory_and_verdict_in_their_own_b
     assert state["counts"]["ambiguous"] == 1       # iB's date
     assert state["counts"]["no_block"] == 4        # iA day 2 (clean), 3 (none), 4 (no verdict); iC day 5 (clean)
     assert {p: p.read_bytes() for p in (tmp_path / "research").iterdir()} == before_notes
+
+
+def test_a_block_whose_last_verdict_line_has_any_value_is_recovered_with_a_clean_memory(tmp_path, store):
+    # The VERDICT value shapes of the lost blocks that are not a bare close/continue/spawn: (shape only, invented text).
+    semicolon = "read about {x}\nMEMORY: A memory about {x} that ends here.\nVERDICT: continue; one more look later"
+    dotted = "read about {x}\nMEMORY: A memory about {x} that ends here.\nVERDICT: continue."
+    prose_inside = "read about {x}\nMEMORY: A memory about {x}.\nVERDICT: x\nanother line of the memory"
+    fires = _build(tmp_path, {
+        "i1": [(_fire("i1", 0), _INLINE)],           # the one that proves the run does something
+        "i2": [(_fire("i2", 0), semicolon)],
+        "i3": [(_fire("i3", 0), dotted)],
+        "i4": [(_fire("i4", 0), prose_inside)],      # a non-offered value with a line after it: not a verdict line
+    })
+    _run_to_the_end(store)
+    links = _log(tmp_path)
+    for fire in fires[1:3]:
+        memory = store.get(links[(fire.interest_id, fire.fired_at)], bump=False)
+        assert memory is not None
+        assert memory.content == f"A memory about {fire.interest_id}-{fire.fired_at:%m%d} that ends here."
+    assert links[("i1", fires[0].fired_at)] is not None
+    assert links[("i4", fires[3].fired_at)] is None
+    state = json.loads((tmp_path / research_recovery.STATE_FILE).read_text(encoding="utf-8"))
+    assert state["counts"]["recovered"] == 3 and state["counts"]["no_block"] == 1
 
 
 def test_a_date_whose_recoverable_blocks_do_not_match_its_fires_is_skipped(tmp_path, store):
@@ -516,6 +539,11 @@ def test_a_candidate_whose_journal_line_was_lost_is_found_in_the_store_when_the_
     assert store.count() == 2
     research_recovery._DEFERRED.clear()
     research_recovery._STALLED.clear()
+    # One pass after the restart: the fire whose journal line was lost is found in the store (the second layer of the
+    # duplicate protection) and only linked, so nothing is enqueued and the store gains nothing.
+    counts = research_recovery.run_recovery(tmp_path, store)
+    assert counts["resumed"] == 1 and counts["recovered"] == 0
+    assert _queued_ids(tmp_path) == [] and store.count() == 2
     _run_to_the_end(store)
     assert store.count() == len(fires)
     assert len(set(_log(tmp_path).values())) == len(fires)
@@ -536,7 +564,15 @@ def test_an_unexpected_error_stalls_the_job_until_the_next_start_even_with_an_em
     assert research_recovery.has_recovery_work(tmp_path) is True
 
 
-@pytest.mark.parametrize("state", [{"counts": [1, 2], "skipped": "x", "done": "yes"}, {"counts": {"recovered": "many"}}, [1, 2]])
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"counts": [1, 2], "skipped": "x", "done": "yes"},
+        {"counts": {"recovered": "many"}},
+        {"skipped": [1, {"a": 2}]},
+        [1, 2],
+    ],
+)
 def test_a_foreign_or_damaged_state_file_does_not_wedge_recovery(tmp_path, store, state):
     fires = _three_interests(tmp_path)
     (tmp_path / research_recovery.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
