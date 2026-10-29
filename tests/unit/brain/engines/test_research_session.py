@@ -183,6 +183,10 @@ def test_inline_verdict_line_ahead_of_a_bare_memory_is_not_a_marker():
     assert out.verdict == "close"
 
 
+@pytest.mark.no_base_failure(
+    reason="guard pin: the pre-#591 parser also keeps these lines where they are; the test only reads the new "
+    "`SessionOutput.missing` field (absent on base), so it guards that the extended-marker rules add no split here"
+)
 def test_an_offered_inline_verdict_ahead_of_a_bare_memory_is_not_a_marker():
     # The only inline VERDICT candidate, a value the prompt offers: only the order guard (the `lo` half) keeps it in notes.
     out = parse_session_output("NOTES:\nn\nVERDICT: close\nmore notes\n\nMEMORY:\nI felt it.\n")
@@ -190,6 +194,10 @@ def test_an_offered_inline_verdict_ahead_of_a_bare_memory_is_not_a_marker():
     assert out.memory == "I felt it." and out.verdict == "continue" and out.missing == ("VERDICT",)
 
 
+@pytest.mark.no_base_failure(
+    reason="guard pin: the pre-#591 parser also keeps these lines where they are; the test only reads the new "
+    "`SessionOutput.missing` field (absent on base), so it guards that the extended-marker rules add no split here"
+)
 def test_an_inline_memory_ahead_of_a_bare_notes_marker_is_not_a_marker():
     # The only inline MEMORY candidate, sitting before a bare NOTES: the order guard (the `lo` half) rejects it.
     out = parse_session_output("NOTES:\nx\nMEMORY: x\nNOTES:\nn\nVERDICT:\nclose\n")
@@ -213,6 +221,10 @@ def test_prose_verdict_line_ahead_of_the_inline_memory_is_not_a_marker():
     assert out.missing == ("VERDICT",)
 
 
+@pytest.mark.no_base_failure(
+    reason="guard pin: the pre-#591 parser also keeps these lines where they are; the test only reads the new "
+    "`SessionOutput.missing` field (absent on base), so it guards that the extended-marker rules add no split here"
+)
 def test_prose_notes_line_after_a_preamble_is_not_a_marker_and_loses_nothing():
     raw = "Today I read about X.\nIt was long.\nNotes: it was hard going\nmore\nMEMORY: m\nVERDICT: close\n"
     out = parse_session_output(raw)
@@ -260,6 +272,10 @@ def test_title_case_verdict_line_ahead_of_a_bare_memory_does_not_split():
 # ---- a prose "Verdict:" line is never taken for the marker (a VERDICT section keeps only its first line) --------------------
 
 
+@pytest.mark.no_base_failure(
+    reason="guard pin: the pre-#591 parser also keeps these lines where they are; the test only reads the new "
+    "`SessionOutput.missing` field (absent on base), so it guards that the extended-marker rules add no split here"
+)
 def test_a_prose_verdict_line_does_not_end_the_notes_and_loses_nothing():
     raw = "NOTES:\nfinding one\nVerdict: this approach is promising\nfinding two\nfinding three\n"
     out = parse_session_output(raw)
@@ -267,6 +283,10 @@ def test_a_prose_verdict_line_does_not_end_the_notes_and_loses_nothing():
     assert out.missing == ("MEMORY", "VERDICT")  # recorded by the caller as an unread layout
 
 
+@pytest.mark.no_base_failure(
+    reason="guard pin: the pre-#591 parser also keeps these lines where they are; the test only reads the new "
+    "`SessionOutput.missing` field (absent on base), so it guards that the extended-marker rules add no split here"
+)
 def test_a_prose_verdict_line_does_not_end_a_bare_memory():
     raw = "NOTES:\nn\nMEMORY:\nA trial changed how I think.\nVerdict: the evidence convinced me.\nIt stayed with me.\n"
     out = parse_session_output(raw)
@@ -326,6 +346,16 @@ def test_the_rule_and_the_parse_read_the_same_value_line(separator):
     assert out.memory == "m" and out.verdict == "close" and out.missing == ()
 
 
+@pytest.mark.parametrize("separator", ["\r", "\x0b", "\u2028"])
+def test_a_line_break_that_only_splitlines_sees_does_not_hide_text_after_a_value_that_is_not_offered(separator):
+    # `maybe` is not an offered verdict and text follows it after a break that only splitlines() recognises; judging the
+    # value by the text up to "\n" would take the marker and silently drop the text after the break.
+    raw = f"NOTES:\nn\nMEMORY: m\nVERDICT: maybe{separator}more text of the memory\n"
+    out = parse_session_output(raw)
+    assert out.missing == ("VERDICT",)
+    assert out.memory == f"m\nVERDICT: maybe{separator}more text of the memory"
+
+
 def test_only_the_last_inline_verdict_candidate_counts_so_an_earlier_close_is_not_applied():
     # The last candidate is prose with text after it, so there is no VERDICT marker; the earlier `close` stays text.
     raw = "NOTES:\nn\nMEMORY: m1\nVERDICT: close\nm2 more memory\nVerdict: mixed on this\nm3\n"
@@ -351,6 +381,10 @@ def test_with_two_verdict_labelled_last_lines_the_last_is_taken_and_the_close_be
     assert out.memory == "m\nVERDICT: close"
 
 
+@pytest.mark.no_base_failure(
+    reason="guard pin: the pre-#591 parser also keeps these lines where they are; the test only reads the new "
+    "`SessionOutput.missing` field (absent on base), so it guards that the extended-marker rules add no split here"
+)
 def test_an_inline_marker_after_a_later_bare_marker_is_not_a_marker():
     out = parse_session_output("NOTES:\nn\nVERDICT:\nclose\nMemory: afterthought")
     assert out.memory is None and out.verdict == "close" and out.missing == ("MEMORY",)

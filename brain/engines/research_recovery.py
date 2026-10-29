@@ -137,19 +137,19 @@ def _scopes(persona_dir: Path) -> dict[str, str]:
     return {i["id"]: i["scope"] for i in items if isinstance(i, dict) and "id" in i and isinstance(i.get("scope"), str)}
 
 
-def run_recovery(persona_dir: Path, store: MemoryStore, *, now: datetime | None = None) -> dict[str, int]:
+def run_recovery(persona_dir: Path, store: MemoryStore) -> dict[str, int]:
     """One pass: recover one interest's lost memories, link them, and mark the job done when nothing is left.
 
     Returns this pass's counts. An unexpected error stalls the persona for this process and propagates.
     """
     try:
-        return _run_pass(persona_dir, store, now or datetime.now(UTC))
+        return _run_pass(persona_dir, store)
     except Exception:
         _STALLED.add(str(persona_dir))
         raise
 
 
-def _run_pass(persona_dir: Path, store: MemoryStore, now: datetime) -> dict[str, int]:
+def _run_pass(persona_dir: Path, store: MemoryStore) -> dict[str, int]:
     state = _load_state(persona_dir)
     if state.get("done"):
         return dict.fromkeys(_COUNTERS, 0)
@@ -194,7 +194,7 @@ def _run_pass(persona_dir: Path, store: MemoryStore, now: datetime) -> dict[str,
         {
             "version": 1,
             "done": done,
-            "finished_at": iso_utc(now) if done else None,
+            "finished_at": iso_utc(datetime.now(UTC)) if done else None,
             "counts": totals,
             "skipped": sorted(skipped),
         },
