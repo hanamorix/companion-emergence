@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from brain.memory import peak_rss
+from tests.thread_support import finish_threads
 
 _linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux peak counter")
 
@@ -304,7 +305,8 @@ def test_a_latch_or_a_warning_while_a_sampler_runs_does_not_deadlock(forced) -> 
 
     worker = threading.Thread(target=_go, daemon=True)
     worker.start()
-    assert done.wait(5.0), "stop() joins outside the lock; the sampler never takes it"
+    finish_threads(worker)
+    assert done.is_set(), "stop() joins outside the lock; the sampler never takes it"
 
 
 def test_without_the_force_linux_keeps_the_exact_reading(monkeypatch, tmp_path) -> None:

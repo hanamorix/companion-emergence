@@ -17,6 +17,7 @@ import brain.bridge.supervisor as supervisor_mod
 from brain import tunables
 from brain.bridge.events import EventBus
 from brain.memory import embedding_backfill
+from tests.thread_support import finish_threads
 
 _KEY = "embedding_backfill.tick_interval_seconds"
 
@@ -64,8 +65,7 @@ def _waits_of_one_loop(persona_dir: Path, monkeypatch, **tick) -> list[float | N
     }
     thread = threading.Thread(target=lambda: supervisor_mod.run_folded(**kwargs), daemon=True)
     thread.start()
-    thread.join(timeout=30)
-    stop_event.set()
+    finish_threads(thread)
     assert not thread.is_alive()
     return stop_event.waits
 
