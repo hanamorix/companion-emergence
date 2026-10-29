@@ -702,12 +702,16 @@ def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_loaded_arc
 
 
 def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_directly_built_arc(
-    persona_dir: Path, store: MemoryStore
+    persona_dir: Path, store: MemoryStore, caplog
 ):
     # `ReflexArc` accepts any keys when built directly; the gate must not depend on the loader.
     arc = _arc("comfort_arc", trigger={"Comfort_Seeking": 5.0, "love": 5.0})
-    result = _run_crystallizer_with_proposal(persona_dir, store, [arc], {"comfort-seeking": 7.0})
+    with caplog.at_level(logging.INFO, logger="brain.growth.crystallizers.reflex"):
+        result = _run_crystallizer_with_proposal(
+            persona_dir, store, [arc], {"comfort-seeking": 7.0}
+        )
     assert result.emergences == []
+    assert any("gate 8" in r.getMessage() for r in caplog.records)
 
 
 def test_emergence_gate_9_rejects_when_at_total_cap(persona_dir):
