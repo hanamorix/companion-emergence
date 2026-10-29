@@ -17,6 +17,7 @@ from datetime import UTC
 from datetime import datetime as _datetime
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.store import BufferTurn
 from brain.health.json_io import Recovery, iter_jsonl, read_json, write_json
 
@@ -219,18 +220,16 @@ def should_run_supplementary_backfill(persona_dir: Path) -> bool:
     The new category dimensions (topic_affinity, response_shape, relational)
     need a supplementary bootstrap from history.  Returns False when there is
     no prior completed state or when the completed state is already at the
-    current SCHEMA_VERSION.
+    current dev_constants.ATTUNEMENT_SCHEMA_VERSION.
     """
-    from brain.attunement.schemas import SCHEMA_VERSION
-
     existing = _load_state(persona_dir)
     if _unfinished_supplementary(existing):
         return True  # #473: a supplementary pass that stopped early (refused, deferred, yielded) resumes
     if existing is None or existing.status != "complete":
         return False
-    old, new = _schema_key(existing.schema_version), _schema_key(SCHEMA_VERSION)
+    old, new = _schema_key(existing.schema_version), _schema_key(dev_constants.ATTUNEMENT_SCHEMA_VERSION)
     if old is None or new is None:  # unparseable: re-run on any difference, as before
-        return existing.schema_version != SCHEMA_VERSION
+        return existing.schema_version != dev_constants.ATTUNEMENT_SCHEMA_VERSION
     # Only OLDER: a newer version is what a rolled-back brain finds (#295).
     return old < new
 
@@ -278,8 +277,6 @@ def run_backfill(
     from brain.attunement.budget import lock as _attunement_budget_lock
     from brain.attunement.crystallise import check_crystallisations
     from brain.attunement.schemas import (
-        DAILY_BUDGET_DEFAULT,
-        SCHEMA_VERSION,
         BackfillState,
     )
     from brain.attunement.store import merge_into_learned
@@ -292,7 +289,7 @@ def run_backfill(
     # signal emotion_backfill's _user_recently_active wraps.
 
     if cap is None:
-        cap = DAILY_BUDGET_DEFAULT
+        cap = dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT
 
     now_dt = now_dt or _datetime.now(UTC)
     now_iso = _now_iso_str(now_dt)
@@ -374,7 +371,7 @@ def run_backfill(
         patterns_emitted=patterns_emitted_so_far,
         status="running",
         last_cursor=last_cursor,
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         pass_kind="supplementary" if supplementary else "full",
         categories=tuple(sorted(only_categories)) if supplementary and only_categories is not None else None,
     )
@@ -494,7 +491,7 @@ def run_supplementary_backfill(
 
     Extracts ONLY the new category dimensions (topic_affinity, response_shape,
     relational) from history. tone + cadence are already learned — no
-    double-counting. Writes a fresh state at the current SCHEMA_VERSION so the
+    double-counting. Writes a fresh state at the current dev_constants.ATTUNEMENT_SCHEMA_VERSION so the
     feed-source will not fire another backfill_complete for the same completion.
     """
     return run_backfill(

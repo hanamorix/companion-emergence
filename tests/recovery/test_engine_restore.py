@@ -13,7 +13,9 @@ def _seed_current(persona: Path):
     s.create(Memory(id="faded", content="short summary", memory_type="conversation",
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
     # create() ignores `state`; force 'faded' into fading state via SQL.
-    s._conn.execute("UPDATE memories SET state='fading' WHERE id='faded'")
+    s._conn.execute(
+        "UPDATE memories SET state='fading', content_snapshot='stale snapshot' WHERE id='faded'"
+    )
     s._conn.commit()
     s.close()
 
@@ -49,6 +51,7 @@ def test_source_mode_restores_missing_and_unfades(tmp_path):
     refaded = s.get("faded")
     assert refaded.state == "active"
     assert refaded.content == "ORIGINAL long text"
+    assert refaded.content_snapshot is None
     assert s.get("keep").content == "kept"
     s.close()
 

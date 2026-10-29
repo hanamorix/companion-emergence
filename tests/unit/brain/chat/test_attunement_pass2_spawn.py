@@ -139,7 +139,8 @@ def test_spawn_skips_when_message_too_short(tmp_path: Path):
 
 def test_run_attunement_pass2_calls_mark_addressed(tmp_path: Path):
     """_run_attunement_pass2 calls mark_addressed with addressed_pattern_ids from DetectorOutput."""
-    from brain.attunement.schemas import SCHEMA_VERSION, CurrentRead, DetectorOutput
+    from brain import dev_constants
+    from brain.attunement.schemas import CurrentRead, DetectorOutput
     from brain.chat.tool_loop import _run_attunement_pass2
 
     fake_read = CurrentRead(
@@ -152,7 +153,7 @@ def test_run_attunement_pass2_calls_mark_addressed(tmp_path: Path):
         mood_valence=0.5,
         mood_intensity=0.5,
         predicted_arc_shape="steady",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     fake_output = DetectorOutput(
         current_read=fake_read,
@@ -207,25 +208,21 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
     from contextlib import contextmanager
     from datetime import UTC, datetime
 
+    from brain import dev_constants
     from brain.attunement import budget
-    from brain.attunement.schemas import (
-        DAILY_BUDGET_DEFAULT,
-        SCHEMA_VERSION,
-        CurrentRead,
-        DetectorOutput,
-    )
+    from brain.attunement.schemas import CurrentRead, DetectorOutput
     from brain.chat import tool_loop
     from brain.chat.tool_loop import _run_attunement_pass2
 
     now = datetime.now(UTC)
-    for _ in range(DAILY_BUDGET_DEFAULT - 1):
+    for _ in range(dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT - 1):
         assert budget.consume_call(tmp_path, now=now)
     assert budget.get_remaining(tmp_path, now=now) == 1
 
     fake_read = CurrentRead(
         ts="2026-06-02T10:00:00Z", source_turn_id="t1", tone_label="warm", tone_justification="open",
         cadence_label="flowing", cadence_justification="long", mood_valence=0.5, mood_intensity=0.5,
-        predicted_arc_shape="steady", schema_version=SCHEMA_VERSION,
+        predicted_arc_shape="steady", schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     calls: list[int] = []
     arrivals: list[int] = []
@@ -266,4 +263,4 @@ def test_two_attunement_calls_at_once_cannot_overshoot_the_daily_cap(tmp_path: P
         for t in threads:
             finish_threads(t)
     assert len(calls) == 1
-    assert budget._load(tmp_path)["count"] == DAILY_BUDGET_DEFAULT
+    assert budget._load(tmp_path)["count"] == dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT

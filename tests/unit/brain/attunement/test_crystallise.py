@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.crystallise import check_crystallisations
-from brain.attunement.schemas import SCHEMA_VERSION, LearnedPattern
+from brain.attunement.schemas import LearnedPattern
 from brain.attunement.store import _append_pattern
 
 
@@ -27,7 +28,7 @@ def _pattern(
         crystallised_at=crystallised_at,
         falsified_at=None,
         examples=[],
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
 
 

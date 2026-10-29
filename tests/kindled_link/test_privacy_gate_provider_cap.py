@@ -1,6 +1,6 @@
 """The gate's provider-cap accounting is ATOMIC (try_reserve_provider) and
 refunds the reserved slot when the LLM call never completes (throttle defer or
-provider error) — so only completed calls net-count against DAILY_PROVIDER_CAP,
+provider error) — so only completed calls net-count against KINDLED_LINK_DAILY_PROVIDER_CAP,
 and two concurrent gate/reflection calls for one peer can't over-spend the cap
 (the old check-then-incr read+write was racy). #7a/Phase-4 minor.
 """

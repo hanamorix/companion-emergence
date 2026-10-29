@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory import judge_eval, judge_full_ft, judge_lora, judge_selftune, relevance_judge
 from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
@@ -102,10 +103,10 @@ def _consumed(store: MemoryStore, row_id: int) -> bool:
 
 def _set_tier(monkeypatch: pytest.MonkeyPatch, grade: str) -> None:
     """Scripted RAM + headroom so tier-detect selects `grade` (no downgrade)."""
-    if grade == judge_selftune.TUNE_GRADE_FULL_FT:
+    if grade == dev_constants.JUDGE_TUNE_GRADE_FULL_FT:
         ram = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES + 1.0
         head = judge_selftune.JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES + 1.0
-    elif grade == judge_selftune.TUNE_GRADE_LORA:
+    elif grade == dev_constants.JUDGE_TUNE_GRADE_LORA:
         ram = judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES + 1.0
         head = judge_selftune.JUDGE_TUNE_FOOTPRINT_LORA_BYTES + 1.0
     else:
@@ -117,10 +118,10 @@ def _set_tier(monkeypatch: pytest.MonkeyPatch, grade: str) -> None:
 
 def _small_tunables(monkeypatch: pytest.MonkeyPatch, *, gate: int = 2, min_n: int = 2) -> None:
     # The gate is a dev-level constant (not a tunable, S26) since the
-    # RAM-spike-fix INC-1 move — override the module attribute directly so
-    # the tick's plain-global read (`gate_handful = JUDGE_TUNE_GATE_HANDFUL_
+    # RAM-spike-fix INC-1 move — override the constant on brain.dev_constants
+    # so the tick's call-time read (`dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_
     # DECISIONS`) picks it up.
-    monkeypatch.setattr(judge_selftune, "JUDGE_TUNE_GATE_HANDFUL_DECISIONS", gate)
+    monkeypatch.setattr(dev_constants, "JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS", gate)
 
     real = judge_selftune.tunables.get_tunable
 
@@ -228,7 +229,7 @@ def _place_checkpoint(persona_dir: Path) -> Path:
     return d
 
 
-GRADES = [judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT]
+GRADES = [dev_constants.JUDGE_TUNE_GRADE_LORA, dev_constants.JUDGE_TUNE_GRADE_FULL_FT]
 
 
 # ---------------------------------------------------------------------------
@@ -443,10 +444,10 @@ def test_fault_after_commit_keeps_new_checkpoint_with_its_knob(
 @pytest.mark.parametrize(
     ("week1", "week2"),
     [
-        (judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_LORA),
-        (judge_selftune.TUNE_GRADE_FULL_FT, judge_selftune.TUNE_GRADE_FULL_FT),
-        (judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT),
-        (judge_selftune.TUNE_GRADE_FULL_FT, judge_selftune.TUNE_GRADE_LORA),
+        (dev_constants.JUDGE_TUNE_GRADE_LORA, dev_constants.JUDGE_TUNE_GRADE_LORA),
+        (dev_constants.JUDGE_TUNE_GRADE_FULL_FT, dev_constants.JUDGE_TUNE_GRADE_FULL_FT),
+        (dev_constants.JUDGE_TUNE_GRADE_LORA, dev_constants.JUDGE_TUNE_GRADE_FULL_FT),
+        (dev_constants.JUDGE_TUNE_GRADE_FULL_FT, dev_constants.JUDGE_TUNE_GRADE_LORA),
     ],
 )
 def test_week_two_starts_from_week_one_champion_and_trains_on_its_own_rows(
@@ -503,7 +504,7 @@ def test_week_after_a_revert_starts_from_the_unchanged_champion(
 @pytest.mark.parametrize("has_checkpoint", [False, True])
 @pytest.mark.parametrize(
     "grade",
-    [judge_selftune.TUNE_GRADE_KNOB_REFIT, judge_selftune.TUNE_GRADE_LORA, judge_selftune.TUNE_GRADE_FULL_FT],
+    [dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT, dev_constants.JUDGE_TUNE_GRADE_LORA, dev_constants.JUDGE_TUNE_GRADE_FULL_FT],
 )
 def test_dispatch_matrix(
     grade: str, has_checkpoint: bool, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -516,7 +517,7 @@ def test_dispatch_matrix(
     before = _pointer_bytes(tmp_path)
     result = _tick(store, tmp_path)
     assert result["fired"] is True and result["method"] == grade
-    if grade == judge_selftune.TUNE_GRADE_KNOB_REFIT:
+    if grade == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT:
         assert env.builds == [], "knob week trains no weights"
         assert _pointer_bytes(tmp_path) == before
         # H4 on a knob week: current and start both name the serving model.
@@ -546,7 +547,7 @@ def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     _small_tunables(monkeypatch)
     env = Env(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_FULL_FT)
     assert _tick(store, tmp_path)["accepted"] is True
     before_ptr, before_dirs = _pointer_bytes(tmp_path), _stored_dirs(tmp_path)
 
@@ -554,9 +555,9 @@ def test_drop_to_weak_tier_only_refits_the_knob_on_the_same_model(
     # The week-1 doc-absent row stays unconsumed after an accept (2B), so the
     # weak week's logged fit covers every row the gate scanned this tick.
     _count, tick_rows = store.count_new_haiku_decisions()
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT)
     result = _tick(store, tmp_path)
-    assert result["fired"] is True and result["method"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert result["fired"] is True and result["method"] == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     served = _current(tmp_path).name
     assert result["current"] == served and result["start"] == served
     assert _pointer_bytes(tmp_path) == before_ptr and _stored_dirs(tmp_path) == before_dirs
@@ -575,16 +576,16 @@ def test_beefy_to_mid_drop_runs_lora_on_the_same_model(
     _small_tunables(monkeypatch)
     env = Env(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_FULL_FT)
     assert _tick(store, tmp_path)["accepted"] is True
     c1 = _current(tmp_path)
     before_ptr = _pointer_bytes(tmp_path)
 
     env.accept = accept_week2
     _seed_scenario(store, "w2")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     result = _tick(store, tmp_path)
-    assert env.builds[1]["method"] == judge_selftune.TUNE_GRADE_LORA
+    assert env.builds[1]["method"] == dev_constants.JUDGE_TUNE_GRADE_LORA
     assert env.builds[1]["start"] == str(c1), "the LoRA trains on the fine-tuned model, not the base"
     if accept_week2:
         assert result["accepted"] is True
@@ -613,21 +614,21 @@ def test_stored_dir_set_across_a_week_sequence(
         _set_tier(monkeypatch, grade)
         return _tick(store, tmp_path)
 
-    assert week("a", judge_selftune.TUNE_GRADE_FULL_FT, True)["accepted"] is True
+    assert week("a", dev_constants.JUDGE_TUNE_GRADE_FULL_FT, True)["accepted"] is True
     c1 = Path(env.builds[-1]["staged"]).name
     assert _stored_dirs(tmp_path) == {c1}
 
-    assert week("b", judge_selftune.TUNE_GRADE_LORA, True)["accepted"] is True
+    assert week("b", dev_constants.JUDGE_TUNE_GRADE_LORA, True)["accepted"] is True
     c2 = Path(env.builds[-1]["staged"]).name
     assert _stored_dirs(tmp_path) == {c2}, "C1 deleted in the same tick as the swap"
 
-    assert week("c", judge_selftune.TUNE_GRADE_KNOB_REFIT, True)["method"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert week("c", dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT, True)["method"] == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     assert _stored_dirs(tmp_path) == {c2}
 
-    assert week("d", judge_selftune.TUNE_GRADE_LORA, False)["accepted"] is False
+    assert week("d", dev_constants.JUDGE_TUNE_GRADE_LORA, False)["accepted"] is False
     assert _stored_dirs(tmp_path) == {c2}
 
-    assert week("e", judge_selftune.TUNE_GRADE_FULL_FT, True)["accepted"] is True
+    assert week("e", dev_constants.JUDGE_TUNE_GRADE_FULL_FT, True)["accepted"] is True
     c3 = Path(env.builds[-1]["staged"]).name
     assert _stored_dirs(tmp_path) == {c3}
     assert _current(tmp_path).name == c3
@@ -639,7 +640,7 @@ def test_refused_delete_is_not_raised_and_a_later_tick_reaps_it(
 ) -> None:
     prior = _place_checkpoint(tmp_path)
     ids = _seed_scenario(store)
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     _small_tunables(monkeypatch)
     env = Env(monkeypatch)
     real_rmtree = judge_lora.shutil.rmtree
@@ -681,7 +682,7 @@ def test_pointer_to_a_legacy_adapter_dir_trains_from_base_and_is_not_reaped_earl
     (legacy / "adapter_config.json").write_text("{}", encoding="utf-8")
     judge_lora.swap_champion_pointer(root, legacy)
     _seed_scenario(store)
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     _small_tunables(monkeypatch)
     env = Env(monkeypatch)
     env.accept = False
@@ -704,7 +705,7 @@ def test_one_personas_accept_does_not_touch_another_personas_store(
     b_ckpt = _place_checkpoint(b)
     b_before = (_pointer_bytes(b), _stored_dirs(b))
     _seed_scenario(store)
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_FULL_FT)
     _small_tunables(monkeypatch)
     Env(monkeypatch)
     assert _tick(store, a)["accepted"] is True

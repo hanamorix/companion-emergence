@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import io
 import json
 import logging
 import math
@@ -256,6 +257,30 @@ def _resolve_image_ext(images_dir: Path, sha: str) -> str | None:
         if (images_dir / f"{sha}.{ext}").exists():
             return ext
     return None
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
+    """Read an upload, at most ``max_bytes + 1`` bytes: one over the cap, so the caller can tell the body overran it.
+
+    Never asks the file for more than it holds. A read of a spooled file converts its size argument to a C ``Py_ssize_t``
+    (an ``OverflowError`` above ``sys.maxsize``) and, for a body that rolled to a disk file, allocates that many bytes up
+    front (a ``MemoryError`` for a large one), so reading ``max_bytes + 1`` straight away would make a large
+    ``files.upload_max_bytes`` fail every upload however small the body. ``UploadFile.size`` is the bytes written to the file
+    (starlette's multipart parser creates it with ``size=0`` and ``write`` counts); when it is None the file is read in pieces
+    of at most ``io.DEFAULT_BUFFER_SIZE`` until ``max_bytes + 1`` bytes were read or the file ends.
+    """
+    limit = max_bytes + 1
+    if file.size is not None:
+        return await file.read(min(limit, file.size))
+    pieces: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        piece = await file.read(min(remaining, io.DEFAULT_BUFFER_SIZE))
+        if not piece:
+            break
+        pieces.append(piece)
+        remaining -= len(piece)
+    return b"".join(pieces)
 
 
 def _respond_blocking(
@@ -1191,7 +1216,7 @@ def _tracked_sync(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
 def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
-    tick_interval_s: float = 60.0,
+    tick_interval_s: float | None = None,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
@@ -1208,6 +1233,9 @@ def build_app(
     allowed_origins: WebSocket Origin header allowlist (extra defense
     against browser-based attacks if someone proxies localhost). "null"
     matches CLI/non-browser clients; "tauri://localhost" matches SP-8.
+
+    tick_interval_s: the supervisor's tick in seconds. None (default) leaves it to
+    ``run_folded``, which reads the ``embedding_backfill.tick_interval_seconds`` setting.
 
     background_threads: start the supervisor + compaction-backlog-migration
     threads in the lifespan. None (default) → ``not _background_threads_inhibited``,
@@ -2659,9 +2687,9 @@ def build_app(
         return {"ok": True}
 
     # ── POST /upload — file upload (images + non-image files) ──────────────
-    # Image upload limit (matches the spec D2 default; per-persona override
-    # via PersonaConfig.image_max_bytes can come later if needed).
-    _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # noqa: N806 — local frozen constant
+    # The kinds of image the byte sniff (brain.images.sniff_media_type) can recognise: the declared type of an upload
+    # is only cross-checked against the sniffed one for these. Not files.image_types, which says which images the
+    # read_file tool opens and can only narrow this set.
     _ALLOWED_UPLOAD_MEDIA_TYPES = frozenset(  # noqa: N806
         {"image/png", "image/jpeg", "image/webp", "image/gif"}
     )
@@ -2694,10 +2722,12 @@ def build_app(
 
         s: BridgeAppState = app.state.bridge
         declared_media_type = (file.content_type or "").lower()
-        # Read up to the larger of the two caps + 1 so overrun is detectable
-        # without buffering arbitrarily large payloads in memory.
-        max_bytes = max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes())
-        raw = await file.read(max_bytes + 1)
+        # Read up to the cap + 1 so overrun is detectable without buffering
+        # arbitrarily large payloads in memory, and never more than the body
+        # holds (a large cap must not reach the read). One cap for images and
+        # files: the files.upload_max_bytes setting.
+        max_bytes = file_store.upload_max_bytes()
+        raw = await _read_upload_capped(file, max_bytes)
         if len(raw) > max_bytes:
             raise HTTPException(
                 status_code=413,
@@ -2720,7 +2750,7 @@ def build_app(
                     status_code=422,
                     detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
                 )
-            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the 20 MB cap.
+            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the upload cap.
             record = await tracked_to_thread("upload", save_image_bytes, s.persona_dir, raw, sniffed)
             return {
                 "kind": "image",

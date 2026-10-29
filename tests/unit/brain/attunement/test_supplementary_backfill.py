@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.backfill import should_run_supplementary_backfill
-from brain.attunement.schemas import SCHEMA_VERSION
 
 
 def _state(tmp_path: Path, version: str, status: str = "complete"):
@@ -24,7 +24,7 @@ def test_supplementary_runs_when_prior_complete_at_older_version(tmp_path: Path)
 
 
 def test_no_supplementary_when_already_current(tmp_path: Path):
-    _state(tmp_path, version=SCHEMA_VERSION, status="complete")
+    _state(tmp_path, version=dev_constants.ATTUNEMENT_SCHEMA_VERSION, status="complete")
     assert should_run_supplementary_backfill(tmp_path) is False
 
 
@@ -76,7 +76,7 @@ def _make_buffer_file(persona_dir: Path, n_turns: int = 15) -> list[dict]:
 
 
 def test_run_supplementary_backfill_completes_at_current_schema_version(tmp_path):
-    """After supplementary backfill, state is complete at the new SCHEMA_VERSION."""
+    """After supplementary backfill, state is complete at the new ATTUNEMENT_SCHEMA_VERSION."""
     from datetime import UTC, datetime
 
     from brain.attunement.backfill import run_supplementary_backfill
@@ -102,7 +102,7 @@ def test_run_supplementary_backfill_completes_at_current_schema_version(tmp_path
                 mood_valence=0.0,
                 mood_intensity=0.0,
                 predicted_arc_shape="",
-                schema_version=SCHEMA_VERSION,
+                schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
             ),
             pattern_candidates=[
                 PatternCandidate(
@@ -121,7 +121,7 @@ def test_run_supplementary_backfill_completes_at_current_schema_version(tmp_path
         delay_s=0,
     )
 
-    assert state.schema_version == SCHEMA_VERSION
+    assert state.schema_version == dev_constants.ATTUNEMENT_SCHEMA_VERSION
     assert state.status == "complete"
 
     # Verify a topic_affinity pattern was written to learned_patterns
@@ -201,7 +201,7 @@ def test_supplementary_preserves_prior_completion_record(tmp_path):
                 tone_label="unknown", tone_justification="",
                 cadence_label="unknown", cadence_justification="",
                 mood_valence=0.0, mood_intensity=0.0, predicted_arc_shape="",
-                schema_version=SCHEMA_VERSION,
+                schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
             ),
             pattern_candidates=[PatternCandidate(
                 category="topic_affinity", canonical_key="topic_affinity:various-topics",
@@ -219,7 +219,7 @@ def test_supplementary_preserves_prior_completion_record(tmp_path):
     # Original journey-start preserved (not reset to now); new patterns accumulate.
     assert state.started_at == original_started_at
     assert state.patterns_emitted >= 3
-    assert state.schema_version == SCHEMA_VERSION
+    assert state.schema_version == dev_constants.ATTUNEMENT_SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
