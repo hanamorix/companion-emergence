@@ -321,8 +321,11 @@ class Settings:
             loose = [bound] if bound else []
             loose += [f for f in (name_words(".".join(segments[i:])) for i in range(len(segments))) if len(f) >= MIN_FORM_WORDS]
             value = None if key.startswith("model.") else info.default  # a model id is the model case's (G1)
+            # R2 takes the key's own forms as well as the bound name's, so a drifted copy named after the key is
+            # caught (#601); R3 uses the same forms for value-equal matches.
+            forms = tuple(dict.fromkeys(loose))
             settings.append(
-                _Setting(f"tunables:{key}", value, (bound,) if bound else (), tuple(dict.fromkeys(loose)), info.owner_file,
+                _Setting(f"tunables:{key}", value, forms, forms, info.owner_file,
                          (info.bound_name,) if info.bound_name else ())
             )
         self.constant_names = frozenset(n for st in settings for n in st.names)
