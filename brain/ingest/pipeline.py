@@ -442,10 +442,13 @@ def _archive_buffer(persona_dir: Path, session_id: str) -> list[dict]:
     Uses ``archive_once`` (fsync, durable commit marker), the writer compaction, the cascade and the rollover also use, so the rows
     are durable before the caller removes the buffer and a retry of the same batch after a crash does not write it twice (except
     after a crash between ``archive_once``'s append and its marker write, where the batch is repeated, never lost). An error
-    propagates and the caller has removed nothing. A malformed line is skipped by ``read_session`` like everywhere else.
+    propagates and the caller has removed nothing; so does an append that reports zero bytes for a non-empty batch, as in
+    compaction and the rollover. A malformed line is skipped by ``read_session`` like everywhere else.
     """
     rows = read_session(persona_dir, session_id)
-    archive_once(persona_dir, session_id, rows, new_gen=_CLOSE_BATCH_GEN)
+    written = archive_once(persona_dir, session_id, rows, new_gen=_CLOSE_BATCH_GEN)
+    if rows and written <= 0:
+        raise OSError("archive append wrote zero bytes")
     return rows
 
 

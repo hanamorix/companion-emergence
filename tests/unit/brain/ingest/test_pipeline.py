@@ -1546,9 +1546,24 @@ def test_close_keeps_buffer_cursor_and_backoff_when_the_archive_write_fails(
     def _boom(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(pipeline, "archive_once", _boom, raising=False)
+    monkeypatch.setattr(pipeline, "archive_once", _boom)
 
     with pytest.raises(OSError, match="disk full"):
+        _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert {name: p.read_bytes() for name, p in paths.items()} == before
+
+
+def test_close_keeps_the_buffer_when_the_archive_reports_zero_bytes_written(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An append that reports zero bytes for a non-empty batch is not a durable archive: the close raises and removes nothing."""
+    _seed_closable(tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC)))
+    paths = _sidecars(tmp_path, _ARCHIVE_SID)
+    before = {name: p.read_bytes() for name, p in paths.items()}
+    monkeypatch.setattr(pipeline, "archive_once", lambda *args, **kwargs: 0)
+
+    with pytest.raises(OSError, match="zero bytes"):
         _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
 
     assert {name: p.read_bytes() for name, p in paths.items()} == before
@@ -1638,7 +1653,7 @@ def test_a_writer_that_takes_no_append_lock_keeps_the_buffer_and_the_retry_archi
             rewrite_session_atomic(persona_dir, session_id, [*records, added])
         return written
 
-    monkeypatch.setattr(pipeline, "archive_once", _archive_then_rewrite, raising=False)
+    monkeypatch.setattr(pipeline, "archive_once", _archive_then_rewrite)
     paths = _sidecars(tmp_path, _ARCHIVE_SID)
 
     first = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
@@ -1693,7 +1708,7 @@ def test_the_close_holds_the_append_lock_from_the_late_rows_check_to_the_removal
         real_delete_backoff(persona_dir, session_id)
 
     monkeypatch.setattr(pipeline, "read_session_after", _read_after)
-    monkeypatch.setattr(pipeline, "archive_once", _archive, raising=False)
+    monkeypatch.setattr(pipeline, "archive_once", _archive)
     monkeypatch.setattr(pipeline, "delete_session_buffer", _delete)
     monkeypatch.setattr(pipeline, "delete_backoff", _delete_backoff)
 
