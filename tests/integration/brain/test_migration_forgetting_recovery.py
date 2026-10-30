@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.forgetting import FORGETTING_STATE_FILENAME, run_pass
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -21,6 +23,7 @@ def _old(days):
     return datetime.now(UTC) - timedelta(days=days)
 
 
+@pytest.mark.no_base_failure(reason="#548 rename only: the same test under a synthetic persona name, so it passes on the old code")
 def test_canary_loop_heals(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
 
