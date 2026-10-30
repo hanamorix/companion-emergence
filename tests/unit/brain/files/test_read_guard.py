@@ -32,6 +32,9 @@ def _plant(path: Path, data: bytes = b"secret") -> Path:
     return path
 
 
+_KEY_PEM = b"-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----\n"
+
+
 def _refused(out: dict) -> bool:
     return "content" not in out and "image" not in out and "protected" in out.get("error", "")
 
@@ -62,13 +65,42 @@ def test_ssh_private_key_refused(env):
     "AppData/Roaming/Mozilla/Firefox/Profiles/p/logins.json",
     "AppData/Roaming/Microsoft/Credentials/x",
     "AppData/Roaming/Microsoft/Protect/x",
+    # review of #608: other browsers, cloud CLIs, Windows stores
+    "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies",
+    "Library/Application Support/Microsoft Edge/Default/Cookies",
+    "Library/Application Support/com.operasoftware.Opera/Cookies",
+    "Library/Application Support/Vivaldi/Default/Cookies",
+    "Library/Application Support/Chromium/Default/Cookies",
+    "Library/Safari/History.db",
+    "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+    ".config/BraveSoftware/Brave-Browser/Default/Cookies",
+    ".config/microsoft-edge/Default/Cookies",
+    ".config/opera/Cookies",
+    ".config/vivaldi/Default/Cookies",
+    ".config/gcloud/credentials.db",
+    ".azure/msal_token_cache.json",
+    "AppData/Local/BraveSoftware/Brave-Browser/User Data/Default/Cookies",
+    "AppData/Local/Microsoft/Edge/User Data/Default/Cookies",
+    "AppData/Roaming/Opera Software/Opera Stable/Cookies",
+    "AppData/Local/Vivaldi/User Data/Default/Cookies",
+    "AppData/Local/Chromium/User Data/Default/Cookies",
+    "AppData/Local/Microsoft/Credentials/x",
+    "AppData/Roaming/GitHub CLI/hosts.yml",
+    "AppData/Roaming/gcloud/credentials.db",
+    "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
 ])
 def test_home_secret_dirs_refused(env, rel):
     f = _plant(env["home"] / rel)
     assert _refused(read_file(path=str(f), persona_dir=env["persona"]))
 
 
-@pytest.mark.parametrize("rel", [".claude.json", ".netrc", ".git-credentials", ".pgpass", ".npmrc", ".pypirc"])
+@pytest.mark.parametrize("rel", [
+    ".claude.json", ".netrc", ".git-credentials", ".pgpass", ".npmrc", ".pypirc",
+    ".cargo/credentials.toml", ".cargo/credentials", ".gem/credentials", ".terraform.d/credentials.tfrc.json",
+    # shell and REPL history: pasted tokens and `export KEY=...` lines
+    ".bash_history", ".zsh_history", ".python_history", ".psql_history", ".mysql_history", ".node_repl_history",
+    ".local/share/fish/fish_history",
+])
 def test_home_secret_files_refused(env, rel):
     f = _plant(env["home"] / rel)
     assert _refused(read_file(path=str(f), persona_dir=env["persona"]))
@@ -92,13 +124,50 @@ def test_persona_secrets_refused(env, persona, rel):
     assert _refused(read_file(path=str(f), persona_dir=env["persona"]))
 
 
+@pytest.mark.parametrize("rel", ["memories.db", "voice.md", "files/" + "b" * 64])
+def test_another_personas_directory_refused(env, rel):
+    """Review of #608: another kindled on the same machine is private to it, not just its bridge token and link key."""
+    f = _plant(env["kh"] / "personas" / "other" / rel)
+    assert _refused(read_file(path=str(f), persona_dir=env["persona"]))
+    assert _refused(list_directory(path=str(f.parent), persona_dir=env["persona"]))
+
+
 @pytest.mark.parametrize("name", [
     ".env", ".env.local", ".ENV", "server.pem", "tls.key", "TLS.KEY", "cert.p12", "cert.pfx",
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "login.keychain-db",
 ])
 def test_secret_file_names_refused_anywhere(env, name):
-    f = _plant(env["home"] / "proj" / name)
+    f = _plant(env["home"] / "proj" / name, _KEY_PEM)
     assert _refused(read_file(path=str(f), persona_dir=env["persona"]))
+
+
+def test_a_public_certificate_pem_still_reads(env):
+    """Review of #608: `.pem` is refused only when it holds private-key material; a certificate is public."""
+    cert = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+    f = _plant(env["home"] / "proj" / "cert.pem", cert)
+    assert read_file(path=str(f), persona_dir=env["persona"]).get("content") == cert.decode()
+    bundle = _plant(env["home"] / "proj" / "bundle.pem", cert + b"-----BEGIN EC PRIVATE KEY-----\nMHc\n")
+    assert _refused(read_file(path=str(bundle), persona_dir=env["persona"]))
+
+
+def test_a_dotenv_directory_still_lists(env):
+    """Review of #608: `.env/` is a common virtualenv name; only the dotenv FILE is a secret."""
+    _plant(env["home"] / "proj" / ".env" / "pyvenv.cfg", b"home = /usr")
+    out = list_directory(path=str(env["home"] / "proj" / ".env"), persona_dir=env["persona"])
+    assert [e["name"] for e in out["entries"]] == ["pyvenv.cfg"]
+
+
+@pytest.mark.parametrize("name", [".env.example", ".env.sample", ".ENV.Template", ".env.dist"])
+def test_dotenv_templates_still_read(env, name):
+    """Review of #608: a dotenv template holds placeholders, not secrets."""
+    f = _plant(env["home"] / "proj" / name, b"hello")
+    assert read_file(path=str(f), persona_dir=env["persona"]).get("content") == "hello"
+
+
+@pytest.mark.parametrize("path", ["/proc/self/environ", "/proc/1/environ", "/proc/1/task/1/environ"])
+def test_process_environment_refused(env, path):
+    """Review of #608: the environment can hold tokens and keys. On Linux these exist; elsewhere the refusal still comes first."""
+    assert _refused(read_file(path=path, persona_dir=env["persona"]))
 
 
 @pytest.mark.no_base_failure(reason="#597 over-blocking guard: ordinary files read on the old code too, and must keep reading")
@@ -168,4 +237,18 @@ def test_listing_home_still_works(env):
     _plant(env["home"] / ".ssh" / "id_rsa")
     _plant(env["home"] / "Desktop" / "a.txt")
     out = list_directory(path="~", persona_dir=env["persona"])
-    assert {e["name"] for e in out["entries"]} >= {"Desktop", ".ssh"}
+    assert "Desktop" in {e["name"] for e in out["entries"]}
+
+
+def test_a_listing_leaves_out_refused_entries(env):
+    """Review of #608: listing a parent must not show the names inside it that a read would refuse."""
+    _plant(env["home"] / ".ssh" / "id_rsa")
+    _plant(env["home"] / ".bash_history")
+    _plant(env["home"] / "proj" / ".env")
+    _plant(env["home"] / "proj" / "tls.key")
+    _plant(env["home"] / "proj" / "main.py")
+    _plant(env["kh"] / "personas" / "other" / "memories.db")
+    names = lambda d: {e["name"] for e in list_directory(path=str(d), persona_dir=env["persona"])["entries"]}  # noqa: E731
+    assert ".ssh" not in names(env["home"]) and ".bash_history" not in names(env["home"])
+    assert names(env["home"] / "proj") == {"main.py"}
+    assert names(env["kh"] / "personas") == {"canary"}

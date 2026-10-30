@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from brain.files.read_guard import PROTECTED, is_read_denied
+from brain.files.read_guard import PROTECTED, denied_stats, is_read_denied
 from brain.tools.impls.read_file import _audit
 
 _LIST_ENTRY_CAP = 200
@@ -39,9 +39,14 @@ def list_directory(path: str, *, persona_dir: Path, **_) -> dict:
         return {"error": f"not a directory: {p}"}
 
     entries = []
+    denied = denied_stats(persona_dir)
     try:
-        for child in sorted(p.iterdir(), key=lambda c: c.name)[:_LIST_ENTRY_CAP]:
+        for child in sorted(p.iterdir(), key=lambda c: c.name):
+            if len(entries) >= _LIST_ENTRY_CAP:
+                break
             try:
+                if is_read_denied(child.resolve(), persona_dir=persona_dir, denied=denied):
+                    continue  # don't show the names a read would refuse
                 entries.append(
                     {
                         "name": child.name,
@@ -49,7 +54,7 @@ def list_directory(path: str, *, persona_dir: Path, **_) -> dict:
                         "size": child.stat().st_size if child.is_file() else None,
                     }
                 )
-            except OSError:
+            except (OSError, RuntimeError):  # RuntimeError: a symlink loop in resolve() on Python 3.12
                 continue
     except OSError as exc:
         _audit(
