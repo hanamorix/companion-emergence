@@ -87,6 +87,7 @@ def test_building_the_app_leaves_the_real_data_home_untouched(tmp_path, monkeypa
     assert (paths.get_home() / "tunables.toml").exists()
 
 
+@pytest.mark.no_base_failure(reason="#600 test infrastructure: it checks this file's own _snapshot helper, not brain code")
 def test_a_live_supervisor_writing_its_own_persona_is_not_a_leak(tmp_path):
     """#600: the installed app's supervisor writes `personas/<name>/` (and its SQLite sidecars) whenever it likes. That must not read
     as this test writing into the real home; a new persona directory still must."""
