@@ -150,6 +150,7 @@ def test_a_public_certificate_pem_still_reads(env):
     assert _refused(read_file(path=str(bundle), persona_dir=env["persona"]))
 
 
+@pytest.mark.no_base_failure(reason="#608 review over-blocking guard: main has no read guard, so this reads there too")
 def test_a_dotenv_directory_still_lists(env):
     """Review of #608: `.env/` is a common virtualenv name; only the dotenv FILE is a secret."""
     _plant(env["home"] / "proj" / ".env" / "pyvenv.cfg", b"home = /usr")
@@ -157,6 +158,7 @@ def test_a_dotenv_directory_still_lists(env):
     assert [e["name"] for e in out["entries"]] == ["pyvenv.cfg"]
 
 
+@pytest.mark.no_base_failure(reason="#608 review over-blocking guard: main has no read guard, so this reads there too")
 @pytest.mark.parametrize("name", [".env.example", ".env.sample", ".ENV.Template", ".env.dist"])
 def test_dotenv_templates_still_read(env, name):
     """Review of #608: a dotenv template holds placeholders, not secrets."""
