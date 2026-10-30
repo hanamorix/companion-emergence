@@ -4,6 +4,7 @@ Driven through the two tools' real entry points with a temp HOME and KINDLED_HOM
 (no mocked state files). The deny list always wins; ordinary files still read.
 """
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -166,9 +167,10 @@ def test_dotenv_templates_still_read(env, name):
     assert read_file(path=str(f), persona_dir=env["persona"]).get("content") == "hello"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="no procfs: /proc/... resolves to an ordinary file on the current drive")
 @pytest.mark.parametrize("path", ["/proc/self/environ", "/proc/1/environ", "/proc/1/task/1/environ"])
 def test_process_environment_refused(env, path):
-    """Review of #608: the environment can hold tokens and keys. On Linux these exist; elsewhere the refusal still comes first."""
+    """Review of #608: the environment can hold tokens and keys. On Linux these exist; on macOS the refusal still comes first."""
     assert _refused(read_file(path=path, persona_dir=env["persona"]))
 
 
