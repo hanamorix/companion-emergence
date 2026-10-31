@@ -32,6 +32,8 @@ import httpx
 
 from brain.bridge import respawn_guard, start_backoff, state_file
 from brain.bridge.shutdown import REASON_USER_STOP
+from brain.health.log_rotation import rotate_rolling_size
+from brain.paths import RUNTIME_LOG_BACKUPS, RUNTIME_LOG_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +256,12 @@ def spawn_detached(
     reports alive, and ``poll()`` is also what reaps it.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Outside launchd nothing else bounds this file (#559). The previous child is gone (the caller holds the bridge
+    # lock), so rotating before the new child opens it is safe; a failed rotation never blocks a start.
+    try:
+        rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not rotate %s; starting the bridge anyway", log_path, exc_info=True)
     log_fh = open(log_path, "ab")  # noqa: SIM115
     python, env = bridge_python()
     popen_extra: dict[str, object] = {} if env is None else {"env": env}
@@ -969,21 +977,22 @@ _follow_should_stop: threading.Event | None = None
 
 
 def cmd_tail_log(args) -> int:
-    """Print the last N lines of the bridge log; -f to follow.
+    """Print the last N lines of the runtime log; -f to follow.
 
     Cross-platform: pure Python loop, no shell `tail` (Windows CI lacks it).
     Follow mode polls every 200ms. KeyboardInterrupt is treated as a clean
     exit (returns 0). Tests can interrupt the loop by setting the module-level
     `_follow_should_stop` Event before the call.
     """
-    from brain.paths import get_log_dir, get_persona_dir
+    from brain.paths import get_persona_dir, runtime_log_path
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+    # The runtime log, where logging goes (#558); bridge-<persona>.log only has the child's raw stdout/stderr.
+    log_path = runtime_log_path(persona_dir.name)
     if not log_path.exists():
         print(
             f"bridge log not found at {log_path} — has the supervisor ever started?",
