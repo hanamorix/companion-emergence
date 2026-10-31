@@ -93,7 +93,7 @@ mod tests {
 
     fn sample(stdout: &str) -> LaunchFailure {
         LaunchFailure {
-            command: "nell init --persona phoebe".into(),
+            command: "nell init --persona canary".into(),
             exit_code: Some(1),
             stdout_tail: stdout.into(),
             stderr_tail: "boom".into(),
@@ -126,7 +126,7 @@ mod tests {
         let home = tmp_home();
         append_failure(&home, &sample("")).unwrap();
         let log = fs::read_to_string(home.join("launch-failures.log")).unwrap();
-        assert!(log.contains("\"command\":\"nell init --persona phoebe\""));
+        assert!(log.contains("\"command\":\"nell init --persona canary\""));
         assert!(log.contains("\"stderr_tail\":\"boom\""));
         assert!(log.contains("\"ts\":"));
         assert!(log.contains("\"kindled_home\":"));

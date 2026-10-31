@@ -27,9 +27,9 @@ def test_ce_manifest_records_source_lived_age(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     src = _make_ce_source(tmp_path)
     migrate_companion_emergence(CompanionEmergenceMigrateArgs(
-        input_dir=src, install_as="Phoebe", force=False))
+        input_dir=src, install_as="Canary", force=False))
     manifest = json.loads(
-        (tmp_path / "home" / "personas" / "Phoebe" / "source-manifest.json").read_text())
+        (tmp_path / "home" / "personas" / "Canary" / "source-manifest.json").read_text())
     assert manifest["lived_age_hours_at_migration"] == 42.0
     assert "migrated_at_utc" in manifest
     datetime.fromisoformat(manifest["migrated_at_utc"].replace("Z", "+00:00"))

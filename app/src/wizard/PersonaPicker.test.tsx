@@ -12,7 +12,7 @@ import type { PersonaSummary } from "../appConfig";
 
 const personas: PersonaSummary[] = [
   { name: "nell",   last_opened_at: "2026-05-22T10:00:00Z", has_memories_db: true },
-  { name: "phoebe", last_opened_at: "2026-05-23T09:00:00Z", has_memories_db: true },
+  { name: "canary", last_opened_at: "2026-05-23T09:00:00Z", has_memories_db: true },
   { name: "broken", last_opened_at: null,                   has_memories_db: false },
 ];
 
@@ -21,7 +21,7 @@ describe("PersonaPicker", () => {
 
   it("lists all personas", () => {
     render(<PersonaPicker personas={personas} onPick={() => {}} onNew={() => {}} />);
-    ["nell", "phoebe", "broken"].forEach((n) =>
+    ["nell", "canary", "broken"].forEach((n) =>
       expect(screen.getByText(new RegExp(n))).toBeInTheDocument()
     );
   });
@@ -29,9 +29,9 @@ describe("PersonaPicker", () => {
   it("calls onPick with the chosen name", () => {
     const onPick = vi.fn();
     render(<PersonaPicker personas={personas} onPick={onPick} onNew={() => {}} />);
-    fireEvent.click(screen.getByText(/phoebe/));
+    fireEvent.click(screen.getByText(/canary/));
     fireEvent.click(screen.getByRole("button", { name: /continue/i }));
-    expect(onPick).toHaveBeenCalledWith("phoebe");
+    expect(onPick).toHaveBeenCalledWith("canary");
   });
 
   it("calls onNew when 'set up a new one' clicked", () => {
