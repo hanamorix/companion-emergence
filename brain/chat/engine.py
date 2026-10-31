@@ -48,6 +48,7 @@ from brain.initiate import presence_state
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
+from brain.tools.naming import tool_prefix_of
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,9 @@ def _respond_inner(
     if daemon_anomaly is not None:
         logger.warning("daemon_state anomaly: %s", daemon_anomaly.kind)
 
+    # What this backend calls a brain tool, put into every text below as it is built (#417).
+    tool_prefix = tool_prefix_of(provider)
+
     # 4. Soul store
     soul_db = persona_dir / "crystallizations.db"
     soul_store = SoulStore(str(soul_db))
@@ -266,10 +270,11 @@ def _respond_inner(
         # surfaced file path line (that lands only on the outgoing user message
         # below), so a file-send turn's volatile content is equivalent to the
         # same text without a file (C14).
-        system_msg = build_static_system_message(persona_dir, voice_md=voice_md)
+        system_msg = build_static_system_message(persona_dir, voice_md=voice_md, tool_prefix=tool_prefix)
         volatile_suffix: str | None = build_volatile_context(
             persona_dir,
             voice_md=voice_md,
+            tool_prefix=tool_prefix,
             daemon_state=daemon_state,
             soul_store=soul_store,
             store=store,
@@ -284,7 +289,7 @@ def _respond_inner(
     # Resolve any shared files to on-disk paths and append a marked line per
     # file to the OUTGOING user text only. The path line is NOT fed into
     # salience/volatile (computed above on raw user_input) — C14.
-    file_lines = _resolve_shared_file_lines(persona_dir, shared_files)
+    file_lines = _resolve_shared_file_lines(persona_dir, shared_files, tool_prefix=tool_prefix)
     if file_lines:
         file_block = "\n".join(file_lines)
         outgoing_user_text = f"{user_input}\n{file_block}" if user_input else file_block
@@ -339,7 +344,7 @@ def _respond_inner(
         logger.warning("salience/recruitment failed; using full tool suite", exc_info=True)
         signal = None
         allowed = None
-    tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed)
+    tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed, tool_prefix=tool_prefix)
 
     # Per-call provider options carrying the Option A+ volatile suffix. On text/
     # stream turns this threads the per-turn context to the provider so it lands
@@ -430,6 +435,8 @@ def _respond_inner(
 def _resolve_shared_file_lines(
     persona_dir: Path,
     shared_files: list[dict] | None,
+    *,
+    tool_prefix: str = "",
 ) -> list[str]:
     """Resolve each shared-file reference to its on-disk path and render a
     marked line the model can act on.
@@ -472,7 +479,7 @@ def _resolve_shared_file_lines(
             logger.warning("skipping shared file sha=%s: %s", short, exc)
             continue
         # #269: name the tool in the line itself; the model tends to forget it has read_file.
-        cue = "Open it with your read_file tool to see what it says."
+        cue = f"Open it with your {tool_prefix}read_file tool to see what it says."
         if filename:
             lines.append(f'[the user shared a file "{filename}": {path}. {cue}]')
         else:

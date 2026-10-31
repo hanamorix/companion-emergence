@@ -660,7 +660,16 @@ def brain_tools_mcp_entry(
     """
     entry: dict = {
         "command": sys.executable,
-        "args": ["-P", "-m", "brain.mcp_server", "--persona-dir", str(persona_dir)],
+        "args": [
+            "-P",
+            "-m",
+            "brain.mcp_server",
+            "--persona-dir",
+            str(persona_dir),
+            # The CLI registers the tools under this entry's "brain-tools" key (#417).
+            "--tool-prefix",
+            ClaudeCliProvider.tool_name_prefix,
+        ],
     }
     env: dict[str, str] = {}
     if request_id is not None:
@@ -702,6 +711,10 @@ class ProviderError(RuntimeError):
 
 class LLMProvider(ABC):
     """Abstract LLM provider.  Subclasses implement both call shapes."""
+
+    # What this backend calls a brain tool: prepended to the bare name wherever text the model
+    # reads names one (brain.tools.naming, #417). Empty where tools are passed in by name.
+    tool_name_prefix: str = ""
 
     @abstractmethod
     def generate(self, prompt: str, *, system: str | None = None) -> str:
@@ -1054,6 +1067,9 @@ class ClaudeCliProvider(LLMProvider):
     When ``tools`` is None, the text ``-p`` path applies. Multi-turn history
     is told as narrative lines to avoid role-label leakage.
     """
+
+    # The CLI registers the brain tools under the "brain-tools" MCP server key.
+    tool_name_prefix = "mcp__brain-tools__"
 
     def __init__(
         self,
@@ -1953,7 +1969,7 @@ class ClaudeCliProvider(LLMProvider):
 
 
 _CLI_BUILTIN_ORIGIN = "cli_builtin"
-_BRAIN_TOOLS_PREFIX = "mcp__brain-tools__"
+_BRAIN_TOOLS_PREFIX = ClaudeCliProvider.tool_name_prefix
 
 
 def _collect_builtin_calls(content: Any, calls: dict[str, dict[str, Any]]) -> None:

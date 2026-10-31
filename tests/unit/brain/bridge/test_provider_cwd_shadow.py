@@ -27,7 +27,15 @@ PROVIDER_SRC = Path(provider_mod.__file__)
 def test_entry_without_request_id_has_no_env_and_safe_path(tmp_path: Path) -> None:
     entry = brain_tools_mcp_entry(tmp_path / "persona")
     assert entry["command"] == sys.executable
-    assert entry["args"] == ["-P", "-m", "brain.mcp_server", "--persona-dir", str(tmp_path / "persona")]
+    assert entry["args"] == [
+        "-P",
+        "-m",
+        "brain.mcp_server",
+        "--persona-dir",
+        str(tmp_path / "persona"),
+        "--tool-prefix",
+        "mcp__brain-tools__",
+    ]
     assert "env" not in entry  # matches legacy site A exactly
 
 

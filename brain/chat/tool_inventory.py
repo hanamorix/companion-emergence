@@ -19,6 +19,7 @@ import re
 
 from brain import prompt_strings
 from brain.tools import NELL_TOOL_NAMES
+from brain.tools.naming import fill_tool_prefix
 from brain.tools.schemas import build_schemas
 
 # Text externalized to prompt_strings.toml [chat.tool_inventory] (issue #129 stage 2a).
@@ -50,16 +51,17 @@ def _gloss(description: str) -> str:
     return first
 
 
-def build_tool_inventory(companion_name: str) -> str:
-    """Render every registered tool as `name` — gloss, plus the reach valve."""
-    schemas = build_schemas(companion_name)
+def build_tool_inventory(companion_name: str, *, tool_prefix: str = "") -> str:
+    """Render every registered tool as `name` — gloss, plus the reach valve, each tool called by
+    ``tool_prefix`` + its name (brain.tools.naming)."""
+    schemas = build_schemas(companion_name, tool_prefix=tool_prefix)
     lines: list[str] = []
     for name in NELL_TOOL_NAMES:
         schema = schemas.get(name)
         if schema is None:
             # Fail soft: an unregistered-but-named tool is a bug, but the prompt
             # is not the place to raise it.
-            lines.append(f"- `{name}`")
+            lines.append(f"- `{tool_prefix}{name}`")
             continue
-        lines.append(f"- `{name}` — {_gloss(schema.get('description', ''))}")
-    return "\n\n".join([_HEADER, "\n".join(lines), _REACH_VALVE])
+        lines.append(f"- `{tool_prefix}{name}` — {_gloss(schema.get('description', ''))}")
+    return "\n\n".join([_HEADER, "\n".join(lines), fill_tool_prefix(_REACH_VALVE, tool_prefix)])

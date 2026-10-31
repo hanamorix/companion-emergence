@@ -305,7 +305,7 @@ def test_c13_unfamiliar_bucket_and_epistemic_instruction(tmp_path: Path) -> None
     # Content the frozen copy was guarding: the search-before-denying rule and
     # the exact "not recognised" wording the recall block emits (asserted
     # against `block` above), plus the never-invent-familiarity distinction.
-    assert "call search_memories" in instr
+    assert "call {tool_prefix}search_memories" in instr
     assert 'Never say "I don\'t remember" without searching first' in instr
     assert '"not recognised (searched; no memory found)"' in instr
     assert '"I never knew this"' in instr and '"I don\'t remember"' in instr

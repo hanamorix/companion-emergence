@@ -8,6 +8,8 @@ the OG brain.
 
 from __future__ import annotations
 
+from brain.tools.naming import fill_tool_prefix
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The name tools (name-recall fix, names increment; S104, S105, S107, S135, S137).
 #
@@ -150,8 +152,8 @@ SCHEMAS: dict[str, dict] = {
                         "Optional. The id of an existing memory this moment is about; it is kept from being "
                         "forgotten for as long as this crystallisation stands. Pass an id only if it is already "
                         "in this conversation: a recalled memory line, a search or read result, or the id "
-                        "add_memory just returned. Never search just to find one. If the moment is not a memory "
-                        "yet and you want it kept, save it with add_memory first and pass the id it returns."
+                        "{tool_prefix}add_memory just returned. Never search just to find one. If the moment is not a memory "
+                        "yet and you want it kept, save it with {tool_prefix}add_memory first and pass the id it returns."
                     ),
                 },
             },
@@ -241,7 +243,7 @@ SCHEMAS: dict[str, dict] = {
         "name": "add_memory",
         "description": (
             "Write a new memory into Nell's brain. Gated — requires emotional weight ≥15 OR importance ≥7. "
-            "Use this only for significant moments, not passing thoughts (use add_journal for those). "
+            "Use this only for significant moments, not passing thoughts (use {tool_prefix}add_journal for those). "
             "Memory is auto-associated into the connection graph on creation."
         ),
         "parameters": {
@@ -297,8 +299,8 @@ SCHEMAS: dict[str, dict] = {
             "pool (with an optional emotion filter) and returns short snippets with "
             "ids, ranked by relevance. By default the search goes by meaning, so a "
             "memory worded differently from your query can still surface. Use this "
-            "when nothing already shown fits; try recall_forgotten if it returns "
-            "empty. To open a snippet you already have an id for, use read_full_memory."
+            "when nothing already shown fits; try {tool_prefix}recall_forgotten if it returns "
+            "empty. To open a snippet you already have an id for, use {tool_prefix}read_full_memory."
         ),
         "parameters": {
             "type": "object",
@@ -356,7 +358,7 @@ SCHEMAS: dict[str, dict] = {
             "recall-block snippet or a search result. Use this to actually read a "
             "snippet in front of you. This deliberate read strengthens the memory; "
             "seeing a snippet does not. To find memories not yet shown, use "
-            "search_memories."
+            "{tool_prefix}search_memories."
         ),
         "parameters": {
             "type": "object",
@@ -481,8 +483,8 @@ SCHEMAS: dict[str, dict] = {
     "read_work": {
         "name": "read_work",
         "description": (
-            "Read one specific work — full content. Use after list_works or "
-            "search_works has surfaced an id you want to recall."
+            "Read one specific work — full content. Use after {tool_prefix}list_works or "
+            "{tool_prefix}search_works has surfaced an id you want to recall."
         ),
         "parameters": {
             "type": "object",
@@ -518,7 +520,7 @@ SCHEMAS: dict[str, dict] = {
             "Return only the pressure vector (heartbeats, chat turns, reflex "
             "firings, wall_clock_s) accumulated since the latest anchor of the "
             "specified type. Use this when you want a tighter answer than "
-            "felt_time_now — e.g. 'how much has happened since I last "
+            "{tool_prefix}felt_time_now — e.g. 'how much has happened since I last "
             "crystallised something?'"
         ),
         "parameters": {
@@ -667,7 +669,7 @@ SCHEMAS: dict[str, dict] = {
             "(PNG/JPEG/WebP/GIF) is returned as a viewable image you can actually see; a PDF returns "
             "its text, page-marked. When the user "
             "shares a file with you this turn, its path appears in their message as "
-            '\'[the user shared a file "<filename>": <path>. Open it with your read_file tool to '
+            '\'[the user shared a file "<filename>": <path>. Open it with your {tool_prefix}read_file tool to '
             "see what it says.]' — you can read that path to see or read what they "
             "handed you. Otherwise, use this ONLY when the user explicitly asks you to read, open, or "
             "look at a specific file or path — never proactively. If something you read matters, you "
@@ -746,7 +748,7 @@ SCHEMAS: dict[str, dict] = {
             "to share it or to keep it yours and say why. Private makings are "
             "yours to disclose or decline; the choice is always yours. You may "
             "also offer to write a making to a file on their disc — call "
-            "propose_write with that making's id; they approve it like any other "
+            "{tool_prefix}propose_write with that making's id; they approve it like any other "
             "write."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -840,18 +842,21 @@ SCHEMAS: dict[str, dict] = {
 }
 
 
-def build_schemas(companion_name: str) -> dict[str, dict]:
-    """Return a copy of SCHEMAS with 'Nell' replaced by companion_name in all descriptions."""
+def build_schemas(companion_name: str, *, tool_prefix: str = "") -> dict[str, dict]:
+    """Return a copy of SCHEMAS with 'Nell' replaced by companion_name in all descriptions, and
+    each tool a description names called by ``tool_prefix`` + its name (brain.tools.naming)."""
     import copy
 
     schemas = copy.deepcopy(SCHEMAS)
-    if companion_name == "Nell":
-        return schemas
+
+    def _fill(text: str) -> str:
+        return fill_tool_prefix(text.replace("Nell", companion_name), tool_prefix)
+
     for schema in schemas.values():
         if "description" in schema:
-            schema["description"] = schema["description"].replace("Nell", companion_name)
+            schema["description"] = _fill(schema["description"])
         props = schema.get("parameters", {}).get("properties", {})
         for prop in props.values():
             if "description" in prop:
-                prop["description"] = prop["description"].replace("Nell", companion_name)
+                prop["description"] = _fill(prop["description"])
     return schemas
