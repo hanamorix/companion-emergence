@@ -9,7 +9,7 @@ How "the memories db" is recognised (a path variable defeats any single test, so
 
 1. Opens. Every `sqlite3.connect`, `sqlite3.Connection(...)` and `open_store_connection` in brain/ must
    sit in a file listed in OPENERS (with the database it opens) or in a (file, function) listed in
-   READER_EXCEPTIONS. An unlisted opener fails whatever path it passes. Adding a new SQLite file
+   READER_EXCEPTIONS, where a method is keyed as `Class.method`. An unlisted opener fails whatever path it passes. Adding a new SQLite file
    costs one line in OPENERS.
 2. Write statements. Any `execute` / `executemany` / `executescript` whose SQL text starts with
    INSERT, UPDATE, DELETE, REPLACE, CREATE, DROP or ALTER (a CTE counts when one of those verbs
@@ -29,7 +29,9 @@ Limits (the scanner is a name-and-text check, not a type check):
 - SQL with no resolvable literal prefix (built by a function call, read from a file, or whose first
   piece is a variable) is not analysed. So are: a table name held in a variable (`UPDATE {t}`), SQL in
   a class attribute, dict value, ternary or parameter default, and a literal handed to a wrapper
-  function that runs it. A bare name is judged against every value assigned to it in scope.
+  function that runs it. A bare name is judged against every value assigned to it in scope, except
+  through a chained assignment (`a = b = "DELETE ..."`), a loop over a named tuple of SQL strings, or a
+  constant re-exported through a second module.
 - PRAGMA statements that write (journal_mode, user_version) are not flagged.
 - Registered other-db openers (OPENERS) are trusted not to open memories.db; only humans reviewing a
   registry edit catch that. Likewise a second open in the same function of a reader exception.

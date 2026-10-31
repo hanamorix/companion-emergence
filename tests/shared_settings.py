@@ -71,7 +71,7 @@ Thresholds. Each is derived from a measurement of the tree and says which:
 NOT detected: a copy of a round value under an unrelated name (``delay = 60`` for a 60 s tick) or under a related name
 that lacks one of the setting's words (``scan_cap = 500`` for ``DEFAULT_SCAN_CAP``); a copy computed at run time; a value
 spelled differently across a call (``datetime.timedelta(minutes=15)`` for 900 s) or in another unit or inside a string
-(``PRAGMA busy_timeout = 5000`` for the 5.0 s ``SQLITE_STORE_BUSY_TIMEOUT_S``, in brain/initiate/resonance.py); a default
+(``PRAGMA busy_timeout = 5000`` for the 5.0 s ``SQLITE_STORE_BUSY_TIMEOUT_S``); a default
 computed from a dev constant (``def f(x=dev_constants.Y * 3600.0)``); constant folding other than ``+ - * **`` (``/``,
 ``//``, ``<<`` are not folded); a collection that is not a literal of strings (a dict, a comprehension, a list built by a
 call); a tunable registered through ``from brain.tunables import register`` or ``brain.tunables.register(...)`` (the tree
