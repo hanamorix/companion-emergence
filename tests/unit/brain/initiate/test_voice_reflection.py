@@ -40,6 +40,7 @@ def test_voice_reflection_emits_candidate_when_evidence_strong(
         provider=_evidence_provider(emit=True),
         crystallizations=[{"id": "c1", "ts": "2026-05-08T00:00:00+00:00"}],
         dreams=[{"id": "d1", "ts": "2026-05-09T00:00:00+00:00"}],
+        companion_name="Nell",
     )
     candidates = read_candidates(persona_dir)
     assert len(candidates) == 1
@@ -58,6 +59,7 @@ def test_voice_reflection_skips_when_evidence_thin(tmp_path: Path) -> None:
         provider=_evidence_provider(emit=False),
         crystallizations=[],
         dreams=[],
+        companion_name="Nell",
     )
     assert read_candidates(persona_dir) == []
 
@@ -85,6 +87,7 @@ def test_voice_reflection_requires_at_least_3_evidence_pieces(
         provider=provider,
         crystallizations=[],
         dreams=[],
+        companion_name="Nell",
     )
     assert read_candidates(persona_dir) == []
 
@@ -125,6 +128,7 @@ def test_voice_reflection_prompt_carries_evidence_text(tmp_path: Path) -> None:
             {"id": "c1", "ts": "2026-09-01T00:00:00+00:00", "text": "the kitchen light left on"}
         ],
         dreams=[{"id": "d1", "ts": "2026-09-02T00:00:00+00:00", "text": "the sailor kept the boat"}],
+        companion_name="Nell",
     )
     prompt = provider.complete.call_args.args[0]
     assert "the kitchen light left on" in prompt
@@ -139,6 +143,7 @@ def test_voice_reflection_no_longer_accepts_recent_tones(tmp_path: Path) -> None
         run_voice_reflection_tick(
             tmp_path, provider=_evidence_provider(emit=False),
             crystallizations=[], dreams=[], recent_tones=[],
+            companion_name="Nell",
         )
 
 
@@ -147,7 +152,7 @@ def test_voice_reflection_records_an_unparseable_reply(tmp_path: Path) -> None:
     from brain.health.parse_failures import PARSE_FAILURE_LOG
 
     provider = MagicMock(complete=MagicMock(return_value="I don't think I should change."))
-    run_voice_reflection_tick(tmp_path, provider=provider, crystallizations=[], dreams=[])
+    run_voice_reflection_tick(tmp_path, provider=provider, crystallizations=[], dreams=[], companion_name="Nell")
     (row,) = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
     assert row["site"] == "voice_reflection" and row["raw"] == "I don't think I should change."
     assert read_candidates(tmp_path) == []
@@ -161,5 +166,6 @@ def test_voice_reflection_reads_a_fenced_reply(tmp_path: Path) -> None:
         tmp_path, provider=provider,
         crystallizations=[{"id": "c1", "ts": "2026-05-08T00:00:00+00:00"}],
         dreams=[{"id": "d1", "ts": "2026-05-09T00:00:00+00:00"}],
+        companion_name="Nell",
     )
     assert [c.kind for c in read_candidates(tmp_path)] == ["voice_edit_proposal"]

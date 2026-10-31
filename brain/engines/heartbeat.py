@@ -1551,6 +1551,7 @@ class HeartbeatEngine:
             try:
                 from datetime import UTC, datetime
 
+                from brain.ingest.ingest_utils import load_user_name
                 from brain.initiate.draft import (
                     append_draft_fragment,
                     compose_draft_fragment,
@@ -1565,6 +1566,8 @@ class HeartbeatEngine:
                     source="emotion_spike",
                     source_id=f"emotion_{tick_count}",
                     linked_memory_excerpts=[],
+                    user_name=load_user_name(persona_dir) or "my user",
+                    companion_name=persona_dir.name,
                 )
                 append_draft_fragment(
                     persona_dir,
