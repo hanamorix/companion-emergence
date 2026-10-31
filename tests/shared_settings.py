@@ -71,7 +71,7 @@ Thresholds. Each is derived from a measurement of the tree and says which:
 NOT detected: a copy of a round value under an unrelated name (``delay = 60`` for a 60 s tick) or under a related name
 that lacks one of the setting's words (``scan_cap = 500`` for ``DEFAULT_SCAN_CAP``); a copy computed at run time; a value
 spelled differently across a call (``datetime.timedelta(minutes=15)`` for 900 s) or in another unit or inside a string
-(``PRAGMA busy_timeout = 5000`` for the 5.0 s ``SQLITE_STORE_BUSY_TIMEOUT_S``, in brain/initiate/resonance.py); a default
+(``PRAGMA busy_timeout = 5000`` for the 5.0 s ``SQLITE_STORE_BUSY_TIMEOUT_S``); a default
 computed from a dev constant (``def f(x=dev_constants.Y * 3600.0)``); constant folding other than ``+ - * **`` (``/``,
 ``//``, ``<<`` are not folded); a collection that is not a literal of strings (a dict, a comprehension, a list built by a
 call); a tunable registered through ``from brain.tunables import register`` or ``brain.tunables.register(...)`` (the tree
@@ -321,8 +321,11 @@ class Settings:
             loose = [bound] if bound else []
             loose += [f for f in (name_words(".".join(segments[i:])) for i in range(len(segments))) if len(f) >= MIN_FORM_WORDS]
             value = None if key.startswith("model.") else info.default  # a model id is the model case's (G1)
+            # R2 takes the key's own forms as well as the bound name's, so a drifted copy named after the key is
+            # caught (#601); R3 uses the same forms for value-equal matches.
+            forms = tuple(dict.fromkeys(loose))
             settings.append(
-                _Setting(f"tunables:{key}", value, (bound,) if bound else (), tuple(dict.fromkeys(loose)), info.owner_file,
+                _Setting(f"tunables:{key}", value, forms, forms, info.owner_file,
                          (info.bound_name,) if info.bound_name else ())
             )
         self.constant_names = frozenset(n for st in settings for n in st.names)
