@@ -408,6 +408,44 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     assert "new2" in out
 
 
+def test_cmd_tail_log_follow_mode_keeps_following_across_a_rollover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review of #613: the runtime log rolls over by rename (RotatingFileHandler). Follow mode must pick up the new file
+    at the same path, not keep reading the renamed one; and it must not hold the file open between polls, which on
+    Windows would make that rename fail."""
+    import threading
+
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    log_path = log_dir / "runtime-nell.log"
+    log_path.write_text("seed\n")
+    stop_event = threading.Event()
+    monkeypatch.setattr(daemon, "_follow_should_stop", stop_event)
+
+    def writer():
+        time.sleep(0.35)
+        with log_path.open("a") as f:
+            f.write("before\n")
+        time.sleep(0.35)
+        for _ in range(50):  # a poll may have the file open for an instant
+            try:
+                os.replace(log_path, log_dir / "runtime-nell.log.1")
+                break
+            except PermissionError:
+                time.sleep(0.02)
+        log_path.write_text("after\n")
+        time.sleep(0.6)
+        stop_event.set()
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=1, follow=True))
+    finish_threads(t)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "before" in out and "after" in out
+
+
 # ---------- cmd_tail (I-1 follow-up audit: subprotocol auth, no ?token=) ----------
 
 
@@ -795,25 +833,56 @@ def test_release_lock_is_idempotent_after_external_unlink(
 # ---------- spawn_detached (lines 117-148) ----------
 
 
-def test_spawn_detached_rotates_an_oversize_bridge_log_before_the_child_appends(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_start_rotates_an_oversize_bridge_log(tmp_path: Path) -> None:
     """#559: outside launchd nothing else bounds bridge-<persona>.log; each start rotates it past the runtime log's cap."""
-    persona_dir = tmp_path / "persona"
-    persona_dir.mkdir()
     log_path = tmp_path / "logs" / "bridge-nell.log"
     log_path.parent.mkdir()
     log_path.write_bytes(b"x" * (6 * 1024 * 1024))
 
-    class FakeProc:
-        pid = 4242
-
-    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: FakeProc())
-    daemon.spawn_detached(persona_dir, idle_shutdown_seconds=300.0, client_origin="cli", log_path=log_path)
+    daemon._rotate_bridge_log(log_path)
 
     assert (tmp_path / "logs" / "bridge-nell.log.1.gz").exists()
     assert log_path.stat().st_size == 0
+
+
+def test_cmd_start_rotates_the_bridge_log_before_handing_the_lock_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of #613: the rotation is only safe while this starter holds the bridge lock (no other starter's child is
+    writing the log), so it must happen before cmd_start releases the lock to its own child."""
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    monkeypatch.setattr(daemon, "_service_installed", lambda _p: False)
+    order: list[str] = []
+    monkeypatch.setattr(daemon, "rotate_rolling_size", lambda *a, **k: order.append("rotate"))
+    real_release = daemon.release_lock
+    monkeypatch.setattr(daemon, "release_lock", lambda *a: (order.append("release"), real_release(*a)))
+
+    class _StopAtSpawnError(Exception):
+        pass
+
+    def stop_at_spawn(*a, **k):
+        raise _StopAtSpawnError
+
+    monkeypatch.setattr("subprocess.Popen", stop_at_spawn)
+    with pytest.raises(_StopAtSpawnError):
+        daemon.cmd_start(_args("nell"))
+    assert order == ["rotate", "release"]
+
+
+def test_a_failed_rotation_never_blocks_a_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(daemon, "rotate_rolling_size", boom)
+    with caplog.at_level("WARNING", logger=daemon.logger.name):
+        daemon._rotate_bridge_log(tmp_path / "bridge-nell.log")  # must not raise
+    assert "starting the bridge anyway" in caplog.text
 
 
 def test_spawn_detached_invokes_popen_with_detach_flags(

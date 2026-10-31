@@ -15,6 +15,7 @@ Internal:
 
 from __future__ import annotations
 
+import codecs
 import errno
 import logging
 import os
@@ -256,12 +257,6 @@ def spawn_detached(
     reports alive, and ``poll()`` is also what reaps it.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    # Outside launchd nothing else bounds this file (#559). The previous child is gone (the caller holds the bridge
-    # lock), so rotating before the new child opens it is safe; a failed rotation never blocks a start.
-    try:
-        rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
-    except Exception:  # noqa: BLE001
-        logger.warning("could not rotate %s; starting the bridge anyway", log_path, exc_info=True)
     log_fh = open(log_path, "ab")  # noqa: SIM115
     python, env = bridge_python()
     popen_extra: dict[str, object] = {} if env is None else {"env": env}
@@ -280,6 +275,15 @@ def spawn_detached(
         return proc.pid
     finally:
         log_fh.close()
+
+
+def _rotate_bridge_log(log_path: Path) -> None:
+    """Outside launchd nothing else bounds bridge-<persona>.log (#559). cmd_start calls this while it still holds the
+    bridge lock, so no bridge (and no other starter's child) is writing the file. A failed rotation never blocks a start."""
+    try:
+        rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not rotate %s; starting the bridge anyway", log_path, exc_info=True)
 
 
 # pid -> Popen for children spawn_detached started and cmd_start has not yet
@@ -389,6 +393,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+    _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
     release_lock(persona_dir, fd)  # hand the lock to the child runner
     # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
     # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
@@ -1011,19 +1016,33 @@ def cmd_tail_log(args) -> int:
                     print(line, end="")
             if not getattr(args, "follow", False):
                 return 0
-            # Follow mode: seek to end, poll for new content
-            f.seek(0, 2)  # SEEK_END
-            stop = _follow_should_stop or threading.Event()
-            try:
-                while not stop.is_set():
-                    chunk = f.read()
-                    if chunk:
-                        print(chunk, end="")
-                    else:
-                        time.sleep(0.2)
-            except KeyboardInterrupt:
-                return 0
+            st = os.fstat(f.fileno())
+        # Follow mode polls by path and never holds the file open between polls: the runtime log rolls over by
+        # rename (RotatingFileHandler), so a kept handle would go on reading the renamed file, and on Windows it
+        # would make that rename fail.
+        ident, pos = st.st_ino, st.st_size
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        stop = _follow_should_stop or threading.Event()
+        try:
+            while not stop.is_set():
+                try:
+                    st = log_path.stat()
+                except FileNotFoundError:  # between the rename and the new file
+                    st = None
+                if st is not None and (st.st_ino != ident or st.st_size < pos):  # rolled over or truncated
+                    ident, pos = st.st_ino, 0
+                    decoder.reset()
+                if st is not None and st.st_size > pos:
+                    with log_path.open("rb") as fb:
+                        fb.seek(pos)
+                        chunk = fb.read()
+                    pos += len(chunk)
+                    print(decoder.decode(chunk), end="")
+                else:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
             return 0
+        return 0
     except OSError as e:
         print(f"error reading {log_path}: {e}", file=sys.stderr)
         return 1
