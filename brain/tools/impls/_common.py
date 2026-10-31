@@ -8,6 +8,7 @@ _write_gate_check — validate emotion_score + importance against the write gate
 from __future__ import annotations
 
 from brain.memory.store import Memory
+from brain.tools.naming import TOOL_PREFIX_SLOT
 from brain.utils.time import format_local
 
 
@@ -76,6 +77,6 @@ def _write_gate_check(
 
     reason = (
         f"below threshold (emotion_score={emotion_score:.0f}, importance={effective_importance}); "
-        "use add_journal for low-weight content"
+        f"use {TOOL_PREFIX_SLOT}add_journal for low-weight content"
     )
     return False, effective_importance, emotion_score, reason

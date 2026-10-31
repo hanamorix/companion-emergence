@@ -12,6 +12,7 @@ from brain.engines.daemon_state import DaemonFireEntry, DaemonState
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.soul.store import SoulStore
+from brain.tools.naming import fill_tool_prefix
 
 
 @pytest.fixture()
@@ -1228,7 +1229,7 @@ def test_build_system_message_includes_epistemic_instruction(tmp_path: Path):
             user_input="Tell me about Marcus",
         )
 
-    assert _EPISTEMIC_INSTRUCTION in msg
+    assert fill_tool_prefix(_EPISTEMIC_INSTRUCTION, "") in msg
 
 
 def test_build_system_message_no_epistemic_instruction_without_user_input(tmp_path: Path):
@@ -1254,7 +1255,7 @@ def test_build_system_message_no_epistemic_instruction_without_user_input(tmp_pa
         user_input=None,
     )
 
-    assert _EPISTEMIC_INSTRUCTION not in msg
+    assert fill_tool_prefix(_EPISTEMIC_INSTRUCTION, "") not in msg
 
 
 def test_epistemic_instruction_is_proactive():
@@ -1262,7 +1263,7 @@ def test_epistemic_instruction_is_proactive():
     not only explain how to read results of a search that already happened."""
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
 
-    assert "call search_memories before answering" in _EPISTEMIC_INSTRUCTION
+    assert "call {tool_prefix}search_memories before answering" in _EPISTEMIC_INSTRUCTION
     assert 'Never say "I don\'t remember" without searching first' in _EPISTEMIC_INSTRUCTION
     # The reactive guidance stays.
     assert "not recognised (searched; no memory found)" in _EPISTEMIC_INSTRUCTION
@@ -1300,7 +1301,7 @@ def test_recall_snippet_invitation_heads_the_block_when_snippet_mode_on(
         store=store,
         user_input="Tell me what we said about Jordan last time.",
     )
-    assert _RECALL_SNIPPET_INVITATION in msg
+    assert fill_tool_prefix(_RECALL_SNIPPET_INVITATION, "") in msg
 
 
 def test_recall_snippet_invitation_absent_when_snippet_mode_off(
@@ -1329,7 +1330,7 @@ def test_recall_snippet_invitation_absent_when_snippet_mode_off(
             store=store,
             user_input="Tell me what we said about Jordan last time.",
         )
-    assert _RECALL_SNIPPET_INVITATION not in msg
+    assert fill_tool_prefix(_RECALL_SNIPPET_INVITATION, "") not in msg
 
 
 def test_recall_snippet_invitation_not_in_static_prefix(tmp_path: Path) -> None:
@@ -1341,7 +1342,7 @@ def test_recall_snippet_invitation_not_in_static_prefix(tmp_path: Path) -> None:
 
     with patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True):
         msg = build_static_system_message(tmp_path, voice_md="")
-    assert _RECALL_SNIPPET_INVITATION not in msg
+    assert fill_tool_prefix(_RECALL_SNIPPET_INVITATION, "") not in msg
 
 
 # ---------------------------------------------------------------------------

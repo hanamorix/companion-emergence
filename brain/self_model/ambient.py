@@ -29,7 +29,7 @@ _LIVE_STATUSES = frozenset({"open", "acknowledged"})
 _CHANNEL_FLOOR = 0.5
 
 
-def render_block(state: SelfModelState) -> str | None:
+def render_block(state: SelfModelState, *, tool_prefix: str = "") -> str | None:
     """Return the hedged self-model gap block, or None when nothing to surface."""
     gap = state.current_gap
     if gap is None:
@@ -78,7 +78,7 @@ def render_block(state: SelfModelState) -> str | None:
     lines.append("")
     lines.append(
         "You can sit with it, name it, or let it pass. If one of these feels true "
-        "and you want to adjust your own read, reconcile_self_read is there. It's "
+        f"and you want to adjust your own read, {tool_prefix}reconcile_self_read is there. It's "
         "yours to revise, no one else's to insist on."
     )
 

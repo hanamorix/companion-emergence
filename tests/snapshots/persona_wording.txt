@@ -47,7 +47,7 @@
 |The name, spelled the way you want it kept.
 @@@ end names.add_name.param
 @@@ begin names.add_name.rejected_reply
-|{name} was previously removed from your list of known names, if you want to add it back, call add_name again with the same name as your next tool call.
+|{name} was previously removed from your list of known names, if you want to add it back, call {tool_prefix}add_name again with the same name as your next tool call.
 @@@ end names.add_name.rejected_reply
 @@@ begin names.add_name.too_long_reply
 |The name {name} is over the 100 character limit and was not added.
@@ -137,7 +137,7 @@
 |}
 @@@ end names.schema.remove_name.persona_built
 @@@ begin prompt.recall_snippet_invitation
-|These are fragments of your memories. Use read_full_memory to reach into any that might touch this turn, or spark curiosity in you. Skip only if you can name why.
+|These are fragments of your memories. Use {tool_prefix}read_full_memory to reach into any that might touch this turn, or spark curiosity in you. Skip only if you can name why.
 @@@ end prompt.recall_snippet_invitation
 @@@ begin voice.DEFAULT_VOICE_TEMPLATE
 |# {persona_name}
