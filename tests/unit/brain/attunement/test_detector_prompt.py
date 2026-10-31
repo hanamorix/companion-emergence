@@ -37,8 +37,8 @@ def test_prompt_grounds_companion_identity() -> None:
     """v0.0.33 fix: without identity grounding, the CLI-wrapped detector
     falls back to its self-concept and names the companion 'Claude' in
     pattern descriptions (a live persona's report, 2026-06-11)."""
-    prompt = build_detector_system_prompt(companion_name="Canary", user_name="Hana")
-    assert "between Hana (the user) and the user's companion, Canary" in prompt
+    prompt = build_detector_system_prompt(companion_name="Canary", user_name="Bob")
+    assert "between Bob (the user) and the user's companion, Canary" in prompt
     assert 'never "Claude"' in prompt
 
 

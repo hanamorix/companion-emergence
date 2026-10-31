@@ -2,7 +2,7 @@
 
 **Audience:** the owner of the gitignored `hunts/symptom-cluster-rootcause/live-run/` files
 (`run_arm.sh`, `live_server.py`), which live only in the main clone
-(`/home/zero/Desktop/companion-emergence`). This note is documentation only — the tracked
+(`/home/<user>/Desktop/companion-emergence`). This note is documentation only — the tracked
 capability is on branch `ThinkerOfThoughts/harness-drop-in-code-ingest`, module
 `tests/harness/foreground.py`, exported from `tests.harness`.
 

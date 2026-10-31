@@ -49,7 +49,7 @@ G1/G2/G3 inject fakes for exactly these seams.
 - `assert_brain_tools_roster` first does `_assert_declared_authoritative(build)`
   (`roster_preflight.py:152`) resolving in-process `brain` under `build.repo`
   (`roster_preflight.py:67-68`). In the orchestrator `brain` resolves to
-  `/home/zero/Desktop/ce-harness-ingest/brain/`, not the copy → raises `DropinMismatch`
+  `/home/<user>/Desktop/ce-harness-ingest/brain/`, not the copy → raises `DropinMismatch`
   (`roster_preflight.py:69-73`).
 - Ships "green" because `test_foreground.py` injects fakes and never invokes the real defaults.
 - Route to spec/plan: either (a) `boot_and_verify` must NOT re-run the process-self asserts (the
