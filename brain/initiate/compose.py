@@ -44,7 +44,7 @@ def compose_subject(
     provider: Any,
     candidate: InitiateCandidate,
     semantic_memory_excerpts: list[str],
-    companion_name: str = "Nell",
+    companion_name: str,
 ) -> str:
     """Return a single-sentence subject for this candidate.
 
@@ -71,7 +71,7 @@ def compose_tone(
     candidate: InitiateCandidate,
     voice_template: str,
     user_name: str = "my user",
-    companion_name: str = "Nell",
+    companion_name: str,
     persona_dir: Path | None = None,
 ) -> str:
     """Render the subject in Nell's voice, coloured by current emotional state.
@@ -113,7 +113,7 @@ def compose_decision(
     recent_send_history: list[dict],
     current_local_time: datetime,
     voice_edit_acceptance_rate: float | None,
-    companion_name: str = "Nell",
+    companion_name: str,
     persona_dir: Path | None = None,
 ) -> DecisionResult:
     """Decide send_notify | send_quiet | hold | drop on the finished message.
@@ -175,7 +175,7 @@ def compose_decision_voice_edit(
     current_voice_template: str,
     recent_voice_evolutions: list[dict],
     current_local_time: datetime,
-    companion_name: str = "Nell",
+    companion_name: str,
     persona_dir: Path | None = None,
 ) -> DecisionResult:
     """Decision prompt specifically for voice_edit_proposal candidates.

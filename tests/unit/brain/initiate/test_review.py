@@ -827,6 +827,7 @@ def test_process_one_candidate_passes_user_name_to_compose_tone(tmp_path, monkey
         voice_template="warm",
         now=datetime(2026, 5, 28, 0, 0, tzinfo=UTC),
         user_name="Henryk",
+        companion_name="Nell",
     )
 
     assert captured_kwargs, "compose_tone was not called"
@@ -971,6 +972,7 @@ def test_process_one_candidate_keeps_an_unparseable_decision_in_the_persona_log(
     _process_one_candidate(
         tmp_path, cand, provider=MagicMock(complete=MagicMock(return_value="not a decision")),
         voice_template="warm", now=datetime(2026, 5, 28, 0, 0, tzinfo=UTC),
+        companion_name="Nell",
     )
 
     rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
