@@ -2603,7 +2603,7 @@ def _run_narrative_memory_pass(
     # set would pull soul-linked memories in, so skip. Read before any store is opened so a skip
     # does no work; the next maintenance run tries again.
     try:
-        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir, caller="narrative")
     except SoulExemptionsUnavailableError as exc:
         logger.warning("narrative-memory pass: %s; skipping this pass", exc)
         return
