@@ -26,7 +26,7 @@ section — this file does NOT re-test that arithmetic):
     `mode == "lexical"`), never raises.
 
 All offline: `FakeRerankerProvider`/a recording wrapper around it, and a
-hand-scripted `EmbeddingProvider`, never a real model or the live Phoebe DB
+hand-scripted `EmbeddingProvider`, never a real model or a real persona's DB
 (I11).
 """
 

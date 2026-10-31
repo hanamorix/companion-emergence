@@ -36,7 +36,7 @@ from __future__ import annotations
 # connects directly and applies it itself.
 # Sized above the longest single memories.db write transaction measured in
 # 2-plan.md §4.3: clustering's `set_cluster_memberships` at 6.7 s on
-# F-bob20k on the dev host; Phoebe-class hardware is 3-30x slower and was
+# F-bob20k on the dev host; slower user hardware is 3-30x slower and was
 # IO-saturated (O15/O23) -> ~20-27 s estimated; 30 s is the next round value
 # above that. Other memories.db writers (this repo only) stay on their own
 # 5 s default (hebbian.db, works.db, soul.db, kindled_link's stores), named by

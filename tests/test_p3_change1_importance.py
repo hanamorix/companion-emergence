@@ -3,7 +3,7 @@
 Covers C1.1-C1.5 from changes/p3-retention/1.5-criteria.md. Each test
 documents how the PRE-CHANGE code would have violated the criterion.
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations

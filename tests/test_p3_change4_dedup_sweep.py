@@ -2,7 +2,7 @@
 
 Covers C4.1 from changes/p3-retention/1.5-criteria.md.
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations

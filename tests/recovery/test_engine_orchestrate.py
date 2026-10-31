@@ -9,7 +9,7 @@ from brain.recovery.engine import preflight_recovery, run_recovery
 
 
 def _persona_with_dangling(tmp_path):
-    p = tmp_path / "Phoebe"
+    p = tmp_path / "Canary"
     p.mkdir()
     s = MemoryStore(p / "memories.db")
     s.create(Memory(id="S", content="survivor", memory_type="conversation",

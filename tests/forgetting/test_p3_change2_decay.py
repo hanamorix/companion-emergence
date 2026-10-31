@@ -9,7 +9,7 @@ passes, consecutive_low_passes counter, FADE/UNFADE/LOSE per
 `policy.next_state`) — the same mechanics production drives, without a real
 MemoryStore/DB/heartbeat.
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations
