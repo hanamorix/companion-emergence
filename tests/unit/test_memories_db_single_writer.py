@@ -46,7 +46,9 @@ Limits (the scanner is a name-and-text check, not a type check):
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,9 +81,9 @@ OPENERS: dict[str, str] = {
     "brain/health/walker.py": "works.db integrity check only; the other databases go through their stores.",
 }
 
-# (file, innermost function) -> why this read of a memories.db is allowed outside the store.
+# (file, innermost function; a method is Class.method) -> why this read of a memories.db is allowed outside the store.
 READER_EXCEPTIONS: dict[tuple[str, str], str] = {
-    ("brain/memory/embedding_matrix.py", "_load_from_db"): (
+    ("brain/memory/embedding_matrix.py", "EmbeddingMatrix._load_from_db"): (
         "SELECT id, embedding only, into the in-process embedding matrix (plus PRAGMA busy_timeout)."
     ),
     ("brain/recovery/source_reader.py", "_ro_connect"): (
@@ -148,10 +150,19 @@ def _pieces(node: ast.AST, consts: list[dict[str, list[ast.AST]]], depth: int = 
         and node.func.attr == "format"
     ):
         return _pieces(node.func.value, consts, depth + 1)
-    if isinstance(node, ast.Name):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("strip", "lstrip", "rstrip"):
+        return _pieces(node.func.value, consts, depth + 1)  # the judge already skips leading whitespace
+    if (
+        isinstance(node, ast.Call)
+        and node.args
+        and (getattr(node.func, "attr", None) == "dedent" or getattr(node.func, "id", None) == "dedent")
+    ):
+        return _pieces(node.args[0], consts, depth + 1)
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        key = node.id if isinstance(node, ast.Name) else ast.unparse(node)  # "q.SQL" for a module's constant
         for scope in reversed(consts):
-            if node.id in scope:
-                return _pieces(scope[node.id][-1], consts, depth + 1)
+            if key in scope:
+                return _pieces(scope[key][-1], consts, depth + 1)
     return [None]
 
 
@@ -186,8 +197,24 @@ def _assignments(scope: ast.AST) -> dict[str, list[ast.AST]]:
     for node in nodes:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             out.setdefault(node.targets[0].id, []).append(node.value)
+        elif (  # sql, params = "...", ()
+            isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple)
+            and isinstance(node.value, ast.Tuple) and len(node.targets[0].elts) == len(node.value.elts)
+        ):
+            for target, value in zip(node.targets[0].elts, node.value.elts, strict=True):
+                if isinstance(target, ast.Name):
+                    out.setdefault(target.id, []).append(value)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
             out.setdefault(node.target.id, []).append(node.value)
+        elif isinstance(node, ast.NamedExpr):  # (sql := "...")
+            out.setdefault(node.target.id, []).append(node.value)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add) and isinstance(node.target, ast.Name):
+            out.setdefault(node.target.id, []).append(node.value)  # each appended piece is judged on its own
+        elif (  # for s in ("...", "..."):
+            isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name)
+            and isinstance(node.iter, (ast.Tuple, ast.List, ast.Set))
+        ):
+            out.setdefault(node.target.id, []).extend(node.iter.elts)
     return out
 
 
@@ -201,9 +228,16 @@ class _FileScan(ast.NodeVisitor):
         openers: dict[str, str],
         readers: dict[tuple[str, str], str],
         result: ScanResult,
+        module_consts: dict[str, dict[str, list[ast.AST]]] | None = None,
     ) -> None:
+        module_consts = module_consts or {}
         self.rel = rel
-        self.lines = source.splitlines()
+        # lines holding the marker in a comment token, not in a string (#603)
+        self.marker_lines = {
+            tok.start[0]
+            for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+            if tok.type == tokenize.COMMENT and MARKER in tok.string
+        }
         self.tables = tables
         self.table_re = (
             re.compile(r"\b(?:" + "|".join(re.escape(t.upper()) for t in sorted(tables)) + r")\w*")
@@ -214,6 +248,7 @@ class _FileScan(ast.NodeVisitor):
         self.readers = readers
         self.result = result
         self.funcs: list[str] = []
+        self.classes: list[tuple[str, int]] = []  # (class name, depth of self.funcs where it sits)
         self.consts: list[dict[str, list[ast.AST]]] = [_assignments(tree)]
         # Names that mean sqlite3.connect / sqlite3.Connection in this file.
         self.module_names = {"sqlite3"}
@@ -225,6 +260,8 @@ class _FileScan(ast.NodeVisitor):
                 for alias in node.names:
                     if alias.name == "sqlite3":
                         self.module_names.add(alias.asname or "sqlite3")
+                    elif alias.name in module_consts:  # import brain.sqlconsts [as q]
+                        self._bind_module(alias.asname or alias.name, module_consts[alias.name])
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     if node.module == "sqlite3" and alias.name == "connect":
@@ -233,14 +270,32 @@ class _FileScan(ast.NodeVisitor):
                         self.connection_names.add(alias.asname or "Connection")
                     elif alias.name == "open_store_connection":
                         self.store_open_names.add(alias.asname or "open_store_connection")
+                    elif alias.name in module_consts.get(node.module or "", {}):
+                        imported = module_consts[node.module][alias.name]
+                        self.consts[0].setdefault(alias.asname or alias.name, []).extend(imported)
+                    elif f"{node.module}.{alias.name}" in module_consts:  # from brain import sqlconsts as q
+                        self._bind_module(alias.asname or alias.name, module_consts[f"{node.module}.{alias.name}"])
+
+    def _bind_module(self, local: str, consts: dict[str, list[ast.AST]]) -> None:
+        """Make `<local>.NAME` resolve to that module's NAME (keys are the dotted source text, see _pieces)."""
+        for name, values in consts.items():
+            self.consts[0].setdefault(f"{local}.{name}", []).extend(values)
 
     # -- scope tracking -----------------------------------------------------
     def _enter(self, node: ast.AST, name: str) -> None:
+        # a method is Class.method, so a READER_EXCEPTIONS entry covers that class's method only (#603)
+        if self.classes and self.classes[-1][1] == len(self.funcs):
+            name = f"{self.classes[-1][0]}.{name}"
         self.funcs.append(name)
         self.consts.append(_assignments(node))
         self.generic_visit(node)
         self.consts.pop()
         self.funcs.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.classes.append((node.name, len(self.funcs)))
+        self.generic_visit(node)
+        self.classes.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._enter(node, node.name)
@@ -276,8 +331,7 @@ class _FileScan(ast.NodeVisitor):
         key = (self.rel, func)
         if key in self.readers:
             self.result.used_readers.add(key)
-            window = "\n".join(self.lines[max(0, line - 1 - MARKER_WINDOW) : line])
-            if MARKER not in window:
+            if not any(line - MARKER_WINDOW <= n <= line for n in self.marker_lines):
                 self.result.findings.append(
                     Finding(
                         self.rel,
@@ -373,11 +427,17 @@ def scan_tree(
     readers = READER_EXCEPTIONS if readers is None else readers
     tables = memories_tables() if tables is None else tables
     result = ScanResult()
+    parsed: list[tuple[str, str, ast.Module]] = []
     for path in sorted((root / "brain").rglob("*.py")):
         rel = path.relative_to(root).as_posix()
         source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        _FileScan(rel, source, tree, tables, openers, readers, result).visit(tree)
+        parsed.append((rel, source, ast.parse(source)))
+    # module-level assignments of every brain module, so SQL imported from another module is judged by its text (#603)
+    module_consts = {
+        rel.removesuffix(".py").removesuffix("/__init__").replace("/", "."): _assignments(tree) for rel, _s, tree in parsed
+    }
+    for rel, source, tree in parsed:
+        _FileScan(rel, source, tree, tables, openers, readers, result, module_consts).visit(tree)
     result.findings.sort(key=lambda f: (f.path, f.line, f.rule))
     return result
 
@@ -406,8 +466,14 @@ def _plant(tmp_path: Path, files: dict[str, str]) -> Path:
     return tmp_path
 
 
-def test_real_tree_has_no_memories_db_writer_outside_the_store():
-    result = scan_tree(REPO)
+@pytest.fixture(scope="module")
+def real_scan() -> ScanResult:
+    """The scan of the real tree, done once in setup: it costs seconds of CPU on CI, which belongs to no one test."""
+    return scan_tree(REPO)
+
+
+def test_real_tree_has_no_memories_db_writer_outside_the_store(real_scan):
+    result = real_scan
     assert not result.findings, (
         "Only brain/memory/store.py may write memories.db (see this file's docstring).\n"
         + "\n".join(str(f) for f in result.findings)
@@ -415,8 +481,8 @@ def test_real_tree_has_no_memories_db_writer_outside_the_store():
 
 
 @pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
-def test_registry_entries_all_match_a_real_call(tmp_path):
-    assert not registry_problems(scan_tree(REPO))
+def test_registry_entries_all_match_a_real_call(tmp_path, real_scan):
+    assert not registry_problems(real_scan)
     # the oracle can fail: on a tree with no brain/ files every entry is reported stale
     assert len(registry_problems(scan_tree(tmp_path))) == len(OPENERS) + len(READER_EXCEPTIONS)
 
@@ -434,10 +500,11 @@ _RAW_OPEN = (
 )
 _READER_OK = (
     "import sqlite3\n"
-    "def _load_from_db(path):\n"
-    f"    # {MARKER}: reads embeddings only\n"
-    "    conn = sqlite3.connect(path)\n"
-    "    return conn.execute('SELECT id FROM memories').fetchall()\n"
+    "class EmbeddingMatrix:\n"
+    "    def _load_from_db(self, path):\n"
+    f"        # {MARKER}: reads embeddings only\n"
+    "        conn = sqlite3.connect(path)\n"
+    "        return conn.execute('SELECT id FROM memories').fetchall()\n"
 )
 
 PLANTED = {
@@ -475,12 +542,19 @@ PLANTED = {
     ),
     "reader_exception_without_marker": (
         "brain/memory/embedding_matrix.py",
-        "import sqlite3\ndef _load_from_db(path):\n    return sqlite3.connect(path)\n",
+        "import sqlite3\nclass EmbeddingMatrix:\n    def _load_from_db(self, path):\n        return sqlite3.connect(path)\n",
         "marker",
     ),
     "reader_exception_marker_too_far_above": (
         "brain/memory/embedding_matrix.py",
-        f"import sqlite3\ndef _load_from_db(path):\n    # {MARKER}\n    a = 1\n    b = 2\n    c = 3\n    d = 4\n    return sqlite3.connect(path)\n",
+        "import sqlite3\nclass EmbeddingMatrix:\n    def _load_from_db(self, path):\n"
+        f"        # {MARKER}\n        a = 1\n        b = 2\n        c = 3\n        d = 4\n        return sqlite3.connect(path)\n",
+        "marker",
+    ),
+    "reader_exception_marker_only_in_a_string": (  # #603: the marker must be a comment
+        "brain/memory/embedding_matrix.py",
+        "import sqlite3\nclass EmbeddingMatrix:\n    def _load_from_db(self, path):\n"
+        f"        note = '{MARKER}'\n        return sqlite3.connect(path)\n",
         "marker",
     ),
     "second_open_in_another_function_of_a_reader_file": (
@@ -532,6 +606,48 @@ PLANTED = {
         "    store._conn.execute(sql)\n",
         "write",
     ),
+    "write_sql_wrapped_in_strip": (  # #603
+        "brain/rogue.py",
+        "def go(store):\n    store._conn.execute(\"\"\"\n        DELETE FROM memories WHERE id = ?\n    \"\"\".strip(), (1,))\n",
+        "write",
+    ),
+    "write_sql_wrapped_in_textwrap_dedent": (  # #603
+        "brain/rogue.py",
+        "import textwrap\ndef go(store):\n"
+        "    store._conn.execute(textwrap.dedent(\"\"\"\n        UPDATE memories SET state = 1\n    \"\"\"))\n",
+        "write",
+    ),
+    "write_sql_wrapped_in_bare_dedent": (  # #603
+        "brain/rogue.py",
+        "from textwrap import dedent\ndef go(store):\n    store._conn.execute(dedent('DELETE FROM memories'))\n",
+        "write",
+    ),
+    "write_sql_from_a_tuple_unpack": (  # #603
+        "brain/rogue.py",
+        "def go(store):\n    sql, params = 'DELETE FROM memories WHERE id = ?', (1,)\n    store._conn.execute(sql, params)\n",
+        "write",
+    ),
+    "write_sql_from_a_walrus": (  # #603
+        "brain/rogue.py",
+        "def go(store):\n    if (sql := 'UPDATE memories SET state = 1'):\n        store._conn.execute(sql)\n",
+        "write",
+    ),
+    "write_sql_built_with_plus_equals": (  # #603
+        "brain/rogue.py",
+        "def go(store):\n    sql = ''\n    sql += 'DELETE FROM memories WHERE id = ?'\n    store._conn.execute(sql, (1,))\n",
+        "write",
+    ),
+    "write_sql_from_a_for_loop": (  # #603
+        "brain/rogue.py",
+        "def go(store):\n    for s in ('SELECT 1', 'DELETE FROM memories'):\n        store._conn.execute(s)\n",
+        "write",
+    ),
+    "reader_exception_name_reused_by_another_class": (  # #603: exceptions are keyed by Class.method
+        "brain/memory/embedding_matrix.py",
+        "import sqlite3\nclass Impostor:\n    def _load_from_db(self, path):\n"
+        f"        # {MARKER}\n        return sqlite3.connect(path)\n",
+        "open",
+    ),
     "connect_taken_as_a_reference": (
         "brain/rogue.py",
         "import sqlite3\ndef go(p):\n    c = sqlite3.connect\n    return c(p)\n",
@@ -548,6 +664,28 @@ def test_scanner_flags_each_planted_violation(tmp_path, name):
     assert any(f.path == rel and f.rule == rule for f in result.findings), (
         f"expected a {rule!r} finding in {rel}, got: {[str(f) for f in result.findings]}"
     )
+
+
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
+def test_scanner_follows_a_sql_constant_imported_from_another_module(tmp_path):
+    """#603: `from brain.x import SQL; conn.executemany(SQL, rows)` is judged by the constant's text in brain/x.py."""
+    files = {
+        "brain/sqlconsts.py": "SQL = 'DELETE FROM memories WHERE id = ?'\n",
+        "brain/rogue.py": "from brain.sqlconsts import SQL\ndef go(store, rows):\n    store._conn.executemany(SQL, rows)\n",
+    }
+    result = scan_tree(_plant(tmp_path, files))
+    assert any(f.path == "brain/rogue.py" and f.rule == "write" for f in result.findings), [str(f) for f in result.findings]
+
+
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
+def test_scanner_follows_a_sql_constant_read_as_a_module_attribute(tmp_path):
+    """#603: `from brain import sqlconsts as q; conn.execute(q.SQL)` is judged by the constant's text."""
+    files = {
+        "brain/sqlconsts.py": "SQL = 'UPDATE memories SET state = 1'\n",
+        "brain/rogue.py": "from brain import sqlconsts as q\ndef go(store):\n    store._conn.execute(q.SQL)\n",
+    }
+    result = scan_tree(_plant(tmp_path, files))
+    assert any(f.path == "brain/rogue.py" and f.rule == "write" for f in result.findings), [str(f) for f in result.findings]
 
 
 INNOCENT = {

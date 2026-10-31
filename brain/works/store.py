@@ -30,7 +30,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from brain.utils.sqlite_open import STRICT_WAL_PROFILE, close_on_error, open_store_connection
+from brain.utils.sqlite_open import close_on_error, open_store_connection, strict_wal_profile
 from brain.works import Work
 
 logger = logging.getLogger(__name__)
@@ -146,7 +146,7 @@ class WorksStore:
             self._path,
             caller="WorksStore",
             integrity_check=False,
-            profile=STRICT_WAL_PROFILE,
+            profile=strict_wal_profile(),
             setup=_works_setup,
         )
 

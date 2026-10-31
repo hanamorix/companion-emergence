@@ -54,8 +54,8 @@ _FLOOR_REF = "0c4e7b23 fold pre-flip revision F2a fixes into #274"
 _ST_REF = "108bb6c5 fix(recall): per-message rerank width, always-merged keyword search, known-names list (#321)"
 _TIER_REF = "44af2447 Choose each job's model with one line in the user tunables file"
 _IDLE_REF = "1f69f189 feat(ram-spike-fix): one shared chat-idle lull + is_chat_idle gate for every background caller (INC-6)"
-_DEVCONST_REF = "#531 shared-settings guard, the constants move into brain/dev_constants.py (draft PR #553)"
-_GUARD_REF = "#531 shared-settings guard (draft PR #553)"
+_DEVCONST_REF = "7af1da3f #531 shared-settings guard, the constants move into brain/dev_constants.py (#553)"
+_GUARD_REF = "7af1da3f #531 shared-settings guard (#553)"
 _JSON_REF = "b826f01b refactor(brain): one shared JSON reader/writer for every JSON file read and write (#439)"
 
 # Every public writer and helper of brain/utils/atomic_write.py except save_with_backup_text (attempt_heal imports that).

@@ -376,6 +376,7 @@ _R2_VIOLATING = {
     "unprefixed_form_as_a_parameter": "def f(daily_budget_default=3.5):\n    return daily_budget_default\n",
     "unprefixed_form_in_a_class": "class C:\n    ROW_LIMIT_CAP = 9\n",
     "unprefixed_form_of_the_smallest_group": "GAUGE_WIDTH_LIMIT = 9.5\n",
+    "drifted_copy_named_after_a_tunable_key": "UPLOAD_CAP = 1234\n",  # #601: area.upload_cap, value drifted
 }
 _R2_CONFORMING = {
     "owner_file_of_a_dev_constant": ("WIDGET_TIMEOUT_S: float = 45.0\n", "brain/dev_constants.py"),
@@ -787,7 +788,7 @@ ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
     # The app mirrors the upload cap.
     ("APP-R3", "app/src/components/ChatPanel.tsx", "number 20971520", _UPLOAD_CAPS,
      "real copy of the 20 MiB upload cap (MAX_BYTES, applied to every staged file) that cannot read the setting: the "
-     "TypeScript cannot import the Python tunable; see the draft issue in the #531 records"),
+     "TypeScript cannot import the Python tunable; tracked in #560"),
 )
 ALLOW_SIZE = 4
 
