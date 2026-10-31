@@ -40,6 +40,7 @@ from brain.memory.semantic_recall import (
     SemanticRecallResult,
 )
 from brain.memory.store import Memory, MemoryStore
+from brain.tools.naming import fill_tool_prefix
 
 # A body long enough that the ~20% snippet cut is visible (a snippet ends with
 # an ellipsis, a full render does not): 24 words, well past the 20-char floor.
@@ -534,7 +535,7 @@ def test_block_frame_and_section_order_are_preserved_on_a_merged_turn(tmp_path: 
     with patch("brain.chat.prompt.run_semantic_recall", return_value=_semantic(full=[sem])):
         block = _build_recall_block(store, "quokka Zorblaxian", persona_dir=tmp_path)
     lines = block.splitlines()
-    assert lines[0] == _RECALL_SNIPPET_INVITATION, "snippet invitation first when an active section exists"
+    assert lines[0] == fill_tool_prefix(_RECALL_SNIPPET_INVITATION, ""), "snippet invitation first when an active section exists"
     assert lines[1] == "recall", "then the header"
     order = [
         next(i for i, ln in enumerate(lines) if ln.strip() == "active:"),

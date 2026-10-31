@@ -226,11 +226,12 @@ def test_static_system_message_has_no_volatile_markers(
 
 def test_static_system_message_contains_preamble_voice_epistemic(persona_dir: Path) -> None:
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
+    from brain.tools.naming import fill_tool_prefix
 
     static = build_static_system_message(persona_dir, voice_md="# Nell\n\nsweater novelist.")
     assert "nell" in static.lower()
     assert "sweater novelist" in static
-    assert _EPISTEMIC_INSTRUCTION in static
+    assert fill_tool_prefix(_EPISTEMIC_INSTRUCTION, "") in static
 
 
 def test_static_system_message_contains_harness_fence(persona_dir: Path) -> None:
@@ -283,11 +284,12 @@ def test_information_completeness_static_union_volatile(
     # Block-signature markers the full pre-change message produced for these
     # inputs. Each must survive into static OR volatile.
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
+    from brain.tools.naming import fill_tool_prefix
 
     expected_markers = [
         "You are nell",  # preamble (static)
         "southern novelist",  # voice (static)
-        _EPISTEMIC_INSTRUCTION,  # epistemic (static)
+        fill_tool_prefix(_EPISTEMIC_INSTRUCTION, ""),  # epistemic (static)
         "── brain context ──",  # volatile
         "current emotions:",  # volatile
         "recall",  # volatile (recall block)

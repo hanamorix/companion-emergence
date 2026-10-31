@@ -385,6 +385,10 @@ class _StreamingProxy:
         self._q = chunk_q
         self._loop = loop
 
+    @property
+    def tool_name_prefix(self) -> str:
+        return self._real.tool_name_prefix
+
     def name(self) -> str:
         return self._real.name()
 
