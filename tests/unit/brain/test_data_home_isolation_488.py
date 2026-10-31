@@ -18,14 +18,25 @@ from brain.bridge.server import build_app
 from tests.conftest import REAL_PLATFORM_DIRS, REAL_XDG_CACHE_HOME
 
 
-def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
+def _snapshot(root: Path) -> dict[str, tuple[int, int] | None]:
+    """mtime and size of every file under `root`, except inside a persona: there only the directory is recorded. A running supervisor
+    (the installed app on a dev machine, #600) writes its own persona's files and SQLite sidecars at any moment; a test leak shows up as
+    a new persona directory or a file outside `personas/`."""
     if not root.exists():
         return {}
-    return {
-        str(p.relative_to(root)): (p.stat().st_mtime_ns, p.stat().st_size)
-        for p in sorted(root.rglob("*"))
-        if p.is_file()
-    }
+    snap: dict[str, tuple[int, int] | None] = {}
+    for p in root.rglob("*"):
+        rel = p.relative_to(root)
+        if rel.parts[0] == "personas" and len(rel.parts) >= 2:
+            snap[f"personas/{rel.parts[1]}/"] = None
+            continue
+        try:
+            st = p.stat()
+        except FileNotFoundError:  # removed by that other writer mid-walk
+            continue
+        if p.is_file() and not p.name.endswith(("-wal", "-shm", "-journal")):
+            snap[rel.as_posix()] = (st.st_mtime_ns, st.st_size)
+    return snap
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -74,6 +85,35 @@ def test_building_the_app_leaves_the_real_data_home_untouched(tmp_path, monkeypa
     assert _snapshot(real) == before
     # the lifespan did write its tunables file: into the test's own home
     assert (paths.get_home() / "tunables.toml").exists()
+
+
+@pytest.mark.no_base_failure(reason="#600 test infrastructure: it checks this file's own _snapshot helper, not brain code")
+def test_a_live_supervisor_writing_its_own_persona_is_not_a_leak(tmp_path):
+    """#600: the installed app's supervisor writes `personas/<name>/` (and its SQLite sidecars) whenever it likes. That must not read
+    as this test writing into the real home; a new persona directory still must."""
+    real = tmp_path / "home"
+    (real / "personas" / "live").mkdir(parents=True)
+    (real / "personas" / "live" / "hebbian.db").write_bytes(b"a")
+    before = _snapshot(real)
+
+    (real / "personas" / "live" / "hebbian.db").write_bytes(b"ab")
+    (real / "personas" / "live" / "hebbian.db-wal").write_bytes(b"")
+    (real / "personas" / "live" / "new_cadence.json").write_text("{}")
+    assert _snapshot(real) == before
+
+    (real / "personas" / "p").mkdir()
+    (real / "personas" / "p" / "bridge.json").write_text("{}")
+    assert _snapshot(real) != before
+
+
+@pytest.mark.no_base_failure(reason="#600 guard: the narrower snapshot must still see the #488 leak, which the old one saw too")
+def test_a_top_level_write_is_still_a_leak(tmp_path):
+    real = tmp_path / "home"
+    real.mkdir()
+    (real / "tunables.toml").write_text("x = 1\n")
+    before = _snapshot(real)
+    (real / "tunables.toml").write_text("x = 22\n")
+    assert _snapshot(real) != before
 
 
 def test_the_isolated_dirs_keep_the_appauthor_distinction():
