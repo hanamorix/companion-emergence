@@ -110,8 +110,8 @@ def _load_exempt_ids(persona_dir: Path) -> set[str]:
     row is touched: a failed read is not "nothing is exempt"."""
     from brain.forgetting import _load_soul_linked_ids  # lazy: forgetting is heavier
 
-    # Fails closed (#431): an unreadable exemption set raises here, so nothing is deleted, and the
-    # error reaches the CLI as a traceback. The set is a snapshot taken once: a row crystallised
+    # Fails closed (#431): an unreadable exemption set raises here, so nothing is deleted; the CLI
+    # reports it as "dedup-sweep stopped, nothing was deleted" and exits 1 (#502). The set is a snapshot taken once: a row crystallised
     # mid-pass is not exempt until the next run. Forgetting loads its exemptions once per pass the
     # same way. The sweep is a one-shot CLI run, and re-reading per row would cost a soul-file read
     # each time.
