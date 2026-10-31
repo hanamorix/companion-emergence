@@ -42,6 +42,7 @@ from brain.chat.tool_loop import build_tools_list, run_tool_loop
 from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
+from brain.ingest.buffer import _now_iso as buffer_now_iso
 from brain.ingest.buffer import read_session
 from brain.initiate import presence_state
 from brain.memory.hebbian import HebbianMatrix
@@ -221,6 +222,9 @@ def _respond_inner(
     and wall-clock duration.
     """
     t0 = time.monotonic()
+    # When the user sent this message (#598): the prompt line and the stored row carry the same stamp,
+    # so the live line reaches the next turn's history byte-identical (#390).
+    turn_ts = buffer_now_iso()
 
     # 1. Session
     if session is None:
@@ -286,7 +290,7 @@ def _respond_inner(
         outgoing_user_text = f"{user_input}\n{file_block}" if user_input else file_block
     else:
         outgoing_user_text = user_input
-    user_msg = ChatMessage(role="user", content=outgoing_user_text)
+    user_msg = ChatMessage(role="user", content=outgoing_user_text, ts=turn_ts)
     try:
         prior_turns = read_session(persona_dir, session.session_id)
         # Note: on call N+1, _persist_turn has already written turn N to
@@ -388,6 +392,7 @@ def _respond_inner(
         user_text=outgoing_user_text,
         assistant_text=content,
         image_rel_paths=image_rel_paths,
+        user_ts=turn_ts,
     )
     session.append_turn(outgoing_user_text, content)
 
@@ -518,6 +523,7 @@ def _persist_turn(
     user_text: str,
     assistant_text: str,
     image_rel_paths: list[str] | None = None,
+    user_ts: str | None = None,
 ) -> tuple[bool, str | None]:
     """Write both turns to the ingest buffer. Errors are logged, not raised.
 
@@ -545,6 +551,8 @@ def _persist_turn(
             "speaker": "user",
             "text": user_text,
         }
+        if user_ts is not None:
+            user_record["ts"] = user_ts  # else persist stamps it now
         image_records: list[dict] = [
             {
                 "session_id": session_id,
