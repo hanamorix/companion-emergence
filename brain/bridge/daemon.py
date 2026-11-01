@@ -279,7 +279,10 @@ def spawn_detached(
 
 def _rotate_bridge_log(log_path: Path) -> None:
     """Outside launchd nothing else bounds bridge-<persona>.log (#559). cmd_start calls this while it still holds the
-    bridge lock, so no bridge (and no other starter's child) is writing the file. A failed rotation never blocks a start."""
+    bridge lock, so no running bridge (a runner holds that lock for its whole life) is writing the file. Not airtight:
+    another starter's child, spawned after that starter released the lock but before the child took it, can be writing.
+    Its stdout appends (O_APPEND), so the copy-then-truncate costs at most the lines it wrote between the two, and only
+    when the log is over the cap. A failed rotation never blocks a start."""
     try:
         rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
     except Exception:  # noqa: BLE001
