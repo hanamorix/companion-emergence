@@ -3453,6 +3453,7 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("attunement_errors.jsonl", 5),
     ("gate_rejections.jsonl", 3),
     ("self_model_articulate_errors.jsonl", 5),
+    ("extractor_errors.jsonl", 5),  # written by the extractor and monologue capture; nothing reads it (#559)
 )
 # This table is deliberately hand-maintained, NOT derived from the jsonl files
 # present on disk. Several persona jsonl files are stores or queues, not logs —

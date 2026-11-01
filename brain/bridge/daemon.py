@@ -15,6 +15,7 @@ Internal:
 
 from __future__ import annotations
 
+import codecs
 import errno
 import logging
 import os
@@ -32,6 +33,8 @@ import httpx
 
 from brain.bridge import respawn_guard, start_backoff, state_file
 from brain.bridge.shutdown import REASON_USER_STOP
+from brain.health.log_rotation import rotate_rolling_size
+from brain.paths import RUNTIME_LOG_BACKUPS, RUNTIME_LOG_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +277,18 @@ def spawn_detached(
         log_fh.close()
 
 
+def _rotate_bridge_log(log_path: Path) -> None:
+    """Outside launchd nothing else bounds bridge-<persona>.log (#559). cmd_start calls this while it still holds the
+    bridge lock, so no running bridge (a runner holds that lock for its whole life) is writing the file. Not airtight:
+    another starter's child, spawned after that starter released the lock but before the child took it, can be writing.
+    Its stdout appends (O_APPEND), so the copy-then-truncate costs at most the lines it wrote between the two, and only
+    when the log is over the cap. A failed rotation never blocks a start."""
+    try:
+        rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not rotate %s; starting the bridge anyway", log_path, exc_info=True)
+
+
 # pid -> Popen for children spawn_detached started and cmd_start has not yet
 # finished waiting on (cmd_start pops its own entry). See spawn_detached.
 _spawned_children: dict[int, subprocess.Popen] = {}
@@ -381,6 +396,7 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
     log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
     idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+    _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
     release_lock(persona_dir, fd)  # hand the lock to the child runner
     # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
     # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
@@ -969,21 +985,22 @@ _follow_should_stop: threading.Event | None = None
 
 
 def cmd_tail_log(args) -> int:
-    """Print the last N lines of the bridge log; -f to follow.
+    """Print the last N lines of the runtime log; -f to follow.
 
     Cross-platform: pure Python loop, no shell `tail` (Windows CI lacks it).
     Follow mode polls every 200ms. KeyboardInterrupt is treated as a clean
     exit (returns 0). Tests can interrupt the loop by setting the module-level
     `_follow_should_stop` Event before the call.
     """
-    from brain.paths import get_log_dir, get_persona_dir
+    from brain.paths import get_persona_dir, runtime_log_path
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+    # The runtime log, where logging goes (#558); bridge-<persona>.log only has the child's raw stdout/stderr.
+    log_path = runtime_log_path(persona_dir.name)
     if not log_path.exists():
         print(
             f"bridge log not found at {log_path} — has the supervisor ever started?",
@@ -1002,19 +1019,33 @@ def cmd_tail_log(args) -> int:
                     print(line, end="")
             if not getattr(args, "follow", False):
                 return 0
-            # Follow mode: seek to end, poll for new content
-            f.seek(0, 2)  # SEEK_END
-            stop = _follow_should_stop or threading.Event()
-            try:
-                while not stop.is_set():
-                    chunk = f.read()
-                    if chunk:
-                        print(chunk, end="")
-                    else:
-                        time.sleep(0.2)
-            except KeyboardInterrupt:
-                return 0
+            st = os.fstat(f.fileno())
+        # Follow mode polls by path and never holds the file open between polls: the runtime log rolls over by
+        # rename (RotatingFileHandler), so a kept handle would go on reading the renamed file, and on Windows it
+        # would make that rename fail.
+        ident, pos = st.st_ino, st.st_size
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        stop = _follow_should_stop or threading.Event()
+        try:
+            while not stop.is_set():
+                try:
+                    st = log_path.stat()
+                except FileNotFoundError:  # between the rename and the new file
+                    st = None
+                if st is not None and (st.st_ino != ident or st.st_size < pos):  # rolled over or truncated
+                    ident, pos = st.st_ino, 0
+                    decoder.reset()
+                if st is not None and st.st_size > pos:
+                    with log_path.open("rb") as fb:
+                        fb.seek(pos)
+                        chunk = fb.read()
+                    pos += len(chunk)
+                    print(decoder.decode(chunk), end="")
+                else:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
             return 0
+        return 0
     except OSError as e:
         print(f"error reading {log_path}: {e}", file=sys.stderr)
         return 1
