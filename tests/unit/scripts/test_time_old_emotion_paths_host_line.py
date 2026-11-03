@@ -113,8 +113,7 @@ def test_cpu_model_starts_no_process(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", SpyPopen)
     cpuinfo = tmp_path / "cpuinfo"
     cpuinfo.write_bytes(b"model name\t: Sentinel CPU\n")
-    assert _cpu_model_on(monkeypatch, cpuinfo) == "Sentinel CPU"
-    monkeypatch.setattr(mod, "CPUINFO", cpuinfo)
+    assert _cpu_model_on(monkeypatch, cpuinfo) == "Sentinel CPU"  # also points mod.CPUINFO at the file
     with monkeypatch.context() as scoped:
         scoped.setattr(sys, "platform", "linux")
         mod._host_line()
