@@ -557,6 +557,20 @@ def test_an_assigned_event_for_an_old_memory_removes_a_stale_record_and_a_recent
     assert recent.repeats["m"] == eu.RepeatEntry(first_at=_at(3), count=0)
 
 
+def test_an_old_assignment_leaves_a_record_dated_after_it_alone() -> None:
+    state = eu.EngineState()
+    now = _at(6)
+    _fold(state, _event("showing", _at(5, 20), {"joy": 5.0}, "m"), now)  # a live record, newer than the assignment below
+    _fold(state, _event("assigned", _at(3), {"grief": 5.0}, "m"), now)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=_at(5, 20), count=0)
+
+
+def test_a_commit_of_an_old_memory_still_writes_its_record() -> None:
+    state = eu.EngineState()
+    _fold(state, _event("commit", _at(0), {"joy": 5.0}, "m"), _at(0) + _window() + timedelta(hours=6))
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=_at(0), count=0)
+
+
 def test_an_assigned_event_over_a_live_record_takes_the_next_repeat_factor() -> None:
     state = eu.EngineState()
     _fold(state, _event("commit", _at(0), {"joy": 5.0}, "m"))

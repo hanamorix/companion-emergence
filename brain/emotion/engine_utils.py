@@ -277,8 +277,9 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
     A commit counts as the first showing and resets any entry. A showing or assignment outside the window (an entry not yet
     pruned, or one dated before the recorded first showing) is a new first showing; whether an entry is live is judged at the
     event's own `at`. An assignment is dated at the row's creation time, so its record starts there, not when the assignment is
-    folded: when that window has already ended by `now` the record is not kept (and a stale one for the memory is removed), so
-    the memory's next full showing counts at full weight. Only an assignment skips an expired record; a commit always writes one.
+    folded: when that window has already ended by `now` the record is not kept (and a stale one from before the assignment is
+    removed; a record dated after it is left alone), so the memory's next full showing counts at full weight. Only an
+    assignment skips an expired record; a commit always writes one.
     """
     if event.memory_id is None:
         return 1.0
@@ -289,7 +290,8 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
         entry.count += 1
         return factor
     if event.kind == "assigned" and at + window <= now:
-        state.repeats.pop(event.memory_id, None)
+        if entry is not None and entry.first_at <= at:
+            del state.repeats[event.memory_id]  # a stale record from before this assignment; a newer one is left alone
         return 1.0
     state.repeats[event.memory_id] = RepeatEntry(first_at=at, count=0)
     return 1.0
