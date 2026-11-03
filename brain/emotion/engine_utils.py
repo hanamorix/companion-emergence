@@ -58,6 +58,8 @@ _COUNTED_INITIATE_STATES = (frozenset(get_args(StateName)) - {"pending"}) | {"no
 _EVENT_KINDS = frozenset({"commit", "assigned", "showing", "change", "start"})
 # The kinds that carry a source modifier. A change has none (its weight is 1) and a start folds nothing.
 _MODIFIER_KINDS = frozenset({"commit", "assigned", "showing"})
+# The kinds dated at the row's creation time, whose repeat record starts there and is not kept once its window has ended.
+_ANCHORED_KINDS = frozenset({"commit", "assigned"})
 
 
 # --- state ---------------------------------------------------------------------------------------------------------
@@ -274,12 +276,12 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
     """1 for a memory's first showing, then the repeat factor, its square and so on within the repeat window of that first
     showing (`dev_constants.EMOTION_REPEAT_FACTOR` ** (showings since the first + 1)).
 
-    A commit counts as the first showing and resets any entry. A showing or assignment outside the window (an entry not yet
-    pruned, or one dated before the recorded first showing) is a new first showing; whether an entry is live is judged at the
-    event's own `at`. An assignment is dated at the row's creation time, so its record starts there, not when the assignment is
-    folded: when that window has already ended by `now` the record is not kept (and a stale one from before the assignment is
-    removed; a record dated after it is left alone), so the memory's next full showing counts at full weight. Only an
-    assignment skips an expired record; a commit always writes one.
+    A commit under the window old counts as the first showing and resets any entry. A showing or assignment outside the window
+    (an entry not yet pruned, or one dated before the recorded first showing) is a new first showing; whether an entry is live is
+    judged at the event's own `at`. A commit and an assignment are dated at the row's creation time, so their record starts
+    there, not when they are folded: when that window has already ended by `now` the record is not kept (and a stale one from
+    before the event is removed; a record dated after it is left alone), so the memory's next full showing counts at full
+    weight. A showing always writes its record.
     """
     if event.memory_id is None:
         return 1.0
@@ -289,9 +291,9 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
         factor = dev_constants.EMOTION_REPEAT_FACTOR ** (entry.count + 1)
         entry.count += 1
         return factor
-    if event.kind == "assigned" and at + window <= now:
+    if event.kind in _ANCHORED_KINDS and at + window <= now:
         if entry is not None and entry.first_at <= at:
-            del state.repeats[event.memory_id]  # a stale record from before this assignment; a newer one is left alone
+            del state.repeats[event.memory_id]  # a stale record from before this event; a newer one is left alone
         return 1.0
     state.repeats[event.memory_id] = RepeatEntry(first_at=at, count=0)
     return 1.0
@@ -303,7 +305,8 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
     A future event time and a future `last_update` are held to `now` first. A commit, an assignment and a showing fold each
     of the event's emotions at weight `modifier x repeat factor`; a commit then keeps the persona's start date and, when its
     stored climax is 7 or more, applies the climax reset after its own emotions are in. An event with no emotions folds
-    nothing and writes or advances no repeat record. A change folds, for each average, the stored average plus the signed
+    nothing and writes or advances no repeat record; a commit or an assignment of a memory that is already a window old keeps
+    none either (`_repeat_factor`). A change folds, for each average, the stored average plus the signed
     amount (no history: base 0), held to 0-10, at weight 1 (it has no modifier and no repeat factor). A start event keeps the
     persona's start date and folds nothing else.
 

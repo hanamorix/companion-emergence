@@ -565,10 +565,103 @@ def test_an_old_assignment_leaves_a_record_dated_after_it_alone() -> None:
     assert state.repeats["m"] == eu.RepeatEntry(first_at=_at(5, 20), count=0)
 
 
-def test_a_commit_of_an_old_memory_still_writes_its_record() -> None:
+def test_a_commit_of_an_old_memory_keeps_no_repeat_record() -> None:
+    created = _at(0)
+    now = created + _window() + timedelta(hours=6)
     state = eu.EngineState()
-    _fold(state, _event("commit", _at(0), {"joy": 5.0}, "m"), _at(0) + _window() + timedelta(hours=6))
-    assert state.repeats["m"] == eu.RepeatEntry(first_at=_at(0), count=0)
+    _fold(state, _event("commit", created, {"joy": 5.0}, "m"), now)
+    assert state.emotions["joy"].short.weight == pytest.approx(1.0)  # the commit itself still folds at full weight
+    assert state.persona_start_at == created  # and still keeps the persona's start date
+    assert "m" not in state.repeats
+    assert _grief_showing_weight(state, now, now) == pytest.approx(1.0)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=now, count=0)  # the showing is the memory's first, with its own record
+
+
+def test_the_climax_reset_still_applies_to_a_commit_whose_record_is_not_kept() -> None:
+    created = _at(0)
+    now = created + _window() + timedelta(hours=6)
+    state = eu.EngineState()
+    _fold(state, _event("commit", created, {"arousal": 9.0}, "m", climax=8.0), now)
+    assert "m" not in state.repeats
+    expected = max(dev_constants.EMOTION_CLIMAX_AROUSAL_FLOOR, 9.0 * dev_constants.EMOTION_CLIMAX_AROUSAL_FACTOR)
+    assert _short(state, "arousal") == pytest.approx(expected)
+
+
+def test_a_showing_dated_inside_the_old_commits_window_is_still_a_first_showing() -> None:
+    created = _at(0)
+    now = created + _window() + timedelta(hours=6)
+    state = eu.EngineState()
+    _fold(state, _event("commit", created, {"joy": 5.0}, "m"), now)
+    assert _grief_showing_weight(state, created + timedelta(hours=2), now) == pytest.approx(1.0)
+
+
+def test_a_commit_of_a_recent_memory_keeps_the_remaining_window() -> None:
+    created = _at(0)
+    now = created + timedelta(hours=1)
+    state = eu.EngineState()
+    _fold(state, _event("commit", created, {"joy": 5.0}, "m"), now)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=created, count=0)  # anchored at created_at, not at the fold time
+    later = created + timedelta(hours=2)
+    assert _grief_showing_weight(state, later, later) == pytest.approx(dev_constants.EMOTION_REPEAT_FACTOR)
+    assert state.repeats["m"].count == 1
+    after = created + _window() + timedelta(minutes=1)  # the window ends 24 h after created_at, not 24 h after the fold
+    _grief_showing_weight(state, after, after)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=after, count=0)
+
+
+def test_the_commit_record_is_kept_one_second_before_the_window_ends_and_not_at_it() -> None:
+    created = _at(0)
+    kept = eu.EngineState()
+    _fold(kept, _event("commit", created, {"joy": 5.0}, "m"), created + _window() - timedelta(seconds=1))
+    assert kept.repeats["m"] == eu.RepeatEntry(first_at=created, count=0)
+    dropped = eu.EngineState()
+    _fold(dropped, _event("commit", created, {"joy": 5.0}, "m"), created + _window())
+    assert "m" not in dropped.repeats
+
+
+def test_a_future_dated_commit_is_held_to_now_and_kept() -> None:
+    now = _at(0)
+    state = eu.EngineState()
+    _fold(state, _event("commit", now + timedelta(hours=5), {"joy": 5.0}, "m"), now)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=now, count=0)
+
+
+def test_a_commit_of_an_old_memory_removes_a_stale_record_even_one_still_live_at_its_own_time() -> None:
+    state = eu.EngineState()
+    _fold(state, _event("showing", _at(3), {"joy": 5.0}, "m"))  # a record that is still live an hour later
+    _fold(state, _event("commit", _at(3) + timedelta(hours=1), {"joy": 5.0}, "m"), _at(6))
+    assert "m" not in state.repeats  # dated before the commit's created_at, and past its own window at the fold time
+    recent = eu.EngineState()
+    _fold(recent, _event("showing", _at(3), {"joy": 5.0}, "m"))
+    _fold(recent, _event("commit", _at(3) + timedelta(hours=1), {"joy": 5.0}, "m"), _at(3) + timedelta(hours=2))
+    assert recent.repeats["m"] == eu.RepeatEntry(first_at=_at(3) + timedelta(hours=1), count=0)  # a recent commit resets
+
+
+def test_an_old_commit_leaves_a_record_dated_after_it_alone() -> None:
+    state = eu.EngineState()
+    now = _at(6)
+    _fold(state, _event("showing", _at(5, 20), {"joy": 5.0}, "m"), now)  # a live record, newer than the commit below
+    _fold(state, _event("commit", _at(3), {"grief": 5.0}, "m"), now)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=_at(5, 20), count=0)
+
+
+def test_an_old_commit_with_no_emotions_touches_no_repeat_record() -> None:
+    state = eu.EngineState()
+    now = _at(6)
+    _fold(state, _event("showing", _at(5, 20), {"joy": 5.0}, "m"), now)
+    _fold(state, _event("commit", _at(3), {}, "m"), now)
+    assert state.repeats["m"] == eu.RepeatEntry(first_at=_at(5, 20), count=0)
+    assert state.persona_start_at == _at(3)
+
+
+@pytest.mark.parametrize("age_h", [1, 23, 24, 30])
+def test_a_commit_and_an_assigned_event_leave_the_same_repeat_record(age_h: int) -> None:
+    created = _at(0)
+    now = created + timedelta(hours=age_h)
+    committed, assigned = eu.EngineState(), eu.EngineState()
+    _fold(committed, _event("commit", created, {"joy": 5.0}, "m"), now)
+    _fold(assigned, _event("assigned", created, {"joy": 5.0}, "m"), now)
+    assert committed.repeats == assigned.repeats
 
 
 def test_an_assigned_event_over_a_live_record_takes_the_next_repeat_factor() -> None:
