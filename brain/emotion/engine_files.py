@@ -21,7 +21,7 @@ The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a blockin
 file. No function in this module takes it; every caller holds it (a hook around its appends, a drain around its whole run, the
 rebuild around everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``,
 ``switch_exists``, ``read_switch``, ``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a
-writer; the state and switch files are replaced atomically, the queue and the change log are only appended to; a queue reader
+writer; the state and switch files are replaced atomically, the queue and the change log are appended to and removed whole; a queue reader
 that is not the drain, which holds the lock, can meet a line being appended and log a false error for it). Expecting the
 caller's lock: ``save_state``, ``append_event``, ``clear_queue``, ``append_change``, ``prune_changes`` and ``write_switch``.
 

@@ -314,7 +314,6 @@ def test_a_modifier_that_is_not_a_finite_number_is_still_refused(kind: str, valu
         engine_files.event_from_json(_raw(kind, modifier=value))
 
 
-@pytest.mark.no_base_failure(reason="pins the refusal that already exists and must stay when the hold is added: through the queue read a non-finite modifier is dropped with an error line and its neighbours stay; the old code passes it")
 def test_the_queue_read_still_drops_a_non_finite_modifier_and_keeps_the_neighbours(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -374,10 +373,6 @@ def _event(i: int) -> Event:
 
 def _jline(raw: object) -> bytes:
     return json.dumps(raw).encode("utf-8") + b"\n"
-
-
-def _drops(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return _errors(caplog)
 
 
 @pytest.mark.no_base_failure(reason="pins what must stay when the file format changes: a missing queue is an empty queue and the read creates nothing; the old reader passes it")
@@ -467,7 +462,7 @@ def test_a_torn_last_line_is_dropped_alone_and_the_next_append_starts_a_new_line
     before = path.read_bytes()
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_queue(tmp_path) == good
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1
     assert str(path) in messages[0] and "line 4" in messages[0] and "malformed JSON" in messages[0]
     assert path.read_bytes() == before  # the read writes nothing
@@ -478,7 +473,7 @@ def test_a_torn_last_line_is_dropped_alone_and_the_next_append_starts_a_new_line
     assert path.read_bytes().startswith(before)  # the three good lines and the torn one are byte-identical
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_queue(tmp_path) == [*good, fourth]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1 and "line 4" in messages[0]
 
 
@@ -492,7 +487,7 @@ def test_each_invalid_event_line_is_dropped_alone_with_its_line_number_and_reaso
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         events = engine_files.read_queue(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1
     assert str(path) in messages[0] and "line 2" in messages[0]
     if label in ("not an object", "a list"):
@@ -510,6 +505,7 @@ _BAD_LINES = {
     "invalid utf-8": (b"\xff\xfe\xfa{", "invalid UTF-8"),
     "a very long line": (b"x" * 2_000_000, "malformed JSON"),
     "deeply nested": (b"[" * 100_000, "malformed JSON"),
+    "an integer of 5,000 digits": (b"1" * 5000, "malformed JSON"),  # a plain ValueError, which the line parser lets through
 }
 
 
@@ -523,7 +519,7 @@ def test_a_line_that_is_not_an_event_is_dropped_alone_with_its_line_number_and_r
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         events = engine_files.read_queue(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1
     assert str(path) in messages[0] and "line 2" in messages[0] and word in messages[0]
     assert len(messages[0]) < 1000  # the content of the line is not echoed
@@ -542,7 +538,7 @@ def test_crlf_endings_and_a_byte_order_mark_are_tolerated_and_later_lines_are_nu
     _put_queue_file(tmp_path, data + b"junk\r\n")
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert [e.memory_id for e in engine_files.read_queue(tmp_path)] == ["a", "c"]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1 and str(path) in messages[0] and "line 3" in messages[0]
 
 
@@ -550,7 +546,7 @@ def test_blank_lines_count_in_the_line_numbers(tmp_path: Path, caplog: pytest.Lo
     _put_queue_file(tmp_path, _jline(_raw("commit", memory_id="a")) + b"\n\n" + b"{oops\n")
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert [e.memory_id for e in engine_files.read_queue(tmp_path)] == ["a"]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1 and "line 4" in messages[0]
 
 
@@ -564,7 +560,7 @@ def test_a_line_of_zero_bytes_is_dropped_like_a_torn_line_and_the_next_line_is_r
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         events = engine_files.read_queue(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1 and str(path) in messages[0] and "line 2" in messages[0]
     assert _tree(tmp_path) == before
 
@@ -577,12 +573,12 @@ def test_a_zero_filled_tail_with_no_newline_is_one_dropped_line_and_the_next_app
     path = _put_queue_file(tmp_path, _jline(_raw("commit", memory_id="a")) + b"\x00" * 64)
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_queue(tmp_path) == [first]
-    assert len(_drops(caplog)) == 1
+    assert len(_errors(caplog)) == 1
     caplog.clear()
     assert engine_files.append_event(tmp_path, second) is True
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_queue(tmp_path) == [first, second]
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 1 and str(path) in messages[0] and "line 2" in messages[0]
 
 
@@ -596,7 +592,7 @@ def test_a_record_cut_short_by_a_zero_fill_is_dropped_and_zeros_in_front_of_a_re
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         events = engine_files.read_queue(tmp_path)
     assert [e.memory_id for e in events] == ["a", "z"]  # the glued record is NOT returned: a damaged line is dropped whole
-    messages = _drops(caplog)
+    messages = _errors(caplog)
     assert len(messages) == 2 and all(str(path) in m for m in messages)
     assert "line 2" in messages[0] and "line 3" in messages[1]
 
