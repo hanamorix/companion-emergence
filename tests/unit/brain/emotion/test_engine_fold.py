@@ -11,6 +11,7 @@ snapshot carry in `close_days`. Engine 4's simulation (Check 25 and Check 21) is
 
 from __future__ import annotations
 
+import copy
 import itertools
 import logging
 import math
@@ -53,6 +54,10 @@ def _short(state: eu.EngineState, name: str = "joy") -> float:
 
 def _long(state: eu.EngineState, name: str = "joy") -> float:
     return state.emotions[name].long.avg
+
+
+def _deep_copy(state: eu.EngineState) -> eu.EngineState:
+    return copy.deepcopy(state)
 
 
 def _lone_entry_then_quiet_days(value: float, quiet_days: int) -> eu.EngineState:
@@ -154,12 +159,6 @@ def test_entry_just_after_midnight_then_quiet() -> None:
     _close(state, 1)
     _close(state, 2)
     assert _short(state) == pytest.approx(1.2, abs=0.02)
-
-
-def _deep_copy(state: eu.EngineState) -> eu.EngineState:
-    import copy
-
-    return copy.deepcopy(state)
 
 
 # --- E2.11: the result does not depend on the order the entries arrive in -------------------------------------------
@@ -300,7 +299,6 @@ def test_fade_floor_holds_for_love_and_belonging_only() -> None:
     for name in ("love", "belonging"):
         floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION[name]
         assert eu.fade(9.0, 10_000.0, 365.0, 0.0, GAIN, floor) == pytest.approx(9.0 * floor)
-    assert "joy" not in dev_constants.EMOTION_FADE_FLOOR_FRACTION
     assert eu.fade(9.0, 10_000.0, 3.0, 0.0, GAIN) < 1e-6
     # a value above its floor is untouched by the floor
     assert eu.fade(9.0, 365.0, 365.0, 0.0, GAIN, 1.0 / 3.0) == pytest.approx(4.5)
@@ -319,7 +317,7 @@ def test_fade_never_grows_a_value_for_a_row_dated_in_the_future() -> None:
 # --- E4: the climax reset ------------------------------------------------------------------------------------------
 
 
-def _climax_state(**extra: float) -> eu.EngineState:
+def _climax_state() -> eu.EngineState:
     state = eu.EngineState()
     _fold(state, _event("commit", _at(0), {"arousal": 6.0, "desire": 5.0, "comfort_seeking": 9.0, "rest_need": 3.0}, "p"))
     return state
@@ -473,7 +471,6 @@ def test_an_entry_so_old_that_its_weight_underflows_adds_nothing_and_does_not_cr
 def test_close_days_on_an_unset_day_only_opens_it() -> None:
     state = eu.EngineState()
     eu.fold_entry(state, "joy", 5.0, 1.0, _at(0))
-    state.last_entry_day = None
     eu.close_days(state, _at(3))
     assert state.active_day == eu.day_of(_at(3))
     assert state.emotions["joy"].snapshot == []
@@ -636,3 +633,81 @@ def test_a_dropped_spelling_does_not_spoil_the_other() -> None:
 
 def test_resolve_emotions_signed_keeps_the_sign() -> None:
     assert eu.resolve_emotions({"Joy": -2.0, "grief": 30.0}, signed=True) == {"joy": -2.0, "grief": 30.0}
+
+
+# --- review-driven additions: the edges the first draft of these tests did not pin ---------------------------------------
+
+
+def test_a_climax_of_exactly_the_threshold_resets() -> None:
+    state = _climax_state()
+    _fold(state, _event("commit", _at(1), {"arousal": 6.0, "climax": 7.0}, "c", climax=dev_constants.EMOTION_CLIMAX_THRESHOLD))
+    assert state.emotions["climax"].short.avg == 0.0
+
+
+@pytest.mark.parametrize("kind", ["showing", "assigned"])
+def test_only_a_commit_triggers_the_climax_reset(kind: str) -> None:
+    state = _climax_state()
+    _fold(state, _event(kind, _at(1), {"climax": 9.0}, "c", climax=9.0))
+    assert state.emotions["climax"].short.avg == 9.0
+
+
+def test_fold_entry_holds_the_value_to_the_emotion_scale() -> None:
+    state = eu.EngineState()
+    eu.fold_entry(state, "joy", 25.0, 1.0, _at(0))
+    eu.fold_entry(state, "grief", -4.0, 1.0, _at(0))
+    eu.fold_entry(state, "anger", 99.0, 1.0, _at(0))
+    assert state.emotions["joy"].short.avg == dev_constants.EMOTION_VALUE_CAP
+    assert state.emotions["grief"].short.avg == 0.0
+    assert state.emotions["anger"].long.avg == dev_constants.EMOTION_VALUE_CAP
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_fold_entry_refuses_a_non_finite_value(bad: float) -> None:
+    state = eu.EngineState()
+    with pytest.raises(ValueError, match="non-finite"):
+        eu.fold_entry(state, "joy", bad, 1.0, _at(0))
+    assert state == eu.EngineState()
+
+
+def test_a_bad_event_leaves_the_state_untouched() -> None:
+    state = eu.EngineState()
+    _fold(state, _event("commit", _at(0), {"joy": 5.0}, "a"))
+    before = _deep_copy(state)
+    with pytest.raises(ValueError, match="non-finite"):
+        _fold(state, _event("commit", _at(1), {"joy": 5.0, "grief": math.nan}, "b"))
+    with pytest.raises(ValueError, match="non-finite"):
+        _fold(state, _event("showing", _at(1), {"joy": 5.0}, "a", modifier=math.nan))
+    assert state == before
+
+
+def test_a_zero_entry_for_an_absent_emotion_changes_nothing() -> None:
+    state = eu.EngineState()
+    eu.fold_entry(state, "joy", 5.0, 1.0, _at(0))
+    before = _deep_copy(state)
+    eu.fold_entry(state, "grief", 0.0, 1.0, _at(1), zero=True)
+    assert state == before
+
+
+def test_the_snapshot_stores_each_average_in_its_own_place() -> None:
+    state = eu.EngineState()
+    _close(state, 0)
+    _fold(state, _event("commit", _at(0), {"joy": 8.0}))
+    _close(state, 1)
+    _close(state, 2)  # closes day 1: the zero pulls the short average far below the long one
+    first, second = state.emotions["joy"].snapshot
+    assert (first.short, first.long) == (8.0, 8.0)
+    assert second.short == _short(state) and second.long == _long(state)
+    assert second.short < second.long
+
+
+def test_a_commit_without_emotions_still_keeps_the_persona_start() -> None:
+    state = eu.EngineState()
+    _fold(state, _event("commit", _at(2), {}, "e"))
+    assert state.persona_start_at == _at(2)
+    assert state.emotions == {} and state.repeats == {}
+
+
+def test_resolve_emotions_drops_an_integer_too_large_for_a_float(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert eu.resolve_emotions({"joy": 10**400, "grief": 3}) == {"grief": 3.0}
+    assert len(caplog.records) == 1

@@ -1,8 +1,9 @@
 """The emotion engine's pure functions (Engine 1, #576).
 
 Everything here works on in-memory state and takes the time as an argument: no files, no lock, no clock, no memory
-store. The engine module (Engine 0 and later) orchestrates; this file is what its numbers come from. Nothing calls it
-yet. The JSON form of `EngineState`, the queue, the drain and the rebuild belong to the later slices.
+store. The engine module (Engine 0 and later) orchestrates; this file is what its numbers come from. The JSON form
+of `EngineState`, the queue, the drain and the rebuild belong to the later slices. Callers pass names already resolved
+(`resolve_emotions`): the fold functions do not canonicalise.
 
 What lives here:
 
@@ -249,10 +250,12 @@ def fold_entry(
     """Fold one entry (`value` held to 0-10, weight `w`, dated `at`) into both averages of `emotion`.
 
     An entry at or after `last_update` ages all weights to its time and becomes the new `last_update`; an earlier one is
-    pre-aged and ages nothing else. A non-zero entry sets the emotion's last-entry day (the later of the old and the entry's
-    day) and the state's oldest entry (the earlier). `zero=True` is a quiet-day zero: it goes only to an emotion that
+    pre-aged and ages nothing else. An entry that is not a quiet-day zero (even one whose value is 0) sets the emotion's last-entry
+    day (the later of the old and the entry's day) and the state's oldest entry (the earlier). `zero=True` is a quiet-day zero: it goes only to an emotion that
     already has an average and sets neither. The caller holds a future `at` to now (`fold_event` does).
     """
+    if not math.isfinite(value):
+        raise ValueError(f"cannot fold a non-finite value for {emotion!r}: {value!r}")
     held = _hold(value)
     _fold(state, emotion, held, held, w, at, zero=zero)
 
@@ -294,15 +297,22 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
     event whose hook was still waiting for the lock when the drain closed its day).
 
     The skip of a commit or assignment whose memory was already folded in the same drain is the drain's, not this function's.
+
+    The emotions of an event are expected to be resolved already (`resolve_emotions`). A non-finite value or modifier raises
+    before anything is changed, so a bad event leaves the state as it was.
     """
     if event.kind not in _EVENT_KINDS:
         raise ValueError(f"unknown event kind {event.kind!r}")
+    if event.kind != "start" and not (math.isfinite(event.modifier) and all(math.isfinite(v) for v in event.emotions.values())):
+        raise ValueError(f"cannot fold an event with a non-finite value or modifier: {event.kind} {event.memory_id}")
     if state.last_update is not None and state.last_update > now:
         state.last_update = now
     at = min(event.at, now)
     if event.kind == "start":
         _fold_persona_start(state, event.at)
         return
+    if event.kind == "commit":
+        _fold_persona_start(state, event.at)
     if not event.emotions:
         return
     if event.kind == "change":
@@ -312,8 +322,6 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
             long_base = existing.long.avg if existing is not None else 0.0
             _fold(state, name, _hold(short_base + amount), _hold(long_base + amount), event.modifier, at, zero=False)
         return
-    if event.kind == "commit":
-        _fold_persona_start(state, event.at)
     w = event.modifier * _repeat_factor(state, event, at)
     for name, value in event.emotions.items():
         fold_entry(state, name, value, w, at)
@@ -430,10 +438,14 @@ def resolve_emotions(raw: Mapping[str, object], *, signed: bool = False) -> dict
         if not isinstance(name, str):
             logger.warning("dropping an emotion whose name %r is not text", name)
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        try:
+            number = None if isinstance(value, bool) or not isinstance(value, (int, float)) else float(value)
+        except OverflowError:  # an int too large for a float
+            number = None
+        if number is None or not math.isfinite(number):
             logger.warning("dropping emotion %r: %r is not a finite number", name, value)
             continue
-        groups.setdefault(canonical_name(name), []).append(float(value))
+        groups.setdefault(canonical_name(name), []).append(number)
     averaged = {name: sum(values) / len(values) for name, values in groups.items()}
     if signed:
         return averaged
@@ -637,9 +649,9 @@ def close_days(state: EngineState, t: datetime) -> None:
 
     * A system clock set forward and then corrected: this function closes the open day and sets `active_day` to the far-future
       day, and then day closes stop until real time reaches that day, so the shift stays frozen at its last value and, with
-      no day closing, the change-log files the drain would delete pile up. The deletion half is handled by the drain (it
+      no day closing, the change-log files the drain would delete pile up. The deletion half belongs to the drain (it
       anchors on the active day as it stood before its closes). The open design call, telling a corrected clock from a long
-      absence, needs a chosen number or a new rule and is filed as an issue.
+      absence, needs a chosen number or a new rule; it is tracked in an issue filed when this slice merges.
     * An entry dated in a day that has already closed cannot undo the zero already folded for it: that day holds both the zero
       and the entry.
     """
