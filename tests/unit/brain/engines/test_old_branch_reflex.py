@@ -1,7 +1,9 @@
 """Pins for how the reflex engine treats an emotion that is absent from the store, before the readers move.
 
-An arc that names an emotion no memory carries reads it as 0.0 in the trigger test, the ranking and the
-recorded ``trigger_state``. Deleted with the old branch when the reader switch-over lands.
+An arc that names an emotion no memory carries reads it as 0.0 in the trigger test and in the recorded
+``trigger_state``. (The template placeholder for a missing emotion, which also renders "0", is already pinned by
+``test_reflex.py::test_run_tick_prompt_resolves_variant_spelled_placeholders``.) Deleted with the old branch when
+the reader switch-over lands.
 """
 
 from __future__ import annotations
@@ -17,8 +19,8 @@ from brain.health.json_io import write_json
 from brain.memory.store import Memory, MemoryStore
 
 _REASON = (
-    "pins the old reflex branch (absent counts as 0.0 in trigger, rank and trigger_state, "
-    "template placeholder \"0\"); passes on the current code by design and is deleted with the branch at phase C"
+    "pins the old reflex branch (absent counts as 0.0 in the trigger test and in trigger_state); "
+    "passes on the current code by design and is deleted with the branch at phase C"
 )
 
 

@@ -20,8 +20,7 @@ if [ -n "${PYTHON:-}" ]; then
 elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
   exec "$REPO_ROOT/.venv/bin/python" "$SCRIPT" "$@"
 elif command -v uv >/dev/null 2>&1; then
-  cd "$REPO_ROOT"
-  exec uv run python "$SCRIPT" "$@"
+  exec uv run --project "$REPO_ROOT" python "$SCRIPT" "$@"
 else
   echo "time_old_emotion_paths: no Python found. Set PYTHON=/path/to/python, create $REPO_ROOT/.venv, or install uv." >&2
   exit 1

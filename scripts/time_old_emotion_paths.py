@@ -16,8 +16,10 @@ in milliseconds. Nothing is asserted: there is no threshold and no pass or fail.
 It refuses a path under the brain's home directory, aborts when the source has a non-empty -wal file, copies only
 the main database file, and removes its temporary directory when it ends. It starts one process, `git rev-parse
 HEAD`, calls no model and reads no persona data file other than the path given (the app code it imports may read
-its own settings file from the home directory). The AVX2 field comes from the app's own probe, which reads
-/proc/cpuinfo on Linux and answers "no" when that read fails; the script prints "unknown" on other systems.
+its own settings file from the home directory). The commit printed is the repository's HEAD, so the script also
+prints which `brain` package it imported and aborts when that is not this checkout's. The AVX2 field comes from the
+app's own probe, which reads /proc/cpuinfo on Linux and answers "no" when that read fails; the script prints
+"unknown" on other systems. The CPU field is the machine architecture only.
 
 A timing whose function is absent on the checked-out commit is skipped with a printed reason. On a failure it
 prints one line, `time_old_emotion_paths: FAILED at <step>: <detail>`, to stderr, prints no timings and exits 1.
@@ -54,12 +56,23 @@ class StepError(Exception):
         self.detail = detail
 
 
+def _guarded[T](step: str, call: Callable[[], T]) -> T:
+    """Run ``call``; any exception other than a StepError becomes the one named abort for ``step``."""
+    try:
+        return call()
+    except StepError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - every failure ends the run with the one-line message
+        raise StepError(step, f"{type(exc).__name__}: {exc}") from exc
+
+
 def _under_home(path: Path, home: Path) -> bool:
     return path == home or home in path.parents
 
 
-def _step_source(arg: str | None) -> tuple[Path, str]:
-    """Resolve and vet the source file; return it with the commit the repository is on."""
+def _step_source(arg: str | None) -> tuple[Path, str, Path]:
+    """Resolve and vet the source file; return it, the commit the repository is on and the brain package dir."""
+    import brain
     from brain.paths import get_home
 
     given = Path(arg).expanduser() if arg else REPO_ROOT / DEFAULT_DB
@@ -83,7 +96,14 @@ def _step_source(arg: str | None) -> tuple[Path, str]:
     commit = done.stdout.strip()
     if done.returncode != 0 or not commit:
         raise StepError("source", f"git rev-parse HEAD failed: {done.stderr.strip() or 'no output'}")
-    return source, commit
+    code = Path(brain.__file__).resolve().parent
+    if REPO_ROOT not in code.parents:
+        raise StepError(
+            "source",
+            f"the brain package imported is {code}, not this checkout's ({REPO_ROOT}); "
+            "the commit printed would not be the code timed (set PYTHONPATH to the checkout or use its venv)",
+        )
+    return source, commit, code
 
 
 def _step_copy(source: Path, scratch: Path) -> str:
@@ -102,10 +122,7 @@ def _step_open(scratch: Path):
     """Open the copy as the app does (default integrity check, schema and migrations)."""
     from brain.memory.store import MemoryStore
 
-    try:
-        return MemoryStore(scratch / "memories.db")
-    except Exception as exc:  # noqa: BLE001 - any open or migration failure becomes this one named abort
-        raise StepError("open", f"{type(exc).__name__}: {exc}") from exc
+    return _guarded("open", lambda: MemoryStore(scratch / "memories.db"))
 
 
 def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
@@ -113,12 +130,11 @@ def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
     from brain.emotion import vocabulary
     from brain.emotion.persona_loader import load_persona_vocabulary
 
-    try:
+    def load() -> tuple[int, int]:
         registered = load_persona_vocabulary(scratch / "emotion_vocabulary.json", store=store)
-        registry_size = len(vocabulary.list_all())
-    except Exception as exc:  # noqa: BLE001 - reported as the named step
-        raise StepError("vocabulary", f"{type(exc).__name__}: {exc}") from exc
-    return registered, registry_size
+        return registered, len(vocabulary.list_all())
+
+    return _guarded("vocabulary", load)
 
 
 def _ms(seconds: float) -> str:
@@ -155,13 +171,10 @@ def _time_state(scratch: Path, store) -> list[str]:
 
     hebbian = HebbianMatrix(":memory:")
     try:
-        try:
-            durations = _time_calls(
-                lambda: get_emotional_state(store=store, hebbian=hebbian, persona_dir=scratch),
-                1 + WARM_REPEATS,
-            )
-        except Exception as exc:  # noqa: BLE001 - reported as the named step
-            raise StepError("state", f"{type(exc).__name__}: {exc}") from exc
+        durations = _time_calls(
+            lambda: get_emotional_state(store=store, hebbian=hebbian, persona_dir=scratch),
+            1 + WARM_REPEATS,
+        )
     finally:
         hebbian.close()
     return _timing_lines(
@@ -184,28 +197,27 @@ def _time_trace(scratch: Path, store) -> list[str]:
     middle = statistics.median_low(len(m.content) for m in traces)
     text = next(m.content for m in traces if len(m.content) == middle)
     queue = scratch / "pending_candidates.jsonl"
-    try:
-        durations = _time_calls(
-            lambda: write_trace_memory(store, text),
-            1 + WARM_REPEATS,
-            before_each=lambda: write_jsonl(queue, []),
-        )
-    except Exception as exc:  # noqa: BLE001 - reported as the named step
-        raise StepError("trace", f"{type(exc).__name__}: {exc}") from exc
+    durations = _time_calls(
+        lambda: write_trace_memory(store, text),
+        1 + WARM_REPEATS,
+        before_each=lambda: write_jsonl(queue, []),
+    )
     return _timing_lines(
-        f"write_trace_memory, one trace of {middle} characters (rows changed: 1)",
+        f"write_trace_memory, one trace of {middle} characters "
+        "(adds one entry to the pending-candidates queue, resets before each call; memories.db rows changed: 0)",
         "process-cold, OS page cache warm (fresh copy)",
         durations,
     )
 
 
 def _time_decay(scratch: Path, store) -> list[str]:
-    from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
+    from brain.engines.heartbeat import HeartbeatEngine
 
     if getattr(HeartbeatEngine, "_apply_emotion_decay", None) is None:
         return ["decay: skipped, HeartbeatEngine._apply_emotion_decay is not on this commit"]
     from brain.bridge import supervisor
     from brain.bridge.provider import FakeProvider
+    from brain.engines.heartbeat import HeartbeatState
     from brain.memory.hebbian import HebbianMatrix
 
     interval = inspect.signature(supervisor.run_folded).parameters["heartbeat_interval_s"].default
@@ -213,31 +225,28 @@ def _time_decay(scratch: Path, store) -> list[str]:
         raise StepError("decay", f"run_folded's heartbeat_interval_s default is not a positive number: {interval!r}")
     hebbian = HebbianMatrix(":memory:")
     try:
-        try:
-            engine = HeartbeatEngine(
-                store=store,
-                hebbian=hebbian,
-                provider=FakeProvider(),
-                state_path=scratch / "heartbeat_state.json",
-                config_path=scratch / "heartbeat_config.json",
-                dream_log_path=scratch / "dreams.log.jsonl",
-                heartbeat_log_path=scratch / "heartbeats.log.jsonl",
-                persona_name="Timing",
-                persona_system_prompt="You are Timing.",
-            )
-            state = HeartbeatState.fresh("timing")
-            changed: list[int] = []
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hebbian,
+            provider=FakeProvider(),
+            state_path=scratch / "heartbeat_state.json",
+            config_path=scratch / "heartbeat_config.json",
+            dream_log_path=scratch / "dreams.log.jsonl",
+            heartbeat_log_path=scratch / "heartbeats.log.jsonl",
+            persona_name="Timing",
+            persona_system_prompt="You are Timing.",
+        )
+        state = HeartbeatState.fresh("timing")
+        changed: list[int] = []
 
-            def one_pass() -> None:
-                changed.append(
-                    engine._apply_emotion_decay(
-                        float(interval), tick_at=datetime.now(UTC), state=state, dry_run=False
-                    )
+        def one_pass() -> None:
+            changed.append(
+                engine._apply_emotion_decay(
+                    float(interval), tick_at=datetime.now(UTC), state=state, dry_run=False
                 )
+            )
 
-            durations = _time_calls(one_pass, 1 + WARM_REPEATS)
-        except Exception as exc:  # noqa: BLE001 - reported as the named step
-            raise StepError("decay", f"{type(exc).__name__}: {exc}") from exc
+        durations = _time_calls(one_pass, 1 + WARM_REPEATS)
     finally:
         hebbian.close()
     lines = _timing_lines(
@@ -250,7 +259,7 @@ def _time_decay(scratch: Path, store) -> list[str]:
 
 
 def _host_line() -> str:
-    cpu = platform.processor() or platform.machine() or "unknown"
+    arch = platform.machine() or "unknown"
     avx2 = "unknown"
     ram = "unknown"
     try:
@@ -265,41 +274,46 @@ def _host_line() -> str:
             ram = f"{total / 1024**3:.1f} GiB"
     except ImportError:
         pass
-    return (
-        f"host: {platform.platform()}; cpu {cpu}; avx2={avx2}; cores {os.cpu_count() or 'unknown'}; ram {ram}"
-    )
+    # platform.platform() and platform.processor() both start a `uname -p` process, so neither is used.
+    system = f"{platform.system() or 'unknown'} {platform.release()}".strip()
+    return f"host: {system}; arch {arch}; avx2={avx2}; cores {os.cpu_count() or 'unknown'}; ram {ram}"
 
 
 def run(arg: str | None) -> list[str]:
-    source, commit = _step_source(arg)
-    scratch = Path(tempfile.mkdtemp(prefix="a1r-timing-")).resolve()
+    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
+    from brain.paths import get_home
+
+    source, commit, code = _step_source(arg)
+    scratch = _guarded("copy", lambda: Path(tempfile.mkdtemp(prefix="a1r-timing-")).resolve())
     store = None
     try:
-        from brain.paths import get_home
-
         if _under_home(scratch, get_home()):
             raise StepError("copy", f"the temporary directory is under the brain's home directory: {scratch}")
         digest = _step_copy(source, scratch)
         store = _step_open(scratch)
         registered, registry_size = _step_vocabulary(scratch, store)
-        active = len(store.list_active())
+        active = _guarded("open", lambda: len(store.list_active()))
         out = [
             _host_line(),
             f"commit: {commit}",
+            f"code: {code}",
             f"database: sha256 {digest}",
             f"emotion names registered by the first vocabulary load: {registered}; registry size: {registry_size}",
             "  (a name with no stored half-life gets the placeholder half-life in brain.health.reconstruct, "
-            "14.0 days, which sets how many rows the decay pass rewrites)",
+            f"{PLACEHOLDER_DECAY_DAYS} days, which sets how many rows the decay pass rewrites)",
             f"active rows: {active}",
             "",
         ]
-        out += _time_state(scratch, store) + [""]
-        out += _time_trace(scratch, store) + [""]
-        out += _time_decay(scratch, store)
+        out += _guarded("state", lambda: _time_state(scratch, store)) + [""]
+        out += _guarded("trace", lambda: _time_trace(scratch, store)) + [""]
+        out += _guarded("decay", lambda: _time_decay(scratch, store))
         return out
     finally:
-        if store is not None:
-            store.close()
+        try:
+            if store is not None:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 - a failed close must not stop the directory being removed
+            _CLEANUP_ERRORS.append(f"time_old_emotion_paths: could not close the copy: {exc}")
         try:
             shutil.rmtree(scratch)
         except OSError as exc:

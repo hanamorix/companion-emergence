@@ -15,7 +15,7 @@ from brain.self_model.gap import Gap, compute_gap
 from brain.self_model.state import SelfModelState
 
 _REASON = (
-    "pins the old self-model branch (0.5 floor with >=, long-only channel is a candidate); "
+    "pins the old self-model gap and block branch (0.5 floor with >=, long-only channel is a candidate); "
     "passes on the current code by design and is deleted with the branch at phase C"
 )
 

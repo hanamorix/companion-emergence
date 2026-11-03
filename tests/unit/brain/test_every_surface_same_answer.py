@@ -117,7 +117,7 @@ def _window_pool(window: str, mems: list[Memory]) -> dict[str, float]:
     if window == "sum":
         names = {name for m in mems for name in m.emotions}
         return {name: sum(m.emotions.get(name, 0.0) for m in mems) for name in names}
-    raise AssertionError(f"unknown window {window!r}")
+    raise ValueError(f"unknown window {window!r}")
 
 
 # ── surfaces ─────────────────────────────────────────────────────────────────
