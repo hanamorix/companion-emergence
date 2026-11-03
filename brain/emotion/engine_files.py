@@ -50,6 +50,8 @@ from typing import Any, NamedTuple
 
 from brain import dev_constants, paths
 from brain.emotion.engine_utils import (
+    _MODIFIER_FLOOR,  # with _MODIFIER_SPAN: the range `source_modifier` makes, which a stored modifier is held to
+    _MODIFIER_SPAN,
     Average,
     EmotionState,
     EngineState,
@@ -617,6 +619,11 @@ class StateCache:
 # committed row of a type that does not count, and keeps the persona's start date.
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
+# The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
+# from the floor up to floor + span). A stored modifier outside it is held to it (P12b); one far outside would otherwise fold
+# to an infinite average and make every save of the state fail.
+_MODIFIER_LOW = _MODIFIER_FLOOR
+_MODIFIER_HIGH = _MODIFIER_FLOOR + _MODIFIER_SPAN
 
 
 class InvalidEventError(ValueError):
@@ -640,8 +647,9 @@ def event_from_json(raw: object) -> Event:
     event's own content must not repeat for ever, so the drop is the remedy); a commit, assigned or showing with no
     `memory_id` (a non-empty text); a commit or assigned with no emotion values; an emotion name that is not text or an amount
     that is not a finite number (a bool is not a number); a `modifier` or `climax`, when present, that is not a finite
-    number; a `source`, when present, that is not text. A missing `modifier` is 1.0 and a missing `climax` is 0.0. The
-    `modifier` of a change is not read (a change has weight 1, no repeat factor).
+    number; a `source`, when present, that is not text. A missing `climax` is 0.0. A missing `modifier` is 1.0; a finite one
+    outside the range `source_modifier` can make (0.1 to 1.0) is not invalid: it is held to the range, with a warning line
+    (P12b). The `modifier` of a change is not read (a change has weight 1, no repeat factor).
     """
     if not isinstance(raw, dict):
         raise InvalidEventError(f"not an object ({type(raw).__name__})")
@@ -682,6 +690,18 @@ def event_from_json(raw: object) -> Event:
             raise InvalidEventError(f"source must be text, found {type(source).__name__}")
         return Event(kind="change", at=at, emotions=emotions, source=source)
     modifier = _event_number(raw, "modifier", 1.0)
+    held = min(max(modifier, _MODIFIER_LOW), _MODIFIER_HIGH)
+    if held != modifier:
+        logger.warning(
+            "emotion event %s %s: modifier %r is outside %s to %s, held to %s",
+            kind,
+            memory_id,
+            modifier,
+            _MODIFIER_LOW,
+            _MODIFIER_HIGH,
+            held,
+        )
+        modifier = held
     climax = _event_number(raw, "climax", 0.0) if kind == "commit" else 0.0
     return Event(kind=kind, at=at, memory_id=memory_id, emotions=emotions, modifier=modifier, climax=climax)
 

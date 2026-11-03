@@ -10,8 +10,10 @@ build them and extend this file.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
+import math
 import pathlib
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
@@ -20,8 +22,9 @@ import pytest
 
 from brain import dev_constants
 from brain.emotion import engine_files, engine_utils
-from brain.emotion.engine_utils import EngineState, Event, day_of, fold_event
+from brain.emotion.engine_utils import EngineState, Event, day_of, fold_event, source_modifier
 from brain.health import json_io
+from brain.memory.store import Memory
 
 LOGGER = "brain.emotion.engine_files"
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
@@ -203,11 +206,11 @@ def test_an_at_that_cannot_be_turned_into_a_local_day_is_invalid(
     assert engine_files.event_from_json(_raw("commit")).kind == "commit"  # a normal time still passes
 
 
-_WRONG = [None, "x", [], {}, True, 10**400, -1, float("nan"), float("inf"), 0, 2.5]
+_WRONG = [None, "x", [], {}, True, 10**400, -1, float("nan"), float("inf"), 0, 2.5, 1e308, -1e308, 10**300]
 
 
-def test_every_event_the_check_accepts_folds_without_raising() -> None:
-    """The check and the fold agree: nothing that passes can fail every drain for ever (E6.10)."""
+def test_every_event_the_check_accepts_folds_and_saves(tmp_path: Path) -> None:
+    """The check and the fold agree: nothing that passes can fail every drain for ever (E6.10), not even at the save."""
     accepted = refused = 0
     for kind in ("commit", "assigned", "showing", "change", "start"):
         base = _raw(kind)
@@ -226,9 +229,132 @@ def test_every_event_the_check_accepts_folds_without_raising() -> None:
                 except engine_files.InvalidEventError:
                     refused += 1
                     continue
-                fold_event(EngineState(), event, NOW)
+                state = EngineState()
+                fold_event(state, event, NOW)
+                state.saved_at = NOW
+                engine_files.save_state(tmp_path, state)  # strict: a non-finite number anywhere raises
                 accepted += 1
     assert accepted > 20 and refused > 100
+
+
+# --- a modifier outside the range its producer can make is held to the range -------------------
+
+
+def _memory(memory_type: str, **metadata: object) -> Memory:
+    return Memory.create_new(content="c", memory_type=memory_type, domain="us", emotions={"joy": 5.0}, tags=[], metadata=metadata)
+
+
+def _produced_range() -> tuple[float, float]:
+    """The smallest and largest modifier `source_modifier` makes over the kinds and the extreme inputs, and a check that all lie between."""
+    outputs = [source_modifier(_memory("conversation"), 0.0), source_modifier(_memory("making"), 0.0)]
+    peer = _memory("kindled_peer", peer_id="p")
+    outputs += [source_modifier(peer, trust) for trust in (-5, 0, 0.3, 0.5, 1, 9, math.nan, math.inf, -math.inf)]
+    research = [{}, {"engagement_rating": "abc"}] + [
+        {"engagement_rating": rating} for rating in (-3, 0, 5, "8", 10, 15, math.nan, math.inf, -math.inf)
+    ]
+    outputs += [source_modifier(_memory("research", **metadata), 0.0) for metadata in research]
+    return min(outputs), max(outputs)
+
+
+def test_the_held_range_is_the_range_source_modifier_produces() -> None:
+    low, high = _produced_range()
+    assert (low, high) == (pytest.approx(0.1), pytest.approx(1.0))  # both ends are reached, so neither bound is looser
+    assert engine_files.event_from_json(_raw("showing", modifier=-1e308)).modifier == low
+    assert engine_files.event_from_json(_raw("showing", modifier=1e308)).modifier == high
+
+
+@pytest.mark.parametrize("kind", ["commit", "assigned", "showing"])
+@pytest.mark.parametrize("value", [1e308, -1e308, 2.0, 0.0, -1.0, 0.05, pytest.param(10**300, id="int-1e300")])
+def test_a_finite_modifier_outside_the_range_is_held_to_the_nearest_bound(kind: str, value: float) -> None:
+    low, high = _produced_range()
+    expected = low if value < low else high
+    event = engine_files.event_from_json(_raw(kind, modifier=value))
+    twin = engine_files.event_from_json(_raw(kind, modifier=0.5))
+    assert event.modifier == expected
+    assert dataclasses.replace(event, modifier=0.5) == twin  # nothing else about the event changed
+
+
+@pytest.mark.parametrize("kind", ["commit", "assigned", "showing"])
+def test_a_hold_writes_one_warning_saying_what_was_found_and_where_it_went(
+    kind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    low, high = _produced_range()
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        engine_files.event_from_json(_raw(kind, memory_id="mem-77", modifier=1e308))
+    records = [r for r in caplog.records if r.name == LOGGER]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    text = records[0].getMessage()
+    for part in (kind, "mem-77", repr(1e308), str(low), str(high)):
+        assert part in text
+
+
+@pytest.mark.no_base_failure(reason="pins what the hold must leave alone: an in-range or absent modifier, and a change or start event's stored one, are unchanged and quiet; the old code passes it")
+def test_an_in_range_modifier_is_untouched_and_quiet(caplog: pytest.LogCaptureFixture) -> None:
+    low, high = _produced_range()
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        for kind in ("commit", "assigned", "showing"):
+            for value in (low, 0.55, 0.9999, high):
+                assert engine_files.event_from_json(_raw(kind, modifier=value)).modifier == value
+            assert engine_files.event_from_json(_drop(_raw(kind), "modifier")).modifier == 1.0
+        assert engine_files.event_from_json(_raw("change", modifier=1e308)).modifier == 1.0  # a change does not read it
+        assert engine_files.event_from_json(_raw("start", modifier=1e308)).kind == "start"
+    assert [r for r in caplog.records if r.name == LOGGER] == []
+
+
+@pytest.mark.no_base_failure(reason="pins the refusal that already exists and must stay when the hold is added: a modifier that is not a finite number is refused, not held; the old code passes it")
+@pytest.mark.parametrize("kind", ["commit", "assigned", "showing"])
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), float("-inf"), "1", True, pytest.param(10**400, id="int-1e400")]
+)
+def test_a_modifier_that_is_not_a_finite_number_is_still_refused(kind: str, value: object) -> None:
+    with pytest.raises(engine_files.InvalidEventError, match="modifier"):
+        engine_files.event_from_json(_raw(kind, modifier=value))
+
+
+@pytest.mark.no_base_failure(reason="pins the refusal that already exists and must stay when the hold is added: through the queue read a non-finite modifier is dropped with an error line and its neighbours stay; the old code passes it")
+def test_the_queue_read_still_drops_a_non_finite_modifier_and_keeps_the_neighbours(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_raw_queue(tmp_path, [_raw("commit", memory_id="a"), _raw("showing", modifier=float("inf")), _raw("assigned", memory_id="c")])
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        events = engine_files.read_queue(tmp_path)
+    assert [e.memory_id for e in events] == ["a", "c"]
+    errors = _errors(caplog)
+    assert len(errors) == 1 and "modifier" in errors[0]
+
+
+def test_a_huge_queued_modifier_is_held_then_folds_and_saves(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The overflow this closes: an event with modifier about 1e308 once folded to an infinite average and made every save fail."""
+    low, high = _produced_range()
+    raw = [
+        _raw("commit", memory_id="a"),
+        _raw("commit", memory_id="big", modifier=1e308, emotions={"joy": 9.0}),
+        _raw("assigned", memory_id="big2", modifier=-1e308, emotions={"grief": 4.0}),
+        _raw("change"),
+    ]
+    queue = _write_raw_queue(tmp_path, raw)
+    before = _tree(tmp_path)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        events = engine_files.read_queue(tmp_path)
+    assert _tree(tmp_path) == before  # the hold is read-side: the file is not rewritten, nothing is created
+    assert queue.read_bytes() == before[str(queue.relative_to(tmp_path))]
+    assert [e.memory_id for e in events] == ["a", "big", "big2", None]
+    assert [e.modifier for e in events[1:3]] == [high, low]
+    assert _errors(caplog) == []
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+
+    state = EngineState()
+    for event in events:
+        fold_event(state, event, NOW)
+    state.saved_at = NOW
+    state.active_day = day_of(NOW)  # the drain sets the day; a state with `last_update` and no `active_day` is not valid
+    engine_files.save_state(tmp_path, state)  # strict serialization: raises on any non-finite number
+    loaded = engine_files.read_state(tmp_path)
+    assert loaded.source == "main" and loaded.state is not None
+    for emotion in loaded.state.emotions.values():
+        for average in (emotion.short, emotion.long):
+            assert math.isfinite(average.avg) and math.isfinite(average.weight)
+    assert set(loaded.state.emotions) >= {"joy", "grief"}
 
 
 # --- the queue file ----------------------------------------------------------------------------
