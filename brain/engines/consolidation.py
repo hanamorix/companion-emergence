@@ -1005,16 +1005,7 @@ def _dispatch(
             # commits and the item is retried before claim.settle (the process dies, or an error follows the commit), the
             # candidate is merged again and the emotions are averaged with it a second time; the content is protected by
             # `_fold`'s "contains it" rule, the averages are not.
-            try:
-                fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
-            except ValueError as exc:
-                # A stored value that cannot be averaged: keep the target's emotions exactly as stored, merge the content.
-                logger.warning(
-                    "consolidation gate: emotions of candidate %s not merged into %s (%s); content merged only",
-                    cand.id,
-                    target.id,
-                    exc,
-                )
+            fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
         try:
             store.update(target.id, **fields)
         except KeyError:
@@ -1066,30 +1057,15 @@ def _dispatch(
         result.promoted += 1
 
 
-def _check_finite_numbers(emotions: dict, side: str) -> None:
-    """Raise ValueError naming the first emotion whose stored value is not a finite number (a bool, a string, None, NaN, inf,
-    an int too large for a float). A merge rewrites the column, so such a value must stop the merge, not be dropped."""
-    for name, value in emotions.items():
-        try:
-            usable = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
-        except OverflowError:  # an int too large for a float
-            usable = False
-        if not usable:
-            raise ValueError(f"{side} emotion {name!r} has a value that is not a finite number: {value!r}")
-
-
 def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, float]:
-    """The emotions of two memories that merge: each name in its standard spelling (`vocabulary.canonical_name`, through
-    `resolve_emotions`), two spellings of one emotion one entry with their average, an emotion on both memories the average of the
-    two, an emotion on one memory only copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory is resolved first, so each memory
-    counts once in the average across the two. No value is held to a range. Returns a new dict, the target's names first.
-
-    Raises ValueError when a value on either side is not a finite number (the caller keeps the stored emotions then).
+    """The emotions of two memories that merge. Each memory goes through the engine's one name-resolution step first
+    (`resolve_emotions`: each name in its standard spelling, two spellings of one emotion one entry with their average, every
+    value held to 0-10, a value that is not a finite number dropped with a log line). Then an emotion on both memories is the
+    average of the two, and an emotion on one memory only is copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory counts
+    once in the average across the two. Returns a new dict, the target's names first.
     """
-    _check_finite_numbers(target_emotions, "target")
-    _check_finite_numbers(cand_emotions, "candidate")
-    merged = resolve_emotions(target_emotions, signed=True)
-    for name, value in resolve_emotions(cand_emotions, signed=True).items():
+    merged = resolve_emotions(target_emotions)
+    for name, value in resolve_emotions(cand_emotions).items():
         merged[name] = (merged[name] + value) / 2 if name in merged else value
     return merged
 

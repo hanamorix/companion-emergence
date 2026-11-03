@@ -621,7 +621,12 @@ _MERGE_TABLE = [
     pytest.param({"love_grief_blend": 2}, {"grief_love_blend": 6}, {"grief_love_blend": 4.0}, id="blend-pair-order"),
     pytest.param({"Joy": 5, "joy": 7}, {"joy": 8}, {"joy": 7.0}, id="within-one-memory-then-across"),
     pytest.param({"Joy": 5, "joy": 7}, {}, {"joy": 6.0}, id="within-one-memory-only"),
-    pytest.param({"joy": 12.5}, {}, {"joy": 12.5}, id="one-sided-value-not-clamped"),
+    pytest.param({"joy": 12.5}, {}, {"joy": 10.0}, id="one-sided-value-held-to-10"),
+    pytest.param({"joy": -3}, {}, {"joy": 0.0}, id="one-sided-negative-held-to-0"),
+    pytest.param({"joy": 12}, {"joy": 4}, {"joy": 7.0}, id="shared-out-of-range-held-then-averaged"),
+    pytest.param({}, {"joy": 15}, {"joy": 10.0}, id="candidate-out-of-range-held"),
+    pytest.param({"Joy": 20, "joy": 4}, {}, {"joy": 10.0}, id="spellings-averaged-then-held"),
+    pytest.param({"Joy": 20, "joy": 4}, {"joy": 4}, {"joy": 7.0}, id="spellings-averaged-held-then-averaged-across"),
     pytest.param({"joy": 5}, {"joy": 5}, {"joy": 5.0}, id="equal-values"),
     pytest.param({}, {}, {}, id="both-empty"),
 ]
@@ -658,13 +663,23 @@ _UNUSABLE = [
 @pytest.mark.parametrize("bad", _UNUSABLE)
 @pytest.mark.parametrize("side", ["target", "candidate"])
 @pytest.mark.parametrize("shared", [True, False])
-def test_e5_merge_emotions_refuses_a_value_that_is_not_a_finite_number(bad, side, shared):
+def test_e5_merge_emotions_drops_a_value_that_is_not_a_finite_number(bad, side, shared, caplog):
     good = {"trust": 3.0}
     with_bad = {"joy" if shared else "awe": bad, **good}
     other = {"joy": 4.0}
     target, cand = (with_bad, other) if side == "target" else (other, with_bad)
-    with pytest.raises(ValueError, match="finite number"):
-        consolidation._merge_emotions(target, cand)
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.engine_utils"):
+        got = consolidation._merge_emotions(target, cand)  # no exception
+    # The bad value is dropped; on a shared name the other side's value is then the only one. The rest merges.
+    assert got == {"trust": 3.0, "joy": 4.0}
+    dropped = [r.getMessage() for r in caplog.records if "not a finite number" in r.getMessage()]
+    assert len(dropped) == 1
+    assert ("'joy'" if shared else "'awe'") in dropped[0]
+
+
+def test_e5_merge_emotions_of_an_all_unusable_side_with_an_empty_side_is_empty():
+    assert consolidation._merge_emotions({"joy": float("nan"), "awe": None}, {}) == {}
+    assert consolidation._merge_emotions({}, {"joy": "5", "awe": True}) == {}
 
 
 def test_e5_live_merge_averages_shared_and_copies_one_sided(persona, emotion_engine_stub):
@@ -782,35 +797,121 @@ def test_e5_live_merge_of_a_target_deleted_before_the_write_defers_the_candidate
     assert queue.read_recent("dream", limit=5)  # the candidate is back in the queue
 
 
-@pytest.mark.parametrize("bad", _UNUSABLE)
-def test_e5_live_merge_keeps_the_stored_emotions_when_a_value_cannot_be_averaged(
-    persona, emotion_engine_stub, caplog, bad
-):
+def _set_raw_emotions(store, memory_id, emotions):
+    """Put emotions on a row with a direct UPDATE (`create` drops non-finite values; the column takes anything)."""
     import json
 
+    store._conn.execute(
+        "UPDATE memories SET emotions_json = ? WHERE id = ?", (json.dumps(emotions, allow_nan=True), memory_id)
+    )
+    store._conn.commit()
+
+
+def _archived_target_emotions(tmp, target_id):
+    import json
+
+    records = [json.loads(line) for line in (tmp / _ARCHIVE_FILENAME).read_text().splitlines() if line.strip()]
+    mine = [r for r in records if r["target"]["id"] == target_id]
+    assert len(mine) == 1
+    return mine[0]["target"]["emotions"]
+
+
+# What the archive writes for each unusable stored value (it writes JSON with `nonfinite="null"`).
+_UNUSABLE_ARCHIVED = [
+    pytest.param(float("nan"), None, id="nan"),
+    pytest.param(float("inf"), None, id="inf"),
+    pytest.param("5", "5", id="string"),
+    pytest.param(None, None, id="none"),
+    pytest.param(True, True, id="bool"),
+    pytest.param(10**400, 10**400, id="int-too-big-for-a-float"),
+]
+
+
+@pytest.mark.parametrize(("bad", "archived"), _UNUSABLE_ARCHIVED)
+def test_e5_live_merge_drops_a_stored_value_that_is_not_a_finite_number_and_merges_the_rest(
+    persona, emotion_engine_stub, caplog, bad, archived
+):
     tmp, store, hebbian, queue = persona
     emotion_engine_stub.live = True
     target_id = store.create(_mem("Bob likes tea", "conversation", emotions={"joy": 7.0}), fold=False)
     cand = _mem("Bob likes tea with honey", "dream", emotions={"awe": 6.0})
     queue.enqueue(cand, source="x")
-    # The unusable value goes onto the row with a raw UPDATE (`create` drops non-finite values; the column takes anything).
-    # The candidate side is covered by the unit cells above: the queue's `enqueue` clamps a non-finite value to 0.0.
-    store._conn.execute(
-        "UPDATE memories SET emotions_json = ? WHERE id = ?",
-        (json.dumps({"joy": bad, "trust": 3.0}, allow_nan=True), target_id),
-    )
-    store._conn.commit()
-    raw_before = _raw(store, target_id, "emotions_json")[0]
-    with caplog.at_level(logging.WARNING, logger="brain.engines.consolidation"):
+    _set_raw_emotions(store, target_id, {"joy": bad, "trust": 3.0})
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.engine_utils"):
         res = run_consolidation(
             store, persona_dir=tmp, hebbian=hebbian,
             classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content="merged text")}),
         )
     assert res.merged == 1
     got = store.get(target_id, bump=False)
-    assert got.content == "merged text"  # the content merge still happens
-    assert _raw(store, target_id, "emotions_json")[0] == raw_before  # the stored emotions are byte-identical
-    assert any("not merged" in r.getMessage() for r in caplog.records)
+    assert got.content == "merged text"  # the content merge happens
+    assert got.emotions == {"trust": 3.0, "awe": 6.0}  # the unusable value is dropped, the rest merged
+    assert sum("not a finite number" in r.getMessage() for r in caplog.records) == 1
+    # The pre-merge row is in the archive (NaN and inf are written as null there).
+    assert _archived_target_emotions(tmp, target_id) == {"joy": archived, "trust": 3.0}
+
+
+def test_e5_live_merge_of_an_all_unusable_target_and_an_empty_candidate_writes_empty_emotions(
+    persona, emotion_engine_stub
+):
+    tmp, store, hebbian, queue = persona
+    emotion_engine_stub.live = True
+    target_id = store.create(_mem("Bob likes tea", "conversation", emotions={"joy": 7.0}), fold=False)
+    cand = _mem("Bob likes tea with honey", "dream")
+    queue.enqueue(cand, source="x")
+    _set_raw_emotions(store, target_id, {"joy": float("nan"), "awe": None})
+    res = run_consolidation(
+        store, persona_dir=tmp, hebbian=hebbian,
+        classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content="merged text")}),
+    )
+    assert res.merged == 1
+    assert store.get(target_id, bump=False).emotions == {}
+
+
+def test_e5_live_merge_holds_an_out_of_range_value_to_0_10(persona, emotion_engine_stub):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    target_id, _res = _merge_run(persona, {"joy": 12.5}, {})
+    assert store.get(target_id, bump=False).emotions == {"joy": 10.0}
+    target_id, _res = _merge_run(persona, {}, {"joy": 15.0})
+    assert store.get(target_id, bump=False).emotions == {"joy": 10.0}
+
+
+def test_e5_live_merge_drops_a_bool_value_on_the_candidate_with_a_log_line(persona, emotion_engine_stub, caplog):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.engine_utils"):
+        target_id, res = _merge_run(persona, {}, {"joy": True, "awe": 6.0})
+    assert res.merged == 1
+    assert store.get(target_id, bump=False).emotions == {"awe": 6.0}
+    assert sum("not a finite number" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_e5_live_merge_two_spellings_in_one_memory_then_across(persona, emotion_engine_stub):
+    # Planning's ruling (Q1): the target's Joy 5 and joy 7 are one entry, 6; across the two memories 6 and the candidate's 8 give 7.
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    target_id, _res = _merge_run(persona, {"Joy": 5.0, "joy": 7.0}, {"joy": 8.0})
+    assert store.get(target_id, bump=False).emotions == {"joy": 7.0}
+
+
+def test_e5_live_merge_leaves_the_target_created_at_alone(persona, emotion_engine_stub):
+    # Planning's ruling (Q4): the merge writes content, emotions and fold=False only.
+    tmp, store, hebbian, queue = persona
+    emotion_engine_stub.live = True
+    old = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+    target = replace(_mem("Bob likes tea", "conversation", emotions={"joy": 5.0}), created_at=old)
+    target_id = store.create(target, fold=False)
+    cand = _mem("Bob likes tea with honey", "dream", emotions={"joy": 7.0})
+    queue.enqueue(cand, source="x")
+    before = _raw(store, target_id, "created_at")[0]
+    res = run_consolidation(
+        store, persona_dir=tmp, hebbian=hebbian,
+        classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content="merged text")}),
+    )
+    assert res.merged == 1
+    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}  # the live merge ran
+    assert _raw(store, target_id, "created_at")[0] == before == old.isoformat()
 
 
 def _assert_preread_is_not_an_access(store, target_id, res):
@@ -1128,6 +1229,47 @@ def test_e5_an_emotions_write_during_the_reappraiser_call_is_kept(
     got = store.get(mem.id, bump=False)
     assert got.emotions == {"joy": 6.0}  # not erased by a fade of the stale empty dict
     assert got.created_at == _FIXED_NOW
+
+
+def _importance_sensitive_fade(memory, emotion):
+    """A fade whose answer moves with the memory's importance, so the importance a write-back fades under shows in its output."""
+    return memory.emotions[emotion] * (1 - memory.importance / 20)
+
+
+@pytest.mark.parametrize("new_importance", [7.25, 9.5])
+def test_e5_the_fade_in_a_write_back_does_not_depend_on_the_reappraised_importance(
+    persona, emotion_engine_stub, monkeypatch, new_importance
+):
+    # Planning's ruling (Q3, spec 3.2): the fade uses the importance the memory was loaded with, not the re-appraised one.
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    monkeypatch.setattr(emotion_engine_stub, "faded_value", _importance_sensitive_fade)
+    mem = _mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0)
+    store.create(mem, fold=False)
+    res = _reappraise_run(tmp, store, mem, new_importance=new_importance)
+    assert res.reappraised == 1
+    got = store.get(mem.id, bump=False)
+    assert got.importance == pytest.approx(new_importance)  # the re-appraisal itself is stored
+    assert got.emotions["joy"] == pytest.approx(8.0 * (1 - 3.0 / 20))  # 6.8: faded under the loaded 3.0
+
+
+def test_e5_the_fade_takes_emotions_from_the_reread_row_and_importance_from_the_loaded_memory(
+    persona, emotion_engine_stub, monkeypatch
+):
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    monkeypatch.setattr(emotion_engine_stub, "faded_value", _importance_sensitive_fade)
+    mem = _mem("Bob's address", "conversation", importance=3.0)  # loaded with no emotions
+    store.create(mem, fold=False)
+
+    def reappraiser_while_backfill_writes(m):
+        store.update(m.id, emotions={"joy": 6.0}, fold=False)  # emotions land during the model call
+        return Reappraisal(9.5)
+
+    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
+    got = store.get(mem.id, bump=False)
+    assert got.importance == pytest.approx(9.5)
+    assert got.emotions["joy"] == pytest.approx(6.0 * (1 - 3.0 / 20))  # 5.1: fresh emotions, loaded importance
 
 
 def test_e5_a_later_fade_reads_the_reappraised_importance_and_the_reset_created_at(
