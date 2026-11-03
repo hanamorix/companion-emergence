@@ -446,8 +446,9 @@ def test_an_unwritable_change_log_logs_and_returns_false(tmp_path: Path, caplog:
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
+@pytest.mark.parametrize("error", [OverflowError("date value out of range"), OSError("pre-1970 on Windows")])
 def test_a_change_that_cannot_be_encoded_or_dated_is_logged_and_returns_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    error: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.append_change(tmp_path, _change(NOW, joy=float("nan"))) is False
@@ -455,7 +456,7 @@ def test_a_change_that_cannot_be_encoded_or_dated_is_logged_and_returns_false(
     caplog.clear()
 
     def failing(dt: datetime) -> datetime:
-        raise OverflowError("date value out of range")
+        raise error
 
     monkeypatch.setattr(engine_utils, "to_local", failing)
     with caplog.at_level(logging.ERROR, logger=LOGGER):
@@ -632,6 +633,15 @@ def test_the_reader_adds_nothing_and_raises_nothing_for_a_missing_folder_or_a_ga
     assert [e.emotions["joy"] for e in engine_files.read_changes(tmp_path, since)] == [1.0, 2.0]
 
 
+def test_the_reader_takes_a_naive_start_as_utc_and_refuses_nothing_else(tmp_path: Path) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0))
+    naive = since.replace(tzinfo=None)
+    assert [e.emotions["joy"] for e in engine_files.read_changes(tmp_path, naive)] == [1.0]
+    with pytest.raises(ValueError):
+        engine_files.read_changes(tmp_path, "soon")  # type: ignore[arg-type]
+
+
 def test_the_reader_ignores_files_that_are_not_day_files(tmp_path: Path) -> None:
     since = _local_noon(date(2026, 6, 10))
     folder = engine_files.changes_dir(tmp_path)
@@ -676,23 +686,6 @@ def test_the_reader_treats_an_unlistable_folder_as_missing_with_a_line(
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_changes(tmp_path, NOW) == []
     assert len(_errors(caplog)) == 1
-
-
-def test_the_reader_uses_what_it_could_read_of_a_file_that_fails_midway(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    since = _local_noon(date(2026, 6, 10))
-    _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0))
-    _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=2.0))
-    real = engine_files.iter_jsonl
-
-    def failing_first(path: Path, **kwargs: object):
-        if path.name == "2026-06-10.jsonl":
-            raise PermissionError("locked")
-        return real(path, **kwargs)
-
-    monkeypatch.setattr(engine_files, "iter_jsonl", failing_first)
-    assert [e.emotions["joy"] for e in engine_files.read_changes(tmp_path, since)] == [2.0]
 
 
 def test_a_change_written_then_read_round_trips(tmp_path: Path) -> None:

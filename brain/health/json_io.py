@@ -11,6 +11,7 @@ Reading a whole file::
     read_json(path, default=dict)                              # fail soft, evidence logged
     read_json(path, recover=Recovery.RAISE)                    # fail closed: JsonFileError
     read_json_result(path, default=f, recover=Recovery.HEAL)   # quarantine + restore + anomaly
+    read_json_walk(path, expect=dict, validate=check)          # read-only: path, then .bak1-.bak3; says which copy won
     read_json(path, default=dict, recover=Recovery.RESTORE)    # restore from a good backup, else raise
 
 Recovery policies: DEFAULT returns ``default()`` and leaves the file (an I/O fault too); CONTENT does the same for bad

@@ -767,6 +767,13 @@ def test_walk_signature_is_that_of_the_bytes_parsed(
     assert walk.signature != (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
+def test_walk_takes_a_text_path_too(tmp_path: Path) -> None:
+    (tmp_path / "f.json").write_text('{"v": 1}', encoding="utf-8")
+    (tmp_path / "f.json.bak1").write_text('{"v": 2}', encoding="utf-8")
+    (tmp_path / "f.json").write_text("{bad", encoding="utf-8")
+    assert read_json_walk(str(tmp_path / "f.json"), expect=dict).source == "bak1"
+
+
 def test_walk_signature_is_the_ino_mtime_size_triple(tmp_path: Path) -> None:
     path = tmp_path / "f.json"
     path.write_text('{"v": 1}', encoding="utf-8")
@@ -961,7 +968,7 @@ _BAD_DAYS = {
     "last-with not a date": _day("2026-06-09", run=["2026-06-05", 1, "x"]),
     "start later than the day": _day("2026-06-09", run=["2026-06-10", 1, "2026-06-09"]),
     "last-with later than the day": _day("2026-06-09", run=["2026-06-05", 1, "2026-06-10"]),
-    "last-with before start": _day("2026-06-09", run=["2026-06-08", 1, "2026-06-07"]),
+    "last-with before start": _day("2026-06-09", run=["2026-06-09", 1, "2026-06-08"]),
     "last-with two days before the day": _day("2026-06-09", run=["2026-06-05", 1, "2026-06-07"]),
     "run of the wrong length": _day("2026-06-09", run=["2026-06-05", 1]),
     "run not a list": _day("2026-06-09", run="x"),
@@ -1009,6 +1016,19 @@ def test_a_snapshot_average_outside_the_scale_is_held_and_the_day_kept(tmp_path:
     state = engine_files.state_from_json(data, label=f"hold {tmp_path}")
     day = state.emotions["joy"].snapshot[0]
     assert (day.day, day.short, day.long) == ("2026-06-09", 10.0, 0.0)
+
+
+def test_a_snapshot_average_is_held_to_the_dev_constant_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dev_constants, "EMOTION_VALUE_CAP", 5.0)
+    data = _valid_json()
+    data["emotions"]["joy"]["short"]["avg"] = 7
+    data["emotions"]["joy"]["snapshot"] = [_day("2026-06-09", short=8, long=6)]
+    state = engine_files.state_from_json(data, label=f"cap {tmp_path}")
+    assert state.emotions["joy"].short.avg == 5.0
+    day = state.emotions["joy"].snapshot[0]
+    assert (day.short, day.long) == (5.0, 5.0)
 
 
 def test_a_run_record_one_day_before_the_day_is_valid(tmp_path: Path) -> None:
@@ -1429,6 +1449,39 @@ def test_a_corrupt_switch_main_reads_from_its_backup_and_still_exists(tmp_path: 
     path.write_text("{torn", encoding="utf-8")
     assert engine_files.switch_exists(tmp_path) is True
     assert engine_files.read_switch(tmp_path) == when
+
+
+def test_a_switch_main_with_no_usable_time_falls_to_a_backup_that_has_one(tmp_path: Path) -> None:
+    when = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
+    path = engine_files.switch_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"switch_over_at": "never"}', encoding="utf-8")
+    path.with_name(path.name + ".bak1").write_text('{"switch_over_at": "2026-07-01T08:00:00Z"}', encoding="utf-8")
+    assert engine_files.read_switch(tmp_path) == when
+    path.write_text('["not", "an", "object"]', encoding="utf-8")
+    assert engine_files.read_switch(tmp_path) == when
+
+
+def test_the_files_are_written_with_the_modes_the_design_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """State: three backups, compact. Switch: three backups, once. Queue: compact, no fsync, no backups."""
+    calls: list[tuple[str, dict]] = []
+    real = engine_files.write_json
+
+    def spy(path: Path, data: object, **kwargs: object):
+        calls.append((path.name, kwargs))
+        return real(path, data, **kwargs)
+
+    monkeypatch.setattr(engine_files, "write_json", spy)
+    engine_files.save_state(tmp_path, _full_state())
+    engine_files.write_switch(tmp_path, NOW)
+    engine_files.write_queue(tmp_path, [engine_files.event_from_json({"kind": "start", "at": "2026-06-10T10:00:00Z"})])
+    assert calls == [
+        ("emotion_state.json", {"backups": 3, "indent": None}),
+        ("emotion_switch.json", {"backups": 3, "if_missing": True}),
+        ("emotion_pending.json", {"indent": None, "fsync": False}),
+    ]
 
 
 def test_read_switch_is_none_for_no_file_and_for_a_switch_with_no_usable_time(tmp_path: Path) -> None:

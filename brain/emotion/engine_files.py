@@ -57,6 +57,7 @@ from brain.emotion.engine_utils import (
     RepeatEntry,
     RunRecord,
     SnapshotDay,
+    _hold,  # the one hold-to-0-10 rule, shared with the fold (same package, no second copy)
     day_of,
 )
 from brain.emotion.vocabulary import canonical_name
@@ -74,6 +75,9 @@ from brain.utils.log_throttle import count_throttled, warn_throttled
 from brain.utils.time import iso_utc, lenient_utc
 
 logger = logging.getLogger(__name__)
+
+# The state file and the switch keep three backups; `json_io.read_json_walk` reads exactly `.bak1` to `.bak3`.
+_BACKUPS = 3
 
 _VOCABULARY_FILENAME = "emotion_vocabulary.json"
 
@@ -294,10 +298,6 @@ def _day(value: object, what: str) -> str:
     return value
 
 
-def _hold(value: float) -> float:
-    return min(max(value, 0.0), dev_constants.EMOTION_VALUE_CAP)
-
-
 def _mapping(parent: Mapping, key: str, what: str) -> Mapping:
     value = parent.get(key)
     if not isinstance(value, dict):
@@ -377,8 +377,8 @@ def _snapshot_day(item: object, previous_day: str | None) -> SnapshotDay:
         if type(direction) is not int or direction not in (1, -1):
             raise ValueError(f"run direction must be 1 or -1, found {direction!r}")
         last_with = _day(record[2], "run last with-direction day")
-        if start > day:
-            raise ValueError(f"run start day {start} is later than the day {day}")
+        # A start later than the day is refused by the next two checks: its last with-direction day would be after the day
+        # or before the start.
         if last_with > day:
             raise ValueError(f"run last with-direction day {last_with} is later than the day {day}")
         if last_with < start:
@@ -518,7 +518,7 @@ def save_state(persona_dir: Path, state: EngineState) -> None:
 
     Does not change `state`. Serialization is strict: a non-finite number fails before any file is touched.
     """
-    write_json(state_path(persona_dir), state_to_json(state), backups=3, indent=None)
+    write_json(state_path(persona_dir), state_to_json(state), backups=_BACKUPS, indent=None)
 
 
 class LoadedState(NamedTuple):
@@ -873,6 +873,10 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
     (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
     with an error log line. The reader repairs nothing.
     """
+    when = lenient_utc(since)  # a naive time means UTC, as everywhere in the repo
+    if when is None:
+        raise ValueError(f"since is not a usable time: {since!r}")
+    since = when
     start = (date.fromisoformat(day_of(since)) - timedelta(days=1)).isoformat()
     folder = changes_dir(persona_dir)
     events: list[Event] = []
@@ -881,19 +885,16 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         if day is None or day < start:
             continue
         path = folder / name
-        try:
-            for record in iter_jsonl(path):
-                try:
-                    event = event_from_json(record)
-                    if event.kind != "change":
-                        raise InvalidEventError(f"a {event.kind} event is not a change")
-                except InvalidEventError as exc:
-                    logger.error("emotion change log %s: a line was dropped (%s)", path, exc)
-                    continue
-                if event.at >= since:
-                    events.append(event)
-        except OSError as exc:
-            logger.error("emotion change log %s could not be read (%s); what was read is used", path, exc)
+        for record in iter_jsonl(path):  # an I/O failure ends the iteration there; what was read is used
+            try:
+                event = event_from_json(record)
+                if event.kind != "change":
+                    raise InvalidEventError(f"a {event.kind} event is not a change")
+            except InvalidEventError as exc:
+                logger.error("emotion change log %s: a line was dropped (%s)", path, exc)
+                continue
+            if event.at >= since:
+                events.append(event)
     return events
 
 
@@ -911,7 +912,7 @@ def write_switch(persona_dir: Path, switch_over_at: datetime) -> bool:
     return write_json(
         switch_path(persona_dir),
         {"switch_over_at": _iso(switch_over_at, "switch_over_at")},
-        backups=3,
+        backups=_BACKUPS,
         if_missing=True,
     )
 
