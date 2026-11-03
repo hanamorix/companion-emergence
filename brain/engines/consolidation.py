@@ -917,13 +917,13 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
     neither requeued nor settled as failed, so the outer per-item handler never sees it.
     """
     try:
-        if not engine.engine_for(persona_dir).is_live():
+        live_engine = engine.engine_for(persona_dir)
+        if not live_engine.is_live():
             return
         fresh = store.get(memory.id, bump=False)  # a maintenance read, not an access
         if fresh is None:
             return  # hard-deleted since the importance update: nothing to write
         row = replace(fresh, importance=memory.importance)
-        live_engine = engine.engine_for(persona_dir)
         faded = {name: live_engine.faded_value(row, name) for name in row.emotions}
         store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
     except Exception:  # noqa: BLE001

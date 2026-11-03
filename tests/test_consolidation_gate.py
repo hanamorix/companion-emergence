@@ -861,6 +861,27 @@ def _reappraise_run(tmp, store, mem, *, new_importance=7.25, reappraiser=None):
     return run_consolidation(store, persona_dir=tmp, reappraiser=fake)
 
 
+def _count_refresh_calls(monkeypatch):
+    """Replace `refresh_faded_emotions` with a recorder (it writes nothing). Returns the list of recorded calls."""
+    from brain.memory.store import MemoryStore
+
+    calls = []
+    monkeypatch.setattr(MemoryStore, "refresh_faded_emotions", lambda self, *a, **k: calls.append(a))
+    return calls
+
+
+def _control_write_back_is_seen(tmp, store, stub, calls):
+    """Positive control: a live write-back of a second row records exactly one call, so an empty recorder means something."""
+    was_live = stub.live
+    stub.live = True
+    control = _mem("a control fact", "conversation", emotions={"joy": 8.0}, importance=3.0)
+    store.create(control, fold=False)
+    _reappraise_run(tmp, store, control)
+    stub.live = was_live
+    assert [call[0] for call in calls] == [control.id]
+    calls.clear()
+
+
 @pytest.mark.parametrize("memory_type", ["conversation", "dream", "making"])
 def test_e5_write_back_writes_faded_values_and_a_new_created_at(
     persona, emotion_engine_stub, monkeypatch, memory_type
@@ -934,17 +955,15 @@ def test_e5_write_back_for_a_memory_with_empty_emotions_resets_created_at_only(
 
 
 def test_e5_not_live_writes_nothing_back(persona, emotion_engine_stub, monkeypatch):
-    from brain.memory.store import MemoryStore
-
     tmp, store, _heb, _queue = persona
+    refreshed = _count_refresh_calls(monkeypatch)
+    _control_write_back_is_seen(tmp, store, emotion_engine_stub, refreshed)
     emotion_engine_stub.live = False
     mem = _mem("a stable fact", "conversation", emotions={"joy": 8.0}, importance=3.0)
     store.create(mem, fold=False)
     before = store.get(mem.id, bump=False)
     emotion_engine_stub.faded[(mem.id, "joy")] = 1.0
-    refreshed = []
     faded_asked = []
-    monkeypatch.setattr(MemoryStore, "refresh_faded_emotions", lambda self, *a, **k: refreshed.append(a))
     real_faded = emotion_engine_stub.faded_value
     monkeypatch.setattr(
         emotion_engine_stub, "faded_value", lambda m, e: faded_asked.append(e) or real_faded(m, e)
@@ -1025,10 +1044,32 @@ def test_e5_no_write_back_when_the_importance_update_fails(persona, emotion_engi
 
     tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
+    refreshed = _count_refresh_calls(monkeypatch)
+    _control_write_back_is_seen(tmp, store, emotion_engine_stub, refreshed)
     mem = _mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0)
     store.create(mem, fold=False)
-    refreshed = []
-    monkeypatch.setattr(MemoryStore, "refresh_faded_emotions", lambda self, *a, **k: refreshed.append(a))
+    real_update = MemoryStore.update
+
+    def failing_importance_update(self, memory_id, **fields):
+        if memory_id == mem.id and "importance" in fields:
+            raise RuntimeError("the importance update failed")  # not a KeyError: the row still exists
+        return real_update(self, memory_id, **fields)
+
+    monkeypatch.setattr(MemoryStore, "update", failing_importance_update)
+    res = _reappraise_run(tmp, store, mem)
+    assert res.reappraised == 0
+    assert refreshed == []  # the write-back never ran: the row survives, so only the ORDER keeps it from writing
+
+
+def test_e5_no_write_back_when_the_row_is_gone_before_the_importance_update(
+    persona, emotion_engine_stub, monkeypatch
+):
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    refreshed = _count_refresh_calls(monkeypatch)
+    _control_write_back_is_seen(tmp, store, emotion_engine_stub, refreshed)
+    mem = _mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0)
+    store.create(mem, fold=False)
 
     def deleting_reappraiser(m):
         store._conn.execute("DELETE FROM memories WHERE id = ?", (m.id,))
@@ -1047,18 +1088,19 @@ def test_e5_a_row_deleted_right_after_the_importance_update_writes_nothing(
 
     tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
+    refreshed = _count_refresh_calls(monkeypatch)
+    _control_write_back_is_seen(tmp, store, emotion_engine_stub, refreshed)
     mem = _mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0)
     store.create(mem, fold=False)
     real_update = MemoryStore.update
 
     def update_then_delete(self, memory_id, **fields):
         real_update(self, memory_id, **fields)
-        self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        if memory_id == mem.id:
+            self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            self._conn.commit()
 
-    refreshed = []
     monkeypatch.setattr(MemoryStore, "update", update_then_delete)
-    monkeypatch.setattr(MemoryStore, "refresh_faded_emotions", lambda self, *a, **k: refreshed.append(a))
     with caplog.at_level(logging.ERROR, logger="brain.engines.consolidation"):
         res = _reappraise_run(tmp, store, mem)
     assert res.reappraised == 1

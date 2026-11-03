@@ -131,7 +131,8 @@ def clamp_importance(x: float) -> float:
 
 
 def _emotions_column(emotions: dict[str, float]) -> str:
-    """Encode an emotions dict for the ``emotions_json`` column (the batch and the refresh writers share this one encoder)."""
+    """Encode an emotions dict for the ``emotions_json`` column. The batch and the refresh writers share this one encoder, so the
+    refresh adds no direct ``json.dumps`` site to ``store.py`` (the json-io allowlist's count for this file does not grow)."""
     return json.dumps(emotions)
 
 
