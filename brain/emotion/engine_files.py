@@ -907,6 +907,9 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         path = folder / name
         for record in iter_jsonl(path):  # an I/O failure ends the iteration there; what was read is used
             try:
+                kind = record.get("kind") if isinstance(record, dict) else None
+                if kind in _MEMORY_KINDS or kind == "start":  # before the check, so a held-modifier line is not logged for it
+                    raise InvalidEventError(f"a {kind} event is not a change")
                 event = event_from_json(record)
                 if event.kind != "change":
                     raise InvalidEventError(f"a {event.kind} event is not a change")

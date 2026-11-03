@@ -284,7 +284,7 @@ def test_a_hold_writes_one_warning_saying_what_was_found_and_where_it_went(
     records = [r for r in caplog.records if r.name == LOGGER]
     assert [r.levelno for r in records] == [logging.WARNING]
     text = records[0].getMessage()
-    for part in (kind, "mem-77", repr(1e308), str(low), str(high)):
+    for part in (kind, "mem-77", repr(1e308), f"{low} to {high}", f"held to {high}"):
         assert part in text
 
 
@@ -802,6 +802,19 @@ def test_the_reader_skips_a_torn_line_a_bad_line_and_a_line_that_is_not_a_change
     assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
     assert path.read_bytes() == before  # the reader repairs nothing
     assert len(_errors(caplog)) == 2  # the invalid event and the commit line
+
+
+@pytest.mark.no_base_failure(reason="guards the new hold line against firing in the change-log reader: a commit line there is dropped as not a change with one error line and no 'held' warning; the old code has no hold line to misfire")
+def test_a_commit_line_in_the_change_log_is_dropped_as_not_a_change_without_a_hold_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(tmp_path, "2026-06-10", json.dumps(_raw("commit", modifier=1e308)), _line(since, joy=1.0))
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0]
+    assert [r.levelno for r in caplog.records if r.name == LOGGER] == [logging.ERROR]
+    assert "not a change" in caplog.records[-1].getMessage()
 
 
 def test_the_reader_treats_an_unlistable_folder_as_missing_with_a_line(
