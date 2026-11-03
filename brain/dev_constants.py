@@ -99,6 +99,34 @@ EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
 # The half-life of an emotion that is in neither the persona's vocabulary file nor the table above.
 EMOTION_DEFAULT_HALF_LIFE_DAYS: float = 14.0
 
+# --- the rest of the emotion engine's numbers (emotion rework, Engine 1, #576) -----------------------------------------
+# `brain.emotion.engine_utils`. The two averages every emotion keeps: the short one over about a day, the long one over about
+# a month. The same 30 days is the rebuild window, the change-log retention, the shift window and the shift's start gate:
+# one constant, not four.
+EMOTION_SHORT_HALF_LIFE_H: float = 24.0
+EMOTION_LONG_HALF_LIFE_D: float = 30.0
+# Emotion values and averages are held to 0 to this.
+EMOTION_VALUE_CAP: float = 10.0
+# The climax reset, applied to the short averages when a newly committed memory carries a climax of at least the threshold:
+# arousal x factor (never below the floor), desire x factor, comfort_seeking and rest_need + the bump (held to the cap), climax to 0.
+EMOTION_CLIMAX_THRESHOLD: float = 7.0
+EMOTION_CLIMAX_AROUSAL_FACTOR: float = 0.2
+EMOTION_CLIMAX_AROUSAL_FLOOR: float = 0.5
+EMOTION_CLIMAX_DESIRE_FACTOR: float = 0.6
+EMOTION_CLIMAX_RELIEF_BUMP: float = 2.0
+# A stored memory value never fades below this fraction of what was stored, for these emotions only; memory values only,
+# never the averages.
+EMOTION_FADE_FLOOR_FRACTION: dict[str, float] = {"love": 1 / 3, "belonging": 1 / 3}
+# A memory shown again within the window after its first showing counts for the factor, then the factor squared, and so on.
+EMOTION_REPEAT_WINDOW_H: float = 24.0
+EMOTION_REPEAT_FACTOR: float = 0.5
+# The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
+EMOTION_STATE_DIR: str = "state"
+EMOTION_STATE_FILENAME: str = "emotion_state.json"
+EMOTION_PENDING_FILENAME: str = "emotion_pending.json"
+EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
+EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
+
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
 # to all 4 sqlite stores per orchestrator directive 2026-09-28) ------------
