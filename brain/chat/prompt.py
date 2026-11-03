@@ -1052,9 +1052,9 @@ def _bump_active_entries(
     """Apply the recall-counter ticks for the rendered "active:" entries.
 
     Render-loop rule (#231 consolidation): the bump follows the ACTUAL render.
-    A row rendered FULL goes through the one `open_memory` door (+1.0,
-    deliberate=False, per-id enqueue via ``pending_ids`` when persona_dir is
-    set). A row rendered as a snippet takes the shared rank-weighted
+    A row rendered FULL goes through the one `open_memory` door (+1.0 and
+    last_accessed_at, one engine report, per-id enqueue via ``pending_ids`` when
+    persona_dir is set). A row rendered as a snippet takes the shared rank-weighted
     fractional bump (`_snippet_bump_amount`: 0.8 top -> 0.1 bottom over the
     snippet rows in rendered order; a lone snippet -> 0.8) and its id joins
     ``snippet_ids`` for the caller's one batched enqueue. When
@@ -1069,7 +1069,6 @@ def _bump_active_entries(
                 mem,
                 store=store,
                 persona_dir=persona_dir,
-                deliberate=False,
                 seen=seen,
                 pending_ids=pending_ids,
             )
@@ -1224,15 +1223,15 @@ def _build_recall_block(
             prefix += "]"
             lines.append(f'- {prefix} {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
-        # Reconciliation E (#231): the legacy/no-persona_dir path now routes its
-        # FULL renders through the one door too — recall_count bumps (+1.0,
-        # deliberate=False so last_accessed_at is untouched) and the enqueue
-        # auto-skips because persona_dir is None. Full iff the row rendered
+        # Reconciliation E (#231): the legacy/no-persona_dir path routes its
+        # FULL renders through the one door too: recall_count bumps (+1.0) and
+        # last_accessed_at is set, and the enqueue and the engine report
+        # auto-skip because persona_dir is None. Full iff the row rendered
         # untruncated: in full_ids, or every row when snippet mode is off.
         # Snippet rows stay bump-free here (unchanged).
         for mem in top:
             if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
-                open_memory(mem, store=store, persona_dir=None, deliberate=False, seen=None)
+                open_memory(mem, store=store, persona_dir=None, seen=None)
 
         return "\n".join(lines)
 
@@ -1597,8 +1596,8 @@ def _build_recall_block(
 
         # --- Passive recall bumps + reappraisal enqueues (#231 consolidation) ---
         # The render-loop rule replaces the old scattered per-tier gating: a row
-        # rendered in FULL goes through the one door (`open_memory`: +1.0,
-        # deliberate=False, per-id enqueue when persona_dir is set), a genuine
+        # rendered in FULL goes through the one door (`open_memory`: +1.0 and
+        # last_accessed_at, one engine report, per-id enqueue when persona_dir is set), a genuine
         # snippet takes the rank-weighted fractional bump and is folded into one
         # batched enqueue. `seen` (created before the active tier is rendered and
         # threaded through it and the fading tier) dedups every id across every
@@ -1630,7 +1629,6 @@ def _build_recall_block(
                     mem,
                     store=store,
                     persona_dir=persona_dir,
-                    deliberate=False,
                     seen=seen,
                     pending_ids=full_open_ids,
                 )

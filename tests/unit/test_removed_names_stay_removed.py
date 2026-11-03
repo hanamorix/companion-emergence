@@ -537,6 +537,18 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/chat",),
     ),
+    # --- every full open is an access (#582) ----------------------------------------------------------------------------
+    Removed(
+        names=("deliberate",),
+        why="open_memory has no deliberate parameter: every full open sets last_accessed_at and reports to the emotion engine, so no caller says whether the open was deliberate",
+        ref="#582 (draft PR #631): the access fixes",
+        kind="code",
+        scope=(
+            "brain/memory/recall_open.py",
+            "brain/tools/impls/read_full_memory.py",
+            "brain/chat/prompt.py",
+        ),
+    ),
 )
 
 
