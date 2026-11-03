@@ -12,8 +12,9 @@ on the next call. A failure that says nothing about the content (a filesystem er
 the read, an error from `stat` other than "no such file") is not cached: the previously
 loaded half-lives stay in force and the next call tries again (the same bound as
 `brain/tunables.py`, #530). A fault in the content (not JSON, wrong shape, a bad entry)
-is cached, because the same bytes give the same fault, and is reported once per change of
-the file.
+is cached, because the same bytes give the same fault. A bad entry is reported once per change
+of the file; a file that is not JSON or not the right shape is reported by `read_json_result`,
+which follows its own throttle (one warning per path and kind per interval).
 """
 
 from __future__ import annotations

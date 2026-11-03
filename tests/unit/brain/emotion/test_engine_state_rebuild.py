@@ -40,9 +40,13 @@ def _entry(name: object, days: object = 5.0, **extra: object) -> dict:
     }
 
 
+def _write_vocab_to(path: Path, entries: list) -> None:
+    path.write_text(json.dumps({"version": 1, "emotions": entries}), encoding="utf-8")
+
+
 def _write_vocab(persona_dir: Path, entries: list) -> Path:
     path = persona_dir / VOCAB
-    path.write_text(json.dumps({"version": 1, "emotions": entries}), encoding="utf-8")
+    _write_vocab_to(path, entries)
     return path
 
 
@@ -191,11 +195,10 @@ def test_a_present_non_text_name_is_coerced_not_a_fault(
 
 
 def test_the_file_is_re_read_when_its_size_changes(tmp_path: Path) -> None:
-    path = _write_vocab(tmp_path, [_entry("joy", 9.0)])
+    _write_vocab(tmp_path, [_entry("joy", 9.0)])
     engine = _engine(tmp_path)
     assert engine.half_life("joy") == 9.0
     _write_vocab(tmp_path, [_entry("joy", 10.25)])
-    assert path.stat().st_size > 0
     assert engine.half_life("joy") == 10.25
 
 
@@ -209,10 +212,6 @@ def test_a_same_size_replacement_with_a_new_inode_is_seen(tmp_path: Path) -> Non
     assert replacement.stat().st_size == size
     os.replace(replacement, path)
     assert engine.half_life("joy") == 6.0
-
-
-def _write_vocab_to(path: Path, entries: list) -> None:
-    path.write_text(json.dumps({"version": 1, "emotions": entries}), encoding="utf-8")
 
 
 _T1 = 1_700_000_000_000_000_000
@@ -482,7 +481,7 @@ def test_an_entry_fault_is_one_warning_naming_file_entry_and_field(
     message = warnings[0].getMessage()
     assert str(path) in message
     assert label in message
-    assert field in message
+    assert f"(field {field}:" in message
     assert path.read_bytes() == before
     assert sorted(p.name for p in tmp_path.iterdir()) == [VOCAB]
 
