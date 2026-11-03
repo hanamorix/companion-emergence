@@ -566,7 +566,7 @@ def test_c18_eligible_types_are_only_episode_types():
 
 
 # --------------------------------------------------------------------------- Engine 5 (#580)
-# The gate's merge keeps both memories' emotions once the emotion engine is live; the temp-gate
+# The gate's merge combines both memories' emotions once the emotion engine is live; the temp-gate
 # write-back writes faded values and a fresh created_at; the merge pre-read is not an access.
 # `emotion_engine_stub` makes `engine.engine_for(...)` return one settable stand-in (`stub.live`).
 

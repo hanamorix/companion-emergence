@@ -1000,7 +1000,7 @@ def _dispatch(
             merged = _fold(target.content, cand.content)
         fields: dict = {"content": merged}
         if engine.engine_for(persona_dir).is_live():
-            # Once the engine is live the merge keeps both memories' emotions, in the one update that writes the content.
+            # Once the engine is live the merge combines both memories' emotions (see `_merge_emotions`), in the one update that writes the content.
             # fold=False: a merge is not a new memory, so it queues nothing for the engine. Accepted edge: if this update
             # commits and the item is retried before claim.settle (the process dies, or an error follows the commit), the
             # candidate is merged again and the emotions are averaged with it a second time; the content is protected by
