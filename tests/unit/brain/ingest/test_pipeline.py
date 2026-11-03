@@ -1738,3 +1738,71 @@ def test_a_torn_line_is_dropped_with_the_file_and_every_parseable_row_is_archive
 
     assert read_archive(tmp_path, _ARCHIVE_SID) == rows
     assert not buffer_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# The ghost-file sweeps delete an empty buffer only under its append lock
+# ---------------------------------------------------------------------------
+
+_GHOST_SID = "sess_ghost_race"
+_GHOST_SWEEPS = [
+    pytest.param(snapshot_stale_sessions, id="snapshot_stale_sessions"),
+    pytest.param(close_stale_sessions, id="close_stale_sessions"),
+]
+
+
+def _ghost(persona: Path) -> Path:
+    buf = persona / "active_conversations" / f"{_GHOST_SID}.jsonl"
+    buf.parent.mkdir(parents=True, exist_ok=True)
+    buf.touch()
+    return buf
+
+
+@pytest.mark.parametrize("sweep", _GHOST_SWEEPS)
+def test_a_turn_landing_after_the_empty_read_is_not_deleted_with_the_ghost(
+    sweep, tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep's first read finds no rows; a turn appended before the unlink must keep the buffer."""
+    _ghost(tmp_path)
+    real_read = pipeline.read_session
+    reads: list[int] = []
+
+    def _read_then_append(persona_dir, session_id):
+        out = real_read(persona_dir, session_id)
+        if session_id == _GHOST_SID and not reads:
+            reads.append(1)
+            ingest_turn(persona_dir, {"session_id": _GHOST_SID, "speaker": "user", "text": "a turn mid-sweep"})
+        return out
+
+    monkeypatch.setattr(pipeline, "read_session", _read_then_append)
+
+    sweep(tmp_path, silence_minutes=5.0, store=store, hebbian=hebbian, provider=_CannedProvider([]))
+
+    assert reads == [1]
+    assert [r["text"] for r in read_session(tmp_path, _GHOST_SID)] == ["a turn mid-sweep"]
+
+
+@pytest.mark.parametrize("sweep", _GHOST_SWEEPS)
+def test_the_ghost_unlink_runs_under_the_append_lock(
+    sweep, tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock-respecting appender is refused while the sweep unlinks the ghost; the ghost is still removed."""
+    buf = _ghost(tmp_path)
+    probe = {"session_id": _GHOST_SID, "speaker": "user", "text": "probe", "ts": "2026-10-01T10:00:00+00:00"}
+    at_delete: list[int | None] = []
+    real_delete = pipeline.delete_session_buffer
+
+    def _delete(persona_dir, session_id):
+        at_delete.append(append_jsonl(buf, probe, lock="try"))
+        if at_delete[-1] is None:  # held: the unlink goes ahead on the still-empty file
+            real_delete(persona_dir, session_id)
+
+    monkeypatch.setattr(pipeline, "delete_session_buffer", _delete)
+
+    sweep(tmp_path, silence_minutes=5.0, store=store, hebbian=hebbian, provider=_CannedProvider([]))
+
+    assert at_delete == [None]
+    assert not buf.exists()
+    # positive control: with nobody holding the lock the probe writes, so None above means "held"
+    buf.touch()
+    assert append_jsonl(buf, probe, lock="try") is not None

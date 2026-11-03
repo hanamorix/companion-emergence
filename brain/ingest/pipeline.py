@@ -696,6 +696,17 @@ def _extract_session_snapshot_locked(
     return report
 
 
+def _delete_ghost_buffer(persona_dir: Path, session_id: str) -> None:
+    """Remove a buffer a sweep read as empty, unless a turn landed since that read.
+
+    The re-read and the unlink run under the buffer's append lock (the one ``ingest_turn`` takes), so a row appended
+    between the sweep's read and the unlink keeps the buffer instead of being deleted unseen.
+    """
+    with session_append_lock(persona_dir, session_id):
+        if not read_session(persona_dir, session_id):
+            delete_session_buffer(persona_dir, session_id)
+
+
 def snapshot_stale_sessions(
     persona_dir: Path,
     *,
@@ -739,7 +750,7 @@ def snapshot_stale_sessions(
             turns = read_session(persona_dir, sid)
             if not turns:
                 # Ghost file — clean up without generating a report.
-                delete_session_buffer(persona_dir, sid)
+                _delete_ghost_buffer(persona_dir, sid)
                 continue
             age = session_silence_minutes(turns)
             if age >= silence_minutes:
@@ -922,7 +933,7 @@ def close_stale_sessions(
         turns = read_session(persona_dir, sid)
         if not turns:
             # Ghost file — clean it up without generating a report.
-            delete_session_buffer(persona_dir, sid)
+            _delete_ghost_buffer(persona_dir, sid)
             continue
         age = session_silence_minutes(turns)
         if age >= silence_minutes:
