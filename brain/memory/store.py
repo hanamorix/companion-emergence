@@ -130,6 +130,11 @@ def clamp_importance(x: float) -> float:
     return min(10.0, max(0.0, float(x)))
 
 
+def _emotions_column(emotions: dict[str, float]) -> str:
+    """Encode an emotions dict for the ``emotions_json`` column (the batch and the refresh writers share this one encoder)."""
+    return json.dumps(emotions)
+
+
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
     """Decode a metadata_json column value into a dict, defending against
     manual DB edits or legacy writers that stored the string "null",
@@ -2916,9 +2921,31 @@ class MemoryStore:
             self._conn.execute(
                 "UPDATE memories SET emotions_json = ?, "
                 "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-                (json.dumps(emotions), new_max, memory_id),
+                (_emotions_column(emotions), new_max, memory_id),
             )
         self._conn.commit()
+
+    def refresh_faded_emotions(
+        self, memory_id: str, emotions: dict[str, float], created_at: datetime
+    ) -> None:
+        """Write a remembered memory's faded emotion values and a fresh ``created_at`` in ONE UPDATE (the temp gate's write-back).
+
+        A stored emotion value means "as of the last time this memory was written or remembered", so ``created_at`` moves with
+        it. ``created_at`` is written as ``created_at.isoformat()`` (the ``+00:00`` form `create` writes, because rows are
+        compared as text); the caller passes a timezone-aware UTC value. ``emotions`` may be ``{}``: the row's emotions stay
+        empty and ``created_at`` is still written. ``peak_emotion_intensity`` is NOT touched: it is monotone and exists to survive
+        fading. No hook fires. Not gated here: the caller decides whether the engine is live.
+
+        Raises KeyError if memory_id does not exist. The write is committed before that is judged: sqlite3 opens a write
+        transaction for an UPDATE that changes no row too, and the store must not stay holding it.
+        """
+        cursor = self._conn.execute(
+            "UPDATE memories SET emotions_json = ?, created_at = ? WHERE id = ?",
+            (_emotions_column(emotions), created_at.isoformat(), memory_id),
+        )
+        self._conn.commit()
+        if cursor.rowcount == 0:
+            raise KeyError(f"Unknown memory id: {memory_id!r}")
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
