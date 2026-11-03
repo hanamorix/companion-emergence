@@ -220,8 +220,9 @@ class EmotionEngine:
     def _start_needed(self, created_at: datetime) -> bool:
         """True when the persona's stored start date is missing, unreadable (a state that cannot be read reads as none) or later than this row's date.
 
-        Read through the cache with no lock. The check only ever says "not needed" from a stored start that is already
-        at or before the row, and the stored start only moves earlier, so a state replaced meanwhile cannot make that wrong.
+        Read through the cache with no lock. The check only says "not needed" from a stored start that is already at or
+        before the row's date, and the fold keeps the earliest date it has seen (a min-fold, `fold_event`), so a state
+        replaced meanwhile cannot make that verdict wrong.
         A backup copy of the state is older, so its start is never earlier than the main file's: it can only add a duplicate
         start event, which the drain's min-fold makes harmless.
         """
