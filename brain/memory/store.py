@@ -20,7 +20,7 @@ import sqlite3
 import sys
 import uuid
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -1044,8 +1044,12 @@ class MemoryStore:
             raise ValueError("an in-memory MemoryStore has no persona directory")
         return self._db_path.parent
 
-    def create(self, memory: Memory) -> str:
+    def create(self, memory: Memory, *, fold: bool = True) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id.
+
+        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook appends one
+        event to the engine's queue and never raises into this call. `fold=False` is for a write that is not new
+        experience (a restore, an import). An in-memory store tells nobody.
 
         Deliberately does NOT itself touch embeddings — MemoryStore has no
         embeddings dependency baked into `create()` (~11 call sites use it
@@ -1110,7 +1114,42 @@ class MemoryStore:
             ),
         )
         self._conn.commit()
+        if fold:
+            self._notify_committed(memory)
         return memory.id
+
+    def _emotion_engine(self) -> Any | None:
+        """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
+
+        `brain.emotion.engine` is imported here, not at the top: it pulls `brain.utils.memory`, which imports this module.
+        """
+        try:
+            persona_dir = self.persona_dir
+        except ValueError:
+            return None
+        from brain.emotion import engine
+
+        return engine.engine_for(persona_dir)
+
+    def _notify_committed(self, memory: Memory) -> None:
+        """Tell the engine a row was committed. All of it is inside the guard: a failure here must not reach the write."""
+        try:
+            target = self._emotion_engine()
+            if target is not None:
+                target.on_memory_committed(memory)
+        except Exception:
+            logger.error("MemoryStore.create: telling the emotion engine about %s failed", memory.id, exc_info=True)
+
+    def _notify_assigned(self, before: Memory, new_emotions: dict[str, float]) -> None:
+        """Tell the engine a row that had no feelings now has some: the row as it was before the update, with the new emotions."""
+        try:
+            if before.emotions or not new_emotions:
+                return
+            target = self._emotion_engine()
+            if target is not None:
+                target.on_emotions_assigned(replace(before, emotions=dict(new_emotions)))
+        except Exception:
+            logger.error("MemoryStore.update: telling the emotion engine about %s failed", before.id, exc_info=True)
 
     def embed_row(self, memory_id: str, content: str) -> None:
         """Compute + persist the retrieval embedding for one existing row
@@ -2743,15 +2782,22 @@ class MemoryStore:
                     break
         return results
 
-    def update(self, memory_id: str, **fields: Any) -> None:
+    def update(self, memory_id: str, *, fold: bool = True, **fields: Any) -> None:
         """Update the given fields on an existing memory.
 
         Accepts: content, memory_type, domain, emotions (dict), tags (list),
         importance, score, last_accessed_at, active, protected.
 
+        `fold` is not a field. When true and `emotions` is among the fields, a row that had no emotions and gets some now
+        is reported to the emotion engine (`on_emotions_assigned`), once the update, and the re-embed of a changed content,
+        are done; the hook never raises into this call. Whether the row counts is judged on the row as it was BEFORE this
+        update (its type, tags and metadata included, whatever else is updated together with the emotions). A content-only
+        update, or emotions written onto a row that already had some, report nothing.
+
         Raises KeyError if memory_id does not exist.
         """
-        if self.get(memory_id, bump=False) is None:
+        before = self.get(memory_id, bump=False)
+        if before is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
 
         column_map: dict[str, tuple[str, Any]] = {}
@@ -2836,6 +2882,9 @@ class MemoryStore:
             # clear-on-failure branch in `_reembed_or_clear` is now
             # belt-and-suspenders, since the row is already NULL going in.
             self._reembed_or_clear(memory_id, fields["content"])
+
+        if fold and "emotions" in fields:
+            self._notify_assigned(before, fields["emotions"])
 
     def update_emotions_batch(self, rows: Sequence[tuple[str, dict[str, float]]]) -> None:
         """Write a batch of emotions-only updates in ONE transaction (C10(b),

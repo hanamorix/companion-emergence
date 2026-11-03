@@ -184,7 +184,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem)
+            store.create(mem, fold=False)
             migrated_count += 1
     finally:
         store.close()
