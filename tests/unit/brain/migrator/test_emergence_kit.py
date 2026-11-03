@@ -325,3 +325,28 @@ def test_args_require_exactly_one_of_output_or_install_as(tmp_path: Path) -> Non
             install_as=None,
             force=False,
         )
+
+
+def test_migrate_emergence_kit_creates_memories_without_telling_the_emotion_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An import is not new experience: every memory it creates passes fold=False, and no engine folder appears."""
+    from brain.memory.store import MemoryStore
+
+    input_dir = tmp_path / "kit-data"
+    output_dir = tmp_path / "output"
+    _seed_kit(input_dir)
+    seen: list[dict] = []
+    real_create = MemoryStore.create
+
+    def recording_create(self, memory, **kwargs):
+        seen.append(kwargs)
+        return real_create(self, memory, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "create", recording_create)
+    migrate_emergence_kit(
+        EmergenceKitMigrateArgs(input_dir=input_dir, output_dir=output_dir, install_as=None, force=False)
+    )
+
+    assert len(seen) == 2 and all(kwargs.get("fold") is False for kwargs in seen)
+    assert not (output_dir / "state").exists()
