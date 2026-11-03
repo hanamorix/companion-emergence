@@ -255,6 +255,18 @@ def state_lock(persona_dir: Path) -> AbstractContextManager[bool]:
     return file_lock(state_path(persona_dir))
 
 
+def peer_trust(persona_dir: Path, peer_id: str) -> float:
+    """How far this persona trusts one peer (0 to 1): the engine's one door to the peer-trust score.
+
+    Engine-internal stand-in that answers 0.0 for every peer and does no I/O, so until Engine 6 (#584) every peer memory
+    weighs the modifier floor, 0.1. Engine 6 replaces this body with a call to the kindled-link accessor
+    ``peer_trust(persona_dir, peer_id)`` (not built here, not ours). Its expected shape: open
+    ``KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)``, read
+    ``get_relationship_state(...).trust_score``, and give 0.0 for no database or no relationship row.
+    """
+    return 0.0
+
+
 # ================================================================================================
 # The state file
 # ================================================================================================

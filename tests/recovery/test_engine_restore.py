@@ -83,3 +83,28 @@ def test_graveyard_mode_restores_from_summary(tmp_path):
     s = MemoryStore(persona / "memories.db")
     assert s.get("gone").content == "compressed summary"
     s.close()
+
+
+def test_a_restore_is_not_new_experience_and_queues_nothing_for_the_emotion_engine(tmp_path, monkeypatch):
+    from brain.emotion import engine_files
+
+    persona = tmp_path / "Canary"
+    _seed_current(persona)
+    src = tmp_path / "src"
+    _seed_source(src)
+    queue = engine_files.queue_path(persona)
+    queued_by_seeding = queue.read_bytes()  # the seeding created rows with the default, so the queue exists
+    plan = _build_restore_plan(persona, source_dir=src)
+
+    seen = []
+    real_create = MemoryStore.create
+
+    def recording_create(self, memory, **kwargs):
+        seen.append(kwargs)
+        return real_create(self, memory, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "create", recording_create)
+    _apply_memory_restores(persona, plan)
+
+    assert seen and all(kwargs.get("fold") is False for kwargs in seen)
+    assert queue.read_bytes() == queued_by_seeding
