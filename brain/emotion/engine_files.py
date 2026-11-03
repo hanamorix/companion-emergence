@@ -7,8 +7,10 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
   ``write_json(backups=3, indent=None)``. Read through ``json_io.read_json_walk``, the read-only walk with the validator
   below: a read never heals, quarantines, rotates or rewrites anything, and says which copy it loaded. ``read_state`` reads
   fresh objects (what a drain mutates); ``StateCache`` keeps the parsed state for readers by a stat key.
-* ``emotion_pending.json``: the queue, a JSON list of events waiting to be folded. No backups (a drained queue must not come
-  back from one); removed when empty; a missing file is an empty queue.
+* ``emotion_pending.jsonl``: the queue of events waiting to be folded, one JSON event per line. Append-only: an append writes
+  only its own line, so it costs the same at any depth (a whole-file rewrite per append was quadratic). No backups (a drained
+  queue must not come back from one); the drain removes the file after it has folded the events (``clear_queue``); a missing
+  file is an empty queue; a bad line is dropped on its own with an error log line (``read_queue``).
 * ``emotion_changes/YYYY-MM-DD.jsonl``: the change log, one file a day, a crash-recovery record of chat-derived changes.
   Whole files are deleted once they are older than the retention boundary.
 * ``emotion_switch.json``: ``{"switch_over_at": ...}`` and nothing else, written once; its existence means the engine is live.
@@ -19,8 +21,9 @@ The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a blockin
 file. No function in this module takes it; every caller holds it (a hook around its appends, a drain around its whole run, the
 rebuild around everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``,
 ``switch_exists``, ``read_switch``, ``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a
-writer; the writers replace files atomically). Expecting the caller's lock: ``save_state``, ``append_event``, ``write_queue``,
-``clear_queue``, ``append_change``, ``prune_changes`` and ``write_switch``.
+writer; the state and switch files are replaced atomically, the queue and the change log are appended to and removed whole; a queue reader
+that is not the drain, which holds the lock, can meet a line being appended and log a false error for it). Expecting the
+caller's lock: ``save_state``, ``append_event``, ``clear_queue``, ``append_change``, ``prune_changes`` and ``write_switch``.
 
 Times are UTC ISO strings written with ``iso_utc`` (``Z``) and read with ``lenient_utc``; day labels are local ``YYYY-MM-DD``
 from ``engine_utils.day_of``. All constants (file and folder names, the retention length, the value cap) are read as
@@ -42,7 +45,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -50,6 +53,8 @@ from typing import Any, NamedTuple
 
 from brain import dev_constants, paths
 from brain.emotion.engine_utils import (
+    _MODIFIER_FLOOR,  # with _MODIFIER_SPAN: the range `source_modifier` makes, which a stored modifier is held to
+    _MODIFIER_SPAN,
     Average,
     EmotionState,
     EngineState,
@@ -66,6 +71,7 @@ from brain.health.json_io import (
     Recovery,
     append_jsonl,
     iter_jsonl,
+    parse_jsonl,
     read_json_result,
     read_json_walk,
     write_json,
@@ -617,6 +623,11 @@ class StateCache:
 # committed row of a type that does not count, and keeps the persona's start date.
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
+# The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
+# from the floor up to floor + span). A stored modifier outside it is held to it (P12b); one far outside would otherwise fold
+# to an infinite average and make every save of the state fail.
+_MODIFIER_LOW = _MODIFIER_FLOOR
+_MODIFIER_HIGH = _MODIFIER_FLOOR + _MODIFIER_SPAN
 
 
 class InvalidEventError(ValueError):
@@ -640,8 +651,9 @@ def event_from_json(raw: object) -> Event:
     event's own content must not repeat for ever, so the drop is the remedy); a commit, assigned or showing with no
     `memory_id` (a non-empty text); a commit or assigned with no emotion values; an emotion name that is not text or an amount
     that is not a finite number (a bool is not a number); a `modifier` or `climax`, when present, that is not a finite
-    number; a `source`, when present, that is not text. A missing `modifier` is 1.0 and a missing `climax` is 0.0. The
-    `modifier` of a change is not read (a change has weight 1, no repeat factor).
+    number; a `source`, when present, that is not text. A missing `climax` is 0.0. A missing `modifier` is 1.0; a finite one
+    outside the range `source_modifier` can make (0.1 to 1.0) is not invalid: it is held to the range, with a warning line
+    (P12b). The `modifier` of a change is not read (a change has weight 1, no repeat factor).
     """
     if not isinstance(raw, dict):
         raise InvalidEventError(f"not an object ({type(raw).__name__})")
@@ -682,6 +694,18 @@ def event_from_json(raw: object) -> Event:
             raise InvalidEventError(f"source must be text, found {type(source).__name__}")
         return Event(kind="change", at=at, emotions=emotions, source=source)
     modifier = _event_number(raw, "modifier", 1.0)
+    held = min(max(modifier, _MODIFIER_LOW), _MODIFIER_HIGH)
+    if held != modifier:
+        logger.warning(
+            "emotion event %s %s: modifier %r is outside %s to %s, held to %s",
+            kind,
+            memory_id,
+            modifier,
+            _MODIFIER_LOW,
+            _MODIFIER_HIGH,
+            held,
+        )
+        modifier = held
     climax = _event_number(raw, "climax", 0.0) if kind == "commit" else 0.0
     return Event(kind=kind, at=at, memory_id=memory_id, emotions=emotions, modifier=modifier, climax=climax)
 
@@ -712,62 +736,72 @@ def event_to_json(event: Event) -> dict:
 # ================================================================================================
 
 
-def _read_raw_queue(persona_dir: Path) -> list:
-    """The queue file's list as it is, unchecked. A missing file is an empty queue.
+def read_queue(persona_dir: Path) -> list[Event]:
+    """The valid events of the queue, in file order. A missing file is an empty queue.
 
-    Accepted edge E3 (A3 E6.18; owner 2026-10-21 15:02, ledger:337 "Agreed with your extension of the logic to the full
-    rebuild"): a queue file that does not parse, is empty, or is not a list is DISCARDED with an ordinary error log line and
-    NO rebuild follows. What a discard loses is at most one turn's worth of events (the accepted loss of R12); a rebuild would
-    trade the long average's history older than 30 days for them. The read itself writes nothing: the next append replaces
-    the file and the drain removes it.
+    Accepted edge E3 (A3 E6.18, applied per line; owner 2026-10-21 15:02, ledger:337 "Agreed with your extension of the logic
+    to the full rebuild"): a line that is not valid JSON (a torn last line after a crash, a line of zero bytes left by an
+    unclean machine stop, anything else) or that fails the event check is DROPPED with its own ordinary error log line naming
+    the file, the line number and the reason, and the other lines are read. NO rebuild follows. What a drop loses is at most
+    one turn's worth of events (the accepted loss of R12); a rebuild would trade the long average's history older than 30
+    days for them. A line damaged in the middle takes anything glued to it along: nothing is salvaged. A blank line is
+    skipped. The read itself writes nothing: the bad lines stay in the file (and are logged again by the next read) until the
+    drain removes the whole file.
 
-    A fault in the READING (permissions, a sharing violation) is not a discard: it raises, the queue file is left alone, and
-    the caller's failure handling keeps the queue for the next drain (E6.10).
+    A fault in the READING (permissions, a sharing violation, a directory in the file's place) is not a drop: it raises, the
+    queue file is left alone, and the caller's failure handling keeps the queue for the next drain (E6.10).
+
+    Each line is parsed by ``json_io.parse_jsonl(..., strict=True)`` (the one JSON line parser: UTF-8 with a byte-order mark
+    tolerated, CRLF tolerated, a line that is valid JSON but not an object refused). The file is opened here, not read by
+    ``iter_jsonl``, because that reader skips blank lines and bad lines silently as far as the caller can tell (its warning
+    echoes line content and carries no line number the caller can use); this log line needs the physical line number and the
+    reason and echoes no content.
     """
     path = queue_path(persona_dir)
-    try:
-        return read_json_result(path, default=list, recover=Recovery.RAISE, expect=list).data
-    except JsonFileError as exc:
-        if exc.kind == "io":
-            raise
-        logger.error("emotion queue %s discarded (%s: %s); no rebuild follows", path, exc.kind, exc.detail)
-        return []
-
-
-def read_queue(persona_dir: Path) -> list[Event]:
-    """The valid events of the queue, in file order. An invalid event is dropped with an error log line saying why."""
-    path = queue_path(persona_dir)
     events: list[Event] = []
-    for index, raw in enumerate(_read_raw_queue(persona_dir)):
-        try:
-            events.append(event_from_json(raw))
-        except InvalidEventError as exc:
-            logger.error("emotion queue %s: event %d dropped (%s)", path, index, exc)
+    try:
+        fh = open(path, "rb")
+    except FileNotFoundError:
+        return events
+    with fh:
+        for number, line in enumerate(fh, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                parsed = list(parse_jsonl(text, strict=True))
+            except JsonFileError as exc:  # malformed JSON, invalid UTF-8, valid JSON that is not an object
+                logger.error("emotion queue %s: line %d dropped (%s)", path, number, exc.detail)
+                continue
+            except (ValueError, RecursionError) as exc:  # the two a line can raise that the line parser lets through
+                logger.error("emotion queue %s: line %d dropped (malformed JSON: %s: %s)", path, number, type(exc).__name__, exc)
+                continue
+            if not parsed:  # a line of only a byte-order mark
+                continue
+            raw = parsed[0]
+            try:
+                events.append(event_from_json(raw))
+            except InvalidEventError as exc:
+                logger.error("emotion queue %s: line %d dropped (%s)", path, number, exc)
     return events
 
 
-def _write_raw_queue(persona_dir: Path, raw: list) -> None:
-    path = queue_path(persona_dir)
-    if not raw:
-        path.unlink(missing_ok=True)
-        return
-    write_json(path, raw, indent=None, fsync=False)  # no backups: a drained queue must not come back from one
+def append_event(persona_dir: Path, event: Event) -> bool:
+    """Append an event as one line at the end of the queue (the caller holds the lock). True if it was written.
 
+    Earlier lines are never read or rewritten, so an append costs the same at any depth of the queue. Best effort, by design
+    (E6.11): a failure (a full disk, a folder that is a file, a value that cannot be encoded) is logged and gives False, and
+    never raises into the caller. An OSError is logged by ``append_jsonl`` (a throttled warning); a value that cannot be
+    encoded gets an error line here. No fsync, no backups.
 
-def append_event(persona_dir: Path, event: Event) -> None:
-    """Add an event to the end of the queue (the caller holds the lock). The events already there are kept as they are."""
-    raw = _read_raw_queue(persona_dir)
-    raw.append(event_to_json(event))
-    _write_raw_queue(persona_dir, raw)
-
-
-def write_queue(persona_dir: Path, events: Sequence[Event]) -> None:
-    """Replace the queue with `events`; no events removes the file."""
-    _write_raw_queue(persona_dir, [event_to_json(event) for event in events])
+    R12 (B04.2): an entry lost to a failed append, or damaged by an unclean machine stop, is an accepted minor edge. It is not
+    recovered; a damaged line is dropped on read like a torn one, and takes any record glued to it along.
+    """
+    return _append_line(lambda: queue_path(persona_dir), event, "queue")
 
 
 def clear_queue(persona_dir: Path) -> None:
-    """Remove the queue file (a missing one is fine)."""
+    """Remove the queue file (a missing one is fine): the drain's step after it has folded the events (E1.13). The caller holds the lock."""
     queue_path(persona_dir).unlink(missing_ok=True)
 
 
@@ -787,6 +821,20 @@ def _name_to_day(name: str) -> str | None:
         return None
 
 
+def _append_line(path_of: Callable[[], Path], event: Event, what: str) -> bool:
+    """Append `event` as one line to the file `path_of()` names, never raising: the shared failure rule of the queue and the log.
+
+    The caller holds the lock (``lock="held"``). A failure of the append itself is logged by ``append_jsonl``; a value that
+    cannot be encoded, or a time that cannot be dated (the path is built inside the guard), gets an ordinary error line here.
+    """
+    try:
+        written = append_jsonl(path_of(), event_to_json(event), lock="held", on_error="log")
+    except (ValueError, TypeError, OverflowError, OSError) as exc:
+        logger.error("emotion %s: an event at %s was not recorded (%s: %s)", what, event.at, type(exc).__name__, exc)
+        return False
+    return written is not None
+
+
 def append_change(persona_dir: Path, event: Event) -> bool:
     """Append a change event as one line to the file of its local day (the caller holds the lock). True if it was written.
 
@@ -796,13 +844,7 @@ def append_change(persona_dir: Path, event: Event) -> bool:
     """
     if event.kind != "change":
         raise ValueError(f"the change log holds change events, not {event.kind!r}")
-    try:
-        path = changes_dir(persona_dir) / f"{day_of(event.at)}.jsonl"
-        written = append_jsonl(path, event_to_json(event), lock="held", on_error="log")
-    except (ValueError, TypeError, OverflowError, OSError) as exc:
-        logger.error("emotion change log: a change at %s was not recorded (%s: %s)", event.at, type(exc).__name__, exc)
-        return False
-    return written is not None
+    return _append_line(lambda: changes_dir(persona_dir) / f"{day_of(event.at)}.jsonl", event, "change log")
 
 
 def list_change_files(persona_dir: Path) -> list[str]:
@@ -887,6 +929,9 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         path = folder / name
         for record in iter_jsonl(path):  # an I/O failure ends the iteration there; what was read is used
             try:
+                kind = record.get("kind") if isinstance(record, dict) else None
+                if kind in _MEMORY_KINDS or kind == "start":  # before the check, so a held-modifier line is not logged for it
+                    raise InvalidEventError(f"a {kind} event is not a change")
                 event = event_from_json(record)
                 if event.kind != "change":
                     raise InvalidEventError(f"a {event.kind} event is not a change")

@@ -599,7 +599,7 @@ def test_every_engine_path_is_built_through_paths_state_dir(
 def test_the_engine_paths_sit_under_the_persona_state_folder(tmp_path: Path) -> None:
     state = tmp_path / "state"
     assert engine_files.state_path(tmp_path) == state / "emotion_state.json"
-    assert engine_files.queue_path(tmp_path) == state / "emotion_pending.json"
+    assert engine_files.queue_path(tmp_path) == state / "emotion_pending.jsonl"
     assert engine_files.switch_path(tmp_path) == state / "emotion_switch.json"
     assert engine_files.changes_dir(tmp_path) == state / "emotion_changes"
 
@@ -1465,7 +1465,7 @@ def test_a_switch_main_with_no_usable_time_falls_to_a_backup_that_has_one(tmp_pa
 def test_the_files_are_written_with_the_modes_the_design_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """State: three backups, compact. Switch: three backups, once. Queue: compact, no fsync, no backups."""
+    """State: three backups, compact. Switch: three backups, once. (The queue is appended, not written: its test is in test_engine_queue.py.)"""
     calls: list[tuple[str, dict]] = []
     real = engine_files.write_json
 
@@ -1476,11 +1476,9 @@ def test_the_files_are_written_with_the_modes_the_design_names(
     monkeypatch.setattr(engine_files, "write_json", spy)
     engine_files.save_state(tmp_path, _full_state())
     engine_files.write_switch(tmp_path, NOW)
-    engine_files.write_queue(tmp_path, [engine_files.event_from_json({"kind": "start", "at": "2026-06-10T10:00:00Z"})])
     assert calls == [
         ("emotion_state.json", {"backups": 3, "indent": None}),
         ("emotion_switch.json", {"backups": 3, "if_missing": True}),
-        ("emotion_pending.json", {"indent": None, "fsync": False}),
     ]
 
 
