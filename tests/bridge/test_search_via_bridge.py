@@ -5,7 +5,7 @@ project's local pre-check gate is ``-m "not live and not requires_claude_cli and
 integration"``, so ``integration`` alone already excludes this from the default gate; mirrors the
 double-marking convention in tests/unit/brain/memory/test_embedding_real_model.py). Uses the
 F-bob20k fixture (a copy of the dragonfly-ram-spike diagnosis's synthetic Bob persona,
-Phoebe-sized, ~20k rows with cached embedding vectors) per 1.5-criteria.md's C1 — that fixture is
+sized like a long-lived real persona, ~20k rows with cached embedding vectors) per 1.5-criteria.md's C1 — that fixture is
 "not committed" and local to this machine, so every test here SKIPS gracefully when it's absent
 (this machine only; a fresh clone or CI never runs these).
 

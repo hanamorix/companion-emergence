@@ -33,7 +33,7 @@ def _seed_source(src: Path):
 
 
 def test_source_mode_restores_missing_and_unfades(tmp_path):
-    persona = tmp_path / "Phoebe"
+    persona = tmp_path / "Canary"
     _seed_current(persona)
     src = tmp_path / "src"
     _seed_source(src)

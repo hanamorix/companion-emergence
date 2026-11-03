@@ -58,7 +58,7 @@ def test_peak_zero_contributes_nothing():
 
 
 def test_peak_survives_empty_emotions():
-    """The Phoebe failure shape: emotions dict noise-floor-emptied, peak intact."""
+    """The live failure shape: emotions dict noise-floor-emptied, peak intact."""
     mem = _mem(peak=5.0, days_old=7, emotions={})
     assert _emotion_input(mem) == 0.0
     assert _peak_input(mem, _fts()) > 0.0

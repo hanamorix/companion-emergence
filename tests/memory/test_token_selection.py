@@ -4,7 +4,7 @@ token-selector fix (`changes/recall-token-selector/`).
 No live/integration/requires_claude_cli markers, runs in default CI. Fast
 (":memory:" SQLite only). Drives the REAL `_extract_recall_tokens` and the
 `tests/memory/recall_eval.py` harness against a synthetic store (user "Bob",
-persona label "Canary", never Phoebe's persona).
+persona label "Canary", never a real persona).
 """
 
 from __future__ import annotations
