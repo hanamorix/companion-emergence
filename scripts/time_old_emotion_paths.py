@@ -19,7 +19,9 @@ HEAD`, calls no model and reads no persona data file other than the path given (
 its own settings file from the home directory). The commit printed is the repository's HEAD, so the script also
 prints which `brain` package it imported and aborts when that is not this checkout's. The AVX2 field comes from the
 app's own probe, which reads /proc/cpuinfo on Linux and answers "no" when that read fails; the script prints
-"unknown" on other systems. The CPU field is the machine architecture only.
+"unknown" on other systems. The CPU model is the first `model name` field of /proc/cpuinfo, read by the script
+itself on Linux (the read starts no process); it prints "unknown" on other systems and when the field is missing or
+unreadable. The architecture is printed beside it.
 
 A timing whose function is absent on the checked-out commit is skipped with a printed reason. On a failure it
 prints one line, `time_old_emotion_paths: FAILED at <step>: <detail>`, to stderr, prints no timings and exits 1.
@@ -45,6 +47,7 @@ from pathlib import Path
 WARM_REPEATS = 9
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = Path("test-data") / "synthetic-db" / "memories.db"
+CPUINFO = Path("/proc/cpuinfo")
 
 
 class StepError(Exception):
@@ -258,6 +261,25 @@ def _time_decay(scratch: Path, store) -> list[str]:
     return lines
 
 
+def _cpu_model() -> str:
+    """The first ``model name`` field of /proc/cpuinfo on Linux; "unknown" elsewhere or when it is missing or unreadable.
+
+    A plain read: this script is not part of the app, and starting a process (platform.processor() runs ``uname -p``)
+    is not allowed here.
+    """
+    if sys.platform != "linux":
+        return "unknown"
+    try:
+        text = CPUINFO.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "unknown"
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "model name":
+            return " ".join(value.split()) or "unknown"
+    return "unknown"
+
+
 def _host_line() -> str:
     arch = platform.machine() or "unknown"
     avx2 = "unknown"
@@ -276,7 +298,7 @@ def _host_line() -> str:
         pass
     # platform.platform() and platform.processor() both start a `uname -p` process, so neither is used.
     system = f"{platform.system() or 'unknown'} {platform.release()}".strip()
-    return f"host: {system}; arch {arch}; avx2={avx2}; cores {os.cpu_count() or 'unknown'}; ram {ram}"
+    return f"host: {system}; cpu {_cpu_model()}; arch {arch}; avx2={avx2}; cores {os.cpu_count() or 'unknown'}; ram {ram}"
 
 
 def run(arg: str | None) -> list[str]:
