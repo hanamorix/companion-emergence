@@ -56,6 +56,10 @@ _RATING_SCALE = 10.0  # a research memory's engagement rating is 0 to this
 _COUNTED_INITIATE_STATES = (frozenset(get_args(StateName)) - {"pending"}) | {"note"}
 
 _EVENT_KINDS = frozenset({"commit", "assigned", "showing", "change", "start"})
+# The kinds that carry a source modifier. A change has none (its weight is 1) and a start folds nothing.
+_MODIFIER_KINDS = frozenset({"commit", "assigned", "showing"})
+# The kinds dated at the row's creation time, whose repeat record starts there and is not kept once its window has ended.
+_ANCHORED_KINDS = frozenset({"commit", "assigned"})
 
 
 # --- state ---------------------------------------------------------------------------------------------------------
@@ -127,10 +131,13 @@ class Event:
     """One thing that happened to the emotions.
 
     kind "commit": a counted memory was committed (`at` is its creation time, `emotions` its faded values, `climax` its
-    stored climax). "assigned": an existing counted memory got its feelings later. "showing": a counted memory was shown in
-    full. "change": signed amounts to add to the stored averages (`source` names the caller). "start": the start-only event,
-    queued for a committed row of a type that does not count; it carries only `at`, the row's creation time, and keeps the
-    persona's start date.
+    stored climax). "assigned": an existing counted memory got its feelings later (`at` is the row's creation time, as for a
+    commit, not the time of the assignment). "showing": a counted memory was shown in full. "change": signed amounts to add to
+    the stored averages (`source` names the caller). "start": the start-only event, queued for a committed row of a type that
+    does not count; it carries only `at`, the row's creation time, and keeps the persona's start date.
+
+    `modifier` is the source modifier of a commit, an assigned or a showing event. A change has no modifier (its weight is
+    always 1) and a start event folds nothing, so neither reads the field.
     """
 
     kind: str
@@ -265,11 +272,16 @@ def _fold_persona_start(state: EngineState, created_at: datetime) -> None:
         state.persona_start_at = created_at
 
 
-def _repeat_factor(state: EngineState, event: Event, at: datetime) -> float:
-    """1 for a memory's first showing, then 1/2, 1/4 ... within the repeat window of that first showing.
+def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime) -> float:
+    """1 for a memory's first showing, then the repeat factor, its square and so on within the repeat window of that first
+    showing (`dev_constants.EMOTION_REPEAT_FACTOR` ** (showings since the first + 1)).
 
-    A commit counts as the first showing and resets any entry. A showing or assignment outside the window (an entry not yet
-    pruned, or one dated before the recorded first showing) is a new first showing.
+    A commit of a memory less than a window old counts as the first showing and resets any entry. A showing or assignment outside the window
+    (an entry not yet pruned, or one dated before the recorded first showing) is a new first showing; whether an entry is live is
+    judged at the event's own `at`. A commit and an assignment are dated at the row's creation time, so their record starts
+    there, not when they are folded: when that window has already ended by `now` the record is not kept (and a stale one from
+    before the event is removed; a record dated after it is left alone), so the memory's next full showing counts at full
+    weight. A showing always writes its record.
     """
     if event.memory_id is None:
         return 1.0
@@ -279,6 +291,10 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime) -> float:
         factor = dev_constants.EMOTION_REPEAT_FACTOR ** (entry.count + 1)
         entry.count += 1
         return factor
+    if event.kind in _ANCHORED_KINDS and at + window <= now:
+        if entry is not None and entry.first_at <= at:
+            del state.repeats[event.memory_id]  # a stale record from before this event; a newer one is left alone
+        return 1.0
     state.repeats[event.memory_id] = RepeatEntry(first_at=at, count=0)
     return 1.0
 
@@ -288,9 +304,11 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
 
     A future event time and a future `last_update` are held to `now` first. A commit, an assignment and a showing fold each
     of the event's emotions at weight `modifier x repeat factor`; a commit then keeps the persona's start date and, when its
-    stored climax is 7 or more, applies the climax reset after its own emotions are in. A change folds, for each average, the
-    stored average plus the signed amount (no history: base 0), held to 0-10, at weight `modifier`. A start event keeps the
-    persona's start date and folds nothing else.
+    stored climax is 7 or more, applies the climax reset after its own emotions are in. An event with no emotions folds
+    nothing and writes or advances no repeat record; a commit or an assignment of a memory that is already a window old keeps
+    none either (`_repeat_factor`). A change folds, for each average, the stored average plus the signed amount (no history:
+    base 0), held to 0-10, at weight 1 (it has no modifier and no repeat factor). A start event keeps the persona's start date
+    and folds nothing else.
 
     An entry belongs to the day of its own time. One dated in a day that has already closed cannot undo the zero folded for that
     day, so the day then holds both the zero and the entry (accepted edge, A3 E5.13: a late-gated memory dated yesterday, or an
@@ -298,12 +316,13 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
 
     The skip of a commit or assignment whose memory was already folded in the same drain is the drain's, not this function's.
 
-    The emotions of an event are expected to be resolved already (`resolve_emotions`). A non-finite value or modifier raises
-    before anything is changed, so a bad event leaves the state as it was.
+    The emotions of an event are expected to be resolved already (`resolve_emotions`). A non-finite value, or a non-finite
+    modifier on a kind that carries one, raises before anything is changed, so a bad event leaves the state as it was.
     """
     if event.kind not in _EVENT_KINDS:
         raise ValueError(f"unknown event kind {event.kind!r}")
-    if event.kind != "start" and not (math.isfinite(event.modifier) and all(math.isfinite(v) for v in event.emotions.values())):
+    bad_modifier = event.kind in _MODIFIER_KINDS and not math.isfinite(event.modifier)
+    if bad_modifier or (event.kind != "start" and not all(math.isfinite(v) for v in event.emotions.values())):
         raise ValueError(f"cannot fold an event with a non-finite value or modifier: {event.kind} {event.memory_id}")
     if state.last_update is not None and state.last_update > now:
         state.last_update = now
@@ -320,9 +339,9 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
             existing = state.emotions.get(name)
             short_base = existing.short.avg if existing is not None else 0.0
             long_base = existing.long.avg if existing is not None else 0.0
-            _fold(state, name, _hold(short_base + amount), _hold(long_base + amount), event.modifier, at, zero=False)
+            _fold(state, name, _hold(short_base + amount), _hold(long_base + amount), 1.0, at, zero=False)
         return
-    w = event.modifier * _repeat_factor(state, event, at)
+    w = event.modifier * _repeat_factor(state, event, at, now)
     for name, value in event.emotions.items():
         fold_entry(state, name, value, w, at)
     if event.kind == "commit" and event.climax >= dev_constants.EMOTION_CLIMAX_THRESHOLD:
