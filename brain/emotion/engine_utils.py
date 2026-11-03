@@ -2,7 +2,7 @@
 
 Everything here works on in-memory state and takes the time as an argument: no files, no lock, no clock, no memory
 store. The engine module (Engine 0 and later) orchestrates; this file is what its numbers come from. The JSON form
-of `EngineState`, the queue, the drain and the rebuild belong to the later slices. Callers pass names already resolved
+of `EngineState` and the queue are in `engine_files.py`; the drain and the rebuild belong to the later slices. Callers pass names already resolved
 (`resolve_emotions`): the fold functions do not canonicalise.
 
 What lives here:
