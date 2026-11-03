@@ -276,7 +276,7 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
     """1 for a memory's first showing, then the repeat factor, its square and so on within the repeat window of that first
     showing (`dev_constants.EMOTION_REPEAT_FACTOR` ** (showings since the first + 1)).
 
-    A commit under the window old counts as the first showing and resets any entry. A showing or assignment outside the window
+    A commit of a memory less than a window old counts as the first showing and resets any entry. A showing or assignment outside the window
     (an entry not yet pruned, or one dated before the recorded first showing) is a new first showing; whether an entry is live is
     judged at the event's own `at`. A commit and an assignment are dated at the row's creation time, so their record starts
     there, not when they are folded: when that window has already ended by `now` the record is not kept (and a stale one from
@@ -306,9 +306,9 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
     of the event's emotions at weight `modifier x repeat factor`; a commit then keeps the persona's start date and, when its
     stored climax is 7 or more, applies the climax reset after its own emotions are in. An event with no emotions folds
     nothing and writes or advances no repeat record; a commit or an assignment of a memory that is already a window old keeps
-    none either (`_repeat_factor`). A change folds, for each average, the stored average plus the signed
-    amount (no history: base 0), held to 0-10, at weight 1 (it has no modifier and no repeat factor). A start event keeps the
-    persona's start date and folds nothing else.
+    none either (`_repeat_factor`). A change folds, for each average, the stored average plus the signed amount (no history:
+    base 0), held to 0-10, at weight 1 (it has no modifier and no repeat factor). A start event keeps the persona's start date
+    and folds nothing else.
 
     An entry belongs to the day of its own time. One dated in a day that has already closed cannot undo the zero folded for that
     day, so the day then holds both the zero and the entry (accepted edge, A3 E5.13: a late-gated memory dated yesterday, or an
