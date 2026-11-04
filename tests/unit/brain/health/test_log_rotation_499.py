@@ -2,7 +2,7 @@
 
 The old order shifted the archives up (evicting the oldest) before it wrote the new `.1.gz`, so while the write kept
 failing each tick destroyed one archive. The rotation now writes the new archive to `<log>.next.gz` first, shifts
-with a gap-aware `os.replace` chain, publishes with the retried replace and truncates last. Faults are injected at
+with a gap-aware chain of retried replaces, publishes with the retried replace and truncates last. Faults are injected at
 `os.replace` (the one call every step but the compression goes through) and at `gzip.open`, and a `BaseException`
 subclass stands in for a kill (no cleanup may run for it). The tests do not import the shared writer module.
 """

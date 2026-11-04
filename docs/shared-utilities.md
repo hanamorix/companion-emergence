@@ -20,46 +20,46 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 | `JsonRead` (class) | brain/health/json_io.py:200 | Result record of read_json_result: `data`, `outcome` (ok, missing, defaulted, restored, reset), `kind` and any `anomaly`. |
 | `read_json` | brain/health/json_io.py:269 | Read a whole JSON file under a Recovery policy (default factory, expected type, validator, fallback files) and return its data. |
 | `read_json_result` | brain/health/json_io.py:289 | Same read as read_json but returns a JsonRead, so the caller can see whether the file was missing, defaulted or restored. |
-| `write_json` | brain/health/json_io.py:696 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
-| `encode_jsonl` | brain/health/json_io.py:814 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
-| `parse_jsonl` | brain/health/json_io.py:842 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict); a line the JSON parser cannot load stops the read. |
-| `iter_jsonl` | brain/health/json_io.py:872 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning (a line the JSON parser cannot load stops the read); a missing file yields nothing. |
-| `read_jsonl` | brain/health/json_io.py:907 | iter_jsonl collected into a list. |
-| `iter_jsonl_raw` | brain/health/json_io.py:913 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
-| `read_jsonl_tail` | brain/health/json_io.py:1026 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
-| `append_jsonl` | brain/health/json_io.py:1116 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
-| `write_jsonl` | brain/health/json_io.py:1183 | Atomically replace a JSONL file with the given records (same writer as write_json). |
-| `read_jsonl_from` | brain/health/json_io.py:994 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. |
-| `JsonlRecord` (class) | brain/health/json_io.py:974 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
-| `JsonlRead` (class) | brain/health/json_io.py:987 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
+| `write_json` | brain/health/json_io.py:703 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
+| `encode_jsonl` | brain/health/json_io.py:821 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
+| `parse_jsonl` | brain/health/json_io.py:849 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict); a line the JSON parser cannot load stops the read. |
+| `iter_jsonl` | brain/health/json_io.py:879 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning (a line the JSON parser cannot load stops the read); a missing file yields nothing. |
+| `read_jsonl` | brain/health/json_io.py:914 | iter_jsonl collected into a list. |
+| `iter_jsonl_raw` | brain/health/json_io.py:920 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
+| `read_jsonl_tail` | brain/health/json_io.py:1050 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
+| `append_jsonl` | brain/health/json_io.py:1145 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
+| `write_jsonl` | brain/health/json_io.py:1212 | Atomically replace a JSONL file with the given records (same writer as write_json). |
+| `read_jsonl_from` | brain/health/json_io.py:1016 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. Streams the file line by line (one pass; only the returned records are held). |
+| `JsonlRecord` (class) | brain/health/json_io.py:996 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
+| `JsonlRead` (class) | brain/health/json_io.py:1009 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
 
 ### `brain/health/jsonl_reader.py`
 
 | function | where (path:line) | what it is for |
 |---|---|---|
 | `JsonlLineError` (class) | brain/health/jsonl_reader.py:25 | ValueError for a bad line met in strict mode: carries `line` (1-based), `reason` and `path`; json_io turns it into `JsonFileError(kind="line")`. |
-| `UnloadableJsonlLineError` (class) | brain/health/jsonl_reader.py:38 | ValueError (stable `code` "jsonl_unloadable_line", plus `path`, `line`, `reason`) that stops a read at a line the JSON parser cannot load (integer past the digit limit, nesting too deep); a known abort, see #646. |
-| `classify_line` | brain/health/jsonl_reader.py:91 | The one place a JSONL line is judged: a usable object, a blank line, or a bad line (invalid UTF-8, unparsable JSON, not an object) with the reason; every JSONL reader calls it. |
-| `LineVerdict` (class) | brain/health/jsonl_reader.py:64 | What classify_line returns: the line's text, its object, the kind of fault and a `reason` property. |
+| `UnloadableJsonlLineError` (class) | brain/health/jsonl_reader.py:38 | ValueError (stable `code` "jsonl_unloadable_line", plus `path`, `line`, `reason`; `line` is None for `read_jsonl_tail` on a plain file, whose `reason` gives the position in the window of the last lines) that stops a read at a line the JSON parser cannot load (integer past the digit limit, nesting too deep); a known abort, see #646. |
+| `classify_line` | brain/health/jsonl_reader.py:92 | The one place a JSONL line is judged: a usable object, a blank line, or a bad line (invalid UTF-8, unparsable JSON, not an object) with the reason; every JSONL reader calls it. |
+| `LineVerdict` (class) | brain/health/jsonl_reader.py:65 | What classify_line returns: the line's text, its object, the kind of fault and a `reason` property. |
 
 ## File access: atomic writes, locks, TOML, SQLite
 
 ### `brain/utils/file_ops.py`
 
-Use these for retried replace and delete, whole-file byte reads, folder listing and path checks; do not call `os.replace`, `unlink`, `os.listdir` or `os.stat` directly in new code. The retry schedule is `FILE_RETRY_ATTEMPTS`, `FILE_RETRY_SLEEP_S` and `FILE_READ_ATTEMPTS` in `brain/dev_constants.py`.
+Use these for retried replace and delete, whole-file byte reads, folder listing and path checks; do not call `os.replace`, `unlink`, `os.listdir` or `os.stat` directly in new code. The retry schedule is `FILE_RETRY_ATTEMPTS`, `FILE_RETRY_SLEEP_S` and `FILE_READ_ATTEMPTS` in `brain/dev_constants.py`; the update overlay's folder rename passes its own (`OVERLAY_RENAME_ATTEMPTS`, `OVERLAY_RENAME_SLEEP_S`) to `retry_transient`.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
 | `retry_transient` | brain/utils/file_ops.py:32 | The one retry loop: call a function again after a Windows `PermissionError` (sharing violation) on a short growing sleep, and raise if it persists; `windows_only=True` makes one attempt elsewhere. |
 | `stat_key` | brain/utils/file_ops.py:64 | The `(inode, mtime_ns, size)` triple a cache compares to see that a file has not changed; the one definition. |
 | `read_bytes_stat` | brain/utils/file_ops.py:75 | Read a whole file and return its bytes with the stat key taken from the open handle; retries a Windows sharing violation. |
-| `read_bytes` | brain/utils/file_ops.py:85 | Read a whole file's bytes (read_bytes_stat without the key). |
-| `replace_file` | brain/utils/file_ops.py:90 | `os.replace` of a file or folder with the transient-failure retry. |
-| `delete_file` | brain/utils/file_ops.py:95 | Delete a file with the retry; a missing file is not an error, a failure that persists raises, a folder is refused. |
-| `delete_tree` | brain/utils/file_ops.py:112 | Delete a folder and its content with the retry; a missing folder is not an error; a file or a symbolic link is refused, never followed. |
-| `list_dir` | brain/utils/file_ops.py:122 | The sorted names of the entries in a folder; a missing folder is `[]` and is not created. |
-| `PathStat` (class) | brain/utils/file_ops.py:130 | One `os.stat` of a path: inode, mtime_ns, size, is_file, is_dir, and a `key` property equal to stat_key. |
-| `stat_path` | brain/utils/file_ops.py:145 | One `os.stat` of a path as a PathStat, or None if the path is missing; any other OSError raises. The accessor for exists, size, file-or-folder and a cache's currency key. |
+| `open_read` | brain/utils/file_ops.py:85 | Open a file for reading bytes (for a caller that streams it) with the read retry: a Windows sharing violation is retried, one attempt elsewhere; the caller closes it. |
+| `replace_file` | brain/utils/file_ops.py:95 | `os.replace` of a file or folder with the transient-failure retry. |
+| `delete_file` | brain/utils/file_ops.py:100 | Delete a file with the retry; a missing file is not an error, a failure that persists raises, a folder raises IsADirectoryError at once on every system (never retried). |
+| `delete_tree` | brain/utils/file_ops.py:121 | Delete a folder and its content with the retry; a missing folder is not an error; a file or a symbolic link is refused, never followed. |
+| `list_dir` | brain/utils/file_ops.py:131 | The sorted names of the entries in a folder; a missing folder is `[]` and is not created. |
+| `PathStat` (class) | brain/utils/file_ops.py:139 | One `os.stat` of a path: inode, mtime_ns, size, is_file, is_dir, and a `key` property equal to stat_key. |
+| `stat_path` | brain/utils/file_ops.py:154 | One `os.stat` of a path as a PathStat, or None if the path is missing; any other OSError raises. The accessor for exists, size, file-or-folder and a cache's currency key. |
 
 ### `brain/utils/atomic_write.py`
 
@@ -109,7 +109,7 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `rotate_rolling_size` | brain/health/log_rotation.py:80 | Once a log exceeds max_bytes, gzip it to `<log>.1.gz`, shift older archives up (keeping archive_keep), truncate the live log; returns the new archive path or None. |
+| `rotate_rolling_size` | brain/health/log_rotation.py:79 | Once a log exceeds max_bytes, gzip it to `<log>.1.gz`, shift older archives up (keeping archive_keep), truncate the live log; returns the new archive path or None. |
 
 ### `brain/health/parse_failures.py`
 

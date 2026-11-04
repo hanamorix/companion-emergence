@@ -581,6 +581,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="#627 emotion rework Engine 3 (issue #578; the grief-touch race #342)",
         kind="code",
     ),
+    Removed(
+        names=("read_bytes",),
+        why="file_ops.read_bytes had no production caller once read_jsonl_from streamed through open_read; the whole-file accessor is file_ops.read_bytes_stat (pathlib's Path.read_bytes is a different, attribute-call use elsewhere)",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/utils/file_ops.py",),
+    ),
 )
 
 
