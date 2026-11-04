@@ -123,6 +123,8 @@ def test_a_memory_with_no_referent_key_at_all_is_refused(store: MemoryStore) -> 
     with pytest.raises(ValueError):
         store.create_grief_touch_unless_recent(bare, hours=HOURS)
     assert _grief_rows(store) == []
+    good = _touch()
+    assert store.create_grief_touch_unless_recent(good, hours=HOURS) == good.id  # the positive control
 
 
 def test_a_duplicate_id_raises_rolls_back_and_leaves_no_transaction_open(store: MemoryStore) -> None:
