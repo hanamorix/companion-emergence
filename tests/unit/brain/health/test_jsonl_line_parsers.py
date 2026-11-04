@@ -209,7 +209,8 @@ def _assert_the_unloadable_line_error(exc: BaseException | None, cause: type[Exc
     assert isinstance(exc, ValueError)
     assert not isinstance(exc, (JsonlLineError, jio.JsonFileError))
     assert exc.code == "jsonl_unloadable_line"
-    assert exc.line == line and exc.path == path
+    assert exc.line == line
+    assert exc.path == path
     assert type(exc.__cause__) is cause  # the parser's own exception stays reachable
 
 
@@ -248,14 +249,15 @@ def test_a_line_the_json_parser_cannot_load_stops_the_read_with_a_named_error(
     assert _messages(caplog) == []
 
 
+@pytest.mark.parametrize("layout", _LAYOUTS)
 @pytest.mark.parametrize(("build", "cause"), _UNLOADABLE)
 @pytest.mark.parametrize("reader_name", _HAVE_STRICT)
 def test_strict_mode_gives_the_same_named_error_for_such_a_line(
-    tmp_path: Path, reader_name: str, build, cause: type[Exception]
+    tmp_path: Path, reader_name: str, build, cause: type[Exception], layout: str
 ) -> None:
-    content, file_line, _window_line = _layout("plain", build())
+    content, file_line, window_line = _layout(layout, build())
     rows, exc, path = _run(reader_name, tmp_path, content, strict=True)
-    _assert_the_unloadable_line_error(exc, cause, file_line, path)
+    _assert_the_unloadable_line_error(exc, cause, window_line if reader_name == "read_jsonl_tail" else file_line, path)
     assert rows == ([] if reader_name in _RETURNS_A_LIST else [{"a": 1}])
 
 
