@@ -1,15 +1,17 @@
 """The line parsers behind ``iter_jsonl``, ``parse_jsonl``, ``iter_jsonl_raw`` and ``iter_jsonl_skipping_corrupt`` keep their
 warning texts, their strict-mode reasons and their exception chains when they share one line classifier (#643).
 
-The first block pins what the parsers did before the change (it passes on the old code by design, so each test carries the
-``no_base_failure`` mark). The tests after them are new behaviour: a line the JSON parser rejects with a plain ``ValueError`` (an
-integer of more than the interpreter's digit limit) or ``RecursionError`` used to abort ``iter_jsonl``, ``parse_jsonl``, the
-skipping reader and ``read_jsonl_tail``, and is now skipped with a warning by every parser, as ``iter_jsonl_raw`` always did; in strict
-mode it raises ``JsonlLineError`` from the line parser and ``JsonFileError(kind="line")`` through ``json_io``'s readers.
+Every test here pins what the parsers did before the change (it passes on the old code by design, so each carries the
+``no_base_failure`` mark). That includes a known defect, kept by the owner's ruling and filed separately: a line the JSON parser
+rejects with a plain ``ValueError`` (an integer of more than the interpreter's digit limit) or ``RecursionError`` (nesting too deep)
+stops ``iter_jsonl``, ``read_jsonl``, ``parse_jsonl``, ``read_jsonl_tail`` and the skipping reader with the parser's own bare
+exception, in strict mode too, while ``iter_jsonl_raw`` skips such a line (strict: ``JsonFileError(kind="line")``). A fix that makes
+the first group skip it must change those tests on purpose.
 """
 
 from __future__ import annotations
 
+import gzip
 import io
 import logging
 import sys
@@ -20,7 +22,7 @@ import pytest
 from brain.health import json_io as jio
 from brain.health.jsonl_reader import JsonlLineError, _parse_lines, iter_jsonl_skipping_corrupt
 
-_PINNED = pytest.mark.no_base_failure(reason="pins the parsers' existing warning texts and strict reasons, which the old code already has")
+_PINNED = pytest.mark.no_base_failure(reason="pins what the parsers already do on origin/main: their warning texts, strict reasons and what they do with a line the JSON parser cannot load")
 
 BAD_UTF8 = b'{"b": "caf\xff"}\n'
 BAD_JSON = b"nope\n"
@@ -115,43 +117,6 @@ def test_blank_lines_count_for_line_numbers_and_give_no_record(tmp_path: Path) -
     assert list(jio.iter_jsonl_raw(path)) == [('{"a": 1}', {"a": 1})]
 
 
-@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-@pytest.mark.parametrize("reader_name", ["iter_jsonl", "parse_jsonl", "iter_jsonl_skipping_corrupt"])
-def test_an_over_long_integer_line_is_skipped_with_a_warning_by_the_readers_that_aborted(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, reader_name: str
-) -> None:
-    huge = b'{"n": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}\n"
-    path = _file(tmp_path, GOOD, huge, GOOD)
-    with caplog.at_level(logging.WARNING):
-        if reader_name == "parse_jsonl":
-            rows = list(jio.parse_jsonl(path.read_bytes()))
-        elif reader_name == "iter_jsonl_skipping_corrupt":
-            rows = list(iter_jsonl_skipping_corrupt(path))
-        else:
-            rows = list(jio.iter_jsonl(path))
-    assert rows == [{"a": 1}, {"a": 1}]
-    assert len(_messages(caplog)) == 1
-
-
-@_PINNED
-@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-def test_iter_jsonl_raw_already_skipped_an_over_long_integer_line(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    huge = b'{"n": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}\n"
-    path = _file(tmp_path, GOOD, huge, GOOD)
-    with caplog.at_level(logging.WARNING):
-        assert [rec for _text, rec in jio.iter_jsonl_raw(path)] == [{"a": 1}, {"a": 1}]
-    assert len(_messages(caplog)) == 1
-
-
-@pytest.mark.skipif(sys.getrecursionlimit() > 100000, reason="needs a depth the parser rejects")
-def test_a_too_deeply_nested_line_is_skipped_not_fatal(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    deep = b"[" * 200000 + b"]" * 200000 + b"\n"
-    path = _file(tmp_path, GOOD, deep, GOOD)
-    with caplog.at_level(logging.WARNING):
-        assert list(jio.iter_jsonl(path)) == [{"a": 1}, {"a": 1}]
-    assert len(_messages(caplog)) == 1
-
-
 @_PINNED
 def test_an_empty_object_line_is_a_record(tmp_path: Path) -> None:
     path = _file(tmp_path, b"{}\n", GOOD)
@@ -159,7 +124,7 @@ def test_an_empty_object_line_is_a_record(tmp_path: Path) -> None:
     assert list(jio.iter_jsonl_raw(path)) == [("{}", {}), ('{"a": 1}', {"a": 1})]
 
 
-# --- strict mode and the tail reader on a line the JSON parser rejects with a plain ValueError or RecursionError (#643) ------
+# --- a line the JSON parser rejects with a plain ValueError or RecursionError (the behaviour from before #643) ---------------
 
 _NEEDS_DIGIT_LIMIT = pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
 _NEEDS_DEPTH_LIMIT = pytest.mark.skipif(sys.getrecursionlimit() > 100000, reason="needs a depth the parser rejects")
@@ -173,57 +138,110 @@ def _deep_line() -> bytes:
     return b"[" * 200000 + b"]" * 200000 + b"\n"
 
 
-@_NEEDS_DIGIT_LIMIT
-def test_strict_line_parser_raises_jsonl_line_error_for_an_over_long_integer() -> None:
-    """A bare ``ValueError`` used to escape; the error is now the line error, which is a ``ValueError`` and has the line number."""
-    stream = io.StringIO(_huge_int_line().decode())
-    with pytest.raises(JsonlLineError) as exc:
-        list(_parse_lines(stream, Path("x.jsonl"), strict=True))
-    assert isinstance(exc.value, ValueError)
-    assert exc.value.line == 1
+# (line builder, the exact exception the JSON parser gives for it)
+_UNLOADABLE = [
+    pytest.param(_huge_int_line, ValueError, id="over-long-integer", marks=_NEEDS_DIGIT_LIMIT),
+    pytest.param(_deep_line, RecursionError, id="too-deeply-nested", marks=_NEEDS_DEPTH_LIMIT),
+]
+
+# Readers that stop on such a line. The ones that return a list give back nothing when they stop.
+_ABORTING_READERS = [
+    "iter_jsonl",
+    "iter_jsonl_gz",
+    "read_jsonl",
+    "parse_jsonl",
+    "iter_jsonl_skipping_corrupt",
+    "read_jsonl_tail",
+    "read_jsonl_tail_gz",
+]
+_RETURNS_A_LIST = {"read_jsonl", "read_jsonl_tail", "read_jsonl_tail_gz"}
+_HAVE_STRICT = [name for name in _ABORTING_READERS if name != "iter_jsonl_skipping_corrupt"]
 
 
-@_NEEDS_DEPTH_LIMIT
-def test_strict_line_parser_raises_jsonl_line_error_for_a_too_deeply_nested_line() -> None:
-    stream = io.StringIO(_deep_line().decode())
-    with pytest.raises(JsonlLineError) as exc:
-        list(_parse_lines(stream, Path("x.jsonl"), strict=True))
-    assert exc.value.line == 1
-
-
-@_NEEDS_DIGIT_LIMIT
-@pytest.mark.parametrize("reader_name", ["iter_jsonl", "parse_jsonl", "read_jsonl_tail"])
-def test_strict_readers_raise_a_line_file_error_for_an_over_long_integer(tmp_path: Path, reader_name: str) -> None:
-    """Through ``json_io`` the strict error is ``JsonFileError(kind="line")``: an ``OSError`` and a ``ValueError``."""
-    path = _file(tmp_path, GOOD, _huge_int_line())
-    with pytest.raises(jio.JsonFileError) as exc:
-        if reader_name == "parse_jsonl":
-            list(jio.parse_jsonl(path.read_bytes(), strict=True))
-        elif reader_name == "read_jsonl_tail":
-            jio.read_jsonl_tail(path, 2, strict=True, recover=jio.Recovery.RAISE)
+def _run(reader_name: str, tmp_path: Path, content: bytes, *, strict: bool) -> tuple[list[dict], Exception | None]:
+    """Run one reader over ``content``: (the rows it gave before it stopped, the exception that stopped it or None)."""
+    path = _file(tmp_path, content)
+    if reader_name.endswith("_gz"):
+        path = tmp_path / "x.jsonl.gz"
+        path.write_bytes(gzip.compress(content))
+    recover = jio.Recovery.RAISE
+    rows: list[dict] = []
+    try:
+        if reader_name in ("iter_jsonl", "iter_jsonl_gz"):
+            stream = jio.iter_jsonl(path, strict=strict, recover=recover)
+        elif reader_name == "read_jsonl":
+            stream = iter(jio.read_jsonl(path, strict=strict, recover=recover))
+        elif reader_name == "parse_jsonl":
+            stream = jio.parse_jsonl(content, strict=strict)
+        elif reader_name == "iter_jsonl_skipping_corrupt":
+            stream = iter_jsonl_skipping_corrupt(path)
         else:
-            list(jio.iter_jsonl(path, strict=True))
-    assert exc.value.kind == "line"
-    assert isinstance(exc.value, OSError) and isinstance(exc.value, ValueError)
-    if reader_name != "read_jsonl_tail":  # the tail reader numbers the lines of the window it read
-        assert exc.value.line == 2
+            stream = iter(jio.read_jsonl_tail(path, 3, strict=strict, recover=recover))
+        for row in stream:
+            rows.append(row)
+    except Exception as exc:  # noqa: BLE001 - the test inspects exactly what came out
+        return rows, exc
+    return rows, None
 
 
-@_NEEDS_DEPTH_LIMIT
-@pytest.mark.parametrize("reader_name", ["iter_jsonl", "read_jsonl_tail"])
-def test_strict_readers_raise_a_line_file_error_for_a_too_deeply_nested_line(tmp_path: Path, reader_name: str) -> None:
-    path = _file(tmp_path, GOOD, _deep_line())
-    with pytest.raises(jio.JsonFileError) as exc:
-        if reader_name == "read_jsonl_tail":
-            jio.read_jsonl_tail(path, 2, strict=True, recover=jio.Recovery.RAISE)
-        else:
-            list(jio.iter_jsonl(path, strict=True))
-    assert exc.value.kind == "line"
+def _assert_the_parsers_own_exception(exc: Exception | None, expected: type[Exception]) -> None:
+    """Exactly the exception ``json.loads`` raised: not ``JsonlLineError`` or ``JsonFileError``, which are ``ValueError``s too."""
+    assert exc is not None, "the read went on past the line"
+    assert type(exc) is expected, f"got {type(exc).__name__}: {exc}"
+    assert exc.__cause__ is None
 
 
-@_NEEDS_DIGIT_LIMIT
-def test_the_tail_reader_skips_an_over_long_integer_line_with_a_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    path = _file(tmp_path, GOOD, _huge_int_line(), GOOD)
+@_PINNED
+@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
+@pytest.mark.parametrize("reader_name", _ABORTING_READERS)
+def test_a_line_the_json_parser_cannot_load_stops_the_read_with_its_own_exception(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, reader_name: str, build, expected: type[Exception]
+) -> None:
     with caplog.at_level(logging.WARNING):
-        assert jio.read_jsonl_tail(path, 3, recover=jio.Recovery.RAISE) == [{"a": 1}, {"a": 1}]
-    assert len(_messages(caplog)) == 1
+        rows, exc = _run(reader_name, tmp_path, GOOD + build() + GOOD, strict=False)
+    _assert_the_parsers_own_exception(exc, expected)
+    assert rows == ([] if reader_name in _RETURNS_A_LIST else [{"a": 1}])  # the line after it was never reached
+    assert _messages(caplog) == []
+
+
+@_PINNED
+@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
+@pytest.mark.parametrize("reader_name", _HAVE_STRICT)
+def test_strict_mode_gives_the_same_bare_exception_for_such_a_line(
+    tmp_path: Path, reader_name: str, build, expected: type[Exception]
+) -> None:
+    rows, exc = _run(reader_name, tmp_path, GOOD + build(), strict=True)
+    _assert_the_parsers_own_exception(exc, expected)
+    assert rows == ([] if reader_name in _RETURNS_A_LIST else [{"a": 1}])
+
+
+@_PINNED
+@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
+@pytest.mark.parametrize("strict", [False, True])
+def test_the_line_parser_itself_stops_on_such_a_line(build, expected: type[Exception], strict: bool) -> None:
+    stream = io.StringIO(GOOD.decode() + build().decode())
+    with pytest.raises(expected) as exc:
+        list(_parse_lines(stream, Path("x.jsonl"), strict=strict))
+    assert type(exc.value) is expected and not isinstance(exc.value, JsonlLineError)
+
+
+@_PINNED
+@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
+def test_iter_jsonl_raw_skips_such_a_line_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, build, expected: type[Exception]
+) -> None:
+    path = _file(tmp_path, GOOD, build(), GOOD)
+    with caplog.at_level(logging.WARNING):
+        assert [rec for _text, rec in jio.iter_jsonl_raw(path)] == [{"a": 1}, {"a": 1}]
+    assert len(_messages(caplog)) == 1 and "malformed JSON" in _messages(caplog)[0]
+    seen = [rec for _text, rec in jio.iter_jsonl_raw(path, bad_lines=True)]
+    assert seen == [{"a": 1}, None, {"a": 1}]
+
+
+@_PINNED
+@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
+def test_iter_jsonl_raw_strict_raises_a_line_file_error_for_such_a_line(tmp_path: Path, build, expected: type[Exception]) -> None:
+    path = _file(tmp_path, GOOD, build())
+    with pytest.raises(jio.JsonFileError) as exc:
+        list(jio.iter_jsonl_raw(path, strict=True))
+    assert (exc.value.kind, exc.value.line) == ("line", 2)

@@ -73,7 +73,9 @@ def classify_line(raw: str) -> LineVerdict:
     surrogate and costs only this line). The checks run in this order: invalid UTF-8, blank, JSON that does not parse
     (``ValueError``, which includes the integer digit limit, or ``RecursionError`` for a line nested too deep), a value that is
     not an object. Every JSONL reader (``_parse_lines`` here, ``json_io``'s raw reader and its line-position reader) calls
-    this, so they agree on what a bad line is; each keeps its own log text and strict-mode error.
+    this, so they agree on what a bad line is; each keeps its own log text and strict-mode error, and what it does with a
+    line the JSON parser cannot load: the raw reader skips it and the line-position reader reports it as a bad line, while
+    ``_parse_lines`` raises the parser's own exception (see there).
     """
     try:
         raw.encode("utf-8")
@@ -105,6 +107,11 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
     :class:`JsonlLineError` on the first bad line instead of skipping it, for
     callers that must fail closed. The default is unchanged. Each line is judged by
     :func:`classify_line`.
+
+    One kind of line stops the read instead of being skipped, in strict mode too: a line the JSON parser
+    cannot load at all (an integer past the interpreter's digit limit, nesting past the recursion limit).
+    The parser's own ``ValueError`` or ``RecursionError`` comes out, as it did before the parsers shared
+    :func:`classify_line`.
     """
     for line_index, raw in enumerate(fh, start=1):
         verdict = classify_line(raw)
@@ -112,6 +119,11 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
             if verdict.data is not None:
                 yield verdict.data
             continue
+        if verdict.kind == "json" and not isinstance(verdict.exc, json.JSONDecodeError):
+            # A known defect kept as it was on origin/main (ruling on #643), not a contract: one such line stops
+            # the whole read. Skipping it needs an audit of the callers that rewrite, delete or take a safety set
+            # from what they read, tracked in its own issue.
+            raise verdict.exc
         if strict:
             raise JsonlLineError(line_index, verdict.reason or "", path) from verdict.exc
         if verdict.kind == "utf8":
@@ -151,7 +163,8 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     this generator.
 
     Per-line resilience: a single corrupt line never invalidates the
-    lines around it. Each skipped line emits a warning that includes
+    lines around it, except a line the JSON parser cannot load (see
+    :func:`_parse_lines`), which stops the read. Each skipped line emits a warning that includes
     the line number, the file path, the parse exception, and a 200-
     char preview of the bad content — enough for a human to find and
     quarantine the line.
