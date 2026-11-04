@@ -35,6 +35,28 @@ class JsonlLineError(ValueError):
         self.path = path
 
 
+class UnloadableJsonlLineError(ValueError):
+    """A line the JSON parser cannot load (an integer past the interpreter's digit limit, nesting past the recursion limit) stopped a read.
+
+    ``code`` is the stable identifier (``"jsonl_unloadable_line"``); ``path`` is the file (or the ``source`` given to ``parse_jsonl``),
+    ``line`` the 1-based line within the text the reader was given (for ``read_jsonl_tail`` on a plain file, within the window of
+    the last lines it parses) and ``reason`` the parser's message, never the line's content. The parser's own ``ValueError`` or
+    ``RecursionError`` is ``__cause__``. A ``ValueError`` but not a :class:`JsonlLineError`, so strict-mode handlers do not take it
+    for an ordinary bad line. See #646.
+    """
+
+    code = "jsonl_unloadable_line"
+
+    def __init__(self, line: int, reason: str, path: Path) -> None:
+        super().__init__(f"{path}: line {line}: {reason}")
+        self.line = line
+        self.reason = reason
+        self.path = path
+
+    def __reduce__(self):
+        return (type(self), (self.line, self.reason, self.path))
+
+
 # JSONDecodeError is a ValueError, and so is the error for an integer of more than 4300 digits.
 _JSON_PARSE_ERRORS = (ValueError, RecursionError)
 
@@ -75,7 +97,7 @@ def classify_line(raw: str) -> LineVerdict:
     not an object. Every JSONL reader (``_parse_lines`` here, ``json_io``'s raw reader and its line-position reader) calls
     this, so they agree on what a bad line is; each keeps its own log text and strict-mode error, and what it does with a
     line the JSON parser cannot load: the raw reader skips it and the line-position reader reports it as a bad line, while
-    ``_parse_lines`` raises the parser's own exception (see there).
+    ``_parse_lines`` raises ``UnloadableJsonlLineError`` (see there).
     """
     try:
         raw.encode("utf-8")
@@ -110,8 +132,8 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
 
     One kind of line stops the read instead of being skipped, in strict mode too: a line the JSON parser
     cannot load at all (an integer past the interpreter's digit limit, nesting past the recursion limit).
-    The parser's own ``ValueError`` or ``RecursionError`` comes out, as it did before the parsers shared
-    :func:`classify_line` (#643).
+    :class:`UnloadableJsonlLineError` comes out (the parser's own ``ValueError`` or ``RecursionError`` is its ``__cause__``),
+    as the parser's bare exception did before the parsers shared :func:`classify_line` (#643, #646).
     """
     for line_index, raw in enumerate(fh, start=1):
         verdict = classify_line(raw)
@@ -120,10 +142,11 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
                 yield verdict.data
             continue
         if verdict.kind == "json" and not isinstance(verdict.exc, json.JSONDecodeError):
-            # A known defect, kept as these readers behaved before they shared classify_line (#643), not a
-            # contract: one such line stops the whole read. Skipping it needs an audit of the callers that
-            # rewrite, delete or take a safety set from what they read, tracked in its own issue.
-            raise verdict.exc
+            # A known, deliberate abort, to be fixed later (#646): one such line stops the whole read. These readers
+            # always stopped here; they now say so with a named error instead of the parser's bare exception.
+            # Skipping the line is not safe yet: callers that rewrite, delete or take a safety set from what they
+            # read would lose or fail to protect data, so #646 audits them first.
+            raise UnloadableJsonlLineError(line_index, verdict.reason or "", path) from verdict.exc
         if strict:
             raise JsonlLineError(line_index, verdict.reason or "", path) from verdict.exc
         if verdict.kind == "utf8":

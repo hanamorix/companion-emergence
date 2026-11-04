@@ -76,7 +76,7 @@ from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import (
     Recovery,
     append_jsonl,
-    iter_jsonl,
+    iter_jsonl_raw,
     read_json_result,
     read_json_walk,
     read_jsonl_from,
@@ -670,7 +670,8 @@ class StateCache:
 # ================================================================================================
 
 # The kinds the queue knows. "start" is the start-only event Engine 1 added: it carries only `at`, the creation time of a
-# committed row of a type that does not count, and keeps the persona's start date.
+# committed row of a type that does not count, and keeps the persona's start date. It is a memory's own date event, which
+# the spec makes a direct apply (Engine 4 moves it); until then the commit hook appends it to the queue like the others.
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
 # The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
@@ -990,8 +991,9 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
     time, so a time-zone change could put a first in-window line in an earlier-named file) and keeps the lines dated at or
     after `since`; the caller applies the end of its window and folds in time order. The log is a crash-recovery record and
     its absence or damage is normal: a missing file anywhere in the series, a missing folder, a file not named
-    ``YYYY-MM-DD.jsonl``, an unlistable folder (logged), a torn or unparseable line and a file that cannot be read in full
-    (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
+    ``YYYY-MM-DD.jsonl``, an unlistable folder (logged), a torn or unparseable line (including one the JSON parser cannot
+    load, such as an integer of more than 4300 digits, skipped with a warning naming the file and line) and a file that
+    cannot be read in full (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
     with an error log line. The reader repairs nothing.
     """
     when = lenient_utc(since)  # a naive time means UTC, as everywhere in the repo
@@ -1006,7 +1008,7 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         if day is None or day < start:
             continue
         path = folder / name
-        for record in iter_jsonl(path):  # an I/O failure ends the iteration there; what was read is used
+        for _text, record in iter_jsonl_raw(path):  # a line the parser cannot load is skipped; an I/O failure ends the file there
             try:
                 kind = record.get("kind") if isinstance(record, dict) else None
                 if kind in _MEMORY_KINDS or kind == "start":  # before the check, so a held-modifier line is not logged for it

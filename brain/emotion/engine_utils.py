@@ -137,8 +137,9 @@ class Event:
     kind "commit": a counted memory was committed (`at` is its creation time, `emotions` its faded values, `climax` its
     stored climax). "assigned": an existing counted memory got its feelings later (`at` is the row's creation time, as for a
     commit, not the time of the assignment). "showing": a counted memory was shown in full. "change": signed amounts to add to
-    the stored averages (`source` names the caller). "start": the start-only event, queued for a committed row of a type that
-    does not count; it carries only `at`, the row's creation time, and keeps the persona's start date.
+    the stored averages (`source` names the caller). "start": the start-only event for a committed row of a type that
+    does not count (a memory's own date event, which the spec makes a direct apply; Engine 4 moves it, and until then the
+    commit hook appends it to the queue); it carries only `at`, the row's creation time, and keeps the persona's start date.
 
     `modifier` is the source modifier of a commit, an assigned or a showing event. A change has no modifier (its weight is
     always 1) and a start event folds nothing, so neither reads the field.

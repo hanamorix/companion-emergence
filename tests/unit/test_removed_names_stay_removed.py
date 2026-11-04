@@ -575,6 +575,12 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/update/overlay.py",),
     ),
+    Removed(
+        names=("exists_recent_grief_touch",),
+        why="the grief touch's recent-touch check and its insert are one store call, MemoryStore.create_grief_touch_unless_recent (the race, #342); a lookup kept alone would let a caller check and write in two steps again",
+        ref="#627 emotion rework Engine 3 (issue #578; the grief-touch race #342)",
+        kind="code",
+    ),
 )
 
 
