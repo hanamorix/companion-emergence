@@ -556,10 +556,17 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("_read_bytes", "_signature", "_IS_WINDOWS", "_READ_ATTEMPTS"),
-        why="json_io reads its bytes with file_ops.read_bytes_stat and compares file_ops.stat_key; toml_io calls file_ops.read_bytes_stat; no private reader, key or platform flag of their own",
+        why="json_io reads its bytes with file_ops.read_bytes_stat and takes the key it compares from file_ops.stat_path; toml_io calls file_ops.read_bytes_stat; no private reader, key or platform flag of their own",
         ref=_FILE_OPS_REF,
         kind="code",
         scope=("brain/health/json_io.py", "brain/utils/toml_io.py"),
+    ),
+    Removed(
+        names=("stat_key",),
+        why="json_io compares the key of file_ops.stat_path(...), the one accessor for a metadata check; it does not build the key from a raw stat itself",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/health/json_io.py",),
     ),
     Removed(
         names=("_RETRY_ATTEMPTS", "_RETRY_DELAY_S"),
