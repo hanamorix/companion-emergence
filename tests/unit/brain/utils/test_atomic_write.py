@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import brain.utils.atomic_write as aw
+from brain import dev_constants
 from brain.utils.atomic_write import (
     fsync_dir,
     save_blob_once,
@@ -133,7 +134,7 @@ def test_g1e_transient_permission_errors_are_retried_and_a_persistent_one_is_rai
     state = _flaky_replace(monkeypatch, "persist.bin", 10_000)
     with pytest.raises(PermissionError):
         save_bytes_atomic(p2, b"new")
-    assert state["calls"] == aw._REPLACE_RETRIES
+    assert state["calls"] == dev_constants.FILE_RETRY_ATTEMPTS
     assert p2.read_bytes() == b"old"
     assert _temps(tmp_path) == []
 

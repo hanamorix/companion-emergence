@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from brain.utils import file_ops
 from brain.utils.atomic_write import save_with_backup_text
 from tests.thread_support import finish_threads, release_at_teardown
 
@@ -388,7 +389,7 @@ def test_cr5_windows_path_retries_a_transient_permission_error(
 ) -> None:
     p = tmp_path / "state.json"
     p.write_text('{"a": 1}')
-    monkeypatch.setattr(jio, "_IS_WINDOWS", True)
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", True)
     sleeps = _sleeps(monkeypatch)
     monkeypatch.setattr(
         "builtins.open", _failing_open(p, lambda: PermissionError(13, "busy"), times=2)
@@ -402,7 +403,7 @@ def test_cr5_windows_path_retries_a_transient_permission_error(
 def test_cr5_windows_path_gives_up_after_three_attempts(tmp_path: Path, monkeypatch) -> None:
     p = tmp_path / "state.json"
     p.write_text('{"a": 1}')
-    monkeypatch.setattr(jio, "_IS_WINDOWS", True)
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", True)
     sleeps = _sleeps(monkeypatch)
     fake = _failing_open(p, lambda: PermissionError(13, "busy"))
     monkeypatch.setattr("builtins.open", fake)
@@ -414,7 +415,7 @@ def test_cr5_windows_path_gives_up_after_three_attempts(tmp_path: Path, monkeypa
 def test_cr5_posix_path_has_no_retry_and_no_sleep(tmp_path: Path, monkeypatch, caplog) -> None:
     p = tmp_path / "state.json"
     p.write_text('{"a": 1}')
-    monkeypatch.setattr(jio, "_IS_WINDOWS", False)
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", False)
     sleeps = _sleeps(monkeypatch)
     fake = _failing_open(p, lambda: PermissionError(13, "denied"))
     monkeypatch.setattr("builtins.open", fake)
@@ -2557,14 +2558,14 @@ def test_cr9_g_a_failed_install_keeps_the_corrupt_live_file_raises_json_file_err
 ) -> None:
     """F2: used to leave the live file quarantined and absent, raise a raw PermissionError, then reset on the next read."""
     p = _corrupt_with_backup(tmp_path, b'{"count": 7}')
-    real = jio._replace_with_retry
+    real = jio.replace_file
 
     def failing(src, dst):
         if Path(dst) == p:
             raise PermissionError(13, "an AV scan holds the backup")
         return real(src, dst)
 
-    monkeypatch.setattr(jio, "_replace_with_retry", failing)
+    monkeypatch.setattr(jio, "replace_file", failing)
     with pytest.raises(jio.JsonFileError) as exc:
         jio.read_json(p, default=lambda: {"count": 0}, recover=_policy(policy))
     assert exc.value.kind == "io" and not isinstance(exc.value, PermissionError)
