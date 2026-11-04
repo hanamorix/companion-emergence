@@ -92,11 +92,6 @@ def open_read(path: str | Path):
     return retry_transient(open, path, "rb", attempts=dev_constants.FILE_READ_ATTEMPTS, windows_only=True)
 
 
-def read_bytes(path: str | Path) -> bytes:
-    """Read the whole file (:func:`read_bytes_stat` without the key)."""
-    return read_bytes_stat(path)[0]
-
-
 def replace_file(src: str | Path, dst: str | Path) -> None:
     """``os.replace`` (a file, or a folder where the system allows it) with the transient-failure retry."""
     retry_transient(os.replace, src, dst)

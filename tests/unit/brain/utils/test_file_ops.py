@@ -115,7 +115,7 @@ def test_windows_only_runs_the_full_schedule_on_windows(sleeps: list[float], mon
     assert fn.calls == 3 and sleeps == _linear(2)
 
 
-# --- read_bytes, read_bytes_stat, stat_key ---------------------------------------------------------------------------
+# --- read_bytes_stat, stat_key ---------------------------------------------------------------------------
 
 
 def test_read_bytes_stat_gives_the_bytes_and_the_stat_key(tmp_path: Path) -> None:
@@ -125,7 +125,7 @@ def test_read_bytes_stat_gives_the_bytes_and_the_stat_key(tmp_path: Path) -> Non
     st = os.stat(path)
     assert data == b"hello"
     assert key == (st.st_ino, st.st_mtime_ns, st.st_size) == file_ops.stat_key(st)
-    assert file_ops.read_bytes(path) == b"hello" and file_ops.read_bytes(str(path)) == b"hello"
+    assert file_ops.read_bytes_stat(str(path)) == (b"hello", key)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a file that is open cannot be replaced on Windows")
@@ -148,9 +148,9 @@ def test_read_bytes_stat_takes_the_key_from_the_open_handle(tmp_path: Path, monk
     assert file_ops.stat_key(os.stat(path)) != old_key
 
 
-def test_read_bytes_of_a_missing_file_raises_at_once(tmp_path: Path, sleeps: list[float]) -> None:
+def test_read_bytes_stat_of_a_missing_file_raises_at_once(tmp_path: Path, sleeps: list[float]) -> None:
     with pytest.raises(FileNotFoundError):
-        file_ops.read_bytes(tmp_path / "missing")
+        file_ops.read_bytes_stat(tmp_path / "missing")
     assert sleeps == []
 
 

@@ -54,13 +54,12 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 | `stat_key` | brain/utils/file_ops.py:64 | The `(inode, mtime_ns, size)` triple a cache compares to see that a file has not changed; the one definition. |
 | `read_bytes_stat` | brain/utils/file_ops.py:75 | Read a whole file and return its bytes with the stat key taken from the open handle; retries a Windows sharing violation. |
 | `open_read` | brain/utils/file_ops.py:85 | Open a file for reading bytes (for a caller that streams it) with the read retry: a Windows sharing violation is retried, one attempt elsewhere; the caller closes it. |
-| `read_bytes` | brain/utils/file_ops.py:95 | Read a whole file's bytes (read_bytes_stat without the key). |
-| `replace_file` | brain/utils/file_ops.py:100 | `os.replace` of a file or folder with the transient-failure retry. |
-| `delete_file` | brain/utils/file_ops.py:105 | Delete a file with the retry; a missing file is not an error, a failure that persists raises, a folder raises IsADirectoryError at once on every system (never retried). |
-| `delete_tree` | brain/utils/file_ops.py:126 | Delete a folder and its content with the retry; a missing folder is not an error; a file or a symbolic link is refused, never followed. |
-| `list_dir` | brain/utils/file_ops.py:136 | The sorted names of the entries in a folder; a missing folder is `[]` and is not created. |
-| `PathStat` (class) | brain/utils/file_ops.py:144 | One `os.stat` of a path: inode, mtime_ns, size, is_file, is_dir, and a `key` property equal to stat_key. |
-| `stat_path` | brain/utils/file_ops.py:159 | One `os.stat` of a path as a PathStat, or None if the path is missing; any other OSError raises. The accessor for exists, size, file-or-folder and a cache's currency key. |
+| `replace_file` | brain/utils/file_ops.py:95 | `os.replace` of a file or folder with the transient-failure retry. |
+| `delete_file` | brain/utils/file_ops.py:100 | Delete a file with the retry; a missing file is not an error, a failure that persists raises, a folder raises IsADirectoryError at once on every system (never retried). |
+| `delete_tree` | brain/utils/file_ops.py:121 | Delete a folder and its content with the retry; a missing folder is not an error; a file or a symbolic link is refused, never followed. |
+| `list_dir` | brain/utils/file_ops.py:131 | The sorted names of the entries in a folder; a missing folder is `[]` and is not created. |
+| `PathStat` (class) | brain/utils/file_ops.py:139 | One `os.stat` of a path: inode, mtime_ns, size, is_file, is_dir, and a `key` property equal to stat_key. |
+| `stat_path` | brain/utils/file_ops.py:154 | One `os.stat` of a path as a PathStat, or None if the path is missing; any other OSError raises. The accessor for exists, size, file-or-folder and a cache's currency key. |
 
 ### `brain/utils/atomic_write.py`
 
