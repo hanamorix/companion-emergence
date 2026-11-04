@@ -232,12 +232,9 @@ def test_the_error_code_is_a_stable_class_attribute() -> None:
 
 
 @pytest.mark.parametrize("clone", [copy.copy, lambda e: pickle.loads(pickle.dumps(e))], ids=["copy", "pickle"])
-@pytest.mark.parametrize("line", [7, None])
-def test_the_error_survives_copy_and_pickle(clone, line: int | None) -> None:
-    original = jsonl_reader.UnloadableJsonlLineError(line, "malformed JSON (x)", Path("a") / "b.jsonl")
+def test_the_error_survives_copy_and_pickle(clone) -> None:
+    original = jsonl_reader.UnloadableJsonlLineError(7, "malformed JSON (x)", Path("a") / "b.jsonl")
     again = clone(original)
-    if line is None:
-        assert "None" not in str(original)  # the message does not claim "line None"
     assert type(again) is type(original)
     assert (again.line, again.reason, again.path, again.code, str(again)) == (
         original.line,
@@ -246,6 +243,15 @@ def test_the_error_survives_copy_and_pickle(clone, line: int | None) -> None:
         original.code,
         str(original),
     )
+
+
+@pytest.mark.parametrize("clone", [copy.copy, lambda e: pickle.loads(pickle.dumps(e))], ids=["copy", "pickle"])
+def test_the_error_without_a_line_survives_copy_and_pickle_and_its_message_claims_no_line(clone) -> None:
+    original = jsonl_reader.UnloadableJsonlLineError(None, "malformed JSON (x) (line 2 of the window)", Path("a") / "b.jsonl")
+    again = clone(original)
+    assert type(again) is type(original) and again.line is None
+    assert (again.reason, again.path, again.code, str(again)) == (original.reason, original.path, original.code, str(original))
+    assert str(original) == f"{Path('a') / 'b.jsonl'}: malformed JSON (x) (line 2 of the window)"
 
 
 @pytest.mark.parametrize("layout", _LAYOUTS)
