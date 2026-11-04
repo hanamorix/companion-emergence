@@ -559,6 +559,33 @@ def test_an_event_that_raises_after_it_changed_the_state_is_put_back_and_the_nex
     assert set(state_of(persona).emotions) == {"grief"}
 
 
+@pytest.mark.parametrize("route", ["drain", "direct"])
+def test_a_day_close_that_raises_after_it_changed_the_state_is_put_back_and_the_next_event_still_folds(
+    world, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """Round-4 MAJOR 2, the `close_days` half: the close and the fold of an event are ONE guarded step."""
+    persona, store = world
+    eng = install(persona, NOW)
+    bad_at, good_at = NOW - timedelta(hours=2), NOW - timedelta(hours=1)
+    real = engine.close_days
+
+    def closes_then_raises(state, t):  # noqa: ANN001
+        if t == bad_at:
+            state.emotions["ghost"] = EmotionState(short=Average(9.0, 9.0), long=Average(9.0, 9.0))
+            raise RuntimeError("a bug after the state changed")
+        return real(state, t)
+
+    monkeypatch.setattr(engine, "close_days", closes_then_raises)
+    if route == "drain":
+        queue(persona, showing("bad", bad_at, {"joy": 6.0}), showing("good", good_at, {"grief": 2.0}))
+        eng.note_active(NOW)
+    else:
+        with eng.batch():
+            store.create(row(bad_at, emotions={"joy": 6.0}))
+            store.create(row(good_at, emotions={"grief": 2.0}))
+    assert set(state_of(persona).emotions) == {"grief"}
+
+
 def test_the_accepted_edge_comments_are_in_the_source() -> None:
     """D11, A10: the comments the spec asks for (S22, S42, F-DA, the climax-skip edge, the RD7 case, catch-up holding the lock)."""
     source = Path(engine.__file__).read_text(encoding="utf-8")

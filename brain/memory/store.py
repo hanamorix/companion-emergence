@@ -1070,8 +1070,8 @@ class MemoryStore:
         A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
         had open is left as it was), so a failure does not leave one open for the next writer.
 
-        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook appends one
-        event to the engine's queue and never raises into this call. `fold=False` is for a write that is not new
+        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook applies the
+        memory's own emotions to the engine's state under its lock (a commit is never queued) and never raises into this call. `fold=False` is for a write that is not new
         experience (a restore, an import). An in-memory store tells nobody.
 
         Deliberately does NOT itself touch embeddings — MemoryStore has no

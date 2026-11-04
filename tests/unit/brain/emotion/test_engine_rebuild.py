@@ -197,6 +197,7 @@ def test_a_row_dated_ahead_of_now_folds_at_now_not_at_the_future_time() -> None:
     assert folded == {"future"}
     assert state.last_update == now
     assert state.emotions["joy"].last_entry_day == day_of(now)
+    assert state.repeats["future"].first_at == now  # the repeat record is dated like the fold, so the next showing is halved
     again, _ = _run([memory], now=now)
     assert engine_files.state_to_json(_stamped(again)) == engine_files.state_to_json(_stamped(state))
 

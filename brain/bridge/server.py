@@ -3180,6 +3180,7 @@ def build_app(
             await ws.close()
             return
 
+        drain_after_close = False  # set only by the success path; every error path returns before it
         async with lock:
             t0 = datetime.now(UTC)
             await ws.send_json({"type": "started", "session_id": session_id, "at": _now()})
@@ -3311,8 +3312,10 @@ def build_app(
             # client gets the clean shutdown it expects after the
             # `done` frame.
             await ws.close(code=1000)
-            # The emotion engine's drain, after the clean close so the client never waits for it, and only on this
-            # success path (every error path above returns before this line).
+            drain_after_close = True
+        # The emotion engine's drain, after the clean close so the client never waits for it, after the session's turn
+        # lock is released so the next turn does not wait behind a catch-up, and only on the success path.
+        if drain_after_close:
             await _drain_emotion_engine(s.persona_dir)
 
     # ── WS /events — server-push only broadcast ────────────────────────────

@@ -97,7 +97,8 @@ def replay(
     before `after` and opened at or after `stop`: its queued showing folds it). The lower bound `after` is INCLUSIVE for every
     point (rows, stamps, change lines), matching `MemoryStore.list_engine_window` ("on or after"); the upper bound `stop` is
     exclusive. `stop=None` means no bound: accesses and changes replay up to now. A row created in the last
-    `EMOTION_REPEAT_WINDOW_H` hours gets a repeat entry (its first showing, count 0), so the next showing is halved. A climax
+    `EMOTION_REPEAT_WINDOW_H` hours gets a repeat entry (its first showing, count 0, dated like the fold, never after now), so the
+    next showing is halved. A climax
     reset is not replayed. A change dated exactly at `after` can fold twice (no skip id exists for a change): the S42-class
     overlap, accepted.
 
@@ -152,7 +153,7 @@ def replay(
                 for name, value in payload.emotions.items():
                     fold_entry(state, name, value, payload.weight, held)
                 if payload.created >= after and now - payload.created < repeat_window:
-                    state.repeats[payload.memory.id] = RepeatEntry(first_at=payload.created, count=0)
+                    state.repeats[payload.memory.id] = RepeatEntry(first_at=min(payload.created, now), count=0)
             else:
                 fold_event(state, payload, now)  # type: ignore[arg-type]
 

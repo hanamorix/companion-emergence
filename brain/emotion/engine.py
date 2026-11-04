@@ -6,8 +6,8 @@ engine behind every call exists.
 Real now:
 - `half_life`, the lookup of an emotion's half-life in days (the persona's vocabulary file, then
   `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `EMOTION_DEFAULT_HALF_LIFE_DAYS`), and `is_live()`, which is True once
-  `state/emotion_switch.json` exists (nothing writes that file until the switch-over, so it answers False for every persona
-  today).
+  `state/emotion_switch.json` exists, or cannot be inspected (nothing writes that file until the switch-over, so it answers
+  False for every persona today unless the stat itself fails; only a switch file that was seen is remembered).
 - The four hooks. A memory's own emotions (`on_memory_committed`, `on_emotions_assigned`, and the start-only date event
   that the commit hook makes for a row that counts for nothing) are APPLIED to the state under the engine's lock when the
   memory is written (`_apply_direct`, or once per `batch()` block). A showing (`on_memory_shown`) and a chat change
@@ -440,10 +440,11 @@ class EmotionEngine:
     def _run_apply(self, events: list[Event], *, drain: bool, now: datetime) -> None:
         """The one apply step of the drain and the direct apply. The caller holds the engine lock (it is not re-entrant).
 
-        Steps (spec 3.1 S4): (2) read the state; recovery first when it came from a backup copy; (2) for the drain, read the
+        Steps (spec 3.1 S4): (2) read the state, recovery first when it came from a backup copy, then (for the drain) read the
         queue by position; (3-5) fold the events in time order with `close_days` before each and once at `now`, prune the
         change-log files and the repeat list; (6) one `save_state`, with the queue position, when anything was read, folded or
-        closed; (7) the drain then empties the queue file and saves position 0. A direct apply passes `events` (its own, with
+        closed, when a catch-up ran, or when an empty state replaced one that could not be used; (7) the drain then empties
+        the queue file and saves position 0. A direct apply passes `events` (its own, with
         `drain=False`) and writes no queue and reads none except the catch-up's one read. `now` is held to the loaded
         `saved_at` for the whole step, so a clock read before a wait for the lock cannot rewind the state, and `saved_at`
         never moves backwards (a clock set back does not drag it back, by design).
@@ -461,6 +462,7 @@ class EmotionEngine:
         queue_read: engine_files.QueueRead | None = None
         caught_up = False
         fallback_empty = False
+        pre_day = state.active_day if state is not None else None  # the active day as it stood BEFORE this step's own closes
         if state is None:
             if self.is_live():
                 self._mark_failed(f"the emotion state is {loaded.problem}", now)
@@ -497,8 +499,7 @@ class EmotionEngine:
                         type(exc).__name__,
                         exc,
                     )
-                    state, queue_read, fallback_empty = EngineState(), None, True
-        pre_day = state.active_day
+                    state, queue_read, fallback_empty, pre_day = EngineState(), None, True, None
         if drain:
             if queue_read is None:
                 queue_read = engine_files.read_queue(persona, from_line=state.queue_line)
