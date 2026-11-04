@@ -330,7 +330,8 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
 
 
 def _build_emotions(persona_dir: Path) -> dict[str, float]:
-    """Top non-zero emotions from recent emotion-carrying memories.
+    """Top non-zero emotions from recent emotion-carrying memories (when the emotion engine is live: its short
+    averages, present zeros included).
 
     The previous query took the last 50 memories by ``created_at``
     regardless of whether they actually carried an emotion vector.
@@ -381,7 +382,8 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
 
 
 def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
-    """Body block from compute_body_state. None on failure."""
+    """Body block from compute_body_state (from the engine's short averages through body_state_from_short when the
+    emotion engine is live). None on failure."""
     try:
         from brain.body.state import body_state_from_short, compute_body_state
         from brain.body.words import count_words_in_session

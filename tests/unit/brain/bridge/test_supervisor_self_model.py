@@ -798,12 +798,16 @@ def test_reset_during_the_reads_clears_an_open_gap_without_a_resolution_or_histo
     _saved_gap(persona_dir, status="open", sustained_ticks=5, reset_seen=None)
     _history_marker(persona_dir)
     before_history = [g.per_channel for g in sm_state.load_or_recover(persona_dir)[0].gap_history]
-    result, bus = _live_tick(
-        persona_dir,
-        emotion_engine_stub,
-        readings={"awe": _reading(short=6.0, difference=2.0, shift=1)},
-        statuses=[EngineStatus(True, None), EngineStatus(True, datetime(2026, 11, 4, 9, 0, tzinfo=UTC))],
-    )
+    from unittest.mock import patch
+
+    with patch("brain.bridge.supervisor.check_and_emit_resolution") as resolution:
+        result, bus = _live_tick(
+            persona_dir,
+            emotion_engine_stub,
+            readings={"awe": _reading(short=6.0, difference=2.0, shift=1)},
+            statuses=[EngineStatus(True, None), EngineStatus(True, datetime(2026, 11, 4, 9, 0, tzinfo=UTC))],
+        )
+    resolution.assert_not_called()  # the clear is not a resolution: no soul candidate, no feed event
     state, _ = sm_state.load_or_recover(persona_dir)
     assert result is True  # the tick finished; the reflection did nothing but the spare rule
     assert state.current_gap is None
@@ -829,7 +833,8 @@ def test_spare_rule_keeps_an_answered_gap_with_three_sustained_ticks_and_clears_
         ("open", 9, False),
     ]
     for index, (status, ticks, kept) in enumerate(cases):
-        persona_dir = _persona_dir(tmp_path / f"case{index}") if (tmp_path / f"case{index}").mkdir() is None else None
+        (tmp_path / f"case{index}").mkdir()
+        persona_dir = _persona_dir(tmp_path / f"case{index}")
         _saved_gap(persona_dir, status=status, sustained_ticks=ticks, reset_seen=None)
         _history_marker(persona_dir)
         sm_cadence.save(persona_dir, sm_cadence.SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0))

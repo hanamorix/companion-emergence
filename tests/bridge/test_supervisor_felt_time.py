@@ -488,3 +488,18 @@ def test_live_body_strain_is_fed_from_the_short_average_not_the_store(tmp_path: 
         dict.fromkeys(("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal"), 9.0),
     )
     assert tired.body_strain > quiet.body_strain
+
+
+def test_live_drivers_survive_a_read_that_raises(tmp_path: Path, emotion_engine_stub) -> None:
+    """The felt-time drivers keep their fail-soft except: a raising read leaves body strain and emotional
+    intensity at their 0.0 defaults and the other two drivers still come back."""
+    emotion_engine_stub.live = True
+
+    def boom():
+        raise RuntimeError("engine fault")
+
+    emotion_engine_stub.read = boom
+    from brain.bridge.supervisor import _derive_intensity_drivers
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    assert drivers.body_strain == 0.0 and drivers.emotional_intensity == 0.0

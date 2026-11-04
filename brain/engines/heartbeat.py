@@ -26,7 +26,7 @@ from brain.bridge.model_tier import (
 )
 from brain.bridge.provider import LLMProvider
 from brain.dev_constants import HEARTBEAT_DECAY_BATCH_BUDGET_S
-from brain.emotion import engine
+from brain.emotion import engine as emotion_engine
 from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
 from brain.health.anomaly import BrainAnomaly
@@ -1425,7 +1425,7 @@ class HeartbeatEngine:
         heartbeat entry stays).
         """
         try:
-            live_engine = engine.engine_for(persona_dir)
+            live_engine = emotion_engine.engine_for(persona_dir)
             if live_engine.is_live():
                 # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
                 # pending or retrying, read() returns nothing and the heartbeat entry is not written this tick.
@@ -1462,7 +1462,7 @@ class HeartbeatEngine:
     @staticmethod
     def _faded_emotions(persona_dir: Path, mem) -> dict[str, float]:
         """`mem`'s emotions at their faded values (the stored values until the switch)."""
-        live_engine = engine.engine_for(persona_dir)
+        live_engine = emotion_engine.engine_for(persona_dir)
         return {n: live_engine.faded_value(mem, n) for n in mem.emotions}
 
     @staticmethod
@@ -1492,6 +1492,9 @@ class HeartbeatEngine:
         dicts — same scalar used elsewhere as "dominant emotion intensity".
         When `forced_resonance` is given (test-only injection), the vector is
         a single-key dict so the snapshot still carries structured data.
+
+        When the emotion engine is live the result is always (0.0, {}): the
+        detector has no engine input, so its emitter stays dormant (#569).
         """
         if forced_resonance is not None:
             return float(forced_resonance), {"forced": float(forced_resonance)}

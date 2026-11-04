@@ -2603,10 +2603,31 @@ def test_live_spike_resonance_is_zero_and_the_forced_resonance_path_is_unchanged
         heartbeat.hebbian.close()
 
 
-def test_the_fired_row_peak_uses_the_faded_value(tmp_path: Path, emotion_engine_stub) -> None:
-    """The dream, reflex and research daemon-state writes pick the peak of the memory's FADED emotions."""
+def test_the_fired_row_peak_helper_uses_the_faded_value(tmp_path: Path, emotion_engine_stub) -> None:
+    """`_faded_emotions` (shared by the dream, reflex and research daemon-state writes) fades through the engine."""
     mem = Memory.create_new(
         content="a dream", memory_type="dream", domain="us", emotions={"love": 9.0, "joy": 6.0}
     )
     emotion_engine_stub.faded = {(mem.id, "love"): 2.0, (mem.id, "joy"): 5.0}
     assert HeartbeatEngine._peak_emotion(HeartbeatEngine._faded_emotions(tmp_path, mem)) == ("joy", 5)
+
+
+def test_the_reflex_daemon_state_entry_takes_its_peak_from_the_faded_values(tmp_path: Path, emotion_engine_stub) -> None:
+    """`_write_daemon_state_for_reflex` reads the fired row's FADED emotions (the dream and research writes share the
+    one `_faded_emotions` call)."""
+    from brain.engines.daemon_state import load_daemon_state
+
+    heartbeat, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        row = Memory.create_new(
+            content="a reflex journal", memory_type="reflex_journal", domain="us", emotions={"love": 9.0, "joy": 6.0}
+        )
+        heartbeat.store.create(row)
+        emotion_engine_stub.faded = {(row.id, "love"): 2.0, (row.id, "joy"): 5.0}
+        heartbeat._write_daemon_state_for_reflex(persona_dir, ("an_arc",))
+        state, _ = load_daemon_state(persona_dir)
+        entry = state.last_reflex
+        assert (entry.dominant_emotion, entry.intensity) == ("joy", 5)
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()

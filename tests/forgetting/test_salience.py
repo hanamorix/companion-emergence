@@ -290,3 +290,26 @@ class _StoredEngine:
 
     def faded_value(self, memory, emotion):
         return memory.emotions[emotion]
+
+
+def test_compute_inputs_fades_the_emotion_input_through_the_engine(tmp_path, emotion_engine_stub):
+    """`salience_inputs_at_drop.emotion` is the faded value, taken once at the write."""
+    from brain.forgetting.salience import compute_inputs
+
+    store = MemoryStore(tmp_path / "memories.db")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        m = _make_memory(emotions={"joy": 10.0})
+        store.create(m)
+        emotion_engine_stub.faded = {(m.id, "joy"): 4.0}
+        inputs = compute_inputs(
+            m,
+            store=store,
+            hebbian=hebbian,
+            felt_time_state=FeltTimeState(lived_age_hours=100.0),
+            soul_linked_ids=set(),
+        )
+        assert inputs.emotion == 0.4
+    finally:
+        store.close()
+        hebbian.close()

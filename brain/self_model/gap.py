@@ -84,9 +84,6 @@ class _Unset:
     def __repr__(self) -> str:
         return "UNSET"
 
-    def __bool__(self) -> bool:
-        return False
-
 
 UNSET = _Unset()
 
@@ -100,6 +97,8 @@ class Gap:
     Attributes:
         per_channel: {channel_name: delta} where delta = short − long.
             Registered channels only. Below-noise-floor channels are omitted.
+            (A gap built by `gap_from_read` holds the engine's signed difference for
+            each shifted channel instead, with no noise floor.)
         magnitude: sum(abs(delta) for delta in per_channel.values()).
             0.0 when short and long are within the noise floor on every channel.
         unnamed_pressure: residual body signal from the short read that maps to no

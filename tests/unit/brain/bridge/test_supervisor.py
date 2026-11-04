@@ -1491,3 +1491,30 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
     assert seen["emotions"] == {"rest_need": 8.5}
     assert captured["is_rest_state"] is True
     assert seen["closed"] == 1
+
+
+def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail_open(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from unittest.mock import MagicMock, patch
+
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+
+    persona_dir = _persona_dir(tmp_path)
+    emotion_engine_stub.live = True
+
+    def boom():
+        raise RuntimeError("engine fault")
+
+    emotion_engine_stub.read = boom
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
+        captured["is_rest_state"] = is_rest_state
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+    assert captured["is_rest_state"] is False

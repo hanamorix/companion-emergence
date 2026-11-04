@@ -117,7 +117,7 @@ def _step(
         object.__setattr__(mem, "state", state)
         s = salience.score(
             mem,
-            store=None,  # unused by score() — see salience.py signature
+            store=None,  # no store: the explicit emotion_engine below stands in for the store-resolved one
             hebbian=None,  # _hebbian_input degrades to 0 on AttributeError
             felt_time_state=felt_state,
             soul_linked_ids=({mem.id} if soul_linked else set()),

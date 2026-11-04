@@ -2114,7 +2114,9 @@ def _build_self_model_block(persona_dir: Path, *, tool_prefix: str = "") -> str 
     """Return the self-model gap block, or None when there's nothing to surface.
 
     Renders only when an open gap exists between her declared (max-pool) and
-    derived (trend/body) emotional reads (self-model design §3, R-F1). Hedged
+    derived (trend/body) emotional reads (self-model design §3, R-F1); when the
+    emotion engine is live the gap is its shifted channels, rendered with their
+    position and direction. Hedged
     framing — she's invited to notice, never commanded to revise.
 
     Failure-safe: a missing/corrupt state file or any read error yields None so

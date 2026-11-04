@@ -2448,12 +2448,10 @@ def _self_model_reflect(
     from brain.utils.memory import days_since_human
     from brain.utils.time import iso_utc
 
-    # ── 4: load prior state, track sustained ticks ──────────────────────────
-    state, _recovered = self_model_state.load_or_recover(persona_dir)
-    prior_gap = state.current_gap
-
     if reads is not None:
         # ── live: a rebuild or catch-up since the last tick runs the spare rule and ends the tick ──
+        state, _recovered = self_model_state.load_or_recover(persona_dir)
+        prior_gap = state.current_gap
         if _self_model_reset_seen(reads, prior_gap):
             _self_model_apply_reset(persona_dir, state, reads)
             return False
@@ -2513,6 +2511,10 @@ def _self_model_reflect(
         )
         long = compute_baseline(memories, now=now)
         new_gap = compute_gap(short, long)
+
+        # ── 4: load prior state, track sustained ticks ──────────────────────────
+        state, _recovered = self_model_state.load_or_recover(persona_dir)
+        prior_gap = state.current_gap
 
     # ── 4a: R-B2 anti-oscillation — honour the reconcile cooldown (live) ─────
     # Drop any channel the prior gap put in cooldown (REGARDLESS of prior

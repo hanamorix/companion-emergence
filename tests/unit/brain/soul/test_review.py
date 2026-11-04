@@ -1105,3 +1105,20 @@ def test_current_emotional_summary_live_is_the_top_three_short_averages(tmp_path
         assert _current_emotional_summary(store) == "neutral"
     finally:
         store.close()
+
+
+def test_current_emotional_summary_live_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
+    from brain.memory.store import MemoryStore
+    from brain.soul.review import _current_emotional_summary
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        emotion_engine_stub.live = True
+
+        def boom():
+            raise RuntimeError("engine fault")
+
+        emotion_engine_stub.read = boom
+        assert _current_emotional_summary(store) == "unknown"
+    finally:
+        store.close()
