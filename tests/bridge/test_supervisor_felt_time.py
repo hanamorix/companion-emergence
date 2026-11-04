@@ -449,7 +449,7 @@ def _live_drivers(tmp_path: Path, stub, readings: dict[str, float]):
     [
         {},
         {"rest_need": 8.0},
-        {n: 9.0 for n in ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")},
+        dict.fromkeys(("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal"), 9.0),
     ],
     ids=["empty", "partial", "full"],
 )
@@ -485,6 +485,6 @@ def test_live_body_strain_is_fed_from_the_short_average_not_the_store(tmp_path: 
     tired = _live_drivers(
         tmp_path,
         emotion_engine_stub,
-        {n: 9.0 for n in ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")},
+        dict.fromkeys(("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal"), 9.0),
     )
     assert tired.body_strain > quiet.body_strain

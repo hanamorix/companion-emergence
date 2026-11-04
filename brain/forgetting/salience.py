@@ -14,11 +14,15 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from brain.felt_time.state import FeltTimeState
 from brain.memory import memory_utils
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
 
 DEFAULT_WEIGHTS: dict[str, float] = {
     "emotion": 0.30,
@@ -56,10 +60,19 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def _emotion_input(memory: Memory) -> float:
+def _emotion_input(memory: Memory, eng: EmotionEngine | None) -> float:
+    """The strongest emotion of the memory as a fraction of the denominator.
+
+    `eng` is the emotion engine, whose `faded_value` is the value the memory carries now (the stored value until the
+    switch), or None for the stored values (an in-memory store has no engine). Required, no default: every caller
+    says which it means.
+    """
     if not memory.emotions:
         return 0.0
-    max_intensity = max(memory.emotions.values())
+    if eng is None:
+        max_intensity = max(memory.emotions.values())
+    else:
+        max_intensity = max(eng.faded_value(memory, n) for n in memory.emotions)
     return _clamp(float(max_intensity) / _EMOTION_DENOMINATOR)
 
 
@@ -157,11 +170,17 @@ def score(
     felt_time_state: FeltTimeState | None,
     soul_linked_ids: Iterable[str],
     weights: dict[str, float] | None = None,
+    emotion_engine: EmotionEngine | None = None,
 ) -> float:
-    """Composite salience in [0, 1]. See module docstring."""
+    """Composite salience in [0, 1]. See module docstring.
+
+    `emotion_engine` is the engine the emotion input fades through; None resolves it from `store` (an in-memory
+    store resolves to no engine, so stored values). A pass over many memories resolves it once and passes it.
+    """
     w = weights or DEFAULT_WEIGHTS
+    eng = emotion_engine if emotion_engine is not None else store.emotion_engine()
     inputs = SalienceInputs(
-        emotion=max(_emotion_input(memory), _peak_input(memory, felt_time_state)),
+        emotion=max(_emotion_input(memory, eng), _peak_input(memory, felt_time_state)),
         hebbian=_hebbian_input(memory, hebbian),
         recall=_recall_input(memory),
         soul=_soul_input(memory, soul_linked_ids),
@@ -183,11 +202,13 @@ def compute_inputs(
     hebbian: HebbianMatrix,
     felt_time_state: FeltTimeState | None,
     soul_linked_ids: Iterable[str],
+    emotion_engine: EmotionEngine | None = None,
 ) -> SalienceInputs:
     """Return the per-input breakdown — used by the graveyard writer to
-    record salience_inputs_at_drop for audit."""
+    record salience_inputs_at_drop for audit. `emotion_engine` as in `score`."""
+    eng = emotion_engine if emotion_engine is not None else store.emotion_engine()
     return SalienceInputs(
-        emotion=max(_emotion_input(memory), _peak_input(memory, felt_time_state)),
+        emotion=max(_emotion_input(memory, eng), _peak_input(memory, felt_time_state)),
         hebbian=_hebbian_input(memory, hebbian),
         recall=_recall_input(memory),
         soul=_soul_input(memory, soul_linked_ids),

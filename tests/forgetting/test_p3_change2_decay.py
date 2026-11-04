@@ -24,6 +24,14 @@ from brain.felt_time.state import FeltTimeState
 from brain.forgetting import policy, salience
 from brain.memory.store import Memory
 
+
+class _StoredValues:
+    """An engine whose faded value is the stored one. These simulations score synthetic memories with no store, and
+    `score` resolves its engine from the store unless one is passed."""
+
+    def faded_value(self, memory, emotion):
+        return memory.emotions[emotion]
+
 _CADENCE_HOURS = 6.0
 _TWO_LIVED_YEARS_HOURS = 17_532.0  # per plan's stated anchor
 _MAX_SIM_HOURS = _TWO_LIVED_YEARS_HOURS * 3  # generous ceiling so LOSE has room to appear
@@ -113,6 +121,7 @@ def _step(
             hebbian=None,  # _hebbian_input degrades to 0 on AttributeError
             felt_time_state=felt_state,
             soul_linked_ids=({mem.id} if soul_linked else set()),
+            emotion_engine=_StoredValues(),
         )
         next_low = consecutive_low + 1 if s < dev_constants.LOST_THRESHOLD else 0
         transition = policy.next_state(
@@ -180,7 +189,12 @@ def test_c2_2_high_importance_survives_well_beyond_30_lived_days_where_imp0_does
         object.__setattr__(mem, "created_at", datetime.now(UTC) - timedelta(hours=thirty_days_hours))
         object.__setattr__(mem, "state", "active")
         s = salience.score(
-            mem, store=None, hebbian=None, felt_time_state=felt_state, soul_linked_ids=set()
+            mem,
+            store=None,
+            hebbian=None,
+            felt_time_state=felt_state,
+            soul_linked_ids=set(),
+            emotion_engine=_StoredValues(),
         )
         transition = policy.next_state(mem, salience=s, consecutive_low_passes=0, narrative_weight=0.0)
         assert transition == policy.Transition.NONE  # still active: not FADE, not LOSE

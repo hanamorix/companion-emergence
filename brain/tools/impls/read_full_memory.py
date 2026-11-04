@@ -43,4 +43,4 @@ def read_full_memory(
     if mem is None:
         return {"error": "not found", "id": memory_id}
     open_memory(mem, store=store, persona_dir=persona_dir, seen=None)
-    return _mem_to_result(mem)
+    return _mem_to_result(mem, persona_dir)
