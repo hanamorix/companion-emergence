@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.utils import file_ops
 from brain.utils.atomic_write import save_with_backup_text
 from tests.thread_support import finish_threads, release_at_teardown
@@ -1324,6 +1325,53 @@ def test_cr15_a_frozen_older_tmp_loses_to_a_newer_bak1(tmp_path: Path) -> None:
     r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,))
     assert r.data == {"day": "fresh-bak1"}
     assert tmp.exists()  # an unused fallback is left alone
+
+
+def _refuse_unlink_of(monkeypatch, name: str, times: int) -> list[int]:
+    """``os.unlink`` of a file called ``name`` raises PermissionError for the first ``times`` calls (a scanner holding it)."""
+    real, calls = os.unlink, []
+
+    def unlink(path, *args, **kwargs):
+        if Path(path).name == name:
+            calls.append(1)
+            if len(calls) <= times:
+                raise PermissionError(13, "in use")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    return calls
+
+
+def test_a_transient_refusal_on_the_fallback_cleanup_is_retried(tmp_path: Path, monkeypatch) -> None:
+    """#643 review: the cleanup of a used fallback was a raw ``unlink``, so a scanner holding the file for a moment made
+    a restore that had already succeeded fail."""
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    tmp = tmp_path / "b.tmp"
+    tmp.write_bytes(b'{"day": "today"}')
+    _sleeps(monkeypatch)
+    calls = _refuse_unlink_of(monkeypatch, "b.tmp", times=2)
+    r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,))
+    assert r.data == {"day": "today"} and r.outcome == "restored"
+    assert len(calls) == 3 and not tmp.exists()
+    assert json.loads(p.read_text()) == {"day": "today"}
+
+
+def test_a_persistent_refusal_on_the_fallback_cleanup_keeps_the_restore(tmp_path: Path, monkeypatch, caplog) -> None:
+    """The restored bytes are already at the live path. A fallback that cannot be deleted stays as an unused file; it
+    must not turn the successful restore into a failure."""
+    p = tmp_path / "b.json"
+    p.write_bytes(b"{nope")
+    tmp = tmp_path / "b.tmp"
+    tmp.write_bytes(b'{"day": "today"}')
+    _sleeps(monkeypatch)
+    calls = _refuse_unlink_of(monkeypatch, "b.tmp", times=10_000)
+    with caplog.at_level(logging.WARNING):
+        r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,))
+    assert r.data == {"day": "today"} and r.outcome == "restored"
+    assert len(calls) == dev_constants.FILE_RETRY_ATTEMPTS and tmp.read_bytes() == b'{"day": "today"}'
+    assert json.loads(p.read_text()) == {"day": "today"}
+    assert [rec for rec in caplog.records if "b.tmp" in rec.getMessage() and rec.levelno == logging.WARNING]
 
 
 def test_cr15_equal_mtimes_prefer_the_fallback_and_an_invalid_tmp_is_ignored(
