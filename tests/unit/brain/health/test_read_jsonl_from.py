@@ -149,3 +149,104 @@ def test_a_bad_line_has_the_same_reason_as_iter_jsonl_raw_gives_in_strict_mode(t
     with pytest.raises(jio.JsonFileError) as exc:
         list(jio.iter_jsonl_raw(path, strict=True))
     assert read.records[1].reason == exc.value.detail and read.records[1].line == exc.value.line == 2
+
+
+# --- streaming (hana review 1): no whole-file load, bounded memory, opened through the read retry ------------------
+
+
+def _forbid_whole_file_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.utils import file_ops
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("read_jsonl_from loaded the whole file")
+
+    for owner in (file_ops, jio):
+        monkeypatch.setattr(owner, "read_bytes_stat", refuse, raising=False)
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+
+
+def test_reads_without_loading_the_whole_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _write(tmp_path, b'{"a": 1}\n\nnot json\n{"a": 4}\n{"a": 5')
+    _forbid_whole_file_reads(monkeypatch)
+    read = jio.read_jsonl_from(path, 1)
+    assert [(r.line, r.data is None) for r in read.records] == [(3, True), (4, False)] and read.end_line == 4
+
+
+def test_memory_stays_bounded_on_a_large_file(tmp_path: Path) -> None:
+    import tracemalloc
+
+    line = b'{"k": "' + b"x" * 90 + b'"}\n'
+    count = 60_000
+    path = _write(tmp_path, line * count)
+    size = path.stat().st_size
+    assert size > 5_000_000
+    tracemalloc.start()
+    try:
+        read = jio.read_jsonl_from(path, count)  # skips every line
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert read == jio.JsonlRead([], count)
+    assert peak < size // 10
+    tail = jio.read_jsonl_from(path, count - 2)
+    assert [r.line for r in tail.records] == [count - 1, count] and tail.end_line == count
+
+
+def test_opens_the_file_through_retry_transient_with_the_read_schedule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain import dev_constants
+    from brain.utils import file_ops
+
+    seen: list[tuple[object, dict]] = []
+    real = file_ops.retry_transient
+
+    def spy(fn, *args, **kwargs):
+        seen.append((fn, kwargs))
+        return real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(file_ops, "retry_transient", spy)
+    jio.read_jsonl_from(_write(tmp_path, b'{"a": 1}\n'))
+    assert any(
+        fn is open and kw == {"attempts": dev_constants.FILE_READ_ATTEMPTS, "windows_only": True} for fn, kw in seen
+    )
+
+
+@pytest.mark.no_base_failure(reason="pins the unchanged contract through the rewrite: a skipped line is counted, never parsed or reported")
+def test_a_bad_line_before_the_start_line_is_counted_and_not_reported(tmp_path: Path) -> None:
+    read = jio.read_jsonl_from(_write(tmp_path, b'not json\n{"a": 2}\n{"a": 3}\n'), 2)
+    assert _lines(read) == [(3, {"a": 3})] and read.end_line == 3
+
+
+@pytest.mark.no_base_failure(reason="pins the unchanged contract through the rewrite: a torn last line is not counted even when start_line is past the end")
+def test_a_torn_last_line_is_not_counted_when_the_start_line_is_past_the_end(tmp_path: Path) -> None:
+    path = _write(tmp_path, b'{"a": 1}\n{"a": 2}\n{"a": 3')
+    assert jio.read_jsonl_from(path, 99) == jio.JsonlRead([], 2)
+    assert jio.read_jsonl_from(path, 2) == jio.JsonlRead([], 2)
+
+
+@pytest.mark.no_base_failure(reason="pins the unchanged contract through the rewrite: only an open that is refused on Windows is retried, and any other OSError is raised")
+def test_open_errors_are_raised_and_only_a_windows_refusal_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.utils import file_ops
+
+    path = _write(tmp_path, b'{"a": 1}\n')
+    with pytest.raises(OSError):
+        jio.read_jsonl_from(tmp_path)  # a folder: not an empty result
+    tries: list[int] = []
+
+    def flaky_open(file, *args, **kwargs):
+        tries.append(1)
+        if len(tries) < 3:
+            raise PermissionError(13, "busy")
+        return real_open(file, *args, **kwargs)
+
+    real_open = open
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops, "open", flaky_open, raising=False)
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", True)
+    assert jio.read_jsonl_from(path).end_line == 1 and len(tries) == 3
+    tries.clear()
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", False)
+    with pytest.raises(PermissionError):
+        jio.read_jsonl_from(path)
+    assert len(tries) == 1

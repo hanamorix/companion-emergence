@@ -550,17 +550,22 @@ def test_session_append_lock_propagates_a_body_error_once(tmp_path):
 
 
 @pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-@pytest.mark.no_base_failure(reason="pins read_session's behaviour on origin/main: a line the JSON parser cannot load stops the read")
-def test_read_session_raises_the_parsers_own_error_on_an_over_long_integer_line(tmp_path: Path) -> None:
-    """A line holding an integer past the interpreter's digit limit stops the read with the bare ``ValueError`` (a known
-    defect, kept as it was before #643 and filed separately; the bridge's ``read_session`` handler then skips the session).
-    A fix that makes the read skip the line must change this test on purpose."""
+def test_read_session_raises_a_named_error_on_an_over_long_integer_line(tmp_path: Path) -> None:
+    """A line holding an integer past the interpreter's digit limit stops the read with ``UnloadableJsonlLineError`` (a known
+    defect, kept as it was before #643 and filed as #646; it is a ``ValueError``, so the bridge's ``read_session`` handler
+    still skips the session). A fix for #646 that makes the read skip the line must change this test on purpose."""
+    from brain.health import jsonl_reader
+
     folder = tmp_path / "active_conversations"
     folder.mkdir()
     huge = '{"speaker": "user", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
     good1 = json.dumps({"speaker": "user", "text": "one"})
     good2 = json.dumps({"speaker": "assistant", "text": "two"})
-    (folder / "sess_big.jsonl").write_text("\n".join([good1, huge, good2]) + "\n", encoding="utf-8")
+    session = folder / "sess_big.jsonl"
+    session.write_text("\n".join([good1, huge, good2]) + "\n", encoding="utf-8")
     with pytest.raises(ValueError) as exc:
         read_session(tmp_path, "sess_big")
-    assert type(exc.value) is ValueError  # not a JsonFileError, which is a ValueError too
+    assert type(exc.value).__name__ == "UnloadableJsonlLineError"
+    assert type(exc.value) is jsonl_reader.UnloadableJsonlLineError
+    assert (exc.value.code, exc.value.line, exc.value.path) == ("jsonl_unloadable_line", 2, session)
+    assert type(exc.value.__cause__) is ValueError

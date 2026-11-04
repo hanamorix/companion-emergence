@@ -72,7 +72,7 @@ from brain.health.jsonl_reader import (
 )
 from brain.utils.atomic_write import save_with_backup_text
 from brain.utils.file_lock import file_lock
-from brain.utils.file_ops import read_bytes, read_bytes_stat, replace_file, stat_path
+from brain.utils.file_ops import delete_file, open_read, read_bytes_stat, replace_file, stat_path
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -303,7 +303,7 @@ def read_json_result(
     and HEAL; under RAISE it applies only to a missing file. ``expect`` is a type (or tuple) the
     top-level value must be; ``validate`` raises to reject. ``fallbacks`` (RESTORE/HEAL only) are
     sibling files tried in preference to the backup chain when they are valid and not older than
-    the freshest valid backup. A fallback is *removed* when installed, so it must be a throwaway
+    the freshest valid backup. A fallback is *removed* when installed (left if the delete keeps failing), so it must be a throwaway
     sibling (a stray ``.tmp``); one that resolves to the live file or a backup is a ValueError.
     """
     path = _as_path(path)
@@ -586,7 +586,14 @@ def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: 
             raw, _sig = read_bytes_stat(chosen_fallback)
             data = _check(raw, expect, validate)
             save_with_backup_text(path, raw.decode("utf-8-sig"), keep_backups=False, newline="\n")
-            chosen_fallback.unlink(missing_ok=True)
+            try:
+                delete_file(chosen_fallback)
+            except OSError as exc:
+                # The restore is already in place; the used fallback is only an unused sidecar. Keep the restore.
+                logger.warning(
+                    "restored %s from fallback %s but could not delete the fallback (errno %s); leaving it",
+                    path.name, chosen_fallback.name, exc.errno,
+                )
             return (
                 data,
                 "restored_from_bak1",
@@ -912,10 +919,10 @@ def parse_jsonl(
         raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
 
 
-def _stream(binary, source: Path, strict: bool) -> Iterator[dict]:
+def _stream(binary, source: Path, strict: bool, window: bool = False) -> Iterator[dict]:
     wrapper = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="surrogateescape", newline="\n")
     try:
-        yield from _parse_lines(wrapper, source, strict=strict)
+        yield from _parse_lines(wrapper, source, strict=strict, window=window)
     except JsonlLineError as exc:
         raise _StrictLineError(source, exc.reason, exc.line) from exc
     finally:
@@ -936,7 +943,7 @@ def iter_jsonl(
     """Yield the dict records of a JSONL file (``.gz`` by suffix), skipping bad lines with a warning.
 
     A missing file yields nothing. ``strict=True`` raises ``JsonFileError(kind="line")`` on the first bad
-    line (after yielding the good ones before it); a line the JSON parser cannot load (an integer past the digit limit, nesting too deep) stops the read with the parser's own exception in either mode. An I/O failure (including a truncated gz) ends the
+    line (after yielding the good ones before it); a line the JSON parser cannot load (an integer past the digit limit, nesting too deep) stops the read with ``UnloadableJsonlLineError`` (#646) in either mode. An I/O failure (including a truncated gz) ends the
     iteration with a throttled warning (DEFAULT) or raises ``JsonFileError(kind="io")`` (RAISE).
     """
     path = _as_path(path)
@@ -1004,10 +1011,25 @@ def iter_jsonl_raw(
         yield from _io_stop(path, exc, recover)  # type: ignore[misc]
 
 
-def _stream_raw(binary, source: Path, strict: bool, bad_lines: bool) -> Iterator[tuple[str, dict | None]]:
+def _stream_raw(
+    binary, source: Path, strict: bool, bad_lines: bool, *, start_line: int | None = None
+) -> Iterator[tuple[Any, Any]]:
+    """The one loop that streams a JSONL file line by line, for :func:`iter_jsonl_raw` and :func:`read_jsonl_from`.
+
+    Default mode yields ``(line_text, record)`` as :func:`iter_jsonl_raw` documents. With ``start_line`` (the positions mode of
+    :func:`read_jsonl_from`) it yields ``(line_number, verdict)`` for every complete line: ``verdict`` is None for a line at or
+    before ``start_line`` (skipped without being parsed), else the line's :func:`classify_line` verdict, whose ``kind`` and
+    ``data`` are both None for a blank line, so a blank line is counted. A last line with no newline yet (torn) ends the stream
+    uncounted. Nothing is logged and ``strict`` does not apply in this mode: the caller decides what a bad line is worth.
+    """
     wrapper = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="surrogateescape", newline="\n")
     try:
         for line_index, raw in enumerate(wrapper, start=1):
+            if start_line is not None:
+                if not raw.endswith("\n"):
+                    return
+                yield line_index, (None if line_index <= start_line else classify_line(raw))
+                continue
             verdict = classify_line(raw)
             if verdict.kind is None:
                 if verdict.data is not None:
@@ -1062,25 +1084,27 @@ def read_jsonl_from(path: Path | str, start_line: int = 0) -> JsonlRead:
     counted, so it is read whole once it is complete; if a crash left it torn and the next ``append_jsonl`` wrote a newline
     before its own record, it is then a complete, bad line. A missing file gives no records and ``end_line`` 0; a
     ``start_line`` past the end gives no records and the true ``end_line``. Nothing is logged: the caller decides what a bad
-    line is worth. The file is read whole through ``file_ops.read_bytes`` as raw bytes (a ``.gz`` file is not decompressed), and any other ``OSError`` is raised.
+    line is worth. The file is streamed line by line (a ``.gz`` file is not decompressed): the lines skipped and the file itself cost no memory beyond the longest line (the returned records grow with the lines after
+    ``start_line``), and the read is one pass over the file, so a log that is drained after each read holds only the lines since the last drain. It is opened through
+    ``file_ops.open_read`` (a Windows sharing violation is retried briefly); any other ``OSError`` is raised.
     """
     if start_line < 0:
         raise ValueError(f"start_line must not be negative, got {start_line}")
     try:
-        data = read_bytes(path)
+        fh = open_read(path)
     except FileNotFoundError:
         return JsonlRead([], 0)
-    if data.startswith(_BOM):
-        data = data[len(_BOM) :]
-    lines = data.split(b"\n")
-    end_line = len(lines) - 1  # the last piece is what follows the final newline: empty, or a torn line
     records: list[JsonlRecord] = []
-    for number in range(start_line + 1, end_line + 1):
-        verdict = classify_line(lines[number - 1].decode("utf-8", "surrogateescape"))
-        if verdict.kind is not None:
-            records.append(JsonlRecord(number, None, verdict.reason))
-        elif verdict.data is not None:
-            records.append(JsonlRecord(number, verdict.data, None))
+    end_line = 0
+    with fh:
+        for number, verdict in _stream_raw(fh, _as_path(path), False, False, start_line=start_line):
+            end_line = number
+            if verdict is None:
+                continue
+            if verdict.kind is not None:
+                records.append(JsonlRecord(number, None, verdict.reason))
+            elif verdict.data is not None:
+                records.append(JsonlRecord(number, verdict.data, None))
     return JsonlRead(records, end_line)
 
 
@@ -1096,6 +1120,11 @@ def read_jsonl_tail(
 
     A ``.gz`` path cannot be read backwards: it is streamed through :func:`iter_jsonl` and the last ``n``
     *records* (after bad lines are skipped) are returned.
+
+    A plain file is parsed as a window of the last lines. A line the JSON parser cannot load then stops the read with an
+    ``UnloadableJsonlLineError`` whose ``line`` is None (a file line would need a count of the whole file, which this reader
+    exists to avoid) and whose ``reason`` names the line's position in the window. A strict-mode ``JsonFileError(kind="line")``
+    carries that window position as its ``line``.
     """
     path = _as_path(path)
     _check_jsonl_recover(recover)
@@ -1113,7 +1142,7 @@ def read_jsonl_tail(
         _report(path, "io", exc, "returning no records")
         return []
     try:
-        return list(_stream(io.BytesIO(b"\n".join(lines)), path, strict))
+        return list(_stream(io.BytesIO(b"\n".join(lines)), path, strict, window=True))
     except _StrictLineError as exc:
         raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
 
