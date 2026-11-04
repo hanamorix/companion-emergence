@@ -1023,8 +1023,8 @@ def read_jsonl_from(path: Path | str, start_line: int = 0) -> JsonlRead:
     counted, so it is read whole once it is complete; if a crash left it torn and the next ``append_jsonl`` wrote a newline
     before its own record, it is then a complete, bad line. A missing file gives no records and ``end_line`` 0; a
     ``start_line`` past the end gives no records and the true ``end_line``. Nothing is logged: the caller decides what a bad
-    line is worth. The file is streamed line by line (a ``.gz`` file is not decompressed): memory is bounded by the longest line, and the read is
-    one pass over the file, so a log that is drained after each read holds only the lines since the last drain. It is opened through
+    line is worth. The file is streamed line by line (a ``.gz`` file is not decompressed): the lines skipped and the file itself cost no memory beyond the longest line (the returned records grow with the lines after
+    ``start_line``), and the read is one pass over the file, so a log that is drained after each read holds only the lines since the last drain. It is opened through
     ``file_ops.open_read`` (a Windows sharing violation is retried briefly); any other ``OSError`` is raised.
     """
     if start_line < 0:

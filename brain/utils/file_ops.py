@@ -8,7 +8,7 @@ the call.
 
 Also here, because no shared function existed for them: :func:`list_dir` (the sorted names in a folder) and :func:`stat_path`
 (one ``os.stat``, with the key a cache compares). Neither creates anything. JSON and JSONL are read and written through
-``brain.health.json_io``, which reads its bytes with :func:`read_bytes_stat`.
+``brain.health.json_io``, which reads its bytes with :func:`read_bytes_stat` and opens a file it streams with :func:`open_read`.
 
 This module sits below ``brain.utils.atomic_write`` and ``brain.health``: it imports only the standard library and
 ``brain.dev_constants``, so every module may call it without an import cycle.
@@ -86,8 +86,8 @@ def open_read(path: str | Path):
     """Open a file for reading bytes, for a caller that streams it; the caller closes the handle.
 
     The open gets the read schedule of :func:`read_bytes_stat` (``FILE_READ_ATTEMPTS`` tries, Windows only; one attempt on
-    other systems, where a ``PermissionError`` is a real one). A missing file raises ``FileNotFoundError`` and a folder an
-    ``OSError`` at once.
+    other systems, where a ``PermissionError`` is a real one). A missing file raises ``FileNotFoundError`` at once; a folder raises
+    ``IsADirectoryError`` on Linux and macOS (on Windows a ``PermissionError``, retried like any other).
     """
     return retry_transient(open, path, "rb", attempts=dev_constants.FILE_READ_ATTEMPTS, windows_only=True)
 

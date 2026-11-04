@@ -214,7 +214,7 @@ RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.
 # --- transient file-access retry (#643) --------------------------------------
 # Windows refuses to replace, delete or open a file another handle holds for a moment (WinError 32: a just-flushed writer,
 # an antivirus scan or indexer on a freshly written file, a reader that is not yet closed). `brain.utils.file_ops
-# .retry_transient` is the one retry for it, and replace, delete and the whole-file read go through it. A failed try is
+# .retry_transient` is the one retry for it, and replace, delete, the whole-file read and the open of a file that is streamed go through it. A failed try is
 # repeated up to FILE_RETRY_ATTEMPTS tries in all, sleeping FILE_RETRY_SLEEP_S * n after the n-th failed try (0.05, 0.10 ...
 # 0.35 s, about 1.4 s in all) before the error is let through, so a real permission problem still fails loudly. A read holds
 # the file for microseconds, so it rides out a rename in progress with fewer tries, and only on Windows: on Linux and macOS a
