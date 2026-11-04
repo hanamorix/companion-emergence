@@ -9,11 +9,16 @@ Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona 
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
+import brain.emotion.engine_utils as engine_utils
 import brain.memory.store as store_module
 from brain.memory import embedding_matrix, embeddings
 from brain.memory.store import Memory, MemoryStore
@@ -27,9 +32,9 @@ _CHANGED = {"content", "content_snapshot", "emotions_json", "created_at", "embed
 
 @pytest.fixture(autouse=True)
 def _utc_days(monkeypatch):
-    """The store's local-day conversion as UTC, so no cell depends on the host's zone. `raising=False`: on a base without the
-    name a cell still reaches its own assertion."""
-    monkeypatch.setattr(store_module, "to_local", lambda dt: dt.astimezone(UTC), raising=False)
+    """The local-day conversion the store's date prefix goes through (`engine_utils.day_of` reads `engine_utils.to_local`) as UTC,
+    so no cell depends on the host's zone."""
+    monkeypatch.setattr(engine_utils, "to_local", lambda dt: dt.astimezone(UTC))
 
 
 @pytest.fixture
@@ -227,11 +232,52 @@ def test_refresh_prefixes_a_text_that_does_not_start_with_the_working_date_form(
 
 def test_the_date_is_the_local_calendar_day_not_the_utc_day(store, monkeypatch):
     zone = timezone(timedelta(hours=13))
-    monkeypatch.setattr(store_module, "to_local", lambda dt: dt.astimezone(zone), raising=False)
+    monkeypatch.setattr(engine_utils, "to_local", lambda dt: dt.astimezone(zone))
     late = datetime(2031, 3, 4, 23, 0, 0, tzinfo=UTC)  # 2031-03-05 12:00 at +13
     memory_id = _make(store, {"joy": 8.0}, created_at=late)
     store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     assert _raw(store, memory_id)["content"] == _prefix("2031-03-05") + "Bob likes tea"
+
+
+def test_the_prefix_day_comes_from_engine_utils_day_of(store, monkeypatch):
+    """One day rule (P1): the store does not convert the day itself, it asks `engine_utils.day_of`. A day no real conversion of
+    the row's `created_at` could give shows the prefix follows that function."""
+    seen: list[datetime] = []
+
+    def fixed_day(t):
+        seen.append(t)
+        return "2099-01-01"
+
+    monkeypatch.setattr(engine_utils, "day_of", fixed_day)
+    memory_id = _make(store, {"joy": 8.0})
+    store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
+    assert _raw(store, memory_id)["content"] == _prefix("2099-01-01") + "Bob likes tea"
+    assert seen == [_OLD]  # asked once, about the row's created_at BEFORE the reset
+
+
+_IMPORT_PROBES = {
+    "store first": (
+        "import brain.memory.store as s; import brain.emotion.engine_utils; "
+        "from datetime import UTC, datetime; "
+        "assert s._with_date_prefix('x', datetime(2031, 3, 4, 12, tzinfo=UTC)).endswith('x')"
+    ),
+    "engine_utils first": "import brain.emotion.engine_utils; import brain.memory.store",
+}
+
+
+@pytest.mark.no_base_failure(
+    reason="a guard against a circular import: the lazy import of day_of in the store keeps it working, and the code before the change had no such import to break"
+)
+@pytest.mark.parametrize("order", sorted(_IMPORT_PROBES))
+def test_the_store_and_engine_utils_import_in_a_fresh_interpreter_in_either_order(order, tmp_path):
+    """`engine_utils` pulls `brain.utils.memory`, which imports the store, so the store must reach `day_of` lazily. The store-first
+    process also runs `_with_date_prefix` once, so the lazy import itself executes in a process where the store came first."""
+    repo = Path(__file__).resolve().parents[4]
+    env = dict(os.environ, PYTHONPATH=str(repo), KINDLED_HOME=str(tmp_path))
+    done = subprocess.run(  # noqa: S603 (fixed argv, our own interpreter)
+        [sys.executable, "-c", _IMPORT_PROBES[order]], cwd=repo, env=env, capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
 
 
 def test_the_placeholder_is_one_constant_and_the_add_and_the_skip_both_follow_it(store, monkeypatch):
@@ -445,7 +491,7 @@ def test_an_error_after_the_transaction_began_rolls_back_and_propagates(store, m
     def boom(dt):
         raise OSError("no local time for this date")
 
-    monkeypatch.setattr(store_module, "to_local", boom, raising=False)
+    monkeypatch.setattr(engine_utils, "to_local", boom)
     with pytest.raises(OSError, match="no local time"):
         store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     assert store._conn.in_transaction is False
@@ -479,7 +525,7 @@ def test_the_read_happens_inside_the_write_transaction_begun_first(store):
 
 
 def test_no_other_writer_can_get_in_between_the_read_and_the_write(store, monkeypatch):
-    # `to_local` runs after the SELECT and before the UPDATE: from inside it, a second connection tries to take the write lock.
+    # The day conversion (`engine_utils.to_local`, through `day_of`) runs after the SELECT and before the UPDATE: from inside it, a second connection tries to take the write lock.
     memory_id = _make(store, {"joy": 8.0})
     outcomes: list[object] = []
 
@@ -495,7 +541,7 @@ def test_no_other_writer_can_get_in_between_the_read_and_the_write(store, monkey
             other.close()
         return dt.astimezone(UTC)
 
-    monkeypatch.setattr(store_module, "to_local", to_local_that_probes_the_lock, raising=False)
+    monkeypatch.setattr(engine_utils, "to_local", to_local_that_probes_the_lock)
     store._reembed_or_clear = _Recorder()
     store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     assert len(outcomes) == 1

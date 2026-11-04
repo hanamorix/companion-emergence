@@ -1516,12 +1516,13 @@ _OLD_CREATED_AT = datetime(2031, 3, 4, 12, 0, 0, tzinfo=UTC)
 
 
 def _patch_local_day(monkeypatch, hours=0):
-    """Make the store's local-day conversion a fixed offset (so no cell depends on the host's zone). `raising=False`: on a base
-    without the name the cell still reaches its own assertion."""
+    """Make the local-day conversion the store's date prefix goes through (`engine_utils.day_of` reads `engine_utils.to_local`) a
+    fixed offset, so no cell depends on the host's zone. Returns the store module, whose placeholder the cells read."""
+    import brain.emotion.engine_utils as engine_utils
     import brain.memory.store as store_module
 
     zone = timezone(timedelta(hours=hours))
-    monkeypatch.setattr(store_module, "to_local", lambda dt: dt.astimezone(zone), raising=False)
+    monkeypatch.setattr(engine_utils, "to_local", lambda dt: dt.astimezone(zone))
     return store_module
 
 

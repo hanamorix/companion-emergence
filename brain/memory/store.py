@@ -32,7 +32,6 @@ from brain import dev_constants, tunables
 from brain.memory import cost_series
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 from brain.utils.sqlite_open import OpenProfile, close_on_error, open_store_connection
-from brain.utils.time import to_local
 
 logger = logging.getLogger(__name__)
 
@@ -155,11 +154,17 @@ def _date_prefix_pattern(fmt: str) -> re.Pattern[str]:
 
 
 def _with_date_prefix(text: str, created_at: datetime) -> str:
-    """`text` with the local calendar day of `created_at` at its start, unless it already starts with a date in the working form."""
+    """`text` with the local calendar day of `created_at` at its start, unless it already starts with a date in the working form.
+
+    The day is `engine_utils.day_of`, the one day rule the engine uses. It is imported here, not at the top: `brain.emotion.engine_utils`
+    pulls `brain.utils.memory`, which imports this module.
+    """
+    from brain.emotion.engine_utils import day_of
+
     fmt = DATE_PREFIX_FORMAT_PLACEHOLDER
     if _date_prefix_pattern(fmt).match(text):
         return text
-    return fmt.replace("{date}", to_local(created_at).date().isoformat()) + text
+    return fmt.replace("{date}", day_of(created_at)) + text
 
 
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
@@ -3009,6 +3014,9 @@ class MemoryStore:
             before = _coerce_utc(row["created_at"])
             content = _with_date_prefix(row["content"], before)
             snapshot = row["content_snapshot"]
+            # A fading row's snapshot (the original text `unfade` restores) is dated with the same origin day, so an unfade after
+            # this write-back keeps the day the memory was made. Accepted edge: a summary made by `fade` after an earlier write-back
+            # has no prefix, so a later write-back dates that summary with the last reset day while the snapshot keeps the origin day.
             new_snapshot = None if snapshot is None else _with_date_prefix(snapshot, before)
             assignments = ["emotions_json = ?", "created_at = ?"]
             values: list[Any] = [_emotions_column(emotions), created_at.isoformat()]
