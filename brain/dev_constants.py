@@ -454,3 +454,7 @@ SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
 # daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high regardless). Owner-set,
 # 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
 FEELS_HIGH_RANGE_FRACTION: float = 0.5
+# Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
+# `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
+# replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
+BODY_ENERGY_HIGH_COUNT: int = 6

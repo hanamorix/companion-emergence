@@ -82,6 +82,22 @@ def test_more_than_six_high_feelings_lower_energy_by_one_and_six_do_not():
     assert _body(short, *names).energy == BASE_ENERGY - 1
 
 
+def test_the_high_feeling_count_is_one_dev_constant_read_at_call_time_on_both_paths(monkeypatch):
+    """The count that lowers energy ("more than six") is `dev_constants.BODY_ENERGY_HIGH_COUNT`, used by the engine path
+    (`body_state_from_short`) and the old path (`compute_body_state`) alike: lowering it to 2 makes three high feelings enough."""
+    from brain import dev_constants
+
+    names = [f"feeling_{i}" for i in range(3)]
+    short = dict.fromkeys(names, 0.5)
+    old_short = dict.fromkeys(names, 7.5)  # at the old path's fixed level of 7.0
+    assert dev_constants.BODY_ENERGY_HIGH_COUNT == 6
+    assert _body(short, *names).energy == BASE_ENERGY
+    assert compute_body_state(emotions=old_short, **FRESH).energy == BASE_ENERGY
+    monkeypatch.setattr(dev_constants, "BODY_ENERGY_HIGH_COUNT", 2)
+    assert _body(short, *names).energy == BASE_ENERGY - 1
+    assert compute_body_state(emotions=old_short, **FRESH).energy == BASE_ENERGY - 1
+
+
 def test_all_values_at_the_top_but_nothing_high_leaves_energy_and_temperature_at_baseline():
     names = [f"feeling_{i}" for i in range(8)] + [
         "rest_need",

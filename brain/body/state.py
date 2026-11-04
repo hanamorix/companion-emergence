@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import brain.dev_constants as dev_constants  # pure data, listed in the purity guard's _PURE_BRAIN_MODULES
+
 # The 6-emotion body set tracked by compute_body_state.
 # Reconciliation 2026-04-30: arousal + desire are existing core emotions
 # (not new); the four new ones live in vocabulary._BASELINE under category="body".
@@ -87,7 +89,7 @@ def compute_body_state(
     energy = _energy_from_flags(
         session_hours,
         words_written,
-        many_high=sum(1 for v in emotions.values() if v >= 7.0) > 6,
+        many_high=sum(1 for v in emotions.values() if v >= 7.0) > dev_constants.BODY_ENERGY_HIGH_COUNT,
         rest_need_high=emotions.get("rest_need", 0.0) >= 7.0,
         peace_high=emotions.get("peace", 0.0) >= 7.0,
     )
@@ -130,7 +132,7 @@ def body_state_from_short(
     energy = _energy_from_flags(
         session_hours,
         words_written,
-        many_high=sum(1 for name in short if feels_high(name)) > 6,
+        many_high=sum(1 for name in short if feels_high(name)) > dev_constants.BODY_ENERGY_HIGH_COUNT,
         rest_need_high=feels_high("rest_need"),
         peace_high=feels_high("peace"),
     )

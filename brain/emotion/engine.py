@@ -699,7 +699,7 @@ class EmotionEngine:
         feeling's own 30-day range). This gathers its inputs: the feeling's `Reading` from `read()` and its snapshot from the
         state cache `read()` takes the shift from. A name `read()` does not return is not high, and nothing stored is
         read or written beyond that cache. A snapshot that cannot be read leaves only the shift part. It raises only if `read()`
-        does, which the engine's `read()` is specified never to do (3.0: `{}` for any failure); Engine 4 must keep that.
+        does, and `read()` never raises (it answers `{}` for any failure), so this never raises.
         """
         reading = self.read().get(name)
         if reading is None:

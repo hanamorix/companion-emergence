@@ -360,7 +360,7 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        winner = self._rank(eligible, emotions, log, now, live=live)
+        winner = self._rank(eligible, emotions, log, now)
         losers = [a for a in eligible if a.name != winner.name]
         skipped.extend(ArcSkipped(arc_name=a.name, reason="single_fire_cap") for a in losers)
 
@@ -446,21 +446,15 @@ class ReflexEngine:
         emotions: Mapping[str, float],
         log: ReflexLog,
         now: datetime,
-        *,
-        live: bool = False,
     ) -> ReflexArc:
         """Highest aggregate threshold-excess wins; ties broken by longest-since-fire.
 
-        On the live path an arc's own threshold numbers are not compared (what fires an arc is `engine.feels_high`), so
-        the excess is the sum of the trigger emotions' short averages.
+        The same ordering on both paths: the sum of each trigger emotion's value minus the arc's own threshold. The
+        thresholds are used only to order eligible arcs; what makes an arc eligible on the live path is `engine.feels_high`.
         """
 
         def key(arc: ReflexArc) -> tuple[float, float]:
-            if live:
-                # An eligible arc has every trigger emotion present (`_trigger_met` fails on an absent one).
-                excess = sum(emotions[e] for e in arc.trigger)
-            else:
-                excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
+            excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
             last = log.last_fire_for_arc(arc.name)
             seconds_since = (now - last).total_seconds() if last is not None else float("inf")
             return (excess, seconds_since)

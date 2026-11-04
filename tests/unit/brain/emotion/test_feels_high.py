@@ -4,9 +4,9 @@ A feeling is high when its shift reads stronger (a rising run), or when its shor
 `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)` of its own daily short averages in the 30-day snapshot. With
 fewer than two snapshot days, or a flat range, only the shift part applies.
 
-The rule is `engine_utils.feels_high_from`; `EmotionEngine.feels_high` gathers its inputs. `read()` is the stub in this
-branch (Engine 4 builds the real one), so the engine tests patch it with the readings they need and keep the snapshot in
-a real state file read through the engine's own state cache.
+The rule is `engine_utils.feels_high_from`; `EmotionEngine.feels_high` gathers its inputs. The gathering tests patch
+`read()` with the readings they need and keep the snapshot in a real state file read through the engine's own state cache;
+the integration test at the end of the engine section runs the real `read()` on a synthetic persona.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from pathlib import Path
 import pytest
 
 from brain import dev_constants
-from brain.emotion import engine_files
+from brain.body.state import body_state_from_short
+from brain.emotion import engine as engine_module
+from brain.emotion import engine_files, persona_loader
 from brain.emotion.engine import EmotionEngine, Reading
 from brain.emotion.engine_files import LoadedState
 from brain.emotion.engine_utils import (
@@ -28,6 +30,7 @@ from brain.emotion.engine_utils import (
     SnapshotDay,
     feels_high_from,
 )
+from tests.unit.brain.emotion._engine_support import install, make_persona
 
 # Snapshot shorts 2.0 and 6.0: with the fraction 0.5 the threshold is exactly 4.0 (all exact in binary).
 RANGE = (2.0, 4.0, 6.0, 3.0)
@@ -105,7 +108,7 @@ def _state(snapshots: dict[str, list[SnapshotDay]]) -> EngineState:
 
 @pytest.fixture
 def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """An engine over a real state file; `read()` (the stub in this branch) answers from `engine.readings`."""
+    """An engine over a real state file; `read()` is patched to answer from `engine.readings`."""
     eng = EmotionEngine(tmp_path)
     eng.readings = {}  # type: ignore[attr-defined]
     monkeypatch.setattr(EmotionEngine, "read", lambda self: dict(self.readings))  # type: ignore[attr-defined]
@@ -170,9 +173,39 @@ def test_an_empty_read_is_not_high(engine, tmp_path):
     assert engine.feels_high("love") is False
 
 
-def test_the_stub_read_of_this_branch_makes_every_name_not_high(tmp_path):
-    _write(tmp_path, {"love": _days(*RANGE)})
-    assert EmotionEngine(tmp_path).feels_high("love") is False  # read() is {} until Engine 4
+def test_through_the_real_engine_the_range_part_fires_and_a_reader_follows_it(tmp_path, monkeypatch):
+    """No patched `read()`: a synthetic persona's real state file, the real `engine_for`, the real `read()`.
+
+    `love` stands in the upper half of its own 30-day range (short 5.0 in 2.0..6.0) and `desire` below it (short 3.5); no run
+    shift is set up (the shift part is closed: `persona_start_at` is unset), so only the range part can make `love` high.
+    Before the real `read()` landed `feels_high` answered False for every name, so this fails there.
+    """
+    monkeypatch.delattr(persona_loader, "refresh_if_changed", raising=False)
+    persona = make_persona(tmp_path / "persona")
+    saved_at = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    state = EngineState(saved_at=saved_at, last_update=saved_at, active_day="2026-11-04")
+    state.emotions["love"] = EmotionState(short=Average(5.0, 1.0), long=Average(3.0, 1.0), snapshot=_days(*RANGE))
+    state.emotions["desire"] = EmotionState(short=Average(3.5, 1.0), long=Average(3.0, 1.0), snapshot=_days(*RANGE))
+    engine_files.save_state(persona, state)
+    install(persona)
+    live = engine_module.engine_for(persona)
+
+    assert live.read()["love"].shift == 0
+    assert live.feels_high("love") is True
+    assert live.feels_high("desire") is False
+    assert live.feels_high("grief") is False  # registered, but not in this state: absent
+
+    def temperature(feels_high):
+        return body_state_from_short(
+            {"love": 5.0, "desire": 3.5},
+            feels_high=feels_high,
+            session_hours=0.0,
+            words_written=0,
+            days_since_contact=0.0,
+            now=saved_at,
+        ).temperature
+
+    assert temperature(live.feels_high) == temperature(lambda name: False) + 1  # love is high; desire is not
 
 
 def test_nothing_is_written_by_asking(engine, tmp_path):

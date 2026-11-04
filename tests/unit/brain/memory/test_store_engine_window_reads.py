@@ -125,7 +125,7 @@ def test_the_window_bumps_nothing_and_fires_no_hook(store: MemoryStore, monkeypa
     _put(store, _memory(T0 + timedelta(hours=1)))
     _put(store, _memory(T0 - timedelta(days=2), accessed=T0 + timedelta(hours=2)))
     called: list[str] = []
-    monkeypatch.setattr(MemoryStore, "_emotion_engine", lambda self: called.append("engine") or None)
+    monkeypatch.setattr(MemoryStore, "emotion_engine", lambda self: called.append("engine") or None)
     before = _snapshot(store)
     store.list_engine_window(T0)
     store.creation_stamps_since(T0)

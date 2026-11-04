@@ -1302,11 +1302,12 @@ def test_live_ranking_and_trigger_state_use_the_engine_values(tmp_path: Path, em
     assert result.arcs_fired[0].trigger_state == {"grief": 9.0}
 
 
-def test_live_ranking_ignores_the_arcs_own_threshold_numbers(tmp_path: Path, emotion_engine_stub):
-    """Both arcs fire. Ranked by value minus the arc's threshold, `a` would win (1 against -1); ranked by the short
-    averages alone, `b` wins (8.0 against 6.0)."""
+def test_live_ranking_orders_by_value_minus_the_arcs_own_threshold(tmp_path: Path, emotion_engine_stub):
+    """Both arcs fire (the engine calls both feelings high). S52 and S53 change when an arc fires, not how eligible arcs are
+    ordered: the ranking stays the sum of value minus the arc's own threshold. `a` wins (6.0 - 5 = +1 against 8.0 - 9 = -1);
+    ranked by the short averages alone, `b` would win (8.0 against 6.0)."""
     arcs = [_arc(name="a", trigger={"love": 5}), _arc(name="b", trigger={"grief": 9})]
     result, _ = _live_reflex(
         tmp_path, emotion_engine_stub, {"love": 6.0, "grief": 8.0}, arcs, stored={}
     )
-    assert [f.arc_name for f in result.arcs_fired] == ["b"]
+    assert [f.arc_name for f in result.arcs_fired] == ["a"]
