@@ -133,11 +133,12 @@ from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
 from brain.self_model import cadence as self_model_cadence
 from brain.self_model import reconcile as sm_reconcile
+from brain.self_model import resolve as sm_resolve
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
 from brain.self_model.articulate import log_self_model_deferred
-from brain.self_model.derived import compute_baseline, compute_derived
-from brain.self_model.gap import compute_gap
+from brain.self_model.derived import compute_baseline, compute_derived, compute_unnamed_pressure
+from brain.self_model.gap import UNSET, compute_gap, gap_from_read
 from brain.self_model.resolve import (
     check_and_emit_resolution,
     increment_gaps_surfaced,
@@ -2255,6 +2256,10 @@ def _run_self_model_tick(
       2. short = compute_derived(memories, body)       (recent normalized mean, short half-life)
       3. long  = compute_baseline(memories)            (baseline normalized mean, long half-life)
       4. gap   = compute_gap(short, long)              (bidirectional short − long, noise-floored)
+         (Steps 1-4 are the old path. With the emotion engine live they are replaced: the tick reads the
+         engine's status, read and status again, returns untouched on an empty read or a state that is not
+         caught up, applies the spare rule after a rebuild or catch-up, and otherwise builds the gap with
+         `gap_from_read` from the engine's shifted channels.)
       5. Track sustained_ticks vs the prior current_gap; bump the
          gaps_surfaced audit counter while a gap is active.
       6. If gap.magnitude >= threshold → articulate a note via Haiku. The real
@@ -2305,8 +2310,18 @@ def _run_self_model_tick(
 
     outcome = "clean"
     try:
+        # Live engine: take the three reads (status, read, status) in this thread first. Nothing readable, or a state
+        # that is not caught up, means this tick does nothing: no saved gap, no cadence advance, no audit counter.
+        # The call sits inside the try so that a raise takes the tick's own failure outcome (the cadence backs off).
+        from brain.emotion import engine
+
+        reads = None
+        if engine.engine_for(persona_dir).is_live():
+            reads = _self_model_engine_reads(persona_dir)
+            if reads is None:
+                return False
         deferred = _self_model_reflect(
-            persona_dir, provider=provider, event_bus=event_bus, now=now
+            persona_dir, provider=provider, event_bus=event_bus, now=now, reads=reads
         )
         if deferred:
             outcome = "deferred"
@@ -2323,14 +2338,97 @@ def _run_self_model_tick(
     return True
 
 
+@dataclass(frozen=True)
+class _SelfModelEngineReads:
+    """What the self-model tick took from the emotion engine: the read, and the engine's `reset_at` before and after it."""
+
+    read: dict[str, Any]
+    before: datetime | None
+    after: datetime | None
+
+
+def _self_model_engine_reads(persona_dir: Path) -> _SelfModelEngineReads | None:
+    """The engine's `status()`, `read()` and `status()` again, in that order, in this thread.
+
+    None when the read is empty or either status says the engine is not caught up: the tick then does nothing.
+    A `reset_at` that differs between the two statuses means a rebuild or catch-up happened during the read.
+    """
+    from brain.emotion import engine
+
+    live_engine = engine.engine_for(persona_dir)
+    first = live_engine.status()
+    read = live_engine.read()
+    second = live_engine.status()
+    if not read or not first.caught_up or not second.caught_up:
+        return None
+    return _SelfModelEngineReads(read=read, before=first.reset_at, after=second.reset_at)
+
+
+def _self_model_reset_seen(reads: _SelfModelEngineReads, prior_gap: Any) -> bool:
+    """True when the engine was rebuilt or caught up since the saved gap was written (live path).
+
+    That is: `reset_at` moved during this tick's reads, or the saved gap never recorded the `reset_at` it was
+    made against (`UNSET`), or the one it recorded differs from the current one (a stored None equals None).
+    """
+    from brain.utils.time import lenient_utc
+
+    if reads.before != reads.after:
+        return True
+    if prior_gap is None:
+        return False
+    if prior_gap.reset_seen is UNSET:
+        return True
+    return lenient_utc(prior_gap.reset_seen) != reads.after
+
+
+def _self_model_apply_reset(
+    persona_dir: Path, state: self_model_state.SelfModelState, reads: _SelfModelEngineReads
+) -> None:
+    """The spare rule, after a rebuild or catch-up (live path). The tick then ends: nothing else is done.
+
+    After a rebuild or a catch-up the saved flags are only approximate. No gap: nothing to do. A gap she has
+    acknowledged or dismissed that held for the sustained number of ticks is kept (its `reset_seen` brought up to
+    date). Any other gap is cleared without the resolution path and without a history entry.
+    """
+    from brain.utils.time import iso_utc
+
+    prior_gap = state.current_gap
+    if prior_gap is None:
+        return
+    # The two private constants of the resolution path are read, not copied: which statuses mean "she has answered
+    # this gap" and how many sustained ticks make a gap worth keeping, so the rule and the resolution path cannot drift.
+    if (
+        prior_gap.status in sm_resolve._RESOLVED_STATUSES  # noqa: SLF001
+        and prior_gap.sustained_ticks >= sm_resolve._SUSTAINED_TICKS  # noqa: SLF001
+    ):
+        prior_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
+        self_model_state.save(
+            persona_dir,
+            self_model_state.SelfModelState(current_gap=prior_gap, gap_history=state.gap_history),
+        )
+        return
+    # Accepted edge: clearing a gap here drops its reconcile cooldowns, so a channel she has just reconciled can
+    # come back on the next ordinary tick. After a rebuild or a catch-up the saved flags are only approximate, so a
+    # gap that is neither acknowledged nor dismissed with 3 or more sustained ticks is cleared without the
+    # resolution path. A follow-up issue records the deferral.
+    self_model_state.save(
+        persona_dir,
+        self_model_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
+    )
+
+
 def _self_model_reflect(
     persona_dir: Path,
     *,
     provider: LLMProvider,
     event_bus: EventBus | object,
     now: datetime,
+    reads: _SelfModelEngineReads | None = None,
 ) -> bool:
     """The reflection body — separated so cadence advance always runs.
+
+    ``reads`` is the engine's reads for this tick when the emotion engine is live (see
+    `_self_model_engine_reads`); None runs the old path.
 
     See _run_self_model_tick for the step-by-step contract. This function
     does steps 1-8; the caller owns the cadence gates (steps 0/0a) and
@@ -2343,51 +2441,78 @@ def _self_model_reflect(
     unrelated to the throttle). The caller uses this to pick the cadence
     outcome ("deferred" vs "clean").
     """
-    from brain.body.state import compute_body_state
+    from brain.body.state import body_state_from_short, compute_body_state
     from brain.body.words import count_words_in_session
     from brain.emotion.aggregate import aggregate_state
     from brain.memory.store import MemoryStore, _row_to_memory
     from brain.utils.memory import days_since_human
+    from brain.utils.time import iso_utc
 
-    # ── 1-3: read memories, body + short/long reads ─────────────────────────
-    # Same query as _build_intensity_drivers: the 200 most recent active
-    # emotion-bearing memories. aggregate_state (max-pool peak) still feeds the
-    # body-state computation; the gap uses short/long normalized-mean reads.
-    with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
-        stack.callback(store.close)
+    # ── 4: load prior state, track sustained ticks ──────────────────────────
+    state, _recovered = self_model_state.load_or_recover(persona_dir)
+    prior_gap = state.current_gap
 
-        rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        memories = [_row_to_memory(row) for row in rows]
-
-        declared = aggregate_state(memories)
-        days = days_since_human(store, now=now, persona_dir=persona_dir)
-        words = count_words_in_session(
-            store, persona_dir=persona_dir, session_hours=0.0, now=now
-        )
-        body = compute_body_state(
-            emotions=declared.emotions,
+    if reads is not None:
+        # ── live: a rebuild or catch-up since the last tick runs the spare rule and ends the tick ──
+        if _self_model_reset_seen(reads, prior_gap):
+            _self_model_apply_reset(persona_dir, state, reads)
+            return False
+        short_values = {name: r.short for name, r in reads.read.items()}
+        with ExitStack() as stack:
+            store = MemoryStore(persona_dir / "memories.db")
+            stack.callback(store.close)
+            days = days_since_human(store, now=now, persona_dir=persona_dir)
+            words = count_words_in_session(
+                store, persona_dir=persona_dir, session_hours=0.0, now=now
+            )
+        body = body_state_from_short(
+            short_values,
             session_hours=0.0,
             words_written=words,
             days_since_contact=days,
             now=now,
         )
+        unnamed = compute_unnamed_pressure(
+            short_values, body_energy=body.energy, body_exhaustion=body.exhaustion
+        )
+        new_gap = gap_from_read(reads.read, unnamed_pressure=unnamed)
+        new_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
+    else:
+        # ── 1-3: read memories, body + short/long reads ─────────────────────────
+        # Same query as _build_intensity_drivers: the 200 most recent active
+        # emotion-bearing memories. aggregate_state (max-pool peak) still feeds the
+        # body-state computation; the gap uses short/long normalized-mean reads.
+        with ExitStack() as stack:
+            store = MemoryStore(persona_dir / "memories.db")
+            stack.callback(store.close)
 
-    short = compute_derived(
-        memories, body_energy=body.energy, body_exhaustion=body.exhaustion, now=now
-    )
-    long = compute_baseline(memories, now=now)
-    new_gap = compute_gap(short, long)
+            rows = store._conn.execute(  # noqa: SLF001
+                "SELECT * FROM memories "
+                "WHERE active = 1 "
+                "AND emotions_json IS NOT NULL "
+                "AND emotions_json != '{}' "
+                "ORDER BY created_at DESC LIMIT 200"
+            ).fetchall()
+            memories = [_row_to_memory(row) for row in rows]
 
-    # ── 4: load prior state, track sustained ticks ──────────────────────────
-    state, _recovered = self_model_state.load_or_recover(persona_dir)
-    prior_gap = state.current_gap
+            declared = aggregate_state(memories)
+            days = days_since_human(store, now=now, persona_dir=persona_dir)
+            words = count_words_in_session(
+                store, persona_dir=persona_dir, session_hours=0.0, now=now
+            )
+            body = compute_body_state(
+                emotions=declared.emotions,
+                session_hours=0.0,
+                words_written=words,
+                days_since_contact=days,
+                now=now,
+            )
+
+        short = compute_derived(
+            memories, body_energy=body.energy, body_exhaustion=body.exhaustion, now=now
+        )
+        long = compute_baseline(memories, now=now)
+        new_gap = compute_gap(short, long)
 
     # ── 4a: R-B2 anti-oscillation — honour the reconcile cooldown (live) ─────
     # Drop any channel the prior gap put in cooldown (REGARDLESS of prior
@@ -2404,6 +2529,7 @@ def _self_model_reflect(
                     continue
                 kept_channels[ch] = delta
             new_gap.per_channel = kept_channels
+            new_gap.directions = {ch: d for ch, d in new_gap.directions.items() if ch in kept_channels}
             new_gap.magnitude = sum(abs(v) for v in kept_channels.values())
             # Keep only cooldowns that have not yet expired.
             for ch, expiry in prior_gap.channel_cooldowns.items():

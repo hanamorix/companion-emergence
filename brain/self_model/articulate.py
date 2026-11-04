@@ -54,6 +54,11 @@ log = logging.getLogger(__name__)
 # Text externalized to prompt_strings.toml [self_model.articulate] (issue #129 stage 2b/2c).
 _PROMPT_SEGMENTS = prompt_strings.register_segments("self_model.articulate.prompt_segments")
 _SYSTEM = prompt_strings.register("self_model.articulate.system")
+# The label written after a channel's delta when the gap carries its direction (+1 rising, -1 fading).
+_DIRECTION_LABELS = {
+    1: prompt_strings.register("self_model.articulate.direction_rising"),
+    -1: prompt_strings.register("self_model.articulate.direction_fading"),
+}
 
 _GAP_THRESHOLD: float = 0.4          # below this magnitude → skip articulation
 _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
@@ -257,7 +262,8 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     # built these only after the slot was already held — cheap string
     # formatting, no reason to do it while touching the shared throttle).
     deltas_text = ", ".join(
-        f"{ch}: {delta:+.2f}" for ch, delta in sorted(gap.per_channel.items())
+        f"{ch}: {delta:+.2f}{_DIRECTION_LABELS.get(gap.directions.get(ch), '')}"
+        for ch, delta in sorted(gap.per_channel.items())
     )
     system = _SYSTEM
     seg = _PROMPT_SEGMENTS

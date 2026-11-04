@@ -52,10 +52,15 @@ Gap dataclass fields per spec §4:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from brain.emotion.vocabulary import get as _get_emotion
 from brain.self_model.derived import DerivedRead
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import Reading
 
 # A channel is surfaced only when its recent read diverges from baseline by at
 # least this much (on the 0–10 intensity scale). Below-floor deltas are treated
@@ -162,4 +167,26 @@ def compute_gap(short: DerivedRead, long: DerivedRead) -> Gap:
         per_channel=per_channel,
         magnitude=magnitude,
         unnamed_pressure=short.unnamed_pressure,
+    )
+
+
+def gap_from_read(read: Mapping[str, Reading], *, unnamed_pressure: float) -> Gap:
+    """The gap from the emotion engine's `read()` (used when the engine is live).
+
+    A channel opens when the engine reads it as shifted (`shift != 0`); it is valued at its signed `difference`
+    (0.0 allowed) and carries the shift as its direction (+1 rising, -1 fading). No name test (`read()` already
+    lists only registered names) and no noise floor (the shift rule decided). `magnitude` is the sum of the
+    absolute differences. Persistence fields stay at their defaults for the cadence layer.
+    """
+    per_channel: dict[str, float] = {}
+    directions: dict[str, int] = {}
+    for name, reading in read.items():
+        if reading.shift != 0:
+            per_channel[name] = reading.difference
+            directions[name] = reading.shift
+    return Gap(
+        per_channel=per_channel,
+        magnitude=sum(abs(v) for v in per_channel.values()),
+        unnamed_pressure=unnamed_pressure,
+        directions=directions,
     )

@@ -850,6 +850,12 @@ level_rising = '''{name} is rising'''
 level_fading = '''{name} is fading'''
 
 [self_model.articulate]
+# The label written after a channel's delta in articulate()'s deltas text when the gap carries the channel's direction
+# (rising or fading). No label for a channel without a direction, so a gap with no directions gives today's text.
+# PLACEHOLDER wording (spec section 7, item 4): working text only. The final wording, and the segment and system text
+# that tells the model how to read these labels, are the owner's, at the end of the build.
+direction_rising = ''' (rising)'''
+direction_fading = ''' (fading)'''
 # articulate()'s local prompt segments, in order, reassembled around 2
 # vars: deltas_text, f"{gap.unnamed_pressure:.2f}" -- seg[0] + deltas_text
 # + seg[1] + formatted_pressure + seg[2].

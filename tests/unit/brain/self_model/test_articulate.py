@@ -384,3 +384,31 @@ def test_articulate_shares_the_one_lull_not_its_own_min_idle(tmp_path):
         __import__("brain.self_model.articulate", fromlist=["articulate_min_idle_seconds"]),
         "articulate_min_idle_seconds",
     )
+
+
+# ── B2 phase B: each channel's direction label in the prompt ─────────────────
+
+
+def test_prompt_carries_each_channels_direction_when_present(tmp_path):
+    provider = _CountingProvider()
+    gap = Gap(
+        per_channel={"grief": 1.5, "joy": -1.0, "calm": 0.0},
+        magnitude=2.5,
+        unnamed_pressure=0.0,
+        directions={"grief": 1, "joy": -1},
+    )
+    articulate(gap, provider=provider, persona_dir=tmp_path)
+    prompt = provider.calls[0][0]
+    assert "calm: +0.00," in prompt or "calm: +0.00." in prompt  # no direction for calm: no label
+    assert "grief: +1.50 (rising)" in prompt
+    assert "joy: -1.00 (fading)" in prompt
+
+
+@pytest.mark.no_base_failure(reason="pins that an empty directions map leaves today's articulation text unchanged")
+def test_prompt_is_todays_text_when_directions_is_empty(tmp_path):
+    provider = _CountingProvider()
+    gap = Gap(per_channel={"grief": 1.5, "joy": -1.0}, magnitude=2.5, unnamed_pressure=0.0)
+    articulate(gap, provider=provider, persona_dir=tmp_path)
+    prompt = provider.calls[0][0]
+    assert "grief: +1.50, joy: -1.00. Unnamed pressure: 0.00" in prompt
+    assert "rising" not in prompt and "fading" not in prompt
