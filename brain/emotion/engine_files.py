@@ -76,7 +76,7 @@ from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import (
     Recovery,
     append_jsonl,
-    iter_jsonl,
+    iter_jsonl_raw,
     read_json_result,
     read_json_walk,
     read_jsonl_from,
@@ -978,8 +978,9 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
     time, so a time-zone change could put a first in-window line in an earlier-named file) and keeps the lines dated at or
     after `since`; the caller applies the end of its window and folds in time order. The log is a crash-recovery record and
     its absence or damage is normal: a missing file anywhere in the series, a missing folder, a file not named
-    ``YYYY-MM-DD.jsonl``, an unlistable folder (logged), a torn or unparseable line and a file that cannot be read in full
-    (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
+    ``YYYY-MM-DD.jsonl``, an unlistable folder (logged), a torn or unparseable line (including one the JSON parser cannot
+    load, such as an integer of more than 4300 digits, skipped with a warning naming the file and line) and a file that
+    cannot be read in full (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
     with an error log line. The reader repairs nothing.
     """
     when = lenient_utc(since)  # a naive time means UTC, as everywhere in the repo
@@ -994,7 +995,7 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         if day is None or day < start:
             continue
         path = folder / name
-        for record in iter_jsonl(path):  # an I/O failure ends the iteration there; what was read is used
+        for _text, record in iter_jsonl_raw(path):  # a line the parser cannot load is skipped; an I/O failure ends the file there
             try:
                 kind = record.get("kind") if isinstance(record, dict) else None
                 if kind in _MEMORY_KINDS or kind == "start":  # before the check, so a held-modifier line is not logged for it
