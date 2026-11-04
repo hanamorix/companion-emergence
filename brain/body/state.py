@@ -11,7 +11,7 @@ Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -93,6 +93,33 @@ def compute_body_state(
         days_since_contact=round(days_since_contact, 2),
         body_emotions=body_emotions,
         computed_at=now,
+    )
+
+
+def body_state_from_short(
+    short: Mapping[str, float],
+    *,
+    session_hours: float,
+    words_written: int,
+    days_since_contact: float,
+    now: datetime,
+) -> BodyState:
+    """The body state from the engine's short averages (`{name: short}` taken from `engine.read()`).
+
+    Same projection as `compute_body_state`, but a body emotion the engine did not return is absent from
+    `body_emotions` instead of filled with 0.0. A present 0.0 is kept. Pure: the caller passes the one `short`
+    snapshot it read, so a caller that needs the same numbers twice reads once.
+    """
+    body = compute_body_state(
+        emotions=short,
+        session_hours=session_hours,
+        words_written=words_written,
+        days_since_contact=days_since_contact,
+        now=now,
+    )
+    return replace(
+        body,
+        body_emotions={n: v for n, v in body.body_emotions.items() if n in short},
     )
 
 

@@ -43,6 +43,11 @@ Gap dataclass fields per spec §4:
   last_seen_ts       — ISO-8601 UTC string, set by the caller / cadence layer
   sustained_ticks    — integer count, incremented by the cadence layer
   channel_cooldowns  — {channel: ISO-8601 UTC string} — set by reconcile layer
+  directions         — {channel: +1 | -1} the engine's shift direction per channel
+                       (rising / fading); empty on a gap built by `compute_gap`
+  reset_seen         — the engine's `status().reset_at` as the tick saw it second,
+                       as an ISO-8601 UTC string; `UNSET` for a gap saved before
+                       the field existed, None when the engine had never reset
 """
 
 from __future__ import annotations
@@ -59,6 +64,26 @@ from brain.self_model.derived import DerivedRead
 # ambient block would name the channel. Kept local (not imported) to avoid a
 # self_model→self_model import cycle; the equality is intentional.
 _GAP_NOISE_FLOOR: float = 0.5
+
+
+class _Unset:
+    """The type of `UNSET`: "this field was never stored" (distinct from a stored None)."""
+
+    _instance: _Unset | None = None
+
+    def __new__(cls) -> _Unset:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = _Unset()
 
 
 @dataclass
@@ -83,6 +108,12 @@ class Gap:
         channel_cooldowns: {channel: ISO-8601 UTC expiry} set by the reconcile layer
             after a self-authored revision; no new gap surfaced for that channel
             until the expiry passes (R-B2).
+        directions: {channel: +1 | -1}, the engine's shift direction for each channel
+            of `per_channel` (+1 rising, -1 fading). Empty when the gap did not come
+            from the engine.
+        reset_seen: the engine's `reset_at` as the tick saw it second, an ISO-8601 UTC
+            string. `UNSET` means "never stored" (a gap saved before this field);
+            None is a stored "no reset yet".
     """
 
     per_channel: dict[str, float]
@@ -94,6 +125,8 @@ class Gap:
     last_seen_ts: str | None = None
     sustained_ticks: int = 0
     channel_cooldowns: dict[str, str] = field(default_factory=dict)
+    directions: dict[str, int] = field(default_factory=dict)
+    reset_seen: str | None | _Unset = UNSET
 
 
 def compute_gap(short: DerivedRead, long: DerivedRead) -> Gap:

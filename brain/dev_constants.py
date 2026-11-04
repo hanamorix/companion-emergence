@@ -438,3 +438,13 @@ KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
 # per poll PER PEER. Excess is left un-acked on the relay and surfaced as a
 # degraded state; bounds local decrypt/provider work against a flooding peer.
 KINDLED_LINK_INBOUND_FLOOD_CAP = 20
+
+# --- emotion readers (B2 phase B) ----------------------------------------------
+# The prompt's mood summary (`brain.chat.prompt._build_emotion_summary`) lists this many feelings by long average,
+# highest first; None lists them all. Read at use time, inside the function.
+EMOTION_SUMMARY_COUNT: int | None = 3
+# How each listed feeling is written: "long" (name:L), "long_short" (name:L/S) or "long_difference" (name:L(D), D signed).
+EMOTION_SUMMARY_MODE: str = "long"
+# The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
+# by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
+SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3

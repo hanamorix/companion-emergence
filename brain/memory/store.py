@@ -1151,7 +1151,7 @@ class MemoryStore:
             ),
         )
 
-    def _emotion_engine(self) -> Any | None:
+    def emotion_engine(self) -> Any | None:
         """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
 
         `brain.emotion.engine` is imported here, not at the top: it pulls `brain.utils.memory`, which imports this module.
@@ -1167,7 +1167,7 @@ class MemoryStore:
     def _notify_committed(self, memory: Memory) -> None:
         """Tell the engine a row was committed. All of it is inside the guard: a failure here must not reach the write."""
         try:
-            target = self._emotion_engine()
+            target = self.emotion_engine()
             if target is not None:
                 target.on_memory_committed(memory)
         except Exception:
@@ -1178,7 +1178,7 @@ class MemoryStore:
         try:
             if before.emotions or not new_emotions:
                 return
-            target = self._emotion_engine()
+            target = self.emotion_engine()
             if target is not None:
                 target.on_emotions_assigned(replace(before, emotions=dict(new_emotions)))
         except Exception:

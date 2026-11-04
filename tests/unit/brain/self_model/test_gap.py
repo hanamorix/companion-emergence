@@ -66,3 +66,17 @@ def test_noise_floor_equals_ambient_channel_floor_invariant():
     from brain.self_model.ambient import _CHANNEL_FLOOR
 
     assert _GAP_NOISE_FLOOR == _CHANNEL_FLOOR
+
+
+def test_gap_directions_default_empty_and_reset_seen_default_unset():
+    """compute_gap builds no directions and never stored a reset (B2 phase B, step 20)."""
+    from brain.self_model.gap import UNSET, Gap
+
+    gap = Gap(per_channel={}, magnitude=0.0, unnamed_pressure=0.0)
+    assert gap.directions == {}
+    assert gap.reset_seen is UNSET
+    assert repr(UNSET) == "UNSET"
+    # Two gaps do not share one directions dict.
+    other = Gap(per_channel={}, magnitude=0.0, unnamed_pressure=0.0)
+    gap.directions["joy"] = 1
+    assert other.directions == {}
