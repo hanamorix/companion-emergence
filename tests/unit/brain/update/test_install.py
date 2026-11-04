@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.update import install, overlay
 
 
@@ -550,12 +551,68 @@ def test_staging_rename_rides_out_a_transient_permission_error(tmp_path, monkeyp
         real(src, dst)
 
     monkeypatch.setattr(os, "replace", flaky_once)
-    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)
     root = tmp_path / "brain-overlay"
     entry = install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
     assert (root / entry["dir"] / "brain").is_dir()
     assert overlay.read_state(root)["active"] == entry
+
+
+def _stub_staging_rename(monkeypatch, failures: int) -> list[Path]:
+    """``os.replace`` raises PermissionError for the first ``failures`` renames of the staging folder, and only for those."""
+    import os
+    import time
+
+    real, staging_renames = os.replace, []
+
+    def replace(src, dst):
+        if Path(src).name.startswith(".staging-"):
+            staging_renames.append(Path(dst))
+            if len(staging_renames) <= failures:
+                raise PermissionError("scanning")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    return staging_renames
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_staging_rename_follows_the_shared_replace_schedule(tmp_path, monkeypatch):
+    """#643: the overlay's rename used its own 6-try schedule; it now rides out as many consecutive refusals as every other
+    replace (8 tries in all, 7 failures then success)."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    renames = _stub_staging_rename(monkeypatch, failures=7)
+    root = tmp_path / "brain-overlay"
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert len(renames) == 8
+    assert (root / entry["dir"] / "brain").is_dir()
+    assert overlay.read_state(root)["active"] == entry
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_staging_rename_that_never_succeeds_fails_the_update_and_cleans_up(tmp_path, monkeypatch):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    renames = _stub_staging_rename(monkeypatch, failures=10_000)
+    root = tmp_path / "brain-overlay"
+    with pytest.raises(install.UpdateError, match="update failed"):
+        install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
+                             root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert len(renames) == 8
+    assert overlay.read_state(root)["active"] is None
+    assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
 
 
 @pytest.mark.usefixtures("fast_install")

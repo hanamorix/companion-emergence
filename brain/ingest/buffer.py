@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -33,6 +32,7 @@ from brain.health.json_io import (
 )
 from brain.utils.atomic_write import fsync_dir, save_with_backup_text
 from brain.utils.file_lock import file_lock
+from brain.utils.file_ops import delete_file
 
 logger = logging.getLogger(__name__)
 
@@ -175,33 +175,10 @@ def session_silence_minutes(turns: list[dict]) -> float:
     return delta.total_seconds() / 60.0
 
 
-_UNLINK_RETRIES = 8
-_UNLINK_RETRY_SLEEP_S = 0.05
-
-
-def _unlink_with_retry(path: Path) -> None:
-    """Unlink with a short bounded retry on transient PermissionError.
-
-    Windows cannot delete a file another handle holds open (WinError 32) —
-    a just-flushed writer, a not-yet-GC'd reader generator, or the CI
-    runner's antivirus/indexer briefly pins freshly-written files. On POSIX
-    the retry never triggers. Re-raises after the budget so a *real*
-    permission problem still surfaces (fail-loud, matching the ingest
-    pipeline's error counters)."""
-    for attempt in range(_UNLINK_RETRIES):
-        try:
-            path.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            if attempt == _UNLINK_RETRIES - 1:
-                raise
-            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
-
-
 def delete_session_buffer(persona_dir: Path, session_id: str) -> None:
-    """Unlink the buffer file. Idempotent — no-op when file is missing."""
+    """Delete the buffer file. Idempotent — no-op when file is missing; a transient sharing violation is retried."""
     path = _session_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def _cursor_path(persona_dir: Path, session_id: str) -> Path:
@@ -252,9 +229,9 @@ def write_cursor(persona_dir: Path, session_id: str, ts: str) -> None:
 
 
 def delete_cursor(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the cursor file (retry — see _unlink_with_retry)."""
+    """Idempotent delete of the cursor file (retried: ``file_ops.delete_file``)."""
     path = _cursor_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
@@ -330,9 +307,9 @@ def write_backoff(
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the backoff sidecar (retry — see _unlink_with_retry)."""
+    """Idempotent delete of the backoff sidecar (retried: ``file_ops.delete_file``)."""
     path = _backoff_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]) -> None:
@@ -344,7 +321,7 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     compaction to install ``[summary, *retained_tail]``. Temp file + os.replace
     mirrors ``write_cursor`` so a reader never sees a torn buffer.
 
-    The replace gets the same bounded retry as ``_unlink_with_retry`` (#198):
+    The replace gets the shared bounded retry (``file_ops.retry_transient``, #198):
     Windows refuses ``os.replace`` over a file another handle holds open — a
     ``GET /chat/history`` streaming this buffer is the realistic case, and it
     finishes in milliseconds. On POSIX the retry never triggers. After the

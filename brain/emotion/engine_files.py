@@ -6,9 +6,9 @@ In this slice the module holds one thing: the half-life cache behind
 engine only reads it, never writes it, never repairs it and never quarantines it
 (`Recovery.DEFAULT`: bad content takes the default).
 
-The file is re-read when its stat key `(st_mtime_ns, st_size, st_ino)` changes. The key
-is taken BEFORE the read, so a file replaced between the stat and the read is read again
-on the next call. A failure that says nothing about the content (a filesystem error on
+The file is re-read when its stat key, `file_ops.stat_path(path).key`
+(`(inode, mtime_ns, size)`), changes. The key is taken BEFORE the read, so a file replaced
+between the stat and the read is read again on the next call. A failure that says nothing about the content (a filesystem error on
 the read, an error from `stat` other than "no such file") is not cached: the previously
 loaded half-lives stay in force and the next call tries again (the same bound as
 `brain/tunables.py`, #530). A fault in the content (not JSON, wrong shape, a bad entry)
@@ -27,6 +27,7 @@ from typing import Any, NamedTuple
 
 from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import Recovery, read_json_result
+from brain.utils import file_ops
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -45,15 +46,6 @@ class _Fault(NamedTuple):
     name: str | None  # None: the entry has no name to report
     field: str
     why: str
-
-
-def _stat_key(path: Path) -> _StatKey | None:
-    """The file's stat key, or None when there is no such file. Any other error from `stat` is raised."""
-    try:
-        st = path.stat()
-    except FileNotFoundError:
-        return None
-    return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
 def _emotions_list(data: dict) -> None:
@@ -121,7 +113,7 @@ class VocabularyHalfLives:
 
     def _refresh(self) -> None:
         try:
-            key = _stat_key(self._path)
+            stat = file_ops.stat_path(self._path)
         except OSError as exc:
             # Says nothing about the content: keep what is loaded, store nothing, try again next call.
             warn_throttled(
@@ -132,6 +124,7 @@ class VocabularyHalfLives:
                 exc,
             )
             return
+        key = None if stat is None else stat.key
         if self._loaded and key == self._key:
             return
         if key is None:
