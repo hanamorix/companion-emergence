@@ -37,8 +37,10 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `classify_line` | brain/health/jsonl_reader.py:69 | The one place a JSONL line is judged: a usable object, a blank line, or a bad line (invalid UTF-8, unparsable JSON, not an object) with the reason; every JSONL reader calls it. |
-| `LineVerdict` (class) | brain/health/jsonl_reader.py:42 | What classify_line returns: the line's text, its object, the kind of fault and a `reason` property. |
+| `JsonlLineError` (class) | brain/health/jsonl_reader.py:25 | ValueError for a bad line met in strict mode: carries `line` (1-based), `reason` and `path`; json_io turns it into `JsonFileError(kind="line")`. |
+| `UnloadableJsonlLineError` (class) | brain/health/jsonl_reader.py:38 | ValueError (stable `code` "jsonl_unloadable_line", plus `path`, `line`, `reason`) that stops a read at a line the JSON parser cannot load (integer past the digit limit, nesting too deep); a known abort, see #646. |
+| `classify_line` | brain/health/jsonl_reader.py:91 | The one place a JSONL line is judged: a usable object, a blank line, or a bad line (invalid UTF-8, unparsable JSON, not an object) with the reason; every JSONL reader calls it. |
+| `LineVerdict` (class) | brain/health/jsonl_reader.py:64 | What classify_line returns: the line's text, its object, the kind of fault and a `reason` property. |
 
 ## File access: atomic writes, locks, TOML, SQLite
 
