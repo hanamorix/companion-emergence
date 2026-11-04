@@ -762,7 +762,14 @@ def test_pc2_legacy_names_are_undefined_and_kept_helpers_are_exact() -> None:
     assert ast.dump(swb) == ast.dump(ast.parse(_KEPT_SAVE_WITH_BACKUP).body[0]), "save_with_backup must stay byte-identical"
     reader = _defs(REPO / "brain" / "health" / "jsonl_reader.py")
     # classify_line and LineVerdict are here on purpose (#643): the one place a JSONL line is judged, below json_io
-    assert set(reader) == {"JsonlLineError", "LineVerdict", "classify_line", "_parse_lines", "iter_jsonl_skipping_corrupt"}
+    assert set(reader) == {
+        "JsonlLineError",
+        "UnloadableJsonlLineError",
+        "LineVerdict",
+        "classify_line",
+        "_parse_lines",
+        "iter_jsonl_skipping_corrupt",
+    }
     # The only brain modules that still call the kept helpers are the held felt-time files.
     importers = set()
     for rel, text in brain_sources().items():

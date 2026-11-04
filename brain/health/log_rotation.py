@@ -39,7 +39,6 @@ import errno
 import gzip
 import io
 import logging
-import os
 import shutil
 from collections import Counter
 from collections.abc import Iterator
@@ -165,7 +164,7 @@ def _rotate_rolling_locked(log_path: Path, archive_keep: int) -> Path:
         (n for n in range(1, archive_keep + 1) if not _archive_path(log_path, n).exists()), archive_keep + 1
     )
     for i in range(min(first_empty, archive_keep) - 1, 0, -1):
-        os.replace(_archive_path(log_path, i), _archive_path(log_path, i + 1))  # atomic-write: ok -- the rotation's shift is a plain rename of a finished archive up one slot, not a write
+        replace_file(_archive_path(log_path, i), _archive_path(log_path, i + 1))  # atomic-write: ok -- the rotation's shift is a plain rename of a finished archive up one slot, not a write
 
     # 4. Publish the staged archive as .1.gz.
     replace_file(staging, new_archive)  # atomic-write: ok -- publishes the finished, fsynced staging file by rename (the write above went through the shared writer)
