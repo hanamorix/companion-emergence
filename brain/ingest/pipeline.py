@@ -443,7 +443,7 @@ def _archive_buffer(persona_dir: Path, session_id: str) -> list[dict]:
     are durable before the caller removes the buffer and a retry of the same batch after a crash does not write it twice (except
     after a crash between ``archive_once``'s append and its marker write, where the batch is repeated, never lost). An error
     propagates and the caller has removed nothing; so does an append that reports zero bytes for a non-empty batch, as in
-    compaction and the rollover. A malformed line is skipped by ``read_session`` like everywhere else.
+    compaction and the rollover. A malformed line is skipped by ``read_session`` like everywhere else (one the JSON parser cannot load stops the read).
     """
     rows = read_session(persona_dir, session_id)
     written = archive_once(persona_dir, session_id, rows, new_gen=_CLOSE_BATCH_GEN)

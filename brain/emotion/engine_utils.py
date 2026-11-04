@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, NamedTuple, get_args
 from brain import dev_constants
 from brain.emotion.vocabulary import canonical_name
 from brain.initiate.schemas import StateName
+from brain.memory import memory_utils
 from brain.utils.memory import is_conversation_derived
 from brain.utils.time import to_local
 
@@ -113,7 +114,9 @@ class EngineState:
 
     `last_update` is the time up to which the weights have been aged; `active_day` is the open day; `oldest_entry_at` is the
     time of the oldest entry folded (never set by a quiet-day zero); `persona_start_at` is the creation time of the persona's
-    oldest memory, which the shift's start gate counts from (null: no memory yet, the gate is closed).
+    oldest memory, which the shift's start gate counts from (null: no memory yet, the gate is closed). `queue_line` is the
+    number of lines of the queue file the engine has already folded: the next drain reads the lines after it. It is saved
+    with the state so that the fold and the position reach the disk in one write.
     """
 
     saved_at: datetime | None = None
@@ -124,6 +127,7 @@ class EngineState:
     persona_start_at: datetime | None = None
     repeats: dict[str, RepeatEntry] = field(default_factory=dict)
     emotions: dict[str, EmotionState] = field(default_factory=dict)
+    queue_line: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,8 +137,9 @@ class Event:
     kind "commit": a counted memory was committed (`at` is its creation time, `emotions` its faded values, `climax` its
     stored climax). "assigned": an existing counted memory got its feelings later (`at` is the row's creation time, as for a
     commit, not the time of the assignment). "showing": a counted memory was shown in full. "change": signed amounts to add to
-    the stored averages (`source` names the caller). "start": the start-only event, queued for a committed row of a type that
-    does not count; it carries only `at`, the row's creation time, and keeps the persona's start date.
+    the stored averages (`source` names the caller). "start": the start-only event for a committed row of a type that
+    does not count (a memory's own date event, which the spec makes a direct apply; Engine 4 moves it, and until then the
+    commit hook appends it to the queue); it carries only `at`, the row's creation time, and keeps the persona's start date.
 
     `modifier` is the source modifier of a commit, an assigned or a showing event. A change has no modifier (its weight is
     always 1) and a start event folds nothing, so neither reads the field.
@@ -382,16 +387,17 @@ def fade(
     age_days: float,
     half_life_days: float,
     importance: float,
-    importance_gain: float,
     floor_fraction: float | None = None,
 ) -> float:
-    """`value x 0.5^(age / (half_life x (1 + gain x importance / 10)))`, never below `floor_fraction x value` when one is given.
+    """`value x 0.5^(age / (half_life x importance_stretch(importance)))`, never below `floor_fraction x value` when one is given.
 
-    The caller measures the age from the memory's creation time, or from the switch-over time when that is later, and passes
-    the gain (`dev_constants.HORIZON_IMPORTANCE_GAIN`) and the floor of the emotion (`EMOTION_FADE_FLOOR_FRACTION`, love and
-    belonging only). A negative age (a row dated in the future) is held at 0 so a stored value never grows.
+    The stretch is the forgetting pass's own, from `brain.memory.memory_utils.importance_stretch` (the one function that holds
+    the formula and the gain); an importance outside 0 to 10 is held to it there. The caller measures the age from the memory's
+    creation time, or from the switch-over time when that is later, and passes the floor of the emotion
+    (`EMOTION_FADE_FLOOR_FRACTION`, love and belonging only). A negative age (a row dated in the future) is held at 0 so a
+    stored value never grows.
     """
-    stretched = half_life_days * (1.0 + importance_gain * importance / 10.0)
+    stretched = half_life_days * memory_utils.importance_stretch(importance)
     faded = value * 0.5 ** (max(age_days, 0.0) / stretched)
     if floor_fraction is not None:
         faded = max(faded, floor_fraction * value)

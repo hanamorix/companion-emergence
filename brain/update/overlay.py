@@ -13,7 +13,6 @@ import contextlib
 import os
 import shutil
 import sysconfig
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -26,8 +25,6 @@ STATE_FILE = "current.json"
 LOCK_FILE = ".lock"
 # <overlay folder>/.in-use/<pid>: a process running `brain` from that folder (#302).
 IN_USE_DIR = ".in-use"
-_RETRY_ATTEMPTS = 6
-_RETRY_DELAY_S = 0.05  # doubling: ~1.5 s in all before the error is let through
 
 
 class OverlayBusy(RuntimeError):  # noqa: N818
@@ -90,20 +87,6 @@ def loaded_overlay() -> dict | None:
 
 def _write_state(root: Path, active: dict | None, previous: dict | None) -> None:
     write_json(root / STATE_FILE, {"active": active, "previous": previous}, indent=2, fsync=False)
-
-
-def replace_retrying(src: Path, dst: Path) -> None:
-    """os.replace, riding out a transient PermissionError — on Windows, AV scanning
-    freshly written files or another interpreter's hook reading current.json at
-    start-up (#302). Anything else, or a lock that outlasts the retries, raises."""
-    for attempt in range(_RETRY_ATTEMPTS):
-        try:
-            os.replace(src, dst)  # atomic-write: ok -- replace_retrying is the C3 retried-rename helper that C3 folds into the shared one; a rename of a finished file, not a write
-            return
-        except PermissionError:
-            if attempt == _RETRY_ATTEMPTS - 1:
-                raise
-            time.sleep(_RETRY_DELAY_S * 2**attempt)
 
 
 def mark_in_use(root: Path | None = None) -> None:

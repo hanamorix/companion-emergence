@@ -12,6 +12,7 @@ snapshot carry in `close_days`. Engine 4's simulation (Check 25 and Check 21) is
 from __future__ import annotations
 
 import copy
+import inspect
 import itertools
 import logging
 import math
@@ -21,6 +22,7 @@ import pytest
 
 from brain import dev_constants
 from brain.emotion import engine_utils as eu
+from brain.memory import memory_utils
 from brain.memory.store import Memory
 
 BASE = date(2026, 5, 1)  # the 120-day cases end by Aug 29: no daylight-saving start in common zones
@@ -281,37 +283,49 @@ def test_a_last_update_ahead_of_now_is_pulled_back_to_now() -> None:
 # --- E3.1 / E3.2: the fade -------------------------------------------------------------------------------------
 
 
-GAIN = dev_constants.HORIZON_IMPORTANCE_GAIN
-
-
 def test_fade_halves_after_one_half_life_at_importance_zero() -> None:
-    assert eu.fade(8.0, 14.0, 14.0, 0.0, GAIN) == pytest.approx(4.0)
-    assert eu.fade(8.0, 0.0, 14.0, 0.0, GAIN) == 8.0
+    assert eu.fade(8.0, 14.0, 14.0, 0.0) == pytest.approx(4.0)
+    assert eu.fade(8.0, 0.0, 14.0, 0.0) == 8.0
 
 
 def test_importance_stretches_the_half_life() -> None:
-    stretched = 14.0 * (1.0 + GAIN * 5.0 / 10.0)
-    assert eu.fade(8.0, stretched, 14.0, 5.0, GAIN) == pytest.approx(4.0)
-    assert eu.fade(8.0, 14.0, 14.0, 5.0, GAIN) > eu.fade(8.0, 14.0, 14.0, 0.0, GAIN)
+    stretched = 14.0 * memory_utils.importance_stretch(5.0)
+    assert eu.fade(8.0, stretched, 14.0, 5.0) == pytest.approx(4.0)
+    assert eu.fade(8.0, 14.0, 14.0, 5.0) > eu.fade(8.0, 14.0, 14.0, 0.0)
+
+
+def test_fade_holds_the_importance_to_zero_to_ten_like_the_forgetting_pass() -> None:
+    assert eu.fade(8.0, 30.0, 14.0, 15.0) == eu.fade(8.0, 30.0, 14.0, 10.0)
+    assert eu.fade(8.0, 30.0, 14.0, -4.0) == eu.fade(8.0, 30.0, 14.0, 0.0)
+
+
+def test_fade_takes_no_importance_gain_argument() -> None:
+    assert list(inspect.signature(eu.fade).parameters) == [
+        "value",
+        "age_days",
+        "half_life_days",
+        "importance",
+        "floor_fraction",
+    ]
 
 
 def test_fade_floor_holds_for_love_and_belonging_only() -> None:
     for name in ("love", "belonging"):
         floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION[name]
-        assert eu.fade(9.0, 10_000.0, 365.0, 0.0, GAIN, floor) == pytest.approx(9.0 * floor)
-    assert eu.fade(9.0, 10_000.0, 3.0, 0.0, GAIN) < 1e-6
+        assert eu.fade(9.0, 10_000.0, 365.0, 0.0, floor) == pytest.approx(9.0 * floor)
+    assert eu.fade(9.0, 10_000.0, 3.0, 0.0) < 1e-6
     # a value above its floor is untouched by the floor
-    assert eu.fade(9.0, 365.0, 365.0, 0.0, GAIN, 1.0 / 3.0) == pytest.approx(4.5)
+    assert eu.fade(9.0, 365.0, 365.0, 0.0, 1.0 / 3.0) == pytest.approx(4.5)
 
 
 def test_fade_age_is_the_callers_age_so_the_legacy_anchor_is_the_callers() -> None:
     # A memory created 100 days ago, switch-over 10 days ago: the caller passes 10, and that is all fade uses.
-    assert eu.fade(8.0, 10.0, 10.0, 0.0, GAIN) == pytest.approx(4.0)
-    assert eu.fade(8.0, 100.0, 10.0, 0.0, GAIN) < 0.01
+    assert eu.fade(8.0, 10.0, 10.0, 0.0) == pytest.approx(4.0)
+    assert eu.fade(8.0, 100.0, 10.0, 0.0) < 0.01
 
 
 def test_fade_never_grows_a_value_for_a_row_dated_in_the_future() -> None:
-    assert eu.fade(8.0, -5.0, 14.0, 0.0, GAIN) == 8.0
+    assert eu.fade(8.0, -5.0, 14.0, 0.0) == 8.0
 
 
 # --- E4: the climax reset ------------------------------------------------------------------------------------------

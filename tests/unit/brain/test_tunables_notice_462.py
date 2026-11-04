@@ -140,16 +140,16 @@ def test_an_io_unreadable_notice_stays_until_the_runtime_actually_reloads(tunabl
     path.write_text('"a.b" = 1.0\n', encoding="utf-8")
     from brain.utils import toml_io
 
-    real = toml_io._read_bytes
+    real = toml_io.read_bytes_stat
 
     def boom(p):
         raise PermissionError("busy")
 
-    monkeypatch.setattr(toml_io, "_read_bytes", boom)
+    monkeypatch.setattr(toml_io, "read_bytes_stat", boom)
     assert tunables.get_tunable("a.b", 60.0) == 60.0
     notice = tunables.current_notice()
     assert notice is not None and notice["kind"] == "unreadable" and notice["line"] is None
-    monkeypatch.setattr(toml_io, "_read_bytes", real)
+    monkeypatch.setattr(toml_io, "read_bytes_stat", real)
     # Rev-4 review bycatch: a transient I/O failure says nothing about the content, so the notice ends as soon as a read
     # succeeds, even though the file's mtime never changed (it used to stay until the mtime moved, saying "could not be read"
     # while the settings were in effect).
