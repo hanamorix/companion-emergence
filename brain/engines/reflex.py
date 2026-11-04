@@ -8,6 +8,7 @@ evaluation + firing logic lands in Task 2.
 from __future__ import annotations
 
 import logging
+import string
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -15,8 +16,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from brain.bridge.provider import LLMProvider
+from brain.emotion import engine
 from brain.emotion.aggregate import aggregate_state
 from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
+from brain.emotion.vocabulary import get as registered_emotion
 from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.emotion import format_emotion_summary
@@ -148,7 +151,9 @@ class ArcSkipped:
     """Record of one arc evaluated-but-not-fired."""
 
     arc_name: str
-    reason: str  # trigger_not_met | days_since_human_too_low | cooldown_active | single_fire_cap | no_arcs_defined
+    # trigger_not_met | days_since_human_too_low | cooldown_active | single_fire_cap | no_arcs_defined
+    # | template_emotion_absent (engine live only: the prompt template names an emotion with no value)
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -323,14 +328,21 @@ class ReflexEngine:
             )
 
         all_mems = self.store.list_active(limit=None)
-        state = aggregate_state(all_mems)
+        live_engine = engine.engine_for(self.log_path.parent)
+        live = live_engine.is_live()
+        if live:
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and no arc fires.
+            emotions = {name: r.short for name, r in live_engine.read().items()}
+        else:
+            emotions = aggregate_state(all_mems).emotions
         # log_path lives at the persona dir root, so its parent IS the
         # persona dir — same pattern used at line 450 below for prompt
         # composition. Passing it lets days_since_human see active
         # session JSONL buffers (the freshest user-contact signal).
         days_since = days_since_human(self.store, now, persona_dir=self.log_path.parent)
 
-        eligible, skipped = self._evaluate(arc_set.arcs, state.emotions, days_since, log, now)
+        eligible, skipped = self._evaluate(arc_set.arcs, emotions, days_since, log, now, live=live)
 
         if not eligible:
             return ReflexResult(
@@ -341,7 +353,7 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        winner = self._rank(eligible, state.emotions, log, now)
+        winner = self._rank(eligible, emotions, log, now, live=live)
         losers = [a for a in eligible if a.name != winner.name]
         skipped.extend(ArcSkipped(arc_name=a.name, reason="single_fire_cap") for a in losers)
 
@@ -368,7 +380,7 @@ class ReflexEngine:
                     evaluated_at=now,
                 )
 
-            fire = self._fire(winner, state.emotions, days_since, all_mems, now)
+            fire = self._fire(winner, emotions, days_since, all_mems, now, live=live)
             new_log = log.appended(fire)
             new_log.save(self.log_path)
 
@@ -387,14 +399,26 @@ class ReflexEngine:
         days_since_human: float,
         log: ReflexLog,
         now: datetime,
+        *,
+        live: bool = False,
     ) -> tuple[list[ReflexArc], list[ArcSkipped]]:
         eligible: list[ReflexArc] = []
         skipped: list[ArcSkipped] = []
 
         for arc in arcs:
-            if not _trigger_met(arc, emotions):
+            if not _trigger_met(arc, emotions, live=live):
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="trigger_not_met"))
                 continue
+            if live:
+                absent = _template_emotions_absent(arc, emotions)
+                if absent:
+                    logger.debug(
+                        "reflex arc %s does not fire: its template names emotions with no value: %s",
+                        arc.name,
+                        ", ".join(absent),
+                    )
+                    skipped.append(ArcSkipped(arc_name=arc.name, reason="template_emotion_absent"))
+                    continue
             if days_since_human < arc.days_since_human_min:
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="days_since_human_too_low"))
                 continue
@@ -414,11 +438,17 @@ class ReflexEngine:
         emotions: Mapping[str, float],
         log: ReflexLog,
         now: datetime,
+        *,
+        live: bool = False,
     ) -> ReflexArc:
         """Highest aggregate threshold-excess wins; ties broken by longest-since-fire."""
 
         def key(arc: ReflexArc) -> tuple[float, float]:
-            excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
+            if live:
+                # An eligible arc has every trigger emotion present (`_trigger_met` fails on an absent one).
+                excess = sum(emotions[e] - t for e, t in arc.trigger.items())
+            else:
+                excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
             last = log.last_fire_for_arc(arc.name)
             seconds_since = (now - last).total_seconds() if last is not None else float("inf")
             return (excess, seconds_since)
@@ -434,6 +464,7 @@ class ReflexEngine:
         now: datetime,
         *,
         dry_run: bool = False,
+        live: bool = False,
     ) -> ArcFire:
         """Render prompt → call LLM → write memory → return ArcFire."""
         context = _PromptContext(emotions)
@@ -445,7 +476,10 @@ class ReflexEngine:
         prompt = arc.prompt_template.format_map(context)
         raw = self.provider.generate(prompt, system=self.persona_system_prompt)
 
-        trigger_state = {e: emotions.get(e, 0.0) for e in arc.trigger}
+        if live:
+            trigger_state = {e: emotions[e] for e in arc.trigger}
+        else:
+            trigger_state = {e: emotions.get(e, 0.0) for e in arc.trigger}
 
         # P3 retention rework, Change 1: reflex arc output is reflexive
         # self-behavior with moderate retention value, not the ~0.0 the
@@ -530,11 +564,40 @@ class _PromptContext(dict):
         return self._emotion_text.get(canonical_name(key), "0")
 
 
-def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:
+def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float], *, live: bool = False) -> bool:
     for name, threshold in arc.trigger.items():
-        if emotions.get(name, 0.0) < threshold:
+        if live:
+            # Accepted edge: a hand-edited arc with a threshold of 0 or below used to fire on a missing emotion because
+            # a missing value read as 0.0. On the live path a missing emotion fails the trigger, so such an arc waits
+            # until the emotion has a value. The crystallizer refuses thresholds below 5.0, so only hand-edited arc
+            # files are affected.
+            if name not in emotions or emotions[name] < threshold:
+                return False
+        elif emotions.get(name, 0.0) < threshold:
             return False
     return True
+
+
+def _template_emotions_absent(arc: ReflexArc, emotions: Mapping[str, float]) -> list[str]:
+    """The emotions the arc's prompt template names that have no value in `emotions` (engine live only).
+
+    A placeholder names an emotion when its canonical name is in the vocabulary registry, the test `read()` applies.
+    It has a value when the pooled emotions hold that canonical name, which is the lookup `_PromptContext` renders by,
+    so `{Love}` while `love` is present has a value. Other placeholders are not looked at: they render "0".
+    A template that does not parse names no emotion here; it fails where it fails today, at `format_map`.
+    """
+    try:
+        fields = [f for _, f, _, _ in string.Formatter().parse(arc.prompt_template) if f]
+    except ValueError:
+        return []
+    pooled = pool_by_canonical_name(emotions)
+    absent: list[str] = []
+    for placeholder in fields:
+        name = placeholder.split(".")[0].split("[")[0]
+        canonical = canonical_name(name)
+        if registered_emotion(canonical) is not None and canonical not in pooled:
+            absent.append(canonical)
+    return absent
 
 
 def _format_memory_summary(memories: list) -> str:

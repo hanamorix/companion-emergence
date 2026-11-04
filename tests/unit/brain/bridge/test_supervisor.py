@@ -1430,3 +1430,64 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
     assert state.next_at is not None
     assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
+
+
+def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and_closes_its_store(
+    tmp_path: Path, emotion_engine_stub, monkeypatch
+) -> None:
+    """B2 phase B: with the engine live the gate's body is built from the engine's short averages (not the store's
+    rows), reports rest when the energy is low, and closes the store it opened."""
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock, patch
+
+    from brain.body.state import BodyState
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.emotion.engine import Reading
+    from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
+    from brain.memory.store import Memory, MemoryStore
+
+    persona_dir = _persona_dir(tmp_path)
+    seeded = MemoryStore(persona_dir / "memories.db")
+    seeded.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"joy": 9.0}))
+    seeded.close()
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"rest_need": Reading(short=8.5, long=0.0, difference=0.0, shift=0)}
+
+    seen: dict[str, object] = {"emotions": None, "closed": 0}
+    low = BodyState(
+        energy=_REST_ENERGY_THRESHOLD,
+        temperature=5,
+        exhaustion=4,
+        session_hours=0.0,
+        days_since_contact=1.0,
+        body_emotions={"rest_need": 8.5},
+        computed_at=datetime.now(UTC),
+    )
+
+    def fake_compute(**kwargs):
+        seen["emotions"] = dict(kwargs["emotions"])
+        return low
+
+    real_close = MemoryStore.close
+
+    def counting_close(self):
+        seen["closed"] += 1
+        return real_close(self)
+
+    monkeypatch.setattr(MemoryStore, "close", counting_close)
+
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
+        captured["is_rest_state"] = is_rest_state
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.body.state.compute_body_state", fake_compute),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+
+    assert seen["emotions"] == {"rest_need": 8.5}
+    assert captured["is_rest_state"] is True
+    assert seen["closed"] == 1

@@ -430,3 +430,61 @@ def test_derive_intensity_drivers_emotional_intensity_zero_when_at_baseline(tmp_
 
     drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
     assert drivers.emotional_intensity == 0.0
+
+
+# ── B2 phase B: the live branch of the felt-time drivers ─────────────────────
+
+
+def _live_drivers(tmp_path: Path, stub, readings: dict[str, float]):
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.emotion.engine import Reading
+
+    stub.live = True
+    stub.readings = {n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()}
+    return _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+
+
+@pytest.mark.parametrize(
+    "readings",
+    [
+        {},
+        {"rest_need": 8.0},
+        {n: 9.0 for n in ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")},
+    ],
+    ids=["empty", "partial", "full"],
+)
+def test_live_drivers_are_finite_in_unit_range_and_emotional_intensity_is_unplugged(
+    tmp_path: Path, emotion_engine_stub, readings
+) -> None:
+    import math
+
+    from brain.felt_time.state import FeltTimeState, persist
+    from brain.memory.store import MemoryStore
+
+    persist(FeltTimeState(lived_age_hours=200.0), tmp_path)
+    store = MemoryStore(tmp_path / "memories.db")
+    # The old path would saturate emotional_intensity from these rows (a stored spike over a flat baseline).
+    for i in range(15):
+        _make_emotion_memory(store, channel="sorrow", value=1.0, days_ago=20 + i)
+    _make_emotion_memory(store, channel="sorrow", value=9.0, days_ago=0.1)
+    store.close()
+    drivers = _live_drivers(tmp_path, emotion_engine_stub, readings)
+    assert drivers.emotional_intensity == 0.0
+    for value in (drivers.body_strain, drivers.chat_activity, drivers.narrative_weight):
+        assert math.isfinite(value) and 0.0 <= value <= 1.0
+
+
+def test_live_body_strain_is_fed_from_the_short_average_not_the_store(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    for i in range(3):
+        _make_emotion_memory(store, channel="rest_need", value=9.0, days_ago=0.1 + i)  # stored: strain from rest_need
+    store.close()
+    quiet = _live_drivers(tmp_path, emotion_engine_stub, {})
+    tired = _live_drivers(
+        tmp_path,
+        emotion_engine_stub,
+        {n: 9.0 for n in ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")},
+    )
+    assert tired.body_strain > quiet.body_strain

@@ -196,10 +196,23 @@ class ResearchEngine:
         )
         emo_state = emotion_state_override
         if emo_state is None:
-            from brain.emotion.aggregate import aggregate_state
+            from brain.emotion import engine
 
-            all_mems = self.store.list_active(limit=None)
-            emo_state = aggregate_state(all_mems)
+            live_engine = engine.engine_for(self.interests_path.parent)
+            if live_engine.is_live():
+                from brain.emotion.state import EmotionalState
+
+                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+                # pending or retrying, read() returns nothing and the research gate sees no emotion peak.
+                # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
+                emo_state = EmotionalState(
+                    emotions={name: r.short for name, r in live_engine.read().items()}
+                )
+            else:
+                from brain.emotion.aggregate import aggregate_state
+
+                all_mems = self.store.list_active(limit=None)
+                emo_state = aggregate_state(all_mems)
 
         emo_peak = max(emo_state.emotions.values(), default=0.0)
 

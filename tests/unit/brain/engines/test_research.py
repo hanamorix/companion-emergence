@@ -1002,3 +1002,41 @@ def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
     _engine, result, memory = _fire_with_reply(tmp_path, reply)
     assert result.fired is not None and memory is not None
     assert _session_rows(tmp_path) == []
+
+
+# ── B2 phase B: the research gate reads the engine's short peak when it is live ──
+
+
+def _live_gate_reason(tmp_path: Path, stub, readings: dict[str, float], *, stored: dict[str, float]) -> str | None:
+    from brain.emotion.engine import Reading
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    stub.live = True
+    stub.readings = {n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()}
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        if stored:
+            store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored))
+        runner = _build_engine(tmp_path, store)
+        result = runner.run_tick(
+            trigger="manual", dry_run=True, days_since_human_override=0.0, emotion_state_override=None
+        )
+    finally:
+        store.close()
+    return result.reason
+
+
+def test_live_gate_opens_on_an_engine_short_peak_at_or_above_seven_even_with_an_empty_store(
+    tmp_path: Path, emotion_engine_stub
+):
+    assert _live_gate_reason(tmp_path, emotion_engine_stub, {"awe": 7.0}, stored={}) != "not_due"
+
+
+def test_live_gate_stays_closed_below_seven_whatever_the_store_holds(tmp_path: Path, emotion_engine_stub):
+    assert (
+        _live_gate_reason(tmp_path, emotion_engine_stub, {"awe": 6.9}, stored={"awe": 9.5}) == "not_due"
+    )
+
+
+def test_live_gate_with_an_empty_read_is_closed(tmp_path: Path, emotion_engine_stub):
+    assert _live_gate_reason(tmp_path, emotion_engine_stub, {}, stored={"awe": 9.5}) == "not_due"

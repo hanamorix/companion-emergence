@@ -2527,3 +2527,86 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
     finally:
         store.close()
         hm.close()
+
+
+# ── B2 phase B: the heartbeat's emotion readers when the engine is live ───────
+
+
+def _live_reading(short: float):
+    from brain.emotion.engine import Reading
+
+    return Reading(short=short, long=0.0, difference=0.0, shift=0)
+
+
+def test_live_status_summary_writes_the_short_peak_and_no_calm_default(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.engines.daemon_state import load_daemon_state
+
+    heartbeat, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        # The stored sum would be love 10 (clamped); the engine's short peak is joy 6.
+        for value in (8.0, 7.0):
+            heartbeat.store.create(
+                Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": value})
+            )
+        emotion_engine_stub.live = True
+        emotion_engine_stub.readings = {"joy": _live_reading(5.6), "love": _live_reading(2.0)}
+        heartbeat._write_daemon_state_for_heartbeat(
+            persona_dir, elapsed_seconds=900.0, memories_decayed=0, edges_pruned=0, dream_id=None
+        )
+        state, _ = load_daemon_state(persona_dir)
+        assert (state.last_heartbeat.dominant_emotion, state.last_heartbeat.intensity) == ("joy", 6)
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()
+
+
+def test_live_status_summary_with_an_empty_read_writes_nothing_and_keeps_the_previous_line(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.engines.daemon_state import load_daemon_state, update_daemon_state
+
+    heartbeat, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        update_daemon_state(
+            persona_dir,
+            daemon_type="heartbeat",
+            dominant_emotion="awe",
+            intensity=4,
+            theme="heartbeat tick",
+            summary="Previous heartbeat",
+        )
+        emotion_engine_stub.live = True
+        heartbeat._write_daemon_state_for_heartbeat(
+            persona_dir, elapsed_seconds=900.0, memories_decayed=0, edges_pruned=0, dream_id=None
+        )
+        state, _ = load_daemon_state(persona_dir)
+        assert (state.last_heartbeat.dominant_emotion, state.last_heartbeat.intensity) == ("awe", 4)
+        assert state.last_heartbeat.summary == "Previous heartbeat"
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()
+
+
+def test_live_spike_resonance_is_zero_and_the_forced_resonance_path_is_unchanged(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    heartbeat, _ = _make_engine_with_persona_dir(tmp_path)
+    try:
+        heartbeat.store.create(
+            Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 9.0})
+        )
+        emotion_engine_stub.live = True
+        assert heartbeat._compute_current_resonance(None) == (0.0, {})
+        assert heartbeat._compute_current_resonance(6.5) == (6.5, {"forced": 6.5})
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()
+
+
+def test_the_fired_row_peak_uses_the_faded_value(tmp_path: Path, emotion_engine_stub) -> None:
+    """The dream, reflex and research daemon-state writes pick the peak of the memory's FADED emotions."""
+    mem = Memory.create_new(
+        content="a dream", memory_type="dream", domain="us", emotions={"love": 9.0, "joy": 6.0}
+    )
+    emotion_engine_stub.faded = {(mem.id, "love"): 2.0, (mem.id, "joy"): 5.0}
+    assert HeartbeatEngine._peak_emotion(HeartbeatEngine._faded_emotions(tmp_path, mem)) == ("joy", 5)

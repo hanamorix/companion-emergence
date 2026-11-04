@@ -1877,7 +1877,10 @@ def _derive_intensity_drivers(
 
     Emotional intensity — computed as the max positive sigma-deviation
     across emotion channels (capped at 1.0), using aggregate_state over
-    the 200 most recent active memories. Falls back to 0.0 on any error.
+    the 200 most recent active memories. Falls back to 0.0 on any error. When
+    the emotion engine is live this is not computed: emotional_intensity stays
+    0.0 (flagged for the felt-time rework, #386) and body strain comes from the
+    engine's short averages.
 
     Chat activity uses a fixed 6 turns/h baseline for the supervisor
     tick window. Phase 9.2 follow-up will tighten to a rolling baseline
@@ -1887,69 +1890,91 @@ def _derive_intensity_drivers(
     body_strain = 0.0
     emotional_intensity = 0.0
     try:
-        from brain.body.state import compute_body_state
+        from brain.body.state import body_state_from_short, compute_body_state
         from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
+        from brain.emotion import engine
         from brain.memory.store import MemoryStore, _row_to_memory
         from brain.utils.memory import days_since_human
 
+        live_engine = engine.engine_for(persona_dir)
+        is_live = live_engine.is_live()
         store = MemoryStore(persona_dir / "memories.db")
         try:
-            rows = store._conn.execute(  # noqa: SLF001
-                "SELECT * FROM memories "
-                "WHERE active = 1 "
-                "AND emotions_json IS NOT NULL "
-                "AND emotions_json != '{}' "
-                "ORDER BY created_at DESC LIMIT 200"
-            ).fetchall()
-            memories = [_row_to_memory(row) for row in rows]
-            emotion_state = aggregate_state(memories)
+            if is_live:
+                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+                # pending or retrying, read() returns nothing and body strain is computed from baseline energy.
+                short = {name: r.short for name, r in live_engine.read().items()}
+            else:
+                from brain.emotion.aggregate import aggregate_state
+
+                rows = store._conn.execute(  # noqa: SLF001
+                    "SELECT * FROM memories "
+                    "WHERE active = 1 "
+                    "AND emotions_json IS NOT NULL "
+                    "AND emotions_json != '{}' "
+                    "ORDER BY created_at DESC LIMIT 200"
+                ).fetchall()
+                memories = [_row_to_memory(row) for row in rows]
+                emotion_state = aggregate_state(memories)
             _now = datetime.now(UTC)
             days = days_since_human(store, now=_now, persona_dir=persona_dir)
             words = count_words_in_session(
                 store, persona_dir=persona_dir, session_hours=0.0, now=_now
             )
-            body = compute_body_state(
-                emotions=emotion_state.emotions,
-                session_hours=0.0,
-                words_written=words,
-                days_since_contact=days,
-                now=_now,
-            )
+            if is_live:
+                body = body_state_from_short(
+                    short,
+                    session_hours=0.0,
+                    words_written=words,
+                    days_since_contact=days,
+                    now=_now,
+                )
+            else:
+                body = compute_body_state(
+                    emotions=emotion_state.emotions,
+                    session_hours=0.0,
+                    words_written=words,
+                    days_since_contact=days,
+                    now=_now,
+                )
             # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
             # Normalize each to [0, 1] then take the max (strain = worst axis).
             raw_exhaustion = float(body.exhaustion) / 9.0
             raw_energy_lack = 1.0 - float(body.energy) / 10.0
             body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
-            # emotional_intensity: max positive sigma-deviation from per-channel baseline.
-            # Channels with < 10 samples skipped (cold-start guard). 3σ ceiling clips to 1.0.
-            from collections import defaultdict
+            if not is_live:
+                # emotional_intensity: max positive sigma-deviation from per-channel baseline.
+                # Channels with < 10 samples skipped (cold-start guard). 3σ ceiling clips to 1.0.
+                from collections import defaultdict
 
-            from brain.felt_time.weather_shift import update_baseline as _update_baseline_emo
-            _channel_samples: dict[str, list] = defaultdict(list)
-            for _mem in memories:
-                if _mem.created_at is None:
-                    continue
-                for _ch, _val in _mem.emotions.items():
-                    try:
-                        _fval = float(_val)
-                    except (TypeError, ValueError):
+                from brain.felt_time.weather_shift import update_baseline as _update_baseline_emo
+                _channel_samples: dict[str, list] = defaultdict(list)
+                for _mem in memories:
+                    if _mem.created_at is None:
                         continue
-                    if _fval > 0.0:
-                        _channel_samples[_ch].append((_mem.created_at, _fval))
-            _positive_devs: list[float] = []
-            for _ch, _ch_samps in _channel_samples.items():
-                if len(_ch_samps) < 10:
-                    continue
-                _bl = _update_baseline_emo(None, _ch_samps)
-                if _bl.sigma <= 0.0:
-                    continue
-                _current_val = max(v for _, v in _ch_samps)  # max-pool mirrors aggregate_state behaviour
-                _dev = (_current_val - _bl.mean) / max(_bl.sigma, 0.1)
-                if _dev > 0.0:
-                    _positive_devs.append(_dev)
-            if _positive_devs:
-                emotional_intensity = min(1.0, max(_positive_devs) / 3.0)
+                    for _ch, _val in _mem.emotions.items():
+                        try:
+                            _fval = float(_val)
+                        except (TypeError, ValueError):
+                            continue
+                        if _fval > 0.0:
+                            _channel_samples[_ch].append((_mem.created_at, _fval))
+                _positive_devs: list[float] = []
+                for _ch, _ch_samps in _channel_samples.items():
+                    if len(_ch_samps) < 10:
+                        continue
+                    _bl = _update_baseline_emo(None, _ch_samps)
+                    if _bl.sigma <= 0.0:
+                        continue
+                    _current_val = max(v for _, v in _ch_samps)  # max-pool mirrors aggregate_state behaviour
+                    _dev = (_current_val - _bl.mean) / max(_bl.sigma, 0.1)
+                    if _dev > 0.0:
+                        _positive_devs.append(_dev)
+                if _positive_devs:
+                    emotional_intensity = min(1.0, max(_positive_devs) / 3.0)
+            # Live: emotional_intensity is never computed and stays at its initial 0.0. The old measure (a sigma
+            # deviation over the 200-row max-pool) has no engine counterpart; it is unplugged until the felt-time
+            # rework decides what replaces it (#386).
         finally:
             store.close()
     except Exception:
@@ -3297,35 +3322,54 @@ def _run_initiate_review_tick(
     # Soft rest gate: suppress recall-resonance when body energy is low.
     # Fail-open: a body-read error must never permanently silence her.
     is_rest_state = False
+    _store = None
     try:
-        from brain.body.state import compute_body_state
+        from brain.body.state import body_state_from_short, compute_body_state
         from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
+        from brain.emotion import engine
         from brain.memory.store import MemoryStore, _row_to_memory
         from brain.utils.memory import days_since_human
 
+        _live_engine = engine.engine_for(persona_dir)
+        _is_live = _live_engine.is_live()
         _store = MemoryStore(persona_dir / "memories.db")
         _now = datetime.now(UTC)
-        _rows = _store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        _memories = [_row_to_memory(row) for row in _rows]
-        _emotion_state = aggregate_state(_memories)
+        if _is_live:
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the gate sees baseline energy (not resting).
+            _short = {name: r.short for name, r in _live_engine.read().items()}
+        else:
+            from brain.emotion.aggregate import aggregate_state
+
+            _rows = _store._conn.execute(  # noqa: SLF001
+                "SELECT * FROM memories "
+                "WHERE active = 1 "
+                "AND emotions_json IS NOT NULL "
+                "AND emotions_json != '{}' "
+                "ORDER BY created_at DESC LIMIT 200"
+            ).fetchall()
+            _memories = [_row_to_memory(row) for row in _rows]
+            _emotion_state = aggregate_state(_memories)
         _days = days_since_human(_store, now=_now, persona_dir=persona_dir)
         _words = count_words_in_session(
             _store, persona_dir=persona_dir, session_hours=0.0, now=_now
         )
-        _body = compute_body_state(
-            emotions=_emotion_state.emotions,
-            session_hours=0.0,
-            words_written=_words,
-            days_since_contact=_days,
-            now=_now,
-        )
+        if _is_live:
+            _body = body_state_from_short(
+                _short,
+                session_hours=0.0,
+                words_written=_words,
+                days_since_contact=_days,
+                now=_now,
+            )
+        else:
+            _body = compute_body_state(
+                emotions=_emotion_state.emotions,
+                session_hours=0.0,
+                words_written=_words,
+                days_since_contact=_days,
+                now=_now,
+            )
         is_rest_state = _rest_state_from_energy(_body.energy)
     except Exception:
         logger.debug(
@@ -3333,6 +3377,10 @@ def _run_initiate_review_tick(
             exc_info=True,
         )
         is_rest_state = False  # fail-open: a body bug must never silence her permanently
+    finally:
+        # The store used to stay open for the rest of the process; close it whichever way the gate read ended.
+        if _store is not None:
+            _store.close()
     _paused_out: list[bool] = []
     run_initiate_review_tick(
         persona_dir,

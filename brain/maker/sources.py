@@ -1,6 +1,7 @@
 """brain.maker.sources — live charge signals, read from existing stores.
 
-Emotional intensity (peak of the current aggregate), soul crystallisation
+Emotional intensity (peak of the engine's short averages when the engine is live,
+else of the current aggregate), soul crystallisation
 activity (current pending count — caller takes the delta), and dream activity
 (dream-typed memories since a cutoff). No new producer hooks.
 """
@@ -19,13 +20,21 @@ _RECENT_EMOTION_WINDOW = 200
 
 
 def current_emotional_intensity(store: MemoryStore) -> float:
-    """Peak intensity across the current emotional aggregate (0.0 if none).
+    """Peak intensity across the current emotional state (0.0 if none).
+
+    When the emotion engine is live this is the highest short average it reads;
+    otherwise the peak of the aggregate below.
 
     ``MemoryStore.list_by_type`` requires a concrete type string (it filters
     ``memory_type = ?``), so there is no ``None``-means-all path. Mirror
     ``brain/bridge/persona_state.py::_build_emotions``: pull the recent active
     emotion-carrying rows directly, aggregate, and take the peak.
     """
+    live_engine = store.emotion_engine()
+    if live_engine is not None and live_engine.is_live():
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
+        # or retrying, read() returns nothing and the intensity is 0.0.
+        return max((r.short for r in live_engine.read().values()), default=0.0)
     try:
         rows = store._conn.execute(  # noqa: SLF001
             "SELECT * FROM memories "

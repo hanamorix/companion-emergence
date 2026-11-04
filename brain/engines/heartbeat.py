@@ -26,6 +26,7 @@ from brain.bridge.model_tier import (
 )
 from brain.bridge.provider import LLMProvider
 from brain.dev_constants import HEARTBEAT_DECAY_BATCH_BUDGET_S
+from brain.emotion import engine
 from brain.engines.daemon_state import update_daemon_state
 from brain.health.alarm import compute_pending_alarms
 from brain.health.anomaly import BrainAnomaly
@@ -1306,7 +1307,9 @@ class HeartbeatEngine:
                 mem = self.store.get(dream_id)
             if mem is None:
                 return
-            dominant_emotion, intensity = self._peak_emotion(mem.emotions)
+            dominant_emotion, intensity = self._peak_emotion(
+                self._faded_emotions(persona_dir, mem)
+            )
             theme = mem.content[:80]
             update_daemon_state(
                 persona_dir,
@@ -1342,7 +1345,9 @@ class HeartbeatEngine:
                 )
             if reflex_mems:
                 mem = reflex_mems[0]
-                dominant_emotion, intensity = self._peak_emotion(mem.emotions)
+                dominant_emotion, intensity = self._peak_emotion(
+                    self._faded_emotions(persona_dir, mem)
+                )
                 theme = arc_name
                 summary = mem.content
             else:
@@ -1381,7 +1386,9 @@ class HeartbeatEngine:
                 research_mems = self.store.list_by_type("research", active_only=True, limit=1)
             if research_mems:
                 mem = research_mems[0]
-                dominant_emotion, intensity = self._peak_emotion(mem.emotions)
+                dominant_emotion, intensity = self._peak_emotion(
+                    self._faded_emotions(persona_dir, mem)
+                )
                 theme = research_topic
                 summary = mem.content
             else:
@@ -1413,15 +1420,28 @@ class HeartbeatEngine:
 
         dominant_emotion + intensity come from the aggregate emotional state
         across all active conversation memories. Falls back to 'calm'/'3' when
-        no conversation memories exist.
+        no conversation memories exist. When the emotion engine is live they are
+        its highest short average, and an empty read writes nothing (the previous
+        heartbeat entry stays).
         """
         try:
-            all_mems = self.store.list_active()
-            combined_emotions: dict[str, float] = {}
-            for m in all_mems:
-                for name, val in m.emotions.items():
-                    combined_emotions[name] = combined_emotions.get(name, 0.0) + val
-            dominant_emotion, intensity = self._peak_emotion(combined_emotions, default=("calm", 3))
+            live_engine = engine.engine_for(persona_dir)
+            if live_engine.is_live():
+                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+                # pending or retrying, read() returns nothing and the heartbeat entry is not written this tick.
+                short = {name: r.short for name, r in live_engine.read().items()}
+                if not short:
+                    return
+                dominant_emotion, intensity = self._peak_emotion(short)
+            else:
+                all_mems = self.store.list_active()
+                combined_emotions: dict[str, float] = {}
+                for m in all_mems:
+                    for name, val in m.emotions.items():
+                        combined_emotions[name] = combined_emotions.get(name, 0.0) + val
+                dominant_emotion, intensity = self._peak_emotion(
+                    combined_emotions, default=("calm", 3)
+                )
             theme = "heartbeat tick"
             summary = (
                 f"elapsed={elapsed_seconds / 3600:.1f}h, "
@@ -1438,6 +1458,12 @@ class HeartbeatEngine:
             )
         except Exception as exc:
             logger.warning("daemon_state write for heartbeat failed; isolating: %.200s", exc)
+
+    @staticmethod
+    def _faded_emotions(persona_dir: Path, mem) -> dict[str, float]:
+        """`mem`'s emotions at their faded values (the stored values until the switch)."""
+        live_engine = engine.engine_for(persona_dir)
+        return {n: live_engine.faded_value(mem, n) for n in mem.emotions}
 
     @staticmethod
     def _peak_emotion(
@@ -1469,6 +1495,14 @@ class HeartbeatEngine:
         """
         if forced_resonance is not None:
             return float(forced_resonance), {"forced": float(forced_resonance)}
+
+        live_engine = self.store.emotion_engine()
+        if live_engine is not None and live_engine.is_live():
+            # The spike detector's input has no engine counterpart. With a resonance of 0.0 the rolling-baseline
+            # window fills with zeros, so `_maybe_emit_emotion_spike` never reaches its `delta_sigma >= 0.5` bar and
+            # the emitter stays dormant until it is rebuilt (#569). The call, `_update_rolling_baseline`, the emitter
+            # and the `forced_resonance` plumbing stay in place.
+            return 0.0, {}
 
         combined: dict[str, float] = {}
         for mem in self.store.list_active():

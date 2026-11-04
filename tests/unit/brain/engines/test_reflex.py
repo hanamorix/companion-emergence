@@ -1101,3 +1101,130 @@ def test_run_tick_prompt_resolves_variant_spelled_placeholders(tmp_path: Path):
         assert captured[0] == "8.0|8.0|0|0"
     finally:
         store.close()
+
+
+# ── B2 phase B: arcs read the engine's short averages when it is live ─────────
+#
+# Each case seeds the file-backed store with values that CONTRADICT the stub's read, so an arc evaluated from the
+# store would give a different answer.
+
+
+def _live_reflex(tmp_path: Path, stub, readings: dict[str, float], arcs: list[dict], *, stored: dict[str, float]):
+    from brain.emotion.engine import Reading
+
+    arcs_path = tmp_path / "arcs.json"
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": arcs}), encoding="utf-8")
+    captured: list[str] = []
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "ok"
+
+    stub.live = True
+    stub.readings = {n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()}
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _seed_emotion_memory(store, stored)
+        runner = ReflexEngine(
+            store=store,
+            provider=CapturingProvider(),
+            persona_name="Nell",
+            persona_system_prompt="",
+            arcs_path=arcs_path,
+            log_path=tmp_path / "log.json",
+            default_arcs_path=DEFAULT_ARCS_PATH,
+        )
+        result = runner.run_tick(dry_run=False)
+    finally:
+        store.close()
+    return result, captured
+
+
+def _arc(name="live_arc", trigger=None, template="Love: {love}") -> dict:
+    return {
+        "name": name,
+        "description": "d",
+        "trigger": trigger if trigger is not None else {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": template,
+    }
+
+
+def test_live_an_absent_emotion_fails_the_trigger_and_ranks_nothing(tmp_path: Path, emotion_engine_stub):
+    result, captured = _live_reflex(
+        tmp_path, emotion_engine_stub, {"grief": 6.0}, [_arc()], stored={"love": 9.0}
+    )
+    assert result.arcs_fired == ()
+    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [("live_arc", "trigger_not_met")]
+    assert captured == []
+
+
+def test_live_a_present_zero_meets_only_a_zero_threshold(tmp_path: Path, emotion_engine_stub):
+    """A hand-edited arc with threshold 0 fires on a present 0 but not on an absent emotion (the accepted edge)."""
+    cases = {
+        "present_zero_zero_threshold": ({"love": 0.0}, 0, 1),
+        "present_zero_normal_threshold": ({"love": 0.0}, 5, 0),
+        "absent_zero_threshold": ({"grief": 3.0}, 0, 0),
+    }
+    for label, (readings, threshold, expected_fired) in cases.items():
+        run_dir = tmp_path / label
+        run_dir.mkdir()
+        result, _ = _live_reflex(
+            run_dir, emotion_engine_stub, readings, [_arc(trigger={"love": threshold})], stored={"love": 9.0}
+        )
+        assert len(result.arcs_fired) == expected_fired, label
+
+
+def test_live_a_template_naming_an_emotion_with_no_value_does_not_fire(tmp_path: Path, emotion_engine_stub):
+    result, captured = _live_reflex(
+        tmp_path,
+        emotion_engine_stub,
+        {"love": 7.0},
+        [_arc(template="Grief: {grief} Love: {love}")],
+        stored={"love": 7.0, "grief": 8.0},
+    )
+    assert result.arcs_fired == ()
+    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [("live_arc", "template_emotion_absent")]
+    assert captured == []
+    assert not (tmp_path / "log.json").exists()
+
+
+def test_live_a_template_whose_placeholders_are_all_present_fires_and_a_present_zero_renders_as_0_0(
+    tmp_path: Path, emotion_engine_stub
+):
+    result, captured = _live_reflex(
+        tmp_path,
+        emotion_engine_stub,
+        {"love": 7.0, "grief": 0.0},
+        [_arc(template="Grief: {grief} Love: {love} Other: {no_such_field}")],
+        stored={"love": 1.0},
+    )
+    assert len(result.arcs_fired) == 1
+    assert captured == ["Grief: 0.0 Love: 7.0 Other: 0"]
+
+
+def test_live_a_variant_spelling_of_a_present_emotion_fires_and_renders_its_value(
+    tmp_path: Path, emotion_engine_stub
+):
+    result, captured = _live_reflex(
+        tmp_path,
+        emotion_engine_stub,
+        {"love": 7.0, "comfort_seeking": 4.0},
+        [_arc(template="{Love}|{comfort-seeking}")],
+        stored={"love": 1.0},
+    )
+    assert len(result.arcs_fired) == 1
+    assert captured == ["7.0|4.0"]
+
+
+def test_live_ranking_and_trigger_state_use_the_engine_values(tmp_path: Path, emotion_engine_stub):
+    arcs = [_arc(name="low", trigger={"love": 5}), _arc(name="high", trigger={"grief": 5})]
+    result, _ = _live_reflex(
+        tmp_path, emotion_engine_stub, {"love": 6.0, "grief": 9.0}, arcs, stored={"love": 10.0}
+    )
+    assert [f.arc_name for f in result.arcs_fired] == ["high"]
+    assert result.arcs_fired[0].trigger_state == {"grief": 9.0}
