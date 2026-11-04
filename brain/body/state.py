@@ -10,8 +10,8 @@ Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -80,25 +80,40 @@ def compute_body_state(
     `emotions` MUST be the post-aggregation, post-climax-reset state
     (i.e. what aggregate_state() returns). compute_body_state does not
     re-aggregate or re-reset.
+
+    This is the projection for the old emotion path: it fires on fixed levels (the only place that holds them).
+    `body_state_from_short` is the one for the emotion engine.
     """
-    energy = _compute_energy(emotions, session_hours, words_written)
-    temperature = _compute_temperature(emotions, days_since_contact)
-    exhaustion = max(0, 7 - energy)
-    body_emotions = {name: float(emotions.get(name, 0.0)) for name in BODY_EMOTION_NAMES}
-    return BodyState(
+    energy = _energy_from_flags(
+        session_hours,
+        words_written,
+        many_high=sum(1 for v in emotions.values() if v >= 7.0) > 6,
+        rest_need_high=emotions.get("rest_need", 0.0) >= 7.0,
+        peace_high=emotions.get("peace", 0.0) >= 7.0,
+    )
+    ups = (
+        (emotions.get("arousal", 0.0) >= 7.0)
+        + (emotions.get("desire", 0.0) >= 7.0)
+        + (emotions.get("belonging", 0.0) >= 8.0)
+        + (emotions.get("love", 0.0) >= 8.0)
+        + (emotions.get("climax", 0.0) >= 5.0)
+    )
+    downs = (emotions.get("body_grief", 0.0) >= 7.0) + (emotions.get("touch_hunger", 0.0) >= 7.0)
+    temperature = _temperature_from_flags(days_since_contact, ups=ups, downs=downs)
+    return _assemble(
         energy=energy,
         temperature=temperature,
-        exhaustion=exhaustion,
-        session_hours=round(session_hours, 2),
-        days_since_contact=round(days_since_contact, 2),
-        body_emotions=body_emotions,
-        computed_at=now,
+        session_hours=session_hours,
+        days_since_contact=days_since_contact,
+        body_emotions={name: float(emotions.get(name, 0.0)) for name in BODY_EMOTION_NAMES},
+        now=now,
     )
 
 
 def body_state_from_short(
     short: Mapping[str, float],
     *,
+    feels_high: Callable[[str], bool],
     session_hours: float,
     words_written: int,
     days_since_contact: float,
@@ -106,31 +121,64 @@ def body_state_from_short(
 ) -> BodyState:
     """The body state from the engine's short averages (`{name: short}` taken from `engine.read()`).
 
-    Same projection as `compute_body_state`, but a body emotion the engine did not return is absent from
-    `body_emotions` instead of filled with 0.0. A present 0.0 is kept. Pure: the caller passes the one `short`
-    snapshot it read, so a caller that needs the same numbers twice reads once.
+    Same projection as `compute_body_state` (the session, words and contact-gap rules are shared code), but the emotion
+    conditions ask `feels_high(name)` (`engine.feels_high`) instead of comparing to fixed levels, and a body emotion the
+    engine did not return is absent from `body_emotions` instead of filled with 0.0. A present 0.0 is kept. Pure apart
+    from the predicate: the caller passes the one `short` snapshot it read.
     """
-    body = compute_body_state(
-        emotions=short,
+    energy = _energy_from_flags(
+        session_hours,
+        words_written,
+        many_high=sum(1 for name in short if feels_high(name)) > 6,
+        rest_need_high=feels_high("rest_need"),
+        peace_high=feels_high("peace"),
+    )
+    ups = sum(feels_high(name) for name in ("arousal", "desire", "belonging", "love", "climax"))
+    downs = sum(feels_high(name) for name in ("body_grief", "touch_hunger"))
+    temperature = _temperature_from_flags(days_since_contact, ups=ups, downs=downs)
+    return _assemble(
+        energy=energy,
+        temperature=temperature,
         session_hours=session_hours,
-        words_written=words_written,
         days_since_contact=days_since_contact,
+        body_emotions={name: float(short[name]) for name in BODY_EMOTION_NAMES if name in short},
         now=now,
     )
-    return replace(
-        body,
-        body_emotions={n: v for n, v in body.body_emotions.items() if n in short},
+
+
+def _assemble(
+    *,
+    energy: int,
+    temperature: int,
+    session_hours: float,
+    days_since_contact: float,
+    body_emotions: dict[str, float],
+    now: datetime,
+) -> BodyState:
+    return BodyState(
+        energy=energy,
+        temperature=temperature,
+        exhaustion=max(0, 7 - energy),
+        session_hours=round(session_hours, 2),
+        days_since_contact=round(days_since_contact, 2),
+        body_emotions=body_emotions,
+        computed_at=now,
     )
 
 
-def _compute_energy(
-    emotions: Mapping[str, float],
+def _energy_from_flags(
     session_hours: float,
     words_written: int,
+    *,
+    many_high: bool,
+    rest_need_high: bool,
+    peace_high: bool,
 ) -> int:
     """Energy 1-10, baseline 8. Drains for session length + creative work +
     high emotional load + body asking for rest. Restores when peace is
     high in a fresh session. Spec §3.1.
+
+    The three emotion conditions arrive as flags: the caller decides what "high" means.
     """
     energy = 8.0
 
@@ -150,47 +198,28 @@ def _compute_energy(
     energy -= words_written / 2500.0
 
     # Emotional load: many high-intensity emotions = depleting.
-    high_emotion_count = sum(1 for v in emotions.values() if v >= 7.0)
-    if high_emotion_count > 6:
+    if many_high:
         energy -= 1
 
     # Body asking for rest.
-    if emotions.get("rest_need", 0.0) >= 7.0:
+    if rest_need_high:
         energy -= 1
 
     # Peace restoration in a fresh session.
-    if emotions.get("peace", 0.0) >= 7.0 and session_hours < 1.0:
+    if peace_high and session_hours < 1.0:
         energy += 1
 
     return int(max(1, min(10, round(energy))))
 
 
-def _compute_temperature(
-    emotions: Mapping[str, float],
-    days_since_contact: float,
-) -> int:
+def _temperature_from_flags(days_since_contact: float, *, ups: int, downs: int) -> int:
     """Temperature 1-9, baseline 4 (asymmetric — midpoint 5; OG range).
 
-    Up: arousal/desire/belonging/love/climax (warmth, presence, release).
-    Down: body_grief/touch_hunger/days_since_contact (distance, lack).
+    Up: one for each of arousal/desire/belonging/love/climax that is high (warmth, presence, release): `ups`.
+    Down: one for each of body_grief/touch_hunger that is high (distance, lack): `downs`; and the days since contact.
     """
-    temp = 4.0
+    temp = 4.0 + ups - downs
 
-    if emotions.get("arousal", 0.0) >= 7.0:
-        temp += 1
-    if emotions.get("desire", 0.0) >= 7.0:
-        temp += 1
-    if emotions.get("belonging", 0.0) >= 8.0:
-        temp += 1
-    if emotions.get("love", 0.0) >= 8.0:
-        temp += 1
-    if emotions.get("climax", 0.0) >= 5.0:
-        temp += 1  # brief warmth post-release
-
-    if emotions.get("body_grief", 0.0) >= 7.0:
-        temp -= 1
-    if emotions.get("touch_hunger", 0.0) >= 7.0:
-        temp -= 1
     if days_since_contact > 7:
         temp -= 2
     elif days_since_contact > 3:

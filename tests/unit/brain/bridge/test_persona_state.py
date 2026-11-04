@@ -613,3 +613,24 @@ def test_build_body_live_omits_absent_body_emotions_and_never_shows_nan(tmp_path
     assert body["body_emotions"] == {"arousal": 6.0}
     for key in ("energy", "temperature", "exhaustion", "session_hours", "days_since_contact"):
         assert not math.isnan(body[key])
+
+
+def _body_numbers(tmp_path: Path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+    from brain.bridge.persona_state import _build_body
+
+    stub.live = True
+    stub.high = set(high)
+    stub.readings = {n: _stub_reading(v) for n, v in readings.items()}
+    body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
+    assert body is not None
+    return body["energy"], body["temperature"]
+
+
+def test_build_body_live_energy_and_temperature_follow_the_engines_predicate_not_a_level(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    energy, temperature = _body_numbers(tmp_path, emotion_engine_stub, {}, set())
+    top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
+    assert _body_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
+    low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
+    assert _body_numbers(tmp_path, emotion_engine_stub, low, set(low)) == (energy - 1, temperature + 1)

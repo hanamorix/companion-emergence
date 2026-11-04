@@ -85,6 +85,7 @@ def get_body_state(
     if is_live:
         body = body_state_from_short(
             short,
+            feels_high=live_engine.feels_high,
             session_hours=session_hours,
             words_written=words,
             days_since_contact=days_since,

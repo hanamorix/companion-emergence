@@ -448,3 +448,9 @@ EMOTION_SUMMARY_MODE: str = "long"
 # The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
 # by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
 SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
+
+# A feeling counts as high (`engine.feels_high`, the one predicate the readers that used to fire on a fixed level call) when
+# its short average today is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, taken over that feeling's
+# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high regardless). Owner-set,
+# 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_RANGE_FRACTION: float = 0.5

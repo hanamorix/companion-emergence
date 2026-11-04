@@ -435,11 +435,13 @@ def test_derive_intensity_drivers_emotional_intensity_zero_when_at_baseline(tmp_
 # ── B2 phase B: the live branch of the felt-time drivers ─────────────────────
 
 
-def _live_drivers(tmp_path: Path, stub, readings: dict[str, float]):
+def _live_drivers(tmp_path: Path, stub, readings: dict[str, float], *, high: set[str] | None = None):
+    """`high` is what the engine's `feels_high` says (default: nothing is high, whatever the numbers)."""
     from brain.bridge.supervisor import _derive_intensity_drivers
     from brain.emotion.engine import Reading
 
     stub.live = True
+    stub.high = set(high or ())
     stub.readings = {n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()}
     return _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
 
@@ -474,19 +476,22 @@ def test_live_drivers_are_finite_in_unit_range_and_emotional_intensity_is_unplug
         assert math.isfinite(value) and 0.0 <= value <= 1.0
 
 
-def test_live_body_strain_is_fed_from_the_short_average_not_the_store(tmp_path: Path, emotion_engine_stub) -> None:
+def test_live_body_strain_follows_the_engines_predicate_not_the_store_or_a_level(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
     from brain.memory.store import MemoryStore
 
     store = MemoryStore(tmp_path / "memories.db")
     for i in range(3):
         _make_emotion_memory(store, channel="rest_need", value=9.0, days_ago=0.1 + i)  # stored: strain from rest_need
     store.close()
+    names = ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")
     quiet = _live_drivers(tmp_path, emotion_engine_stub, {})
-    tired = _live_drivers(
-        tmp_path,
-        emotion_engine_stub,
-        dict.fromkeys(("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal"), 9.0),
-    )
+    # Every value far above the old levels, but the engine calls nothing high: strain does not move.
+    not_high = _live_drivers(tmp_path, emotion_engine_stub, dict.fromkeys(names, 9.0))
+    assert not_high.body_strain == quiet.body_strain
+    # Values far below the old levels, but the engine calls rest_need high: energy drops, so strain rises.
+    tired = _live_drivers(tmp_path, emotion_engine_stub, {"rest_need": 0.5}, high={"rest_need"})
     assert tired.body_strain > quiet.body_strain
 
 

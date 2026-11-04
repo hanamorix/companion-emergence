@@ -731,6 +731,7 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         if is_live:
             body = body_state_from_short(
                 short,
+                feels_high=live_engine.feels_high,
                 session_hours=0.0,
                 words_written=words,
                 days_since_contact=days,

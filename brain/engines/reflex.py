@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import string
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -342,7 +342,14 @@ class ReflexEngine:
         # session JSONL buffers (the freshest user-contact signal).
         days_since = days_since_human(self.store, now, persona_dir=self.log_path.parent)
 
-        eligible, skipped = self._evaluate(arc_set.arcs, emotions, days_since, log, now, live=live)
+        eligible, skipped = self._evaluate(
+            arc_set.arcs,
+            emotions,
+            days_since,
+            log,
+            now,
+            feels_high=live_engine.feels_high if live else None,
+        )
 
         if not eligible:
             return ReflexResult(
@@ -400,13 +407,14 @@ class ReflexEngine:
         log: ReflexLog,
         now: datetime,
         *,
-        live: bool = False,
+        feels_high: Callable[[str], bool] | None = None,
     ) -> tuple[list[ReflexArc], list[ArcSkipped]]:
+        live = feels_high is not None
         eligible: list[ReflexArc] = []
         skipped: list[ArcSkipped] = []
 
         for arc in arcs:
-            if not _trigger_met(arc, emotions, live=live):
+            if not _trigger_met(arc, emotions, feels_high=feels_high):
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="trigger_not_met"))
                 continue
             if live:
@@ -441,12 +449,16 @@ class ReflexEngine:
         *,
         live: bool = False,
     ) -> ReflexArc:
-        """Highest aggregate threshold-excess wins; ties broken by longest-since-fire."""
+        """Highest aggregate threshold-excess wins; ties broken by longest-since-fire.
+
+        On the live path an arc's own threshold numbers are not compared (what fires an arc is `engine.feels_high`), so
+        the excess is the sum of the trigger emotions' short averages.
+        """
 
         def key(arc: ReflexArc) -> tuple[float, float]:
             if live:
                 # An eligible arc has every trigger emotion present (`_trigger_met` fails on an absent one).
-                excess = sum(emotions[e] - t for e, t in arc.trigger.items())
+                excess = sum(emotions[e] for e in arc.trigger)
             else:
                 excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
             last = log.last_fire_for_arc(arc.name)
@@ -564,14 +576,24 @@ class _PromptContext(dict):
         return self._emotion_text.get(canonical_name(key), "0")
 
 
-def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float], *, live: bool = False) -> bool:
+def _trigger_met(
+    arc: ReflexArc,
+    emotions: Mapping[str, float],
+    *,
+    feels_high: Callable[[str], bool] | None = None,
+) -> bool:
+    """Whether every emotion the arc's trigger names is at its level.
+
+    Old path (`feels_high` None): each emotion at or above the arc's threshold for it. Live path: each emotion present in
+    `emotions` and high by `feels_high` (`engine.feels_high`); the arc's threshold numbers are not compared.
+    """
     for name, threshold in arc.trigger.items():
-        if live:
+        if feels_high is not None:
             # Accepted edge: a hand-edited arc with a threshold of 0 or below used to fire on a missing emotion because
             # a missing value read as 0.0. On the live path a missing emotion fails the trigger, so such an arc waits
-            # until the emotion has a value. The crystallizer refuses thresholds below 5.0, so only hand-edited arc
-            # files are affected.
-            if name not in emotions or emotions[name] < threshold:
+            # until the emotion has a value and is high. The crystallizer refuses thresholds below 5.0, so only
+            # hand-edited arc files are affected.
+            if name not in emotions or not feels_high(name):
                 return False
         elif emotions.get(name, 0.0) < threshold:
             return False

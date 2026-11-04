@@ -1925,6 +1925,7 @@ def _derive_intensity_drivers(
             if is_live:
                 body = body_state_from_short(
                     short,
+                    feels_high=live_engine.feels_high,
                     session_hours=0.0,
                     words_written=words,
                     days_since_contact=days,
@@ -2443,6 +2444,7 @@ def _self_model_reflect(
     """
     from brain.body.state import body_state_from_short, compute_body_state
     from brain.body.words import count_words_in_session
+    from brain.emotion import engine
     from brain.emotion.aggregate import aggregate_state
     from brain.memory.store import MemoryStore, _row_to_memory
     from brain.utils.memory import days_since_human
@@ -2465,6 +2467,7 @@ def _self_model_reflect(
             )
         body = body_state_from_short(
             short_values,
+            feels_high=engine.engine_for(persona_dir).feels_high,
             session_hours=0.0,
             words_written=words,
             days_since_contact=days,
@@ -3485,6 +3488,7 @@ def _run_initiate_review_tick(
         if _is_live:
             _body = body_state_from_short(
                 _short,
+                feels_high=_live_engine.feels_high,
                 session_hours=0.0,
                 words_written=_words,
                 days_since_contact=_days,

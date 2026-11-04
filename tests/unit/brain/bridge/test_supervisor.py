@@ -1464,8 +1464,8 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
         computed_at=datetime.now(UTC),
     )
 
-    def fake_compute(**kwargs):
-        seen["emotions"] = dict(kwargs["emotions"])
+    def fake_from_short(short, *, feels_high, **kwargs):
+        seen["emotions"] = dict(short)
         return low
 
     real_close = MemoryStore.close
@@ -1483,7 +1483,7 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", fake_compute),
+        patch("brain.body.state.body_state_from_short", fake_from_short),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
@@ -1518,3 +1518,29 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
     assert captured["is_rest_state"] is False
+
+
+def test_live_rest_gate_asks_the_engines_predicate_for_body_energy(tmp_path: Path, emotion_engine_stub) -> None:
+    """With the engine live the rest gate's body projection takes the engine's `feels_high`, not a fixed level."""
+    from unittest.mock import MagicMock, patch
+
+    import brain.body.state as body_state
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+
+    persona_dir = _persona_dir(tmp_path)
+    emotion_engine_stub.live = True
+    seen: list[object] = []
+    real = body_state.body_state_from_short
+
+    def recording(short, *, feels_high, **kwargs):
+        seen.append(feels_high)
+        return real(short, feels_high=feels_high, **kwargs)
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", lambda *a, **k: None),
+        patch("brain.body.state.body_state_from_short", recording),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+
+    assert seen == [emotion_engine_stub.feels_high]

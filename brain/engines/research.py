@@ -195,15 +195,17 @@ class ResearchEngine:
             else days_since_human(self.store, now, persona_dir=self.interests_path.parent)
         )
         emo_state = emotion_state_override
+        high_engine = None  # the live engine, when its reading drives the emotion half of the gate
         if emo_state is None:
             from brain.emotion import engine
 
             live_engine = engine.engine_for(self.interests_path.parent)
             if live_engine.is_live():
+                high_engine = live_engine
                 from brain.emotion.state import EmotionalState
 
                 # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-                # pending or retrying, read() returns nothing and the research gate sees no emotion peak.
+                # pending or retrying, read() returns nothing and the research gate sees no high feeling.
                 # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
                 emo_state = EmotionalState(
                     emotions={name: r.short for name, r in live_engine.read().items()}
@@ -214,11 +216,16 @@ class ResearchEngine:
                 all_mems = self.store.list_active(limit=None)
                 emo_state = aggregate_state(all_mems)
 
-        emo_peak = max(emo_state.emotions.values(), default=0.0)
+        if high_engine is not None:
+            # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
+            emotion_gate = any(high_engine.feels_high(name) for name in emo_state.emotions)
+        else:
+            # Old path, and a caller-supplied `emotion_state_override` (test-only: no caller in brain/).
+            emotion_gate = max(emo_state.emotions.values(), default=0.0) >= 7.0  # research_emotion_threshold default
 
         gate_ok = (
             days_since >= 1.5  # research_days_since_human_min default
-            or emo_peak >= 7.0  # research_emotion_threshold default
+            or emotion_gate
         )
         if not gate_ok:
             return ResearchResult(

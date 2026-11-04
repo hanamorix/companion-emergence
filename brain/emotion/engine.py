@@ -43,9 +43,15 @@ from typing import TYPE_CHECKING, NamedTuple
 from brain import dev_constants
 from brain.emotion import engine_files, vocabulary
 from brain.emotion.engine_files import VocabularyHalfLives
-from brain.emotion.engine_utils import Event, counted_kind, resolve_emotions, source_modifier
+from brain.emotion.engine_utils import (
+    Event,
+    counted_kind,
+    feels_high_from,
+    resolve_emotions,
+    source_modifier,
+)
 from brain.utils.file_lock import LockTimeoutError
-from brain.utils.log_throttle import count_throttled
+from brain.utils.log_throttle import count_throttled, warn_throttled
 from brain.utils.time import lenient_utc
 
 if TYPE_CHECKING:
@@ -310,6 +316,32 @@ class EmotionEngine:
             raise KeyError(
                 f"memory {memory.id} has no stored value for emotion {emotion!r}"
             ) from None
+
+    def feels_high(self, name: str) -> bool:
+        """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.
+
+        The rule is `engine_utils.feels_high_from` (shift reads stronger, or the short average is in the upper half of the
+        feeling's own 30-day range). This gathers its inputs: the feeling's `Reading` from `read()` and its snapshot from the
+        state cache `read()` takes the shift from. A name `read()` does not return is not high, and nothing stored is
+        read or written beyond that cache. Never raises: a snapshot that cannot be read leaves only the shift part.
+        """
+        reading = self.read().get(name)
+        if reading is None:
+            return False
+        if reading.shift > 0:
+            return True
+        try:
+            state = self._state_cache.get().state
+            emotion = None if state is None else state.emotions.get(name)
+            snapshot = [] if emotion is None else emotion.snapshot
+        except Exception:
+            warn_throttled(
+                logger,
+                f"engine:feels_high:{self.persona_dir}",
+                "emotion engine: feels_high could not read the snapshot; only the shift part applies",
+            )
+            return False
+        return feels_high_from(reading.short, reading.shift, snapshot)
 
     # --- the real lookup ---------------------------------------------------------------------------
 
