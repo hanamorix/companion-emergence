@@ -6,9 +6,9 @@ In this slice the module holds one thing: the half-life cache behind
 engine only reads it, never writes it, never repairs it and never quarantines it
 (`Recovery.DEFAULT`: bad content takes the default).
 
-The file is re-read when its stat key, `file_ops.stat_path(path).key` (`(inode, mtime_ns, size)`), changes. The key
-is taken BEFORE the read, so a file replaced between the stat and the read is read again
-on the next call. A failure that says nothing about the content (a filesystem error on
+The file is re-read when its stat key, `file_ops.stat_path(path).key`
+(`(inode, mtime_ns, size)`), changes. The key is taken BEFORE the read, so a file replaced
+between the stat and the read is read again on the next call. A failure that says nothing about the content (a filesystem error on
 the read, an error from `stat` other than "no such file") is not cached: the previously
 loaded half-lives stay in force and the next call tries again (the same bound as
 `brain/tunables.py`, #530). A fault in the content (not JSON, wrong shape, a bad entry)
