@@ -15,8 +15,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from brain import dev_constants
 from brain.felt_time.state import FeltTimeState
+from brain.memory import memory_utils
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
@@ -128,11 +128,11 @@ def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> f
     if lived is None:
         return 1.0  # cold-start cases — treat as fresh (spec §7)
     # P3 retention rework, Change 2: importance extends the effective horizon.
-    # r=0 (importance 0) -> horizon_eff == _FRESHNESS_LIVED_HOURS_HORIZON,
-    # byte-identical to pre-change. Rising importance stretches the horizon,
-    # slowing freshness decay proportionally; never shrinks it below baseline.
-    r = min(1.0, max(0.0, memory.importance / 10.0))
-    horizon_eff = _FRESHNESS_LIVED_HOURS_HORIZON * (1.0 + dev_constants.HORIZON_IMPORTANCE_GAIN * r)
+    # Importance 0 -> horizon_eff == _FRESHNESS_LIVED_HOURS_HORIZON. Rising
+    # importance stretches the horizon, slowing freshness decay proportionally;
+    # never shrinks it below baseline. The stretch comes from the one function
+    # the emotion fade shares (`memory_utils.importance_stretch`).
+    horizon_eff = _FRESHNESS_LIVED_HOURS_HORIZON * memory_utils.importance_stretch(memory.importance)
     return 1.0 - _clamp(lived / horizon_eff)
 
 

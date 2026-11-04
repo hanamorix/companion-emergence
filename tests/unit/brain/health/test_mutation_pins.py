@@ -19,13 +19,14 @@ from types import SimpleNamespace
 import pytest
 
 from brain.health import json_io as jio
+from brain.utils import file_ops
 
 NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
 
 
 @pytest.fixture
 def deny(monkeypatch):
-    """deny("needle"): any open() by json_io of a path containing the needle raises PermissionError (not a directory)."""
+    """deny("needle"): any open() by json_io or file_ops of a path containing the needle raises PermissionError (not a directory)."""
     real_open = builtins.open
     needles: list[str] = []
 
@@ -34,7 +35,8 @@ def deny(monkeypatch):
             raise PermissionError(13, "denied")
         return real_open(file, *a, **k)
 
-    monkeypatch.setattr(jio, "open", fake_open, raising=False)
+    monkeypatch.setattr(jio, "open", fake_open, raising=False)  # the streaming readers open through json_io
+    monkeypatch.setattr(file_ops, "open", fake_open, raising=False)  # the whole-file reads open through file_ops
 
     def add(needle: str) -> None:
         needles.append(needle)

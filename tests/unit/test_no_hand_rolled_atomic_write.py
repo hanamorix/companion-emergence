@@ -8,14 +8,14 @@ that is not on a line carrying an explicit exemption marker with a reason::
 
 Flagged forms (RUNNER PROPOSAL, see 1-spec.md section 4): ``os.replace/rename/renames`` (and ``from os import`` of them),
 a method call ``X.replace(arg)`` / ``X.rename(arg)`` with exactly one positional argument and no keywords (the ``Path``
-forms), ``tempfile.mkstemp``, ``shutil.move``, and the retry helpers ``_replace_with_retry`` / ``replace_retrying`` /
-``_retry_perm`` (so a helper cannot be a way round the check). A bare ``replace(obj, a=1)`` that came from
+forms), ``tempfile.mkstemp``, ``shutil.move``, and the retry helpers ``replace_file`` / ``retry_transient`` of
+``brain.utils.file_ops`` (so a helper cannot be a way round the check). A bare ``replace(obj, a=1)`` that came from
 ``dataclasses`` is not a file replace and is not flagged: from-imports are resolved by their origin module.
 
 The marker must sit on one of the source lines of the call itself. A marker on lines with no flagged call is a stale
 marker and fails, as does a marker with no reason. The exact number of markers in ``brain/`` is pinned, so a drive-by
-marker is a visible diff. The module that holds the shared writer, ``brain/utils/atomic_write.py``, is the one file
-skipped. Markers on pure-move sites (a plain rename of a finished file) are main's ruling, not the owner's original
+marker is a visible diff. The two modules that hold the shared writer and the shared retried rename,
+``brain/utils/atomic_write.py`` and ``brain/utils/file_ops.py``, are the only files skipped. Markers on pure-move sites (a plain rename of a finished file) are main's ruling, not the owner's original
 wording (the owner named the exclusive-create cases).
 
 Aliased imports (``import os as _os``, ``import shutil as sh``) and the ``.replace(target=...)`` keyword spelling are
@@ -32,16 +32,16 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-SHARED_WRITER = "brain/utils/atomic_write.py"
+SHARED_WRITERS = ("brain/utils/atomic_write.py", "brain/utils/file_ops.py")
 MARKER = re.compile(r"#\s*atomic-write:\s*ok\b(?:\s*--\s*(\S.*?)?)?\s*$")
-RETRY_HELPERS = {"_replace_with_retry", "replace_retrying", "_retry_perm"}
+RETRY_HELPERS = {"replace_file", "retry_transient"}
 OS_FUNCS = {"replace", "rename", "renames"}
 
 # The exact number of markers in brain/ (1-spec.md section 3): 14 from the base scan, the staging publish, the two
 # shutil.move directory moves, and the three heal moves in attempt_heal.py. (The base scan had 15 until #524 replaced the
 # whole-buffer poison rename in brain/ingest/pipeline.py with a span-only append, which has no rename to mark.) Plus one
 # for the settings migration, which renames the finished old tunables.json aside as its backup (#529).
-EXPECTED_MARKERS = 21
+EXPECTED_MARKERS = 20
 
 
 def flagged_calls(source: str, tree: ast.Module | None = None) -> list[tuple[int, int, str]]:
@@ -135,7 +135,7 @@ def scan_tree() -> tuple[list[str], int]:
     errors: list[str] = []
     markers = 0
     for rel, source in brain_sources().items():
-        if rel == SHARED_WRITER:
+        if rel in SHARED_WRITERS:
             continue
         errs, n = check_source(source, rel, trees[rel])
         errors += errs
@@ -169,9 +169,9 @@ FLAGGED = {
     "mkstemp": "import tempfile\nfd, name = tempfile.mkstemp()\n",
     "from tempfile import mkstemp": "from tempfile import mkstemp\nmkstemp()\n",
     "shutil.move": "import shutil\nshutil.move(a, b)\n",
-    "retry helper by name": "_replace_with_retry(a, b)\n",
-    "retry helper by attribute": "heal._retry_perm(lambda: 1)\n",
-    "replace_retrying": "overlay.replace_retrying(a, b)\n",
+    "retry helper by name": "replace_file(a, b)\n",
+    "retry helper by attribute": "file_ops.retry_transient(lambda: 1)\n",
+    "replace_file by attribute": "file_ops.replace_file(a, b)\n",
     "path.replace(target=...)": "def f(tmp, dst):\n    tmp.replace(target=dst)\n",
     "path.rename(target=...)": "def f(tmp, dst):\n    tmp.rename(target=dst)\n",
     "aliased os": "import os as _os\n_os.replace(a, b)\n",

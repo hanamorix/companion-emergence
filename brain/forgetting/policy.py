@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from brain import dev_constants
+from brain.memory import memory_utils
 from brain.memory.store import Memory
 
 IMPORT_GRACE_LIVED_HOURS = 168.0  # 7 lived-days — settling window for migrated memories
@@ -55,7 +56,7 @@ def next_state(
     # Arc pressure + importance both lower the effective threshold, additively,
     # reusing the same divisor idiom. narrative_weight=0 and memory.importance=0
     # → baseline (unchanged); either pressure source lowers the gate further.
-    r = min(1.0, max(0.0, memory.importance / 10.0))
+    r = memory_utils.importance_ratio(memory.importance)
     effective_fade = dev_constants.FADE_THRESHOLD / (1.0 + narrative_weight + dev_constants.FADE_IMPORTANCE_GAIN * r)
     if memory.state == "active":
         if salience < effective_fade:
