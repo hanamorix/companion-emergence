@@ -1615,6 +1615,7 @@ def test_summary_mode_and_count_come_from_the_dev_constants(
     assert _build_emotion_summary(store) == expected
 
 
+@pytest.mark.no_base_failure(reason='pins that an in-memory store reads as not live, so the mood summary takes the old aggregate path, as the old code did')
 def test_summary_in_memory_store_is_not_live_and_takes_the_old_path(emotion_engine_stub):
     from brain.chat.prompt import _build_emotion_summary
 
@@ -1683,6 +1684,7 @@ def test_journal_block_sorts_and_prints_the_faded_values(store, emotion_engine_s
     assert "primary: grief 5, joy 2" in block
 
 
+@pytest.mark.no_base_failure(reason='pins that before the switch (an engine that is not live) the journal block prints the stored values, as the old code did')
 def test_journal_block_before_the_switch_prints_the_stored_values(store, emotion_engine_stub):
     from brain.chat.prompt import _build_recent_journal_block
 
@@ -1698,6 +1700,7 @@ def test_journal_block_before_the_switch_prints_the_stored_values(store, emotion
     assert "primary: joy 9, grief 6" in _build_recent_journal_block(store)
 
 
+@pytest.mark.no_base_failure(reason='pins that an in-memory store has no engine, so the journal block prints the stored values, as the old code did')
 def test_journal_block_in_memory_store_prints_the_stored_values(emotion_engine_stub):
     from brain.chat.prompt import _build_recent_journal_block
 

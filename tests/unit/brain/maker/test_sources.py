@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.maker.sources import (
     current_emotional_intensity,
     dreams_since,
@@ -51,6 +53,7 @@ def test_live_current_emotional_intensity_is_the_peak_short_average(tmp_path, em
         store.close()
 
 
+@pytest.mark.no_base_failure(reason='pins that an in-memory store reads as not live, so the maker takes the old aggregate path, as the old code did')
 def test_in_memory_store_takes_the_old_path_even_when_the_engine_is_live(emotion_engine_stub):
     from brain.emotion.engine import Reading
 
