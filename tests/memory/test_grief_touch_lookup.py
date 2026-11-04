@@ -86,11 +86,20 @@ def test_the_engine_is_told_once_for_an_insert_and_not_for_a_skip_or_fold_false(
     tmp_path: Path, emotion_engine_stub
 ) -> None:
     store = MemoryStore(tmp_path / "memories.db")
+    in_transaction_when_told: list[bool] = []
+    record = emotion_engine_stub.on_memory_committed
+
+    def told(memory: Memory) -> None:
+        in_transaction_when_told.append(store._conn.in_transaction)
+        record(memory)
+
+    emotion_engine_stub.on_memory_committed = told  # type: ignore[method-assign]
     try:
         inserted = _touch("mem-x")
         assert store.create_grief_touch_unless_recent(inserted, hours=HOURS) == inserted.id
         assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]
         assert emotion_engine_stub.recorded_calls[0][1].id == inserted.id
+        assert in_transaction_when_told == [False]  # told after the commit, never inside the write transaction
         assert store.create_grief_touch_unless_recent(_touch("mem-x"), hours=HOURS) is None  # a skip tells nobody
         silent = _touch("mem-y")
         assert store.create_grief_touch_unless_recent(silent, hours=HOURS, fold=False) == silent.id
@@ -185,3 +194,43 @@ def test_a_failed_create_rolls_back_what_it_opened_and_leaves_a_callers_transact
     assert store._conn.in_transaction
     store._conn.commit()
     assert store._conn.execute("SELECT importance FROM memories WHERE id = ?", (first.id,)).fetchone()[0] == 9
+
+
+def test_a_touch_that_appears_between_the_look_and_the_lock_is_skipped_and_the_transaction_is_ended(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def appears_after_the_look(referent_id: str, hours: float) -> bool:
+        calls.append(referent_id)
+        return len(calls) > 1  # nothing at the look, a touch by the time the lock is held
+
+    monkeypatch.setattr(store, "_recent_grief_touch_exists", appears_after_the_look)
+    assert store.create_grief_touch_unless_recent(_touch(), hours=HOURS) is None
+    assert len(calls) == 2  # the look and the check inside the write transaction
+    assert _grief_rows(store) == []
+    assert not store._conn.in_transaction  # the write lock was given up, not held until the next commit
+    other = MemoryStore(store.db_path)
+    try:
+        other._conn.execute("PRAGMA busy_timeout = 200")
+        other._conn.execute("BEGIN IMMEDIATE")  # would time out if the first connection still held the write lock
+        other._conn.rollback()
+    finally:
+        other.close()
+    # the positive control: when neither check finds a touch the same call inserts
+    calls.clear()
+    monkeypatch.setattr(store, "_recent_grief_touch_exists", lambda referent_id, hours: calls.append(referent_id) or False)
+    mine = _touch()
+    assert store.create_grief_touch_unless_recent(mine, hours=HOURS) == mine.id
+    assert len(calls) == 2 and _grief_rows(store) == [mine.id]
+
+
+def test_an_in_memory_store_takes_the_same_one_step_path() -> None:
+    memory_store = MemoryStore(":memory:")
+    try:
+        first = _touch()
+        assert memory_store.create_grief_touch_unless_recent(first, hours=HOURS) == first.id
+        assert memory_store.create_grief_touch_unless_recent(_touch(), hours=HOURS) is None
+        assert _grief_rows(memory_store) == [first.id] and not memory_store._conn.in_transaction
+    finally:
+        memory_store.close()

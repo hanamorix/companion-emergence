@@ -264,8 +264,8 @@ class EmotionEngine:
         (a failed append, a hook that raised, a lock wait that timed out, a crash between the commit and this append, a line
         damaged by an unclean stop). `state_lock` is the bounded acquisition: a hook's caller does not wait for ever, and the
         guard (`_never_raises`) handles its `LockTimeoutError`. That is edge E2 for a queue append; the direct apply Engine 4
-        builds has an outcome of its own (F-DA). It is not recovered. A lost entry is a minor edge while appends succeed; a fault that persists loses every entry for
-        as long as it lasts, and the log line is then the only signal. `append_event` logs a failed append and returns False;
+        builds has an outcome of its own (F-DA). It is not recovered. A lost entry is a minor edge while appends succeed; a fault that persists loses every
+        entry for as long as it lasts, and the log line is then the only signal. `append_event` logs a failed append and returns False;
         nothing more is done with that here.
         """
         with engine_files.state_lock(self.persona_dir):
