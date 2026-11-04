@@ -3,8 +3,8 @@ warning texts, their strict-mode reasons and their exception chains when they sh
 
 The first block pins what the parsers did before the change (it passes on the old code by design, so each test carries the
 ``no_base_failure`` mark). The last test is new behaviour: a line the JSON parser rejects with a plain ``ValueError`` (an
-integer of more than the interpreter's digit limit) used to abort ``iter_jsonl`` and ``parse_jsonl`` and is now skipped
-with a warning by every parser, as ``iter_jsonl_raw`` always did.
+integer of more than the interpreter's digit limit) or ``RecursionError`` used to abort ``iter_jsonl``, ``parse_jsonl`` and
+the skipping reader, and is now skipped with a warning by every parser, as ``iter_jsonl_raw`` always did.
 """
 
 from __future__ import annotations
@@ -114,8 +114,8 @@ def test_blank_lines_count_for_line_numbers_and_give_no_record(tmp_path: Path) -
 
 
 @pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-@pytest.mark.parametrize("reader_name", ["iter_jsonl", "iter_jsonl_raw", "parse_jsonl", "iter_jsonl_skipping_corrupt"])
-def test_an_over_long_integer_line_is_skipped_with_a_warning_by_every_parser(
+@pytest.mark.parametrize("reader_name", ["iter_jsonl", "parse_jsonl", "iter_jsonl_skipping_corrupt"])
+def test_an_over_long_integer_line_is_skipped_with_a_warning_by_the_readers_that_aborted(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, reader_name: str
 ) -> None:
     huge = b'{"n": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}\n"
@@ -125,11 +125,19 @@ def test_an_over_long_integer_line_is_skipped_with_a_warning_by_every_parser(
             rows = list(jio.parse_jsonl(path.read_bytes()))
         elif reader_name == "iter_jsonl_skipping_corrupt":
             rows = list(iter_jsonl_skipping_corrupt(path))
-        elif reader_name == "iter_jsonl_raw":
-            rows = [rec for _text, rec in jio.iter_jsonl_raw(path)]
         else:
             rows = list(jio.iter_jsonl(path))
     assert rows == [{"a": 1}, {"a": 1}]
+    assert len(_messages(caplog)) == 1
+
+
+@_PINNED
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
+def test_iter_jsonl_raw_already_skipped_an_over_long_integer_line(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    huge = b'{"n": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}\n"
+    path = _file(tmp_path, GOOD, huge, GOOD)
+    with caplog.at_level(logging.WARNING):
+        assert [rec for _text, rec in jio.iter_jsonl_raw(path)] == [{"a": 1}, {"a": 1}]
     assert len(_messages(caplog)) == 1
 
 
