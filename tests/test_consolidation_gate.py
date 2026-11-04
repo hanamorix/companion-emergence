@@ -5,7 +5,7 @@ changes/tempgate-memory-consolidation/1.5-criteria.md. Pass-2 decisions are
 driven by an injected STUB classifier so the mechanism is verified without a
 live model (C16 — real Haiku decision quality — is advisory/live, not here).
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations

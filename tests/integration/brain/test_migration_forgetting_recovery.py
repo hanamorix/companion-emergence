@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.forgetting import FORGETTING_STATE_FILENAME, run_pass
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -21,11 +23,12 @@ def _old(days):
     return datetime.now(UTC) - timedelta(days=days)
 
 
-def test_phoebe_loop_heals(tmp_path, monkeypatch):
+@pytest.mark.no_base_failure(reason="#548 rename only: the same test under a synthetic persona name, so it passes on the old code")
+def test_canary_loop_heals(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
 
     # pristine v0.0.11-ish source: importance-10 anchor + 3 low-salience neighbours
-    src = tmp_path / "Downloads" / "Phoebe"
+    src = tmp_path / "Downloads" / "Canary"
     src.mkdir(parents=True)
     s = MemoryStore(src / "memories.db")
     s.create(Memory(id="anchor", content="the important one", memory_type="conversation",
@@ -39,12 +42,12 @@ def test_phoebe_loop_heals(tmp_path, monkeypatch):
     for n in ("n1", "n2", "n3"):
         h.strengthen("anchor", n, 0.6)
     h.close()
-    (src / "persona_config.json").write_text(json.dumps({"user_name": "zero"}))
+    (src / "persona_config.json").write_text(json.dumps({"user_name": "bob"}))
 
     # migrate (CE→CE copytree)
     migrate_companion_emergence(CompanionEmergenceMigrateArgs(
-        input_dir=src, install_as="Phoebe", force=False))
-    p = get_persona_dir("Phoebe")
+        input_dir=src, install_as="Canary", force=False))
+    p = get_persona_dir("Canary")
 
     # Force the neighbours to LOSE on the next pass:
     #  - disable import grace (empty manifest)

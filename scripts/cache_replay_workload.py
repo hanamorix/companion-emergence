@@ -325,6 +325,10 @@ class _TextPathProvider:
     def __init__(self, real) -> None:
         self._real = real
 
+    @property
+    def tool_name_prefix(self) -> str:
+        return getattr(self._real, "tool_name_prefix", "")
+
     def name(self) -> str:
         return self._real.name()
 

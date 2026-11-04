@@ -2121,8 +2121,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     from brain.memory import floor_startup
 
     # #203: default exit is a NON-destructive snapshot (matches the GUI, which
-    # only ever calls /sessions/snapshot). close_session deletes the buffer,
-    # which starves cascade-compaction / archive / rollover. --close opts in.
+    # only ever calls /sessions/snapshot). close_session archives the whole
+    # buffer and then deletes it, which starves cascade-compaction and
+    # rollover of a buffer to work on. --close opts in.
     flush_session = close_session if getattr(args, "close", False) else extract_session_snapshot
 
     persona_dir = get_persona_dir(args.persona)
@@ -3698,9 +3699,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "On exit, finalise the session and delete its conversation buffer. "
+            "On exit, finalise the session, archive its conversation buffer and delete it. "
             "Default is a non-destructive snapshot that preserves the buffer "
-            "for compaction / archive / rollover (same as the GUI)."
+            "for compaction / rollover (same as the GUI)."
         ),
     )
     chat_sub.add_argument(

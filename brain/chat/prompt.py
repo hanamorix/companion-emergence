@@ -48,6 +48,7 @@ from brain.memory.semantic_recall import (
 )
 from brain.memory.store import MemoryStore, split_by_raw_query_floor
 from brain.soul.store import SoulStore
+from brain.tools.naming import fill_tool_prefix, prefix_tool_names
 from brain.utils.time import format_local, to_local
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ def build_system_message(
     store: MemoryStore,
     user_input: str | None = None,
     reply_to_audit_id: str | None = None,
+    tool_prefix: str = "",
 ) -> str:
     """Compose the system message for one chat turn.
 
@@ -133,7 +135,8 @@ def build_system_message(
 
     # 2. Voice
     if voice_md.strip():
-        parts.append(voice_md.strip())
+        # voice.md keeps plain tool names on disk; the prefix goes in here (#417).
+        parts.append(prefix_tool_names(voice_md.strip(), tool_prefix))
 
     # 3. Creative DNA block (evolved writing voice — spec §4.2)
     creative_dna_block = _build_creative_dna_block(persona_dir)
@@ -187,18 +190,18 @@ def build_system_message(
     # the model knows how to handle "not recognised" entities honestly.
     # Condition: user_input is not None (same gate as _build_recall_block call below).
     if user_input is not None:
-        parts.append(_EPISTEMIC_INSTRUCTION)
+        parts.append(fill_tool_prefix(_EPISTEMIC_INSTRUCTION, tool_prefix))
 
     # Toolset parity with the static builder. The image path keeps the combined
     # builder for byte-equivalence, so it needs its own append. ONE line — the
     # monologue/reply framing divergence between the two paths is #72, not this.
-    parts.append(build_tool_inventory(persona_name))
+    parts.append(build_tool_inventory(persona_name, tool_prefix=tool_prefix))
 
     # 4b. Recall block — memories matching the current user input.
     # Passes persona_dir so the forgetting-aware path can partition into
     # active / fading / lost via search_with_loss (spec §5).
     if user_input is not None:
-        recall_block = _build_recall_block(store, user_input, persona_dir=persona_dir)
+        recall_block = _build_recall_block(store, user_input, persona_dir=persona_dir, tool_prefix=tool_prefix)
         if recall_block.strip():
             parts.append(recall_block)
 
@@ -258,7 +261,7 @@ def build_system_message(
     # 5e. Self-model gap block — when her *declared* and *derived* emotional
     # reads have diverged (self-model design §3, R-F1). Hedged framing; only
     # appended when an open gap exists, so an ordinary turn carries no bloat.
-    self_model_block = _build_self_model_block(persona_dir)
+    self_model_block = _build_self_model_block(persona_dir, tool_prefix=tool_prefix)
     if self_model_block:
         parts.append(self_model_block)
 
@@ -303,11 +306,12 @@ def build_system_message(
             voice_excerpt=voice_md[:300],
             soul_hints=soul_hints,
             narrative_hints=narrative_hints,
+            tool_prefix=tool_prefix,
         )
     )
 
     # 9. Reply framing — last so the model treats it as the immediate context.
-    parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user"))
+    parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user", tool_prefix=tool_prefix))
 
     return "\n\n".join(parts)
 
@@ -334,7 +338,7 @@ def build_system_message(
 # ---------------------------------------------------------------------------
 
 
-def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
+def build_static_system_message(persona_dir: Path, *, voice_md: str, tool_prefix: str = "") -> str:
     """The frozen system-prompt-file content: preamble + voice.md + epistemic +
     the inner-monologue frame.
 
@@ -363,9 +367,10 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
         parts.append(AS_NELL_PREAMBLE.format(persona_name=persona_name))
 
     if voice_md.strip():
-        parts.append(voice_md.strip())
+        # voice.md keeps plain tool names on disk; the prefix goes in here (#417).
+        parts.append(prefix_tool_names(voice_md.strip(), tool_prefix))
 
-    parts.append(_EPISTEMIC_INSTRUCTION)
+    parts.append(fill_tool_prefix(_EPISTEMIC_INSTRUCTION, tool_prefix))
 
     # Harness fence: teach her to silently ignore the CLI/plugin scaffolding the
     # environment injects on top of her real context (skill catalogues, agent-type
@@ -377,7 +382,7 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
     # voice.md. Static text → frozen prefix, byte-stable for caching, same as
     # the fence above. This is what reaches EXISTING personas: their voice.md is
     # a frozen copy taken at creation and the framework never edits it (#69).
-    parts.append(build_tool_inventory(persona_name))
+    parts.append(build_tool_inventory(persona_name, tool_prefix=tool_prefix))
 
     # Inner-monologue framing ("record_monologue FIRST, then reply") lives in the
     # FROZEN prefix, not the volatile tail: a "do this before composing" directive
@@ -391,6 +396,7 @@ def build_static_system_message(persona_dir: Path, *, voice_md: str) -> str:
             voice_excerpt="",
             soul_hints=(),
             narrative_hints=(),
+            tool_prefix=tool_prefix,
         )
     )
 
@@ -406,6 +412,7 @@ def build_volatile_context(
     store: MemoryStore,
     user_input: str | None = None,
     reply_to_audit_id: str | None = None,
+    tool_prefix: str = "",
 ) -> str:
     """The per-turn volatile chunk, positioned in the stdin tail (Option A+).
 
@@ -461,7 +468,7 @@ def build_volatile_context(
 
     # 4b. Recall block — memories matching the current user input.
     if user_input is not None:
-        recall_block = _build_recall_block(store, user_input, persona_dir=persona_dir)
+        recall_block = _build_recall_block(store, user_input, persona_dir=persona_dir, tool_prefix=tool_prefix)
         if recall_block.strip():
             parts.append(recall_block)
 
@@ -501,7 +508,7 @@ def build_volatile_context(
         parts.append(attunement_block)
 
     # 5e. Self-model gap block.
-    self_model_block = _build_self_model_block(persona_dir)
+    self_model_block = _build_self_model_block(persona_dir, tool_prefix=tool_prefix)
     if self_model_block:
         parts.append(self_model_block)
 
@@ -543,7 +550,7 @@ def build_volatile_context(
     parts.append(_build_ambient_clock_block())
 
     # 9. Reply framing — genuinely last in the assembled stdin prompt.
-    parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user"))
+    parts.append(build_reply_frame(persona_name=persona_name, user_name=user_name or "the user", tool_prefix=tool_prefix))
 
     return "\n\n".join(parts)
 
@@ -1084,6 +1091,7 @@ def _build_recall_block(
     *,
     persona_dir: Path | None = None,
     limit: int = SNIPPET_COUNT,
+    tool_prefix: str = "",
 ) -> str:
     """Surface up to ``limit`` memories matching the current user input.
 
@@ -1205,7 +1213,7 @@ def _build_recall_block(
 
         lines = ["── recall (memories matching this turn) ──"]
         if SNIPPET_MODE_ENABLED:
-            lines.insert(0, _RECALL_SNIPPET_INVITATION)
+            lines.insert(0, fill_tool_prefix(_RECALL_SNIPPET_INVITATION, tool_prefix))
         for mem in top:
             snippet = _recall_snippet(mem, full=mem.id in full_ids)
             importance = int(round(float(getattr(mem, "importance", 0) or 0)))
@@ -1562,7 +1570,7 @@ def _build_recall_block(
 
         lines = ["recall"]
         if SNIPPET_MODE_ENABLED and has_active:
-            lines.insert(0, _RECALL_SNIPPET_INVITATION)
+            lines.insert(0, fill_tool_prefix(_RECALL_SNIPPET_INVITATION, tool_prefix))
 
         lines.extend(active_lines)
 
@@ -2044,7 +2052,7 @@ def _build_attunement_block(persona_dir: Path) -> str:
         return ""
 
 
-def _build_self_model_block(persona_dir: Path) -> str | None:
+def _build_self_model_block(persona_dir: Path, *, tool_prefix: str = "") -> str | None:
     """Return the self-model gap block, or None when there's nothing to surface.
 
     Renders only when an open gap exists between her declared (max-pool) and
@@ -2059,7 +2067,7 @@ def _build_self_model_block(persona_dir: Path) -> str | None:
         from brain.self_model.state import load_or_recover
 
         state, _recovered = load_or_recover(persona_dir)
-        return render_block(state)
+        return render_block(state, tool_prefix=tool_prefix)
     except Exception:  # noqa: BLE001
         return None
 

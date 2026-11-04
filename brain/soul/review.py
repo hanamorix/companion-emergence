@@ -102,7 +102,7 @@ def _build_messages(
     related: list[str],
     emotional_summary: str,
     soul_size: int,
-    companion_name: str = "Nell",
+    companion_name: str,
     draft_fragments: list[str] | None = None,
     source_moment: str | None = None,
 ) -> list[dict]:

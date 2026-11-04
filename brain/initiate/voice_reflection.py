@@ -38,7 +38,7 @@ def run_voice_reflection_tick(
     provider: Any,
     crystallizations: list[dict],
     dreams: list[dict],
-    companion_name: str = "Nell",
+    companion_name: str,
 ) -> None:
     """Reflect over the last week of internal life; maybe emit a voice-edit candidate.
 
