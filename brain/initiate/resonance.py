@@ -306,7 +306,10 @@ def run_resonance_tick(
             if row is None or row.update_count < thresholds.recall_resonance_bootstrap_min_count:
                 continue
 
-            memory = store.get(memory_id) if store is not None else None
+            # bump=False: this read exists only to get last_accessed_at for the staleness gate below. It shows her
+            # nothing, so it is not an access; a default get would add 1.0 to recall_count and set last_accessed_at
+            # to now for each of up to 50 memories on every tick, about every 15 minutes.
+            memory = store.get(memory_id, bump=False) if store is not None else None
             if memory is None:
                 continue
 

@@ -287,12 +287,14 @@ def _source_memory_snippet(store: MemoryStore, candidate: dict) -> str | None:
     """Return up to 400 chars of the memory that generated this candidate.
 
     Fail-soft: missing memory_id, missing memory, or store error all return None.
+
+    Reads without counting as an access (`bump=False`): the excerpt goes into the review prompt, but a background re-check of a memory is not an access.
     """
     mid = str(candidate.get("memory_id") or "").strip()
     if not mid:
         return None
     try:
-        mem = store.get(mid)
+        mem = store.get(mid, bump=False)
     except Exception as exc:
         logger.debug("_source_memory_snippet: store.get(%r) raised: %s", mid, exc)
         return None
@@ -313,9 +315,13 @@ def _related_memory_snippets(
 
     Best-effort — if search fails, returns empty list. The decision still
     happens, it just has less context.
+
+    Reads without counting as an access (`bump=False`): the excerpt goes into the review prompt, but a background re-check of a memory is not an access.
     """
     try:
-        memories = store.search_text(candidate_text[:200], active_only=True, limit=limit)
+        memories = store.search_text(
+            candidate_text[:200], active_only=True, limit=limit, bump=False
+        )
     except Exception as exc:
         logger.warning("related memory lookup failed: %s", exc)
         return []
