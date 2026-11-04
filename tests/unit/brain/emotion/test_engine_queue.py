@@ -1310,7 +1310,17 @@ def _unloadable_nesting() -> str:
     return '{"x": ' + "[" * 200_000 + "]" * 200_000 + "}"  # past the parser's recursion limit: RecursionError
 
 
-@pytest.mark.parametrize("bad", [_unloadable_digits, _unloadable_nesting], ids=["digits", "nesting"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(
+            _unloadable_digits,
+            marks=pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off"),
+        ),
+        _unloadable_nesting,
+    ],
+    ids=["digits", "nesting"],
+)
 def test_the_reader_skips_a_line_the_json_parser_cannot_load_with_a_warning_naming_file_and_line(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, bad
 ) -> None:
@@ -1360,7 +1370,7 @@ def test_an_unopenable_day_file_adds_nothing_and_the_other_days_are_still_read(
     with caplog.at_level(logging.WARNING):
         got = engine_files.read_changes(tmp_path, since)
     assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
-    assert any(broken.name in m for m in _reader_warnings(caplog))
+    assert any(broken.name in m and "(io:" in m for m in _reader_warnings(caplog))
 
 
 @pytest.mark.no_base_failure(reason="pins the I/O tolerance E7.10 requires, which iter_jsonl had too: a read fault in the middle of a day file ends that file's lines, keeps what was read, warns naming the file, and the next day is still read")
@@ -1397,7 +1407,7 @@ def test_a_read_fault_mid_file_ends_that_file_keeps_what_was_read_and_reads_the_
     with caplog.at_level(logging.WARNING):
         got = engine_files.read_changes(tmp_path, since)
     assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
-    assert any(faulty.name in m for m in _reader_warnings(caplog))
+    assert any(faulty.name in m and "(io:" in m for m in _reader_warnings(caplog))
 
 
 def test_a_change_written_then_read_round_trips(tmp_path: Path) -> None:
