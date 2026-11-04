@@ -21,17 +21,17 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 | `read_json` | brain/health/json_io.py:269 | Read a whole JSON file under a Recovery policy (default factory, expected type, validator, fallback files) and return its data. |
 | `read_json_result` | brain/health/json_io.py:289 | Same read as read_json but returns a JsonRead, so the caller can see whether the file was missing, defaulted or restored. |
 | `write_json` | brain/health/json_io.py:696 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
-| `encode_jsonl` | brain/health/json_io.py:812 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
-| `parse_jsonl` | brain/health/json_io.py:840 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict). |
-| `iter_jsonl` | brain/health/json_io.py:870 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning; a missing file yields nothing. |
-| `read_jsonl` | brain/health/json_io.py:905 | iter_jsonl collected into a list. |
-| `iter_jsonl_raw` | brain/health/json_io.py:911 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
-| `read_jsonl_tail` | brain/health/json_io.py:1024 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
-| `append_jsonl` | brain/health/json_io.py:1114 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
-| `write_jsonl` | brain/health/json_io.py:1181 | Atomically replace a JSONL file with the given records (same writer as write_json). |
-| `read_jsonl_from` | brain/health/json_io.py:992 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. |
-| `JsonlRecord` (class) | brain/health/json_io.py:972 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
-| `JsonlRead` (class) | brain/health/json_io.py:985 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
+| `encode_jsonl` | brain/health/json_io.py:814 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
+| `parse_jsonl` | brain/health/json_io.py:842 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict). |
+| `iter_jsonl` | brain/health/json_io.py:872 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning; a missing file yields nothing. |
+| `read_jsonl` | brain/health/json_io.py:907 | iter_jsonl collected into a list. |
+| `iter_jsonl_raw` | brain/health/json_io.py:913 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
+| `read_jsonl_tail` | brain/health/json_io.py:1026 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
+| `append_jsonl` | brain/health/json_io.py:1116 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
+| `write_jsonl` | brain/health/json_io.py:1183 | Atomically replace a JSONL file with the given records (same writer as write_json). |
+| `read_jsonl_from` | brain/health/json_io.py:994 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. |
+| `JsonlRecord` (class) | brain/health/json_io.py:974 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
+| `JsonlRead` (class) | brain/health/json_io.py:987 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
 
 ### `brain/health/jsonl_reader.py`
 

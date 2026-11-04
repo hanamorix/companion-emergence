@@ -2825,3 +2825,104 @@ def test_heal_reset_to_default_writes_strict_json_and_a_nan_default_raises_with_
     r = jio.read_json_result(p, default=lambda: {"x": 1.5}, recover=jio.Recovery.HEAL)
     assert r.anomaly is not None and r.anomaly.action == "reset_to_default"
     assert json.loads(p.read_text()) == {"x": 1.5}
+
+
+# --- the three "file changed" checks take their stat from file_ops.stat_path (#643) ------------------------------------
+
+
+def _spy_stat_path(monkeypatch, *, answers: dict[int, object] | None = None) -> list[Path]:
+    """Replace ``jio.stat_path`` with a spy that records the path of each call and calls through, except that call number
+    ``n`` (1-based) in ``answers`` returns the given value, or raises it when it is an exception."""
+    calls: list[Path] = []
+    answers = answers or {}
+
+    def spy(path):
+        calls.append(Path(path))
+        answer = answers.get(len(calls))
+        if isinstance(answer, BaseException):
+            raise answer
+        if len(calls) in answers:
+            return answer
+        return file_ops.stat_path(path)
+
+    monkeypatch.setattr(jio, "stat_path", spy)
+    return calls
+
+
+def _key_of(path: Path) -> tuple[int, int, int]:
+    st = file_ops.stat_path(path)
+    assert st is not None
+    return st.key
+
+
+def test_expect_unchanged_reads_the_file_through_stat_path(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "s.json"
+    p.write_text("{}")
+    sig = _key_of(p)
+    calls = _spy_stat_path(monkeypatch)
+    jio._expect_unchanged(p, sig)  # unchanged: returns
+    assert calls == [p]
+
+    other = file_ops.PathStat(inode=sig[0], mtime_ns=sig[1], size=sig[2] + 1, is_file=True, is_dir=False)
+    _spy_stat_path(monkeypatch, answers={1: other})
+    with pytest.raises(jio._ChangedError, match="changed"):
+        jio._expect_unchanged(p, sig)
+
+    _spy_stat_path(monkeypatch, answers={1: None})
+    with pytest.raises(jio._ChangedError, match="vanished"):
+        jio._expect_unchanged(p, sig)
+
+    _spy_stat_path(monkeypatch, answers={1: PermissionError("denied")})
+    with pytest.raises(PermissionError):  # any error other than "missing" propagates, as it did from path.stat()
+        jio._expect_unchanged(p, sig)
+
+
+def test_a_file_that_vanishes_before_the_quarantine_is_reported_through_the_heal(tmp_path: Path, monkeypatch) -> None:
+    p = _corrupt_with_backup(tmp_path)
+    _seam_hook(monkeypatch, before_quarantine=lambda path: path.unlink())
+    with pytest.raises(jio.JsonFileError, match="vanished during the heal"):
+        jio.read_json_result(p, default=dict, recover=jio.Recovery.HEAL)
+    assert not p.exists()
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+def _replace_after_save(monkeypatch, text: str) -> None:
+    """After the save, another writer puts a different file at the path (a new inode, so a new key)."""
+
+    def other_writer(name, path):
+        if name == "after_save":
+            tmp = path.with_name("other.tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
+
+    monkeypatch.setattr(jio, "_seam", other_writer)
+
+
+def test_a_verified_write_takes_its_one_stat_from_stat_path(tmp_path: Path, monkeypatch) -> None:
+    p = tmp_path / "s.json"
+    calls = _spy_stat_path(monkeypatch)
+    assert jio.write_json(p, {"v": 1}, verify=True) is True
+    assert calls == [p]  # the key taken after the save; the bytes match, so the verify needs no second stat
+
+
+@pytest.mark.parametrize(
+    ("answers", "stat_calls"),
+    [
+        pytest.param({2: None}, 2, id="the second stat finds nothing"),
+        pytest.param({2: PermissionError("denied")}, 2, id="the second stat is refused"),
+        pytest.param({1: OSError("no key")}, 2, id="the first stat is refused"),
+    ],
+)
+def test_verify_treats_a_missing_or_unreadable_stat_as_no_key(
+    tmp_path: Path, monkeypatch, answers: dict[int, object], stat_calls: int
+) -> None:
+    """A stat that gives no key cannot show that another saver replaced the file, so a file that differs is damage:
+    ``.bak1`` is restored and the write reports False (the same as before the stat went through ``stat_path``)."""
+    p = tmp_path / "s.json"
+    jio.write_json(p, {"v": "base"}, backups=1)
+    jio.write_json(p, {"v": "newer"}, backups=1)
+    calls = _spy_stat_path(monkeypatch, answers=answers)
+    _replace_after_save(monkeypatch, '{"v": "other"}')
+    assert jio.write_json(p, {"v": "A"}, backups=1, verify=True) is False
+    assert len(calls) == stat_calls
+    assert json.loads(p.read_text()) == json.loads((tmp_path / "s.json.bak1").read_text())

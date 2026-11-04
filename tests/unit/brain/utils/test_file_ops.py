@@ -420,3 +420,21 @@ def test_stat_path_under_a_file_raises_not_a_directory(tmp_path: Path) -> None:
     path.write_bytes(b"")
     with pytest.raises(NotADirectoryError):
         file_ops.stat_path(path / "child")
+
+
+def test_stat_path_under_a_file_follows_the_rule_on_every_system(tmp_path: Path) -> None:
+    """The rule is the same everywhere: a missing path is ``None`` and any other ``OSError`` raises. What a path under a file is
+    reported as differs by system (``NotADirectoryError`` on POSIX; not checked for Windows), so the expectation is what
+    ``os.stat`` itself reports here. This test is not skipped on Windows: the Windows CI job is where it says something new."""
+    path = tmp_path / "a"
+    path.write_bytes(b"")
+    child = path / "child"
+    try:
+        os.stat(child)
+    except FileNotFoundError:
+        assert file_ops.stat_path(child) is None
+    except OSError as err:
+        with pytest.raises(type(err)):
+            file_ops.stat_path(child)
+    else:
+        pytest.fail("os.stat found a path under a file")

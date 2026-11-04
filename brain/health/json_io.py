@@ -70,7 +70,7 @@ from brain.health.jsonl_reader import (
 )
 from brain.utils.atomic_write import save_with_backup_text
 from brain.utils.file_lock import file_lock
-from brain.utils.file_ops import read_bytes, read_bytes_stat, replace_file, stat_key
+from brain.utils.file_ops import read_bytes, read_bytes_stat, replace_file, stat_path
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -411,11 +411,11 @@ class _ChangedError(Exception):
 def _expect_unchanged(path: Path, sig: tuple[int, int, int]) -> None:
     if not _HEAL_REVALIDATE:
         return
-    try:
-        if stat_key(path.stat()) != sig:
-            raise _ChangedError(f"{path} changed")
-    except FileNotFoundError:
-        raise _ChangedError(f"{path} vanished") from None
+    st = stat_path(path)
+    if st is None:
+        raise _ChangedError(f"{path} vanished")
+    if st.key != sig:
+        raise _ChangedError(f"{path} changed")
 
 
 def _expect_absent(path: Path) -> None:
@@ -757,7 +757,8 @@ def _save_text(
                 return True
             # Verify under the same lock as the save: no module writer can land between them.
             try:
-                after = stat_key(path.stat())
+                st = stat_path(path)
+                after = st.key if st is not None else None
             except OSError:
                 after = None
             _seam("after_save", path)
@@ -780,7 +781,8 @@ def _verify(path: Path, text: str, has_backups: bool, after_save) -> bool:
         if path.read_bytes() == expected:
             return True
         try:
-            now = stat_key(path.stat())
+            st = stat_path(path)
+            now = st.key if st is not None else None
         except OSError:
             now = None
         if after_save is not None and now is not None and now != after_save:
