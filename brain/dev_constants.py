@@ -219,11 +219,17 @@ RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.
 # 0.35 s, about 1.4 s in all) before the error is let through, so a real permission problem still fails loudly. A read holds
 # the file for microseconds, so it rides out a rename in progress with fewer tries, and only on Windows: on Linux and macOS a
 # PermissionError is a real one and one attempt is made. These are the values that the copies of the loop in atomic_write and
-# json_io used, moved here unchanged. The update overlay's rename used 6 doubling tries (about 1.55 s) and now follows the
-# replace schedule.
+# json_io used, moved here unchanged. The update overlay's rename has its own schedule (below), not this one.
 FILE_RETRY_ATTEMPTS: int = 8
 FILE_RETRY_SLEEP_S: float = 0.05
 FILE_READ_ATTEMPTS: int = 3
+# The update overlay's rename of the staged folder (brain/update/install.py, #302): the longest-held rename, since Windows
+# refuses a folder rename while any file inside is open and an antivirus scan of a freshly unpacked overlay holds many. It used
+# 6 doubling tries (0.05, 0.1, 0.2, 0.4, 0.8 s: 1.55 s in all). `retry_transient` waits sleep_s * n after the n-th failed try
+# (linear, not doubling), so 6 tries at 0.05 s would give 0.75 s; 0.11 s is the smallest round step whose total,
+# 0.11 * (1 + 2 + 3 + 4 + 5) = 1.65 s, is at or above the old 1.55 s. The old budget is kept, not shortened (D2).
+OVERLAY_RENAME_ATTEMPTS: int = 6
+OVERLAY_RENAME_SLEEP_S: float = 0.11
 
 # --- settings-file lock wait (#529) ------------------------------------------
 # How long a writer of $KINDLED_HOME/tunables.toml (the install-wide settings file: the picker, `nell model`, the

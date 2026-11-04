@@ -182,6 +182,44 @@ def test_a_read_makes_one_attempt_off_windows(tmp_path: Path, sleeps: list[float
     assert len(tries) == 1 and sleeps == []
 
 
+# --- open_read -------------------------------------------------------------------------------------------------------
+
+
+def test_open_read_gives_a_binary_handle_that_streams_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "a"
+    path.write_bytes(b"one\ntwo\n")
+    with file_ops.open_read(path) as fh:
+        assert fh.readline() == b"one\n" and fh.read() == b"two\n"
+
+
+def test_open_read_of_a_missing_file_or_a_folder_raises_at_once(tmp_path: Path, sleeps: list[float]) -> None:
+    with pytest.raises(FileNotFoundError):
+        file_ops.open_read(tmp_path / "missing")
+    with pytest.raises(OSError):
+        file_ops.open_read(tmp_path)  # IsADirectoryError on Linux and macOS, PermissionError on Windows
+    assert sleeps == [] or file_ops._IS_WINDOWS
+
+
+def test_open_read_retries_a_sharing_violation_on_windows_with_the_read_schedule(
+    tmp_path: Path, sleeps: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", True)
+    tries: list[int] = []
+    _deny_open(monkeypatch, tries)
+    with pytest.raises(PermissionError):
+        file_ops.open_read(tmp_path / "a")
+    assert len(tries) == dev_constants.FILE_READ_ATTEMPTS == 3 and sleeps == _linear(2)
+
+
+def test_open_read_makes_one_attempt_off_windows(tmp_path: Path, sleeps: list[float], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", False)
+    tries: list[int] = []
+    _deny_open(monkeypatch, tries)
+    with pytest.raises(PermissionError):
+        file_ops.open_read(tmp_path / "a")
+    assert len(tries) == 1 and sleeps == []
+
+
 # --- replace_file ----------------------------------------------------------------------------------------------------
 
 
