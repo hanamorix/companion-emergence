@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -548,13 +549,10 @@ def test_session_append_lock_propagates_a_body_error_once(tmp_path):
     assert runs == [1]
 
 
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
 def test_read_session_returns_the_turns_around_an_over_long_integer_line(tmp_path: Path) -> None:
     """A line holding an integer past the interpreter's digit limit is skipped like any bad line; the read used to raise a bare
     ``ValueError`` (``bridge/server.py`` then skipped the whole session)."""
-    import sys
-
-    if sys.get_int_max_str_digits() == 0:
-        pytest.skip("the interpreter's integer digit limit is off")
     folder = tmp_path / "active_conversations"
     folder.mkdir()
     huge = '{"speaker": "user", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"

@@ -2877,6 +2877,7 @@ def test_expect_unchanged_reads_the_file_through_stat_path(tmp_path: Path, monke
         jio._expect_unchanged(p, sig)
 
 
+@pytest.mark.no_base_failure(reason="pins the heal's existing outcome for a file that vanishes before the quarantine, which the old code already has")
 def test_a_file_that_vanishes_before_the_quarantine_is_reported_through_the_heal(tmp_path: Path, monkeypatch) -> None:
     p = _corrupt_with_backup(tmp_path)
     _seam_hook(monkeypatch, before_quarantine=lambda path: path.unlink())
@@ -2917,7 +2918,7 @@ def test_verify_treats_a_missing_or_unreadable_stat_as_no_key(
     tmp_path: Path, monkeypatch, answers: dict[int, object], stat_calls: int
 ) -> None:
     """A stat that gives no key cannot show that another saver replaced the file, so a file that differs is damage:
-    ``.bak1`` is restored and the write reports False (the same as before the stat went through ``stat_path``)."""
+    ``.bak1`` is restored and the write reports False."""
     p = tmp_path / "s.json"
     jio.write_json(p, {"v": "base"}, backups=1)
     jio.write_json(p, {"v": "newer"}, backups=1)

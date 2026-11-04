@@ -2,9 +2,10 @@
 warning texts, their strict-mode reasons and their exception chains when they share one line classifier (#643).
 
 The first block pins what the parsers did before the change (it passes on the old code by design, so each test carries the
-``no_base_failure`` mark). The last test is new behaviour: a line the JSON parser rejects with a plain ``ValueError`` (an
-integer of more than the interpreter's digit limit) or ``RecursionError`` used to abort ``iter_jsonl``, ``parse_jsonl`` and
-the skipping reader, and is now skipped with a warning by every parser, as ``iter_jsonl_raw`` always did.
+``no_base_failure`` mark). The tests after them are new behaviour: a line the JSON parser rejects with a plain ``ValueError`` (an
+integer of more than the interpreter's digit limit) or ``RecursionError`` used to abort ``iter_jsonl``, ``parse_jsonl``, the
+skipping reader and ``read_jsonl_tail``, and is now skipped with a warning by every parser, as ``iter_jsonl_raw`` always did; in strict
+mode it raises ``JsonlLineError`` from the line parser and ``JsonFileError(kind="line")`` through ``json_io``'s readers.
 """
 
 from __future__ import annotations
