@@ -95,8 +95,12 @@ def replace_file(src: str | Path, dst: str | Path) -> None:
 def delete_file(path: str | Path) -> None:
     """Delete a file with the transient-failure retry. A missing file is not an error; a failure that persists is raised.
 
-    A folder is not deleted (use :func:`delete_tree`): the delete raises an ``OSError``.
+    A folder is not deleted (use :func:`delete_tree`): it raises ``IsADirectoryError`` at once, on every system and without
+    a retry. (``unlink`` of a folder raises ``PermissionError`` on macOS and Windows, which the retry would otherwise sleep
+    through and then report as a permission problem.) A symbolic link to a folder is removed, the folder is not.
     """
+    if os.path.isdir(path) and not os.path.islink(path):
+        raise IsADirectoryError(f"{path} is a folder: delete_file does not delete folders (use delete_tree)")
     retry_transient(lambda: Path(path).unlink(missing_ok=True))
 
 

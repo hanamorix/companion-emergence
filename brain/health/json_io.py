@@ -70,7 +70,7 @@ from brain.health.jsonl_reader import (
 )
 from brain.utils.atomic_write import save_with_backup_text
 from brain.utils.file_lock import file_lock
-from brain.utils.file_ops import read_bytes, read_bytes_stat, replace_file, stat_path
+from brain.utils.file_ops import delete_file, read_bytes, read_bytes_stat, replace_file, stat_path
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -525,7 +525,14 @@ def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: 
             raw, _sig = read_bytes_stat(chosen_fallback)
             data = _check(raw, expect, validate)
             save_with_backup_text(path, raw.decode("utf-8-sig"), keep_backups=False, newline="\n")
-            chosen_fallback.unlink(missing_ok=True)
+            try:
+                delete_file(chosen_fallback)
+            except OSError as exc:
+                # The restore is already in place; the used fallback is only an unused sidecar. Keep the restore.
+                logger.warning(
+                    "restored %s from fallback %s but could not delete the fallback (errno %s); leaving it",
+                    path.name, chosen_fallback.name, exc.errno,
+                )
             return (
                 data,
                 "restored_from_bak1",

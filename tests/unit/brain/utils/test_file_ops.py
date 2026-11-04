@@ -273,9 +273,39 @@ def test_delete_file_never_removes_a_folder(tmp_path: Path, sleeps: list[float])
     folder = tmp_path / "d"
     folder.mkdir()
     (folder / "x").write_bytes(b"1")
-    with pytest.raises(OSError):  # IsADirectoryError on Linux; PermissionError (retried) on macOS and Windows
+    with pytest.raises(IsADirectoryError):
         file_ops.delete_file(folder)
     assert (folder / "x").read_bytes() == b"1"
+
+
+def test_delete_file_refuses_a_folder_at_once_on_every_system(tmp_path: Path, sleeps: list[float], monkeypatch: pytest.MonkeyPatch) -> None:
+    """macOS and Windows raise PermissionError (not IsADirectoryError) when a folder is unlinked. That must not be retried
+    (8 tries and about 1.4 s, then a permission error): the folder is refused before any unlink is tried."""
+    folder = tmp_path / "d"
+    folder.mkdir()
+    (folder / "x").write_bytes(b"1")
+    attempts: list[object] = []
+
+    def unlink_as_on_macos_and_windows(path, *args, **kwargs):
+        attempts.append(path)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "unlink", unlink_as_on_macos_and_windows)
+    with pytest.raises(IsADirectoryError):
+        file_ops.delete_file(folder)
+    assert attempts == [] and sleeps == []
+    assert (folder / "x").read_bytes() == b"1"
+
+
+@pytest.mark.no_base_failure(reason="pins the existing rule that unlink removes a symbolic link to a folder (the link only); the new folder check must not change it")
+def test_delete_file_removes_a_symlink_to_a_folder_and_keeps_the_folder(tmp_path: Path, requires_symlinks: None, sleeps: list[float]) -> None:
+    folder = tmp_path / "d"
+    folder.mkdir()
+    (folder / "x").write_bytes(b"1")
+    link = tmp_path / "link"
+    link.symlink_to(folder, target_is_directory=True)
+    file_ops.delete_file(link)
+    assert not link.is_symlink() and (folder / "x").read_bytes() == b"1" and sleeps == []
 
 
 # --- delete_tree ---------------------------------------------------------------------------------------------------

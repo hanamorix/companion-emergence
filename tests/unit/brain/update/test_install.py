@@ -615,6 +615,64 @@ def test_staging_rename_that_never_succeeds_fails_the_update_and_cleans_up(tmp_p
     assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
 
 
+def _stub_leftover_removal(monkeypatch, leftover: Path, failures: int) -> list[Path]:
+    """``shutil.rmtree`` of ``leftover`` raises PermissionError for the first ``failures`` calls; every other path (and
+    every call with keywords, such as the staging clean-up) goes through to the real one."""
+    import shutil
+
+    real, calls = shutil.rmtree, []
+
+    def rmtree(path, *args, **kwargs):
+        if Path(path) == leftover:
+            calls.append(Path(path))
+            if len(calls) <= failures:
+                raise PermissionError("scanning")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)
+    return calls
+
+
+def _apply_over_a_leftover(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    leftover = root / f"{'c' * 12}-{'bundle-1'[:8]}"
+    leftover.mkdir(parents=True)
+    (leftover / "junk").write_text("garbage", encoding="utf-8")
+    return leftover, lambda: install.apply_update(
+        wheel=brain_whl, requirements=req, commit="c" * 40, site_dir=site, root=root,
+        pip_extra=["--no-index", "--find-links", str(finds)])
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_leftover_folder_removal_rides_out_a_transient_refusal(tmp_path, monkeypatch):
+    """#643 review: the leftover folder was removed with a bare ``shutil.rmtree``, so the first antivirus or indexer
+    refusal failed the update although the rename right after it is retried."""
+    leftover, apply = _apply_over_a_leftover(tmp_path)
+    calls = _stub_leftover_removal(monkeypatch, leftover, failures=2)
+    entry = apply()
+    assert len(calls) == 3
+    assert (tmp_path / "brain-overlay" / entry["dir"] / "brain").is_dir()
+    assert not (leftover / "junk").exists()
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_leftover_folder_removal_that_never_succeeds_fails_the_update(tmp_path, monkeypatch):
+    leftover, apply = _apply_over_a_leftover(tmp_path)
+    calls = _stub_leftover_removal(monkeypatch, leftover, failures=10_000)
+    with pytest.raises(install.UpdateError, match="could not remove leftover overlay folder"):
+        apply()
+    assert len(calls) == dev_constants.FILE_RETRY_ATTEMPTS  # the retry schedule ran before the failure
+    assert overlay.read_state(tmp_path / "brain-overlay")["active"] is None
+    assert (leftover / "junk").read_text(encoding="utf-8") == "garbage"
+
+
 @pytest.mark.usefixtures("fast_install")
 def test_reapplying_a_commit_never_deletes_its_folder_while_a_process_uses_it(tmp_path):
     """#314 review (ToT): a bridge stays on A, updates go to B then C (prune keeps A
