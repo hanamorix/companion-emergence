@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.utils import file_ops
 from brain.utils.atomic_write import save_with_backup_text
 from tests.thread_support import finish_threads, release_at_teardown
@@ -1368,7 +1369,7 @@ def test_a_persistent_refusal_on_the_fallback_cleanup_keeps_the_restore(tmp_path
     with caplog.at_level(logging.WARNING):
         r = jio.read_json_result(p, default=dict, recover=jio.Recovery.RESTORE, fallbacks=(tmp,))
     assert r.data == {"day": "today"} and r.outcome == "restored"
-    assert len(calls) == 8 and tmp.read_bytes() == b'{"day": "today"}'
+    assert len(calls) == dev_constants.FILE_RETRY_ATTEMPTS and tmp.read_bytes() == b'{"day": "today"}'
     assert json.loads(p.read_text()) == {"day": "today"}
     assert [rec for rec in caplog.records if "b.tmp" in rec.getMessage() and rec.levelno == logging.WARNING]
 

@@ -301,7 +301,7 @@ def read_json_result(
     and HEAL; under RAISE it applies only to a missing file. ``expect`` is a type (or tuple) the
     top-level value must be; ``validate`` raises to reject. ``fallbacks`` (RESTORE/HEAL only) are
     sibling files tried in preference to the backup chain when they are valid and not older than
-    the freshest valid backup. A fallback is *removed* when installed, so it must be a throwaway
+    the freshest valid backup. A fallback is *removed* when installed (left if the delete keeps failing), so it must be a throwaway
     sibling (a stray ``.tmp``); one that resolves to the live file or a backup is a ValueError.
     """
     path = _as_path(path)
