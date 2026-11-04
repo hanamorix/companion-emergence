@@ -11,7 +11,7 @@ import tempfile
 import threading
 import traceback
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -485,6 +485,10 @@ class EmotionEngineStub:
 
     def on_memory_shown(self, memory: Any, at: Any) -> None:
         self.recorded_calls.append(("on_memory_shown", memory, at))
+
+    def batch(self) -> AbstractContextManager[None]:
+        """A context manager that does nothing (the real engine's `batch()` collects events; a caller's test needs only the call to work)."""
+        return nullcontext()
 
     def read(self) -> dict[str, Any]:
         return dict(self.readings)

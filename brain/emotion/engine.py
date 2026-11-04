@@ -12,7 +12,9 @@ Real now:
   event to the queue (`state/emotion_pending.jsonl`) under the engine's lock; it never folds anything and never raises into
   the write that called it. Everything the event needs is worked out before the lock is taken, and nothing inside the lock
   hold touches `memories.db` or a model. A memory of a type that does not count queues nothing, except a start-only event
-  when the stored start date of the persona is missing or later than the row's date.
+  when the stored start date of the persona is missing or later than the row's date. The start-only event is a memory's own
+  date event, which the spec makes a direct apply (Engine 4, #579, moves it there); until then this hook appends it to the
+  queue like the others.
 
 Stubbed now:
 - `read()` returns `{}`; `status()` returns `EngineStatus(True, None)`; `oldest_entry_at()` returns None.
@@ -40,6 +42,7 @@ from brain import dev_constants
 from brain.emotion import engine_files, vocabulary
 from brain.emotion.engine_files import VocabularyHalfLives
 from brain.emotion.engine_utils import Event, counted_kind, resolve_emotions, source_modifier
+from brain.utils.file_lock import LockTimeoutError
 from brain.utils.log_throttle import count_throttled
 from brain.utils.time import lenient_utc
 
@@ -82,15 +85,28 @@ def _utcnow() -> datetime:
 def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
     """Make a hook unable to raise into the write that called it (E6.9): the one guard of all four hooks.
 
-    An `OSError` is the queue's folder or the lock's file refusing us (a read-only or full disk, a share that went away). It
-    stays true for every write until the cause is fixed, so it is logged once per interval, without a traceback
-    (`count_throttled`). Anything else is a bug in the hook: one error line with the traceback, every time.
+    Three outcomes. A `LockTimeoutError` is the engine lock not coming within its wait (a drain, a rebuild or a wedged
+    holder has it): the event is not recorded, one throttled line says so. Any other `OSError` is the queue's folder or the
+    lock's file refusing us (a read-only or full disk, a share that went away). It stays true for every write until the cause
+    is fixed, so it is logged once per interval, without a traceback (`count_throttled`). Anything else is a bug in the
+    hook: one error line with the traceback, every time.
     """
 
     @functools.wraps(hook)
     def guarded(self: EmotionEngine, *args: object, **kwargs: object) -> None:
         try:
             hook(self, *args, **kwargs)
+        except LockTimeoutError as exc:
+            # Before `except OSError`: `LockTimeoutError` IS an `OSError` (a `TimeoutError`), and a lock wait that ran out is
+            # not a disk fault. Its own throttle key, so neither line hides the other.
+            count_throttled(
+                logger,
+                f"engine:lock_wait:{self.persona_dir}",
+                logging.ERROR,
+                "emotion engine: %s gave up on the engine lock (%s); its event was not recorded",
+                hook.__name__,
+                exc,
+            )
         except OSError as exc:
             count_throttled(
                 logger,
@@ -233,6 +249,11 @@ class EmotionEngine:
         return state is None or state.persona_start_at is None or created < state.persona_start_at
 
     def _queue_start_if_needed(self, created_at: datetime) -> None:
+        """Append the start-only event when the stored start date is missing or later than the row's.
+
+        The start-only event is a memory's own date event, which the spec makes a direct apply (Engine 4 moves it);
+        until then this appends it to the queue like the others.
+        """
         if self._start_needed(created_at):
             self._queue(Event(kind="start", at=created_at))
 
@@ -240,8 +261,10 @@ class EmotionEngine:
         """Append `event` to the queue, holding the engine's lock for the append only.
 
         Accepted edge (E2, R12, owner 2026-10-21: "treat it as a fairly minor edge case, noted in code"): an entry can be lost
-        (a failed append, a hook that raised, a crash between the commit and this append, a line damaged by an unclean stop).
-        It is not recovered. A lost entry is a minor edge while appends succeed; a fault that persists loses every entry for
+        (a failed append, a hook that raised, a lock wait that timed out, a crash between the commit and this append, a line
+        damaged by an unclean stop). `state_lock` is the bounded acquisition: a hook's caller does not wait for ever, and the
+        guard (`_never_raises`) handles its `LockTimeoutError`. That is edge E2 for a queue append; the direct apply Engine 4
+        builds has an outcome of its own (F-DA). It is not recovered. A lost entry is a minor edge while appends succeed; a fault that persists loses every entry for
         as long as it lasts, and the log line is then the only signal. `append_event` logs a failed append and returns False;
         nothing more is done with that here.
         """

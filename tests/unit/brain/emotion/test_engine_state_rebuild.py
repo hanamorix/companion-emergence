@@ -1828,7 +1828,7 @@ def test_a_stat_error_other_than_not_found_answers_false_logs_and_is_not_cached(
 def test_fold_change_queues_its_event_and_read_is_still_empty(tmp_path: Path) -> None:
     engine = EmotionEngine(tmp_path, now=lambda: NOW)
     engine.fold_change({"joy": 1.0}, None, "test")
-    assert [(e.kind, e.at, e.source, dict(e.emotions)) for e in engine_files.read_queue(tmp_path)] == [
+    assert [(e.kind, e.at, e.source, dict(e.emotions)) for e in engine_files.read_queue(tmp_path, from_line=0).events] == [
         ("change", NOW, "test", {"joy": 1.0})
     ]
     assert not hasattr(engine, "recorded_calls")  # the record lives on the test fixture only
