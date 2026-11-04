@@ -66,6 +66,8 @@
   "MEMBER_HEBBIAN_THRESHOLD": "3.0",
   "MEMORIES_DB_BUSY_TIMEOUT_S": "30.0",
   "MONOLOGUE_FAMILY_TYPES": "frozenset({'monologue', 'monologue_emotion', 'monologue_soul_candidate', 'monologue_trace'})",
+  "OVERLAY_RENAME_ATTEMPTS": "6",
+  "OVERLAY_RENAME_SLEEP_S": "0.11",
   "PASS2_NOBRIDGE_DRAIN_BUDGET_S": "20.0",
   "RAM_FIT_LARGEST_UNDERESTIMATE": "0.14227",
   "RAM_FIT_SAFETY_FACTOR": "1.1658680470544345",
