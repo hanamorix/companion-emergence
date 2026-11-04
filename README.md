@@ -303,7 +303,7 @@ The Linux and Windows bundles are compile-clean from CI and unit-tested but have
 
 - **Stack:** Python 3.13 framework + Rust/Tauri 2 desktop app + React 18 + TypeScript frontend.
 - **Tooling:** `uv` for Python, `pnpm` for Node, `cargo` for Rust. `ruff` lints, `pytest` runs the suite, `vitest` covers the React side, `cargo test` covers the Rust bridge.
-- **CI:** GitHub Actions matrix builds on macos-14, ubuntu-22.04, windows-2022. Every release tag fires a cross-platform bundle build with sha256 verification of the bundled python-build-standalone runtime.
+- **CI:** GitHub Actions matrix builds on macos-15, ubuntu-22.04, windows-2022. Every release tag fires a cross-platform bundle build with sha256 verification of the bundled python-build-standalone runtime.
 - **Test surface:** ~2,480 unit + integration tests across the Python framework alone. Live-host tests are explicitly opt-in (gated behind `RUN_LIVE_CLAUDE_STRESS=1`).
 - **Pre-1.0 contract:** breaking changes can land in any release. APIs, file formats, and the desktop app shape are all subject to change before the first stable.
 

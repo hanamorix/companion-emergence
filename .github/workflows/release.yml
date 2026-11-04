@@ -215,7 +215,7 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { label: macos-arm64,    os: macos-14,     bundles: 'app,dmg' }
+          - { label: macos-arm64,    os: macos-15,     bundles: 'app,dmg' }
           - { label: linux-x86_64,   os: ubuntu-22.04, bundles: 'deb,appimage' }
           - { label: windows-x86_64, os: windows-2022, bundles: 'msi,nsis' }
     runs-on: ${{ matrix.platform.os }}
