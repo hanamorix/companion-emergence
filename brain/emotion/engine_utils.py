@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, NamedTuple, get_args
 from brain import dev_constants
 from brain.emotion.vocabulary import canonical_name
 from brain.initiate.schemas import StateName
+from brain.memory import memory_utils
 from brain.utils.memory import is_conversation_derived
 from brain.utils.time import to_local
 
@@ -382,16 +383,17 @@ def fade(
     age_days: float,
     half_life_days: float,
     importance: float,
-    importance_gain: float,
     floor_fraction: float | None = None,
 ) -> float:
-    """`value x 0.5^(age / (half_life x (1 + gain x importance / 10)))`, never below `floor_fraction x value` when one is given.
+    """`value x 0.5^(age / (half_life x importance_stretch(importance)))`, never below `floor_fraction x value` when one is given.
 
-    The caller measures the age from the memory's creation time, or from the switch-over time when that is later, and passes
-    the gain (`dev_constants.HORIZON_IMPORTANCE_GAIN`) and the floor of the emotion (`EMOTION_FADE_FLOOR_FRACTION`, love and
-    belonging only). A negative age (a row dated in the future) is held at 0 so a stored value never grows.
+    The stretch is the forgetting pass's own, from `brain.memory.memory_utils.importance_stretch` (the one function that holds
+    the formula and the gain); an importance outside 0 to 10 is held to it there. The caller measures the age from the memory's
+    creation time, or from the switch-over time when that is later, and passes the floor of the emotion
+    (`EMOTION_FADE_FLOOR_FRACTION`, love and belonging only). A negative age (a row dated in the future) is held at 0 so a
+    stored value never grows.
     """
-    stretched = half_life_days * (1.0 + importance_gain * importance / 10.0)
+    stretched = half_life_days * memory_utils.importance_stretch(importance)
     faded = value * 0.5 ** (max(age_days, 0.0) / stretched)
     if floor_fraction is not None:
         faded = max(faded, floor_fraction * value)

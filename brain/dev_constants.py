@@ -120,6 +120,9 @@ EMOTION_FADE_FLOOR_FRACTION: dict[str, float] = {"love": 1 / 3, "belonging": 1 /
 # A memory shown again within the window after its first showing counts for the factor, then the factor squared, and so on.
 EMOTION_REPEAT_WINDOW_H: float = 24.0
 EMOTION_REPEAT_FACTOR: float = 0.5
+# Seconds every acquisition of the engine's lock waits before giving up (`brain.utils.file_lock.locked_within`). Fixed here;
+# a wait that calibrates itself to the machine is #642.
+EMOTION_LOCK_WAIT_S: float = 5.0
 # The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
@@ -342,17 +345,22 @@ RECENT_LIVED_HOURS = 720.0  # 30 days. NOTE: compared against WALL-CLOCK age (se
 # P3 retention rework, Change 2: importance lowers the EFFECTIVE fade gate
 # (never LOST_THRESHOLD/LOST_PASS_COUNT: those stay the final deletion gate,
 # per the invariant above: a lever only delays fading, it does not lower
-# the deletion floor). r = clamp(memory.importance / 10, 0, 1); a no-op at
-# r=0 (importance 0 -> today's behavior, byte-identical). Tuned against the
-# C2 simulation so importance-10 survives >= 2 lived-years while importance-0
-# is untouched and the response is monotonic + never-accelerating.
+# the deletion floor). r = importance_ratio(memory.importance)
+# (`brain/memory/memory_utils.py`); a no-op at r=0 (importance 0 -> today's
+# behavior). Tuned against the C2 simulation so importance-10 survives >= 2
+# lived-years while importance-0 is untouched and the response is monotonic +
+# never-accelerating. The emotion fade does NOT use this gain: it lowers the
+# fade gate of the forgetting pass only.
 FADE_IMPORTANCE_GAIN = 2.0
 
 # P3 retention rework, Change 2: importance extends the freshness age-horizon
 # of `brain.forgetting.salience` (the OTHER decay lever, alongside
-# FADE_IMPORTANCE_GAIN). r = clamp(memory.importance / 10, 0, 1); a no-op at
-# r=0 (importance 0 -> the horizon there, unchanged). Tuned against the
-# C2 simulation alongside FADE_IMPORTANCE_GAIN so importance-10 survives >= 2 lived-years.
+# FADE_IMPORTANCE_GAIN). This is the gain of `importance_stretch`
+# (`brain/memory/memory_utils.py`), the one function that holds the formula;
+# the forgetting freshness horizon and the emotion fade (`brain.emotion.engine_utils.fade`)
+# both take their stretch from it, and nothing else reads this gain. A no-op at
+# importance 0 (the stretch is 1.0). Tuned against the C2 simulation alongside
+# FADE_IMPORTANCE_GAIN so importance-10 survives >= 2 lived-years.
 HORIZON_IMPORTANCE_GAIN = 52.0
 
 # --- narrative memory arcs (moved here, #531) --------------------------------
