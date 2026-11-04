@@ -107,7 +107,9 @@ def test_reflex_arc_set_load_missing_logs_info_not_warning(tmp_path: Path, caplo
     with caplog.at_level(logging.INFO, logger="brain.engines.reflex"):
         ReflexArcSet.load(missing, default_path=DEFAULT_ARCS_PATH)
 
-    defaults_records = [r for r in caplog.records if "using defaults" in r.getMessage()]
+    defaults_records = [
+        r for r in caplog.records if "using defaults" in r.getMessage()
+    ]
     assert len(defaults_records) >= 1, "Expected at least one 'using defaults' log record"
     for record in defaults_records:
         assert record.levelname == "INFO", (
@@ -1002,17 +1004,12 @@ def _variant_arc_dict(name: str, trigger: dict, template: str = "t") -> dict:
 
 def test_reflex_arc_from_dict_keys_trigger_by_canonical_name(tmp_path: Path):
     trigger = {"comfort-seeking": 5, "not_a_real_emotion": 6}
-    expected = {
-        "comfort_seeking": 5.0,
-        "not_a_real_emotion": 6.0,
-    }  # an unknown name in canonical form is kept as is
+    expected = {"comfort_seeking": 5.0, "not_a_real_emotion": 6.0}  # an unknown name in canonical form is kept as is
 
     assert ReflexArc.from_dict(_variant_arc_dict("a", trigger)).trigger == expected
 
     path = tmp_path / "arcs.json"
-    path.write_text(
-        json.dumps({"version": 1, "arcs": [_variant_arc_dict("a", trigger)]}), encoding="utf-8"
-    )
+    path.write_text(json.dumps({"version": 1, "arcs": [_variant_arc_dict("a", trigger)]}), encoding="utf-8")
     before = path.read_bytes()
     loaded = ReflexArcSet.load(path, default_path=DEFAULT_ARCS_PATH)
 
@@ -1063,8 +1060,7 @@ def test_run_tick_fires_a_variant_triggered_arc_on_the_canonical_channel(
         assert [f.arc_name for f in result.arcs_fired] == ["variant_arc"]
         assert result.arcs_fired[0].trigger_state == {"comfort_seeking": 8.0}
         assert any(
-            s.arc_name == "look_alike_arc" and s.reason == "trigger_not_met"
-            for s in result.arcs_skipped
+            s.arc_name == "look_alike_arc" and s.reason == "trigger_not_met" for s in result.arcs_skipped
         )
         assert arcs_path.read_bytes() == arcs_before  # arcs file untouched
         assert store.get(seed_id).emotions == {stored_spelling: 8.0}  # stored row untouched
@@ -1076,9 +1072,7 @@ def test_run_tick_prompt_resolves_variant_spelled_placeholders(tmp_path: Path):
     arcs_path = tmp_path / "arcs.json"
     template = "{comfort-seeking}|{Comfort_Seeking}|{no_such_field}|{love}"
     arcs_path.write_text(
-        json.dumps(
-            {"version": 1, "arcs": [_variant_arc_dict("a", {"comfort_seeking": 5}, template)]}
-        ),
+        json.dumps({"version": 1, "arcs": [_variant_arc_dict("a", {"comfort_seeking": 5}, template)]}),
         encoding="utf-8",
     )
     captured: list[str] = []
@@ -1172,16 +1166,12 @@ def _arc(name="live_arc", trigger=None, template="Love: {love}") -> dict:
     }
 
 
-def test_live_an_absent_emotion_fails_the_trigger_and_ranks_nothing(
-    tmp_path: Path, emotion_engine_stub
-):
+def test_live_an_absent_emotion_fails_the_trigger_and_ranks_nothing(tmp_path: Path, emotion_engine_stub):
     result, captured = _live_reflex(
         tmp_path, emotion_engine_stub, {"grief": 6.0}, [_arc()], stored={"love": 9.0}
     )
     assert result.arcs_fired == ()
-    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [
-        ("live_arc", "trigger_not_met")
-    ]
+    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [("live_arc", "trigger_not_met")]
     assert captured == []
 
 
@@ -1270,9 +1260,7 @@ def test_live_a_template_naming_an_emotion_with_no_value_does_not_fire(
         stored={"love": 7.0, "grief": 8.0},
     )
     assert result.arcs_fired == ()
-    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [
-        ("live_arc", "template_emotion_absent")
-    ]
+    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [("live_arc", "template_emotion_absent")]
     assert captured == []
     assert not (tmp_path / "log.json").exists()
 

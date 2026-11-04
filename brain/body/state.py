@@ -123,8 +123,9 @@ def body_state_from_short(
 
     Same projection as `compute_body_state` (the session, words and contact-gap rules are shared code), but the emotion
     conditions ask `feels_high(name)` (`engine.feels_high`) instead of comparing to fixed levels, and a body emotion the
-    engine did not return is absent from `body_emotions` instead of filled with 0.0. A present 0.0 is kept. Pure apart
-    from the predicate: the caller passes the one `short` snapshot it read.
+    engine did not return is absent from `body_emotions` instead of filled with 0.0. A present 0.0 is kept. The caller
+    passes the one `short` snapshot it read; the predicate asks the engine again for each name it is given, so it can
+    disagree with that snapshot if the engine changes between the two reads.
     """
     energy = _energy_from_flags(
         session_hours,

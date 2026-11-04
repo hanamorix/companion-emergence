@@ -122,6 +122,12 @@ def test_engine_shift_stronger_is_high(engine, tmp_path):
     assert engine.feels_high("love") is True
 
 
+def test_engine_a_falling_run_alone_is_not_high(engine, tmp_path):
+    _write(tmp_path, {"love": _days(*RANGE)})
+    engine.readings = {"love": Reading(1.0, 3.0, -2.0, -1)}
+    assert engine.feels_high("love") is False
+
+
 def test_engine_range_part_reads_the_snapshot_of_that_feeling(engine, tmp_path):
     _write(tmp_path, {"love": _days(*RANGE), "grief": _days(0.0, 1.0, 2.0)})
     engine.readings = {"love": Reading(5.0, 3.0, 2.0, 0), "grief": Reading(5.0, 3.0, 2.0, 0)}

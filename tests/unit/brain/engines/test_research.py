@@ -451,7 +451,9 @@ def test_fire_appends_notes_creates_memory_updates_cooldown(tmp_path: Path):
         store.close()
 
 
-def test_memory_create_failure_does_not_abort_tick_burns_cooldown(tmp_path: Path, caplog) -> None:
+def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
+    tmp_path: Path, caplog
+) -> None:
     """§5.3 fail-soft: store.create raising (SQLite lock, disk full, ...) must not
     abort the tick. Cooldown still burns (last_researched_at updates) so the same
     interest doesn't re-fire + duplicate on the next cadence tick, and the fire
@@ -489,9 +491,9 @@ def test_memory_create_failure_does_not_abort_tick_burns_cooldown(tmp_path: Path
         # (b) cooldown burned — won't re-fire + duplicate next tick
         saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
         assert saved.interests[0].last_researched_at is not None
-        assert any("research memory create failed" in r.getMessage() for r in caplog.records), (
-            "expected a logged warning naming the failed step"
-        )
+        assert any(
+            "research memory create failed" in r.getMessage() for r in caplog.records
+        ), "expected a logged warning naming the failed step"
     finally:
         store.close()
 
@@ -517,7 +519,9 @@ def test_close_verdict_marks_dormant(tmp_path: Path):
 def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
     # Existing interest topic is mixed-case; the spawn verdict names it back in
     # lowercase — proves the dedup match is casefolded, not exact-string.
-    _write_interests(tmp_path / "interests.json", [_interest_dict(topic="Marine Bioluminescence")])
+    _write_interests(
+        tmp_path / "interests.json", [_interest_dict(topic="Marine Bioluminescence")]
+    )
     store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
@@ -830,10 +834,7 @@ def _pf_sites(persona_dir: Path) -> list[tuple[str, str]]:
     path = persona_dir / PARSE_FAILURE_LOG
     if not path.exists():
         return []
-    return [
-        (r["site"], r["raw"])
-        for r in map(_json.loads, path.read_text(encoding="utf-8").splitlines())
-    ]
+    return [(r["site"], r["raw"]) for r in map(_json.loads, path.read_text(encoding="utf-8").splitlines())]
 
 
 def test_compute_topic_overlap_records_a_malformed_reply(tmp_path: Path) -> None:
@@ -844,12 +845,8 @@ def test_compute_topic_overlap_records_a_malformed_reply(tmp_path: Path) -> None
             return "not even close to JSON"
 
     score = _compute_topic_overlap_via_haiku(
-        thread_topic="x",
-        thread_summary="",
-        recent_conversation_excerpt="",
-        provider=P(),
-        user_name="Hana",
-        persona_dir=tmp_path,
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
     )
     assert score == 0.0
     assert _pf_sites(tmp_path) == [("research_topic_overlap", "not even close to JSON")]
@@ -862,17 +859,10 @@ def test_compute_topic_overlap_provider_error_is_not_a_parse_failure(tmp_path: P
         def generate(self, prompt, *, system=None):
             raise OSError("cli gone")
 
-    assert (
-        _compute_topic_overlap_via_haiku(
-            thread_topic="x",
-            thread_summary="",
-            recent_conversation_excerpt="",
-            provider=P(),
-            user_name="Hana",
-            persona_dir=tmp_path,
-        )
-        == 0.0
-    )
+    assert _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    ) == 0.0
     assert _pf_sites(tmp_path) == []
 
 
@@ -901,17 +891,10 @@ def test_compute_topic_overlap_provider_keyerror_still_scores_zero(tmp_path: Pat
         def generate(self, prompt, *, system=None):
             raise KeyError("model")
 
-    assert (
-        _compute_topic_overlap_via_haiku(
-            thread_topic="x",
-            thread_summary="",
-            recent_conversation_excerpt="",
-            provider=P(),
-            user_name="Hana",
-            persona_dir=tmp_path,
-        )
-        == 0.0
-    )
+    assert _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    ) == 0.0
     assert _pf_sites(tmp_path) == []
 
 
@@ -927,11 +910,7 @@ def _fire_with_reply(tmp_path: Path, reply: str, *, interests: list[dict] | None
         result = engine.run_tick(trigger="manual", days_since_human_override=5.0)
         if result.fired is not None:
             run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
-        memory = (
-            store.get(result.fired.output_memory_id)
-            if result.fired and result.fired.output_memory_id
-            else None
-        )
+        memory = store.get(result.fired.output_memory_id) if result.fired and result.fired.output_memory_id else None
         return engine, result, memory
     finally:
         store.close()
@@ -991,9 +970,7 @@ def test_inline_spawn_verdict_creates_side_quest_interests(tmp_path: Path):
     ],
     ids=["degraded", "no-memory", "empty-memory", "no-verdict", "inline-verdict-line-not-taken"],
 )
-def test_a_reply_the_parser_could_not_read_is_recorded_as_a_parse_failure(
-    tmp_path: Path, reply: str
-):
+def test_a_reply_the_parser_could_not_read_is_recorded_as_a_parse_failure(tmp_path: Path, reply: str):
     _engine, result, _memory = _fire_with_reply(tmp_path, reply)
     assert result.fired is not None  # the fire itself is unchanged
     assert _session_rows(tmp_path) == [reply]
@@ -1049,15 +1026,10 @@ def _live_gate_reason(
     store = MemoryStore(tmp_path / "memories.db")
     try:
         if stored:
-            store.create(
-                Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored)
-            )
+            store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored))
         runner = _build_engine(tmp_path, store)
         result = runner.run_tick(
-            trigger="manual",
-            dry_run=True,
-            days_since_human_override=0.0,
-            emotion_state_override=None,
+            trigger="manual", dry_run=True, days_since_human_override=0.0, emotion_state_override=None
         )
     finally:
         store.close()
