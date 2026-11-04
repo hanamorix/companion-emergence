@@ -1470,6 +1470,32 @@ def hook_store(tmp_path: Path) -> Iterator[MemoryStore]:
     store.close()
 
 
+# Since Engine 4 a commit, an assigned update and the start-only date event are APPLIED to the state when the memory is
+# written (`EmotionEngine._apply_direct`); only a showing and a change are queued. The cases below are about WHAT EVENT each
+# hook builds, that it is built before the lock and that no failure reaches the write. So that they can keep reading the
+# hook's output from one place, the direct apply is replaced here by the step it replaced: it appends its events to the queue
+# under the lock, as the hooks did before Engine 4. The direct apply itself (the state it changes, the lock, recovery first,
+# the batch, the failures) is tested for real in `test_engine_direct_apply.py`; a test here that asks for `real_direct_apply`
+# gets the real one.
+
+
+@pytest.fixture(autouse=True)
+def _direct_apply_as_queue_append(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if "real_direct_apply" in request.fixturenames:
+        return
+
+    def as_append(self: engine_module.EmotionEngine, events: list[Event]) -> None:
+        for event in events:
+            self._queue(event)
+
+    monkeypatch.setattr(engine_module.EmotionEngine, "_apply_direct", as_append)
+
+
+@pytest.fixture
+def real_direct_apply() -> None:
+    """Ask for the real direct apply in a test of the hooks."""
+
+
 def _events(persona_dir: Path) -> list[Event]:
     return _read(persona_dir)
 
@@ -2290,7 +2316,7 @@ def test_a_lock_wait_that_runs_out_is_logged_as_that_not_as_a_disk_fault(
         assert len(first) == 1 and first[0].exc_info is None
         wording = first[0].getMessage()
         assert "gave up on the engine lock" in wording and "on_memory_committed" in wording and "not recorded" in wording
-        assert "could not queue" not in wording
+        assert "could not record" not in wording
         caplog.clear()
         hook_store.create(_hook_mem())
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []  # throttled to DEBUG
@@ -2302,5 +2328,5 @@ def test_a_lock_wait_that_runs_out_is_logged_as_that_not_as_a_disk_fault(
         hook_store.create(_hook_mem())
         other = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(other) == 1 and other[0].exc_info is None
-        assert "could not queue its event" in other[0].getMessage()
+        assert "could not record its event" in other[0].getMessage()
         assert "gave up on the engine lock" not in other[0].getMessage()

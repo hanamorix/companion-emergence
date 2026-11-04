@@ -18,6 +18,7 @@ from pathlib import Path
 from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
+from brain.emotion import engine as emotion_engine
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
@@ -981,6 +982,18 @@ def _dream_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drain_emotion_engine(persona_dir: Path) -> None:
+    """Run the emotion engine's drain and day close now (spec 3.1 S4); it catches and logs its own failures and never raises.
+
+    Called by the commands that run in their own process (`nell heartbeat`, `nell chat --no-bridge`) after the work that
+    queues or writes emotions, since no bridge supervisor is running to do it. The module is imported as `emotion_engine`
+    (a local named `engine` exists in several handlers here), and a patch of the module reaches this call.
+    """
+    from datetime import UTC, datetime
+
+    emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+
+
 def _heartbeat_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell heartbeat` to the HeartbeatEngine."""
     persona_dir = get_persona_dir(args.persona)
@@ -1027,6 +1040,8 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             hebbian.close()
     finally:
         store.close()
+    if not args.dry_run:  # a dry run writes nothing, so it drains nothing
+        _drain_emotion_engine(persona_dir)
 
     if result.initialized:
         if args.dry_run:
@@ -2173,6 +2188,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     _flush_cost_series_at_exit(store)
                     raise
                 print(result.content)
+                _drain_emotion_engine(persona_dir)  # the reply is printed: fold what it queued
                 # Flush conversation through ingest pipeline (best-effort).
                 # Mirrors the REPL's finally block — without this, every
                 # one-shot reply orphans its buffer file and no memories
@@ -2195,6 +2211,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                 _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
+                _drain_emotion_engine(persona_dir)  # the pass-2 drain can queue changes of its own
                 return 0
 
             # Interactive REPL mode
@@ -2221,6 +2238,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                     print(result.content)
                     print()
+                    _drain_emotion_engine(persona_dir)  # after each reply
                     total_tool_calls += len(result.tool_invocations)
                     # S210: the reply is finished and printed; only now may the RAM
                     # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
@@ -2245,6 +2263,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                 _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
+                _drain_emotion_engine(persona_dir)  # after the pass-2 drain
                 # Summary
                 print(
                     f"\nSession ended. {session.turns} turn(s), "

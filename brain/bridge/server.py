@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     HTTPException,
@@ -84,6 +85,7 @@ from brain.chat.session import (
     create_session,
     get_or_hydrate_session,
 )
+from brain.emotion import engine as emotion_engine
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -161,6 +163,23 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
     except Exception:
         logger.exception("startup persona-vocabulary load skipped")
+
+
+async def _drain_emotion_engine(persona_dir: Path) -> None:
+    """Run the emotion engine's drain and day close (`note_active`) off the event loop, after a reply was sent.
+
+    `tracked_to_thread` counts the work for the shutdown and refuses it with `ShutdownDeferred` once the bridge has begun to
+    stop. That refusal is not an error here: the reply is already sent, nothing is lost (the queue stays on disk and the next
+    start or the supervisor's next pass drains it), and an unhandled one would reach the app's handler as a 503 for a reply the
+    client already has. So it is logged at info, as `start_tracked_thread` does for the work it does not start, and nothing else is
+    caught: `note_active` never raises.
+    """
+    try:
+        await tracked_to_thread(
+            "emotion drain", emotion_engine.engine_for(persona_dir).note_active, datetime.now(UTC)
+        )
+    except cli_throttle.ShutdownDeferred:
+        logger.info("emotion drain not run: the bridge is stopping; the queue is left for the next drain")
 
 
 def _now() -> str:
@@ -1401,6 +1420,10 @@ def build_app(
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
             _vocab_store.close()
+
+        # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
+        # own failures and never raises.
+        emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
 
         # Backwards-compat backlog migration — one-time, before the supervisor's
         # first daily compaction tick can fold a never-compacted backlog cold.
@@ -2995,7 +3018,7 @@ def build_app(
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
-    async def chat(req: ChatReq) -> dict[str, Any]:
+    async def chat(req: ChatReq, background_tasks: BackgroundTasks) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
         # F-201 Phase B: hydrate from disk if the in-memory registry was
         # cleared by a bridge restart but the buffer file still exists.
@@ -3037,6 +3060,8 @@ def build_app(
                 turn=result.turn,
                 duration_ms=duration_ms,
             )
+            # The emotion engine's drain runs after the response is sent (spec 3.1 S4), and only on this success path.
+            background_tasks.add_task(_drain_emotion_engine, s.persona_dir)
             return {
                 "session_id": sid,
                 "reply": result.content,
@@ -3286,6 +3311,9 @@ def build_app(
             # client gets the clean shutdown it expects after the
             # `done` frame.
             await ws.close(code=1000)
+            # The emotion engine's drain, after the clean close so the client never waits for it, and only on this
+            # success path (every error path above returns before this line).
+            await _drain_emotion_engine(s.persona_dir)
 
     # ── WS /events — server-push only broadcast ────────────────────────────
     @app.websocket("/events")
