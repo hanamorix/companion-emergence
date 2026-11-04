@@ -195,8 +195,11 @@ def test_read_never_prunes_the_repeat_list(persona: Path) -> None:
     state.repeats["old"] = RepeatEntry(first_at=D[1], count=1)
     save(persona, state)
     engine = install(persona)
-    engine.read()
+    assert "joy" in engine.read()  # a real read of this state
     assert "old" in state_of(persona).repeats
+    queue(persona, change(D[4], {"joy": 1.0}))  # the control: the apply step is what prunes it
+    engine.note_active(D[4])
+    assert "old" not in state_of(persona).repeats
 
 
 def test_change_log_files_older_than_the_boundary_go_at_a_day_close_anchored_on_the_day_before_the_close(persona: Path) -> None:
@@ -274,6 +277,9 @@ def test_a_drain_that_reads_nothing_and_closes_no_day_does_not_save(persona: Pat
     engine.note_active(D[3])
     assert saves == []
     assert tree(persona) == before
+    queue(persona, showing("m1", D[3], {"grief": 2.0}))  # the control: with a line to fold the same fresh instance does save
+    install(persona).note_active(D[3])
+    assert [position for position, _ in saves] == [1, 0]
 
 
 def test_a_position_past_an_emptied_queue_reads_from_the_start(persona: Path) -> None:

@@ -88,6 +88,7 @@ def test_read_is_empty_while_the_state_is_missing_unreadable_or_flagged_and_take
     spy = LockSpy(monkeypatch)
     assert eng.read() == {}  # missing
     save(persona, _two_emotion_state())
+    assert set(eng.read()) == {"joy", "grief"}  # the control: the same state is readable until it is damaged
     for suffix in ("", ".bak1", ".bak2", ".bak3"):
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():

@@ -30,16 +30,19 @@ def _record_into(stub, order: list[str]) -> None:  # noqa: ANN001
     stub.note_active = lambda now: (order.append("drain"), real(now))[1]
 
 
-def _patch_provider(monkeypatch: pytest.MonkeyPatch, *, reply: str = "a reply", fails: bool = False) -> None:
+def _patch_provider(monkeypatch: pytest.MonkeyPatch, *, reply: str = "a reply") -> dict[str, bool]:
+    """A fake provider; the returned dict's `fail` switch makes its next chats raise (an error path), and back."""
     import brain.bridge.provider as provider_module
     from brain.bridge.chat import ChatResponse
+
+    behaviour = {"fail": False}
 
     class _Fake:
         def name(self) -> str:
             return "fake"
 
         def chat(self, messages, *, tools=None, options=None):  # noqa: ANN001
-            if fails:
+            if behaviour["fail"]:
                 raise RuntimeError("the provider failed")
             return ChatResponse(content=reply, tool_calls=[])
 
@@ -47,6 +50,7 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, *, reply: str = "a reply", 
             return "[]"
 
     monkeypatch.setattr(provider_module, "get_provider", lambda _name, **_kw: _Fake())
+    return behaviour
 
 
 @pytest.fixture
@@ -114,6 +118,9 @@ def test_the_supervisor_does_not_drain_while_a_reply_is_in_flight(
     monkeypatch.setattr(cli_throttle, "reply_in_flight", lambda: True)
     _run_supervisor(persona_dir, monkeypatch, order, passes=2)
     assert "drain" not in order and order.count("kindled") == 2
+    monkeypatch.setattr(cli_throttle, "reply_in_flight", lambda: False)  # the control: the same passes with no reply in flight
+    _run_supervisor(persona_dir, monkeypatch, order, passes=2)
+    assert order.count("drain") == 2
 
 
 # --- lifespan (W3) ------------------------------------------------------------------------------------------------
@@ -162,13 +169,17 @@ def test_http_chat_queues_the_drain_as_a_background_task_and_runs_it_after_the_r
 
 
 def test_http_chat_queues_no_drain_on_an_error_path(persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_provider(monkeypatch, fails=True)
+    behaviour = _patch_provider(monkeypatch)
     with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as client:
         sid = client.post("/session/new", json={"client": "tests"}).json()["session_id"]
         emotion_engine_stub.recorded_calls.clear()
+        behaviour["fail"] = True
         response = client.post("/chat", json={"session_id": sid, "message": "hi"})
-    assert response.status_code == 502
-    assert _note_active_calls(emotion_engine_stub) == []
+        assert response.status_code == 502
+        assert _note_active_calls(emotion_engine_stub) == []
+        behaviour["fail"] = False  # the control: the same session answers, and now the drain is queued
+        assert client.post("/chat", json={"session_id": sid, "message": "again"}).status_code == 200
+    assert len(_note_active_calls(emotion_engine_stub)) == 1
 
 
 def _stream_one_turn(client: TestClient) -> list[dict]:
@@ -210,12 +221,16 @@ def test_the_websocket_stream_drains_after_the_clean_close_on_a_success_path_onl
 
 def test_the_websocket_stream_runs_no_drain_on_an_error_path(persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
-    _patch_provider(monkeypatch, fails=True)
+    behaviour = _patch_provider(monkeypatch)
     with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as client:
         emotion_engine_stub.recorded_calls.clear()
+        behaviour["fail"] = True
         frames = _stream_one_turn(client)
-    assert frames[-1]["type"] == "error"
-    assert _note_active_calls(emotion_engine_stub) == []
+        assert frames[-1]["type"] == "error"
+        assert _note_active_calls(emotion_engine_stub) == []
+        behaviour["fail"] = False  # the control: the next turn succeeds and drains
+        assert _stream_one_turn(client)[-1]["type"] == "done"
+    assert len(_note_active_calls(emotion_engine_stub)) == 1
 
 
 # --- the helper (V2) ---------------------------------------------------------------------------------------------

@@ -275,8 +275,10 @@ def test_the_start_gate_a_young_persona_is_gated_and_the_same_history_with_an_ol
 def test_a_feeling_with_no_finished_long_run_is_quiet(tmp_path: Path) -> None:
     """(f) The same short climb, but the long average only ever rises (no run finished in the window): quiet, 0."""
     snapshot = _long_run_bar_snapshot(short_days=[6.0, 7.0, 8.0, 9.0, 9.5, 10.0])
+    control = Sim(tmp_path / "control", state=_state_with_snapshot(snapshot))
+    assert control.shift() == 1  # with the finished long run of (d) the same short climb is a shift
     snapshot = [day._replace(long=3.0 + 0.01 * n) for n, day in enumerate(snapshot)]  # up every day: one run, never finished
-    assert Sim(tmp_path, state=_state_with_snapshot(snapshot)).shift() == 0
+    assert Sim(tmp_path / "quiet", state=_state_with_snapshot(snapshot)).shift() == 0
 
 
 def test_a_persona_whose_first_rows_are_uncounted_opens_its_gate_thirty_days_after_the_oldest_of_them(tmp_path: Path) -> None:

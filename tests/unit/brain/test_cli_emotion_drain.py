@@ -93,3 +93,5 @@ def test_the_heartbeat_command_drains_after_the_tick(emotion_engine_stub, heartb
 def test_the_heartbeat_command_does_not_drain_under_dry_run(emotion_engine_stub, heartbeat_persona: Path) -> None:
     assert main(["heartbeat", "--persona", "nell", "--trigger", "manual", "--provider", "fake", "--dry-run"]) == 0
     assert _calls(emotion_engine_stub) == []
+    assert main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"]) == 0  # the control
+    assert len(_calls(emotion_engine_stub)) == 1
