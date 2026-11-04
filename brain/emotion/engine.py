@@ -17,6 +17,7 @@ Real now:
   queue like the others.
 
 Stubbed now:
+- `batch()` is a context manager that does nothing: it takes no argument, yields None and records nothing.
 - `read()` returns `{}`; `status()` returns `EngineStatus(True, None)`; `oldest_entry_at()` returns None.
 - `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
   memory id and the emotion, when the memory has no such emotion. It never returns 0.0:
@@ -33,7 +34,8 @@ from __future__ import annotations
 import functools
 import logging
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -270,6 +272,18 @@ class EmotionEngine:
         """
         with engine_files.state_lock(self.persona_dir):
             engine_files.append_event(self.persona_dir, event)
+
+    # --- batch scope (stubbed: does nothing) -------------------------------------------------------
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """A bulk writer wraps its loop in this block. The stub does nothing.
+
+        The engine built later collects the block's events and applies them once when the outermost
+        block ends; here nothing is collected, applied or recorded, and an exception from the block
+        goes out unchanged.
+        """
+        yield
 
     # --- reads (stubbed) ---------------------------------------------------------------------------
 
