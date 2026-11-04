@@ -1,4 +1,4 @@
-"""A failed single-statement write on MemoryStore leaves no transaction open (Engine 3, #578, BC1).
+"""A failed write on MemoryStore leaves no transaction open (Engine 3, #578, BC1).
 
 Python's sqlite3 opens a transaction before a write. When the write raises, the connection stays inside that transaction unless the method ends it, and
 the next writer's commit would take the failed call's earlier statements with it. `create`, `update`, `update_emotions_batch` and `deactivate` each
