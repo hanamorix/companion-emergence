@@ -85,18 +85,14 @@ cursor resets automatically on a model swap (its persisted `model_id` no
 longer matches the current provider's), so a new model reopens the whole
 backlog rather than silently under-covering it.
 
-The cursor is a COMPOSITE ``(created_at, id)`` keyset position, not a bare
-timestamp — see ``MemoryStore.list_active_since``/``list_unembedded_since``.
-A bare-timestamp cursor made any row sharing its exact ``created_at`` with
-the pinned row permanently unreachable (bulk migrator imports routinely
-produce duplicate/second-granularity timestamps —
-``brain/migrator/emergence_kit.py`` via ``brain/migrator/transform.py``'s
-``_coerce_utc``); pairing the timestamp with the row's own ``id`` gives
-every row a distinct position in the scan order. A cursor file written
-before this pairing existed is timestamp-only and is treated as unparseable
-— see ``_load_cursor`` — which resets to the top of history rather than
-guessing; safe and cheap, since a rescan only re-confirms rows already
-embedded (they no longer satisfy `embedding IS NULL`).
+The cursor is the SQLite ``rowid`` of the last row processed (``{"rowid": n}`` in the persisted file): the backlog is walked in
+insertion order (``MemoryStore.list_unembedded_since``), not by ``created_at`` (sfa S31(b)), because a row's ``created_at`` can
+move (the temp gate's write-back resets it when a memory is remembered) and a cursor keyed on it would skip or revisit such a
+row. Every row has its own distinct rowid, so rows that share a ``created_at`` (bulk migrator imports routinely produce
+duplicate or second-granularity timestamps) are all reachable. A cursor file written before this form existed (the
+``{"created_at", "id"}`` dict or a bare timestamp) reads as unusable — see ``_load_cursor`` — which resets to the top of history
+rather than guessing; safe and cheap, since a rescan only re-confirms rows already embedded (they no longer satisfy
+`embedding IS NULL`).
 
 CURSOR-FREEZE FIX (folded into increment 3): a row that fails to embed is
 logged and the cursor is allowed to advance PAST it (skip-and-log), instead
@@ -144,6 +140,7 @@ logger = logging.getLogger(__name__)
 MIN_CHARS_TO_EMBED = 20
 
 _CURSOR_FILE = "embedding_backfill_cursor.json"
+_SQLITE_MAX_ROWID = 2**63 - 1  # the largest integer SQLite binds; a cursor beyond it would make every tick raise
 
 # ---------------------------------------------------------------------------
 # Runtime-derived batch size (F1 #259 increment 3) — see module docstring.
@@ -335,21 +332,22 @@ class BackfillTickResult:
     batch_size: int  # the derived (or caller-overridden) batch size used
 
 
-def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None:  # noqa: ANN001
+def _load_cursor(persona_dir, current_model_id: str) -> int | None:  # noqa: ANN001
     """Best-effort cursor read. Missing/corrupt/model-mismatched/old-format
     -> None (start of history) — fail toward re-scanning, never toward
     silently skipping a row. See module docstring: the cursor is an
     optimization, not the correctness mechanism.
 
-    The persisted cursor is the COMPOSITE ``{"created_at": ..., "id": ...}``
-    form (see ``MemoryStore.list_unembedded_since``). A cursor file written
-    by a pre-keyset build of this module is timestamp-only (a bare string)
-    — that old format is deliberately NOT half-interpreted (e.g. paired with
-    an empty/sentinel id, which would silently reintroduce the same-timestamp
-    blind spot this format exists to close); it is treated exactly like any
-    other unparseable cursor and reset to ``None``, which just rescans from
-    the top. Safe and cheap: a rescan only re-confirms rows already embedded
-    under the current model (they no longer satisfy the backlog predicate).
+    The persisted cursor is ``{"rowid": n}`` (see
+    ``MemoryStore.list_unembedded_since``): an ``int`` (not a bool) in
+    ``0 .. _SQLITE_MAX_ROWID``. Anything else is unusable and reads as None,
+    which just rescans from the top: a cursor file written by an earlier
+    build (the ``{"created_at", "id"}`` dict, or a bare timestamp string) —
+    deliberately NOT half-interpreted — or a damaged file. An integer SQLite
+    cannot bind would make every tick raise before the file is rewritten, so
+    it is refused here rather than trusted. A rescan only re-confirms rows
+    already embedded under the current model (they no longer satisfy the
+    backlog predicate).
     """
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
     raw = read_json(path, default=lambda: None, expect=dict)  # missing/corrupt/unreadable: rescan from the top
@@ -370,30 +368,25 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
         return None
     cursor = raw.get("cursor")
     if not isinstance(cursor, dict):
-        # Includes the pre-keyset bare-string format, and None/missing.
+        # Includes the earlier bare-string format, and None/missing.
         return None
-    created_at = cursor.get("created_at")
-    row_id = cursor.get("id")
-    if not isinstance(created_at, str) or not created_at:
+    rowid = cursor.get("rowid")
+    if type(rowid) is not int or not 0 <= rowid <= _SQLITE_MAX_ROWID:
         return None
-    if not isinstance(row_id, str) or not row_id:
-        return None
-    return (created_at, row_id)
+    return rowid
 
 
 def _save_cursor(
     persona_dir,  # noqa: ANN001
     current_model_id: str,
-    cursor: tuple[str, str] | None,
+    cursor: int | None,
 ) -> None:
     """Best-effort cursor write (temp file + rename). Failure is swallowed —
     mirrors persisted_cadence.save_cadence's posture: a failed save only
     means the NEXT tick re-scans a bit more than necessary, never that a
     row goes unembedded."""
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
-    cursor_payload = (
-        {"created_at": cursor[0], "id": cursor[1]} if cursor is not None else None
-    )
+    cursor_payload = {"rowid": cursor} if cursor is not None else None
     payload = {"model_id": current_model_id, "cursor": cursor_payload}
     write_json(path, payload, indent=None, fsync=False, on_error="log")  # best-effort: a rescan is the cost
 
@@ -470,9 +463,10 @@ def run_embedding_backfill_tick(
     resolved_up_to = cursor
     hit_batch_limit = False
 
-    for memory in candidates:
+    for backlog_row in candidates:
         scanned += 1
-        row_cursor = (memory.created_at.isoformat(), memory.id)
+        memory = backlog_row.memory
+        row_cursor = backlog_row.rowid
 
         if len(memory.content) < MIN_CHARS_TO_EMBED:
             # Defensive/redundant as of F1 #259 increment-3 red-team fix
@@ -517,8 +511,8 @@ def run_embedding_backfill_tick(
     # scan). Unlike the old content-hash cache, `embedding IS NULL` is not
     # append-only per id: a row can go null a SECOND time (a later content
     # edit whose synchronous re-embed fails — see
-    # MemoryStore._reembed_or_clear) at a `created_at` position the cursor
-    # may already have passed. A persisted forward cursor is only a safe
+    # MemoryStore._reembed_or_clear) at a rowid the cursor may already have
+    # passed. A persisted forward cursor is only a safe
     # scan-cost optimization while there is more of the CURRENTLY FETCHED
     # window left to examine (the `hit_batch_limit` case) or the backlog is
     # LARGER than one scan window; once the window is both fully processed
@@ -650,7 +644,7 @@ def run_embedding_backfill_to_completion(
     — also stop.
 
     Both stop conditions are reached in a BOUNDED number of ticks: the
-    keyset cursor only ever moves forward (or resets to re-scan a
+    rowid cursor only ever moves forward (or resets to re-scan a
     provably-exhausted-of-successes remainder), so the total rows examined
     across the whole drain is bounded by a small constant multiple of the
     backlog size, never unbounded.

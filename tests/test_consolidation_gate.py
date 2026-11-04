@@ -14,7 +14,7 @@ import itertools
 import logging
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -589,8 +589,9 @@ def _raw(store, memory_id, *columns):
 _RUN_COUNTER = itertools.count()
 
 
-def _merge_run(persona, target_emotions, cand_emotions, *, merged="Bob likes tea with honey"):
-    """Make a target (no hook fired for it), queue a candidate, run a merge verdict. Returns (target_id, result)."""
+def _merge_run(persona, target_emotions, cand_emotions, *, merged="Bob likes tea with honey", with_cand=False):
+    """Make a target (no hook fired for it), queue a candidate, run a merge verdict. Returns (target_id, result), or
+    (target_id, result, cand) with `with_cand` (the candidate as queued)."""
     tmp, store, hebbian, queue = persona
     # Distinct texts per call: a candidate whose text equals a stored row is dropped by the gate's exact-duplicate pass.
     n = next(_RUN_COUNTER)
@@ -602,6 +603,8 @@ def _merge_run(persona, target_emotions, cand_emotions, *, merged="Bob likes tea
         store, persona_dir=tmp, hebbian=hebbian,
         classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content=merged)}),
     )
+    if with_cand:
+        return target_id, result, cand
     return target_id, result
 
 
@@ -707,18 +710,70 @@ def test_e5_live_merge_lone_Joy_becomes_joy_with_the_same_value(persona, emotion
     assert store.get(target_id, bump=False).emotions == {"joy": 5.0}
 
 
-def test_e5_live_merge_calls_no_hook_and_folds_nothing(persona, emotion_engine_stub):
+def test_e5_live_merge_sends_one_commit_event_for_the_incoming_memory_and_none_for_the_target(
+    persona, emotion_engine_stub
+):
     _tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     # A target with NO emotions that gets some by the merge: with fold left True this is the "assigned" hook's own case.
     target_id, _res = _merge_run(persona, {}, {"joy": 5.0})
     assert store.get(target_id, bump=False).emotions == {"joy": 5.0}
-    assert emotion_engine_stub.recorded_calls == []
+    assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # the target's update fired none
     # The probe can see: the same empty-to-filled update with fold left True records the assigned hook.
+    emotion_engine_stub.recorded_calls.clear()
     other_id = store.create(_mem("another row", "conversation"), fold=False)
     store.update(other_id, emotions={"joy": 5.0})
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_emotions_assigned"]
     _assert_probe_can_see_hooks(store, emotion_engine_stub)
+
+
+def test_e5_the_commit_event_is_the_incoming_memorys_own_not_the_merged_emotions(persona, emotion_engine_stub):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    target_id, res, cand = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0, "awe": 2.0}, with_cand=True)
+    assert res.merged == 1
+    assert store.get(target_id, bump=False).emotions == {"joy": 6.0, "awe": 2.0}
+    assert len(emotion_engine_stub.recorded_calls) == 1
+    name, sent = emotion_engine_stub.recorded_calls[0]
+    assert name == "on_memory_committed"
+    assert sent.id == cand.id
+    assert sent.emotions == {"joy": 7.0, "awe": 2.0}  # the candidate's own, not the merged {joy: 6, awe: 2}
+    assert sent.created_at == cand.created_at
+    assert sent.memory_type == cand.memory_type
+    assert store.get(cand.id, bump=False) is None  # the merged candidate was never created as a row
+    assert target_id != cand.id
+
+
+def test_e5_the_commit_event_follows_the_write_not_before_it(persona, emotion_engine_stub, monkeypatch):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    log = []
+    real_update = MemoryStore.update
+
+    def spy(self, memory_id, **fields):
+        real_update(self, memory_id, **fields)
+        log.append(("update", memory_id))
+
+    monkeypatch.setattr(MemoryStore, "update", spy)
+
+    def hook(memory):
+        # At the moment of the hook the target row already holds the merged content.
+        log.append(("on_memory_committed", store.get(target_ids[0], bump=False).content))
+
+    monkeypatch.setattr(emotion_engine_stub, "on_memory_committed", hook)
+    target_ids = []
+    real_create = store.create
+
+    def remember_target(memory, **kw):
+        out = real_create(memory, **kw)
+        target_ids.append(out)
+        return out
+
+    monkeypatch.setattr(store, "create", remember_target)
+    target_id, _res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
+    assert [entry[0] for entry in log] == ["update", "on_memory_committed"]
+    assert log[0][1] == target_id
+    assert log[1][1] == "Bob likes tea with honey"
 
 
 def test_e5_live_merge_leaves_score_and_raises_peak_only_by_max(persona, emotion_engine_stub):
@@ -759,10 +814,13 @@ def test_e5_not_live_merge_is_todays_content_only_call(persona, emotion_engine_s
     live_id, _ = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0, "awe": 6.0})
     assert store.get(live_id, bump=False).emotions == {"joy": 6.0, "awe": 6.0}
     assert {"emotions", "fold"} <= set(next(f for mid, f in calls if mid == live_id))
+    assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # the live merge's event
 
     emotion_engine_stub.live = False
+    emotion_engine_stub.recorded_calls.clear()
     target_id, res = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0, "awe": 6.0})
     assert res.merged == 1
+    assert emotion_engine_stub.recorded_calls == []  # not live: no event either
     assert [fields for mid, fields in calls if mid == target_id] == [{"content": "Bob likes tea with honey"}]
     got = store.get(target_id, bump=False)
     assert got.emotions == {"Joy": 5.0}  # untouched, spelling included
@@ -795,6 +853,47 @@ def test_e5_live_merge_of_a_target_deleted_before_the_write_defers_the_candidate
     assert res.deferred == 1
     assert res.merged == 0
     assert queue.read_recent("dream", limit=5)  # the candidate is back in the queue
+    assert emotion_engine_stub.recorded_calls == []  # a merge that did not happen sends no event
+
+
+def _run_merge_verdict(persona, cand, target_id, *, merged="Bob likes tea with honey"):
+    tmp, store, hebbian, queue = persona
+    return run_consolidation(
+        store, persona_dir=tmp, hebbian=hebbian,
+        classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content=merged)}),
+    )
+
+
+def test_e5_a_deferred_merge_sends_no_event_and_the_tick_that_writes_it_sends_one(persona, emotion_engine_stub):
+    tmp, store, hebbian, queue = persona
+    emotion_engine_stub.live = True
+    target = _mem("Bob likes tea number 900", "conversation", emotions={"joy": 5.0})
+    target_id = store.create(target, fold=False)
+    cand = _mem("Bob likes tea with honey, take 900", "dream", emotions={"joy": 7.0})
+    # Tick 1: the verdict names an id the store does not know (a missing target): deferred.
+    queue.enqueue(cand, source="x")
+    first = _run_merge_verdict(persona, cand, "no-such-id")
+    assert first.deferred == 1
+    assert first.merged == 0
+    assert emotion_engine_stub.recorded_calls == []
+    # Tick 2: the target is mid-fade (state 'fading'): deferred again.
+    store._conn.execute("UPDATE memories SET state = 'fading' WHERE id = ?", (target_id,))
+    store._conn.commit()
+    second = _run_merge_verdict(persona, cand, target_id)
+    assert second.deferred == 1
+    assert second.merged == 0
+    assert emotion_engine_stub.recorded_calls == []
+    assert store.get(target_id, bump=False).emotions == {"joy": 5.0}
+    # Tick 3: the target is active again, the verdict is the same: the merge is written and the event is sent, once.
+    store._conn.execute("UPDATE memories SET state = 'active' WHERE id = ?", (target_id,))
+    store._conn.commit()
+    third = _run_merge_verdict(persona, cand, target_id)
+    assert third.merged == 1
+    assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]
+    assert emotion_engine_stub.recorded_calls[0][1].id == cand.id
+    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+    # The probe can see.
+    _assert_probe_can_see_hooks(store, emotion_engine_stub)
 
 
 def _set_raw_emotions(store, memory_id, emotions):
@@ -1075,6 +1174,7 @@ def test_e5_not_live_writes_nothing_back(persona, emotion_engine_stub, monkeypat
     assert got.importance == pytest.approx(7.25)  # the importance update still happens
     assert got.emotions == before.emotions
     assert got.created_at == before.created_at
+    assert got.content == before.content  # no date added when not live
     assert refreshed == []
     assert faded_asked == []
 
@@ -1104,6 +1204,7 @@ def test_e5_a_raising_write_back_is_logged_and_leaves_the_row_alone(
     got = store.get(mem.id, bump=False)
     assert got.emotions == before.emotions
     assert got.created_at == before.created_at
+    assert got.content == before.content
     assert got.importance == pytest.approx(7.25)  # the importance update stands
     assert res.reappraised == 1
     assert res.failed == 0
@@ -1136,6 +1237,7 @@ def test_e5_a_failing_faded_value_is_logged_and_nothing_is_written(
     got = store.get(mem.id, bump=False)
     assert got.emotions == before.emotions
     assert got.created_at == before.created_at
+    assert got.content == before.content
     assert got.importance == pytest.approx(7.25)
     assert res.failed == 0
 
@@ -1295,9 +1397,7 @@ def test_e5_a_later_fade_reads_the_reappraised_importance_and_the_reset_created_
     stretched = 14.0 * (1.0 + dev_constants.HORIZON_IMPORTANCE_GAIN * 9.0 / 10.0)
     from brain.emotion.engine_utils import fade
 
-    assert fade(
-        row.emotions["joy"], age_days, 14.0, row.importance, dev_constants.HORIZON_IMPORTANCE_GAIN
-    ) == pytest.approx(6.0 * 0.5 ** (10.0 / stretched))
+    assert fade(row.emotions["joy"], age_days, 14.0, row.importance) == pytest.approx(6.0 * 0.5 ** (10.0 / stretched))
 
 
 # --- the real engine and a real switch file (the stub ignores which directory it is asked about) ---------
@@ -1335,3 +1435,178 @@ def test_e5_real_engine_write_back_is_live_only_with_a_switch_file(persona):
     assert after.created_at > on_before.created_at  # switch file present: created_at reset to the gate's now
     assert after.emotions == {"joy": 8.0}  # the engine's own faded_value (today: the stored value)
     assert after.importance == pytest.approx(7.25)
+
+
+# --- Engine 5, 2026-11-04: the merge's mood event on the real engine, and how the gate asks about liveness ----
+
+
+def _record_real_engine_hook(monkeypatch, tmp, *, live):
+    """Patch the REAL engine class: `is_live` answers `live`, `on_memory_committed` only records (it never runs the real hook, so
+    the cell does not depend on what sits behind the hook). Returns the list of (persona_dir, memory) it was called with."""
+    from brain.emotion import engine
+
+    cls = type(engine.engine_for(tmp))
+    seen = []
+    monkeypatch.setattr(cls, "is_live", lambda self: live)
+    monkeypatch.setattr(cls, "on_memory_committed", lambda self, memory: seen.append((self.persona_dir, memory)))
+    return seen
+
+
+def test_e5_real_engine_live_merge_sends_the_commit_event_for_the_persona_dir_it_was_given(persona, monkeypatch):
+    tmp, store, _heb, _queue = persona
+    seen = _record_real_engine_hook(monkeypatch, tmp, live=True)
+    target_id, res, cand = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0}, with_cand=True)
+    assert res.merged == 1
+    assert [(path, m.id) for path, m in seen] == [(tmp.resolve(), cand.id)]
+    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+
+
+def test_e5_real_engine_not_live_merge_sends_no_event(persona, monkeypatch):
+    tmp, store, _heb, _queue = persona
+    live_seen = _record_real_engine_hook(monkeypatch, tmp, live=True)
+    _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
+    assert len(live_seen) == 1  # the probe can see: a live merge records its event
+    off_seen = _record_real_engine_hook(monkeypatch, tmp, live=False)
+    target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
+    assert res.merged == 1
+    assert off_seen == []
+    assert store.get(target_id, bump=False).emotions == {"joy": 5.0}  # not live: content only
+
+
+def test_e5_the_gate_asks_is_live_once_per_merge_and_it_gates_the_write_and_the_event_together(
+    persona, emotion_engine_stub, monkeypatch
+):
+    _tmp, store, _heb, _queue = persona
+    asked = []
+
+    def flipping_is_live():
+        asked.append(1)
+        return len(asked) == 1  # True the first time, False after
+
+    monkeypatch.setattr(emotion_engine_stub, "is_live", flipping_is_live)
+    target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
+    assert res.merged == 1
+    assert len(asked) == 1
+    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}  # the emotions write happened
+    assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # and so did the event
+
+
+def test_e5_a_raising_commit_event_is_not_swallowed_by_the_merge(persona, emotion_engine_stub, monkeypatch):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+
+    def raising_hook(memory):
+        raise RuntimeError("the engine's guard is the contract; this hook broke it")
+
+    monkeypatch.setattr(emotion_engine_stub, "on_memory_committed", raising_hook)
+    target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
+    # The merge had already committed; the failure reaches the per-item handler (item scope: quarantined), it is not caught
+    # inside the merge branch. The retry edge (M06) is what this records.
+    assert res.merged == 0
+    assert res.failed == 1
+    assert res.quarantined == 1
+    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+
+
+# --- Engine 5, 2026-11-04: the date the write-back puts at the start of a recalled memory's text (sfa S31(c)) --------
+
+
+_OLD_CREATED_AT = datetime(2031, 3, 4, 12, 0, 0, tzinfo=UTC)
+
+
+def _patch_local_day(monkeypatch, hours=0):
+    """Make the store's local-day conversion a fixed offset (so no cell depends on the host's zone). `raising=False`: on a base
+    without the name the cell still reaches its own assertion."""
+    import brain.memory.store as store_module
+
+    zone = timezone(timedelta(hours=hours))
+    monkeypatch.setattr(store_module, "to_local", lambda dt: dt.astimezone(zone), raising=False)
+    return store_module
+
+
+def _expected_prefix(store_module, iso):
+    return store_module.DATE_PREFIX_FORMAT_PLACEHOLDER.replace("{date}", iso)
+
+
+@pytest.mark.parametrize("memory_type", ["conversation", "dream", "making"])
+def test_e5_write_back_puts_the_old_date_at_the_start_of_the_text_once(
+    persona, emotion_engine_stub, monkeypatch, memory_type
+):
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module = _patch_local_day(monkeypatch)
+    monkeypatch.setattr(consolidation, "datetime", _FixedDatetime)
+    mem = replace(
+        _mem("Bob's address is 12 Elm Street", memory_type, emotions={"joy": 8.0}, importance=3.0),
+        created_at=_OLD_CREATED_AT,
+    )
+    store.create(mem, fold=False)
+    emotion_engine_stub.faded[(mem.id, "joy")] = 3.5
+    prefix = _expected_prefix(store_module, "2031-03-04")
+
+    res = _reappraise_run(tmp, store, mem)
+    assert res.reappraised == 1
+    got = store.get(mem.id, bump=False)
+    assert got.content == prefix + "Bob's address is 12 Elm Street"
+    assert got.created_at == _FIXED_NOW  # reset, and the date written is the one it had BEFORE the reset
+
+    # A second re-appraisal: the date is already there, so it is not added again.
+    again = _reappraise_run(tmp, store, got, new_importance=8.0)
+    assert again.reappraised == 1
+    assert store.get(mem.id, bump=False).content == prefix + "Bob's address is 12 Elm Street"
+
+
+def test_e5_write_back_dates_a_memory_with_empty_emotions_too(persona, emotion_engine_stub, monkeypatch):
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module = _patch_local_day(monkeypatch)
+    monkeypatch.setattr(consolidation, "datetime", _FixedDatetime)
+    mem = replace(_mem("a quiet fact", "conversation", importance=3.0), created_at=_OLD_CREATED_AT)
+    store.create(mem, fold=False)
+    _reappraise_run(tmp, store, mem)
+    got = store.get(mem.id, bump=False)
+    assert got.content == _expected_prefix(store_module, "2031-03-04") + "a quiet fact"
+    assert got.emotions == {}
+    assert got.created_at == _FIXED_NOW
+
+
+def test_e5_a_content_edit_during_the_reappraiser_call_is_kept_and_dated(persona, emotion_engine_stub, monkeypatch):
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module = _patch_local_day(monkeypatch)
+    mem = replace(_mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0), created_at=_OLD_CREATED_AT)
+    store.create(mem, fold=False)
+
+    def reappraiser_while_another_writer_edits(m):
+        assert m.content == "Bob's address"  # the gate holds the stale text
+        store.update(m.id, content="Bob's new address")  # a content edit lands meanwhile
+        return Reappraisal(7.25)
+
+    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_another_writer_edits)
+    got = store.get(mem.id, bump=False)
+    assert got.content == _expected_prefix(store_module, "2031-03-04") + "Bob's new address"  # not erased by the gate's copy
+
+
+def test_e5_a_real_key_error_from_the_store_is_logged_and_not_requeued(
+    persona, emotion_engine_stub, monkeypatch, caplog
+):
+    tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    _patch_local_day(monkeypatch)
+    mem = _mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0)
+    store.create(mem, fold=False)
+    real_refresh = MemoryStore.refresh_faded_emotions
+
+    def delete_then_refresh(self, memory_id, emotions, created_at):
+        self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))  # gone between the re-read and the UPDATE
+        self._conn.commit()
+        return real_refresh(self, memory_id, emotions, created_at)  # the real method: raises KeyError
+
+    monkeypatch.setattr(MemoryStore, "refresh_faded_emotions", delete_then_refresh)
+    with caplog.at_level(logging.ERROR, logger="brain.engines.consolidation"):
+        res = _reappraise_run(tmp, store, mem)
+    assert res.reappraised == 1  # the importance update stood
+    assert res.failed == 0
+    assert any(r.levelno == logging.ERROR and mem.id in r.getMessage() for r in caplog.records)
+    again = run_consolidation(store, persona_dir=tmp, reappraiser=lambda m: Reappraisal(1.0))
+    assert again.reappraised == 0  # settled, not requeued
