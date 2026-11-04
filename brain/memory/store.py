@@ -20,7 +20,8 @@ import re
 import sqlite3
 import sys
 import uuid
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,7 @@ from brain import dev_constants, tunables
 from brain.memory import cost_series
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 from brain.utils.sqlite_open import OpenProfile, close_on_error, open_store_connection
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -1089,11 +1091,32 @@ class MemoryStore:
             raise ValueError("an in-memory MemoryStore has no persona directory")
         return self._db_path.parent
 
+    @contextmanager
+    def _rolls_back_on_error(self) -> Iterator[None]:
+        """Run a write and its commit; if either raises, roll back the transaction this block opened and re-raise.
+
+        sqlite3 opens a transaction before a write, and a write that fails leaves the connection inside it: the next
+        writer's commit would then take the failed call's earlier statements with it, and the code that refuses to start
+        inside an open transaction would refuse until then. A transaction the caller already had open on entry is not
+        this block's to end, so it is left as it was. If the rollback itself raises, that error goes out and the original
+        one stays attached to it as its context.
+        """
+        opened_here = not self._conn.in_transaction
+        try:
+            yield
+        except BaseException:
+            if opened_here and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+
     def create(self, memory: Memory, *, fold: bool = True) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id.
 
-        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook appends one
-        event to the engine's queue and never raises into this call. `fold=False` is for a write that is not new
+        A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
+        had open is left as it was), so a failure does not leave one open for the next writer.
+
+        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook applies the
+        memory's own emotions to the engine's state under its lock (a commit is never queued) and never raises into this call. `fold=False` is for a write that is not new
         experience (a restore, an import). An in-memory store tells nobody.
 
         Deliberately does NOT itself touch embeddings — MemoryStore has no
@@ -1124,16 +1147,9 @@ class MemoryStore:
         full backfill reasoning (Stage 2 of the local semantic-retrieval
         build).
         """
-        opened_here = not self._conn.in_transaction
-        try:
+        with self._rolls_back_on_error():
             self._insert_memory_row(memory)
-        except BaseException:
-            # A failed INSERT leaves the implicit transaction it opened still open, which would refuse the next write that
-            # begins one. Roll back what this call opened; a transaction the caller already had open is not ours to end.
-            if opened_here and self._conn.in_transaction:
-                self._conn.rollback()
-            raise
-        self._conn.commit()
+            self._conn.commit()
         if fold:
             self._notify_committed(memory)
         return memory.id
@@ -2912,8 +2928,9 @@ class MemoryStore:
         )
         values = [v for _, v in column_map.values()] + extra_values
         values.append(memory_id)
-        self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
+            self._conn.commit()
 
         # F1 #259 step 5 (increment-2 red-team fix): a content mutation
         # invalidates the row's embedding — row-id keying has no
@@ -2968,14 +2985,91 @@ class MemoryStore:
         """
         if not rows:
             return
-        for memory_id, emotions in rows:
-            new_max = max((float(v) for v in emotions.values()), default=0.0)
-            self._conn.execute(
-                "UPDATE memories SET emotions_json = ?, "
-                "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-                (_emotions_column(emotions), new_max, memory_id),
-            )
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            for memory_id, emotions in rows:
+                new_max = max((float(v) for v in emotions.values()), default=0.0)
+                self._conn.execute(
+                    "UPDATE memories SET emotions_json = ?, "
+                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
+                    (_emotions_column(emotions), new_max, memory_id),
+                )
+            self._conn.commit()
+
+    # --- the emotion engine's window reads (Engine 4, #579) -------------------------------------------------
+    #
+    # Plain SELECTs on the engine's behalf, in the one module that owns `memories.db`: no bump of `recall_count` or
+    # `last_accessed_at`, no hook, no embedding column. The catch-up replays what happened since a backup state was saved.
+
+    _ENGINE_WINDOW_COLUMNS = (
+        "id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
+        "last_accessed_at, active, protected, metadata_json, state, content_snapshot, recall_count, "
+        "peak_emotion_intensity"
+    )
+
+    @staticmethod
+    def _window_bounds(since: datetime) -> tuple[datetime, str]:
+        """`since` as an aware UTC time and the TEXT bound of the SQL prefilter: a day earlier than `since`.
+
+        The stored times are ISO text in whatever offset the writer used, so a text compare alone can miss a row whose
+        instant is inside the window; the prefilter is therefore widened by a day and the caller filters on parsed times.
+        """
+        when = lenient_utc(since)
+        if when is None:
+            raise ValueError(f"since is not a usable time: {since!r}")
+        return when, (when - timedelta(days=1)).isoformat()
+
+    def list_engine_window(self, since: datetime) -> list[Memory]:
+        """The rows created OR last accessed at or after `since` (any type, any state), oldest first. Bumps nothing.
+
+        A row whose columns cannot be parsed (a bad time or bad JSON) is logged with its id and skipped, so one damaged row
+        does not stop every catch-up.
+        """
+        when, bound = self._window_bounds(since)
+        rows = self._conn.execute(
+            f"SELECT {self._ENGINE_WINDOW_COLUMNS} FROM memories WHERE created_at >= ? OR last_accessed_at >= ?",  # noqa: S608
+            (bound, bound),
+        ).fetchall()
+        found: list[Memory] = []
+        for row in rows:
+            try:
+                memory = _row_to_memory(row)
+            except Exception as exc:  # noqa: BLE001 - one damaged row must not stop the window
+                logger.warning("MemoryStore.list_engine_window: row %s skipped, its columns cannot be read (%s)", row["id"], exc)
+                continue
+            if memory.created_at >= when or (memory.last_accessed_at is not None and memory.last_accessed_at >= when):
+                found.append(memory)
+        found.sort(key=lambda m: (m.created_at, m.id))
+        return found
+
+    def creation_stamps_since(self, since: datetime) -> list[datetime]:
+        """The creation time of every row (any type, any state) created at or after `since`, oldest first.
+
+        A row whose time cannot be parsed is logged with its id and skipped.
+        """
+        when, bound = self._window_bounds(since)
+        rows = self._conn.execute("SELECT id, created_at FROM memories WHERE created_at >= ?", (bound,)).fetchall()
+        stamps: list[datetime] = []
+        for row in rows:
+            try:
+                created = _coerce_utc(row["created_at"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MemoryStore.creation_stamps_since: row %s skipped, its time cannot be read (%s)", row["id"], exc)
+                continue
+            if created >= when:
+                stamps.append(created)
+        stamps.sort()
+        return stamps
+
+    def oldest_created_at(self) -> datetime | None:
+        """The creation time of the oldest row of any type and state (`SELECT MIN(created_at)`), None for an empty database or an unreadable minimum."""
+        row = self._conn.execute("SELECT MIN(created_at) AS oldest FROM memories").fetchone()
+        if row is None or row["oldest"] is None:
+            return None
+        try:
+            return _coerce_utc(row["oldest"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MemoryStore.oldest_created_at: the oldest created_at %r cannot be read (%s)", row["oldest"], exc)
+            return None
 
     def refresh_faded_emotions(
         self, memory_id: str, emotions: dict[str, float], created_at: datetime
@@ -3050,8 +3144,9 @@ class MemoryStore:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
         if self.get(memory_id, bump=False) is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
-        self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
+            self._conn.commit()
 
     def fade(self, memory_id: str, *, summary: str) -> None:
         """Fade a memory: snapshot content into content_snapshot, replace

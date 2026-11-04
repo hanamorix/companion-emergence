@@ -14,10 +14,12 @@ import ast
 import contextlib
 import copy
 import dataclasses
+import io
 import json
 import logging
 import math
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -1302,6 +1304,119 @@ def test_the_reader_treats_an_unlistable_folder_as_missing_with_a_line(
     assert len(_errors(caplog)) == 1
 
 
+def _reader_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The WARNING lines of the shared JSONL readers (`brain.health.*`): which of them logs is the reader's own business."""
+    return [r.getMessage() for r in caplog.records if r.name.startswith("brain.health.") and r.levelno == logging.WARNING]
+
+
+def _unloadable_digits() -> str:
+    return '{"x": ' + "1" * (sys.get_int_max_str_digits() + 1) + "}"  # the parser refuses it: ValueError
+
+
+def _unloadable_nesting() -> str:
+    return '{"x": ' + "[" * 200_000 + "]" * 200_000 + "}"  # past the parser's recursion limit: RecursionError
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(
+            _unloadable_digits,
+            marks=pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off"),
+        ),
+        _unloadable_nesting,
+    ],
+    ids=["digits", "nesting"],
+)
+def test_the_reader_skips_a_line_the_json_parser_cannot_load_with_a_warning_naming_file_and_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, bad
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    unloadable = bad()
+    with pytest.raises((ValueError, RecursionError)) as parser_error:  # the apparatus: this line really is one the parser refuses
+        json.loads(unloadable)
+    assert not isinstance(parser_error.value, json.JSONDecodeError)
+    path = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), unloadable, _line(since + timedelta(minutes=1), joy=2.0))
+    before = path.read_bytes()
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert path.read_bytes() == before  # the reader repairs nothing
+    named = [m for m in _reader_warnings(caplog) if str(path) in m and "line 2" in m]
+    assert len(named) == 1
+
+
+@pytest.mark.no_base_failure(reason="pins what the switch to the raw reader must keep: iter_jsonl warned about a malformed line the same way, naming the file and the line")
+def test_a_malformed_change_line_is_skipped_with_a_warning_naming_file_and_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    path = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), "{not json", _line(since, joy=2.0))
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len([m for m in _reader_warnings(caplog) if str(path) in m and "line 2" in m]) == 1
+
+
+@pytest.mark.no_base_failure(reason="pins the I/O tolerance E7.10 requires, which iter_jsonl had too: a day file that cannot be opened adds nothing, with a warning naming it, and the other days are still read")
+def test_an_unopenable_day_file_adds_nothing_and_the_other_days_are_still_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0))
+    broken = _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=8.0))
+    _write_day(tmp_path, "2026-06-12", _line(since + timedelta(days=2), joy=3.0))
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if Path(path).name == broken.name:
+            raise PermissionError(13, "denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", fake_open, raising=False)
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
+    assert any(broken.name in m and "(io:" in m for m in _reader_warnings(caplog))
+
+
+@pytest.mark.no_base_failure(reason="pins the I/O tolerance E7.10 requires, which iter_jsonl had too: a read fault in the middle of a day file ends that file's lines, keeps what was read, warns naming the file, and the next day is still read")
+def test_a_read_fault_mid_file_ends_that_file_keeps_what_was_read_and_reads_the_next_day(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    faulty = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), _line(since + timedelta(minutes=1), joy=9.0))
+    _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=3.0))
+    first_line = (_line(since, joy=1.0) + "\n").encode("utf-8")  # ends in a newline, so the line is whole before the fault
+
+    class _FaultAfterOneLine(io.RawIOBase):
+        def __init__(self) -> None:
+            self._served = False
+
+        def readable(self) -> bool:
+            return True
+
+        def readinto(self, buffer) -> int:
+            if self._served:
+                raise OSError(5, "input/output error")
+            self._served = True
+            buffer[: len(first_line)] = first_line
+            return len(first_line)
+
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if Path(path).name == faulty.name:
+            return io.BufferedReader(_FaultAfterOneLine())
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", fake_open, raising=False)
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
+    assert any(faulty.name in m and "(io:" in m for m in _reader_warnings(caplog))
+
+
 def test_a_change_written_then_read_round_trips(tmp_path: Path) -> None:
     event = _change(NOW, joy=-2.5, grief=0.25)
     engine_files.append_change(tmp_path, event)
@@ -1353,6 +1468,32 @@ def hook_store(tmp_path: Path) -> Iterator[MemoryStore]:
     store = MemoryStore(tmp_path / "memories.db")
     yield store
     store.close()
+
+
+# Since Engine 4 a commit, an assigned update and the start-only date event are APPLIED to the state when the memory is
+# written (`EmotionEngine._apply_direct`); only a showing and a change are queued. The cases below are about WHAT EVENT each
+# hook builds, that it is built before the lock and that no failure reaches the write. So that they can keep reading the
+# hook's output from one place, the direct apply is replaced here by the step it replaced: it appends its events to the queue
+# under the lock, as the hooks did before Engine 4. The direct apply itself (the state it changes, the lock, recovery first,
+# the batch, the failures) is tested for real in `test_engine_direct_apply.py`; a test here that asks for `real_direct_apply`
+# gets the real one.
+
+
+@pytest.fixture(autouse=True)
+def _direct_apply_as_queue_append(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if "real_direct_apply" in request.fixturenames:
+        return
+
+    def as_append(self: engine_module.EmotionEngine, events: list[Event]) -> None:
+        for event in events:
+            self._queue(event)
+
+    monkeypatch.setattr(engine_module.EmotionEngine, "_apply_direct", as_append)
+
+
+@pytest.fixture
+def real_direct_apply() -> None:
+    """Ask for the real direct apply in a test of the hooks."""
 
 
 def _events(persona_dir: Path) -> list[Event]:
@@ -2175,7 +2316,7 @@ def test_a_lock_wait_that_runs_out_is_logged_as_that_not_as_a_disk_fault(
         assert len(first) == 1 and first[0].exc_info is None
         wording = first[0].getMessage()
         assert "gave up on the engine lock" in wording and "on_memory_committed" in wording and "not recorded" in wording
-        assert "could not queue" not in wording
+        assert "could not record" not in wording
         caplog.clear()
         hook_store.create(_hook_mem())
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []  # throttled to DEBUG
@@ -2187,5 +2328,5 @@ def test_a_lock_wait_that_runs_out_is_logged_as_that_not_as_a_disk_fault(
         hook_store.create(_hook_mem())
         other = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(other) == 1 and other[0].exc_info is None
-        assert "could not queue its event" in other[0].getMessage()
+        assert "could not record its event" in other[0].getMessage()
         assert "gave up on the engine lock" not in other[0].getMessage()

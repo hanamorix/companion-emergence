@@ -27,8 +27,10 @@ def _seed_source(src: Path):
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
     s.create(Memory(id="faded", content="ORIGINAL long text", memory_type="conversation",
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
+    # Older than every row the persona holds, so a restore that told the engine (a fold) would move its persona start and
+    # change the state file.
     s.create(Memory(id="lost", content="forgotten original", memory_type="conversation",
-                    domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
+                    domain="us", created_at=datetime(2026, 3, 20, tzinfo=UTC)))
     s.close()
 
 
@@ -85,15 +87,25 @@ def test_graveyard_mode_restores_from_summary(tmp_path):
     s.close()
 
 
-def test_a_restore_is_not_new_experience_and_queues_nothing_for_the_emotion_engine(tmp_path, monkeypatch):
+def _told_to_the_engine(persona: Path):
+    """What the engine has been told so far: the bytes of its queue file and of its state file (None when a file does not exist).
+
+    A commit is applied to the state (Engine 4) and a chat change or showing is queued; a restore must change neither.
+    """
     from brain.emotion import engine_files
 
+    def read(path: Path):
+        return path.read_bytes() if path.exists() else None
+
+    return read(engine_files.queue_path(persona)), read(engine_files.state_path(persona))
+
+
+def test_a_restore_is_not_new_experience_and_tells_nothing_to_the_emotion_engine(tmp_path, monkeypatch):
     persona = tmp_path / "Canary"
     _seed_current(persona)
     src = tmp_path / "src"
     _seed_source(src)
-    queue = engine_files.queue_path(persona)
-    queued_by_seeding = queue.read_bytes()  # the seeding created rows with the default, so the queue exists
+    told_by_seeding = _told_to_the_engine(persona)  # the seeding created rows with the default fold
     plan = _build_restore_plan(persona, source_dir=src)
 
     seen = []
@@ -107,13 +119,11 @@ def test_a_restore_is_not_new_experience_and_queues_nothing_for_the_emotion_engi
     _apply_memory_restores(persona, plan)
 
     assert seen and all(kwargs.get("fold") is False for kwargs in seen)
-    assert queue.read_bytes() == queued_by_seeding
+    assert _told_to_the_engine(persona) == told_by_seeding
 
 
 def test_a_graveyard_restore_is_not_new_experience_either(tmp_path, monkeypatch):
     import json
-
-    from brain.emotion import engine_files
 
     persona = tmp_path / "Nova"
     persona.mkdir(parents=True)
@@ -121,8 +131,7 @@ def test_a_graveyard_restore_is_not_new_experience_either(tmp_path, monkeypatch)
     s.create(Memory(id="alive", content="alive", memory_type="conversation",
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
     s.close()
-    queue = engine_files.queue_path(persona)
-    queued_by_seeding = queue.read_bytes()
+    told_by_seeding = _told_to_the_engine(persona)
     grave = {
         "memory_id": "gone", "summary": "compressed summary", "domain": "us",
         "memory_type": "conversation",
@@ -144,4 +153,4 @@ def test_a_graveyard_restore_is_not_new_experience_either(tmp_path, monkeypatch)
     _apply_memory_restores(persona, plan)
 
     assert len(seen) == 1 and seen[0].get("fold") is False
-    assert queue.read_bytes() == queued_by_seeding
+    assert _told_to_the_engine(persona) == told_by_seeding

@@ -2,13 +2,13 @@
 
 Windows refuses to replace, delete or open a file another handle holds for a moment (WinError 32). :func:`retry_transient`
 is the one loop for that: a failed try is repeated on a short schedule and a failure that persists is raised, so a real
-permission problem still fails loudly. Replace, delete and the whole-file byte read go through it. The schedule lives in
+permission problem still fails loudly. Replace, delete, the whole-file byte read and the open of a file that is streamed go through it. The schedule lives in
 ``brain/dev_constants.py`` (``FILE_RETRY_ATTEMPTS``, ``FILE_RETRY_SLEEP_S``, ``FILE_READ_ATTEMPTS``) and is read at the time of
 the call.
 
 Also here, because no shared function existed for them: :func:`list_dir` (the sorted names in a folder) and :func:`stat_path`
 (one ``os.stat``, with the key a cache compares). Neither creates anything. JSON and JSONL are read and written through
-``brain.health.json_io``, which reads its bytes with :func:`read_bytes_stat`.
+``brain.health.json_io``, which reads its bytes with :func:`read_bytes_stat` and opens a file it streams with :func:`open_read`.
 
 This module sits below ``brain.utils.atomic_write`` and ``brain.health``: it imports only the standard library and
 ``brain.dev_constants``, so every module may call it without an import cycle.
@@ -82,9 +82,14 @@ def read_bytes_stat(path: str | Path) -> tuple[bytes, tuple[int, int, int]]:
     return retry_transient(_read_once, path, attempts=dev_constants.FILE_READ_ATTEMPTS, windows_only=True)
 
 
-def read_bytes(path: str | Path) -> bytes:
-    """Read the whole file (:func:`read_bytes_stat` without the key)."""
-    return read_bytes_stat(path)[0]
+def open_read(path: str | Path):
+    """Open a file for reading bytes, for a caller that streams it; the caller closes the handle.
+
+    The open gets the read schedule of :func:`read_bytes_stat` (``FILE_READ_ATTEMPTS`` tries, Windows only; one attempt on
+    other systems, where a ``PermissionError`` is a real one). A missing file raises ``FileNotFoundError`` at once; a folder raises
+    ``IsADirectoryError`` on Linux and macOS (on Windows a ``PermissionError``, retried like any other).
+    """
+    return retry_transient(open, path, "rb", attempts=dev_constants.FILE_READ_ATTEMPTS, windows_only=True)
 
 
 def replace_file(src: str | Path, dst: str | Path) -> None:
@@ -95,8 +100,12 @@ def replace_file(src: str | Path, dst: str | Path) -> None:
 def delete_file(path: str | Path) -> None:
     """Delete a file with the transient-failure retry. A missing file is not an error; a failure that persists is raised.
 
-    A folder is not deleted (use :func:`delete_tree`): the delete raises an ``OSError``.
+    A folder is not deleted (use :func:`delete_tree`): it raises ``IsADirectoryError`` at once, on every system and without
+    a retry. (``unlink`` of a folder raises ``PermissionError`` on macOS and Windows, which the retry would otherwise sleep
+    through and then report as a permission problem.) A symbolic link to a folder is removed, the folder is not.
     """
+    if os.path.isdir(path) and not os.path.islink(path):
+        raise IsADirectoryError(f"{path} is a folder: delete_file does not delete folders (use delete_tree)")
     retry_transient(lambda: Path(path).unlink(missing_ok=True))
 
 
