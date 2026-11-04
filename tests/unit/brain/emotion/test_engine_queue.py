@@ -2,22 +2,24 @@
 
 The queue (`state/emotion_pending.jsonl`) is an append-only file of events waiting to be folded, one JSON event per line;
 the change log (`state/emotion_changes/YYYY-MM-DD.jsonl`) is a crash-recovery record of chat-derived changes. These are
-the file-level cases: the per-event check, the queue file's append/read/clear (a bad line is dropped on its own), the
-change log's append, list, prune and tolerant reader. The hook cases (Engine 3, #578: what a memory write queues, the start-only
-event, the guard, the lock) are at the end. Cases that need a drain (fold order, early-out, wiring) belong to the slice that builds
-it and extend this file.
+the file-level cases: the per-event check, the queue file's append, read by position and emptying (a bad line is dropped on
+its own), the accessor each file operation goes through, the change log's append, list, prune and tolerant reader. The hook
+cases (Engine 3, #578: what a memory write queues, the start-only event, the guard, the lock) are at the end. Cases that need a
+drain (fold order, early-out, wiring) belong to the slice that builds it and extend this file.
 """
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import dataclasses
+import io
 import json
 import logging
 import math
-import pathlib
 import sqlite3
+import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -30,7 +32,9 @@ from brain import dev_constants
 from brain.emotion import engine as engine_module
 from brain.emotion import engine_files, engine_utils
 from brain.emotion.engine_utils import EngineState, Event, day_of, fold_event, source_modifier
+from brain.health import json_io
 from brain.memory.store import Memory, MemoryStore
+from brain.utils import file_lock, file_ops
 
 LOGGER = "brain.emotion.engine_files"
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
@@ -84,6 +88,11 @@ def _put_queue_file(persona_dir: Path, content: object) -> Path:
 
 def _change(at: datetime, **emotions: float) -> Event:
     return Event(kind="change", at=at, emotions=emotions or {"joy": 1.0}, source="pass2")
+
+
+def _read(persona_dir: Path, from_line: int = 0) -> list[Event]:
+    """The events `read_queue` returns from line `from_line` (the position the old one-argument reader had implicitly: 0)."""
+    return engine_files.read_queue(persona_dir, from_line=from_line).events
 
 
 def _tree(root: Path) -> dict[str, bytes | None]:
@@ -325,7 +334,7 @@ def test_the_queue_read_still_drops_a_non_finite_modifier_and_keeps_the_neighbou
 ) -> None:
     _put_queue_file(tmp_path, [_raw("commit", memory_id="a"), _raw("showing", modifier=float("inf")), _raw("assigned", memory_id="c")])
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        events = engine_files.read_queue(tmp_path)
+        events = _read(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
     errors = _errors(caplog)
     assert len(errors) == 1 and "modifier" in errors[0]
@@ -343,7 +352,7 @@ def test_a_huge_queued_modifier_is_held_then_folds_and_saves(tmp_path: Path, cap
     queue = _put_queue_file(tmp_path, raw)
     before = _tree(tmp_path)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        events = engine_files.read_queue(tmp_path)
+        events = _read(tmp_path)
     assert _tree(tmp_path) == before  # the hold is read-side: the file is not rewritten, nothing is created
     assert queue.read_bytes() == before[str(queue.relative_to(tmp_path))]
     assert [e.memory_id for e in events] == ["a", "big", "big2", None]
@@ -381,9 +390,8 @@ def _jline(raw: object) -> bytes:
     return json.dumps(raw).encode("utf-8") + b"\n"
 
 
-@pytest.mark.no_base_failure(reason="pins what must stay when the file format changes: a missing queue is an empty queue and the read creates nothing; the old reader passes it")
 def test_a_missing_queue_is_an_empty_queue(tmp_path: Path) -> None:
-    assert engine_files.read_queue(tmp_path) == []
+    assert _read(tmp_path) == []
     assert list(tmp_path.iterdir()) == []
 
 
@@ -394,7 +402,7 @@ def test_an_empty_or_blank_queue_file_is_an_empty_queue_with_no_log_line(
     path = _put_queue_file(tmp_path, content)
     before = _tree(tmp_path)
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
-        assert engine_files.read_queue(tmp_path) == []
+        assert _read(tmp_path) == []
     assert [r for r in caplog.records if r.name == LOGGER] == []
     assert _tree(tmp_path) == before and path.read_bytes() == content
 
@@ -406,7 +414,7 @@ def test_appended_events_are_one_line_each_and_read_back_in_order(
     with caplog.at_level(logging.DEBUG):
         for event in events:
             assert engine_files.append_event(tmp_path, event) is True
-        assert engine_files.read_queue(tmp_path) == events
+        assert _read(tmp_path) == events
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
     data = engine_files.queue_path(tmp_path).read_bytes()
     assert data.endswith(b"\n")
@@ -447,16 +455,16 @@ def test_the_cost_of_appends_does_not_grow_with_the_depth_of_the_queue(tmp_path:
 
 def test_the_queue_read_keeps_file_order_not_time_order(tmp_path: Path) -> None:
     _put_queue_file(tmp_path, [_raw("commit", memory_id="b", at="2026-06-10T11:00:00Z"), _raw("commit", memory_id="a")])
-    assert [e.memory_id for e in engine_files.read_queue(tmp_path)] == ["b", "a"]
+    assert [e.memory_id for e in _read(tmp_path)] == ["b", "a"]
 
 
 def test_a_valid_event_with_non_ascii_text_reads_back_equal(tmp_path: Path) -> None:
     event = engine_files.event_from_json(_raw("commit", memory_id="café-日本"))
     assert engine_files.append_event(tmp_path, event) is True
-    assert engine_files.read_queue(tmp_path) == [event]
+    assert _read(tmp_path) == [event]
 
 
-def test_a_torn_last_line_is_dropped_alone_and_the_next_append_starts_a_new_line(
+def test_a_torn_last_line_is_neither_read_counted_nor_logged_and_the_next_append_makes_it_a_dropped_line(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     good = [_event(i) for i in range(3)]
@@ -466,11 +474,10 @@ def test_a_torn_last_line_is_dropped_alone_and_the_next_append_starts_a_new_line
     with path.open("ab") as fh:
         fh.write(b'{"kind": "commit", "at": "2026-06-10T10:0')  # a crash cut this append short: no newline
     before = path.read_bytes()
-    with caplog.at_level(logging.ERROR, logger=LOGGER):
-        assert engine_files.read_queue(tmp_path) == good
-    messages = _errors(caplog)
-    assert len(messages) == 1
-    assert str(path) in messages[0] and "line 4" in messages[0] and "malformed JSON" in messages[0]
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        result = engine_files.read_queue(tmp_path, from_line=0)
+    assert result.events == good and result.end_line == 3  # the torn line is not a line yet
+    assert [r for r in caplog.records if r.name == LOGGER] == []  # and the reader says nothing about it
     assert path.read_bytes() == before  # the read writes nothing
     caplog.clear()
 
@@ -478,9 +485,10 @@ def test_a_torn_last_line_is_dropped_alone_and_the_next_append_starts_a_new_line
     assert engine_files.append_event(tmp_path, fourth) is True
     assert path.read_bytes().startswith(before)  # the three good lines and the torn one are byte-identical
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        assert engine_files.read_queue(tmp_path) == [*good, fourth]
+        result = engine_files.read_queue(tmp_path, from_line=0)
+    assert result.events == [*good, fourth] and result.end_line == 5
     messages = _errors(caplog)
-    assert len(messages) == 1 and "line 4" in messages[0]
+    assert len(messages) == 1 and "line 4" in messages[0] and "malformed JSON" in messages[0]  # now a complete, bad line
 
 
 @pytest.mark.parametrize("label", sorted(_INVALID))
@@ -491,7 +499,7 @@ def test_each_invalid_event_line_is_dropped_alone_with_its_line_number_and_reaso
     path = _put_queue_file(tmp_path, [_raw("commit", memory_id="a"), raw, _raw("assigned", memory_id="c")])
     before = _tree(tmp_path)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        events = engine_files.read_queue(tmp_path)
+        events = _read(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
     messages = _errors(caplog)
     assert len(messages) == 1
@@ -523,7 +531,7 @@ def test_a_line_that_is_not_an_event_is_dropped_alone_with_its_line_number_and_r
     path = _put_queue_file(tmp_path, _jline(_raw("commit", memory_id="a")) + bad + b"\n" + _jline(_raw("assigned", memory_id="c")))
     before = _tree(tmp_path)
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        events = engine_files.read_queue(tmp_path)
+        events = _read(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
     messages = _errors(caplog)
     assert len(messages) == 1
@@ -539,11 +547,11 @@ def test_crlf_endings_and_a_byte_order_mark_are_tolerated_and_later_lines_are_nu
     data = b"\xef\xbb\xbf" + json.dumps(first).encode() + b"\r\n" + json.dumps(second).encode() + b"\r\n"
     path = _put_queue_file(tmp_path, data)
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
-        assert [e.memory_id for e in engine_files.read_queue(tmp_path)] == ["a", "c"]
+        assert [e.memory_id for e in _read(tmp_path)] == ["a", "c"]
     assert [r for r in caplog.records if r.name == LOGGER] == []
     _put_queue_file(tmp_path, data + b"junk\r\n")
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        assert [e.memory_id for e in engine_files.read_queue(tmp_path)] == ["a", "c"]
+        assert [e.memory_id for e in _read(tmp_path)] == ["a", "c"]
     messages = _errors(caplog)
     assert len(messages) == 1 and str(path) in messages[0] and "line 3" in messages[0]
 
@@ -551,7 +559,7 @@ def test_crlf_endings_and_a_byte_order_mark_are_tolerated_and_later_lines_are_nu
 def test_blank_lines_count_in_the_line_numbers(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     _put_queue_file(tmp_path, _jline(_raw("commit", memory_id="a")) + b"\n\n" + b"{oops\n")
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        assert [e.memory_id for e in engine_files.read_queue(tmp_path)] == ["a"]
+        assert [e.memory_id for e in _read(tmp_path)] == ["a"]
     messages = _errors(caplog)
     assert len(messages) == 1 and "line 4" in messages[0]
 
@@ -564,26 +572,26 @@ def test_a_line_of_zero_bytes_is_dropped_like_a_torn_line_and_the_next_line_is_r
     path = _put_queue_file(tmp_path, _jline(first) + b"\x00" * 64 + b"\n" + _jline(second))
     before = _tree(tmp_path)
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        events = engine_files.read_queue(tmp_path)
+        events = _read(tmp_path)
     assert [e.memory_id for e in events] == ["a", "c"]
     messages = _errors(caplog)
     assert len(messages) == 1 and str(path) in messages[0] and "line 2" in messages[0]
     assert _tree(tmp_path) == before
 
 
-def test_a_zero_filled_tail_with_no_newline_is_one_dropped_line_and_the_next_append_is_read(
+def test_a_zero_filled_tail_with_no_newline_is_not_read_and_the_next_append_makes_it_one_dropped_line(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     first = engine_files.event_from_json(_raw("commit", memory_id="a"))
     second = engine_files.event_from_json(_raw("assigned", memory_id="c"))
     path = _put_queue_file(tmp_path, _jline(_raw("commit", memory_id="a")) + b"\x00" * 64)
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        assert engine_files.read_queue(tmp_path) == [first]
-    assert len(_errors(caplog)) == 1
+        assert _read(tmp_path) == [first]
+    assert _errors(caplog) == []  # no newline yet: a torn tail, not a line
     caplog.clear()
     assert engine_files.append_event(tmp_path, second) is True
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        assert engine_files.read_queue(tmp_path) == [first, second]
+        assert _read(tmp_path) == [first, second]
     messages = _errors(caplog)
     assert len(messages) == 1 and str(path) in messages[0] and "line 2" in messages[0]
 
@@ -596,20 +604,19 @@ def test_a_record_cut_short_by_a_zero_fill_is_dropped_and_zeros_in_front_of_a_re
     glued = b"\x00" * 16 + _jline(_raw("assigned", memory_id="glued"))
     path = _put_queue_file(tmp_path, _jline(keep[0]) + cut + glued + _jline(keep[1]))
     with caplog.at_level(logging.ERROR, logger=LOGGER):
-        events = engine_files.read_queue(tmp_path)
+        events = _read(tmp_path)
     assert [e.memory_id for e in events] == ["a", "z"]  # the glued record is NOT returned: a damaged line is dropped whole
     messages = _errors(caplog)
     assert len(messages) == 2 and all(str(path) in m for m in messages)
     assert "line 2" in messages[0] and "line 3" in messages[1]
 
 
-@pytest.mark.no_base_failure(reason="pins the read-fault rule the old reader already had and the new one keeps: an OSError opening the queue is raised, not turned into a drop, and nothing is changed")
 def test_a_read_fault_raises_and_drops_nothing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     path = engine_files.queue_path(tmp_path)
     path.mkdir(parents=True)  # a directory where the file should be: opening it is an OSError on every platform
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         with pytest.raises(OSError):
-            engine_files.read_queue(tmp_path)
+            _read(tmp_path)
     assert not [m for m in _errors(caplog) if "dropped" in m or "discard" in m]
     assert path.is_dir()
 
@@ -678,16 +685,215 @@ def test_an_oserror_from_the_append_is_logged_and_returns_false(
     assert len(_errors(caplog)) == 1 and "disk full" in _errors(caplog)[0]
 
 
-def test_clear_queue_removes_the_file_tolerates_none_and_the_next_append_starts_afresh(tmp_path: Path) -> None:
-    engine_files.clear_queue(tmp_path)  # nothing there: not an error
-    for i in range(3):
-        engine_files.append_event(tmp_path, _event(i))
-    engine_files.clear_queue(tmp_path)
-    assert not engine_files.queue_path(tmp_path).exists()
-    assert engine_files.read_queue(tmp_path) == []
+# --- the queue: read by position, emptied (S2, S14, S17, S21) ------------------------------------
+
+
+def _queue_of(persona_dir: Path, count: int) -> list[Event]:
+    events = [_event(i) for i in range(count)]
+    for event in events:
+        assert engine_files.append_event(persona_dir, event) is True
+    return events
+
+
+def test_read_queue_returns_the_lines_after_the_position_and_the_line_count(tmp_path: Path) -> None:
+    events = _queue_of(tmp_path, 5)
+    whole = engine_files.read_queue(tmp_path, from_line=0)
+    assert isinstance(whole, engine_files.QueueRead)
+    assert (whole.events, whole.end_line) == (events, 5)
+    after_two = engine_files.read_queue(tmp_path, from_line=2)
+    assert (after_two.events, after_two.end_line) == (events[2:], 5)
+    at_end = engine_files.read_queue(tmp_path, from_line=5)
+    assert (at_end.events, at_end.end_line) == ([], 5)
+
+
+def test_a_bad_line_before_the_position_is_not_read_or_logged_and_one_after_it_is_logged_with_its_number(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _put_queue_file(tmp_path, _jline(_raw("commit", memory_id="a")) + b"{oops\n" + _jline(_raw("commit", memory_id="c")) + b"{bad\n")
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        result = engine_files.read_queue(tmp_path, from_line=2)
+    assert [e.memory_id for e in result.events] == ["c"] and result.end_line == 4
+    messages = _errors(caplog)
+    assert len(messages) == 1 and str(path) in messages[0] and "line 4" in messages[0]
+
+
+def test_a_position_past_the_end_means_the_queue_was_emptied_and_it_is_read_again_from_line_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = _queue_of(tmp_path, 2)
+    calls: list[tuple[Path, int]] = []
+    real = engine_files.read_jsonl_from
+
+    def spy(path: Path, start_line: int = 0):
+        calls.append((Path(path), start_line))
+        return real(path, start_line)
+
+    monkeypatch.setattr(engine_files, "read_jsonl_from", spy)
+    result = engine_files.read_queue(tmp_path, from_line=7)
+    assert (result.events, result.end_line) == (events, 2)
+    queue = engine_files.queue_path(tmp_path)
+    assert calls == [(queue, 7), (queue, 0)]
+    calls.clear()
+    assert engine_files.read_queue(tmp_path, from_line=2).events == []  # at the end is not past it: one read
+    assert calls == [(queue, 2)]
+
+
+@pytest.mark.parametrize("from_line", [0, 3, 10**400])
+def test_a_missing_queue_is_no_events_and_end_line_zero_for_any_position(tmp_path: Path, from_line: int) -> None:
+    result = engine_files.read_queue(tmp_path, from_line=from_line)
+    assert (result.events, result.end_line) == ([], 0)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_huge_position_reads_the_whole_queue_from_line_zero(tmp_path: Path) -> None:
+    events = _queue_of(tmp_path, 3)
+    assert engine_files.read_queue(tmp_path, from_line=10**400).events == events
+
+
+def test_a_negative_position_is_read_as_zero_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P12b: a position outside its range is held to the range. `tmp_path` is unique, so the throttle cannot hide the line."""
+    events = _queue_of(tmp_path, 3)
+    starts: list[int] = []
+    real = engine_files.read_jsonl_from
+
+    def spy(path: Path, start_line: int = 0):
+        starts.append(start_line)
+        return real(path, start_line)
+
+    monkeypatch.setattr(engine_files, "read_jsonl_from", spy)
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        result = engine_files.read_queue(tmp_path, from_line=-4)
+    assert result == engine_files.read_queue(tmp_path, from_line=0)
+    assert result.events == events and result.end_line == 3
+    assert all(start >= 0 for start in starts)
+    messages = _errors(caplog)
+    assert len(messages) == 1 and "-4" in messages[0] and str(engine_files.queue_path(tmp_path)) in messages[0]
+
+
+def test_empty_queue_leaves_an_empty_file_returns_true_and_the_next_append_starts_afresh(tmp_path: Path) -> None:
+    _queue_of(tmp_path, 3)
+    path = engine_files.queue_path(tmp_path)
+    assert engine_files.empty_queue(tmp_path) is True
+    assert path.is_file() and path.read_bytes() == b""  # emptied, never deleted
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]  # no .bak, temp or .lock beside it
+    result = engine_files.read_queue(tmp_path, from_line=0)
+    assert (result.events, result.end_line) == ([], 0)
     fresh = _event(7)
-    engine_files.append_event(tmp_path, fresh)
-    assert engine_files.queue_path(tmp_path).read_bytes() == _jline(engine_files.event_to_json(fresh))
+    assert engine_files.append_event(tmp_path, fresh) is True
+    assert path.read_bytes() == _jline(engine_files.event_to_json(fresh))
+
+
+def test_empty_queue_asks_write_jsonl_for_an_empty_file_with_no_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[Path, object, dict[str, object]]] = []
+    real = engine_files.write_jsonl
+
+    def spy(path: Path, records: object, **kwargs: object):
+        seen.append((Path(path), records, kwargs))
+        return real(path, records, **kwargs)
+
+    monkeypatch.setattr(engine_files, "write_jsonl", spy)
+    assert engine_files.empty_queue(tmp_path) is True
+    assert seen == [(engine_files.queue_path(tmp_path), [], {"fsync": False})]
+
+
+def test_a_failed_emptying_returns_false_logs_raises_nothing_and_leaves_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _queue_of(tmp_path, 3)
+    queue = engine_files.queue_path(tmp_path)
+    before = queue.read_bytes()
+
+    def failing(*args: object, **kwargs: object):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(engine_files, "write_jsonl", failing)
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        assert engine_files.empty_queue(tmp_path) is False
+    assert any(r.levelno >= logging.WARNING and "disk full" in r.getMessage() for r in caplog.records)
+    assert queue.read_bytes() == before  # the queue is as it was
+
+
+def test_emptying_a_queue_path_that_is_a_folder_returns_false_and_keeps_the_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)  # a replace onto a folder is a retried PermissionError on Windows and macOS
+    queue = engine_files.queue_path(tmp_path)
+    queue.mkdir(parents=True)
+    (queue / "inner").write_bytes(b"keep")
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        assert engine_files.empty_queue(tmp_path) is False
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+    assert queue.is_dir() and (queue / "inner").read_bytes() == b"keep"
+
+
+def test_clear_queue_no_longer_exists() -> None:
+    assert not hasattr(engine_files, "clear_queue")
+
+
+def test_the_position_rule_in_one_sequence(tmp_path: Path) -> None:
+    """Append 3, read to the end, empty, append 2: the stored position 3 is past the end of the new queue, so it is read from line 0."""
+    first = _queue_of(tmp_path, 3)
+    read = engine_files.read_queue(tmp_path, from_line=0)
+    assert (read.events, read.end_line) == (first, 3)
+    assert engine_files.empty_queue(tmp_path) is True
+    later = [_event(10), _event(11)]
+    for event in later:
+        assert engine_files.append_event(tmp_path, event) is True
+    again = engine_files.read_queue(tmp_path, from_line=read.end_line)
+    assert (again.events, again.end_line) == (later, 2)
+
+
+# --- every file operation goes through its accessor (P18, S1, S37) -------------------------------
+
+_RAW_FILE_ATTRS = frozenset(
+    "open unlink iterdir stat lstat exists is_file is_dir mkdir rmdir read_text write_text read_bytes write_bytes "
+    "touch rename scandir listdir walk glob rglob".split()
+)
+
+
+def test_engine_files_makes_no_raw_file_call_and_takes_the_lock_in_one_place() -> None:
+    tree = ast.parse(Path(engine_files.__file__).read_text(encoding="utf-8"))
+    raw: list[str] = []
+    locked_within_calls = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            raw += [f"import {a.name}" for a in node.names if a.name.split(".")[0] in {"os", "shutil", "glob"}]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in {"os", "shutil", "glob"}:
+            raw.append(f"from {node.module} import ...")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in {"open", "file_lock"}:
+                raw.append(f"line {node.lineno}: {func.id}(...)")
+            elif isinstance(func, ast.Attribute):
+                base = func.value.id if isinstance(func.value, ast.Name) else None
+                if func.attr in _RAW_FILE_ATTRS and base != "file_ops":
+                    raw.append(f"line {node.lineno}: .{func.attr}(...)")
+                if func.attr == "locked_within":
+                    locked_within_calls += 1
+                if base == "file_lock" and func.attr == "file_lock":
+                    raw.append(f"line {node.lineno}: file_lock.file_lock(...)")
+    assert raw == []
+    assert locked_within_calls == 1  # state_lock is the one bounded acquisition
+
+
+def test_the_queue_read_goes_through_read_jsonl_from_with_the_queue_path_and_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _queue_of(tmp_path, 3)
+    calls: list[tuple[Path, int]] = []
+    real = engine_files.read_jsonl_from
+
+    def spy(path: Path, start_line: int = 0):
+        calls.append((Path(path), start_line))
+        return real(path, start_line)
+
+    monkeypatch.setattr(engine_files, "read_jsonl_from", spy)
+    assert len(_read(tmp_path, from_line=1)) == 2
+    assert calls == [(engine_files.queue_path(tmp_path), 1)]
 
 
 def test_no_queue_or_change_log_function_takes_the_lock(
@@ -699,10 +905,12 @@ def test_no_queue_or_change_log_function_takes_the_lock(
         raise AssertionError("a function of the queue or the change log took the lock")
 
     monkeypatch.setattr(engine_files, "state_lock", forbidden)
-    monkeypatch.setattr(engine_files, "file_lock", forbidden, raising=False)
+    monkeypatch.setattr(file_lock, "locked_within", forbidden)
+    monkeypatch.setattr(file_lock, "file_lock", forbidden)
+    monkeypatch.setattr(json_io, "file_lock", forbidden)  # json_io imports the lock by name: its writers must not take it either
     assert engine_files.append_event(tmp_path, engine_files.event_from_json(_raw("start"))) is True
-    assert len(engine_files.read_queue(tmp_path)) == 1
-    engine_files.clear_queue(tmp_path)
+    assert len(_read(tmp_path)) == 1
+    assert engine_files.empty_queue(tmp_path) is True
     assert engine_files.append_change(tmp_path, _change(NOW)) is True
     engine_files.list_change_files(tmp_path)
     engine_files.read_changes(tmp_path, NOW)
@@ -819,6 +1027,81 @@ def test_list_of_a_missing_folder_is_empty_and_of_an_unlistable_one_is_empty_wit
     assert len(_errors(caplog)) == 1
 
 
+def test_the_listing_goes_through_list_dir_and_stats_each_matching_name_through_stat_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _touch_days(tmp_path, "2026-06-02", "2026-06-01")
+    folder = engine_files.changes_dir(tmp_path)
+    (folder / "notes.txt").write_text("x", encoding="utf-8")
+    (folder / "2026-13-45.jsonl").write_text("x", encoding="utf-8")
+    (folder / "2026-06-04.jsonl").mkdir()  # matches the pattern, so it is asked about, and refused as not a regular file
+    listed: list[Path] = []
+    statted: list[Path] = []
+    real_list, real_stat = file_ops.list_dir, file_ops.stat_path
+
+    def list_spy(path: str | Path) -> list[str]:
+        listed.append(Path(path))
+        return real_list(path)
+
+    def stat_spy(path: str | Path):
+        statted.append(Path(path))
+        return real_stat(path)
+
+    monkeypatch.setattr(file_ops, "list_dir", list_spy)
+    monkeypatch.setattr(file_ops, "stat_path", stat_spy)
+    assert engine_files.list_change_files(tmp_path) == ["2026-06-01.jsonl", "2026-06-02.jsonl"]
+    assert listed == [folder]
+    assert sorted(statted) == [folder / "2026-06-01.jsonl", folder / "2026-06-02.jsonl", folder / "2026-06-04.jsonl"]
+
+
+def test_an_entry_whose_stat_fails_or_finds_nothing_is_skipped_and_the_others_are_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _touch_days(tmp_path, "2026-06-01", "2026-06-02", "2026-06-03")
+    real_stat = file_ops.stat_path
+
+    def flaky(path: str | Path):
+        if Path(path).name == "2026-06-01.jsonl":
+            raise PermissionError("denied")
+        if Path(path).name == "2026-06-02.jsonl":
+            return None  # vanished between the listing and the stat
+        return real_stat(path)
+
+    monkeypatch.setattr(file_ops, "stat_path", flaky)
+    assert engine_files.list_change_files(tmp_path) == ["2026-06-03.jsonl"]
+
+
+def test_a_listing_error_other_than_missing_is_logged_and_read_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def refuse(path: str | Path) -> list[str]:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(file_ops, "list_dir", refuse)
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        assert engine_files.list_change_files(tmp_path) == []
+    assert len(_errors(caplog)) == 1
+
+
+def test_prune_deletes_through_delete_file_and_never_offers_it_a_folder_named_like_a_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _touch_days(tmp_path, "2020-01-01", "2026-06-10")
+    folder = engine_files.changes_dir(tmp_path)
+    (folder / "2020-01-03.jsonl").mkdir()
+    asked: list[Path] = []
+    real_delete = file_ops.delete_file
+
+    def spy(path: str | Path) -> None:
+        asked.append(Path(path))
+        real_delete(path)
+
+    monkeypatch.setattr(file_ops, "delete_file", spy)
+    assert engine_files.prune_changes(tmp_path, "2026-06-10") == ["2020-01-01.jsonl"]
+    assert asked == [folder / "2020-01-01.jsonl"]
+    assert (folder / "2020-01-03.jsonl").is_dir()
+
+
 def test_prune_deletes_whole_files_before_the_boundary_and_keeps_the_boundary_day(tmp_path: Path) -> None:
     _touch_days(tmp_path, "2026-05-10", "2026-05-11", "2026-05-12", "2026-05-13", "2026-06-10")
     # A = 2026-06-10: the boundary label is 30 calendar days earlier, 2026-05-11.
@@ -876,14 +1159,14 @@ def test_a_failed_delete_is_logged_the_others_still_go_and_the_next_close_retrie
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     _touch_days(tmp_path, "2026-01-01", "2026-01-02", "2026-01-03")
-    real_unlink = pathlib.Path.unlink
+    real_delete = file_ops.delete_file
 
-    def refuse_the_second(self: Path, *args: object, **kwargs: object):
-        if self.name == "2026-01-02.jsonl":
+    def refuse_the_second(path: str | Path) -> None:
+        if Path(path).name == "2026-01-02.jsonl":
             raise PermissionError("in use")
-        return real_unlink(self, *args, **kwargs)
+        real_delete(path)
 
-    monkeypatch.setattr(pathlib.Path, "unlink", refuse_the_second)
+    monkeypatch.setattr(file_ops, "delete_file", refuse_the_second)
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         deleted = engine_files.prune_changes(tmp_path, "2026-06-10")
     assert deleted == ["2026-01-01.jsonl", "2026-01-03.jsonl"]
@@ -1018,6 +1301,119 @@ def test_the_reader_treats_an_unlistable_folder_as_missing_with_a_line(
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_changes(tmp_path, NOW) == []
     assert len(_errors(caplog)) == 1
+
+
+def _reader_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The WARNING lines of the shared JSONL readers (`brain.health.*`): which of them logs is the reader's own business."""
+    return [r.getMessage() for r in caplog.records if r.name.startswith("brain.health.") and r.levelno == logging.WARNING]
+
+
+def _unloadable_digits() -> str:
+    return '{"x": ' + "1" * (sys.get_int_max_str_digits() + 1) + "}"  # the parser refuses it: ValueError
+
+
+def _unloadable_nesting() -> str:
+    return '{"x": ' + "[" * 200_000 + "]" * 200_000 + "}"  # past the parser's recursion limit: RecursionError
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(
+            _unloadable_digits,
+            marks=pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off"),
+        ),
+        _unloadable_nesting,
+    ],
+    ids=["digits", "nesting"],
+)
+def test_the_reader_skips_a_line_the_json_parser_cannot_load_with_a_warning_naming_file_and_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, bad
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    unloadable = bad()
+    with pytest.raises((ValueError, RecursionError)) as parser_error:  # the apparatus: this line really is one the parser refuses
+        json.loads(unloadable)
+    assert not isinstance(parser_error.value, json.JSONDecodeError)
+    path = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), unloadable, _line(since + timedelta(minutes=1), joy=2.0))
+    before = path.read_bytes()
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert path.read_bytes() == before  # the reader repairs nothing
+    named = [m for m in _reader_warnings(caplog) if str(path) in m and "line 2" in m]
+    assert len(named) == 1
+
+
+@pytest.mark.no_base_failure(reason="pins what the switch to the raw reader must keep: iter_jsonl warned about a malformed line the same way, naming the file and the line")
+def test_a_malformed_change_line_is_skipped_with_a_warning_naming_file_and_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    path = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), "{not json", _line(since, joy=2.0))
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len([m for m in _reader_warnings(caplog) if str(path) in m and "line 2" in m]) == 1
+
+
+@pytest.mark.no_base_failure(reason="pins the I/O tolerance E7.10 requires, which iter_jsonl had too: a day file that cannot be opened adds nothing, with a warning naming it, and the other days are still read")
+def test_an_unopenable_day_file_adds_nothing_and_the_other_days_are_still_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0))
+    broken = _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=8.0))
+    _write_day(tmp_path, "2026-06-12", _line(since + timedelta(days=2), joy=3.0))
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if Path(path).name == broken.name:
+            raise PermissionError(13, "denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", fake_open, raising=False)
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
+    assert any(broken.name in m and "(io:" in m for m in _reader_warnings(caplog))
+
+
+@pytest.mark.no_base_failure(reason="pins the I/O tolerance E7.10 requires, which iter_jsonl had too: a read fault in the middle of a day file ends that file's lines, keeps what was read, warns naming the file, and the next day is still read")
+def test_a_read_fault_mid_file_ends_that_file_keeps_what_was_read_and_reads_the_next_day(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    faulty = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), _line(since + timedelta(minutes=1), joy=9.0))
+    _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=3.0))
+    first_line = (_line(since, joy=1.0) + "\n").encode("utf-8")  # ends in a newline, so the line is whole before the fault
+
+    class _FaultAfterOneLine(io.RawIOBase):
+        def __init__(self) -> None:
+            self._served = False
+
+        def readable(self) -> bool:
+            return True
+
+        def readinto(self, buffer) -> int:
+            if self._served:
+                raise OSError(5, "input/output error")
+            self._served = True
+            buffer[: len(first_line)] = first_line
+            return len(first_line)
+
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if Path(path).name == faulty.name:
+            return io.BufferedReader(_FaultAfterOneLine())
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", fake_open, raising=False)
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
+    assert any(faulty.name in m and "(io:" in m for m in _reader_warnings(caplog))
 
 
 def test_a_change_written_then_read_round_trips(tmp_path: Path) -> None:
