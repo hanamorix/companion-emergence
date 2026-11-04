@@ -19,7 +19,8 @@ import re
 import sqlite3
 import sys
 import uuid
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1044,10 +1045,28 @@ class MemoryStore:
             raise ValueError("an in-memory MemoryStore has no persona directory")
         return self._db_path.parent
 
+    @contextmanager
+    def _rolls_back_on_error(self) -> Iterator[None]:
+        """Run a write and its commit; if either raises, roll back the transaction this block opened and re-raise.
+
+        sqlite3 opens a transaction before a write, and a write that fails leaves the connection inside it: the next
+        writer's commit would then take the failed call's earlier statements with it, and the code that refuses to start
+        inside an open transaction would refuse until then. A transaction the caller already had open on entry is not
+        this block's to end, so it is left as it was. If the rollback itself raises, that error goes out and the original
+        one stays attached to it as its context.
+        """
+        opened_here = not self._conn.in_transaction
+        try:
+            yield
+        except BaseException:
+            if opened_here and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+
     def create(self, memory: Memory, *, fold: bool = True) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id.
 
-        A failed INSERT is rolled back when this call opened the transaction it ran in (a transaction the caller already
+        A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
         had open is left as it was), so a failure does not leave one open for the next writer.
 
         After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook appends one
@@ -1082,16 +1101,9 @@ class MemoryStore:
         full backfill reasoning (Stage 2 of the local semantic-retrieval
         build).
         """
-        opened_here = not self._conn.in_transaction
-        try:
+        with self._rolls_back_on_error():
             self._insert_memory_row(memory)
-        except BaseException:
-            # A failed INSERT leaves the implicit transaction it opened still open, which would refuse the next write that
-            # begins one. Roll back what this call opened; a transaction the caller already had open is not ours to end.
-            if opened_here and self._conn.in_transaction:
-                self._conn.rollback()
-            raise
-        self._conn.commit()
+            self._conn.commit()
         if fold:
             self._notify_committed(memory)
         return memory.id
@@ -2870,8 +2882,9 @@ class MemoryStore:
         )
         values = [v for _, v in column_map.values()] + extra_values
         values.append(memory_id)
-        self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
+            self._conn.commit()
 
         # F1 #259 step 5 (increment-2 red-team fix): a content mutation
         # invalidates the row's embedding — row-id keying has no
@@ -2926,21 +2939,23 @@ class MemoryStore:
         """
         if not rows:
             return
-        for memory_id, emotions in rows:
-            new_max = max((float(v) for v in emotions.values()), default=0.0)
-            self._conn.execute(
-                "UPDATE memories SET emotions_json = ?, "
-                "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-                (json.dumps(emotions), new_max, memory_id),
-            )
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            for memory_id, emotions in rows:
+                new_max = max((float(v) for v in emotions.values()), default=0.0)
+                self._conn.execute(
+                    "UPDATE memories SET emotions_json = ?, "
+                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
+                    (json.dumps(emotions), new_max, memory_id),
+                )
+            self._conn.commit()
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
         if self.get(memory_id, bump=False) is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
-        self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
+            self._conn.commit()
 
     def fade(self, memory_id: str, *, summary: str) -> None:
         """Fade a memory: snapshot content into content_snapshot, replace
