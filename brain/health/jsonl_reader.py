@@ -39,16 +39,17 @@ class UnloadableJsonlLineError(ValueError):
     """A line the JSON parser cannot load (an integer past the interpreter's digit limit, nesting past the recursion limit) stopped a read.
 
     ``code`` is the stable identifier (``"jsonl_unloadable_line"``); ``path`` is the file (or the ``source`` given to ``parse_jsonl``),
-    ``line`` the 1-based line within the text the reader was given (for ``read_jsonl_tail`` on a plain file, within the window of
-    the last lines it parses) and ``reason`` the parser's message, never the line's content. The parser's own ``ValueError`` or
+    ``line`` the 1-based line within the text the reader was given and ``reason`` the parser's message, never the line's content.
+    For ``read_jsonl_tail`` on a plain file, which parses a window of the last lines, ``line`` is None (the file line is not known
+    without counting the whole file) and ``reason`` also names the line's position in that window. The parser's own ``ValueError`` or
     ``RecursionError`` is ``__cause__``. A ``ValueError`` but not a :class:`JsonlLineError`, so strict-mode handlers do not take it
     for an ordinary bad line. See #646.
     """
 
     code = "jsonl_unloadable_line"
 
-    def __init__(self, line: int, reason: str, path: Path) -> None:
-        super().__init__(f"{path}: line {line}: {reason}")
+    def __init__(self, line: int | None, reason: str, path: Path) -> None:
+        super().__init__(f"{path}: line {line}: {reason}" if line is not None else f"{path}: {reason}")
         self.line = line
         self.reason = reason
         self.path = path
@@ -115,7 +116,7 @@ def classify_line(raw: str) -> LineVerdict:
     return LineVerdict(raw, text, None, "shape", type(data).__name__, None)
 
 
-def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
+def _parse_lines(fh, path: Path, *, strict: bool = False, window: bool = False) -> Iterator[dict]:
     """Parse an open text stream of JSONL, skipping bad lines with a warning.
 
     The stream must be opened with ``errors="surrogateescape"``: a line whose
@@ -133,7 +134,9 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
     One kind of line stops the read instead of being skipped, in strict mode too: a line the JSON parser
     cannot load at all (an integer past the interpreter's digit limit, nesting past the recursion limit).
     :class:`UnloadableJsonlLineError` comes out (the parser's own ``ValueError`` or ``RecursionError`` is its ``__cause__``),
-    as the parser's bare exception did before the parsers shared :func:`classify_line` (#643, #646).
+    as the parser's bare exception did before the parsers shared :func:`classify_line` (#643, #646). With ``window=True`` the text is
+    a window of a larger file (``read_jsonl_tail``), so that error has no ``line`` (None) and its reason names the position in the
+    window; the strict-mode :class:`JsonlLineError` keeps the window position as its ``line``.
     """
     for line_index, raw in enumerate(fh, start=1):
         verdict = classify_line(raw)
@@ -146,7 +149,12 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
             # always stopped here; they now say so with a named error instead of the parser's bare exception.
             # Skipping the line is not safe yet: callers that rewrite, delete or take a safety set from what they
             # read would lose or fail to protect data, so #646 audits them first.
-            raise UnloadableJsonlLineError(line_index, verdict.reason or "", path) from verdict.exc
+            reason = verdict.reason or ""
+            if window:
+                raise UnloadableJsonlLineError(
+                    None, f"{reason} (line {line_index} of the window of the last lines read, not a file line)", path
+                ) from verdict.exc
+            raise UnloadableJsonlLineError(line_index, reason, path) from verdict.exc
         if strict:
             raise JsonlLineError(line_index, verdict.reason or "", path) from verdict.exc
         if verdict.kind == "utf8":
