@@ -1485,25 +1485,49 @@ def _read_cursor_file(persona_dir: Path) -> dict:
         pytest.param({"rowid": 0}, 0, id="zero"),
         pytest.param({"rowid": 5}, 5, id="five"),
         pytest.param({"rowid": 2**63 - 1}, 2**63 - 1, id="largest-bindable"),
-        pytest.param({"created_at": "2020-01-03T00:00:00+00:00", "id": "abc"}, None, id="old-created-at-id-form"),
-        pytest.param("2020-01-03T00:00:00+00:00", None, id="bare-string"),
-        pytest.param({"rowid": True}, None, id="bool"),
-        pytest.param({"rowid": "5"}, None, id="string"),
-        pytest.param({"rowid": -1}, None, id="negative"),
-        pytest.param({"rowid": 1.5}, None, id="float"),
-        pytest.param({"rowid": 1.0}, None, id="whole-float"),
-        pytest.param({"rowid": 2**63}, None, id="one-past-bindable"),
-        pytest.param({"rowid": 10**30}, None, id="huge"),
-        pytest.param({"id": "abc"}, None, id="no-rowid-key"),
-        pytest.param(None, None, id="null"),
-        pytest.param([5], None, id="list"),
     ],
 )
-def test_load_cursor_reads_a_rowid_and_nothing_else(tmp_path: Path, cursor: object, expected: int | None) -> None:
+def test_load_cursor_reads_a_rowid(tmp_path: Path, cursor: object, expected: int) -> None:
     _write_cursor_file(tmp_path, {"model_id": _model_id(), "cursor": cursor})
     assert _load_cursor(tmp_path, _model_id()) == expected
 
 
+_NO_BASE_FAILURE_REASON = (
+    "a cursor of any of these shapes already read as None on the created_at cursor, so no old code can fail the cell; it pins "
+    "that the rowid cursor keeps refusing them (the bool, float, negative and over-2**63 cases are the new validator's own refusals)"
+)
+
+
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        pytest.param("2020-01-03T00:00:00+00:00", id="bare-string"),
+        pytest.param({"rowid": True}, id="bool"),
+        pytest.param({"rowid": "5"}, id="string"),
+        pytest.param({"rowid": -1}, id="negative"),
+        pytest.param({"rowid": 1.5}, id="float"),
+        pytest.param({"rowid": 1.0}, id="whole-float"),
+        pytest.param({"rowid": 2**63}, id="one-past-bindable"),
+        pytest.param({"rowid": 10**30}, id="huge"),
+        pytest.param({"id": "abc"}, id="no-rowid-key"),
+        pytest.param(None, id="null"),
+        pytest.param([5], id="list"),
+    ],
+)
+def test_load_cursor_refuses_every_unusable_cursor(tmp_path: Path, cursor: object) -> None:
+    _write_cursor_file(tmp_path, {"model_id": _model_id(), "cursor": cursor})
+    assert _load_cursor(tmp_path, _model_id()) is None
+
+
+def test_load_cursor_refuses_the_old_created_at_form(tmp_path: Path) -> None:
+    _write_cursor_file(
+        tmp_path, {"model_id": _model_id(), "cursor": {"created_at": "2020-01-03T00:00:00+00:00", "id": "abc"}}
+    )
+    assert _load_cursor(tmp_path, _model_id()) is None
+
+
+@pytest.mark.no_base_failure(reason="the model-swap, missing-file and non-dict reads were None on the created_at cursor too; this pins they stay None")
 def test_load_cursor_of_a_model_swap_a_missing_file_and_a_non_dict_file_is_none(tmp_path: Path) -> None:
     assert _load_cursor(tmp_path, _model_id()) is None  # no file
     _write_cursor_file(tmp_path, {"model_id": "some-other-model", "cursor": {"rowid": 5}})
