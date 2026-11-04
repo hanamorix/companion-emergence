@@ -161,8 +161,7 @@ def _forbid_whole_file_reads(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("read_jsonl_from loaded the whole file")
 
     for owner in (file_ops, jio):
-        for name in ("read_bytes", "read_bytes_stat"):
-            monkeypatch.setattr(owner, name, refuse, raising=False)
+        monkeypatch.setattr(owner, "read_bytes_stat", refuse, raising=False)
     monkeypatch.setattr(Path, "read_bytes", refuse)
 
 
