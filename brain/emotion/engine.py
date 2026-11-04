@@ -17,7 +17,7 @@ Real now:
   queue like the others.
 
 Stubbed now:
-- `batch()` is a context manager that does nothing: it takes no argument, yields None and records nothing.
+- `batch()` is a context manager that does nothing: it takes no argument, yields None and writes nothing.
 - `read()` returns `{}`; `status()` returns `EngineStatus(True, None)`; `oldest_entry_at()` returns None.
 - `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
   memory id and the emotion, when the memory has no such emotion. It never returns 0.0:

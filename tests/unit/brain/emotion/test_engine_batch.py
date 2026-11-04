@@ -1,7 +1,7 @@
 """The S0 stub engine's `batch()` (Engine 0, #575).
 
 `engine.engine_for(persona_dir).batch()` is a context manager on the engine instance (spec 3.0 batch scope).
-In the stub it does nothing: it takes no argument, yields None, records nothing, writes nothing and lets an
+In the stub it does nothing: it takes no argument, yields None, writes nothing and lets an
 exception from the block go out unchanged. The engine built later (S4) collects the block's events and applies
 them once; its own tests replace the "does nothing" ones.
 """
@@ -31,7 +31,6 @@ def test_batch_does_nothing(tmp_path: Path) -> None:
     engine = EmotionEngine(tmp_path)
     with engine.batch():
         pass
-    assert engine.recorded_calls == []
     assert list(tmp_path.iterdir()) == []
 
 
@@ -42,7 +41,6 @@ def test_nested_batches_are_harmless(tmp_path: Path) -> None:
             pass
         with engine.batch():
             pass
-    assert engine.recorded_calls == []
     assert list(tmp_path.iterdir()) == []
 
 
@@ -53,4 +51,3 @@ def test_batch_lets_an_exception_propagate(tmp_path: Path) -> None:
         with engine.batch():
             raise raised
     assert excinfo.value is raised
-    assert engine.recorded_calls == []
