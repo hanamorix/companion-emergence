@@ -120,7 +120,7 @@ def test_after_a_crash_tail_append_jsonl_makes_the_fragment_a_counted_bad_line(t
 
 
 @pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-def test_an_over_long_integer_is_a_bad_line_like_in_the_other_readers(tmp_path: Path) -> None:
+def test_an_over_long_integer_is_a_bad_line_like_in_iter_jsonl_raw(tmp_path: Path) -> None:
     huge = b'{"n": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}\n"
     path = _write(tmp_path, b'{"a": 1}\n' + huge + b'{"a": 3}\n')
     read = jio.read_jsonl_from(path)

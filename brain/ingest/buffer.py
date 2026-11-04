@@ -151,7 +151,7 @@ def list_active_sessions(persona_dir: Path) -> list[str]:
 
 
 def read_session(persona_dir: Path, session_id: str) -> list[dict]:
-    """Return the turns from a session buffer, skipping malformed lines."""
+    """Return the turns from a session buffer, skipping malformed lines (a line the JSON parser cannot load stops the read)."""
     # RAISE: compaction rewrites the buffer from this read and ingest advances its cursor on it, so a failed
     # read must raise (as it always did), never look like an empty session.
     return read_jsonl(_session_path(persona_dir, session_id), recover=Recovery.RAISE)

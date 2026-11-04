@@ -111,7 +111,7 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
     One kind of line stops the read instead of being skipped, in strict mode too: a line the JSON parser
     cannot load at all (an integer past the interpreter's digit limit, nesting past the recursion limit).
     The parser's own ``ValueError`` or ``RecursionError`` comes out, as it did before the parsers shared
-    :func:`classify_line`.
+    :func:`classify_line` (#643).
     """
     for line_index, raw in enumerate(fh, start=1):
         verdict = classify_line(raw)
@@ -120,9 +120,9 @@ def _parse_lines(fh, path: Path, *, strict: bool = False) -> Iterator[dict]:
                 yield verdict.data
             continue
         if verdict.kind == "json" and not isinstance(verdict.exc, json.JSONDecodeError):
-            # A known defect kept as it was on origin/main (ruling on #643), not a contract: one such line stops
-            # the whole read. Skipping it needs an audit of the callers that rewrite, delete or take a safety set
-            # from what they read, tracked in its own issue.
+            # A known defect, kept as these readers behaved before they shared classify_line (#643), not a
+            # contract: one such line stops the whole read. Skipping it needs an audit of the callers that
+            # rewrite, delete or take a safety set from what they read, tracked in its own issue.
             raise verdict.exc
         if strict:
             raise JsonlLineError(line_index, verdict.reason or "", path) from verdict.exc

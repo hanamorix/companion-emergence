@@ -923,7 +923,7 @@ def iter_jsonl_raw(
     still see a line it cannot parse (``recall_diagnostics._prune`` removes it). Blank lines are never yielded.
     With ``bad_lines=True`` a line that cannot be used (malformed, invalid UTF-8, not an object) is yielded as
     ``(text, None)`` after its usual warning; otherwise it is only skipped. ``strict`` and ``recover`` behave
-    as in :func:`iter_jsonl`.
+    as in :func:`iter_jsonl`, except for a line the JSON parser cannot load: this reader skips it (strict: ``JsonFileError``).
     """
     path = _as_path(path)
     _check_jsonl_recover(recover)

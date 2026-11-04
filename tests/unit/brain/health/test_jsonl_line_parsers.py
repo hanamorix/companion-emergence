@@ -226,9 +226,9 @@ def test_the_line_parser_itself_stops_on_such_a_line(build, expected: type[Excep
 
 
 @_PINNED
-@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
+@pytest.mark.parametrize(("build", "_expected"), _UNLOADABLE)
 def test_iter_jsonl_raw_skips_such_a_line_with_a_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, build, expected: type[Exception]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, build, _expected: type[Exception]
 ) -> None:
     path = _file(tmp_path, GOOD, build(), GOOD)
     with caplog.at_level(logging.WARNING):
@@ -239,8 +239,8 @@ def test_iter_jsonl_raw_skips_such_a_line_with_a_warning(
 
 
 @_PINNED
-@pytest.mark.parametrize(("build", "expected"), _UNLOADABLE)
-def test_iter_jsonl_raw_strict_raises_a_line_file_error_for_such_a_line(tmp_path: Path, build, expected: type[Exception]) -> None:
+@pytest.mark.parametrize(("build", "_expected"), _UNLOADABLE)
+def test_iter_jsonl_raw_strict_raises_a_line_file_error_for_such_a_line(tmp_path: Path, build, _expected: type[Exception]) -> None:
     path = _file(tmp_path, GOOD, build())
     with pytest.raises(jio.JsonFileError) as exc:
         list(jio.iter_jsonl_raw(path, strict=True))
