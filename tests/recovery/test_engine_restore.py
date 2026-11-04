@@ -27,8 +27,10 @@ def _seed_source(src: Path):
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
     s.create(Memory(id="faded", content="ORIGINAL long text", memory_type="conversation",
                     domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
+    # Older than every row the persona holds, so a restore that told the engine (a fold) would move its persona start and
+    # change the state file.
     s.create(Memory(id="lost", content="forgotten original", memory_type="conversation",
-                    domain="us", created_at=datetime(2026, 4, 2, tzinfo=UTC)))
+                    domain="us", created_at=datetime(2026, 3, 20, tzinfo=UTC)))
     s.close()
 
 
