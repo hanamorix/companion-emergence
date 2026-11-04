@@ -20,7 +20,7 @@ import pytest
 from brain import dev_constants
 from brain.body.state import body_state_from_short
 from brain.emotion import engine as engine_module
-from brain.emotion import engine_files, persona_loader
+from brain.emotion import engine_files
 from brain.emotion.engine import EmotionEngine, Reading
 from brain.emotion.engine_files import LoadedState
 from brain.emotion.engine_utils import (
@@ -173,14 +173,13 @@ def test_an_empty_read_is_not_high(engine, tmp_path):
     assert engine.feels_high("love") is False
 
 
-def test_through_the_real_engine_the_range_part_fires_and_a_reader_follows_it(tmp_path, monkeypatch):
+def test_through_the_real_engine_the_range_part_fires_and_a_reader_follows_it(tmp_path):
     """No patched `read()`: a synthetic persona's real state file, the real `engine_for`, the real `read()`.
 
     `love` stands in the upper half of its own 30-day range (short 5.0 in 2.0..6.0) and `desire` below it (short 3.5); no run
     shift is set up (the shift part is closed: `persona_start_at` is unset), so only the range part can make `love` high.
     Before the real `read()` landed `feels_high` answered False for every name, so this fails there.
     """
-    monkeypatch.delattr(persona_loader, "refresh_if_changed", raising=False)
     persona = make_persona(tmp_path / "persona")
     saved_at = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
     state = EngineState(saved_at=saved_at, last_update=saved_at, active_day="2026-11-04")
