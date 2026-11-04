@@ -1079,6 +1079,22 @@ class MemoryStore:
         full backfill reasoning (Stage 2 of the local semantic-retrieval
         build).
         """
+        opened_here = not self._conn.in_transaction
+        try:
+            self._insert_memory_row(memory)
+        except BaseException:
+            # A failed INSERT leaves the implicit transaction it opened still open, which would refuse the next write that
+            # begins one. Roll back what this call opened; a transaction the caller already had open is not ours to end.
+            if opened_here and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        self._conn.commit()
+        if fold:
+            self._notify_committed(memory)
+        return memory.id
+
+    def _insert_memory_row(self, memory: Memory) -> None:
+        """The one INSERT of a memory row, uncommitted: `create` and `create_grief_touch_unless_recent` both run it, so the column list is written once."""
         try:
             metadata_json = json.dumps(memory.metadata)
         except TypeError as exc:
@@ -1113,10 +1129,6 @@ class MemoryStore:
                 ),
             ),
         )
-        self._conn.commit()
-        if fold:
-            self._notify_committed(memory)
-        return memory.id
 
     def _emotion_engine(self) -> Any | None:
         """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
@@ -3555,14 +3567,13 @@ class MemoryStore:
         )
         return int(self._conn.execute(sql, (current_model_id, min_chars)).fetchone()[0])
 
-    def exists_recent_grief_touch(self, referent_id: str, *, hours: float) -> bool:
-        """Return True if a grief_event memory with grief_referent_id == referent_id
-        exists in the memories table created within the last `hours`.
+    def _recent_grief_touch_exists(self, referent_id: str, hours: float) -> bool:
+        """True if a grief_event memory with grief_referent_id == referent_id was created within the last `hours`.
 
-        Implementation: SQL filter on (memory_type='grief_event', created_at >= cutoff),
-        then Python-side filter on metadata.grief_referent_id. Recent grief volume is
-        sparse — linear filter cost is negligible. Avoids depending on SQLite
-        json_extract. Spec §4 + §6.
+        SQL filter on (memory_type='grief_event', created_at >= cutoff), then a Python-side filter on
+        metadata.grief_referent_id. Recent grief volume is sparse, so the linear filter costs nothing, and it avoids
+        depending on SQLite json_extract. Spec §4 + §6. The one place this query is written: both checks of
+        `create_grief_touch_unless_recent` run it.
         """
         cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
         cursor = self._conn.execute(
@@ -3575,6 +3586,44 @@ class MemoryStore:
             if meta.get("grief_referent_id") == referent_id:
                 return True
         return False
+
+    def create_grief_touch_unless_recent(self, memory: Memory, *, hours: float, fold: bool = True) -> str | None:
+        """Insert a grief touch unless one for the same referent was created within the last `hours`; the check and the insert are one step (#342).
+
+        Two turns that recall the same forgotten memory at once used to both pass the check and both write a touch,
+        because the check and the write were two calls. Here the referent is read from
+        `memory.metadata["grief_referent_id"]` (a missing, non-text or empty one raises ValueError), so the referent that
+        is checked is the referent that is written.
+
+        A read-only look comes first: on most turns the touch is debounced, and that path takes no write lock. Only when
+        the look finds no touch does the method begin one write transaction (`BEGIN IMMEDIATE`) and check again; that
+        second check is the one that closes the race, since another writer may have inserted between the look and the
+        lock. Returns the new id, or None when a touch for that referent already exists (nothing is written and the
+        engine is told nothing). After the commit, when `fold` is true, the engine hears of the row as `create` tells it.
+
+        Raises RuntimeError when the connection is already inside a transaction, as its siblings do, and, on any
+        database error inside the transaction, rolls back and raises it again.
+        """
+        referent_id = memory.metadata.get("grief_referent_id")
+        if not isinstance(referent_id, str) or not referent_id:
+            raise ValueError("a grief touch needs a non-empty text metadata['grief_referent_id']")
+        if self._conn.in_transaction:
+            raise RuntimeError("grief touch: cannot write inside an open transaction")
+        if self._recent_grief_touch_exists(referent_id, hours):
+            return None
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._recent_grief_touch_exists(referent_id, hours):
+                self._conn.rollback()
+                return None
+            self._insert_memory_row(memory)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        if fold:
+            self._notify_committed(memory)
+        return memory.id
 
     def list_since_iso(self, opened_at_iso: str, *, include_fading: bool = True) -> list[Memory]:
         """Return memories with created_at > opened_at_iso, ordered ascending.

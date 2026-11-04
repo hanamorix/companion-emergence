@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -1355,7 +1356,7 @@ def hook_store(tmp_path: Path) -> Iterator[MemoryStore]:
 
 
 def _events(persona_dir: Path) -> list[Event]:
-    return engine_files.read_queue(persona_dir)
+    return _read(persona_dir)
 
 
 def _lines(persona_dir: Path) -> list[dict]:
@@ -1473,7 +1474,7 @@ def test_a_faded_value_that_raises_drops_that_name_with_a_line_and_queues_the_re
         engine.on_memory_committed(_hook_mem(emotions={"joy": 6.0, "grief": 3.0}))
     assert [dict(e.emotions) for e in _events(tmp_path)] == [{"joy": 6.0}]
     assert any("grief" in r.getMessage() for r in caplog.records)
-    # every name failing leaves nothing to fold: the start-only event is queued instead (B02.6)
+    # every name failing leaves nothing to fold: this hook appends the start-only event instead (B02.6; the spec makes it a direct apply, Engine 4 moves it)
     monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: 1 / 0)
     engine.on_memory_committed(_hook_mem(emotions={"joy": 6.0}))
     assert [e.kind for e in _events(tmp_path)] == ["commit", "start"]
@@ -2055,3 +2056,136 @@ def test_the_store_calls_out_through_engine_for(tmp_path: Path, hook_store: Memo
     assert names == ["on_memory_committed", "on_emotions_assigned"]
     assert emotion_engine_stub.recorded_calls[1][1].emotions == {"joy": 3.0}
     assert not engine_files.queue_path(tmp_path).exists()  # the stub queued nothing
+
+
+# --- the bounded engine lock (Engine 3 delta): every hook passes the owner's wait; a timeout is not a disk fault ----
+
+
+class _WaitRecorder:
+    """A call-through recorder around `file_lock.locked_within`, patched where `engine_files.state_lock` looks it up.
+
+    It records each call's path and wait, and whether its context was open when `append_event` ran.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[tuple[Path, float]] = []
+        self.open = False
+        self.append_open: list[bool] = []
+        real = file_lock.locked_within
+        real_append = engine_files.append_event
+        rec = self
+
+        @contextlib.contextmanager
+        def locked_within(path: Path, seconds: float, **kwargs: object) -> Iterator[None]:
+            rec.calls.append((path, seconds))
+            with real(path, seconds, **kwargs):
+                rec.open = True
+                try:
+                    yield
+                finally:
+                    rec.open = False
+
+        def append(*args: object, **kwargs: object) -> object:
+            rec.append_open.append(rec.open)
+            return real_append(*args, **kwargs)
+
+        monkeypatch.setattr(file_lock, "locked_within", locked_within)
+        monkeypatch.setattr(engine_files, "append_event", append)
+
+
+@pytest.mark.parametrize("kind", ["commit", "assigned", "showing", "change", "start"])
+def test_every_hook_takes_the_engine_lock_once_with_the_owners_wait_and_appends_inside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 7.25)
+    recorder = _WaitRecorder(monkeypatch)
+    engine = engine_module.engine_for(tmp_path)
+    fire = {
+        "commit": lambda: engine.on_memory_committed(_hook_mem()),
+        "assigned": lambda: engine.on_emotions_assigned(_hook_mem()),
+        "showing": lambda: engine.on_memory_shown(_hook_mem(), None),
+        "change": lambda: engine.fold_change({"joy": 1.0}, None, "test"),
+        "start": lambda: engine.on_memory_committed(_uncounted()),
+    }
+    fire[kind]()
+    assert recorder.calls == [(engine_files.state_path(tmp_path), 7.25)]
+    assert recorder.append_open == [True]
+    assert [e.kind for e in _events(tmp_path)] == [kind]
+
+
+def test_a_held_engine_lock_does_not_hang_a_write_and_the_row_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, held_lock
+) -> None:
+    monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 0.2)
+    db = tmp_path / "memories.db"
+    mem = _hook_mem()
+    outcome: dict[str, object] = {}
+
+    def worker() -> None:
+        store = MemoryStore(db)  # opened in this thread: the connection is bound to the thread that makes it
+        try:
+            outcome["id"] = store.create(mem)
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            store.close()
+
+    thread = threading.Thread(target=worker, name="create-under-held-lock", daemon=True)
+    started = False
+    with caplog.at_level(logging.DEBUG, logger=HOOK_LOGGER):
+        try:
+            with held_lock(engine_files.state_path(tmp_path)):
+                thread.start()
+                started = True
+                thread.join(5)
+                finished = not thread.is_alive()
+        finally:
+            if started:
+                thread.join(5)  # a regression that hangs is released by the holder's exit, never left running
+    assert finished, "create hung behind a held engine lock"
+    assert outcome == {"id": mem.id}
+    assert _lines(tmp_path) == []  # the event was not recorded
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "gave up on the engine lock" in errors[0] and "on_memory_committed" in errors[0] and "not recorded" in errors[0]
+    reader = MemoryStore(db)
+    try:
+        assert reader.get(mem.id, bump=False) is not None  # the row is committed
+        later = _hook_mem()
+        reader.create(later)  # the positive control: with the holder gone the next create appends its line
+    finally:
+        reader.close()
+    assert [e.memory_id for e in _events(tmp_path)] == [later.id]
+
+
+def test_a_lock_wait_that_runs_out_is_logged_as_that_not_as_a_disk_fault(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def timed_out(persona_dir: Path) -> object:
+        raise file_lock.LockTimeoutError("could not lock the state file within 5 s")
+
+    def disk_fault(persona_dir: Path) -> object:
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(engine_files, "state_lock", timed_out)
+    with caplog.at_level(logging.DEBUG, logger=HOOK_LOGGER):
+        mem = _hook_mem()
+        assert hook_store.create(mem) == mem.id
+        first = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(first) == 1 and first[0].exc_info is None
+        wording = first[0].getMessage()
+        assert "gave up on the engine lock" in wording and "on_memory_committed" in wording and "not recorded" in wording
+        assert "could not queue" not in wording
+        caplog.clear()
+        hook_store.create(_hook_mem())
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []  # throttled to DEBUG
+        assert hook_store.get(mem.id, bump=False) is not None
+        assert _lines(tmp_path) == []
+        # the generic OSError line keeps its own wording and its own throttle: the timeout's did not swallow it
+        monkeypatch.setattr(engine_files, "state_lock", disk_fault)
+        caplog.clear()
+        hook_store.create(_hook_mem())
+        other = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(other) == 1 and other[0].exc_info is None
+        assert "could not queue its event" in other[0].getMessage()
+        assert "gave up on the engine lock" not in other[0].getMessage()

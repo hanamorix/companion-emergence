@@ -670,7 +670,8 @@ class StateCache:
 # ================================================================================================
 
 # The kinds the queue knows. "start" is the start-only event Engine 1 added: it carries only `at`, the creation time of a
-# committed row of a type that does not count, and keeps the persona's start date.
+# committed row of a type that does not count, and keeps the persona's start date. It is a memory's own date event, which
+# the spec makes a direct apply (Engine 4 moves it); until then the commit hook appends it to the queue like the others.
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
 # The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
