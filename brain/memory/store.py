@@ -1289,8 +1289,8 @@ class MemoryStore:
         content-mutating path (F1 #259 step 5, flag-2 resolved: SYNCHRONOUS
         re-embed, mirroring `fade()`'s existing synchronous-rewrite
         behavior). Called AFTER the row's content UPDATE has already
-        committed, from `fade()`, `update(memory_id, content=...)`, and
-        `unfade()`.
+        committed, from `fade()`, `update(memory_id, content=...)`,
+        `unfade()` and `refresh_faded_emotions` (when it dated the text).
 
         Row-id keying is NOT self-healing the way the old content-hash cache
         was: new content under the SAME id has no `embedding IS NULL` signal
@@ -3032,7 +3032,7 @@ class MemoryStore:
                 from brain.memory.embedding_matrix import build_embedding_matrix
 
                 build_embedding_matrix(self.db_path).evict(memory_id)
-            except Exception:  # noqa: BLE001 — best-effort, must not block the write
+            except Exception:  # noqa: BLE001 (best-effort, must not block the write)
                 logger.warning(
                     "MemoryStore.refresh_faded_emotions: matrix evict failed for id=%s", memory_id, exc_info=True
                 )

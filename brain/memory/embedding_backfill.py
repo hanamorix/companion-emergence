@@ -539,7 +539,8 @@ def run_embedding_backfill_tick(
     # `hit_batch_limit`), the cursor may simply never reset for a long time.
     # A row that goes NULL a SECOND time BEHIND the persisted cursor position
     # (a failed synchronous re-embed from `fade`/`update(content=...)`/
-    # `unfade` — see `MemoryStore._reembed_or_clear`) is invisible to
+    # `unfade`/the temp gate's write-back, see `MemoryStore._reembed_or_clear`)
+    # is invisible to
     # `list_unembedded_since` until either the backlog finally drains below
     # one scan window (letting a tick exhaust it and reset the cursor) or a
     # `MODEL_EMBEDDING` swap forces a full rescan (`_load_cursor` resets on

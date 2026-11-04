@@ -815,6 +815,7 @@ def test_e5_not_live_merge_is_todays_content_only_call(persona, emotion_engine_s
     assert store.get(live_id, bump=False).emotions == {"joy": 6.0, "awe": 6.0}
     assert {"emotions", "fold"} <= set(next(f for mid, f in calls if mid == live_id))
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # the live merge's event
+    assert store.get(live_id, bump=False).content == "Bob likes tea with honey"  # a merge adds no date to the text
 
     emotion_engine_stub.live = False
     emotion_engine_stub.recorded_calls.clear()

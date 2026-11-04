@@ -215,6 +215,7 @@ def test_refresh_leaves_a_text_that_already_starts_with_a_date_as_it_is(store, c
         pytest.param("2031-03-04 notes about tea", id="no-separator"),
         pytest.param("2031-3-4: Bob likes tea", id="not-the-date-shape"),
         pytest.param("Dated 2031-03-04: Bob likes tea", id="not-at-the-start"),
+        pytest.param("\u0662\u0660\u0663\u0661-\u0660\u0663-\u0660\u0664: Bob likes tea", id="non-ascii-digits"),
         pytest.param("", id="empty"),
     ],
 )
@@ -235,12 +236,20 @@ def test_the_date_is_the_local_calendar_day_not_the_utc_day(store, monkeypatch):
 
 def test_the_placeholder_is_one_constant_and_the_add_and_the_skip_both_follow_it(store, monkeypatch):
     assert store_module.DATE_PREFIX_FORMAT_PLACEHOLDER.count("{date}") == 1
+    assert "\u2014" not in store_module.DATE_PREFIX_FORMAT_PLACEHOLDER  # persona-facing: no em-dash, even as working text
     monkeypatch.setattr(store_module, "DATE_PREFIX_FORMAT_PLACEHOLDER", "[{date}] ")
     memory_id = _make(store, {"joy": 8.0})
     store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     assert _raw(store, memory_id)["content"] == "[2031-03-04] Bob likes tea"
     store.refresh_faded_emotions(memory_id, {"joy": 4.0}, _WRITTEN_AT)
     assert _raw(store, memory_id)["content"] == "[2031-03-04] Bob likes tea"  # skipped under the new form too
+
+
+def test_a_stray_brace_in_the_format_cannot_raise_because_the_prefix_is_not_built_with_str_format(store, monkeypatch):
+    monkeypatch.setattr(store_module, "DATE_PREFIX_FORMAT_PLACEHOLDER", "{x}{date}: ")
+    memory_id = _make(store, {"joy": 8.0})
+    store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
+    assert _raw(store, memory_id)["content"] == "{x}2031-03-04: Bob likes tea"
 
 
 @pytest.mark.parametrize("bad", ["no marker here: ", "{date} and {date}: "])
@@ -437,6 +446,43 @@ def test_a_connection_already_inside_a_transaction_is_refused(store):
     finally:
         store._conn.rollback()
     assert _raw(store, memory_id) == before
+
+
+def test_the_read_happens_inside_the_write_transaction_begun_first(store):
+    memory_id = _make(store, {"joy": 8.0})
+    statements: list[str] = []
+    store._conn.set_trace_callback(statements.append)
+    store._reembed_or_clear = _Recorder()
+    store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
+    store._conn.set_trace_callback(None)
+    begin = next(i for i, s in enumerate(statements) if s.strip().upper() == "BEGIN IMMEDIATE")
+    select = next(i for i, s in enumerate(statements) if s.lstrip().upper().startswith("SELECT CONTENT, CONTENT_SNAPSHOT"))
+    update = next(i for i, s in enumerate(statements) if s.lstrip().upper().startswith("UPDATE MEMORIES"))
+    assert begin < select < update  # the row is read AFTER the write lock is taken, and written before the lock is released
+
+
+def test_no_other_writer_can_get_in_between_the_read_and_the_write(store, monkeypatch):
+    # `to_local` runs after the SELECT and before the UPDATE: from inside it, a second connection tries to take the write lock.
+    memory_id = _make(store, {"joy": 8.0})
+    outcomes: list[object] = []
+
+    def to_local_that_probes_the_lock(dt):
+        other = sqlite3.connect(store.db_path, timeout=0.2, isolation_level=None)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+            outcomes.append("got the lock")
+        except sqlite3.OperationalError as exc:
+            outcomes.append(str(exc))
+        finally:
+            other.close()
+        return dt.astimezone(UTC)
+
+    monkeypatch.setattr(store_module, "to_local", to_local_that_probes_the_lock, raising=False)
+    store._reembed_or_clear = _Recorder()
+    store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
+    assert len(outcomes) == 1
+    assert "locked" in outcomes[0]  # the store held the write lock between its read and its write
 
 
 def test_a_busy_store_raises_and_leaves_the_row_unchanged(store):

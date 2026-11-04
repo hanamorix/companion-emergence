@@ -1652,3 +1652,17 @@ def test_a_row_that_goes_null_again_behind_the_cursor_waits_for_the_reset(tmp_pa
     assert _read_cursor_file(tmp_path)["cursor"] == {"rowid": _rowid_of(tmp_path, b.id)}
     per_tick = _embedded_ids_per_tick(monkeypatch, tmp_path, 2)
     assert per_tick == [[c.id], [a.id]]  # C first (A is behind the cursor); the draining tick reset it, so A comes next
+
+
+def test_the_persisted_cursor_is_the_rowid_not_a_count_of_rows_scanned(tmp_path: Path) -> None:
+    # Rows 1 and 2 are already embedded, so the backlog starts at rowid 3 and a count of scanned rows (1, 2) differs from the rowid.
+    made = _seed(tmp_path, 5)
+    store = _open_store(tmp_path)
+    try:
+        for memory in made[:2]:
+            store.embed_row(memory.id, memory.content)
+        run_embedding_backfill_tick(tmp_path, store, batch_size=1, scan_cap=100)  # embeds made[2], rowid 3
+    finally:
+        store.close()
+    assert _rowid_of(tmp_path, made[2].id) == 3
+    assert _read_cursor_file(tmp_path)["cursor"] == {"rowid": 3}
