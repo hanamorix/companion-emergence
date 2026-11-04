@@ -552,3 +552,64 @@ def test_connection_includes_kindled_link_fields(tmp_path: Path) -> None:
     conn = build_persona_state(persona_dir)["connection"]
     assert conn["kindled_link_enabled"] is True
     assert conn["kindled_relay_url"] == "http://127.0.0.1:9000"
+
+
+# ── B2 phase B: the panels read the engine's short averages when it is live ───
+
+
+def _stub_reading(short: float):
+    from brain.emotion.engine import Reading
+
+    return Reading(short=short, long=0.0, difference=0.0, shift=0)
+
+
+def _seed_stored_emotions(persona_dir: Path) -> None:
+    from brain.memory.store import Memory, MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        store.create(
+            Memory.create_new(
+                content="stored",
+                memory_type="fact",
+                domain="us",
+                emotions={"joy": 9.0, "rest_need": 9.0, "love": 1.0},
+            )
+        )
+    finally:
+        store.close()
+
+
+def test_build_emotions_live_shows_a_present_zero_and_omits_an_absent_name(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.bridge.persona_state import _build_emotions
+
+    _seed_stored_emotions(tmp_path)  # the stored joy 9.0 must not appear
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"calm": _stub_reading(0.0), "love": _stub_reading(6.25), "awe": _stub_reading(3.04)}
+    result = _build_emotions(tmp_path)
+    assert result == {"love": 6.2, "awe": 3.0, "calm": 0.0}
+    assert list(result) == ["love", "awe", "calm"]
+    assert "joy" not in result
+
+
+def test_build_emotions_live_with_an_empty_read_is_empty(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.bridge.persona_state import _build_emotions
+
+    _seed_stored_emotions(tmp_path)
+    emotion_engine_stub.live = True
+    assert _build_emotions(tmp_path) == {}
+
+
+def test_build_body_live_omits_absent_body_emotions_and_never_shows_nan(tmp_path: Path, emotion_engine_stub) -> None:
+    import math
+
+    from brain.bridge.persona_state import _build_body
+
+    _seed_stored_emotions(tmp_path)  # stored rest_need 9.0 must not appear
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"arousal": _stub_reading(6.0), "love": _stub_reading(8.0)}
+    body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
+    assert body is not None
+    assert body["body_emotions"] == {"arousal": 6.0}
+    for key in ("energy", "temperature", "exhaustion", "session_hours", "days_since_contact"):
+        assert not math.isnan(body[key])

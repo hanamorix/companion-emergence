@@ -141,3 +141,18 @@ def test_recomputes_each_call(store, hebbian, tmp_path, monkeypatch):
     assert calls == 2
     assert "computed_at" in out1
     assert "computed_at" in out2
+
+
+def test_live_body_state_has_no_key_for_an_absent_body_emotion(store, hebbian, tmp_path, emotion_engine_stub):
+    """B2 phase B: when the engine is live the body emotions are the engine's short averages, and only those."""
+    from brain.emotion.engine import Reading
+
+    store.create(
+        Memory.create_new(
+            content="stored", memory_type="fact", domain="us", emotions={"rest_need": 9.0, "arousal": 9.0}
+        )
+    )
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"arousal": Reading(short=4.0, long=0.0, difference=0.0, shift=0)}
+    out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
+    assert out["body_emotions"] == {"arousal": 4.0}
