@@ -39,6 +39,7 @@ from brain.emotion.engine_utils import (
 )
 from brain.health import json_io
 from brain.health.json_io import JsonRead, JsonWalk, read_json_walk
+from brain.utils import file_ops
 
 VOCAB = "emotion_vocabulary.json"
 FILES_LOGGER = "brain.emotion.engine_files"
@@ -275,6 +276,72 @@ def test_the_file_is_not_re_read_while_its_key_is_unchanged(
     assert len(read_log) == 1
 
 
+def _real_key(path: Path) -> tuple[int, int, int]:
+    st = os.stat(path)  # not `Path.stat`: the test below records those calls
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def test_the_cache_key_is_the_one_file_ops_stat_path_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_log: list[Path]
+) -> None:
+    """The cache re-reads exactly when `file_ops.stat_path(<vocabulary file>).key` changes.
+
+    The accessor is replaced by a fake that returns a settable `PathStat` on every call, so the
+    real file's own stat does not decide anything.
+    """
+    path = _write_vocab(tmp_path, [_entry("joy", 5.0)])
+    fake = {"stat": file_ops.PathStat(10, 20, 30, True, False)}
+    asked: list[Path] = []
+
+    def fake_stat_path(p: str | Path) -> file_ops.PathStat | None:
+        asked.append(Path(p))
+        return fake["stat"]
+
+    path_stat_calls: list[Path] = []
+    real_path_stat = pathlib.Path.stat
+
+    def spy(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        path_stat_calls.append(self)
+        return real_path_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(file_ops, "stat_path", fake_stat_path)
+    monkeypatch.setattr(pathlib.Path, "stat", spy)
+
+    def rewrite(days: float) -> None:
+        before = _real_key(path)
+        _write_vocab(tmp_path, [_entry("joy", days)])
+        assert _real_key(path) != before  # the real key moved (the size changed)
+
+    engine = _engine(tmp_path)
+    assert engine.half_life("joy") == 5.0
+    assert len(read_log) == 1
+
+    # Same accessor key, different real file: no re-read, the old answer stands.
+    rewrite(5.25)
+    assert engine.half_life("joy") == 5.0
+    assert len(read_log) == 1
+
+    # Only the file/folder flags change: the key is `.key`, not the whole `PathStat`.
+    fake["stat"] = fake["stat"]._replace(is_file=False, is_dir=True)
+    assert engine.half_life("joy") == 5.0
+    assert len(read_log) == 1
+
+    # Each component of the key alone, differing from the stored key in that one field: a re-read.
+    new_values = iter([6.125, 7.0625, 8.03125])
+    for field in ("inode", "mtime_ns", "size"):
+        stored = fake["stat"]
+        fake["stat"] = stored._replace(**{field: getattr(stored, field) + 1})
+        days = next(new_values)
+        rewrite(days)
+        reads_before = len(read_log)
+        assert engine.half_life("joy") == days, field
+        assert len(read_log) == reads_before + 1, field
+
+    assert asked
+    assert set(asked) == {path}  # the vocabulary file, not the persona folder
+    assert [p for p in path_stat_calls if p == path] == []  # no raw `Path.stat` on it
+
+
 def test_a_write_between_the_stat_and_the_read_is_seen_by_the_next_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,26 +434,29 @@ def test_an_io_failure_after_a_good_load_keeps_the_last_good_table_and_is_not_ca
     assert engine.half_life("joy") == 7.5  # the failure was not cached: the same key is read again
 
 
-def _fail_next_stat(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
-    real = pathlib.Path.stat
+def _fail_next_stat(monkeypatch: pytest.MonkeyPatch, target: Path) -> dict[str, bool]:
+    """Make the next `file_ops.stat_path(target)` raise; the returned state shows whether it fired."""
+    real = file_ops.stat_path
     state = {"armed": True}
 
-    def flaky(self: Path, *args: object, **kwargs: object) -> os.stat_result:
-        if state["armed"] and self == target:
+    def flaky(path: str | Path) -> file_ops.PathStat | None:
+        if state["armed"] and Path(path) == target:
             state["armed"] = False
             raise PermissionError("denied (test)")
-        return real(self, *args, **kwargs)
+        return real(path)
 
-    monkeypatch.setattr(pathlib.Path, "stat", flaky)
+    monkeypatch.setattr(file_ops, "stat_path", flaky)
+    return state
 
 
 def test_a_stat_error_before_the_first_load_is_not_cached(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _write_vocab(tmp_path, [_entry("joy", 9.0)])
-    _fail_next_stat(monkeypatch, path)
+    state = _fail_next_stat(monkeypatch, path)
     engine = _engine(tmp_path)
     assert engine.half_life("joy") == 3.0
+    assert state["armed"] is False  # the injected error really was raised
     assert engine.half_life("joy") == 9.0
 
 
@@ -396,8 +466,9 @@ def test_a_stat_error_after_a_good_load_keeps_the_table_and_reads_nothing(
     path = _write_vocab(tmp_path, [_entry("joy", 9.0)])
     engine = _engine(tmp_path)
     assert engine.half_life("joy") == 9.0
-    _fail_next_stat(monkeypatch, path)
+    state = _fail_next_stat(monkeypatch, path)
     assert engine.half_life("joy") == 9.0  # not read as "no file"
+    assert state["armed"] is False  # the injected error really was raised
     assert engine.half_life("joy") == 9.0
     assert len(read_log) == 1  # the key never changed, so nothing was re-read
 
@@ -516,13 +587,14 @@ def test_half_life_never_raises_on_a_pile_of_faults(tmp_path: Path) -> None:
 
 
 def test_no_vocabulary_file_answers_from_the_table_and_default_without_a_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, read_log: list[Path]
 ) -> None:
     engine = _engine(tmp_path)
     with caplog.at_level(logging.DEBUG):
         assert engine.half_life("grief") == 60.0
         assert engine.half_life("never_heard_of_it") == 14.0
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert read_log == []  # a missing file has no key and is never read
 
 
 # ================================================================================================

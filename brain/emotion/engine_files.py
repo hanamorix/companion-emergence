@@ -30,8 +30,8 @@ from ``engine_utils.day_of``. All constants (file and folder names, the retentio
 ``dev_constants.NAME`` at call time.
 
 The half-life cache (Engine 0). The persona's own ``emotion_vocabulary.json`` is read, never written, never repaired and
-never quarantined (``Recovery.DEFAULT``: bad content takes the default). It is re-read when its stat key
-``(st_mtime_ns, st_size, st_ino)`` changes. The key is taken BEFORE the read, so a file replaced between the stat and the read
+never quarantined (``Recovery.DEFAULT``: bad content takes the default). It is re-read when its stat key,
+``file_ops.stat_path(path).key`` (``(inode, mtime_ns, size)``), changes. The key is taken BEFORE the read, so a file replaced between the stat and the read
 is read again on the next call. A failure that says nothing about the content (a filesystem error on the read, an error from
 ``stat`` other than "no such file") is not cached: the previously loaded half-lives stay in force and the next call tries
 again (the same bound as ``brain/tunables.py``, #530). A fault in the content (not JSON, wrong shape, a bad entry) is cached,
@@ -76,6 +76,7 @@ from brain.health.json_io import (
     read_json_walk,
     write_json,
 )
+from brain.utils import file_ops
 from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import count_throttled, warn_throttled
 from brain.utils.time import iso_utc, lenient_utc
@@ -99,15 +100,6 @@ class _Fault(NamedTuple):
     name: str | None  # None: the entry has no name to report
     field: str
     why: str
-
-
-def _stat_key(path: Path) -> _StatKey | None:
-    """The file's stat key, or None when there is no such file. Any other error from `stat` is raised."""
-    try:
-        st = path.stat()
-    except FileNotFoundError:
-        return None
-    return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
 def _emotions_list(data: dict) -> None:
@@ -175,7 +167,7 @@ class VocabularyHalfLives:
 
     def _refresh(self) -> None:
         try:
-            key = _stat_key(self._path)
+            stat = file_ops.stat_path(self._path)
         except OSError as exc:
             # Says nothing about the content: keep what is loaded, store nothing, try again next call.
             warn_throttled(
@@ -186,6 +178,7 @@ class VocabularyHalfLives:
                 exc,
             )
             return
+        key = None if stat is None else stat.key
         if self._loaded and key == self._key:
             return
         if key is None:
@@ -572,8 +565,7 @@ def read_state(persona_dir: Path) -> LoadedState:
             walk.source,
         )
     state = state_from_json(walk.data, label=f"{path} ({walk.source})")
-    ino, mtime_ns, size = walk.signature
-    return LoadedState((mtime_ns, size, ino), state, walk.source, None)
+    return LoadedState(walk.signature, state, walk.source, None)
 
 
 class StateCache:
@@ -594,10 +586,10 @@ class StateCache:
         loaded = self._loaded
         if loaded is not None:
             try:
-                current = _stat_key(state_path(self._persona_dir))
+                stat = file_ops.stat_path(state_path(self._persona_dir))
             except OSError:
-                current = None  # cannot tell: read again
-            if current is not None and current == loaded.key:
+                stat = None  # cannot tell: read again
+            if stat is not None and stat.key == loaded.key:
                 return loaded
         fresh = read_state(self._persona_dir)
         self._loaded = fresh if fresh.source == "main" else None

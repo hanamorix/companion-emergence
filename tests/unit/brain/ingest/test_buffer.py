@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.ingest.buffer import (
     delete_backoff,
     delete_cursor,
@@ -22,6 +23,7 @@ from brain.ingest.buffer import (
     write_backoff,
     write_cursor,
 )
+from brain.utils import file_ops
 
 
 def test_ingest_turn_appends_to_session_file(tmp_path: Path) -> None:
@@ -128,7 +130,6 @@ def test_delete_session_buffer_retries_transient_permission_error(
     must retry briefly instead of failing close_session with ingest_failed."""
     from pathlib import Path as _PathCls
 
-    from brain.ingest import buffer as buffer_mod
 
     ingest_turn(tmp_path, {"session_id": "sess_retry", "speaker": "x", "text": "y"})
     path = tmp_path / "active_conversations" / "sess_retry.jsonl"
@@ -144,7 +145,7 @@ def test_delete_session_buffer_retries_transient_permission_error(
         return real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(_PathCls, "unlink", flaky_unlink)
-    monkeypatch.setattr(buffer_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
 
     delete_session_buffer(tmp_path, "sess_retry")
     assert attempts["n"] == 3
@@ -394,8 +395,8 @@ def test_write_backoff_rejects_malformed_ts(tmp_path: Path) -> None:
 
 # ── #198: rewrite_session_atomic survives a transient os.replace refusal ─────
 # Windows refuses os.replace over a file another handle holds open (a GET
-# /chat/history streaming the buffer). Mirror _unlink_with_retry: bounded
-# retry, and never leave the .jsonl.tmp behind.
+# /chat/history streaming the buffer). Same bounded retry as the shared
+# file_ops.retry_transient, and never leave the .jsonl.tmp behind.
 
 
 def _seed_session(persona_dir: Path, sid: str) -> Path:
@@ -422,7 +423,7 @@ def test_rewrite_session_atomic_retries_transient_permission_error(tmp_path, mon
         return real_replace(src, dst)
 
     monkeypatch.setattr(buf.os, "replace", flaky)
-    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0.0)
     buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "rewritten"}])
     assert calls["n"] == 3
     assert path.read_text(encoding="utf-8").strip() == '{"speaker": "assistant", "text": "rewritten"}'
@@ -440,7 +441,7 @@ def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
         raise PermissionError(32, "in use")
 
     monkeypatch.setattr(buf.os, "replace", always)
-    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0.0)
     with pytest.raises(PermissionError):
         buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "x"}])
     assert path.read_text(encoding="utf-8") == before  # old buffer untouched
