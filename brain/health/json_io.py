@@ -875,7 +875,7 @@ def iter_jsonl(
     """Yield the dict records of a JSONL file (``.gz`` by suffix), skipping bad lines with a warning.
 
     A missing file yields nothing. ``strict=True`` raises ``JsonFileError(kind="line")`` on the first bad
-    line (after yielding the good ones before it); a line the JSON parser cannot load (an integer past the digit limit, nesting too deep) stops the read with the parser's own exception in either mode. An I/O failure (including a truncated gz) ends the
+    line (after yielding the good ones before it); a line the JSON parser cannot load (an integer past the digit limit, nesting too deep) stops the read with ``UnloadableJsonlLineError`` (#646) in either mode. An I/O failure (including a truncated gz) ends the
     iteration with a throttled warning (DEFAULT) or raises ``JsonFileError(kind="io")`` (RAISE).
     """
     path = _as_path(path)
