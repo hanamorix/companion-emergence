@@ -168,9 +168,16 @@ def test_refresh_never_touches_the_peak_in_either_direction(store):
 
 def test_refresh_changes_only_the_columns_it_owns_and_leaves_every_other_byte_alone(store):
     memory_id = _make(store, {"joy": 8.0}, importance=4.5, embed=True)
+    # Every nullable column holds a value, so a stray write to one of them is visible.
+    store._conn.execute(
+        "UPDATE memories SET last_accessed_at = ?, cluster_id = 7, cluster_model_id = 'cluster-model' WHERE id = ?",
+        ("2031-01-01T00:00:00+00:00", memory_id),
+    )
+    store._conn.commit()
     before = _raw(store, memory_id)
     store.refresh_faded_emotions(memory_id, {"joy": 2.0}, _WRITTEN_AT)
     after = _raw(store, memory_id)
+    assert before["cluster_id"] == 7 and before["last_accessed_at"] is not None
     assert {k: v for k, v in after.items() if k not in _CHANGED} == {k: v for k, v in before.items() if k not in _CHANGED}
     assert after["created_at"] != before["created_at"]
     assert after["emotions_json"] != before["emotions_json"]
@@ -193,17 +200,10 @@ def test_refresh_puts_the_old_date_at_the_start_once_and_a_second_refresh_leaves
     assert second["created_at"] == later.isoformat()  # created_at moved again
 
 
-@pytest.mark.parametrize(
-    "content",
-    [
-        pytest.param("2031-03-04: Bob likes tea", id="already-dated-same-day"),
-        pytest.param("1999-12-31: Bob likes tea", id="already-dated-another-day"),
-    ],
-)
-def test_refresh_leaves_a_text_that_already_starts_with_a_date_as_it_is(store, content):
-    # The working prefix form is "<date>: ", so these start with the shape the "already there" test looks for.
-    if store_module.DATE_PREFIX_FORMAT_PLACEHOLDER != "{date}: ":
-        pytest.skip("the working form was re-worded; the already-there shape is derived from the constant (next cells)")
+@pytest.mark.parametrize("day", [pytest.param("2031-03-04", id="same-day"), pytest.param("1999-12-31", id="another-day")])
+def test_refresh_leaves_a_text_that_already_starts_with_a_date_as_it_is(store, day):
+    # Built from the constant, so the cell stays meaningful when the owner re-words the form.
+    content = _prefix(day) + "Bob likes tea"
     memory_id = _make(store, {"joy": 8.0}, content=content)
     store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     assert _raw(store, memory_id)["content"] == content
@@ -408,6 +408,23 @@ def test_a_summary_that_already_starts_with_a_date_is_left_alone_and_the_snapsho
     raw = _raw(store, memory_id)
     assert raw["content"] == _prefix("1999-12-31") + "Bob likes tea"
     assert raw["content_snapshot"] == _prefix("2031-03-04") + "Bob likes tea with honey"
+
+
+def test_a_change_to_the_snapshot_alone_keeps_the_vector_and_does_not_re_embed(store):
+    memory_id = _make(store, {"joy": 8.0}, content="Bob likes tea with honey", embed=True)
+    store.fade(memory_id, summary=_prefix("1999-12-31") + "Bob likes tea")  # the summary is dated, the snapshot is not
+    store.embed_row(memory_id, _prefix("1999-12-31") + "Bob likes tea")  # a vector for the summary the row holds
+    before = _raw(store, memory_id)
+    assert before["embedding"] is not None
+    recorder = _Recorder()
+    store._reembed_or_clear = recorder
+    store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
+    after = _raw(store, memory_id)
+    assert after["content_snapshot"] == _prefix("2031-03-04") + "Bob likes tea with honey"  # the snapshot got its date
+    assert after["content"] == before["content"]
+    assert after["embedding"] == before["embedding"]  # the text the vector describes did not change
+    assert after["embedding_model_id"] == before["embedding_model_id"]
+    assert recorder.calls == []
 
 
 def test_an_active_row_writes_no_snapshot(store):

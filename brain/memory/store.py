@@ -3618,7 +3618,7 @@ class MemoryStore:
         handling is needed here.
 
         The caller (embedding backfill) decides whether to persist a forward
-        cursor after a tick, and — as of F1 #259 increment 7 — that decision
+        cursor after a tick, and, as of F1 #259 increment 7, that decision
         is `hit_batch_limit`-aware, not simply "got back fewer than `limit`
         rows": a tick that stops early because it hit its own `batch_size`
         cap (rows still remain in the fetched window) DOES persist a forward
@@ -3632,8 +3632,8 @@ class MemoryStore:
         `brain/memory/embedding_backfill.py` for the exact condition.
         Backlog membership is not append-only per id regardless — a row can
         re-enter it a SECOND time (a later content edit, or a temp-gate
-        write-back, whose synchronous re-embed attempt fails — see
-        `_reembed_or_clear` — or a model swap) at a rowid the cursor may have
+        write-back, whose synchronous re-embed attempt fails; see
+        `_reembed_or_clear`, or a model swap) at a rowid the cursor may have
         already passed. Such a row is offered again only after a tick resets
         the cursor: a persisted forward position is only ever a scan-cost
         optimization, never a correctness mechanism (a missing/stale cursor
