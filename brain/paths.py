@@ -18,6 +18,8 @@ from pathlib import Path
 
 from platformdirs import PlatformDirs
 
+from brain import dev_constants
+
 _APP_NAME = "companion-emergence"
 _APP_AUTHOR = "hanamorix"
 
@@ -222,3 +224,13 @@ def presence_state_path(persona_dir: Path) -> Path:
     cadence pointer.
     """
     return persona_dir / "presence_state.json"
+
+
+def state_dir(persona_dir: Path) -> Path:
+    """The persona's ``state/`` folder, where the emotion engine keeps its files (the state file, the queue, the change log
+    and the switch). The folder name is ``dev_constants.EMOTION_STATE_DIR``, read at call time.
+
+    Nothing here creates the folder: the writers (``write_json``, ``append_jsonl``, ``file_lock``) each create a missing
+    parent. One resolver, so the day the other persona state files move in, one function changes.
+    """
+    return Path(persona_dir) / dev_constants.EMOTION_STATE_DIR

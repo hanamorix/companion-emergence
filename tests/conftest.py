@@ -431,6 +431,92 @@ def _reset_pass2_queue() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_emotion_engine_registry() -> Iterator[None]:
+    """Clear the emotion engine registry (`engine_for`) before and after each test.
+
+    Engines are one per resolved persona directory, and a store write now reaches the engine for its directory, so a
+    leaked instance (and its state cache) must not outlive its test. It acts only when `brain.emotion.engine` is already
+    imported, and imports nothing from `brain.emotion` itself: the new-tests-must-fail job runs this conftest against
+    product code that has no engine module, and an import here would fail every test there (`CANARY FAILED`).
+    """
+
+    def clear() -> None:
+        module = sys.modules.get("brain.emotion.engine")
+        if module is not None:
+            with module._engines_lock:
+                module._engines.clear()
+
+    clear()
+    yield
+    clear()
+
+
+class EmotionEngineStub:
+    """A settable stand-in for the emotion engine, for tests of the callers (see the `emotion_engine_stub` fixture).
+
+    Every public call of the engine exists. `recorded_calls` holds one entry per hook call, `(name, *arguments in the
+    call's own order)`, for example `("on_memory_shown", memory, at)`; the real engine keeps no such list. The rest is
+    settable: `readings` (what `read()` returns), `live`, `faded` (`(memory_id, emotion) -> value`, else the stored value),
+    `engine_status`, `oldest_entry` and `last_fold_at` (a fixed instant well before any test's "now", so a site that
+    compares its own time with it sees a nonzero interval).
+    """
+
+    def __init__(self) -> None:
+        from datetime import UTC, datetime
+
+        from brain.emotion.engine import EngineStatus
+
+        self.recorded_calls: list[tuple[Any, ...]] = []
+        self.readings: dict[str, Any] = {}
+        self.live = False
+        self.faded: dict[tuple[str, str], float] = {}
+        self.engine_status = EngineStatus(True, None)
+        self.oldest_entry: Any = None
+        self.last_fold_at = datetime(2000, 1, 1, tzinfo=UTC)
+
+    def on_memory_committed(self, memory: Any) -> None:
+        self.recorded_calls.append(("on_memory_committed", memory))
+
+    def on_emotions_assigned(self, memory: Any) -> None:
+        self.recorded_calls.append(("on_emotions_assigned", memory))
+
+    def fold_change(self, emotions: Any, at: Any, source: str) -> None:
+        self.recorded_calls.append(("fold_change", emotions, at, source))
+
+    def on_memory_shown(self, memory: Any, at: Any) -> None:
+        self.recorded_calls.append(("on_memory_shown", memory, at))
+
+    def read(self) -> dict[str, Any]:
+        return dict(self.readings)
+
+    def is_live(self) -> bool:
+        return self.live
+
+    def faded_value(self, memory: Any, emotion: str) -> float:
+        return self.faded.get((memory.id, emotion), memory.emotions[emotion])
+
+    def status(self) -> Any:
+        return self.engine_status
+
+    def oldest_entry_at(self) -> Any:
+        return self.oldest_entry
+
+
+@pytest.fixture
+def emotion_engine_stub(monkeypatch: pytest.MonkeyPatch) -> EmotionEngineStub:
+    """Make `engine.engine_for(<any directory>)` return one settable `EmotionEngineStub`.
+
+    Callers use the receiver form `engine.engine_for(persona_dir).<call>`, so patching the module attribute reaches every
+    call site. The module is imported here, in the body, so a test that does not ask for the stub never needs it.
+    """
+    from brain.emotion import engine
+
+    stub = EmotionEngineStub()
+    monkeypatch.setattr(engine, "engine_for", lambda persona_dir: stub)
+    return stub
+
+
+@pytest.fixture(autouse=True)
 def _fake_embedding_provider_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
