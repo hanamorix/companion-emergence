@@ -11,6 +11,7 @@ this store.
 
 from __future__ import annotations
 
+import functools
 import itertools
 import json
 import logging
@@ -24,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 
@@ -135,6 +136,36 @@ def _emotions_column(emotions: dict[str, float]) -> str:
     """Encode an emotions dict for the ``emotions_json`` column. The batch and the refresh writers share this one encoder, so the
     refresh adds no direct ``json.dumps`` site to ``store.py`` (the json-io allowlist's count for this file does not grow)."""
     return json.dumps(emotions)
+
+
+# PLACEHOLDER WORDING. The date the temp gate's write-back puts at the start of a recalled memory's text (spec section 7
+# item 12, sfa S31(c)) is persona-facing: its exact form is the owner's byte-exact call at the end of the build, and this
+# constant is working text until then. `{date}` stands for the day as YYYY-MM-DD and must appear exactly once. The test for "the
+# text already starts with a date" is built from this same constant, so re-wording it changes the add and the skip together.
+DATE_PREFIX_FORMAT_PLACEHOLDER = "{date}: "
+
+
+@functools.lru_cache(maxsize=8)
+def _date_prefix_pattern(fmt: str) -> re.Pattern[str]:
+    """The pattern for text that already starts with a date in the format `fmt` (one `{date}` marker, or ValueError)."""
+    parts = fmt.split("{date}")
+    if len(parts) != 2:
+        raise ValueError(f"the date prefix format must hold exactly one {{date}} marker: {fmt!r}")
+    return re.compile(re.escape(parts[0]) + r"[0-9]{4}-[0-9]{2}-[0-9]{2}" + re.escape(parts[1]))
+
+
+def _with_date_prefix(text: str, created_at: datetime) -> str:
+    """`text` with the local calendar day of `created_at` at its start, unless it already starts with a date in the working form.
+
+    The day is `engine_utils.day_of`, the one day rule the engine uses. It is imported here, not at the top: `brain.emotion.engine_utils`
+    pulls `brain.utils.memory`, which imports this module.
+    """
+    from brain.emotion.engine_utils import day_of
+
+    fmt = DATE_PREFIX_FORMAT_PLACEHOLDER
+    if _date_prefix_pattern(fmt).match(text):
+        return text
+    return fmt.replace("{date}", day_of(created_at)) + text
 
 
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
@@ -839,6 +870,14 @@ def memories_profile() -> OpenProfile:
     return OpenProfile(busy_timeout_s=dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S)
 
 
+class BacklogRow(NamedTuple):
+    """One row of the embedding backfill's backlog: the row's SQLite ``rowid`` (its position in insertion order, which the
+    backfill persists as its cursor) and the memory itself."""
+
+    rowid: int
+    memory: Memory
+
+
 class MemoryStore:
     """SQLite-backed store for Memory records.
 
@@ -1270,8 +1309,8 @@ class MemoryStore:
         content-mutating path (F1 #259 step 5, flag-2 resolved: SYNCHRONOUS
         re-embed, mirroring `fade()`'s existing synchronous-rewrite
         behavior). Called AFTER the row's content UPDATE has already
-        committed, from `fade()`, `update(memory_id, content=...)`, and
-        `unfade()`.
+        committed, from `fade()`, `update(memory_id, content=...)`,
+        `unfade()` and `refresh_faded_emotions` (when it dated the text).
 
         Row-id keying is NOT self-healing the way the old content-hash cache
         was: new content under the SAME id has no `embedding IS NULL` signal
@@ -2961,7 +3000,8 @@ class MemoryStore:
     def refresh_faded_emotions(
         self, memory_id: str, emotions: dict[str, float], created_at: datetime
     ) -> None:
-        """Write a remembered memory's faded emotion values and a fresh ``created_at`` in ONE UPDATE (the temp gate's write-back).
+        """Write a remembered memory's faded emotion values and a fresh ``created_at`` in ONE UPDATE (the temp gate's write-back),
+        and put the date the row had before the reset at the start of its text.
 
         A stored emotion value means "as of the last time this memory was written or remembered", so ``created_at`` moves with
         it. ``created_at`` is written as ``created_at.isoformat()`` (the ``+00:00`` form `create` writes, because rows are
@@ -2969,16 +3009,62 @@ class MemoryStore:
         empty and ``created_at`` is still written. ``peak_emotion_intensity`` is NOT touched: it is monotone and exists to survive
         fading. No hook fires. Not gated here: the caller decides whether the engine is live.
 
-        Raises KeyError if memory_id does not exist. The write is committed before that is judged: sqlite3 opens a write
-        transaction for an UPDATE that changes no row too, and the store must not stay holding it.
+        The date: so a displayed memory keeps the day it was made once ``created_at`` moves, the row's text gets the local
+        calendar day of its ``created_at`` BEFORE this reset at its start (`DATE_PREFIX_FORMAT_PLACEHOLDER`), unless it already
+        starts with a date in that form, so a second write-back adds nothing. A fading row's original text (``content_snapshot``,
+        which `unfade` restores) is judged and dated the same way, so the day survives an unfade. The row's own text is read
+        here, in the same write transaction (`BEGIN IMMEDIATE`) as the UPDATE, so a text change that landed since the caller
+        loaded the row is kept and the old date is the one the row really held. When the text changed, the same UPDATE clears
+        the row's embedding (a crash then leaves a backfill-eligible NULL, never a vector for the old text), and after the commit
+        the matrix entry is evicted and the row is re-embedded as every content-changing path does (`_reembed_or_clear`); the
+        full-text index follows by its update trigger. An unchanged text keeps its vector.
+
+        Raises KeyError if memory_id does not exist and RuntimeError when the connection is already inside a transaction. On any
+        error the transaction is rolled back and the error raised again, so the store never stays holding the write lock.
         """
-        cursor = self._conn.execute(
-            "UPDATE memories SET emotions_json = ?, created_at = ? WHERE id = ?",
-            (_emotions_column(emotions), created_at.isoformat(), memory_id),
-        )
-        self._conn.commit()
-        if cursor.rowcount == 0:
-            raise KeyError(f"Unknown memory id: {memory_id!r}")
+        if self._conn.in_transaction:
+            raise RuntimeError("refresh_faded_emotions: cannot write inside an open transaction")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT content, content_snapshot, created_at FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown memory id: {memory_id!r}")
+            before = _coerce_utc(row["created_at"])
+            content = _with_date_prefix(row["content"], before)
+            snapshot = row["content_snapshot"]
+            # A fading row's snapshot (the original text `unfade` restores) is dated with the same origin day, so an unfade after
+            # this write-back keeps the day the memory was made. Accepted edge: a summary made by `fade` after an earlier write-back
+            # has no prefix, so a later write-back dates that summary with the last reset day while the snapshot keeps the origin day.
+            new_snapshot = None if snapshot is None else _with_date_prefix(snapshot, before)
+            assignments = ["emotions_json = ?", "created_at = ?"]
+            values: list[Any] = [_emotions_column(emotions), created_at.isoformat()]
+            text_changed = content != row["content"]
+            if text_changed:
+                assignments += ["content = ?", "embedding = NULL", "embedding_model_id = NULL"]
+                values.append(content)
+            if new_snapshot != snapshot:
+                assignments.append("content_snapshot = ?")
+                values.append(new_snapshot)
+            values.append(memory_id)
+            self._conn.execute(f"UPDATE memories SET {', '.join(assignments)} WHERE id = ?", values)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        if text_changed:
+            # As `update(content=...)` does: evict the warm matrix entry (a concurrent recall degrades to lexical rather than
+            # serving the old text's vector), then re-embed synchronously (or clear on failure).
+            try:
+                from brain.memory.embedding_matrix import build_embedding_matrix
+
+                build_embedding_matrix(self.db_path).evict(memory_id)
+            except Exception:  # noqa: BLE001 (best-effort, must not block the write)
+                logger.warning(
+                    "MemoryStore.refresh_faded_emotions: matrix evict failed for id=%s", memory_id, exc_info=True
+                )
+            self._reembed_or_clear(memory_id, content)
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
@@ -3474,8 +3560,8 @@ class MemoryStore:
         export's own timestamp string) are still individually reachable: a
         strict `created_at > ts` filter would make every row but the last
         one at a shared timestamp permanently invisible to a caller that
-        pins its cursor at that timestamp (the embedding backfill did
-        exactly this — see brain/memory/embedding_backfill.py). `id` is a
+        pins its cursor at that timestamp (the embedding backfill's cursor
+        used to; it now walks rowid, see `list_unembedded_since`). `id` is a
         UUID4 string (TEXT PRIMARY KEY); the comparison is a plain
         lexicographic tiebreak, not creation order — it only needs to be a
         stable TOTAL order so no row at a shared timestamp is skipped or
@@ -3483,8 +3569,8 @@ class MemoryStore:
         `list_active()` for a caller that walks the WHOLE corpus a little at
         a time across many calls rather than loading it all at once — same
         `active = 1` filter as `list_active()`. See `list_unembedded_since`
-        below for the sibling scoped to the embedding backlog predicate (the
-        embedding backfill's own backlog query, F1 #259 increment 3).
+        below for the embedding backfill's own backlog query (F1 #259
+        increment 3), which walks insertion order instead.
         """
         if cursor is None:
             sql = (
@@ -3505,18 +3591,30 @@ class MemoryStore:
 
     def list_unembedded_since(
         self,
-        cursor: tuple[str, str] | None,
+        cursor: int | None,
         *,
         limit: int,
         current_model_id: str,
         min_chars: int,
-    ) -> list[Memory]:
+    ) -> list[BacklogRow]:
         """Return up to `limit` ACTIVE memories that are backlog for the
-        embedding backfill, strictly after `cursor`, ordered ASCENDING by
-        (created_at, id) — the embedding backfill's own backlog query (F1
-        #259 increment 3; model-mismatch clause + SQL-level short-row
-        exclusion folded in on Fixing's inc3 spec-gap, Planning-ruled
-        2026-09-16).
+        embedding backfill, strictly after `cursor`, ordered ASCENDING by the
+        row's SQLite ``rowid`` (insertion order): the embedding backfill's
+        own backlog query (F1 #259 increment 3; model-mismatch clause +
+        SQL-level short-row exclusion folded in on Fixing's inc3 spec-gap,
+        Planning-ruled 2026-09-16). Each result carries its rowid
+        (`BacklogRow`), which the caller persists as its cursor.
+
+        The cursor walks insertion order, not ``created_at`` (sfa S31(b)): a
+        row's ``created_at`` can move (the temp gate's write-back resets it
+        when a memory is remembered), and a cursor keyed on it would skip or
+        revisit such a row. ``cursor`` None starts at the top; an int returns
+        rows with ``rowid > cursor``. Memory ids are random (uuid4), so the
+        rowid is the insertion order; nothing in `brain/` runs VACUUM, which
+        is the only thing that renumbers it. A rowid is reused when the
+        highest-rowid row is deleted (the table has no AUTOINCREMENT); the
+        caller's cursor reset, when a tick exhausts the backlog, bounds that
+        harm.
 
         Backlog membership is `embedding IS NULL OR embedding_model_id !=
         current_model_id` — determined directly off the row's OWN columns,
@@ -3548,12 +3646,9 @@ class MemoryStore:
         Python's `len()`; `content` is `NOT NULL` per schema so no NULL
         handling is needed here.
 
-        Same composite keyset cursor semantics as `list_active_since` (see
-        that method's docstring for the tied-created_at rationale) — this is
-        its sibling scoped to the backlog predicate above. The caller
-        (embedding backfill) decides whether to persist a forward cursor
-        after a tick, and — as of F1 #259 increment 7 — that decision is
-        `hit_batch_limit`-aware, not simply "got back fewer than `limit`
+        The caller (embedding backfill) decides whether to persist a forward
+        cursor after a tick, and, as of F1 #259 increment 7, that decision
+        is `hit_batch_limit`-aware, not simply "got back fewer than `limit`
         rows": a tick that stops early because it hit its own `batch_size`
         cap (rows still remain in the fetched window) DOES persist a forward
         cursor even though it saw fewer than `limit` candidates, so a
@@ -3565,33 +3660,27 @@ class MemoryStore:
         `run_embedding_backfill_tick`'s closing comment in
         `brain/memory/embedding_backfill.py` for the exact condition.
         Backlog membership is not append-only per id regardless — a row can
-        re-enter it a SECOND time (a later content edit whose synchronous
-        re-embed attempt fails — see `_reembed_or_clear` — or a model swap)
-        at a `created_at` position the cursor may have already passed — so a
-        persisted forward position is only ever a safe scan-cost
+        re-enter it a SECOND time (a later content edit, or a temp-gate
+        write-back, whose synchronous re-embed attempt fails; see
+        `_reembed_or_clear`, or a model swap) at a rowid the cursor may have
+        already passed. Such a row is offered again only after a tick resets
+        the cursor: a persisted forward position is only ever a scan-cost
         optimization, never a correctness mechanism (a missing/stale cursor
         just means more re-scanning, never a skipped row).
         """
-        if cursor is None:
-            sql = (
-                "SELECT * FROM memories WHERE active = 1 "
-                "AND (embedding IS NULL OR embedding_model_id != ?) "
-                "AND length(content) >= ? "
-                "ORDER BY created_at ASC, id ASC LIMIT ?"
-            )
-            params: list[Any] = [current_model_id, min_chars, limit]
-        else:
-            cursor_ts, cursor_id = cursor
-            sql = (
-                "SELECT * FROM memories WHERE active = 1 "
-                "AND (embedding IS NULL OR embedding_model_id != ?) "
-                "AND length(content) >= ? AND "
-                "(created_at > ? OR (created_at = ? AND id > ?)) "
-                "ORDER BY created_at ASC, id ASC LIMIT ?"
-            )
-            params = [current_model_id, min_chars, cursor_ts, cursor_ts, cursor_id, limit]
+        sql = (
+            "SELECT rowid AS _rowid, * FROM memories WHERE active = 1 "
+            "AND (embedding IS NULL OR embedding_model_id != ?) "
+            "AND length(content) >= ?"
+        )
+        params: list[Any] = [current_model_id, min_chars]
+        if cursor is not None:
+            sql += " AND rowid > ?"
+            params.append(cursor)
+        sql += " ORDER BY rowid ASC LIMIT ?"
+        params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
-        return [_row_to_memory(row) for row in rows]
+        return [BacklogRow(int(row["_rowid"]), _row_to_memory(row)) for row in rows]
 
     def count_unembedded(self, *, current_model_id: str, min_chars: int) -> int:
         """Return a plain, cursor-free COUNT of `list_unembedded_since`'s own

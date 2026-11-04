@@ -859,7 +859,8 @@ def _handle_reappraisals(
     each removed name on the rejects list (S135).
 
     Once the emotion engine is live, a re-appraised row also has its emotions rewritten at their faded values and its
-    ``created_at`` set to now (`_write_back_faded_emotions`): remembering a memory restarts its fading.
+    ``created_at`` set to now (`_write_back_faded_emotions`): remembering a memory restarts its fading. The date it had before
+    the reset goes to the start of its text first, unless it is already there.
 
     Each item runs in its own try (#459): a failure is settled by `_settle_failed_item`, and True is returned when the pass
     must end (an environment failure or a deferred call); the unsettled items stay in the processing file.
@@ -908,8 +909,9 @@ def _handle_reappraisals(
 
 def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Memory) -> None:
     """The temp-gate write-back, once the engine is live: the row's emotions become their faded values and its ``created_at``
-    becomes now, in one store write (`refresh_faded_emotions`, no hook). Every memory type and state, a row without emotions
-    included (its ``created_at`` is still reset). Runs after the importance update committed.
+    becomes now, in one store write (`refresh_faded_emotions`, no hook), which also puts the date the row had before the reset at
+    the start of its text when it is not there yet. Every memory type and state, a row without emotions included (its
+    ``created_at`` is still reset). Runs after the importance update committed.
 
     The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
     have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
@@ -998,13 +1000,13 @@ def _dispatch(
         merged = decision.merged_content
         if not merged:
             merged = _fold(target.content, cand.content)
+        # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
+        live = engine.engine_for(persona_dir).is_live()
         fields: dict = {"content": merged}
-        if engine.engine_for(persona_dir).is_live():
-            # Once the engine is live the merge combines both memories' emotions (see `_merge_emotions`), in the one update that writes the content.
-            # fold=False: a merge is not a new memory, so it queues nothing for the engine. Accepted edge: if this update
-            # commits and the item is retried before claim.settle (the process dies, or an error follows the commit), the
-            # candidate is merged again and the emotions are averaged with it a second time; the content is protected by
-            # `_fold`'s "contains it" rule, the averages are not.
+        if live:
+            # Once the engine is live the merge combines both memories' emotions (see `_merge_emotions`), in the one update that
+            # writes the content. fold=False: the target's own update fires no hook (not even "assigned" when its emotions were
+            # empty); the incoming memory's mood move is sent below.
             fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
         try:
             store.update(target.id, **fields)
@@ -1015,6 +1017,21 @@ def _dispatch(
             pending.enqueue(cand, source="gate-deferred")
             result.deferred += 1
             return
+        if live:
+            # The incoming emotions also move her mood, once, when the merge writes them: the existing commit event, for the
+            # incoming memory `cand`, which is never created as a row (so `create` never sends it). It follows the successful
+            # write, so a deferred merge (above) sends nothing and the tick that finally writes the merge sends it once. The
+            # event follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the
+            # climax reset like any commit. No try here: the engine's hooks never raise into their caller.
+            #
+            # Accepted edges, by owner ruling (spec 3.2; section 6, M06 and MR):
+            # - If the update above commits and the item is retried before claim.settle (the process dies, or an error follows
+            #   the commit), the candidate is merged again: the emotions are averaged with it a second time (the content is
+            #   protected by `_fold`'s "contains it" rule, the averages are not), and the event is sent again and counts at the
+            #   repeat factor 1/2.
+            # - A rebuild or a catch-up counts the merged target row's current emotions once and does not restore this separate
+            #   mood move (the merged memory has no row and the merge writes no change-log line): a lost event, one merge's worth.
+            engine.engine_for(persona_dir).on_memory_committed(cand)
         result.merged += 1
         return
 
