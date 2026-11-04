@@ -90,7 +90,7 @@ insertion order (``MemoryStore.list_unembedded_since``), not by ``created_at`` (
 move (the temp gate's write-back resets it when a memory is remembered) and a cursor keyed on it would skip or revisit such a
 row. Every row has its own distinct rowid, so rows that share a ``created_at`` (bulk migrator imports routinely produce
 duplicate or second-granularity timestamps) are all reachable. A cursor file written before this form existed (the
-``{"created_at", "id"}`` dict or a bare timestamp) reads as unusable — see ``_load_cursor`` — which resets to the top of history
+``{"created_at", "id"}`` dict or a bare timestamp) reads as unusable (see ``_load_cursor``), which resets to the top of history
 rather than guessing; safe and cheap, since a rescan only re-confirms rows already embedded (they no longer satisfy
 `embedding IS NULL`).
 
@@ -342,8 +342,8 @@ def _load_cursor(persona_dir, current_model_id: str) -> int | None:  # noqa: ANN
     ``MemoryStore.list_unembedded_since``): an ``int`` (not a bool) in
     ``0 .. _SQLITE_MAX_ROWID``. Anything else is unusable and reads as None,
     which just rescans from the top: a cursor file written by an earlier
-    build (the ``{"created_at", "id"}`` dict, or a bare timestamp string) —
-    deliberately NOT half-interpreted — or a damaged file. An integer SQLite
+    build (the ``{"created_at", "id"}`` dict, or a bare timestamp string; deliberately
+    NOT half-interpreted) or a damaged file. An integer SQLite
     cannot bind would make every tick raise before the file is rewritten, so
     it is refused here rather than trusted. A rescan only re-confirms rows
     already embedded under the current model (they no longer satisfy the

@@ -3570,7 +3570,7 @@ class MemoryStore:
     ) -> list[BacklogRow]:
         """Return up to `limit` ACTIVE memories that are backlog for the
         embedding backfill, strictly after `cursor`, ordered ASCENDING by the
-        row's SQLite ``rowid`` (insertion order) — the embedding backfill's
+        row's SQLite ``rowid`` (insertion order): the embedding backfill's
         own backlog query (F1 #259 increment 3; model-mismatch clause +
         SQL-level short-row exclusion folded in on Fixing's inc3 spec-gap,
         Planning-ruled 2026-09-16). Each result carries its rowid
