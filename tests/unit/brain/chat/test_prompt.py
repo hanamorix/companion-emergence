@@ -1536,3 +1536,232 @@ def test_image_path_system_message_also_contains_the_inventory(
     )
     assert "`reach_for_capability`" in out
     assert "`propose_write`" in out
+
+
+# ── B2 phase B: the prompt's live readers (engine-backed) ─────────────────────
+#
+# Every live case seeds the file-backed store with values that CONTRADICT what the stub holds, so a site that
+# still read the store would give the stored number and fail. A `:memory:` store reads as not live (it has no
+# directory), so it is the not-live case, never a live one.
+
+
+def _reading(short: float = 0.0, long: float = 0.0, difference: float = 0.0, shift: int = 0):
+    from brain.emotion.engine import Reading
+
+    return Reading(short=short, long=long, difference=difference, shift=shift)
+
+
+def _seed_contradiction(store: MemoryStore) -> None:
+    store.create(
+        Memory.create_new(
+            content="stored joy",
+            memory_type="fact",
+            domain="us",
+            emotions={"joy": 9.0, "rest_need": 9.0, "love": 1.0},
+        )
+    )
+
+
+def test_summary_is_the_top_three_by_long_with_ties_by_name(store, emotion_engine_stub):
+    from brain.chat.prompt import _build_emotion_summary
+
+    _seed_contradiction(store)
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "calm": _reading(long=2.0),
+        "awe": _reading(long=5.0),
+        "love": _reading(long=7.25),
+        "joy": _reading(long=5.0),
+        "grief": _reading(long=0.0),
+    }
+    assert _build_emotion_summary(store) == "love:7.2, awe:5.0, joy:5.0"
+
+
+def test_summary_ranks_a_present_zero_below_non_zero_and_empty_read_is_empty(store, emotion_engine_stub):
+    from brain.chat.prompt import _build_emotion_summary
+
+    _seed_contradiction(store)
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"grief": _reading(long=0.0), "calm": _reading(long=0.5)}
+    assert _build_emotion_summary(store) == "calm:0.5, grief:0.0"
+    emotion_engine_stub.readings = {}
+    assert _build_emotion_summary(store) == ""
+
+
+@pytest.mark.parametrize(
+    ("mode", "count", "expected"),
+    [
+        ("long", 3, "love:7.0, awe:5.0, joy:4.0"),
+        ("long_short", 2, "love:7.0/3.0, awe:5.0/6.0"),
+        ("long_difference", 1, "love:7.0(-4.0)"),
+        ("long", None, "love:7.0, awe:5.0, joy:4.0, calm:2.0"),
+    ],
+)
+def test_summary_mode_and_count_come_from_the_dev_constants(
+    store, emotion_engine_stub, monkeypatch, mode, count, expected
+):
+    from brain import dev_constants
+    from brain.chat.prompt import _build_emotion_summary
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "love": _reading(short=3.0, long=7.0, difference=-4.0, shift=-1),
+        "awe": _reading(short=6.0, long=5.0, difference=1.0, shift=1),
+        "joy": _reading(short=1.0, long=4.0, difference=-3.0),
+        "calm": _reading(short=2.0, long=2.0),
+    }
+    monkeypatch.setattr(dev_constants, "EMOTION_SUMMARY_MODE", mode)
+    monkeypatch.setattr(dev_constants, "EMOTION_SUMMARY_COUNT", count)
+    assert _build_emotion_summary(store) == expected
+
+
+def test_summary_in_memory_store_is_not_live_and_takes_the_old_path(emotion_engine_stub):
+    from brain.chat.prompt import _build_emotion_summary
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"awe": _reading(long=9.0)}
+    mem_store = MemoryStore(db_path=":memory:")
+    try:
+        _seed_contradiction(mem_store)
+        summary = _build_emotion_summary(mem_store)
+    finally:
+        mem_store.close()
+    assert "awe" not in summary
+    assert "joy:9.0" in summary
+
+
+def test_body_block_uses_the_short_average_and_shows_absent_body_emotions_as_absent(
+    store, tmp_path, emotion_engine_stub
+):
+    from brain.chat.prompt import _build_body_block
+
+    _seed_contradiction(store)  # stored rest_need 9.0 would show in the old path
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"arousal": _reading(short=6.5), "love": _reading(short=8.0)}
+    block = _build_body_block(store, tmp_path)
+    assert "body emotions: arousal 6.5" in block
+    assert "rest_need" not in block
+
+
+def test_body_block_with_an_empty_read_has_no_body_emotions_line(store, tmp_path, emotion_engine_stub):
+    from brain.chat.prompt import _build_body_block
+
+    _seed_contradiction(store)
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {}
+    block = _build_body_block(store, tmp_path)
+    assert block.startswith("── body ──")
+    assert "body emotions:" not in block
+
+
+def test_body_block_a_read_that_raises_is_caught_by_the_existing_except(store, tmp_path, emotion_engine_stub):
+    from brain.chat.prompt import _build_body_block
+
+    emotion_engine_stub.live = True
+
+    def boom():
+        raise RuntimeError("engine fault")
+
+    emotion_engine_stub.read = boom
+    assert _build_body_block(store, tmp_path) == ""
+
+
+def test_journal_block_sorts_and_prints_the_faded_values(store, emotion_engine_stub):
+    from brain.chat.prompt import _build_recent_journal_block
+
+    entry = Memory.create_new(
+        content="a journal line",
+        memory_type="journal_entry",
+        domain="us",
+        emotions={"joy": 9.0, "grief": 6.0, "calm": 3.0},
+        metadata={"source": "test"},
+    )
+    store.create(entry)
+    # The faded values reorder the stored ones: grief now outranks joy, calm drops out of the top two.
+    emotion_engine_stub.faded = {(entry.id, "joy"): 2.0, (entry.id, "grief"): 5.0, (entry.id, "calm"): 1.0}
+    block = _build_recent_journal_block(store)
+    assert "primary: grief 5, joy 2" in block
+
+
+def test_journal_block_before_the_switch_prints_the_stored_values(store, emotion_engine_stub):
+    from brain.chat.prompt import _build_recent_journal_block
+
+    store.create(
+        Memory.create_new(
+            content="a journal line",
+            memory_type="journal_entry",
+            domain="us",
+            emotions={"joy": 9.0, "grief": 6.0, "calm": 3.0},
+            metadata={"source": "test"},
+        )
+    )
+    assert "primary: joy 9, grief 6" in _build_recent_journal_block(store)
+
+
+def test_journal_block_in_memory_store_prints_the_stored_values(emotion_engine_stub):
+    from brain.chat.prompt import _build_recent_journal_block
+
+    mem_store = MemoryStore(db_path=":memory:")
+    try:
+        entry = Memory.create_new(
+            content="a journal line",
+            memory_type="journal_entry",
+            domain="us",
+            emotions={"joy": 9.0},
+            metadata={"source": "test"},
+        )
+        mem_store.create(entry)
+        emotion_engine_stub.faded = {(entry.id, "joy"): 1.0}
+        block = _build_recent_journal_block(mem_store)
+    finally:
+        mem_store.close()
+    assert "joy 9" in block
+
+
+def test_self_model_block_is_live_when_the_engine_is_live(tmp_path, emotion_engine_stub):
+    from brain.chat.prompt import _build_self_model_block
+    from brain.self_model.gap import Gap
+    from brain.self_model.state import SelfModelState, save
+
+    gap = Gap(
+        per_channel={"joy": 0.2},  # under the old 0.5 floor: the old render would omit the block
+        magnitude=0.2,
+        unnamed_pressure=0.0,
+        directions={"joy": 1},
+    )
+    save(tmp_path, SelfModelState(current_gap=gap))
+    assert _build_self_model_block(tmp_path) is None
+    emotion_engine_stub.live = True
+    block = _build_self_model_block(tmp_path)
+    assert block is not None and "joy" in block
+
+
+@pytest.mark.parametrize("site", ["mood_summary", "monologue_frame"])
+def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor(store, emotion_engine_stub, site):
+    """The mood summary (X7) and the monologue frame that prints the same string (X8) show the long average as read.
+
+    The stub holds a nonzero interval since the last fold (`last_fold_at` is years before now), so a reader that
+    multiplied an average by a time factor would not show the stub's own numbers. Two reads with no fold between
+    them also return the same text.
+    """
+    from brain.chat.monologue_prompts import build_monologue_frame
+    from brain.chat.prompt import _build_emotion_summary
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "love": _reading(short=1.0, long=7.0),
+        "awe": _reading(short=9.0, long=5.5),
+    }
+
+    def render() -> str:
+        summary = _build_emotion_summary(store)
+        if site == "mood_summary":
+            return summary
+        frame = build_monologue_frame(
+            persona_name="Test", emotion_summary=summary, voice_excerpt="", soul_hints=[], narrative_hints=[]
+        )
+        return [ln for ln in frame.splitlines() if "current emotions:" in ln][0]
+
+    first, second = render(), render()
+    assert first == second
+    assert "love:7.0" in first and "awe:5.5" in first

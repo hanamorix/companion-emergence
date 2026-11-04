@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain import prompt_strings
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
@@ -50,6 +52,9 @@ from brain.memory.store import MemoryStore, split_by_raw_query_floor
 from brain.soul.store import SoulStore
 from brain.tools.naming import fill_tool_prefix, prefix_tool_names
 from brain.utils.time import format_local, to_local
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import Reading
 
 log = logging.getLogger(__name__)
 
@@ -670,37 +675,48 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     try:
         from datetime import UTC, datetime
 
-        from brain.body.state import compute_body_state
+        from brain.body.state import body_state_from_short, compute_body_state
         from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
-        from brain.memory.store import _row_to_memory
+        from brain.emotion import engine
         from brain.utils.memory import days_since_human
 
-        # #90: filter to memories that actually carry an emotion vector. This is
-        # the SAME fix already applied to _build_emotion_summary below and to
-        # _build_emotions / _build_body in brain/bridge/persona_state.py — this
-        # site and get_body_state were missed when it went in.
-        #
-        # Measured on the real persona 2026-08-08: 48 of the 50 most recent
-        # memories were `heartbeat` rows with empty emotions_json, so this
-        # aggregated to {} — the injected body block carried no emotion at all —
-        # while love:10.0 and belonging:10.0 sat just outside the window.
-        # heartbeat writes ~50-75 emotionless memories a day and is 49% of the
-        # store, so the unfiltered window fills within a day of quiet.
-        #
-        # Filtering cannot change the aggregation: an emotionless memory is a
-        # no-op in aggregate_state's max-pool. It only stops the window being
-        # spent on rows that cannot contribute. LIMIT matches the sibling's 200
-        # so the two emotion surfaces in one prompt cannot disagree.
-        rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        memories = [_row_to_memory(row) for row in rows]
-        state = aggregate_state(memories)
+        live_engine = engine.engine_for(persona_dir)
+        is_live = live_engine.is_live()
+
+        if is_live:
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the body block shows baselines.
+            short = {name: r.short for name, r in live_engine.read().items()}
+        else:
+            from brain.emotion.aggregate import aggregate_state
+            from brain.memory.store import _row_to_memory
+
+            # #90: filter to memories that actually carry an emotion vector. This is
+            # the SAME fix already applied to _build_emotion_summary below and to
+            # _build_emotions / _build_body in brain/bridge/persona_state.py — this
+            # site and get_body_state were missed when it went in.
+            #
+            # Measured on the real persona 2026-08-08: 48 of the 50 most recent
+            # memories were `heartbeat` rows with empty emotions_json, so this
+            # aggregated to {} — the injected body block carried no emotion at all —
+            # while love:10.0 and belonging:10.0 sat just outside the window.
+            # heartbeat writes ~50-75 emotionless memories a day and is 49% of the
+            # store, so the unfiltered window fills within a day of quiet.
+            #
+            # Filtering cannot change the aggregation: an emotionless memory is a
+            # no-op in aggregate_state's max-pool. It only stops the window being
+            # spent on rows that cannot contribute. LIMIT matches the sibling's 200
+            # so the two emotion surfaces in one prompt cannot disagree.
+            rows = store._conn.execute(  # noqa: SLF001
+                "SELECT * FROM memories "
+                "WHERE active = 1 "
+                "AND emotions_json IS NOT NULL "
+                "AND emotions_json != '{}' "
+                "ORDER BY created_at DESC LIMIT 200"
+            ).fetchall()
+            memories = [_row_to_memory(row) for row in rows]
+            state = aggregate_state(memories)
+            emotions = state.emotions
         now = datetime.now(UTC)
         days = days_since_human(store, now=now, persona_dir=persona_dir)
         # Chat composer doesn't track session_hours yet — passes 0.0; words
@@ -712,13 +728,22 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
             session_hours=0.0,
             now=now,
         )
-        body = compute_body_state(
-            emotions=state.emotions,
-            session_hours=0.0,
-            words_written=words,
-            days_since_contact=days,
-            now=now,
-        )
+        if is_live:
+            body = body_state_from_short(
+                short,
+                session_hours=0.0,
+                words_written=words,
+                days_since_contact=days,
+                now=now,
+            )
+        else:
+            body = compute_body_state(
+                emotions=emotions,
+                session_hours=0.0,
+                words_written=words,
+                days_since_contact=days,
+                now=now,
+            )
     except Exception:  # noqa: BLE001
         return ""
 
@@ -742,6 +767,16 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     return "\n".join(lines)
 
 
+# How the live mood summary writes one feeling, by `dev_constants.EMOTION_SUMMARY_MODE`: the long average, the long and
+# short averages, or the long average with its signed difference from the short one.
+# PLACEHOLDER wording (spec section 7, item 1): working text only, the final form is the owner's, at the end of the build.
+_EMOTION_SUMMARY_FORMATS: dict[str, Callable[[str, Reading], str]] = {
+    "long": lambda name, r: f"{name}:{r.long:.1f}",
+    "long_short": lambda name, r: f"{name}:{r.long:.1f}/{r.short:.1f}",
+    "long_difference": lambda name, r: f"{name}:{r.long:.1f}({r.difference:+.1f})",
+}
+
+
 def _build_emotion_summary(store: MemoryStore) -> str:
     """Return top-3 emotion summary string from recent emotion-bearing memories.
 
@@ -753,8 +788,28 @@ def _build_emotion_summary(store: MemoryStore) -> str:
     returned an empty top-3 even when emotion-bearing memories existed
     just outside the window. Same fix as _build_emotions / _build_body in
     brain/bridge/persona_state.py (see comments at lines 209-217, 260-264).
+
+    When the emotion engine is live the summary is the top `dev_constants.EMOTION_SUMMARY_COUNT` feelings by long
+    average (highest first, ties by name), written per `dev_constants.EMOTION_SUMMARY_MODE`; "" when the engine
+    reads nothing.
     """
     try:
+        live_engine = store.emotion_engine()
+        if live_engine is not None and live_engine.is_live():
+            from brain import dev_constants
+
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the summary is left out.
+            readings = live_engine.read()
+            if not readings:
+                return ""
+            ranked = sorted(readings.items(), key=lambda item: (-item[1].long, item[0]))
+            count = dev_constants.EMOTION_SUMMARY_COUNT
+            if count is not None:
+                ranked = ranked[:count]
+            write = _EMOTION_SUMMARY_FORMATS[dev_constants.EMOTION_SUMMARY_MODE]
+            return ", ".join(write(name, reading) for name, reading in ranked)
+
         from brain.emotion.aggregate import aggregate_state
         from brain.memory.store import _row_to_memory
 
@@ -1906,6 +1961,7 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
     )
 
     cutoff = datetime.now(UTC) - timedelta(days=window_days)
+    live_engine = store.emotion_engine()
 
     try:
         entries = [m for m in store.list_by_type("journal_entry") if m.created_at >= cutoff]
@@ -1930,9 +1986,13 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
         source = (m.metadata or {}).get("source", "unknown")
         arc_name = (m.metadata or {}).get("reflex_arc_name")
         source_str = f"reflex_arc({arc_name})" if arc_name else source
-        # Top-2 emotions by intensity
+        # Top-2 emotions by intensity, faded (the engine's faded_value returns the stored value until the switch;
+        # an in-memory store has no engine, so its stored values stand).
         emotions = sorted(
-            (m.emotions or {}).items(),
+            (
+                (n, v if live_engine is None else live_engine.faded_value(m, n))
+                for n, v in (m.emotions or {}).items()
+            ),
             key=lambda kv: kv[1],
             reverse=True,
         )[:2]
@@ -2061,11 +2121,14 @@ def _build_self_model_block(persona_dir: Path, *, tool_prefix: str = "") -> str 
     a cold install never breaks chat composition.
     """
     try:
+        from brain.emotion import engine
         from brain.self_model.ambient import render_block
         from brain.self_model.state import load_or_recover
 
         state, _recovered = load_or_recover(persona_dir)
-        return render_block(state, tool_prefix=tool_prefix)
+        return render_block(
+            state, tool_prefix=tool_prefix, live=engine.engine_for(persona_dir).is_live()
+        )
     except Exception:  # noqa: BLE001
         return None
 

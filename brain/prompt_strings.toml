@@ -833,6 +833,22 @@ wire_note_back_message_segments = [
   ''' a note in ''',
 ]
 
+[self_model.ambient]
+# The live self-model block's fragment for one channel (ambient.render_block with live=True), filled with
+# str.format(name=...). One key per (position, direction) pair: position is where the channel sits against its usual
+# level (above or below), direction is which way it is moving (rising or fading). The *_only forms are used when the
+# gap carries no direction for the channel; the level_* forms when the difference is exactly 0.
+# PLACEHOLDER wording (spec section 7, item 3): working text only, the final text is the owner's, byte-exact, at the
+# end of the build.
+above_rising = '''{name} is above where it usually sits and rising'''
+above_fading = '''{name} is above where it usually sits and fading'''
+below_rising = '''{name} is below where it usually sits and rising'''
+below_fading = '''{name} is below where it usually sits and fading'''
+above_only = '''{name} is above where it usually sits'''
+below_only = '''{name} is below where it usually sits'''
+level_rising = '''{name} is rising'''
+level_fading = '''{name} is fading'''
+
 [self_model.articulate]
 # articulate()'s local prompt segments, in order, reassembled around 2
 # vars: deltas_text, f"{gap.unnamed_pressure:.2f}" -- seg[0] + deltas_text
