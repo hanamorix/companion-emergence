@@ -999,7 +999,7 @@ def read_jsonl_from(path: Path | str, start_line: int = 0) -> JsonlRead:
     counted, so it is read whole once it is complete; if a crash left it torn and the next ``append_jsonl`` wrote a newline
     before its own record, it is then a complete, bad line. A missing file gives no records and ``end_line`` 0; a
     ``start_line`` past the end gives no records and the true ``end_line``. Nothing is logged: the caller decides what a bad
-    line is worth. The file is read whole through ``file_ops.read_bytes``, and any other ``OSError`` is raised.
+    line is worth. The file is read whole through ``file_ops.read_bytes`` as raw bytes (a ``.gz`` file is not decompressed), and any other ``OSError`` is raised.
     """
     if start_line < 0:
         raise ValueError(f"start_line must not be negative, got {start_line}")

@@ -139,7 +139,7 @@ class PathStat(NamedTuple):
     @property
     def key(self) -> tuple[int, int, int]:
         """``(inode, mtime_ns, size)``: equal to what :func:`read_bytes_stat` returns for the same, unchanged file."""
-        return (self.inode, self.mtime_ns, self.size)
+        return self[:3]
 
 
 def stat_path(path: str | Path) -> PathStat | None:

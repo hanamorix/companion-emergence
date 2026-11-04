@@ -2,7 +2,7 @@
 
 The helpers that any part of `brain/` may call, so the existing function for a job can be found without searching the whole codebase. One row per function: its name, where it is, and what it is for. Classes are marked `(class)`.
 
-Maintained by hand: a PR that adds, moves or removes a shared function, or changes what one is for, updates this list in the same PR. Line numbers are as of commit 19427474 and drift as files change; the path and name are what to search for.
+Maintained by hand: a PR that adds, moves or removes a shared function, or changes what one is for, updates this list in the same PR. Line numbers were last refreshed by the shared file accessors change (#643) and drift as files change; the path and name are what to search for.
 
 New code uses these instead of writing its own copy. Where none fits, extend the shared one rather than working around it.
 
@@ -14,19 +14,21 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `Recovery` (class) | brain/health/json_io.py:156 | Enum of what a JSON read does with a bad file: DEFAULT (use the default), CONTENT (default for bad content, raise on I/O faults), RAISE, RESTORE (from the .bak chain), HEAL (restore and record an anomaly). |
-| `JsonFileError` (class) | brain/health/json_io.py:168 | Exception for an unusable JSON file; `.kind` is missing, io, empty, malformed, encoding, shape, schema or line; is both an OSError and a ValueError. |
-| `JsonFileNotFound` (class) | brain/health/json_io.py:196 | The `kind == "missing"` JsonFileError; also a FileNotFoundError. |
-| `JsonRead` (class) | brain/health/json_io.py:205 | Result record of read_json_result: `data`, `outcome` (ok, missing, defaulted, restored, reset), `kind` and any `anomaly`. |
-| `read_json` | brain/health/json_io.py:293 | Read a whole JSON file under a Recovery policy (default factory, expected type, validator, fallback files) and return its data. |
-| `read_json_result` | brain/health/json_io.py:313 | Same read as read_json but returns a JsonRead, so the caller can see whether the file was missing, defaulted or restored. |
-| `write_json` | brain/health/json_io.py:720 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
-| `encode_jsonl` | brain/health/json_io.py:836 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
-| `parse_jsonl` | brain/health/json_io.py:864 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict). |
-| `iter_jsonl` | brain/health/json_io.py:894 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning; a missing file yields nothing. |
-| `read_jsonl` | brain/health/json_io.py:929 | iter_jsonl collected into a list. |
-| `iter_jsonl_raw` | brain/health/json_io.py:935 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
-| `read_jsonl_tail` | brain/health/json_io.py:1003 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
+| `Recovery` (class) | brain/health/json_io.py:151 | Enum of what a JSON read does with a bad file: DEFAULT (use the default), CONTENT (default for bad content, raise on I/O faults), RAISE, RESTORE (from the .bak chain), HEAL (restore and record an anomaly). |
+| `JsonFileError` (class) | brain/health/json_io.py:163 | Exception for an unusable JSON file; `.kind` is missing, io, empty, malformed, encoding, shape, schema or line; is both an OSError and a ValueError. |
+| `JsonFileNotFound` (class) | brain/health/json_io.py:191 | The `kind == "missing"` JsonFileError; also a FileNotFoundError. |
+| `JsonRead` (class) | brain/health/json_io.py:200 | Result record of read_json_result: `data`, `outcome` (ok, missing, defaulted, restored, reset), `kind` and any `anomaly`. |
+| `read_json` | brain/health/json_io.py:269 | Read a whole JSON file under a Recovery policy (default factory, expected type, validator, fallback files) and return its data. |
+| `read_json_result` | brain/health/json_io.py:289 | Same read as read_json but returns a JsonRead, so the caller can see whether the file was missing, defaulted or restored. |
+| `write_json` | brain/health/json_io.py:696 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
+| `encode_jsonl` | brain/health/json_io.py:812 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
+| `parse_jsonl` | brain/health/json_io.py:840 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict). |
+| `iter_jsonl` | brain/health/json_io.py:870 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning; a missing file yields nothing. |
+| `read_jsonl` | brain/health/json_io.py:905 | iter_jsonl collected into a list. |
+| `iter_jsonl_raw` | brain/health/json_io.py:911 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
+| `read_jsonl_tail` | brain/health/json_io.py:1024 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
+| `append_jsonl` | brain/health/json_io.py:1114 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
+| `write_jsonl` | brain/health/json_io.py:1181 | Atomically replace a JSONL file with the given records (same writer as write_json). |
 | `read_jsonl_from` | brain/health/json_io.py:992 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. |
 | `JsonlRecord` (class) | brain/health/json_io.py:972 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
 | `JsonlRead` (class) | brain/health/json_io.py:985 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
@@ -37,8 +39,6 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 |---|---|---|
 | `classify_line` | brain/health/jsonl_reader.py:69 | The one place a JSONL line is judged: a usable object, a blank line, or a bad line (invalid UTF-8, unparsable JSON, not an object) with the reason; every JSONL reader calls it. |
 | `LineVerdict` (class) | brain/health/jsonl_reader.py:42 | What classify_line returns: the line's text, its object, the kind of fault and a `reason` property. |
-| `append_jsonl` | brain/health/json_io.py:1093 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
-| `write_jsonl` | brain/health/json_io.py:1160 | Atomically replace a JSONL file with the given records (same writer as write_json). |
 
 ## File access: atomic writes, locks, TOML, SQLite
 
@@ -63,10 +63,10 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `fsync_dir` | brain/utils/atomic_write.py:251 | fsync a directory so a new or renamed entry is durable; POSIX only, best effort, never fails a save. |
-| `save_with_backup_text` | brain/utils/atomic_write.py:303 | Atomic raw-text save with a rotating .bak1..N chain; the live path always holds a complete file. |
-| `save_bytes_atomic` | brain/utils/atomic_write.py:346 | Atomic raw-bytes save: unique temp in the same directory, optional mode and fsync, one retried replace, no backup chain. |
-| `save_blob_once` | brain/utils/atomic_write.py:359 | Write a content-addressed blob once; skips if the target exists and tolerates a concurrent writer of the same content (used by images and file_store). |
+| `fsync_dir` | brain/utils/atomic_write.py:223 | fsync a directory so a new or renamed entry is durable; POSIX only, best effort, never fails a save. |
+| `save_with_backup_text` | brain/utils/atomic_write.py:275 | Atomic raw-text save with a rotating .bak1..N chain; the live path always holds a complete file. |
+| `save_bytes_atomic` | brain/utils/atomic_write.py:318 | Atomic raw-bytes save: unique temp in the same directory, optional mode and fsync, one retried replace, no backup chain. |
+| `save_blob_once` | brain/utils/atomic_write.py:331 | Write a content-addressed blob once; skips if the target exists and tolerates a concurrent writer of the same content (used by images and file_store). |
 
 ### `brain/utils/file_lock.py`
 
@@ -107,7 +107,7 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `rotate_rolling_size` | brain/health/log_rotation.py:79 | Once a log exceeds max_bytes, gzip it to `<log>.1.gz`, shift older archives up (keeping archive_keep), truncate the live log; returns the new archive path or None. |
+| `rotate_rolling_size` | brain/health/log_rotation.py:80 | Once a log exceeds max_bytes, gzip it to `<log>.1.gz`, shift older archives up (keeping archive_keep), truncate the live log; returns the new archive path or None. |
 
 ### `brain/health/parse_failures.py`
 

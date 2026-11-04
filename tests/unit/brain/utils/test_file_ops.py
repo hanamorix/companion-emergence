@@ -326,7 +326,7 @@ def test_delete_tree_raises_when_the_failure_persists(tmp_path: Path, sleeps: li
 def test_delete_tree_never_removes_a_file(tmp_path: Path, sleeps: list[float]) -> None:
     path = tmp_path / "a"
     path.write_bytes(b"x")
-    with pytest.raises(OSError):
+    with pytest.raises(NotADirectoryError if os.name != "nt" else OSError):
         file_ops.delete_tree(path)
     assert path.read_bytes() == b"x"
 

@@ -26,7 +26,7 @@ NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
 
 @pytest.fixture
 def deny(monkeypatch):
-    """deny("needle"): any open() by json_io of a path containing the needle raises PermissionError (not a directory)."""
+    """deny("needle"): any open() by json_io or file_ops of a path containing the needle raises PermissionError (not a directory)."""
     real_open = builtins.open
     needles: list[str] = []
 

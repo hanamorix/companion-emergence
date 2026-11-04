@@ -597,7 +597,6 @@ def test_staging_rename_follows_the_shared_replace_schedule(tmp_path, monkeypatc
     assert overlay.read_state(root)["active"] == entry
 
 
-@pytest.mark.no_base_failure(reason="pins that a refusal that never clears still fails the update, which the old retry did too")
 @pytest.mark.usefixtures("fast_install")
 def test_staging_rename_that_never_succeeds_fails_the_update_and_cleans_up(tmp_path, monkeypatch):
     finds = tmp_path / "finds"
