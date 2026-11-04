@@ -211,15 +211,29 @@ COST_SERIES_WINDOW_S: float = 24 * 60 * 60
 RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.14227
 RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.1659
 
+# --- transient file-access retry (#643) --------------------------------------
+# Windows refuses to replace, delete or open a file another handle holds for a moment (WinError 32: a just-flushed writer,
+# an antivirus scan or indexer on a freshly written file, a reader that is not yet closed). `brain.utils.file_ops
+# .retry_transient` is the one retry for it, and replace, delete and the whole-file read go through it. A failed try is
+# repeated up to FILE_RETRY_ATTEMPTS tries in all, sleeping FILE_RETRY_SLEEP_S * n after the n-th failed try (0.05, 0.10 ...
+# 0.35 s, about 1.4 s in all) before the error is let through, so a real permission problem still fails loudly. A read holds
+# the file for microseconds, so it rides out a rename in progress with fewer tries, and only on Windows: on Linux and macOS a
+# PermissionError is a real one and one attempt is made. These are the values that the copies of the loop in atomic_write and
+# json_io used, moved here unchanged. The update overlay's rename used 6 doubling tries (about 1.55 s) and now follows the
+# replace schedule.
+FILE_RETRY_ATTEMPTS: int = 8
+FILE_RETRY_SLEEP_S: float = 0.05
+FILE_READ_ATTEMPTS: int = 3
+
 # --- settings-file lock wait (#529) ------------------------------------------
 # How long a writer of $KINDLED_HOME/tunables.toml (the install-wide settings file: the picker, `nell model`, the
 # bridge boot pass `sync_file`, the migrations) waits for the file's cross-process lock before it gives up and does not
 # write (`brain.utils.file_lock.locked_within`). One constant serves the tunables lock and the model migration's own lock.
 # It is DERIVED from constants that already exist, not sampled: the longest the holder itself can keep the lock is
 # R_read + (K + 2) * R_replace, where
-#   R_replace = _REPLACE_RETRY_SLEEP_S * (1 + 2 + ... + (_REPLACE_RETRIES - 1))        brain/health/attempt_heal.py
+#   R_replace = FILE_RETRY_SLEEP_S * (1 + 2 + ... + (FILE_RETRY_ATTEMPTS - 1))        (brain.utils.file_ops.retry_transient)
 #             = 0.05 * 28 = 1.4 s (a replace that keeps failing with PermissionError, Windows)
-#   R_read    = the same sum over json_io._READ_ATTEMPTS = 0.05 * (1 + 2) = 0.15 s (Windows only; 0 elsewhere)
+#   R_read    = the same sum over FILE_READ_ATTEMPTS = 0.05 * (1 + 2) = 0.15 s (Windows only; 0 elsewhere)
 #   K         = the replaces made under the lock other than the single atomic write: 0. Nothing heals, quarantines or
 #               writes a notice file while `sync_file` or `set_values` holds the lock (the `unreadable` notice is written
 #               after the lock is released).
