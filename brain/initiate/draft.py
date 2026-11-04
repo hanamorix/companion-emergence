@@ -68,7 +68,7 @@ def compose_draft_fragment(
     source_id: str,
     linked_memory_excerpts: list[str],
     user_name: str = "my user",
-    companion_name: str = "Nell",
+    companion_name: str,
 ) -> str:
     """Compose a paragraph-sized fragment via one cheap LLM call.
 

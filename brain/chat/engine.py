@@ -42,11 +42,13 @@ from brain.chat.tool_loop import build_tools_list, run_tool_loop
 from brain.chat.tool_recruit import select_tools
 from brain.chat.voice import load_voice
 from brain.engines.daemon_state import load_daemon_state
+from brain.ingest.buffer import _now_iso as buffer_now_iso
 from brain.ingest.buffer import read_session
 from brain.initiate import presence_state
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.soul.store import SoulStore
+from brain.tools.naming import tool_prefix_of
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +223,9 @@ def _respond_inner(
     and wall-clock duration.
     """
     t0 = time.monotonic()
+    # When the user sent this message (#598): the prompt line and the stored row carry the same stamp,
+    # so the live line reaches the next turn's history byte-identical (#390).
+    turn_ts = buffer_now_iso()
 
     # 1. Session
     if session is None:
@@ -243,6 +248,9 @@ def _respond_inner(
     if daemon_anomaly is not None:
         logger.warning("daemon_state anomaly: %s", daemon_anomaly.kind)
 
+    # What this backend calls a brain tool, put into every text below as it is built (#417).
+    tool_prefix = tool_prefix_of(provider)
+
     # 4. Soul store
     soul_db = persona_dir / "crystallizations.db"
     soul_store = SoulStore(str(soul_db))
@@ -262,10 +270,11 @@ def _respond_inner(
         # surfaced file path line (that lands only on the outgoing user message
         # below), so a file-send turn's volatile content is equivalent to the
         # same text without a file (C14).
-        system_msg = build_static_system_message(persona_dir, voice_md=voice_md)
+        system_msg = build_static_system_message(persona_dir, voice_md=voice_md, tool_prefix=tool_prefix)
         volatile_suffix: str | None = build_volatile_context(
             persona_dir,
             voice_md=voice_md,
+            tool_prefix=tool_prefix,
             daemon_state=daemon_state,
             soul_store=soul_store,
             store=store,
@@ -280,13 +289,13 @@ def _respond_inner(
     # Resolve any shared files to on-disk paths and append a marked line per
     # file to the OUTGOING user text only. The path line is NOT fed into
     # salience/volatile (computed above on raw user_input) — C14.
-    file_lines = _resolve_shared_file_lines(persona_dir, shared_files)
+    file_lines = _resolve_shared_file_lines(persona_dir, shared_files, tool_prefix=tool_prefix)
     if file_lines:
         file_block = "\n".join(file_lines)
         outgoing_user_text = f"{user_input}\n{file_block}" if user_input else file_block
     else:
         outgoing_user_text = user_input
-    user_msg = ChatMessage(role="user", content=outgoing_user_text)
+    user_msg = ChatMessage(role="user", content=outgoing_user_text, ts=turn_ts)
     try:
         prior_turns = read_session(persona_dir, session.session_id)
         # Note: on call N+1, _persist_turn has already written turn N to
@@ -335,7 +344,7 @@ def _respond_inner(
         logger.warning("salience/recruitment failed; using full tool suite", exc_info=True)
         signal = None
         allowed = None
-    tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed)
+    tools = build_tools_list(companion_name=persona_dir.name, allowed=allowed, tool_prefix=tool_prefix)
 
     # Per-call provider options carrying the Option A+ volatile suffix. On text/
     # stream turns this threads the per-turn context to the provider so it lands
@@ -388,6 +397,7 @@ def _respond_inner(
         user_text=outgoing_user_text,
         assistant_text=content,
         image_rel_paths=image_rel_paths,
+        user_ts=turn_ts,
     )
     session.append_turn(outgoing_user_text, content)
 
@@ -425,6 +435,8 @@ def _respond_inner(
 def _resolve_shared_file_lines(
     persona_dir: Path,
     shared_files: list[dict] | None,
+    *,
+    tool_prefix: str = "",
 ) -> list[str]:
     """Resolve each shared-file reference to its on-disk path and render a
     marked line the model can act on.
@@ -467,7 +479,7 @@ def _resolve_shared_file_lines(
             logger.warning("skipping shared file sha=%s: %s", short, exc)
             continue
         # #269: name the tool in the line itself; the model tends to forget it has read_file.
-        cue = "Open it with your read_file tool to see what it says."
+        cue = f"Open it with your {tool_prefix}read_file tool to see what it says."
         if filename:
             lines.append(f'[the user shared a file "{filename}": {path}. {cue}]')
         else:
@@ -518,6 +530,7 @@ def _persist_turn(
     user_text: str,
     assistant_text: str,
     image_rel_paths: list[str] | None = None,
+    user_ts: str | None = None,
 ) -> tuple[bool, str | None]:
     """Write both turns to the ingest buffer. Errors are logged, not raised.
 
@@ -545,6 +558,8 @@ def _persist_turn(
             "speaker": "user",
             "text": user_text,
         }
+        if user_ts is not None:
+            user_record["ts"] = user_ts  # else persist stamps it now
         image_records: list[dict] = [
             {
                 "session_id": session_id,

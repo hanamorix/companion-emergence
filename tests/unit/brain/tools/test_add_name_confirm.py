@@ -25,10 +25,11 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools.dispatch import ToolDispatchError, dispatch
 from brain.tools.impls.remove_known_name import remove_known_name
+from brain.tools.naming import TOOL_PREFIX_SLOT, fill_tool_prefix
 from brain.tools.schemas import ADD_NAME_TOOL_NAME, REMOVE_NAME_TOOL_NAME
 
 _REPO = Path(__file__).resolve().parents[4]
-ASK = prompt_strings.get("tools.add_name.rejected_reply").format(name="Tuesday")  # wording: test_persona_wording_snapshot.py
+ASK = prompt_strings.get("tools.add_name.rejected_reply").format(name="Tuesday", tool_prefix=TOOL_PREFIX_SLOT)  # wording: test_persona_wording_snapshot.py
 
 
 @pytest.fixture(autouse=True)
@@ -246,7 +247,7 @@ def _mcp_call(persona: Path, name: str, arguments: dict) -> str:
 def test_n31_the_confirm_path_through_the_mcp_entry_point(tmp_path):
     _removed_tuesday(tmp_path)
     first = _mcp_call(tmp_path, "add_name", {"name": "Tuesday"})
-    assert ASK in first and json.loads(first)["added"] is False
+    assert fill_tool_prefix(ASK, "") in first and json.loads(first)["added"] is False
     second = json.loads(_mcp_call(tmp_path, "add_name", {"name": "Tuesday"}))
     assert second == {"added": True, "name": "Tuesday"}
 

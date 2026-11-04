@@ -657,7 +657,7 @@ describe("ChatPanel — initiate banner integration (Task 26)", () => {
   it("notify-urgency desktop notification uses the persona name, not hardcoded 'Nell'", async () => {
     vi.mocked(invoke).mockClear();
     const stream = makeStream();
-    render(<ChatPanel persona="phoebe" eventStream={stream} />);
+    render(<ChatPanel persona="canary" eventStream={stream} />);
 
     await act(async () => {
       stream.emit({
@@ -673,7 +673,7 @@ describe("ChatPanel — initiate banner integration (Task 26)", () => {
     await waitFor(() => {
       expect(invoke).toHaveBeenCalledWith(
         "show_initiate_notification",
-        expect.objectContaining({ title: "Phoebe", body: "you up?" }),
+        expect.objectContaining({ title: "Canary", body: "you up?" }),
       );
     });
     expect(invoke).not.toHaveBeenCalledWith(

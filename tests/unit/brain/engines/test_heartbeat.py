@@ -2247,6 +2247,34 @@ def test_emotion_within_baseline_does_not_emit(tmp_path: Path) -> None:
         engine.hebbian.close()
 
 
+def test_emotion_spike_draft_is_written_in_this_personas_and_users_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#135: the spike-draft call passed neither name, so every persona's draft prompt said "Nell" and "my user"."""
+    prompts: list[str] = []
+
+    class _Recorder:
+        def complete(self, prompt: str) -> str:
+            prompts.append(prompt)
+            return "a quiet note"
+
+    monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", lambda *_a, **_k: _Recorder())
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    (persona_dir / "persona_config.json").write_text(json.dumps({"user_name": "Bob"}), encoding="utf-8")
+    try:
+        for i in range(24):
+            engine.run_tick(trigger="close", forced_resonance=5.0 + 0.2 * (i % 3))
+        engine.run_tick(trigger="close", forced_resonance=5.4)  # the draft band, as in the test below
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
+
+    drafts = [p for p in prompts if "emotion_spike" in p]
+    assert drafts, "the spike tick never composed a draft"
+    assert persona_dir.name in drafts[-1] and "Nell" not in drafts[-1]
+    assert "Bob" in drafts[-1] and "my user" not in drafts[-1]
+
+
 def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
     """A 0.5σ ≤ delta < 1.5σ spike writes a draft fragment, not an initiate."""
     from brain.initiate.emit import read_candidates
