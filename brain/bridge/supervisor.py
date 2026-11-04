@@ -78,6 +78,7 @@ from brain.chat.session import (
     prune_empty_sessions,
     remove_session,
 )
+from brain.emotion import engine as emotion_engine
 from brain.engines import interest_sweep, research_recovery
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
@@ -881,6 +882,13 @@ def run_folded(
                     _maybe_run_kindled_link_tick(persona_dir, provider=provider)
                 except Exception:
                     logger.exception("supervisor kindled-link tick raised")
+
+            # The emotion engine's drain and day close (spec 3.1 S4): the end of the pass, after the kindled block and before the
+            # wait, and never while a chat reply is being generated (the reply path drains after it is sent). `note_active` catches
+            # and logs its own failures and never raises. Accepted edge (E5.16, section 6): a day that ends closes at the next
+            # drain, so the rollover can lag until the next supervisor pass or the next reply.
+            if not cli_throttle.reply_in_flight():
+                emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
 
             # Wait for the next tick or for stop_event, whichever comes first.
             stop_event.wait(timeout=tick_interval_s)

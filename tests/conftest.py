@@ -454,8 +454,8 @@ def _reset_emotion_engine_registry() -> Iterator[None]:
 class EmotionEngineStub:
     """A settable stand-in for the emotion engine, for tests of the callers (see the `emotion_engine_stub` fixture).
 
-    Every public call of the engine exists. `recorded_calls` holds one entry per hook call, `(name, *arguments in the
-    call's own order)`, for example `("on_memory_shown", memory, at)`; the real engine keeps no such list. The rest is
+    Every public call of the engine exists. `recorded_calls` holds one entry per hook call and per `note_active` call, `(name,
+    *arguments in the call's own order)`, for example `("on_memory_shown", memory, at)` or `("note_active", now)`; the real engine keeps no such list. The rest is
     settable: `readings` (what `read()` returns), `live`, `high` (the names `feels_high` answers True for, whatever
     `readings` holds, so a reader's test says which feelings are high independently of the numbers it feeds), `faded`
     (`(memory_id, emotion) -> value`, else the stored value), `engine_status`, `oldest_entry` and `last_fold_at` (a fixed
@@ -487,6 +487,9 @@ class EmotionEngineStub:
 
     def on_memory_shown(self, memory: Any, at: Any) -> None:
         self.recorded_calls.append(("on_memory_shown", memory, at))
+
+    def note_active(self, now: Any) -> None:
+        self.recorded_calls.append(("note_active", now))
 
     def batch(self) -> AbstractContextManager[None]:
         """A context manager that does nothing (the real engine's `batch()` collects events; a caller's test needs only the call to work)."""

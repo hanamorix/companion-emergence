@@ -24,7 +24,7 @@ The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a non-re-
 waits at most ``dev_constants.EMOTION_LOCK_WAIT_S`` (``file_lock.locked_within``) and raises ``LockTimeoutError`` when the wait
 runs out. Every acquisition of it passes the wait; what a caller does on the timeout is that caller's. No other function in
 this module takes it; every caller holds it (a hook around its appends, a drain around its whole run, the rebuild around
-everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``, ``switch_exists``,
+everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``, ``switch_state``, ``switch_exists``,
 ``read_switch``, ``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a writer; the state and
 switch files are replaced atomically, the queue is appended to and emptied atomically, the change log is appended to and
 deleted whole; a queue reader that is not the drain, which holds the lock, can meet a line being appended and does not count
@@ -94,6 +94,14 @@ _BACKUPS = 3
 
 _VOCABULARY_FILENAME = "emotion_vocabulary.json"
 
+
+def vocabulary_path(persona_dir: Path) -> Path:
+    """The persona's vocabulary file (``emotion_vocabulary.json``): the one place its name is joined to a persona folder.
+
+    The half-life cache reads it through this, and the engine's `read()` passes it to the persona loader's refresh.
+    """
+    return Path(persona_dir) / _VOCABULARY_FILENAME
+
 _StatKey = tuple[int, int, int]
 
 
@@ -152,7 +160,7 @@ class VocabularyHalfLives:
     """The persona vocabulary file's numeric half-lives, by canonical name, kept current by stat key."""
 
     def __init__(self, persona_dir: Path) -> None:
-        self._path = Path(persona_dir) / _VOCABULARY_FILENAME
+        self._path = vocabulary_path(persona_dir)
         # One lock covers the stat, the reload and the lookup, so a second thread's first call waits
         # for the load instead of reading the file again or seeing a key without its table.
         self._lock = threading.Lock()
@@ -267,6 +275,10 @@ def peer_trust(persona_dir: Path, peer_id: str) -> float:
     ``peer_trust(persona_dir, peer_id)`` (not built here, not ours). Its expected shape: open
     ``KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)``, read
     ``get_relationship_state(...).trust_score``, and give 0.0 for no database or no relationship row.
+
+    Heads-up for that wiring: the engine's `modifier_of` (which calls this) runs INSIDE the catch-up, which holds the engine
+    lock (``engine_rebuild.catch_up``), once per peer row of the replay. A kindled-link read there is a database read under
+    the engine lock.
     """
     return 0.0
 
@@ -582,7 +594,7 @@ class LoadedState(NamedTuple):
 
     `state` is None when no copy was usable (`problem` says why). `source` is the copy it came from. `key` is the stat key
     ``(inode, mtime_ns, size)`` of the bytes parsed, the walk's ``fstat`` signature as returned (the triple that
-    ``file_ops.stat_path(path).key`` gives for the same file), None when there is no state. `shifts` is what Engine 4
+    ``file_ops.stat_path(path).key`` gives for the same file), None when there is no state. `shifts` is what `EmotionEngine.read`
     works out and stores with `StateCache.store_shifts`. The `state` inside is a mutable object shared by everyone holding
     this tuple: treat it as read-only (a drain that folds reads its own copy with `read_state`).
     """
@@ -670,8 +682,9 @@ class StateCache:
 # ================================================================================================
 
 # The kinds the queue knows. "start" is the start-only event Engine 1 added: it carries only `at`, the creation time of a
-# committed row of a type that does not count, and keeps the persona's start date. It is a memory's own date event, which
-# the spec makes a direct apply (Engine 4 moves it); until then the commit hook appends it to the queue like the others.
+# committed row of a type that does not count, and keeps the persona's start date. It is a memory's own date event: like a
+# commit and an assigned event it is APPLIED directly when the memory is written (`engine.EmotionEngine._apply_direct`), and
+# only a showing and a change are appended to the queue. The check and the JSON form are shared by both routes.
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
 # The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
@@ -1043,8 +1056,12 @@ def write_switch(persona_dir: Path, switch_over_at: datetime) -> bool:
     )
 
 
-def switch_exists(persona_dir: Path) -> bool:
-    """True when the switch file exists. A stat error other than "no such file" is logged and answers False."""
+def switch_state(persona_dir: Path) -> bool | None:
+    """Whether the switch file exists: True when it was seen, False when it is missing, None when the stat failed.
+
+    A stat error other than "no such file" (a permission fault, a share that went away) cannot say either way. It is logged
+    (throttled) and answers None, so a caller can tell a file that was SEEN from one that is only unknown.
+    """
     path = switch_path(persona_dir)
     try:
         return file_ops.stat_path(path) is not None
@@ -1052,11 +1069,20 @@ def switch_exists(persona_dir: Path) -> bool:
         warn_throttled(
             logger,
             f"engine_files:switch:{path}:{exc}",
-            "emotion switch %s cannot be inspected (%s); the engine is treated as not live for now",
+            "emotion switch %s cannot be inspected (%s); the engine is treated as live for now, and not remembered as live",
             path,
             exc,
         )
-        return False
+        return None
+
+
+def switch_exists(persona_dir: Path) -> bool:
+    """True when the switch file exists, and also when that cannot be told (a stat error other than "no such file").
+
+    An unknown counts as live: a persona the engine cannot inspect must not be treated as a new one, whose unreadable state
+    would be replaced by an empty one. The unknown answer is the caller's to keep out of any cache (`switch_state`).
+    """
+    return switch_state(persona_dir) is not False
 
 
 def _switch_time(data: object) -> None:
