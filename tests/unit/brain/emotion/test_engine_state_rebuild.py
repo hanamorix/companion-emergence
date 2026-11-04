@@ -821,7 +821,7 @@ def test_walk_signature_is_that_of_the_bytes_parsed(
 ) -> None:
     path = tmp_path / "f.json"
     path.write_text('{"v": 1}', encoding="utf-8")
-    real = json_io._read_bytes
+    real = json_io.read_bytes_stat
     taken: list[tuple[int, int, int]] = []
 
     def read_then_replace(p: Path):
@@ -830,7 +830,7 @@ def test_walk_signature_is_that_of_the_bytes_parsed(
         p.write_text('{"v": 2222222}', encoding="utf-8")  # a newer file lands after the read
         return raw, sig
 
-    monkeypatch.setattr(json_io, "_read_bytes", read_then_replace)
+    monkeypatch.setattr(json_io, "read_bytes_stat", read_then_replace)
     walk = read_json_walk(path, expect=dict)
     monkeypatch.undo()
     assert walk.data == {"v": 1}
@@ -1320,7 +1320,7 @@ def test_read_state_from_main_is_caught_up(tmp_path: Path) -> None:
     assert (loaded.source, loaded.problem, loaded.caught_up) == ("main", None, True)
     assert loaded.shifts is None
     st = engine_files.state_path(tmp_path).stat()
-    assert loaded.key == (st.st_mtime_ns, st.st_size, st.st_ino)
+    assert loaded.key == (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 def test_a_state_from_a_backup_is_flagged_not_caught_up_and_main_is_not_touched(
@@ -1379,7 +1379,7 @@ def test_the_cache_does_not_read_again_while_the_key_is_unchanged(
     for _ in range(4):
         assert cache.get() is first
     assert len(walks) == 1
-    assert first.key == engine_files._stat_key(engine_files.state_path(tmp_path))
+    assert first.key == file_ops.stat_path(engine_files.state_path(tmp_path)).key
 
 
 def test_the_cache_reloads_when_the_size_changes(tmp_path: Path, walks: list[Path]) -> None:
@@ -1478,7 +1478,7 @@ def test_a_stat_error_on_the_hit_check_falls_through_to_a_re_walk(
     def refuse(path: Path):
         raise PermissionError("no stat")
 
-    monkeypatch.setattr(engine_files, "_stat_key", refuse)
+    monkeypatch.setattr(file_ops, "stat_path", refuse)
     assert cache.get().source == "main"
     assert len(walks) == 2
 

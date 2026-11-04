@@ -526,7 +526,7 @@ class JsonWalk:
 
     ``source`` is ``"main"``, ``"bak1"``, ``"bak2"``, ``"bak3"`` or None (no copy was valid). ``problem`` is None when a copy
     was valid, ``"missing"`` when none of the four files exists, ``"unreadable"`` when at least one exists and none is
-    valid. ``signature`` is the ``(st_ino, st_mtime_ns, st_size)`` that :func:`_read_bytes` took with ``fstat`` on the
+    valid. ``signature`` is the ``(inode, mtime_ns, size)`` that ``file_ops.read_bytes_stat`` took with ``fstat`` on the
     descriptor it read, so it describes the bytes in ``data``, not a later ``stat`` that may describe a newer file; None when
     no copy was valid.
     """
@@ -562,7 +562,7 @@ def read_json_walk(
     for source in _WALK_SOURCES:
         candidate = path if source == "main" else path.with_name(f"{path.name}.{source}")
         try:
-            raw, sig = _read_bytes(candidate)
+            raw, sig = read_bytes_stat(candidate)
         except FileNotFoundError:
             continue
         except OSError as exc:
