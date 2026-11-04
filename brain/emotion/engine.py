@@ -95,6 +95,8 @@ class EmotionEngine:
     def on_memory_shown(self, memory: Memory, at: datetime | None) -> None:
         self.recorded_calls.append(("on_memory_shown", memory, at))
 
+    # --- batch scope (stubbed: does nothing) -------------------------------------------------------
+
     @contextmanager
     def batch(self) -> Iterator[None]:
         """A bulk writer wraps its loop in this block. The stub does nothing.
