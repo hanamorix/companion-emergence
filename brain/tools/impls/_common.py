@@ -7,13 +7,19 @@ _write_gate_check — validate emotion_score + importance against the write gate
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from brain.emotion import engine
 from brain.memory.store import Memory
 from brain.tools.naming import TOOL_PREFIX_SLOT
 from brain.utils.time import format_local
 
 
-def _mem_to_result(memory: Memory) -> dict:
+def _mem_to_result(memory: Memory, persona_dir: Path) -> dict:
     """Slim a Memory dataclass down to the fields the LLM needs.
+
+    ``emotions`` carries the faded values (`faded_value` of this persona's emotion
+    engine; the stored values until the switch).
 
     Mirrors OG nell_tools.py:_mem_to_result shape while using the new
     Memory dataclass attribute names (emotions dict, not emotional_tone).
@@ -22,12 +28,13 @@ def _mem_to_result(memory: Memory) -> dict:
     Memory row itself stays stored in UTC; only this tool-result copy is
     converted.
     """
+    live_engine = engine.engine_for(persona_dir)
     return {
         "id": memory.id,
         "content": memory.content,
         "memory_type": memory.memory_type,
         "domain": memory.domain,
-        "emotions": dict(memory.emotions),
+        "emotions": {n: live_engine.faded_value(memory, n) for n in memory.emotions},
         "tags": list(memory.tags),
         "importance": memory.importance,
         "created_at": format_local(memory.created_at),  # tz-local-display: search/read_full_memory result created_at

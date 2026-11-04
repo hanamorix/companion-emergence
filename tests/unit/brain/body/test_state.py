@@ -351,7 +351,7 @@ _STATE_FILE = "brain/body/state.py"
 # What the module may import: nothing that reaches a file, a socket, a process, a database, a clock-wait or a model.
 _PURE_MODULES = frozenset({"__future__", "collections.abc", "dataclasses", "datetime", "typing"})
 # A brain module may be added here only after checking that it does no I/O; it is then scanned by the same rule.
-_PURE_BRAIN_MODULES: tuple[str, ...] = ()
+_PURE_BRAIN_MODULES: tuple[str, ...] = ("brain.dev_constants",)  # constants only: no import but `__future__`, no call
 _FORBIDDEN_CALLS = frozenset({"__import__", "open", "input", "exec", "eval", "compile", "print"})
 
 

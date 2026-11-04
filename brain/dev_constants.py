@@ -59,6 +59,77 @@ SQLITE_STORE_BUSY_TIMEOUT_S: float = 5.0
 # `brain.memory.known_names`.
 KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 
+# --- emotion half-lives (emotion rework, Engine 0, #575) --------------------
+# The built-in half-life, in days, of each named emotion. `brain.emotion.engine`
+# answers `half_life(name)` from the persona's own vocabulary file first, then
+# this table, then EMOTION_DEFAULT_HALF_LIFE_DAYS. Keys are canonical names
+# (`vocabulary.canonical_name`). Emotions the old vocabulary stored as "never
+# fades" and that have no entry here (body_grief, anchor_pull, freedom_ache) take
+# the default; love and belonging are given their long half-lives here.
+EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
+    "love": 730.0,
+    "belonging": 365.0,
+    "joy": 3.0,
+    "grief": 60.0,
+    "anger": 1.0,
+    "fear": 5.0,
+    "desire": 2.0,
+    "arousal": 0.5,
+    "pride": 7.0,
+    "shame": 14.0,
+    "tenderness": 7.0,
+    "awe": 3.0,
+    "nostalgia": 21.0,
+    "jealousy": 7.0,
+    "guilt": 14.0,
+    "relief": 2.0,
+    "loneliness": 10.0,
+    "curiosity": 2.0,
+    "gratitude": 14.0,
+    "defiance": 5.0,
+    "vulnerability": 5.0,
+    "memory_grief": 30.0,
+    "climax": 0.125,
+    "touch_hunger": 1.5,
+    "comfort_seeking": 1.0,
+    "rest_need": 0.75,
+    "emergence": 60.0,
+    "creative_hunger": 5.0,
+}
+# The half-life of an emotion that is in neither the persona's vocabulary file nor the table above.
+EMOTION_DEFAULT_HALF_LIFE_DAYS: float = 14.0
+
+# --- the rest of the emotion engine's numbers (emotion rework, Engine 1, #576) -----------------------------------------
+# `brain.emotion.engine_utils`. The two averages every emotion keeps: the short one over about a day, the long one over about
+# a month. The same 30 days is the rebuild window, the change-log retention, the shift window and the shift's start gate:
+# one constant, not four.
+EMOTION_SHORT_HALF_LIFE_H: float = 24.0
+EMOTION_LONG_HALF_LIFE_D: float = 30.0
+# Emotion values and averages are held to 0 to this.
+EMOTION_VALUE_CAP: float = 10.0
+# The climax reset, applied to the short averages when a newly committed memory carries a climax of at least the threshold:
+# arousal x factor (never below the floor), desire x factor, comfort_seeking and rest_need + the bump (held to the cap), climax to 0.
+EMOTION_CLIMAX_THRESHOLD: float = 7.0
+EMOTION_CLIMAX_AROUSAL_FACTOR: float = 0.2
+EMOTION_CLIMAX_AROUSAL_FLOOR: float = 0.5
+EMOTION_CLIMAX_DESIRE_FACTOR: float = 0.6
+EMOTION_CLIMAX_RELIEF_BUMP: float = 2.0
+# A stored memory value never fades below this fraction of what was stored, for these emotions only; memory values only,
+# never the averages.
+EMOTION_FADE_FLOOR_FRACTION: dict[str, float] = {"love": 1 / 3, "belonging": 1 / 3}
+# A memory shown again within the window after its first showing counts for the factor, then the factor squared, and so on.
+EMOTION_REPEAT_WINDOW_H: float = 24.0
+EMOTION_REPEAT_FACTOR: float = 0.5
+# Seconds every acquisition of the engine's lock waits before giving up (`brain.utils.file_lock.locked_within`). Fixed here;
+# a wait that calibrates itself to the machine is #642.
+EMOTION_LOCK_WAIT_S: float = 5.0
+# The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
+EMOTION_STATE_DIR: str = "state"
+EMOTION_STATE_FILENAME: str = "emotion_state.json"
+EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
+EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
+EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
+
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
 # to all 4 sqlite stores per orchestrator directive 2026-09-28) ------------
@@ -211,15 +282,29 @@ COST_SERIES_WINDOW_S: float = 24 * 60 * 60
 RAM_FIT_LARGEST_UNDERESTIMATE: float = 0.14227
 RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.1659
 
+# --- transient file-access retry (#643) --------------------------------------
+# Windows refuses to replace, delete or open a file another handle holds for a moment (WinError 32: a just-flushed writer,
+# an antivirus scan or indexer on a freshly written file, a reader that is not yet closed). `brain.utils.file_ops
+# .retry_transient` is the one retry for it, and replace, delete and the whole-file read go through it. A failed try is
+# repeated up to FILE_RETRY_ATTEMPTS tries in all, sleeping FILE_RETRY_SLEEP_S * n after the n-th failed try (0.05, 0.10 ...
+# 0.35 s, about 1.4 s in all) before the error is let through, so a real permission problem still fails loudly. A read holds
+# the file for microseconds, so it rides out a rename in progress with fewer tries, and only on Windows: on Linux and macOS a
+# PermissionError is a real one and one attempt is made. These are the values that the copies of the loop in atomic_write and
+# json_io used, moved here unchanged. The update overlay's rename used 6 doubling tries (about 1.55 s) and now follows the
+# replace schedule.
+FILE_RETRY_ATTEMPTS: int = 8
+FILE_RETRY_SLEEP_S: float = 0.05
+FILE_READ_ATTEMPTS: int = 3
+
 # --- settings-file lock wait (#529) ------------------------------------------
 # How long a writer of $KINDLED_HOME/tunables.toml (the install-wide settings file: the picker, `nell model`, the
 # bridge boot pass `sync_file`, the migrations) waits for the file's cross-process lock before it gives up and does not
 # write (`brain.utils.file_lock.locked_within`). One constant serves the tunables lock and the model migration's own lock.
 # It is DERIVED from constants that already exist, not sampled: the longest the holder itself can keep the lock is
 # R_read + (K + 2) * R_replace, where
-#   R_replace = _REPLACE_RETRY_SLEEP_S * (1 + 2 + ... + (_REPLACE_RETRIES - 1))        brain/health/attempt_heal.py
+#   R_replace = FILE_RETRY_SLEEP_S * (1 + 2 + ... + (FILE_RETRY_ATTEMPTS - 1))        (brain.utils.file_ops.retry_transient)
 #             = 0.05 * 28 = 1.4 s (a replace that keeps failing with PermissionError, Windows)
-#   R_read    = the same sum over json_io._READ_ATTEMPTS = 0.05 * (1 + 2) = 0.15 s (Windows only; 0 elsewhere)
+#   R_read    = the same sum over FILE_READ_ATTEMPTS = 0.05 * (1 + 2) = 0.15 s (Windows only; 0 elsewhere)
 #   K         = the replaces made under the lock other than the single atomic write: 0. Nothing heals, quarantines or
 #               writes a notice file while `sync_file` or `set_values` holds the lock (the `unreadable` notice is written
 #               after the lock is released).
@@ -274,17 +359,22 @@ RECENT_LIVED_HOURS = 720.0  # 30 days. NOTE: compared against WALL-CLOCK age (se
 # P3 retention rework, Change 2: importance lowers the EFFECTIVE fade gate
 # (never LOST_THRESHOLD/LOST_PASS_COUNT: those stay the final deletion gate,
 # per the invariant above: a lever only delays fading, it does not lower
-# the deletion floor). r = clamp(memory.importance / 10, 0, 1); a no-op at
-# r=0 (importance 0 -> today's behavior, byte-identical). Tuned against the
-# C2 simulation so importance-10 survives >= 2 lived-years while importance-0
-# is untouched and the response is monotonic + never-accelerating.
+# the deletion floor). r = importance_ratio(memory.importance)
+# (`brain/memory/memory_utils.py`); a no-op at r=0 (importance 0 -> today's
+# behavior). Tuned against the C2 simulation so importance-10 survives >= 2
+# lived-years while importance-0 is untouched and the response is monotonic +
+# never-accelerating. The emotion fade does NOT use this gain: it lowers the
+# fade gate of the forgetting pass only.
 FADE_IMPORTANCE_GAIN = 2.0
 
 # P3 retention rework, Change 2: importance extends the freshness age-horizon
 # of `brain.forgetting.salience` (the OTHER decay lever, alongside
-# FADE_IMPORTANCE_GAIN). r = clamp(memory.importance / 10, 0, 1); a no-op at
-# r=0 (importance 0 -> the horizon there, unchanged). Tuned against the
-# C2 simulation alongside FADE_IMPORTANCE_GAIN so importance-10 survives >= 2 lived-years.
+# FADE_IMPORTANCE_GAIN). This is the gain of `importance_stretch`
+# (`brain/memory/memory_utils.py`), the one function that holds the formula;
+# the forgetting freshness horizon and the emotion fade (`brain.emotion.engine_utils.fade`)
+# both take their stretch from it, and nothing else reads this gain. A no-op at
+# importance 0 (the stretch is 1.0). Tuned against the C2 simulation alongside
+# FADE_IMPORTANCE_GAIN so importance-10 survives >= 2 lived-years.
 HORIZON_IMPORTANCE_GAIN = 52.0
 
 # --- narrative memory arcs (moved here, #531) --------------------------------
@@ -348,3 +438,23 @@ KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
 # per poll PER PEER. Excess is left un-acked on the relay and surfaced as a
 # degraded state; bounds local decrypt/provider work against a flooding peer.
 KINDLED_LINK_INBOUND_FLOOD_CAP = 20
+
+# --- emotion readers (B2 phase B) ----------------------------------------------
+# The prompt's mood summary (`brain.chat.prompt._build_emotion_summary`) lists this many feelings by long average,
+# highest first; None lists them all. Read at use time, inside the function.
+EMOTION_SUMMARY_COUNT: int | None = 3
+# How each listed feeling is written: "long" (name:L), "long_short" (name:L/S) or "long_difference" (name:L(D), D signed).
+EMOTION_SUMMARY_MODE: str = "long"
+# The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
+# by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
+SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
+
+# A feeling counts as high (`engine.feels_high`, the one predicate the readers that used to fire on a fixed level call) when
+# its short average today is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, taken over that feeling's
+# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high regardless). Owner-set,
+# 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_RANGE_FRACTION: float = 0.5
+# Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
+# `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
+# replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
+BODY_ENERGY_HIGH_COUNT: int = 6

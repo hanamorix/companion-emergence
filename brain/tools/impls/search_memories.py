@@ -56,14 +56,14 @@ def _reinforce_corecall(hebbian, memories: list) -> None:
         logger.debug("co-recall reinforcement failed", exc_info=True)
 
 
-def _snippet_result(memory) -> dict:
+def _snippet_result(memory, persona_dir: Path) -> dict:
     """Slim a Memory to a SNIPPET result: truncated body + id + snippet marker.
 
     Full bodies are surfaced only via ``read_full_memory(id)`` — the model pulls
     the few candidates it actually wants, so mere surfacing stops inflating
     salience. Keeps ``id`` prominent so the follow-up read is a copy-paste.
     """
-    result = _mem_to_result(memory)
+    result = _mem_to_result(memory, persona_dir)
     body = result.get("content") or ""
     max_chars = snippet_length(len(body))
     if len(body) > max_chars:
@@ -340,9 +340,9 @@ def search_memories(
     If emotion is provided, memories whose emotions dict contains that emotion
     key are boosted to the front of the result list. Cap at limit.
 
-    Retrieval is **bump-free** in both modes — surfacing does not touch
-    ``recall_count`` (only a deliberate ``read_full_memory`` → ``store.get()``
-    bumps). ND-1 resolved (owner, 2026-08-14): ``store.update()``/
+    Retrieval is **bump-free** in both modes: surfacing does not touch
+    ``recall_count`` (only opening a memory in full does, through ``open_memory``:
+    ``read_full_memory`` and the recall block's full renders). ND-1 resolved (owner, 2026-08-14): ``store.update()``/
     ``store.deactivate()``'s internal existence-check now also passes
     ``bump=False``, so only a genuine full-read bumps ``recall_count``. See
     ``changes/p2-relevance/decisions.md``. The semantic path never calls
@@ -445,7 +445,7 @@ def search_memories(
         ordered = candidates
 
     _reinforce_corecall(hebbian, ordered[: _CORECALL_FANOUT + 1])
-    results = [_snippet_result(m) for m in ordered[:limit]]
+    results = [_snippet_result(m, persona_dir) for m in ordered[:limit]]
 
     return {
         "query": query,

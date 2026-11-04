@@ -11,6 +11,7 @@ Reading a whole file::
     read_json(path, default=dict)                              # fail soft, evidence logged
     read_json(path, recover=Recovery.RAISE)                    # fail closed: JsonFileError
     read_json_result(path, default=f, recover=Recovery.HEAL)   # quarantine + restore + anomaly
+    read_json_walk(path, expect=dict, validate=check)          # read-only: path, then .bak1-.bak3; says which copy won
     read_json(path, default=dict, recover=Recovery.RESTORE)    # restore from a good backup, else raise
 
 Recovery policies: DEFAULT returns ``default()`` and leaves the file (an I/O fault too); CONTENT does the same for bad
@@ -34,7 +35,8 @@ save of a file with a backup chain use their own sidecar ``<name>.heal.lock``: `
 is held for a bridge's whole life (``bridge.json.lock``) and for a whole heartbeat tick
 (``heartbeat_state.json.lock``), so taking it here would block or deadlock.
 
-This module is now the only JSON heal (the legacy ``attempt_heal`` and its fifteen callers are gone). Two legacy
+This module is now the only JSON heal (the legacy ``attempt_heal`` and its fifteen callers are gone); beside it,
+:func:`read_json_walk` is the one READ-ONLY walk of a file and its backups, for a reader that must not heal. Two legacy
 helpers remain for the held felt-time files only: ``attempt_heal.save_with_backup`` and
 ``jsonl_reader.iter_jsonl_skipping_corrupt``; ``jsonl_reader`` also still owns the line parser this module
 imports. ``Recovery.CONTENT`` is for a caller whose handler swallowed bad content but never an I/O fault: a
@@ -51,7 +53,6 @@ import json
 import logging
 import os
 import shutil
-import time
 import zlib
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
@@ -59,29 +60,25 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from brain.health.anomaly import BrainAnomaly
 from brain.health.attempt_heal import _classify_cause, _filename_safe_timestamp
-from brain.health.jsonl_reader import JsonlLineError, _parse_lines
-from brain.utils.atomic_write import (
-    _REPLACE_RETRY_SLEEP_S,
-    _replace_with_retry,
-    save_with_backup_text,
+from brain.health.jsonl_reader import (
+    _JSON_PARSE_ERRORS,
+    JsonlLineError,
+    _parse_lines,
+    classify_line,
 )
+from brain.utils.atomic_write import save_with_backup_text
 from brain.utils.file_lock import file_lock
+from brain.utils.file_ops import read_bytes, read_bytes_stat, replace_file, stat_path
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
 _ENSURE_ASCII = True
-_IS_WINDOWS = os.name == "nt"
-# A read holds the file for microseconds, so it rides out a rename in progress with far fewer
-# attempts than the writer's 8: three attempts, sleeping 0.05 s then 0.10 s (Windows only).
-_READ_ATTEMPTS = 3
 _BOM = b"\xef\xbb\xbf"
-# JSONDecodeError is a ValueError, and so is the error for an integer of more than 4300 digits.
-_JSON_PARSE_ERRORS = (ValueError, RecursionError)
 _TAIL_CHUNK = 8192
 _PREVIEW = 201  # characters of exception text / line preview in a log message
 _DETAIL = 500  # anomaly detail cap (as attempt_heal)
@@ -246,25 +243,6 @@ class _BadContentError(Exception):
         self.cause = cause
 
 
-def _signature(st: os.stat_result) -> tuple[int, int, int]:
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
-
-
-def _read_bytes(path: Path) -> tuple[bytes, tuple[int, int, int]]:
-    """Read the whole file. Windows retries a transient sharing violation briefly; POSIX never does."""
-    attempts = _READ_ATTEMPTS if _IS_WINDOWS else 1
-    for attempt in range(attempts):
-        try:
-            with open(path, "rb") as fh:
-                sig = _signature(os.fstat(fh.fileno()))
-                return fh.read(), sig
-        except PermissionError:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(_REPLACE_RETRY_SLEEP_S * (attempt + 1))
-    raise AssertionError("unreachable")  # pragma: no cover
-
-
 def _check(
     raw: bytes,
     expect: type | tuple[type, ...] | None,
@@ -338,7 +316,7 @@ def read_json_result(
 
 def _read(path, default, recover, expect, validate, fallbacks, waited: bool) -> JsonRead:
     try:
-        raw, sig = _read_bytes(path)
+        raw, sig = read_bytes_stat(path)
     except FileNotFoundError:
         return _missing(path, default, recover, expect, validate, fallbacks, waited)
     except OSError as exc:
@@ -435,11 +413,11 @@ class _ChangedError(Exception):
 def _expect_unchanged(path: Path, sig: tuple[int, int, int]) -> None:
     if not _HEAL_REVALIDATE:
         return
-    try:
-        if _signature(path.stat()) != sig:
-            raise _ChangedError(f"{path} changed")
-    except FileNotFoundError:
-        raise _ChangedError(f"{path} vanished") from None
+    st = stat_path(path)
+    if st is None:
+        raise _ChangedError(f"{path} vanished")
+    if st.key != sig:
+        raise _ChangedError(f"{path} changed")
 
 
 def _expect_absent(path: Path) -> None:
@@ -450,7 +428,7 @@ def _expect_absent(path: Path) -> None:
 def _after_change(path: Path, expect, validate, original: _BadContentError) -> JsonRead:
     """A competing actor touched the file while we healed: report what is there now, destroy nothing."""
     try:
-        raw, _sig = _read_bytes(path)
+        raw, _sig = read_bytes_stat(path)
     except FileNotFoundError:
         raise JsonFileError(path, original.kind, "file vanished during the heal") from None
     except OSError as exc:
@@ -468,7 +446,7 @@ def _mtime(path: Path) -> float:
 def _valid(path: Path, expect, validate) -> tuple[bool, bool, tuple[int, int, int] | None]:
     """(readable, valid, signature) for a candidate file."""
     try:
-        raw, sig = _read_bytes(path)
+        raw, sig = read_bytes_stat(path)
     except OSError:
         return False, False, None
     try:
@@ -493,7 +471,7 @@ def _heal(
         # Re-validate under the lock: another healer, or a writer, may have fixed the file since we judged it.
         if _HEAL_REVALIDATE:
             try:
-                raw, sig = _read_bytes(path)
+                raw, sig = read_bytes_stat(path)
             except FileNotFoundError:
                 # It vanished between our first read and the lock (a legacy healer, a manual delete). HEAL keeps
                 # attempt_heal's meaning (the default); RESTORE must not say "no data yet" while a good copy exists.
@@ -542,11 +520,70 @@ def _pick(path: Path, expect, validate, fallbacks: tuple[Path, ...]):
     return chosen_bak, chosen_fallback, walked
 
 
+@dataclass(frozen=True)
+class JsonWalk:
+    """What :func:`read_json_walk` found: the parsed value of the first valid copy and which copy it was.
+
+    ``source`` is ``"main"``, ``"bak1"``, ``"bak2"``, ``"bak3"`` or None (no copy was valid). ``problem`` is None when a copy
+    was valid, ``"missing"`` when none of the four files exists, ``"unreadable"`` when at least one exists and none is
+    valid. ``signature`` is the ``(inode, mtime_ns, size)`` that ``file_ops.read_bytes_stat`` took with ``fstat`` on the
+    descriptor it read, so it describes the bytes in ``data``, not a later ``stat`` that may describe a newer file; None when
+    no copy was valid.
+    """
+
+    data: Any
+    source: Literal["main", "bak1", "bak2", "bak3"] | None
+    problem: Literal["missing", "unreadable"] | None
+    signature: tuple[int, int, int] | None
+
+
+_WALK_SOURCES = ("main", "bak1", "bak2", "bak3")
+
+
+def read_json_walk(
+    path: Path,
+    *,
+    expect: type | tuple[type, ...] | None = None,
+    validate: Callable[[Any], None] | None = None,
+) -> JsonWalk:
+    """Read ``path``, then ``path.bak1``..``.bak3``, READ-ONLY: the first copy that parses and passes ``expect`` and
+    ``validate`` wins.
+
+    The sanctioned read-only walk beside the heal path (:func:`_pick` serves the heal and rewrites the file; this does
+    not). Nothing is healed, quarantined, rotated or rewritten, no lock is taken, and nothing is created. For a reader
+    that must never touch a file another part owns, or that wants to know WHICH copy it got (a backup is older than the main
+    file and its caller may need to catch it up). A copy that cannot be used (bad content, or an I/O fault such as a
+    directory in place of the file) is skipped and reported through the throttled :func:`_report`; an absent copy is
+    silent. A ``validate`` that raises anything but ValueError/TypeError is the validator's bug and propagates, as in
+    :func:`read_json`.
+    """
+    path = _as_path(path)
+    found = False
+    for source in _WALK_SOURCES:
+        candidate = path if source == "main" else path.with_name(f"{path.name}.{source}")
+        try:
+            raw, sig = read_bytes_stat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            found = True
+            _report(candidate, "io", exc, "read-only walk: trying the next copy")
+            continue
+        found = True
+        try:
+            data = _check(raw, expect, validate)
+        except _BadContentError as bad:
+            _report(candidate, bad.kind, bad.cause, "read-only walk: trying the next copy")
+            continue
+        return JsonWalk(data, source, None, sig)
+    return JsonWalk(None, None, "unreadable" if found else "missing", None)
+
+
 def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: str):
     """Put the chosen candidate at ``path`` with one atomic replace; returns (data, action, detail)."""
     try:
         if chosen_fallback is not None:
-            raw, _sig = _read_bytes(chosen_fallback)
+            raw, _sig = read_bytes_stat(chosen_fallback)
             data = _check(raw, expect, validate)
             save_with_backup_text(path, raw.decode("utf-8-sig"), keep_backups=False, newline="\n")
             chosen_fallback.unlink(missing_ok=True)
@@ -556,9 +593,9 @@ def _install(path: Path, chosen_bak, chosen_fallback, expect, validate, detail: 
                 f"{detail} | restored from fallback {chosen_fallback.name}"[:_DETAIL],
             )
         index, bak = chosen_bak
-        raw, _sig = _read_bytes(bak)
+        raw, _sig = read_bytes_stat(bak)
         data = _check(raw, expect, validate)
-        _replace_with_retry(bak, path)  # atomic-write: ok -- restores a finished backup file over the live one, a rename of a finished file (the heal), not a write
+        replace_file(bak, path)  # atomic-write: ok -- restores a finished backup file over the live one, a rename of a finished file (the heal), not a write
         return data, f"restored_from_bak{index}", detail
     except (FileNotFoundError, _BadContentError):
         # the candidate was rotated away or rewritten (a save that took no heal sidecar): someone else acted
@@ -647,7 +684,7 @@ def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) 
         try:
             _seam("before_quarantine_backup", corrupt)
             _expect_unchanged(corrupt, csig)
-            _replace_with_retry(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))  # atomic-write: ok -- moves a corrupt backup aside to a .corrupt name, a rename of a finished file (the heal), not a write
+            replace_file(corrupt, corrupt.with_name(f"{corrupt.name}.corrupt-{stamp}"))  # atomic-write: ok -- moves a corrupt backup aside to a .corrupt name, a rename of a finished file (the heal), not a write
         except _ChangedError:
             logger.warning("backup %s changed during the heal; left alone", corrupt)
         except OSError:
@@ -781,7 +818,8 @@ def _save_text(
                 return True
             # Verify under the same lock as the save: no module writer can land between them.
             try:
-                after = _signature(path.stat())
+                st = stat_path(path)
+                after = st.key if st is not None else None
             except OSError:
                 after = None
             _seam("after_save", path)
@@ -804,7 +842,8 @@ def _verify(path: Path, text: str, has_backups: bool, after_save) -> bool:
         if path.read_bytes() == expected:
             return True
         try:
-            now = _signature(path.stat())
+            st = stat_path(path)
+            now = st.key if st is not None else None
         except OSError:
             now = None
         if after_save is not None and now is not None and now != after_save:
@@ -864,7 +903,7 @@ def _check_jsonl_recover(recover: Recovery) -> None:
 def parse_jsonl(
     data: bytes | str, *, source: Path | str = "<memory>", strict: bool = False
 ) -> Iterator[dict]:
-    """Parse JSONL text or bytes already read: the one place bad lines are skipped (or, strict, raised)."""
+    """Parse JSONL text or bytes already read: the one place bad lines are skipped (or, strict, raised); a line the JSON parser cannot load stops the read."""
     raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
     src = _as_path(source)
     try:
@@ -897,7 +936,7 @@ def iter_jsonl(
     """Yield the dict records of a JSONL file (``.gz`` by suffix), skipping bad lines with a warning.
 
     A missing file yields nothing. ``strict=True`` raises ``JsonFileError(kind="line")`` on the first bad
-    line (after yielding the good ones before it). An I/O failure (including a truncated gz) ends the
+    line (after yielding the good ones before it); a line the JSON parser cannot load (an integer past the digit limit, nesting too deep) stops the read with ``UnloadableJsonlLineError`` (#646) in either mode. An I/O failure (including a truncated gz) ends the
     iteration with a throttled warning (DEFAULT) or raises ``JsonFileError(kind="io")`` (RAISE).
     """
     path = _as_path(path)
@@ -945,7 +984,7 @@ def iter_jsonl_raw(
     still see a line it cannot parse (``recall_diagnostics._prune`` removes it). Blank lines are never yielded.
     With ``bad_lines=True`` a line that cannot be used (malformed, invalid UTF-8, not an object) is yielded as
     ``(text, None)`` after its usual warning; otherwise it is only skipped. ``strict`` and ``recover`` behave
-    as in :func:`iter_jsonl`.
+    as in :func:`iter_jsonl`, except for a line the JSON parser cannot load: this reader skips it (strict: ``JsonFileError``).
     """
     path = _as_path(path)
     _check_jsonl_recover(recover)
@@ -969,35 +1008,80 @@ def _stream_raw(binary, source: Path, strict: bool, bad_lines: bool) -> Iterator
     wrapper = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="surrogateescape", newline="\n")
     try:
         for line_index, raw in enumerate(wrapper, start=1):
-            text = raw.rstrip("\r\n")
-            try:
-                raw.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                reason, shown = f"invalid UTF-8 ({exc.reason})", text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
-                record = None
-            else:
-                if not text.strip():
-                    continue
-                try:
-                    data = json.loads(text)
-                except _JSON_PARSE_ERRORS as exc:
-                    reason, shown, record = f"malformed JSON ({exc})", text, None
-                else:
-                    if isinstance(data, dict):
-                        yield text, data
-                        continue
-                    reason, shown, record = f"not a JSON object ({type(data).__name__})", text, None
+            verdict = classify_line(raw)
+            if verdict.kind is None:
+                if verdict.data is not None:
+                    yield verdict.text, verdict.data
+                continue
+            reason = verdict.reason or ""
             if strict:
                 raise _StrictLineError(source, reason, line_index)
+            shown = (
+                verdict.text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+                if verdict.kind == "utf8"
+                else verdict.text
+            )
             logger.warning(
                 "skipping malformed jsonl line %d in %s: %s | content: %r",
                 line_index, source, reason, shown[:_PREVIEW],
             )
             if bad_lines:
-                yield text, record
+                yield verdict.text, None
     finally:
         if not binary.closed:  # an abandoned iterator can be closed after the caller's `with` closed the file
             wrapper.detach()
+
+
+class JsonlRecord(NamedTuple):
+    """One complete line of a JSONL file as :func:`read_jsonl_from` read it.
+
+    ``line`` is the 1-based line number. A usable line has ``data`` (the object) and no ``reason``; a bad line has no
+    ``data`` and a ``reason`` (``malformed JSON (...)``, ``not a JSON object (...)`` or ``invalid UTF-8 (...)``) that carries
+    none of the line's content.
+    """
+
+    line: int
+    data: dict | None
+    reason: str | None
+
+
+class JsonlRead(NamedTuple):
+    """What :func:`read_jsonl_from` found: the records after the start line, and ``end_line``, the number of complete lines."""
+
+    records: list[JsonlRecord]
+    end_line: int
+
+
+def read_jsonl_from(path: Path | str, start_line: int = 0) -> JsonlRead:
+    """Read a JSONL file from a line position: skip the first ``start_line`` complete lines, return the rest.
+
+    A caller that has consumed a file up to line N passes ``start_line=N`` and gets the lines after it, each with its
+    1-based line number, a bad line (malformed JSON, not an object, invalid UTF-8, a NUL or zero-filled line) as a record with
+    no ``data`` and a ``reason``, and ``end_line``: the number of complete lines in the file, the position to pass next time.
+    A blank line counts as a line and gives no record. A last line with no newline yet (a torn write) is not returned and not
+    counted, so it is read whole once it is complete; if a crash left it torn and the next ``append_jsonl`` wrote a newline
+    before its own record, it is then a complete, bad line. A missing file gives no records and ``end_line`` 0; a
+    ``start_line`` past the end gives no records and the true ``end_line``. Nothing is logged: the caller decides what a bad
+    line is worth. The file is read whole through ``file_ops.read_bytes`` as raw bytes (a ``.gz`` file is not decompressed), and any other ``OSError`` is raised.
+    """
+    if start_line < 0:
+        raise ValueError(f"start_line must not be negative, got {start_line}")
+    try:
+        data = read_bytes(path)
+    except FileNotFoundError:
+        return JsonlRead([], 0)
+    if data.startswith(_BOM):
+        data = data[len(_BOM) :]
+    lines = data.split(b"\n")
+    end_line = len(lines) - 1  # the last piece is what follows the final newline: empty, or a torn line
+    records: list[JsonlRecord] = []
+    for number in range(start_line + 1, end_line + 1):
+        verdict = classify_line(lines[number - 1].decode("utf-8", "surrogateescape"))
+        if verdict.kind is not None:
+            records.append(JsonlRecord(number, None, verdict.reason))
+        elif verdict.data is not None:
+            records.append(JsonlRecord(number, verdict.data, None))
+    return JsonlRead(records, end_line)
 
 
 def read_jsonl_tail(

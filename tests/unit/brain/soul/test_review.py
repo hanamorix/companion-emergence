@@ -760,7 +760,7 @@ def test_source_memory_snippet_fail_soft() -> None:
 
     # (c) store raising → None (no exception propagated)
     class _BadStore:
-        def get(self, mid: str):
+        def get(self, mid: str, *, bump: bool = True):
             raise RuntimeError("simulated store error")
 
     assert _source_memory_snippet(_BadStore(), {"memory_id": "any"}) is None  # type: ignore[arg-type]
@@ -780,6 +780,40 @@ def test_source_memory_snippet_fail_soft() -> None:
     assert result is not None
     assert len(result) <= 400
     store_d.close()
+
+
+def test_context_reads_do_not_tick_the_memories_they_read() -> None:
+    """The two reads that feed the review prompt (the source memory and the related memories) are not accesses."""
+    from brain.memory.store import Memory
+    from brain.soul.review import _related_memory_snippets, _source_memory_snippet
+
+    store = MemoryStore(":memory:")
+    source = Memory.create_new(
+        content="the lamp was still on when she fell asleep",
+        memory_type="experience",
+        domain="us",
+        emotions={},
+        importance=8.0,
+    )
+    related = Memory.create_new(
+        content="another night the lamp stayed on until morning",
+        memory_type="experience",
+        domain="us",
+        emotions={},
+        importance=8.0,
+    )
+    store.create(source)
+    store.create(related)
+
+    assert _source_memory_snippet(store, {"memory_id": source.id}) is not None  # the reads ran
+    assert len(_related_memory_snippets(store, "the lamp")) == 2
+
+    for mid in (source.id, related.id):
+        row = store.get(mid, bump=False)
+        assert row is not None
+        assert row.recall_count == 0.0
+        assert row.last_accessed_at is None
+    store.close()
 
 
 def test_review_prompt_carries_source_moment_through_loop(tmp_path: Path) -> None:
@@ -1046,3 +1080,45 @@ def test_expired_not_forgetting_exempt(tmp_path: Path) -> None:
     assert expired_mem_id not in under_review, "expired memory_id must NOT be under-review"
     assert accepted_mem_id not in under_review, "accepted memory_id must NOT be under-review"
     assert rejected_mem_id not in under_review, "rejected memory_id must NOT be under-review"
+
+
+# ── B2 phase B: the review's emotional summary when the engine is live ────────
+
+
+def test_current_emotional_summary_live_is_the_top_three_short_averages(tmp_path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import Reading
+    from brain.memory.store import Memory, MemoryStore
+    from brain.soul.review import _current_emotional_summary
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"anger": 9.0}))
+        emotion_engine_stub.live = True
+        emotion_engine_stub.readings = {
+            "love": Reading(short=6.25, long=0.0, difference=0.0, shift=0),
+            "joy": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+            "awe": Reading(short=3.0, long=0.0, difference=0.0, shift=0),
+            "calm": Reading(short=1.0, long=0.0, difference=0.0, shift=0),
+        }
+        assert _current_emotional_summary(store) == "love:6.2, awe:3.0, calm:1.0"
+        emotion_engine_stub.readings = {}
+        assert _current_emotional_summary(store) == "neutral"
+    finally:
+        store.close()
+
+
+def test_current_emotional_summary_live_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
+    from brain.memory.store import MemoryStore
+    from brain.soul.review import _current_emotional_summary
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        emotion_engine_stub.live = True
+
+        def boom():
+            raise RuntimeError("engine fault")
+
+        emotion_engine_stub.read = boom
+        assert _current_emotional_summary(store) == "unknown"
+    finally:
+        store.close()

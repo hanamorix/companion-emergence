@@ -883,3 +883,39 @@ def test_crystallize_soul_schema_does_not_reference_hana() -> None:
 
     desc = SCHEMAS["crystallize_soul"]["description"]
     assert "Hana" not in desc, f"crystallize_soul description hardcodes 'Hana': {desc!r}"
+
+
+# ── B2 phase B: the emotion tools read the engine's short averages when it is live ──
+
+
+def test_get_emotional_state_live_carries_present_zeros_ranked_last(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import Reading
+    from brain.tools.impls.get_emotional_state import get_emotional_state
+
+    store = _make_store()
+    _seed_memory(store, emotions={"anger": 9.0})  # the stored value must not appear
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "calm": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+        "love": Reading(short=6.0, long=0.0, difference=0.0, shift=0),
+        "joy": Reading(short=2.0, long=0.0, difference=0.0, shift=0),
+    }
+    result = get_emotional_state(store=store, hebbian=_make_hebbian(), persona_dir=tmp_path)
+    assert result["all"] == {"calm": 0.0, "love": 6.0, "joy": 2.0}
+    assert [e["emotion"] for e in result["top_5"]] == ["love", "joy", "calm"]
+    assert result["dominant"] == "love"
+
+
+def test_get_emotional_state_live_empty_read_says_no_active_emotions(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.tools.impls.get_emotional_state import get_emotional_state
+
+    store = _make_store()
+    _seed_memory(store, emotions={"anger": 9.0})
+    emotion_engine_stub.live = True
+    result = get_emotional_state(store=store, hebbian=_make_hebbian(), persona_dir=tmp_path)
+    assert result == {
+        "dominant": None,
+        "top_5": [],
+        "all": {},
+        "summary": "No active emotions recorded.",
+    }

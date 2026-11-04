@@ -320,3 +320,17 @@ def test_failed_reconcile_does_not_increment_audit_counter(tmp_path: Path) -> No
     result = reconcile_self_read(persona_dir=tmp_path, action="accept")
     assert "error" in result
     assert load_audit(tmp_path)["reconciles_called"] == 0
+
+
+def test_reconcile_keeps_the_gaps_directions_and_reset_seen(tmp_path: Path) -> None:
+    """A field missing from the round trip would be dropped at the first reconcile or dismiss."""
+    _seed_open_gap(
+        tmp_path,
+        directions={"grief": -1},
+        reset_seen="2026-11-04T10:00:00+00:00",
+    )
+    reconcile_self_read(persona_dir=tmp_path, action="dismiss", channel="grief")
+    state, _ = load_or_recover(tmp_path)
+    assert state.current_gap.status == "dismissed"
+    assert state.current_gap.directions == {"grief": -1}
+    assert state.current_gap.reset_seen == "2026-11-04T10:00:00+00:00"
