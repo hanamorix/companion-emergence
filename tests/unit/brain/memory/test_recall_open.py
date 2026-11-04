@@ -223,8 +223,11 @@ def test_open_queues_a_showing_in_the_real_engine(tmp_path: Path) -> None:
 
     open_memory(m, store=store, persona_dir=tmp_path, seen=None)
 
-    showings = [e for e in engine_files.read_queue(tmp_path) if e.kind == "showing"]
+    # No state file is ever saved for this persona, so the stored position is the default `queue_line`, 0.
+    queued = engine_files.read_queue(tmp_path, from_line=0)
+    showings = [e for e in queued.events if e.kind == "showing"]
     assert [e.memory_id for e in showings] == [m.id]
+    assert queued.end_line == 1  # one complete line was written
 
 
 def test_open_survives_an_engine_failure_and_logs_it(
