@@ -120,11 +120,22 @@ def test_after_a_crash_tail_append_jsonl_makes_the_fragment_a_counted_bad_line(t
 
 
 @pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-def test_an_over_long_integer_is_a_bad_line_like_in_the_other_readers(tmp_path: Path) -> None:
+def test_an_over_long_integer_is_a_bad_line_like_in_iter_jsonl_raw(tmp_path: Path) -> None:
     huge = b'{"n": ' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}\n"
     path = _write(tmp_path, b'{"a": 1}\n' + huge + b'{"a": 3}\n')
     read = jio.read_jsonl_from(path)
     assert [(r.line, r.data is None) for r in read.records] == [(1, False), (2, True), (3, False)]
+    assert [rec for _text, rec in jio.iter_jsonl_raw(path, bad_lines=True)][1] is None
+
+
+@pytest.mark.skipif(sys.getrecursionlimit() > 100000, reason="needs a depth the parser rejects")
+def test_a_too_deeply_nested_line_is_a_bad_line_with_a_reason(tmp_path: Path) -> None:
+    deep = b"[" * 200000 + b"]" * 200000 + b"\n"
+    path = _write(tmp_path, b'{"a": 1}\n' + deep + b'{"a": 3}\n')
+    read = jio.read_jsonl_from(path)
+    assert [(r.line, r.data is None) for r in read.records] == [(1, False), (2, True), (3, False)]
+    reason = read.records[1].reason
+    assert reason is not None and reason.startswith("malformed JSON")
     assert [rec for _text, rec in jio.iter_jsonl_raw(path, bad_lines=True)][1] is None
 
 

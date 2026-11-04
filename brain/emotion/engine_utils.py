@@ -114,7 +114,9 @@ class EngineState:
 
     `last_update` is the time up to which the weights have been aged; `active_day` is the open day; `oldest_entry_at` is the
     time of the oldest entry folded (never set by a quiet-day zero); `persona_start_at` is the creation time of the persona's
-    oldest memory, which the shift's start gate counts from (null: no memory yet, the gate is closed).
+    oldest memory, which the shift's start gate counts from (null: no memory yet, the gate is closed). `queue_line` is the
+    number of lines of the queue file the engine has already folded: the next drain reads the lines after it. It is saved
+    with the state so that the fold and the position reach the disk in one write.
     """
 
     saved_at: datetime | None = None
@@ -125,6 +127,7 @@ class EngineState:
     persona_start_at: datetime | None = None
     repeats: dict[str, RepeatEntry] = field(default_factory=dict)
     emotions: dict[str, EmotionState] = field(default_factory=dict)
+    queue_line: int = 0
 
 
 @dataclass(frozen=True)

@@ -16,11 +16,14 @@ slices extend this file.
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import dataclasses
 import json
 import logging
 import os
 import pathlib
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -39,7 +42,8 @@ from brain.emotion.engine_utils import (
 )
 from brain.health import json_io
 from brain.health.json_io import JsonRead, JsonWalk, read_json_walk
-from brain.utils import file_ops
+from brain.utils import file_lock, file_ops
+from brain.utils.file_lock import LockTimeoutError
 
 VOCAB = "emotion_vocabulary.json"
 FILES_LOGGER = "brain.emotion.engine_files"
@@ -695,12 +699,73 @@ def test_the_lock_is_the_state_file_sidecar(tmp_path: Path) -> None:
     assert (tmp_path / "state" / "emotion_state.json.lock").exists()
 
 
+def _recording_locked_within(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, float]]:
+    """Replace `file_lock.locked_within` with a recorder that holds no lock; the list holds each (path, wait) it was given."""
+    seen: list[tuple[Path, float]] = []
+
+    @contextlib.contextmanager
+    def recorder(path: Path, seconds: float, **kwargs: object):
+        seen.append((Path(path), seconds))
+        yield
+
+    monkeypatch.setattr(file_lock, "locked_within", recorder)
+    return seen
+
+
+def test_the_lock_is_taken_through_locked_within_with_the_state_path_and_the_dev_constant_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _recording_locked_within(monkeypatch)
+    with engine_files.state_lock(tmp_path):
+        pass
+    assert seen == [(engine_files.state_path(tmp_path), dev_constants.EMOTION_LOCK_WAIT_S)]  # the state file, not the sidecar
+
+
+def test_the_lock_wait_is_read_from_the_dev_constant_at_call_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _recording_locked_within(monkeypatch)
+    monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 0.37)
+    with engine_files.state_lock(tmp_path):
+        pass
+    assert [wait for _, wait in seen] == [0.37]
+
+
+def test_a_wedged_holder_gives_a_lock_timeout_after_the_wait_and_the_body_never_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_lock
+) -> None:
+    """A real second holder (a thread of this process holding the blocking lock). Red on an unbounded lock: the join times out."""
+    monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 0.2)
+    outcome: dict[str, object] = {}
+
+    def attempt() -> None:
+        try:
+            with engine_files.state_lock(tmp_path):
+                outcome["ran"] = True
+        except BaseException as exc:  # reported below, not lost on the worker thread
+            outcome["error"] = exc
+
+    with held_lock(engine_files.state_path(tmp_path)):
+        worker = threading.Thread(target=attempt, name="state-lock-attempt", daemon=True)
+        worker.start()
+        worker.join(5)
+        gave_up_in_time = not worker.is_alive()
+    worker.join(10)  # an unbounded wait ends once the holder lets go, so no thread outlives the test
+    assert gave_up_in_time, "no bound on the wait: the attempt was still waiting 5 s after a 0.2 s wait was set"
+    assert isinstance(outcome.get("error"), LockTimeoutError)
+    assert "ran" not in outcome
+
+
+def test_the_timeout_is_an_oserror_so_a_caller_must_catch_it_first() -> None:
+    assert issubclass(LockTimeoutError, OSError)
+
+
 def test_reading_a_persona_without_a_state_folder_creates_none(tmp_path: Path) -> None:
     assert engine_files.read_state(tmp_path).problem == "missing"
     assert engine_files.StateCache(tmp_path).get().problem == "missing"
     assert engine_files.switch_exists(tmp_path) is False
     assert engine_files.read_switch(tmp_path) is None
-    assert engine_files.read_queue(tmp_path) == []
+    assert engine_files.read_queue(tmp_path, from_line=0) == engine_files.QueueRead([], 0)
     assert engine_files.read_changes(tmp_path, NOW) == []
     assert engine_files.list_change_files(tmp_path) == []
     assert not EmotionEngine(tmp_path).is_live()
@@ -1203,6 +1268,92 @@ def test_the_json_form_round_trips_a_full_state() -> None:
     assert engine_files.state_from_json(engine_files.state_to_json(state)) == state
 
 
+# --- the queue position kept in the state: `queue_line` (S14, S21) ----------------------------
+
+
+def test_a_new_state_starts_at_queue_position_zero() -> None:
+    assert EngineState().queue_line == 0
+
+
+@pytest.mark.parametrize("line", [0, 1, 7, 10**400])
+def test_the_queue_position_is_written_and_round_trips_as_given(line: int) -> None:
+    state = dataclasses.replace(_full_state(), queue_line=line)
+    data = engine_files.state_to_json(state)
+    assert data["queue_line"] == line
+    restored = engine_files.state_from_json(json.loads(json.dumps(data)))
+    assert restored.queue_line == line and restored == state
+
+
+def test_the_queue_position_survives_a_save_and_a_walk(tmp_path: Path) -> None:
+    engine_files.save_state(tmp_path, dataclasses.replace(_full_state(), queue_line=5))
+    loaded = engine_files.read_state(tmp_path)
+    assert loaded.state is not None and loaded.state.queue_line == 5
+
+
+_BAD_QUEUE_LINES = {
+    "missing": None,
+    "a string": "5",
+    "a float": 5.0,
+    "a bool": True,
+    "a negative int": -3,
+    "a list": [1],
+    "a dict": {"a": 1},
+    "nan": float("nan"),
+    "null": None,
+}
+
+
+@pytest.mark.parametrize("case", sorted(_BAD_QUEUE_LINES))
+def test_a_queue_position_that_is_not_a_whole_number_of_zero_or_more_reads_as_zero_with_a_log_line(
+    case: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P12b. `count_throttled` keeps process-global state and the suite runs in random order: the label is unique to the case."""
+    data = _valid_json()
+    if case == "missing":
+        del data["queue_line"]
+    else:
+        data["queue_line"] = _BAD_QUEUE_LINES[case]
+    label = f"{case}-{tmp_path.name}"
+    assert engine_files.validate_state(data) is None  # a pin: a state is never refused for it
+    with caplog.at_level(logging.ERROR, logger=FILES_LOGGER):
+        state = engine_files.state_from_json(data, label=label)
+    assert state.queue_line == 0
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR and label in r.getMessage()]
+    assert len(lines) == 1 and "queue_line" in lines[0]
+
+
+def test_the_queue_position_log_key_holds_the_label_and_the_type_only_and_the_text_caps_the_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    keys: list[str] = []
+    real = engine_files.count_throttled
+
+    def spy(logger: logging.Logger, key: str, *args: object, **kwargs: object):
+        keys.append(key)
+        return real(logger, key, *args, **kwargs)
+
+    monkeypatch.setattr(engine_files, "count_throttled", spy)
+    label = f"keys-{tmp_path.name}"
+    for value in ("SECRET-" + "x" * 5000, [list(range(5000))], {str(i): i for i in range(5000)}, float("nan")):
+        data = _valid_json()
+        data["queue_line"] = value
+        with caplog.at_level(logging.ERROR, logger=FILES_LOGGER):
+            assert engine_files.state_from_json(data, label=label).queue_line == 0
+    assert [key for key in keys if "queue_line" in key] == [
+        f"engine_files:queue_line:{label}:{name}" for name in ("str", "list", "dict", "float")
+    ]
+    assert not any("SECRET" in key for key in keys)
+    assert all(len(r.getMessage()) < 400 for r in caplog.records if label in r.getMessage())
+
+
+def test_a_huge_whole_queue_position_is_kept_without_a_log_line(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    data = _valid_json()
+    data["queue_line"] = 10**400
+    with caplog.at_level(logging.DEBUG, logger=FILES_LOGGER):
+        assert engine_files.state_from_json(data, label=f"huge-{tmp_path.name}").queue_line == 10**400
+    assert [r for r in caplog.records if r.name == FILES_LOGGER] == []
+
+
 def test_the_saved_file_has_the_documented_shape(tmp_path: Path) -> None:
     engine_files.save_state(tmp_path, _full_state())
     engine_files.save_state(tmp_path, _full_state())
@@ -1217,9 +1368,11 @@ def test_the_saved_file_has_the_documented_shape(tmp_path: Path) -> None:
         "active_day",
         "oldest_entry_at",
         "persona_start_at",
+        "queue_line",
         "repeats",
         "emotions",
     }
+    assert data["queue_line"] == 0
     for key in ("saved_at", "reset_at", "last_update", "oldest_entry_at", "persona_start_at"):
         assert data[key].endswith("Z"), key
     assert data["saved_at"] == "2026-06-10T15:30:00Z"
@@ -1380,6 +1533,51 @@ def test_the_cache_does_not_read_again_while_the_key_is_unchanged(
         assert cache.get() is first
     assert len(walks) == 1
     assert first.key == file_ops.stat_path(engine_files.state_path(tmp_path)).key
+
+
+def test_the_cache_hit_check_asks_file_ops_stat_path_for_the_state_file_and_no_raw_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walks: list[Path]
+) -> None:
+    engine_files.save_state(tmp_path, _full_state())
+    cache = engine_files.StateCache(tmp_path)
+    first = cache.get()
+    asked: list[Path] = []
+    real_stat_path = file_ops.stat_path
+
+    def spy(path: str | Path):
+        asked.append(Path(path))
+        return real_stat_path(path)
+
+    def no_raw_stat(self: Path, *args: object, **kwargs: object):
+        raise AssertionError(f"a raw Path.stat of {self}")
+
+    monkeypatch.setattr(file_ops, "stat_path", spy)
+    monkeypatch.setattr(pathlib.Path, "stat", no_raw_stat)
+    assert cache.get() is first
+    assert asked == [engine_files.state_path(tmp_path)]
+    assert len(walks) == 1
+
+
+def test_switch_exists_asks_file_ops_stat_path_for_the_switch_file_and_no_raw_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    written = tmp_path / "written"
+    engine_files.write_switch(written, NOW)
+    asked: list[Path] = []
+    real_stat_path = file_ops.stat_path
+
+    def spy(path: str | Path):
+        asked.append(Path(path))
+        return real_stat_path(path)
+
+    def no_raw_stat(self: Path, *args: object, **kwargs: object):
+        raise AssertionError(f"a raw Path.stat of {self}")
+
+    monkeypatch.setattr(file_ops, "stat_path", spy)
+    monkeypatch.setattr(pathlib.Path, "stat", no_raw_stat)
+    assert engine_files.switch_exists(tmp_path / "absent") is False
+    assert engine_files.switch_exists(written) is True
+    assert asked == [engine_files.switch_path(tmp_path / "absent"), engine_files.switch_path(written)]
 
 
 def test_the_cache_reloads_when_the_size_changes(tmp_path: Path, walks: list[Path]) -> None:
@@ -1612,14 +1810,14 @@ def test_a_stat_error_other_than_not_found_answers_false_logs_and_is_not_cached(
 ) -> None:
     engine_files.write_switch(tmp_path, NOW)
     engine = EmotionEngine(tmp_path)
-    real_stat = pathlib.Path.stat
+    real_stat = file_ops.stat_path
 
-    def refuse(self: Path, *args: object, **kwargs: object):
-        if self.name == "emotion_switch.json":
+    def refuse(path: str | Path):
+        if Path(path).name == "emotion_switch.json":
             raise PermissionError("denied")
-        return real_stat(self, *args, **kwargs)
+        return real_stat(path)
 
-    monkeypatch.setattr(pathlib.Path, "stat", refuse)
+    monkeypatch.setattr(file_ops, "stat_path", refuse)
     with caplog.at_level(logging.WARNING, logger=FILES_LOGGER):
         assert engine.is_live() is False
     assert any("emotion_switch.json" in r.getMessage() for r in caplog.records)

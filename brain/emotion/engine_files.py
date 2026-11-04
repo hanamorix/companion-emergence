@@ -1,7 +1,7 @@
 """The files the emotion engine owns, and the one place that knows their paths and their lock (Engine 0, #575; Engine 2, #577).
 
 Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code of ours creates that folder, because
-``write_json``, ``append_jsonl`` and ``file_lock`` each create a missing parent.
+``write_json``, ``write_jsonl``, ``append_jsonl`` and ``file_lock`` each create a missing parent.
 
 * ``emotion_state.json`` (+ ``.bak1``-``.bak3``): the averages, the weights and a 30-day snapshot per emotion. Written with
   ``write_json(backups=3, indent=None)``. Read through ``json_io.read_json_walk``, the read-only walk with the validator
@@ -9,21 +9,27 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
   fresh objects (what a drain mutates); ``StateCache`` keeps the parsed state for readers by a stat key.
 * ``emotion_pending.jsonl``: the queue of events waiting to be folded, one JSON event per line. Append-only: an append writes
   only its own line, so it costs the same at any depth (a whole-file rewrite per append was quadratic). No backups (a drained
-  queue must not come back from one); the drain removes the file after it has folded the events (``clear_queue``); a missing
-  file is an empty queue; a bad line is dropped on its own with an error log line (``read_queue``).
+  queue must not come back from one). It is read by position: ``read_queue(persona_dir, from_line=N)`` returns the lines after
+  line N and the line count, and the position is kept in the state (``EngineState.queue_line``). The drain empties the file
+  after it has folded the events (``empty_queue``); the engine never deletes it. A missing file is an empty queue; a bad line
+  is dropped on its own with an error log line (``read_queue``); a last line with no newline yet is not a line and is read
+  whole once it is complete.
 * ``emotion_changes/YYYY-MM-DD.jsonl``: the change log, one file a day, a crash-recovery record of chat-derived changes.
   Whole files are deleted once they are older than the retention boundary.
 * ``emotion_switch.json``: ``{"switch_over_at": ...}`` and nothing else, written once; its existence means the engine is live.
 * ``emotion_vocabulary.json`` (the persona's own file, owned by the persona loader and the growth code): only READ here, for
   the half-life cache (``VocabularyHalfLives``, behind ``EmotionEngine.half_life``).
 
-The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a blocking, non-re-entrant ``file_lock`` of the state
-file. No function in this module takes it; every caller holds it (a hook around its appends, a drain around its whole run, the
-rebuild around everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``,
-``switch_exists``, ``read_switch``, ``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a
-writer; the state and switch files are replaced atomically, the queue and the change log are appended to and removed whole; a queue reader
-that is not the drain, which holds the lock, can meet a line being appended and log a false error for it). Expecting the
-caller's lock: ``save_state``, ``append_event``, ``clear_queue``, ``append_change``, ``prune_changes`` and ``write_switch``.
+The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a non-re-entrant ``file_lock`` of the state file that
+waits at most ``dev_constants.EMOTION_LOCK_WAIT_S`` (``file_lock.locked_within``) and raises ``LockTimeoutError`` when the wait
+runs out. Every acquisition of it passes the wait; what a caller does on the timeout is that caller's. No other function in
+this module takes it; every caller holds it (a hook around its appends, a drain around its whole run, the rebuild around
+everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``, ``switch_exists``,
+``read_switch``, ``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a writer; the state and
+switch files are replaced atomically, the queue is appended to and emptied atomically, the change log is appended to and
+deleted whole; a queue reader that is not the drain, which holds the lock, can meet a line being appended and does not count
+it until it is complete). Expecting the caller's lock: ``save_state``, ``append_event``, ``empty_queue``, ``append_change``,
+``prune_changes`` and ``write_switch``.
 
 Times are UTC ISO strings written with ``iso_utc`` (``Z``) and read with ``lenient_utc``; day labels are local ``YYYY-MM-DD``
 from ``engine_utils.day_of``. All constants (file and folder names, the retention length, the value cap) are read as
@@ -44,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import math
+import reprlib
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
@@ -67,17 +74,16 @@ from brain.emotion.engine_utils import (
 )
 from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import (
-    JsonFileError,
     Recovery,
     append_jsonl,
     iter_jsonl,
-    parse_jsonl,
     read_json_result,
     read_json_walk,
+    read_jsonl_from,
     write_json,
+    write_jsonl,
 )
-from brain.utils import file_ops
-from brain.utils.file_lock import file_lock
+from brain.utils import file_lock, file_ops
 from brain.utils.log_throttle import count_throttled, warn_throttled
 from brain.utils.time import iso_utc, lenient_utc
 
@@ -239,13 +245,18 @@ def changes_dir(persona_dir: Path) -> Path:
     return paths.state_dir(persona_dir) / dev_constants.EMOTION_CHANGES_DIRNAME
 
 
-def state_lock(persona_dir: Path) -> AbstractContextManager[bool]:
-    """The one lock of the engine's four files: ``file_lock`` of the state file (sidecar ``emotion_state.json.lock``).
+def state_lock(persona_dir: Path) -> AbstractContextManager[None]:
+    """The one lock of the engine's four files: the lock of the state file (sidecar ``emotion_state.json.lock``), bounded.
 
-    Blocking, no timeout, NOT re-entrant. The hooks, the drain and the rebuild take it through this helper, once each;
-    nothing in this module takes it (see the module docstring).
+    ``file_lock.locked_within`` of the state file path (the lock adds the sidecar name itself), waiting at most
+    ``dev_constants.EMOTION_LOCK_WAIT_S``, read here at call time. When the wait runs out it raises ``LockTimeoutError`` and
+    the ``with`` body never runs. The lock is NOT re-entrant (taking it again inside the body times out). The hooks, the drain
+    and the rebuild take it through this helper, once each; nothing else in this module takes it (see the module docstring).
+
+    ``LockTimeoutError`` is an ``OSError`` (a ``TimeoutError``): a caller that wraps the ``with`` in ``except OSError`` would
+    swallow it, so it catches ``LockTimeoutError`` first. What a caller does on the timeout is that caller's.
     """
-    return file_lock(state_path(persona_dir))
+    return file_lock.locked_within(state_path(persona_dir), dev_constants.EMOTION_LOCK_WAIT_S)
 
 
 def peer_trust(persona_dir: Path, peer_id: str) -> float:
@@ -433,12 +444,44 @@ def _snapshot_from_json(name: str, raw: object, label: str) -> list[SnapshotDay]
     return days
 
 
+_VALUE_REPR = reprlib.Repr()
+_VALUE_REPR.maxstring = _VALUE_REPR.maxother = 40
+_VALUE_REPR.maxlevel = 1
+_VALUE_REPR.maxlist = _VALUE_REPR.maxdict = _VALUE_REPR.maxtuple = _VALUE_REPR.maxset = 3
+
+
+def _queue_line_from(data: Mapping, label: str) -> int:
+    """The stored queue position: a whole number of 0 or more, else 0 with a log line (P12b: a value outside its range is held to it).
+
+    A missing key reads as 0 too (a state written before the position existed). `validate_state` never refuses a state for this
+    key: the worst a damaged position does is make the next drain fold the queue from its start. The log line is throttled per
+    label and kind of fault; its key never holds the value, and its text carries only a short, capped form of it.
+    """
+    if "queue_line" not in data:
+        found, shown = "missing", "missing"
+    else:
+        value = data["queue_line"]
+        if type(value) is int and value >= 0:
+            return value
+        found = type(value).__name__
+        shown = _VALUE_REPR.repr(value)
+    count_throttled(
+        logger,
+        f"engine_files:queue_line:{label}:{found}",
+        logging.ERROR,
+        "emotion state %s: queue_line is %s, read as 0 (it must be a whole number, 0 or more); the next drain folds the queue from its start",
+        label,
+        shown,
+    )
+    return 0
+
+
 def state_from_json(data: dict, *, label: str = "state") -> EngineState:
     """The `EngineState` of a state that passed `validate_state`.
 
     Averages (the state's and the snapshot's) are held to 0-10. A bad snapshot day is dropped as a missing day and a bad
-    repeat record is dropped, each with an error log line naming the emotion or the memory; the state stays valid. `label`
-    names the file in those lines.
+    repeat record is dropped, each with an error log line naming the emotion or the memory; the state stays valid. A missing
+    or unusable `queue_line` reads as 0, with a log line. `label` names the file in those lines.
     """
     repeats: dict[str, RepeatEntry] = {}
     for memory_id, record in data.get("repeats", {}).items():
@@ -473,6 +516,7 @@ def state_from_json(data: dict, *, label: str = "state") -> EngineState:
         persona_start_at=optional("persona_start_at"),
         repeats=repeats,
         emotions=emotions,
+        queue_line=_queue_line_from(data, label),
     )
 
 
@@ -516,6 +560,7 @@ def state_to_json(state: EngineState) -> dict:
         "active_day": state.active_day,
         "oldest_entry_at": _optional_iso(state.oldest_entry_at, "oldest_entry_at"),
         "persona_start_at": _optional_iso(state.persona_start_at, "persona_start_at"),
+        "queue_line": state.queue_line,
         "repeats": {
             memory_id: {"first_at": _iso(entry.first_at, "first_at"), "count": entry.count}
             for memory_id, entry in state.repeats.items()
@@ -536,7 +581,8 @@ class LoadedState(NamedTuple):
     """One load of the state file, immutable as a whole (the cache replaces it with one assignment).
 
     `state` is None when no copy was usable (`problem` says why). `source` is the copy it came from. `key` is the stat key
-    ``(st_mtime_ns, st_size, st_ino)`` of the bytes parsed, from the walk's ``fstat`` signature. `shifts` is what Engine 4
+    ``(inode, mtime_ns, size)`` of the bytes parsed, the walk's ``fstat`` signature as returned (the triple that
+    ``file_ops.stat_path(path).key`` gives for the same file), None when there is no state. `shifts` is what Engine 4
     works out and stores with `StateCache.store_shifts`. The `state` inside is a mutable object shared by everyone holding
     this tuple: treat it as read-only (a drain that folds reads its own copy with `read_state`).
     """
@@ -740,54 +786,66 @@ def event_to_json(event: Event) -> dict:
 # ================================================================================================
 
 
-def read_queue(persona_dir: Path) -> list[Event]:
-    """The valid events of the queue, in file order. A missing file is an empty queue.
+class QueueRead(NamedTuple):
+    """What `read_queue` found: the valid events after the position, and the position to keep for next time.
+
+    `end_line` is the number of complete lines in the queue file (bad lines and blank lines count; a last line with no
+    newline yet does not), which is the `from_line` of the next read once these events are folded.
+    """
+
+    events: list[Event]
+    end_line: int
+
+
+def read_queue(persona_dir: Path, *, from_line: int) -> QueueRead:
+    """The valid events on the queue lines after line `from_line`, in file order, and the line count (`QueueRead`).
+
+    `from_line` is the position the engine saved with its state (`EngineState.queue_line`): the lines up to it are already
+    folded. A missing file is `([], 0)`. If `from_line` is larger than the file's line count, the queue was emptied since the
+    position was saved, so it is read again from line 0 (`end_line` is the file's line count either way). A negative
+    `from_line` is not a position: it is read as 0, with a log line (P12b).
 
     Accepted edge E3 (A3 E6.18, applied per line; owner 2026-10-21 15:02, ledger:337 "Agreed with your extension of the logic
-    to the full rebuild"): a line that is not valid JSON (a torn last line after a crash, a line of zero bytes left by an
-    unclean machine stop, anything else) or that fails the event check is DROPPED with its own ordinary error log line naming
-    the file, the line number and the reason, and the other lines are read. NO rebuild follows. What a drop loses is at most
-    one turn's worth of events (the accepted loss of R12); a rebuild would trade the long average's history older than 30
-    days for them. A line damaged in the middle takes anything glued to it along: nothing is salvaged. A blank line is
-    skipped. The read itself writes nothing: the bad lines stay in the file (and are logged again by the next read) until the
-    drain removes the whole file.
+    to the full rebuild"): a line that is not valid JSON (a line of zero bytes left by an unclean machine stop, anything else)
+    or that fails the event check is DROPPED with its own ordinary error log line naming the file, the line number and the
+    reason, and the other lines are read. NO rebuild follows. What a drop loses is at most one turn's worth of events (the
+    accepted loss of R12); a rebuild would trade the long average's history older than 30 days for them. A line damaged in the
+    middle takes anything glued to it along: nothing is salvaged. A dropped line still counts as a line, and so does a blank
+    one. A last line with no newline yet is a torn write, or an append in flight: it is not returned, not counted and not
+    logged, and is read whole once it is complete (if a crash left it torn, the next append starts a new line, and it is then
+    a complete, bad line). The read itself writes nothing: the bad lines stay in the file (and are logged again by a read from
+    before them) until the drain empties it.
 
     A fault in the READING (permissions, a sharing violation, a directory in the file's place) is not a drop: it raises, the
     queue file is left alone, and the caller's failure handling keeps the queue for the next drain (E6.10).
 
-    Each line is parsed by ``json_io.parse_jsonl(..., strict=True)`` (the one JSON line parser: UTF-8 with a byte-order mark
-    tolerated, CRLF tolerated, a line that is valid JSON but not an object refused). The file is opened here, not read by
-    ``iter_jsonl``, because that reader skips blank lines and bad lines silently as far as the caller can tell (its warning
-    echoes line content and carries no line number the caller can use); this log line needs the physical line number and the
-    reason and echoes no content.
+    The file is read by ``json_io.read_jsonl_from`` (one bytes read, the one line classifier); this function adds the event
+    check and the log lines, which name the physical line number and the reason and echo no content.
     """
     path = queue_path(persona_dir)
+    if from_line < 0:
+        count_throttled(
+            logger,
+            f"engine_files:queue_from_line:{path}",
+            logging.ERROR,
+            "emotion queue %s: the position %d is below 0, read as 0 (the queue is read from its start)",
+            path,
+            from_line,
+        )
+        from_line = 0
+    result = read_jsonl_from(path, from_line)
+    if from_line > result.end_line:
+        result = read_jsonl_from(path, 0)
     events: list[Event] = []
-    try:
-        fh = open(path, "rb")
-    except FileNotFoundError:
-        return events
-    with fh:
-        for number, line in enumerate(fh, start=1):
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                parsed = list(parse_jsonl(text, strict=True))
-            except JsonFileError as exc:  # malformed JSON, invalid UTF-8, valid JSON that is not an object
-                logger.error("emotion queue %s: line %d dropped (%s)", path, number, exc.detail)
-                continue
-            except (ValueError, RecursionError) as exc:  # the two a line can raise that the line parser lets through
-                logger.error("emotion queue %s: line %d dropped (malformed JSON: %s: %s)", path, number, type(exc).__name__, exc)
-                continue
-            if not parsed:  # a line of only a byte-order mark
-                continue
-            raw = parsed[0]
-            try:
-                events.append(event_from_json(raw))
-            except InvalidEventError as exc:
-                logger.error("emotion queue %s: line %d dropped (%s)", path, number, exc)
-    return events
+    for record in result.records:
+        if record.reason is not None or record.data is None:
+            logger.error("emotion queue %s: line %d dropped (%s)", path, record.line, record.reason)
+            continue
+        try:
+            events.append(event_from_json(record.data))
+        except InvalidEventError as exc:
+            logger.error("emotion queue %s: line %d dropped (%s)", path, record.line, exc)
+    return QueueRead(events, result.end_line)
 
 
 def append_event(persona_dir: Path, event: Event) -> bool:
@@ -799,14 +857,31 @@ def append_event(persona_dir: Path, event: Event) -> bool:
     encoded gets an error line here. No fsync, no backups.
 
     R12 (B04.2): an entry lost to a failed append, or damaged by an unclean machine stop, is an accepted minor edge. It is not
-    recovered; a damaged line is dropped on read like a torn one, and takes any record glued to it along.
+    recovered; a damaged line is dropped on read (once it is a complete line), and takes any record glued to it along.
     """
     return _append_line(lambda: queue_path(persona_dir), event, "queue")
 
 
-def clear_queue(persona_dir: Path) -> None:
-    """Remove the queue file (a missing one is fine): the drain's step after it has folded the events (E1.13). The caller holds the lock."""
-    queue_path(persona_dir).unlink(missing_ok=True)
+def empty_queue(persona_dir: Path) -> bool:
+    """Empty the queue file, atomically: True once it is empty, False (with a throttled log line) when it could not be. Never raises.
+
+    ``write_jsonl(path, [], fsync=False)`` replaces the file with an empty one; the engine never deletes it. A failure leaves
+    the queue exactly as it was. The caller holds the lock and has folded every line it read; the position it holds
+    (``EngineState.queue_line``) is the caller's to reset.
+    """
+    path = queue_path(persona_dir)
+    try:
+        write_jsonl(path, [], fsync=False)
+    except OSError as exc:
+        warn_throttled(
+            logger,
+            f"engine_files:empty_queue:{path}:{exc}",
+            "emotion queue %s could not be emptied (%s); the queue is kept as it is",
+            path,
+            exc,
+        )
+        return False
+    return True
 
 
 # ================================================================================================
@@ -854,25 +929,27 @@ def append_change(persona_dir: Path, event: Event) -> bool:
 def list_change_files(persona_dir: Path) -> list[str]:
     """The names (only) of the change-log files, oldest first: regular files named ``YYYY-MM-DD.jsonl`` for a real day.
 
-    A missing folder is empty. A folder that cannot be listed is logged and treated as missing.
+    The folder is listed with ``file_ops.list_dir``; a name that matches the pattern is kept only when
+    ``file_ops.stat_path`` says it is a regular file, so a folder named like a day is never listed (and never deleted). An
+    entry that vanished (no stat) or whose stat fails is skipped. A missing folder is empty. A folder that cannot be listed is
+    logged and treated as missing.
     """
     folder = changes_dir(persona_dir)
     try:
-        entries = list(folder.iterdir())
-    except FileNotFoundError:
-        return []
+        entries = file_ops.list_dir(folder)
     except OSError as exc:
         logger.error("emotion change log folder %s cannot be listed (%s); treated as missing", folder, exc)
         return []
     names: list[str] = []
-    for entry in entries:
-        if _name_to_day(entry.name) is None:
+    for name in entries:
+        if _name_to_day(name) is None:
             continue
         try:
-            if entry.is_file():
-                names.append(entry.name)
+            stat = file_ops.stat_path(folder / name)
         except OSError:
             continue
+        if stat is not None and stat.is_file:
+            names.append(name)
     return sorted(names)
 
 
@@ -898,9 +975,7 @@ def prune_changes(persona_dir: Path, anchor_day: str | None) -> list[str]:
         if day is None or day >= boundary:
             continue
         try:
-            (changes_dir(persona_dir) / name).unlink()
-        except FileNotFoundError:
-            continue
+            file_ops.delete_file(changes_dir(persona_dir) / name)
         except OSError as exc:
             logger.error("emotion change log: %s could not be deleted (%s); it is tried again at the next day close", name, exc)
             continue
@@ -970,9 +1045,7 @@ def switch_exists(persona_dir: Path) -> bool:
     """True when the switch file exists. A stat error other than "no such file" is logged and answers False."""
     path = switch_path(persona_dir)
     try:
-        path.stat()
-    except FileNotFoundError:
-        return False
+        return file_ops.stat_path(path) is not None
     except OSError as exc:
         warn_throttled(
             logger,
@@ -982,7 +1055,6 @@ def switch_exists(persona_dir: Path) -> bool:
             exc,
         )
         return False
-    return True
 
 
 def _switch_time(data: object) -> None:

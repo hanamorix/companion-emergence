@@ -903,7 +903,7 @@ def _check_jsonl_recover(recover: Recovery) -> None:
 def parse_jsonl(
     data: bytes | str, *, source: Path | str = "<memory>", strict: bool = False
 ) -> Iterator[dict]:
-    """Parse JSONL text or bytes already read: the one place bad lines are skipped (or, strict, raised)."""
+    """Parse JSONL text or bytes already read: the one place bad lines are skipped (or, strict, raised); a line the JSON parser cannot load stops the read."""
     raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
     src = _as_path(source)
     try:
@@ -936,7 +936,7 @@ def iter_jsonl(
     """Yield the dict records of a JSONL file (``.gz`` by suffix), skipping bad lines with a warning.
 
     A missing file yields nothing. ``strict=True`` raises ``JsonFileError(kind="line")`` on the first bad
-    line (after yielding the good ones before it). An I/O failure (including a truncated gz) ends the
+    line (after yielding the good ones before it); a line the JSON parser cannot load (an integer past the digit limit, nesting too deep) stops the read with the parser's own exception in either mode. An I/O failure (including a truncated gz) ends the
     iteration with a throttled warning (DEFAULT) or raises ``JsonFileError(kind="io")`` (RAISE).
     """
     path = _as_path(path)
@@ -984,7 +984,7 @@ def iter_jsonl_raw(
     still see a line it cannot parse (``recall_diagnostics._prune`` removes it). Blank lines are never yielded.
     With ``bad_lines=True`` a line that cannot be used (malformed, invalid UTF-8, not an object) is yielded as
     ``(text, None)`` after its usual warning; otherwise it is only skipped. ``strict`` and ``recover`` behave
-    as in :func:`iter_jsonl`.
+    as in :func:`iter_jsonl`, except for a line the JSON parser cannot load: this reader skips it (strict: ``JsonFileError``).
     """
     path = _as_path(path)
     _check_jsonl_recover(recover)
