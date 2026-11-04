@@ -39,7 +39,7 @@ def test_run_server_opens_and_closes_stores(tmp_path: Path) -> None:
 
     captured: dict = {}
 
-    def _capture_register(server, *, persona_dir, store, hebbian):
+    def _capture_register(server, *, persona_dir, store, hebbian, tool_prefix=""):
         captured["store"] = store
         captured["hebbian"] = hebbian
         captured["persona_dir"] = persona_dir

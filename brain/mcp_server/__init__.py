@@ -27,22 +27,24 @@ from brain.memory.store import MemoryStore
 __all__ = ["run_server", "register_tools"]
 
 
-def run_server(persona_dir: Path) -> None:
+def run_server(persona_dir: Path, *, tool_prefix: str = "") -> None:
     """Run the MCP server stdio loop until the client disconnects.
 
     Raises FileNotFoundError if persona_dir does not exist.
     """
     if not persona_dir.is_dir():
         raise FileNotFoundError(f"persona_dir does not exist: {persona_dir}")
-    asyncio.run(_run(persona_dir))
+    asyncio.run(_run(persona_dir, tool_prefix))
 
 
-async def _run(persona_dir: Path) -> None:
+async def _run(persona_dir: Path, tool_prefix: str = "") -> None:
     server = Server("brain-tools")
     store = MemoryStore(db_path=persona_dir / "memories.db")
     hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
     try:
-        register_tools(server, persona_dir=persona_dir, store=store, hebbian=hebbian)
+        register_tools(
+            server, persona_dir=persona_dir, store=store, hebbian=hebbian, tool_prefix=tool_prefix
+        )
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
                 read_stream,

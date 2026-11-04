@@ -25,6 +25,7 @@ from brain.memory.known_names import note_tool_call
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
+from brain.tools.naming import fill_tool_prefix, fill_tool_result
 from brain.tools.schemas import ADD_NAME_TOOL_NAME, build_schemas
 
 # Tools dispatched to the running bridge over its local HTTP API instead of
@@ -100,16 +101,20 @@ def register_tools(
     persona_dir: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
+    tool_prefix: str = "",
 ) -> None:
     """Register each brain-tool with the MCP server.
 
     Closures capture store/hebbian/persona_dir so each invocation passes
     them through dispatch unchanged. The server itself is mutated in place;
     the function returns None.
+
+    ``tool_prefix`` is what the client calls these tools (``--tool-prefix``, set by the
+    Claude CLI's spawn entry); descriptions and results name other tools with it (#417).
     """
 
     companion_name = persona_dir.name
-    schemas = build_schemas(companion_name)
+    schemas = build_schemas(companion_name, tool_prefix=tool_prefix)
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
@@ -182,6 +187,7 @@ def register_tools(
                     stored_image_path=stored_image_path,
                 )
                 return [ImageContent(type="image", data=data_b64, mimeType=media_type)]
+            result = fill_tool_result(result, tool_prefix)
             payload = json.dumps(result, default=str, ensure_ascii=False)
             monologue_text: str | None = (
                 result.get("monologue_text") if isinstance(result, dict) else None
@@ -207,13 +213,14 @@ def register_tools(
             )
             return [TextContent(type="text", text=payload)]
         except Exception as exc:  # noqa: BLE001 — broad catch is intentional
-            err_payload = json.dumps({"error": str(exc)})
+            error = fill_tool_prefix(str(exc), tool_prefix)
+            err_payload = json.dumps({"error": error})
             log_invocation(
                 persona_dir,
                 name=name,
                 arguments=arguments,
-                result_summary=f"error: {exc}",
-                error=str(exc),
+                result_summary=f"error: {error}",
+                error=error,
                 outcome="error",
             )
             return [TextContent(type="text", text=err_payload)]

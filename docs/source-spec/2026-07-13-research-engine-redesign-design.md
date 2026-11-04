@@ -19,7 +19,7 @@ is a memory-vignette generator, not a research organ:
    (compounds the dedup defect in issue #66).
 4. Interests are frozen at bootstrap: new interests come ONLY from voice.md (first 2000 chars,
    5 hallucinated topics). The heartbeat hook only bumps existing ones by keyword match.
-   Lived conversation never creates an interest (the Phoebe Lispector/carrot-cake case).
+   Lived conversation never creates an interest (the Lispector/carrot-cake case).
 5. Topic selection is mechanical (highest pull eligible) while the prompt instructs
    "what pulled you to the topic today" — inviting a confabulated motive.
 6. (Partly refuted: no literal JSON/no-bullets contradiction exists, but the principle stands —

@@ -557,7 +557,7 @@ def test_soul_review_system_prompt_does_not_contain_hana() -> None:
         "queued_at": "2026-05-28T00:00:00+00:00",
         "source": "dream",
     }
-    messages = _build_messages(candidate, related=[], emotional_summary="longing:7", soul_size=3)
+    messages = _build_messages(candidate, related=[], emotional_summary="longing:7", soul_size=3, companion_name="Nell")
     # The system message is messages[0]["content"]
     system_content = messages[0]["content"]
     assert "Hana" not in system_content
@@ -714,6 +714,7 @@ def test_build_messages_includes_source_moment_block() -> None:
         emotional_summary="longing:7",
         soul_size=3,
         source_moment=snippet,
+        companion_name="Nell",
     )
     user_content = messages[1]["content"]
     assert "The moment behind this candidate:" in user_content
@@ -737,6 +738,7 @@ def test_build_messages_omits_block_without_source_moment() -> None:
         emotional_summary="longing:7",
         soul_size=3,
         source_moment=None,
+        companion_name="Nell",
     )
     user_content = messages[1]["content"]
     assert "The moment behind this candidate" not in user_content

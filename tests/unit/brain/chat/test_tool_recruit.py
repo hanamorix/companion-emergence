@@ -13,7 +13,7 @@ def test_trivial_turn_gets_only_core():
 
 
 def test_low_salience_question_can_still_search():
-    """Regression: the Phoebe dog-name failure (v0.0.33 spec, Track 1).
+    """Regression: the dog-name failure (v0.0.33 spec, Track 1).
 
     'what's my dog's name?' scores ~0.19 salience with no recruitment flags;
     pre-v0.0.33 the model could not search at all on such turns.

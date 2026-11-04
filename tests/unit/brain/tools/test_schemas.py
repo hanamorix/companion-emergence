@@ -137,11 +137,12 @@ def test_build_schemas_does_not_mutate_original_schemas() -> None:
 
 def test_build_schemas_with_nell_is_identical_to_schemas() -> None:
     """build_schemas('Nell') must be a semantically equivalent copy of SCHEMAS."""
+    from brain.tools.naming import fill_tool_prefix
     from brain.tools.schemas import SCHEMAS, build_schemas
 
     built = build_schemas("Nell")
     for name in SCHEMAS:
-        assert built[name]["description"] == SCHEMAS[name]["description"], (
+        assert built[name]["description"] == fill_tool_prefix(SCHEMAS[name]["description"], ""), (
             f"build_schemas('Nell') description differs for '{name}'"
         )
 
@@ -165,8 +166,8 @@ _SOURCE_MEMORY_ID_PROPERTY = {
     "description": (
         "Optional. The id of an existing memory this moment is about; it is kept from being forgotten for as long "
         "as this crystallisation stands. Pass an id only if it is already in this conversation: a recalled memory "
-        "line, a search or read result, or the id add_memory just returned. Never search just to find one. If the "
-        "moment is not a memory yet and you want it kept, save it with add_memory first and pass the id it returns."
+        "line, a search or read result, or the id {tool_prefix}add_memory just returned. Never search just to find one. If the "
+        "moment is not a memory yet and you want it kept, save it with {tool_prefix}add_memory first and pass the id it returns."
     ),
 }
 
