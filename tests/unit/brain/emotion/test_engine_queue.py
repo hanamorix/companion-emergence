@@ -24,6 +24,7 @@ import pytest
 from brain import dev_constants
 from brain.emotion import engine_files, engine_utils
 from brain.emotion.engine_utils import EngineState, Event, day_of, fold_event, source_modifier
+from brain.health import json_io
 from brain.memory.store import Memory
 from brain.utils import file_lock, file_ops
 
@@ -898,6 +899,7 @@ def test_no_queue_or_change_log_function_takes_the_lock(
     monkeypatch.setattr(engine_files, "state_lock", forbidden)
     monkeypatch.setattr(file_lock, "locked_within", forbidden)
     monkeypatch.setattr(file_lock, "file_lock", forbidden)
+    monkeypatch.setattr(json_io, "file_lock", forbidden)  # json_io imports the lock by name: its writers must not take it either
     assert engine_files.append_event(tmp_path, engine_files.event_from_json(_raw("start"))) is True
     assert len(_read(tmp_path)) == 1
     assert engine_files.empty_queue(tmp_path) is True

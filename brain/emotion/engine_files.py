@@ -1,7 +1,7 @@
 """The files the emotion engine owns, and the one place that knows their paths and their lock (Engine 0, #575; Engine 2, #577).
 
 Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code of ours creates that folder, because
-``write_json``, ``append_jsonl`` and ``file_lock`` each create a missing parent.
+``write_json``, ``write_jsonl``, ``append_jsonl`` and ``file_lock`` each create a missing parent.
 
 * ``emotion_state.json`` (+ ``.bak1``-``.bak3``): the averages, the weights and a 30-day snapshot per emotion. Written with
   ``write_json(backups=3, indent=None)``. Read through ``json_io.read_json_walk``, the read-only walk with the validator
