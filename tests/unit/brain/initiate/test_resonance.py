@@ -365,7 +365,7 @@ def test_run_resonance_tick_reads_the_memory_without_ticking_it(tmp_path):
 
     run_resonance_tick(persona, now=now)
 
-    # The memory passed every gate and was emitted, so the read at resonance.py:309 ran
+    # The memory passed every gate and was emitted, so the tick's staleness-gate read ran
     # (a read that never happened would pass the next assertions for nothing).
     assert len(read_candidates(persona)) == 1
     store = MemoryStore(persona / "memories.db")
