@@ -623,7 +623,6 @@ def _full_state() -> EngineState:
         reset_at=NOW - timedelta(days=2),
         last_update=NOW - timedelta(hours=3),
         active_day="2026-06-10",
-        oldest_entry_at=NOW - timedelta(days=20),
         persona_start_at=NOW - timedelta(days=40),
         repeats={"mem-1": RepeatEntry(NOW - timedelta(hours=5), 2)},
         emotions={
@@ -949,7 +948,6 @@ _REJECTIONS = {
     "reset_at not a time": _set(("reset_at",), "x"),
     "reset_at a number": _set(("reset_at",), 5),
     "last_update not a time": _set(("last_update",), "x"),
-    "oldest_entry_at not a time": _set(("oldest_entry_at",), []),
     "persona_start_at present but unparseable": _set(("persona_start_at",), "not a time"),
     "persona_start_at a number": _set(("persona_start_at",), 7),
     "active_day not a date": _set(("active_day",), "banana"),
@@ -990,7 +988,7 @@ def test_the_validator_rejects(label: str) -> None:
 
 
 @pytest.mark.parametrize("error", [OverflowError("year 1"), OSError("pre-1970 on Windows")])
-@pytest.mark.parametrize("field", ["saved_at", "reset_at", "last_update", "oldest_entry_at", "persona_start_at"])
+@pytest.mark.parametrize("field", ["saved_at", "reset_at", "last_update", "persona_start_at"])
 def test_a_time_that_cannot_be_turned_into_a_local_day_is_rejected(
     field: str, error: Exception, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1110,6 +1108,8 @@ _BAD_DAYS = {
     "run of the wrong length": _day("2026-06-09", run=["2026-06-05", 1]),
     "run not a list": _day("2026-06-09", run="x"),
     "day of the wrong length": ["2026-06-09", 4.0, 3.5, 1],
+    "day with an extra field and a bad felt": ["2026-06-09", 4.0, 3.5, 2, None, "later"],
+    "run with an extra field and a bad direction": _day("2026-06-09", run=["2026-06-05", 0, "2026-06-09", "later"]),
     "day not a list": "2026-06-09",
 }
 
@@ -1166,6 +1166,39 @@ def test_a_snapshot_average_is_held_to_the_dev_constant_cap(
     assert state.emotions["joy"].short.avg == 5.0
     day = state.emotions["joy"].snapshot[0]
     assert (day.short, day.long) == (5.0, 5.0)
+
+
+def test_a_snapshot_day_with_more_fields_than_today_keeps_the_known_ones(tmp_path: Path) -> None:
+    """Additive-only: a newer brain's six-field day is read by its first five fields, not dropped after a rollback."""
+    data = _valid_json()
+    data["emotions"]["joy"]["snapshot"] = [
+        ["2026-06-08", 4.0, 3.5, 1, ["2026-06-05", 1, "2026-06-08"], "a newer field"],
+        ["2026-06-09", 4.5, 3.5, 0, None, {"x": 1}, 7],
+    ]
+    engine_files.validate_state(data)
+    state = engine_files.state_from_json(data, label=f"six {tmp_path}")
+    assert state.emotions["joy"].snapshot == [
+        SnapshotDay("2026-06-08", 4.0, 3.5, True, RunRecord("2026-06-05", 1, "2026-06-08")),
+        SnapshotDay("2026-06-09", 4.5, 3.5, False, None),
+    ]
+
+
+def test_a_run_record_with_more_fields_than_today_keeps_the_known_ones(tmp_path: Path) -> None:
+    data = _valid_json()
+    data["emotions"]["joy"]["snapshot"] = [_day("2026-06-09", run=["2026-06-05", -1, "2026-06-08", "a newer field"])]
+    state = engine_files.state_from_json(data, label=f"four {tmp_path}")
+    assert state.emotions["joy"].snapshot[0].run == RunRecord("2026-06-05", -1, "2026-06-08")
+
+
+def test_a_state_still_holding_the_dropped_oldest_entry_field_is_valid_and_it_is_not_written_back(tmp_path: Path) -> None:
+    """A state written by a development build carries `oldest_entry_at`; whatever it holds, the state stays usable and the key goes at the next save."""
+    for value in ("not a time", [], 5, None, "2026-06-01T00:00:00Z"):
+        data = _valid_json()
+        data["oldest_entry_at"] = value
+        engine_files.validate_state(data)
+        state = engine_files.state_from_json(data, label=f"leftover {tmp_path}")
+        assert "oldest_entry_at" not in engine_files.state_to_json(state)
+        assert not hasattr(state, "oldest_entry_at")
 
 
 def test_a_run_record_one_day_before_the_day_is_valid(tmp_path: Path) -> None:
@@ -1366,14 +1399,13 @@ def test_the_saved_file_has_the_documented_shape(tmp_path: Path) -> None:
         "reset_at",
         "last_update",
         "active_day",
-        "oldest_entry_at",
         "persona_start_at",
         "queue_line",
         "repeats",
         "emotions",
     }
     assert data["queue_line"] == 0
-    for key in ("saved_at", "reset_at", "last_update", "oldest_entry_at", "persona_start_at"):
+    for key in ("saved_at", "reset_at", "last_update", "persona_start_at"):
         assert data[key].endswith("Z"), key
     assert data["saved_at"] == "2026-06-10T15:30:00Z"
     assert data["repeats"] == {"mem-1": {"first_at": "2026-06-10T10:30:00Z", "count": 2}}

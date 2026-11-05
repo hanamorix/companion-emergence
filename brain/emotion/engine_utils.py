@@ -112,9 +112,9 @@ class EmotionState:
 class EngineState:
     """Everything the engine keeps about one persona's emotions, in memory.
 
-    `last_update` is the time up to which the weights have been aged; `active_day` is the open day; `oldest_entry_at` is the
-    time of the oldest entry folded (never set by a quiet-day zero); `persona_start_at` is the creation time of the persona's
-    oldest memory, which the shift's start gate counts from (null: no memory yet, the gate is closed). `queue_line` is the
+    `last_update` is the time up to which the weights have been aged; `active_day` is the open day; `persona_start_at` is the
+    creation time of the persona's oldest memory (a future time is held to now when it is folded), which the shift's start gate
+    counts from (null: no memory yet, the gate is closed). `queue_line` is the
     number of lines of the queue file the engine has already folded: the next drain reads the lines after it. It is saved
     with the state so that the fold and the position reach the disk in one write.
     """
@@ -123,7 +123,6 @@ class EngineState:
     reset_at: datetime | None = None
     last_update: datetime | None = None
     active_day: str | None = None
-    oldest_entry_at: datetime | None = None
     persona_start_at: datetime | None = None
     repeats: dict[str, RepeatEntry] = field(default_factory=dict)
     emotions: dict[str, EmotionState] = field(default_factory=dict)
@@ -191,12 +190,12 @@ def _fold_average(average: Average, value: float, w: float) -> None:
 
     The delta form of the weighted mean: an average fed the value it already holds does not move at all, so a steady feeling
     makes an exactly zero daily move and the shift rule needs no tolerance. A weight of 0 (an entry too old to count) folds
-    nothing.
+    nothing. The result is held to 0-10: the arithmetic can land one rounding step past the cap.
     """
     if w <= 0.0:
         return
     weight = average.weight + w
-    average.avg += (value - average.avg) * w / weight
+    average.avg = _hold(average.avg + (value - average.avg) * w / weight)
     average.weight = weight
 
 
@@ -241,12 +240,10 @@ def _fold(
             return  # so old that nothing of it survives: no ghost emotion
         state.emotions[emotion] = emotion_state
     if zero:
-        return  # a quiet-day zero sets neither the last-entry day nor the oldest entry
+        return  # a quiet-day zero does not set the last-entry day
     day = day_of(at)
     if emotion_state.last_entry_day is None or day > emotion_state.last_entry_day:
         emotion_state.last_entry_day = day
-    if state.oldest_entry_at is None or at < state.oldest_entry_at:
-        state.oldest_entry_at = at
 
 
 def fold_entry(
@@ -262,8 +259,8 @@ def fold_entry(
 
     An entry at or after `last_update` ages all weights to its time and becomes the new `last_update`; an earlier one is
     pre-aged and ages nothing else. An entry that is not a quiet-day zero (even one whose value is 0) sets the emotion's last-entry
-    day (the later of the old and the entry's day) and the state's oldest entry (the earlier). `zero=True` is a quiet-day zero: it goes only to an emotion that
-    already has an average and sets neither. The caller holds a future `at` to now (`fold_event` does).
+    day (the later of the old and the entry's day). `zero=True` is a quiet-day zero: it goes only to an emotion that
+    already has an average and does not set it. The caller holds a future `at` to now (`fold_event` does).
     """
     if not math.isfinite(value):
         raise ValueError(f"cannot fold a non-finite value for {emotion!r}: {value!r}")
@@ -332,10 +329,10 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
         state.last_update = now
     at = min(event.at, now)
     if event.kind == "start":
-        _fold_persona_start(state, event.at)
+        _fold_persona_start(state, at)
         return
     if event.kind == "commit":
-        _fold_persona_start(state, event.at)
+        _fold_persona_start(state, at)
     if not event.emotions:
         return
     if event.kind == "change":

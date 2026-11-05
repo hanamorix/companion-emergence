@@ -1274,6 +1274,67 @@ def test_the_reader_skips_a_torn_line_a_bad_line_and_a_line_that_is_not_a_change
     assert len(_errors(caplog)) == 2  # the invalid event and the commit line
 
 
+def _kind_line(kind: object, at: datetime) -> str:
+    return json.dumps({"kind": kind, "at": at.isoformat(), "emotions": {"joy": 9.0}})
+
+
+@pytest.mark.parametrize("kind", [[], {}, [1], [[]], {"a": 1}], ids=["list", "dict", "list-of-one", "nested", "dict-of-one"])
+def test_the_reader_skips_a_line_whose_kind_cannot_be_looked_up_and_reads_the_rest(
+    kind: object, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unhashable `kind` (valid JSON) used to raise TypeError out of the membership test and abort the whole read."""
+    since = _local_noon(date(2026, 6, 10))
+    path = _write_day(
+        tmp_path,
+        "2026-06-10",
+        _line(since, joy=1.0),
+        _kind_line(kind, since),
+        _line(since + timedelta(minutes=1), joy=2.0),
+    )
+    before = path.read_bytes()
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len(_errors(caplog)) == 1 and "unknown kind" in _errors(caplog)[0]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.no_base_failure(reason="a number, a bool, null or an unknown text kind is hashable, so it already reaches event_from_json's own kind check and is dropped at base; this pins that the whole set of non-text kinds is dropped one line at a time")
+@pytest.mark.parametrize("kind", [5, 1.5, True, None, "x", "Change"], ids=["int", "float", "bool", "null", "text", "case"])
+def test_the_reader_skips_a_line_whose_kind_is_not_a_known_text_and_reads_the_rest(
+    kind: object, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(
+        tmp_path,
+        "2026-06-10",
+        _line(since, joy=1.0),
+        _kind_line(kind, since),
+        _line(since + timedelta(minutes=1), joy=2.0),
+    )
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len(_errors(caplog)) == 1
+
+
+@pytest.mark.no_base_failure(reason="read_queue already checks the kind as text first (event_from_json); this pins that the queue and the change log answer the same lines the same way")
+@pytest.mark.parametrize("kind", [[], {}, 5, None, "x"], ids=["list", "dict", "int", "null", "text"])
+def test_the_queue_skips_a_line_whose_kind_is_not_a_known_text_and_reads_the_rest(
+    kind: object, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = engine_files.queue_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join([json.dumps(_raw("commit")), _kind_line(kind, NOW), json.dumps(_raw("commit", memory_id="m2"))]) + "\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        got = engine_files.read_queue(tmp_path, from_line=0)
+    assert [e.memory_id for e in got.events] == ["m1", "m2"] and got.end_line == 3
+    assert len(_errors(caplog)) == 1
+
+
 @pytest.mark.no_base_failure(reason="guards the new hold line against firing in the change-log reader: a commit line there is dropped as not a change with one error line and no 'held' warning; the old code has no hold line to misfire")
 def test_a_commit_line_in_the_change_log_is_dropped_as_not_a_change_without_a_hold_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture

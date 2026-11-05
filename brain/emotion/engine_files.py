@@ -318,7 +318,7 @@ def _mapping(parent: Mapping, key: str, what: str) -> Mapping:
 def validate_state(data: object) -> None:
     """Raise ValueError unless `data` is a state the engine can use (the validator `read_json_walk` applies to every copy).
 
-    Rejects: not an object; a missing or unparseable `saved_at`; an unparseable `reset_at`, `last_update`, `oldest_entry_at`
+    Rejects: not an object; a missing or unparseable `saved_at`; an unparseable `reset_at`, `last_update`
     or `persona_start_at` (a missing or null `persona_start_at` is accepted: a closed gate until the first memory); an
     `active_day` that is not a real day, or unset while `last_update` is set; `emotions` or `repeats` of the wrong type; an
     emotion that is not an object or lacks `short`, `long` or `last_entry_day`; a non-finite number, a bool, or a negative
@@ -331,7 +331,7 @@ def validate_state(data: object) -> None:
     if "saved_at" not in data:
         raise ValueError("saved_at is missing")
     _time(data["saved_at"], "saved_at")
-    for key in ("reset_at", "last_update", "oldest_entry_at", "persona_start_at"):
+    for key in ("reset_at", "last_update", "persona_start_at"):
         if data.get(key) is not None:
             _time(data[key], key)
     active_day = data.get("active_day")
@@ -366,9 +366,13 @@ def validate_state(data: object) -> None:
 
 
 def _snapshot_day(item: object, previous_day: str | None) -> SnapshotDay:
-    """One snapshot day, or ValueError saying what is wrong with it. Averages outside 0-10 are held, not refused."""
-    if not isinstance(item, list) or len(item) != 5:
-        raise ValueError("a snapshot day is an array of five: day, short, long, felt, run")
+    """One snapshot day, or ValueError saying what is wrong with it. Averages outside 0-10 are held, not refused.
+
+    Only the known leading fields are read: a day with more than five fields, or a run record with more than three, is read
+    by its first five (three), so a state written by a newer version is not dropped after a rollback (additive-only). Fewer is invalid.
+    """
+    if not isinstance(item, list) or len(item) < 5:
+        raise ValueError("a snapshot day is an array of at least five: day, short, long, felt, run")
     day = _day(item[0], "day")
     if previous_day is not None and day <= previous_day:
         raise ValueError(f"day {day} is not later than the day before it, {previous_day}")
@@ -380,8 +384,8 @@ def _snapshot_day(item: object, previous_day: str | None) -> SnapshotDay:
     run: RunRecord | None = None
     if item[4] is not None:
         record = item[4]
-        if not isinstance(record, list) or len(record) != 3:
-            raise ValueError("a run record is null or an array of three: start day, direction, last day with the direction")
+        if not isinstance(record, list) or len(record) < 3:
+            raise ValueError("a run record is null or an array of at least three: start day, direction, last day with the direction")
         start = _day(record[0], "run start day")
         direction = record[1]
         if type(direction) is not int or direction not in (1, -1):
@@ -500,7 +504,6 @@ def state_from_json(data: dict, *, label: str = "state") -> EngineState:
         reset_at=optional("reset_at"),
         last_update=optional("last_update"),
         active_day=data.get("active_day"),
-        oldest_entry_at=optional("oldest_entry_at"),
         persona_start_at=optional("persona_start_at"),
         repeats=repeats,
         emotions=emotions,
@@ -546,7 +549,6 @@ def state_to_json(state: EngineState) -> dict:
         "reset_at": _optional_iso(state.reset_at, "reset_at"),
         "last_update": _optional_iso(state.last_update, "last_update"),
         "active_day": state.active_day,
-        "oldest_entry_at": _optional_iso(state.oldest_entry_at, "oldest_entry_at"),
         "persona_start_at": _optional_iso(state.persona_start_at, "persona_start_at"),
         "queue_line": state.queue_line,
         "repeats": {
@@ -980,7 +982,7 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
     its absence or damage is normal: a missing file anywhere in the series, a missing folder, a file not named
     ``YYYY-MM-DD.jsonl``, an unlistable folder (logged), a torn or unparseable line (including one the JSON parser cannot
     load, such as an integer of more than 4300 digits, skipped with a warning naming the file and line) and a file that
-    cannot be read in full (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
+    cannot be read in full (what was read is used) add nothing and are not errors. A line that fails the event check (a `kind` that is not a known text included), or is not a change, is dropped
     with an error log line. The reader repairs nothing.
     """
     when = lenient_utc(since)  # a naive time means UTC, as everywhere in the repo
@@ -998,7 +1000,7 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         for _text, record in iter_jsonl_raw(path):  # a line the parser cannot load is skipped; an I/O failure ends the file there
             try:
                 kind = record.get("kind") if isinstance(record, dict) else None
-                if kind in _MEMORY_KINDS or kind == "start":  # before the check, so a held-modifier line is not logged for it
+                if isinstance(kind, str) and (kind in _MEMORY_KINDS or kind == "start"):  # before the check, so a held-modifier line is not logged for it
                     raise InvalidEventError(f"a {kind} event is not a change")
                 event = event_from_json(record)
                 if event.kind != "change":
