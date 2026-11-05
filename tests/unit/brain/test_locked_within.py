@@ -121,13 +121,10 @@ def test_wait_constant_covers_the_live_retry_constants_and_stays_under_the_webvi
     replace). K counts the replaces under the lock other than that write: 0, because nothing heals, quarantines or writes
     a notice file while the lock is held. Changing a retry constant without re-deriving the wait fails here.
     """
-    from brain.health import json_io
-    from brain.utils import atomic_write
-
     k_other_replaces = 0
-    step = atomic_write._REPLACE_RETRY_SLEEP_S
-    r_replace = step * sum(range(1, atomic_write._REPLACE_RETRIES))
-    r_read = step * sum(range(1, json_io._READ_ATTEMPTS))
+    step = dev_constants.FILE_RETRY_SLEEP_S
+    r_replace = step * sum(range(1, dev_constants.FILE_RETRY_ATTEMPTS))
+    r_read = step * sum(range(1, dev_constants.FILE_READ_ATTEMPTS))
     needed = r_read + (k_other_replaces + 2) * r_replace
     assert dev_constants.SETTINGS_FILE_LOCK_WAIT_S >= needed
     # The picker request spends the 30 s probe budget first, then the write; the webview cuts a request at about 60 s.
