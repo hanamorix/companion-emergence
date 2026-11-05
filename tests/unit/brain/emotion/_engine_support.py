@@ -85,7 +85,6 @@ def simple_state(*, saved_at: datetime, joy: float = 4.0, day: str | None = None
         saved_at=saved_at,
         last_update=saved_at,
         active_day=day,
-        oldest_entry_at=saved_at,
         persona_start_at=saved_at - timedelta(days=60),
         emotions={
             "joy": EmotionState(short=Average(joy, 1.0), long=Average(joy, 1.0), last_entry_day=day),

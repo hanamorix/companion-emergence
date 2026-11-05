@@ -24,7 +24,6 @@ def _state() -> eu.EngineState:
         saved_at=SAVED,
         last_update=SAVED,
         active_day="2026-06-01",
-        oldest_entry_at=SAVED,
         persona_start_at=SAVED,
         repeats={"m1": eu.RepeatEntry(SAVED, 1)},
         emotions={

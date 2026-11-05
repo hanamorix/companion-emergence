@@ -25,7 +25,6 @@ Shadow mode (the phase before the switch-over): the engine writes a shadow `stat
 stored value, no change-log line is written and nothing rebuilds.
 
 Stubbed now:
-- `oldest_entry_at()` returns None.
 - `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
   memory id and the emotion, when the memory has no such emotion. It never returns 0.0:
   "absent" is for the caller to decide.
@@ -704,9 +703,6 @@ class EmotionEngine:
             return EngineStatus(loaded.caught_up, reset_at)
         except Exception:
             return EngineStatus(False, None)
-
-    def oldest_entry_at(self) -> datetime | None:
-        return None
 
     def _switch_seen(self) -> bool | None:
         """True when the switch file was seen, False when it is missing, None when that cannot be told (a stat error).
