@@ -824,10 +824,6 @@ def test_emptying_a_queue_path_that_is_a_folder_returns_false_and_keeps_the_fold
     assert queue.is_dir() and (queue / "inner").read_bytes() == b"keep"
 
 
-def test_clear_queue_no_longer_exists() -> None:
-    assert not hasattr(engine_files, "clear_queue")
-
-
 def test_the_position_rule_in_one_sequence(tmp_path: Path) -> None:
     """Append 3, read to the end, empty, append 2: the stored position 3 is past the end of the new queue, so it is read from line 0."""
     first = _queue_of(tmp_path, 3)

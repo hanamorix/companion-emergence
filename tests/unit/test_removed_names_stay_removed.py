@@ -583,6 +583,13 @@ REMOVED: tuple[Removed, ...] = (
         scope=("brain/utils/file_ops.py",),
     ),
     Removed(
+        names=("clear_queue",),
+        why="the queue is emptied in place by `empty_queue` (the drain never deletes the file); the deleting `clear_queue` of the first Engine 2 draft is gone",
+        ref="PR #626 (Engine 2), `empty_queue` replaces it",
+        kind="code",
+        scope=("brain/emotion/engine_files.py",),
+    ),
+    Removed(
         names=("oldest_entry_at",),
         why="the emotion state's oldest-entry time (and the engine's `oldest_entry_at()` stub) had no reader; dropped before it was ever persisted, so no state file needs a migration",
         ref="the maintainer's decision on PR #626 (Engine 2), 2026-11-05",

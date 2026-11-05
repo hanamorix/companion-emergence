@@ -709,6 +709,7 @@ def test_persona_start_is_the_earliest_commit_and_a_start_event_folds_nothing_el
     assert only.persona_start_at == _at(0)
 
 
+@pytest.mark.no_base_failure(reason="the old oldest-entry test with its oldest_entry_at assertions removed and a new name; the last-entry-day assertions that remain hold on the base code too")
 def test_last_entry_day_follows_the_entries_never_a_zero() -> None:
     state = eu.EngineState()
     _fold(state, _event("showing", _at(2), {"joy": 5.0}, "a"))
