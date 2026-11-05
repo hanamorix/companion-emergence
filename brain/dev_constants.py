@@ -457,8 +457,8 @@ SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
 
 # A feeling counts as high (`engine.feels_high`, the one predicate the readers that used to fire on a fixed level call) when
 # its short average today is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, taken over that feeling's
-# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high regardless), and only at
-# or above the floor in the next constant. Owner-set, 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
+# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high whatever its range), and either
+# way only at or above the floor in the next constant. Owner-set, 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
 FEELS_HIGH_RANGE_FRACTION: float = 0.5
 # A feeling whose short average is below this level (0 to 10 scale) is never high, whatever its range or its shift: a feeling
 # that sits near zero all month has a tiny range, and without a floor its top half would count as "high" (a vulnerability at

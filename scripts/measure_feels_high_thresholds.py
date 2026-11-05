@@ -86,14 +86,22 @@ R_ROWS = (
 HighFn = Callable[[str], bool]
 
 
+_HELPERS: list = []
+
+
 def _load_timing_helpers():
-    """The timing script's source vetting, copy, store open and vocabulary load, and its host line (one copy of each)."""
-    path = REPO_ROOT / "scripts" / "time_old_emotion_paths.py"
-    spec = importlib.util.spec_from_file_location("time_old_emotion_paths_helpers", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    """The timing script's source vetting, copy, store open and vocabulary load, and its host line (one copy of each).
+
+    Loaded once: a second load would make a second `StepError` class that `main` would not catch.
+    """
+    if not _HELPERS:
+        path = REPO_ROOT / "scripts" / "time_old_emotion_paths.py"
+        spec = importlib.util.spec_from_file_location("time_old_emotion_paths_helpers", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _HELPERS.append(module)
+    return _HELPERS[0]
 
 
 def place_off_days(n_days: int) -> list[tuple[int, int]]:
