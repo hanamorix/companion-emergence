@@ -283,7 +283,7 @@ class EmotionEngine:
     def _apply_start_if_needed(self, created_at: datetime) -> None:
         """Apply the start-only event when the stored start date is missing or later than the row's.
 
-        The start-only event is a memory's own date event: a direct apply, like a commit (spec 3.0). It carries no memory id,
+        The start-only event is a memory's own date event: a direct apply, like a commit (design 2.8, Hooks step 3, of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`). It carries no memory id,
         so recovery never skips it; its min-fold is idempotent.
         """
         if self._start_needed(created_at):
@@ -313,12 +313,12 @@ class EmotionEngine:
         self._apply_direct([event])
 
     def _apply_direct(self, events: list[Event]) -> None:
-        """The direct apply of 3.0: under the engine lock, the drain's own apply step on `events` (no queue write).
+        """The direct apply (design 2.8, Hooks step 3, and "A failed direct apply", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`): under the engine lock, the drain's own apply step on `events` (no queue write).
 
         Never raises: the memory is already saved (R8) and a failure here only costs its emotions. The clock is read once,
         inside the lock.
 
-        Accepted edges (spec section 6), the code comments the spec asks for here:
+        Accepted edges (design section 6), the code comments the design asks for here:
         - S42 (E6.14 case 1): a writer that committed its memory and then waited at the lock while a recovery ran, and that
           recovery counted that memory, applies it again: in that overlap one memory's emotions count twice (one extra entry in
           the short and long averages). No stored catch-up range is added.
@@ -389,7 +389,7 @@ class EmotionEngine:
         """A live persona's state cannot be used: set the catch-up-failed flag (it empties `read()`), log once per active day.
 
         Nothing is written, the queue and its position are kept, and a memory stays saved. The retry is the next call: a failed
-        live catch-up reruns on every tick with the lock held (the spec's cost, 3.0 "Costs recorded").
+        live catch-up reruns on every tick with the lock held (the cost named in design 2.8, "Recovery first").
         """
         self._catch_up_failed = True
         try:
@@ -443,7 +443,8 @@ class EmotionEngine:
         Steps (spec 3.1 S4): (2) read the state, recovery first when it came from a backup copy, then (for the drain) read the
         queue by position; (3-5) fold the events in time order with `close_days` before each and once at `now`, prune the
         change-log files and the repeat list; (6) one `save_state`, with the queue position, when anything was read, folded or
-        closed, when a catch-up ran, or when an empty state replaced one that could not be used; (7) the drain then empties
+        closed, when a catch-up ran, when an empty state replaced one that could not be used, or (the drain) when the stored
+        position is above 0 over a queue with no lines (a stale position, saved as 0); (7) the drain then empties
         the queue file and saves position 0. A direct apply passes `events` (its own, with
         `drain=False`) and writes no queue and reads none except the catch-up's one read. `now` is held to the loaded
         `saved_at` for the whole step, so a clock read before a wait for the lock cannot rewind the state, and `saved_at`
@@ -522,7 +523,10 @@ class EmotionEngine:
         day_closed = pre_day is not None and state.active_day != pre_day
         if day_closed:
             engine_files.prune_changes(persona, pre_day)
-        if not (lines_read or day_closed or caught_up or fallback_empty or (not drain and applied)):
+        # A stored position over an empty queue is stale (the queue was emptied and the save of position 0 did not follow):
+        # save it as 0 so the next reply's lines are not skipped (the maintainer's narrowing of S22, see `_empty_and_remember`).
+        stale_position = drain and queue_read.end_line == 0 and state.queue_line > 0  # type: ignore[union-attr]
+        if not (lines_read or day_closed or caught_up or fallback_empty or stale_position or (not drain and applied)):
             if drain and queue_read is not None and queue_read.end_line > 0:
                 self._empty_and_remember(state)  # a retry of an emptying that failed before
             elif drain:
@@ -548,11 +552,16 @@ class EmotionEngine:
         (nothing is applied twice) and retries the emptying without a new save; the key is then left unset so the early-out
         does not hide the retry.
 
-        Accepted edge S22 (spec section 6; owner 2026-11-03 "That's a very narrow edge, note it in a comment but otherwise
+        Accepted edge S22 (design section 6; owner 2026-11-03 "That's a very narrow edge, note it in a comment but otherwise
         accepted."): a crash between the emptying and the save of position 0 leaves the stored position past the end of the
         emptied queue. If the next reply's queued lines outgrow it before the next drain, those lines are skipped. A failed
         second save leaves the same state on disk and is read as the same edge. Also knowingly accepted: a crash can leave a
         torn last line, which the emptying discards (an R12 loss; the reader does not log a torn tail).
+
+        Narrowed (the maintainer's suggestion on the review of this slice, 2026-11-05; decisions.md of the build records): a
+        drain that reads no lines (`end_line` 0) while the stored position is above 0 saves the position as 0 (`_run_apply`), so
+        the start-up drain clears a stale position over an empty queue. What stays accepted is the window before that drain:
+        lines queued in it that outgrow the stale position are still skipped.
         """
         persona = self.persona_dir
         if not engine_files.empty_queue(persona):

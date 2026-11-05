@@ -282,6 +282,31 @@ def test_a_drain_that_reads_nothing_and_closes_no_day_does_not_save(persona: Pat
     assert [position for position, _ in saves] == [1, 0]
 
 
+def test_a_drain_that_finds_an_empty_queue_under_a_stale_position_saves_the_position_as_zero(persona: Path) -> None:
+    """The start-up drain clears a stale position (the maintainer's narrowing of S22): the stored position 5 is past a queue that has
+    no lines (a crash between the emptying and the save of position 0, or a failed second save), so nothing is read, no day closes
+    and nothing is caught up, and the drain still saves, with position 0. Only the position changes in the state file; the control is
+    the early-out test above (a stored position 0 saves nothing).
+    """
+    before_state = simple_state(saved_at=D[3], day=_day(3), queue_line=5)
+    save(persona, before_state)
+    assert not engine_files.queue_path(persona).exists()
+    install(persona).note_active(D[3])  # a new instance: the start-up drain
+    after = state_of(persona)
+    assert after.queue_line == 0
+    before_state.queue_line = 0
+    assert after == before_state  # nothing else moved, `saved_at` included
+
+
+def test_a_stale_position_over_an_emptied_queue_file_is_cleared_the_same_way(persona: Path) -> None:
+    save(persona, simple_state(saved_at=D[3], day=_day(3), queue_line=2))
+    queue_file = engine_files.queue_path(persona)
+    queue_file.parent.mkdir(parents=True, exist_ok=True)
+    queue_file.write_bytes(b"")
+    install(persona).note_active(D[3])
+    assert state_of(persona).queue_line == 0 and queue_file.read_bytes() == b""
+
+
 def test_a_position_past_an_emptied_queue_reads_from_the_start(persona: Path) -> None:
     save(persona, simple_state(saved_at=D[3], day=_day(3), queue_line=5))
     queue(persona, showing("m1", D[3], {"grief": 3.0}), showing("m2", D[3], {"grief": 3.0}))
@@ -398,6 +423,7 @@ def test_a_failing_second_save_leaves_the_position_at_the_end_the_file_emptied_a
     monkeypatch.setattr(engine_files, "save_state", real)
     engine.note_active(D[3])  # nothing queued: reads nothing, folds nothing, the key was left unset so it takes the lock
     assert state_of(persona).emotions["joy"].short.weight == weight
+    assert state_of(persona).queue_line == 0  # the same drain clears the position the failed save left past the emptied file
 
 
 def test_a_queue_read_that_raises_oserror_keeps_everything_and_the_next_drain_retries(
