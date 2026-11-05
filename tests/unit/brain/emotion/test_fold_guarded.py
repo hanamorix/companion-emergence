@@ -55,7 +55,7 @@ def _half_fold_then(error: BaseException, state: eu.EngineState):
 
 
 @pytest.mark.no_base_failure(
-    reason="the restore already exists on the base; this pins it against removal (the mutation proof is in the build records)"
+    reason="the restore already exists on the base; this pins it against removal"
 )
 @pytest.mark.parametrize(
     "error",
@@ -71,14 +71,10 @@ def test_a_skippable_error_puts_the_state_back_exactly_in_place_and_returns_fals
 ) -> None:
     state = _state()
     before = copy.deepcopy(state)
-    holder = (
-        state  # every holder of the state sees the restore: it is put back in place, not replaced
-    )
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         assert (
             eu.fold_guarded(state, _half_fold_then(error, state), "a test event", key="t") is False
         )
-    assert state is holder
     assert state == before
     assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
         f"emotion engine: a test event skipped ({type(error).__name__}: {error})"

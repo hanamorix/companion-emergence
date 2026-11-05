@@ -558,10 +558,10 @@ class EmotionEngine:
         second save leaves the same state on disk and is read as the same edge. Also knowingly accepted: a crash can leave a
         torn last line, which the emptying discards (an R12 loss; the reader does not log a torn tail).
 
-        Narrowed (the maintainer's suggestion on the review of this slice, 2026-11-05; decisions.md of the build records): a
+        Narrowed (the maintainer's suggestion on the review of this slice, 2026-11-05): a
         drain that reads no lines (`end_line` 0) while the stored position is above 0 saves the position as 0 (`_run_apply`), so
-        the start-up drain clears a stale position over an empty queue. What stays accepted is the window before that drain:
-        lines queued in it that outgrow the stale position are still skipped.
+        a drain clears a stale position over an empty queue (the start-up drain, or the retry after a failed second save). What
+        stays accepted is the window before that drain: lines queued in it that outgrow the stale position are still skipped.
         """
         persona = self.persona_dir
         if not engine_files.empty_queue(persona):
