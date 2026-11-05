@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
@@ -259,7 +259,7 @@ def run_folded(
     compaction_interval_s: float | None = 86400.0,
     calibration_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
-    judge_selftune_interval_s: float | None = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
+    judge_selftune_interval_s: float | None | Literal["dev_constant"] = "dev_constant",
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     pending_reconcile_interval_s: float | None = 900.0,
@@ -321,8 +321,8 @@ def run_folded(
     self-tune cadence (F2c inc2, spec Section 2) — wired structurally
     identically to ``interest_sweep_interval_s`` immediately above (own
     persisted ``judge_selftune_cadence.json``, own fault-isolated tick, NO
-    startup catch-up). Default matches
-    ``dev_constants.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly).
+    startup catch-up). The default, ``"dev_constant"``, reads
+    ``dev_constants.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly) when run_folded starts.
     This increment (inc2) is a SCAFFOLD ONLY: the cadence, the >handful
     gate, runtime RAM tier-detection and the cgroup-aware OOM-safety
     downgrade are built and wired; the actual tuning (knob-refit / LoRA /
@@ -334,6 +334,9 @@ def run_folded(
     # explicit value, ``0.0`` included, wins.
     if tick_interval_s is None:
         tick_interval_s = _backfill_tick_interval_seconds()
+    # The judge self-tune default is read here, not frozen at definition (#602); None stays "disabled".
+    if judge_selftune_interval_s == "dev_constant":
+        judge_selftune_interval_s = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
         persona_dir.name,
