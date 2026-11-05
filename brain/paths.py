@@ -180,6 +180,17 @@ def get_log_dir() -> Path:
     return _dirs.user_log_path.resolve()
 
 
+# The runtime log rotates at this size keeping this many backups; its sibling bridge-<persona>.log uses the same.
+RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024
+RUNTIME_LOG_BACKUPS = 3
+
+
+def runtime_log_path(persona_name: str) -> Path:
+    """The bridge's logging output for a persona (warnings, errors, ticks). ``bridge-<persona>.log`` beside it holds
+    only the detached child's raw stdout/stderr."""
+    return get_log_dir() / f"runtime-{persona_name}.log"
+
+
 _CADENCE_SUBDIR = "cadence"
 
 
