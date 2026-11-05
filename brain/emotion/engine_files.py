@@ -617,7 +617,7 @@ def read_state(persona_dir: Path) -> LoadedState:
 
 
 class StateCache:
-    """The parsed state of one persona, kept in process and re-read when the main file's stat key changes (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.9).
+    """The parsed state of one persona, kept in process and re-read when the main file's stat key changes (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.7).
 
     Only a state loaded from the main file is kept. A state from a backup, or none at all, is read again on the next call (a
     backup is a transient condition that the next drain's catch-up ends by writing a new main file). A hit needs the cached
@@ -664,7 +664,7 @@ class StateCache:
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
 # The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
-# from the floor up to floor + span). A stored modifier outside it is held to it (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.9); one far outside would otherwise fold
+# from the floor up to floor + span). A stored modifier outside it is held to it; one far outside would otherwise fold
 # to an infinite average and make every save of the state fail.
 _MODIFIER_LOW = _MODIFIER_FLOOR
 _MODIFIER_HIGH = _MODIFIER_FLOOR + _MODIFIER_SPAN
@@ -686,14 +686,13 @@ def _event_number(raw: Mapping, key: str, default: float) -> float:
 def event_from_json(raw: object) -> Event:
     """The `Event` of one queue or change-log record, or `InvalidEventError` saying why not.
 
-    Invalid (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` sections 2.8 and 2.9): not an object; an unknown `kind`; a missing `at`, or an `at` that `lenient_utc` rejects or that
+    Invalid (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.13): not an object; an unknown `kind`; a missing `at`, or an `at` that `lenient_utc` rejects or that
     `day_of` cannot turn into a local day (such an event would fail the drain on every call, and a failure that comes from an
     event's own content must not repeat for ever, so the drop is the remedy); a commit, assigned or showing with no
     `memory_id` (a non-empty text); a commit or assigned with no emotion values; an emotion name that is not text or an amount
     that is not a finite number (a bool is not a number); a `modifier` or `climax`, when present, that is not a finite
     number; a `source`, when present, that is not text. A missing `climax` is 0.0. A missing `modifier` is 1.0; a finite one
-    outside the range `source_modifier` can make (0.1 to 1.0) is not invalid: it is held to the range, with a warning line
-    (section 2.9). The `modifier` of a change is not read (a change has weight 1, no repeat factor).
+    outside the range `source_modifier` can make (0.1 to 1.0) is not invalid: it is held to the range, with a warning line. The `modifier` of a change is not read (a change has weight 1, no repeat factor).
     """
     if not isinstance(raw, dict):
         raise InvalidEventError(f"not an object ({type(raw).__name__})")

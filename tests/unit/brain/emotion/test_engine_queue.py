@@ -651,7 +651,7 @@ def test_an_event_that_cannot_be_encoded_is_logged_once_and_the_queue_is_untouch
 def test_the_append_asks_append_jsonl_for_a_held_lock_and_logging_with_no_fsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """design doc section 6: no fsync per append; the caller holds the lock, so the append takes none of its own."""
+    """design doc section 2.9: no fsync per append; the caller holds the lock, so the append takes none of its own."""
     seen: dict[str, object] = {}
     result: list[int | None] = [10]
 
@@ -837,7 +837,7 @@ def test_the_position_rule_in_one_sequence(tmp_path: Path) -> None:
     assert (again.events, again.end_line) == (later, 2)
 
 
-# --- every file operation goes through its accessor (P18, S1, S37) -------------------------------
+# --- every file operation goes through its accessor (design doc section 2.9) -------------------------------
 
 _RAW_FILE_ATTRS = frozenset(
     "open unlink iterdir stat lstat exists is_file is_dir mkdir rmdir read_text write_text read_bytes write_bytes "
