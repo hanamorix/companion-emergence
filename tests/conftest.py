@@ -457,7 +457,7 @@ class EmotionEngineStub:
     Every public call of the engine exists. `recorded_calls` holds one entry per hook call, `(name, *arguments in the
     call's own order)`, for example `("on_memory_shown", memory, at)`; the real engine keeps no such list. The rest is
     settable: `readings` (what `read()` returns), `live`, `faded` (`(memory_id, emotion) -> value`, else the stored value),
-    `engine_status`, `oldest_entry` and `last_fold_at` (a fixed instant well before any test's "now", so a site that
+    `engine_status` and `last_fold_at` (a fixed instant well before any test's "now", so a site that
     compares its own time with it sees a nonzero interval).
     """
 
@@ -471,7 +471,6 @@ class EmotionEngineStub:
         self.live = False
         self.faded: dict[tuple[str, str], float] = {}
         self.engine_status = EngineStatus(True, None)
-        self.oldest_entry: Any = None
         self.last_fold_at = datetime(2000, 1, 1, tzinfo=UTC)
 
     def on_memory_committed(self, memory: Any) -> None:
@@ -501,9 +500,6 @@ class EmotionEngineStub:
 
     def status(self) -> Any:
         return self.engine_status
-
-    def oldest_entry_at(self) -> Any:
-        return self.oldest_entry
 
 
 @pytest.fixture

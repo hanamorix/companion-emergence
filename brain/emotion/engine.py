@@ -18,7 +18,7 @@ Real now:
 
 Stubbed now:
 - `batch()` is a context manager that does nothing: it takes no argument, yields None and writes nothing.
-- `read()` returns `{}`; `status()` returns `EngineStatus(True, None)`; `oldest_entry_at()` returns None.
+- `read()` returns `{}`; `status()` returns `EngineStatus(True, None)`.
 - `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
   memory id and the emotion, when the memory has no such emotion. It never returns 0.0:
   "absent" is for the caller to decide.
@@ -292,9 +292,6 @@ class EmotionEngine:
 
     def status(self) -> EngineStatus:
         return EngineStatus(True, None)
-
-    def oldest_entry_at(self) -> datetime | None:
-        return None
 
     def is_live(self) -> bool:
         """True when the switch file exists. A True answer is cached for the life of the instance; a False one is asked
