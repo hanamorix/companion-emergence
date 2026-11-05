@@ -26,7 +26,14 @@ from pathlib import Path
 import pytest
 
 from brain.emotion import engine_files
-from brain.emotion.engine_utils import Average, EmotionState, EngineState, RunRecord, SnapshotDay
+from brain.emotion.engine_utils import (
+    Average,
+    EmotionState,
+    EngineState,
+    RunRecord,
+    SnapshotDay,
+    close_days,
+)
 from tests.unit.brain.emotion._engine_support import (
     DAY0,
     install,
@@ -507,3 +514,106 @@ def test_two_off_days_in_a_row_end_the_run_before_the_first_and_start_none(sim: 
     """
     flags = sim.run(_climb_values(50), first=40, last=52, off=frozenset({41, 42}))
     assert flags == {40: 0, 43: 0, 44: 0, 45: 0, 46: 0, 47: 1, 48: 1, 49: 1, 50: 1, 51: 1, 52: 0}
+
+
+# --- (l) the run record is carried by `close_days` past the 30-day window ----------------------------------------------------------
+
+
+def _long_run_then_short_climb(*, up_days: int) -> dict[int, float]:
+    """Day 0 at 1.0, days 1..up_days at 10.0 (up_days up moves of the long average), two days at 0.0, then 10.0 again for 17 days.
+
+    Every repeat of 10.0 after the first is a real move, because the averages are still below 10.0. The two days at 0.0 finish the
+    long run (finished length `up_days`); the short average is then a down run of 2, a blip, and a new up run that reaches 17.
+    """
+    values = {0: 1.0}
+    values.update(dict.fromkeys(range(1, up_days + 1), 10.0))
+    values.update(dict.fromkeys(range(up_days + 1, up_days + 3), 0.0))
+    values.update(dict.fromkeys(range(up_days + 3, up_days + 20), 10.0))
+    return values
+
+
+@pytest.mark.no_base_failure(reason="the carry already exists on the base; this pins it against a `run = None` mutation of `close_days`")
+def test_a_thirty_one_day_long_run_is_read_with_its_true_length_after_the_window_has_slid_past_most_of_it(sim: Sim) -> None:
+    """(l) The long average rises on days 1 to 31 (a run of 31 up days that starts on day 1), falls on 32 and 33 (finished: length 31),
+    then rises again. The short average's run in progress after day 50 closed is 17 days long (a down run of 2, a blip on day 34, and an
+    up run that starts on day 34 and reaches day 50: 17 days). The snapshot after day 50 closed holds days 21 to 50, so only 11 days
+    of the long run (21 to 31) are in the window, and 10 of its moves (22 to 31: the oldest snapshot day has no earlier day to move from): the bar is 31 only because `close_days` carried the run's record forward on
+    every snapshot day since day 1. 17 does not beat 31: 0. Had the record not been carried, the window alone would give a finished run
+    of 10, and 17 would beat it: a false +1.
+    """
+    flags = sim.run(_long_run_then_short_climb(up_days=31), first=50, last=50)
+    assert flags == {50: 0}
+    oldest = state_of(sim.persona).emotions["joy"].snapshot[0]
+    assert oldest.day == _day(21) and oldest.run == RunRecord(_day(1), 1, _day(21))  # day 21's record: the run began on day 1, before the window
+
+
+@pytest.mark.no_base_failure(reason="the control for the case above: the same path with a shorter true run flags on the base too")
+def test_the_same_path_with_a_sixteen_day_long_run_does_flag_so_the_zero_above_is_the_bar(sim: Sim) -> None:
+    """(l) Control. A long run of 16 up days (days 1 to 16), finished by days 17 and 18, and the same 17-day short run after day 35
+    closed. The window (days 6 to 35) again holds 11 days of the long run (6 to 16; 10 of its moves), the true bar is 16, and 17 beats it: +1. So the 0
+    of the 31-day case comes from the bar, not from a closed gate or a quiet feeling.
+    """
+    flags = sim.run(_long_run_then_short_climb(up_days=16), first=35, last=35)
+    assert flags == {35: 1}
+
+
+def _close_state(snapshot: list[SnapshotDay], long_avg: float, *, active: int) -> EngineState:
+    """A state whose open day is `active`, with `snapshot` kept for joy and an entry already on the open day (no quiet-day zero)."""
+    return EngineState(
+        saved_at=D(active),
+        last_update=D(active),
+        active_day=_day(active),
+        persona_start_at=D(-100),
+        emotions={
+            "joy": EmotionState(
+                short=Average(long_avg, 1.0), long=Average(long_avg, 1.0), last_entry_day=_day(active), snapshot=snapshot
+            )
+        },
+    )
+
+
+def _written_record(state: EngineState, closing: int) -> RunRecord | None:
+    snapshot = state.emotions["joy"].snapshot
+    assert snapshot[-1].day == _day(closing)
+    return snapshot[-1].run
+
+
+@pytest.mark.no_base_failure(reason="the pending-day kind already exists on the base; this pins it against forcing it to other")
+def test_a_zero_move_on_the_carried_pending_day_then_a_reversal_starts_the_new_run_on_the_reversing_day() -> None:
+    """(l) The seed's pending day (a day after the run's last with-direction day, so not yet decided) takes its kind from the stored
+    snapshot: day 1's long average equals day 0's, a zero move. A down move on day 2 ends the run (finished) and, the first reverse
+    day being a zero, the new down run starts on day 2 with length 1: the record written on day 2 is (day 2, down, day 2).
+    """
+    snapshot = [
+        SnapshotDay(_day(0), 5.0, 5.0, True, None),
+        SnapshotDay(_day(1), 5.0, 5.0, True, RunRecord(_day(-4), 1, _day(0))),
+    ]
+    state = _close_state(snapshot, 4.9, active=2)
+    close_days(state, D(3))
+    assert _written_record(state, 2) == RunRecord(_day(2), -1, _day(2))
+
+
+@pytest.mark.no_base_failure(reason="the control for the case above: a pending day that moved the other way starts the new run on it")
+def test_a_down_move_on_the_carried_pending_day_then_another_starts_the_new_run_on_the_pending_day() -> None:
+    """(l) Control. Day 1's long average is below day 0's (a move the other way), and day 2 moves down again: both reverse days are
+    down, so the new down run starts on the pending day (day 1) with length 2: the record is (day 1, down, day 2).
+    """
+    snapshot = [
+        SnapshotDay(_day(0), 5.0, 5.0, True, None),
+        SnapshotDay(_day(1), 4.9, 4.9, True, RunRecord(_day(-4), 1, _day(0))),
+    ]
+    state = _close_state(snapshot, 4.8, active=2)
+    close_days(state, D(3))
+    assert _written_record(state, 2) == RunRecord(_day(1), -1, _day(2))
+
+
+@pytest.mark.no_base_failure(reason="the pending-day kind of an off day already exists on the base; this pins it against forcing it to other")
+def test_an_off_day_then_a_reversal_in_one_close_starts_the_new_run_on_the_reversing_day() -> None:
+    """(l) The run is seeded on day 0 with its last with-direction day day 0, the app was off on day 1 (a zero move, the run's first
+    reverse day), and day 2 moves down in the same close. The zero first day starts no run: the new down run starts on day 2 with
+    length 1 and the record is (day 2, down, day 2).
+    """
+    snapshot = [SnapshotDay(_day(0), 5.0, 5.0, True, RunRecord(_day(-4), 1, _day(0)))]
+    state = _close_state(snapshot, 4.9, active=2)
+    close_days(state, D(3))
+    assert _written_record(state, 2) == RunRecord(_day(2), -1, _day(2))

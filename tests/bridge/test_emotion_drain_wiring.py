@@ -219,6 +219,47 @@ def test_the_websocket_stream_drains_after_the_clean_close_on_a_success_path_onl
     assert len(_note_active_calls(emotion_engine_stub)) == 1
 
 
+@pytest.mark.no_base_failure(reason="the drain already runs outside the session lock on the base (stage-6 fix 976ea2ee); this pins it against a move back inside")
+def test_the_websocket_stream_drains_after_the_session_turn_lock_is_released(
+    persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next turn of a session must not wait behind a catch-up: when `note_active` runs the session's in-flight lock is free.
+
+    Positive control: at the clean close, which is inside the turn, the same lock IS held, so the probe reads the real lock.
+    """
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_provider(monkeypatch)
+    from starlette.websockets import WebSocket
+
+    seen: dict[str, list[bool]] = {"at_close": [], "at_drain": []}
+    session: dict[str, object] = {}
+    real_close = WebSocket.close
+
+    async def close(self: WebSocket, code: int = 1000, reason: str | None = None) -> None:
+        if code == 1000:
+            seen["at_close"].append(session["lock"].locked())  # type: ignore[attr-defined]
+        await real_close(self, code, reason)
+
+    monkeypatch.setattr(WebSocket, "close", close)
+    with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")) as client:
+        emotion_engine_stub.recorded_calls.clear()
+        real_note_active = emotion_engine_stub.note_active
+
+        def probe(now):  # noqa: ANN001, ANN202
+            seen["at_drain"].append(session["lock"].locked())  # type: ignore[attr-defined]
+            return real_note_active(now)
+
+        emotion_engine_stub.note_active = probe
+        sid = client.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        session["lock"] = client.app.state.bridge.in_flight_locks.setdefault(sid, asyncio.Lock())
+        with client.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "hi"})
+            while ws.receive_json().get("type") not in ("done", "error"):
+                pass
+    assert seen["at_close"] == [True]  # the control: the lock is held through the clean close
+    assert seen["at_drain"] == [False]  # the drain runs once it is released
+
+
 def test_the_websocket_stream_runs_no_drain_on_an_error_path(persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
     behaviour = _patch_provider(monkeypatch)
