@@ -76,6 +76,8 @@ _REAPPRAISER_USER_TEMPLATE = prompt_strings.register(
 )
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
+# Never rotate or truncate the archive: the forgetting exemption (brain/soul/candidates.py::merge_target_map) reads it
+# to protect merge targets (#430). Canary: test_supervisor.py::test_consolidation_archive_is_never_rotated.
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
 _QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
 

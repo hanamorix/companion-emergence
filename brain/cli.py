@@ -499,6 +499,7 @@ def _dedup_sweep_handler(args: argparse.Namespace) -> int:
     Idempotent — safe to re-run.
     """
     from brain.engines.dedup_sweep import run_dedup_sweep
+    from brain.forgetting import SoulExemptionsUnavailableError
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
@@ -508,6 +509,10 @@ def _dedup_sweep_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
         report = run_dedup_sweep(store, persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        # The sweep fails closed (#392): it touched nothing. The loader has logged each failed read.
+        print(f"dedup-sweep stopped, nothing was deleted: {exc}.", file=sys.stderr)
+        return 1
     finally:
         store.close()
 
