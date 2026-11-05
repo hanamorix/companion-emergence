@@ -26,7 +26,9 @@ Today "how does she feel" is answered separately at each surface: the prompt, th
 After the rework a per-persona **emotion engine** keeps two moving averages per emotion, a short one (about the last day) and a long one (about the last month). Memories she lives through, makes or opens, and emotion changes from events, are folded into those averages. Every reader asks the engine. Values stored on memories are no longer rewritten by a decay pass; they are faded when read.
 
 The rework runs in two stages:
-- **Shadow stage.** The engine is built and runs beside today's code: writes queue events, drains fold them into a shadow state, and nothing reads it. Every reader is changed to `if engine.is_live(): <new> else: <today, unchanged>`. No persona is live in the shadow stage.
+- **Shadow stage.** The engine is built and runs beside today's code: a memory's own emotions are applied directly, showings and chat changes are queued and drained into a shadow state, and nothing reads it. Every reader is changed to `if engine.is_live(): <new> else: <today, unchanged>`. No persona is live in the shadow stage.
+
+*Updated 2026-11-05 after review on #626/#628/#629: the shadow-stage bullet no longer says all writes queue events.*
 - **Switch-over stage.** At a persona's first start in the switch-over stage a start-up step fixes the scale of old nudge rows, rebuilds the engine's state from the last 30 days of memories, and writes a switch file. From then on the persona is live, the old decay pass is gone, and the old reader branches are deleted.
 
 ### 1.2 The parts of this half
@@ -156,6 +158,8 @@ The self-model block says which feelings have shifted and which way they are mov
 
 ### 2.7 Reading the engine
 
+*Updated 2026-11-05 after review on #626/#628/#629: `oldest_entry_at()` is dropped. Nothing reads it, and keeping it would have made it a persisted field that could not be removed later without a migration.*
+
 `engine.engine_for(persona_dir)` returns the persona's engine; callers import the module (`from brain.emotion import engine`, or `emotion_engine` in `brain/cli.py`) so one test patch reaches every site. Its calls:
 
 | Call | Returns |
@@ -165,9 +169,8 @@ The self-model block says which feelings have shifted and which way they are mov
 | `is_live()` | whether the switch file exists |
 | `faded_value(memory, emotion)` | the faded stored value (2.4) |
 | `half_life(emotion)` | the half-life lookup of 2.4 |
-| `oldest_entry_at()` | the oldest entry folded into the state (at most 30 days back after a rebuild); no reader uses it any more, and it stays |
 | `note_active(now)` | runs a drain (2.8) |
-| hooks and `fold_change` | append events (2.8) |
+| hooks and `fold_change` | apply a memory's own emotions directly, or append a showing or a chat change to the queue (2.8) |
 
 Rules for `read()`:
 - It returns fresh immutable values, never cached objects, and reads never write: no heal, no quarantine, no backup rotation, no day close.
@@ -178,35 +181,52 @@ Rules for `read()`:
 
 ### 2.8 Hooks, the queue and the drain
 
-Writes never fold. A hook appends an event to a queue file, and a **drain** after the reply folds the queue.
+*Updated 2026-11-05 after review on #626/#628/#629. A memory's own emotions are now applied directly when the memory is written (this section used to say writes never fold); the queue holds only showings and chat changes, is a line file that is emptied and never deleted, and its position is saved with the state; the lock wait is a fixed 5 seconds; and a corrupted state is recovered before anything else is applied.*
+
+A memory's own emotions reach the averages in the call that writes the memory (the **direct apply**). The two events that wait are showings and chat changes: each is appended as one line to a queue file, and a **drain** after the reply folds the queue.
 
 **Hooks.** `MemoryStore.create(memory, *, fold=True)` and `MemoryStore.update(memory_id, *, fold=True, **fields)` call the engine after the commit:
-1. A row whose type does not count returns at once, before any lookup, with one exception: if the stored `persona_start_at` is null or later than the row's `created_at`, it queues a start-only event, so the start gate still counts from the oldest row of any type.
+1. A row whose type does not count, or that carries no emotions, returns before any lookup, with one exception: if the stored `persona_start_at` is null or later than the row's `created_at`, it makes a start-only event, so the start gate still counts from the oldest row of any type.
 2. For a counted row, the hook resolves everything the fold needs before taking the lock (the trust lookup, the modifier, the half-lives, the faded values) and builds the event.
-3. It takes the lock, appends the event, and returns. Nothing inside a hook's lock hold touches the memory database, the trust store or a model.
+3. The commit, assigned and start-only events are applied directly. The hook takes the engine lock and runs the drain's own apply steps on the one event: load the state (2.9; if it came from a backup copy, recovery runs first, below), `close_days` to the event's time, fold the event, `close_days` to now, save the state once, release. There is one apply path for the drain and the direct apply, so no queue is written for these events, and the queue file is read only by a catch-up. Showing and change events are appended to the queue instead. Apart from a catch-up's replay, nothing inside a hook's lock hold touches the memory database, the trust store or a model.
 
-Steps 1 to 3 are inside one `try/except`; a hook never raises into `create` or `update`. `update` fires the "assigned" hook only when emotions go from empty to filled, using the old row it already reads. An in-memory (`:memory:`) store skips the engine. The events are a commit, an assigned event, a showing, a change and the start-only event; each carries its own entry, so a row deleted before the drain still folds.
+Steps 1 to 3 are inside one `try/except`; a hook never raises into `create` or `update`. `update` fires the "assigned" hook only when emotions go from empty to filled, using the old row it already reads. An in-memory (`:memory:`) store skips the engine. The events are a commit, an assigned event, a start-only event (applied directly), a showing and a change (queued); each carries its own entry, so a row deleted before the drain still folds.
+
+**A failed direct apply** keeps the saved memory and logs the failure. If the state cannot be read, the recovery rebuild runs (2.11) and its replay of the memory rows includes the memory. If the state can still be read (a failed save, a crash between the memory's commit and the apply, a lock wait that timed out, a batch lost in a crash), nothing applies the event again and no rebuild is triggered: this is an accepted edge (6), and until the next rebuild folds the memory from its row, that memory's emotions are missing from the short and long averages. The per-turn tool process is short-lived and never runs the recovery job, so a catch-up-failed flag set there dies with the process; the bridge meets the same unreadable state at its own next drain, so no cross-process signal is added.
+
+**Batches.** A bulk writer wraps its loop in `engine.engine_for(persona_dir).batch()`, a context manager on the engine. Inside it, on that thread, the commit, assigned and start-only hooks collect their events and apply nothing; when the outermost block ends, normally or by an exception, one direct apply handles the whole list: one lock hold, the events in time order with `close_days` before each and once at now, one state save. Nested blocks join the outermost, and a hook on another thread applies directly. A failed batch apply is a failed direct apply for each event in it, and a crash inside a block loses that block's events from the engine until a rebuild (the same accepted edge). The one bulk caller is ingest's commit path (hanamorix's call). The emotion backfill is not wrapped: each memory there costs a model call, so a state save per memory is small next to it, and a crash inside a block would lose events after the backfill's cursor had already moved past those memories.
 
 Which writers fire which hook:
 
 | Writer | Hook |
 |---|---|
-| `create` by the gate promote, the pass-2 extractor, `add_memory`, the maker, reach-out, note and peer writers | commit, if the type counts |
+| `create` by the gate promote, the pass-2 extractor, `add_memory`, the maker, reach-out, note and peer writers | commit, if the type counts (applied directly) |
 | `create` by recovery's restore branch and the migrators | none (`fold=False`): they are not new experiences, and the first rebuild covers the past |
-| the emotion backfill's `update` (empty to filled) | assigned |
-| content-only updates, the gate merge, the temp-gate write-back, `update_emotions_batch`, the x10 fix | none |
-| ingest | hanamorix's call; the default folds |
-| a full open through the memory door (3.5) | showing (`on_memory_shown(memory, at)`) |
-| pass 2's chat changes and `reconcile_self_read` | change (`fold_change`); on a live persona also one change-log line, appended first, in the same lock hold |
+| the emotion backfill's `update` (empty to filled) | assigned (applied directly) |
+| content-only updates, the temp-gate write-back, `update_emotions_batch`, the x10 fix | none |
+| the gate merge | the merge's own `update` fires none (`fold=False`); the gate then sends the incoming memory's commit event itself (3.1) |
+| ingest | hanamorix's call; the default folds, and it is the one batch caller |
+| a full open through the memory door (3.5) | showing (`on_memory_shown(memory, at)`), queued |
+| pass 2's chat changes and `reconcile_self_read` | change (`fold_change`), queued; on a live persona also one change-log line, appended first, in the same lock hold |
+
+**The queue.** `state/emotion_pending.jsonl` holds one JSON event per line, no header, and only showings and chat changes (a memory's own emotions are never queued, so losing a queue line never loses a memory's emotions). Lines are numbered from 0. The file is never deleted: a drain empties it. A bad line is dropped with an ordinary error log line and still counts as a line, as does a blank line; a queue whose every line is bad is in effect discarded, and none of this starts a rebuild. The state carries `queue_line`, the number of queue lines already folded, saved in the same write as the averages they went into. A reader that finds `queue_line` greater than the number of lines in the file knows the queue was emptied since and reads from line 0.
+
+**Recovery first.** When the engine finds its state file corrupted (the read-only walk had to fall back to a backup copy), recovery runs before any other change is applied. Whichever caller touches the corrupted state first (the drain, a direct apply or a batch) loads the backup and runs the catch-up (2.11), holding the engine lock from the load to the save, so nothing else changes the state meanwhile; a caller that needs the lock waits. Only after that do the caller's own changes apply, and only those the catch-up could not already account for. `read()` is not such a caller: it never recovers and never writes.
+- The catch-up replays the rows that `MemoryStore.list_engine_window(saved_at)` returns (created or accessed on or after the backup's `saved_at`), each once, at the later of its creation and last access, with the emotions the row has now. So a commit, assigned or start-only event is already accounted for exactly when its memory's row is among the rows that window returned, and then it is skipped. `catch_up` returns the ids of those rows, so the caller tests its events against them and the window's rule is written once. An event whose row the window did not return is applied normally, once: for example an assigned event on an old row that has not been opened since. The queued kinds are not tested this way: the catch-up ends them at the oldest queued event, and the drain applies its queue lines after it.
+- A drain runs recovery and then its own queue lines; a direct apply runs recovery and then its one event unless skipped; a batch runs recovery and then the events not skipped, in time order, in the same lock hold.
+- If recovery fails (the catch-up raises, or no backup can be read), nothing is applied on top of a state that was not recovered. The failure is logged, the in-memory catch-up-failed flag is set, and each change keeps what it has: queue lines stay queued with their position and the next drain retries; a memory stays saved, and for a live persona the recovery rebuild's replay covers it.
+- The catch-up runs inside whatever wrote the memory, so a write during a reply that meets a corrupted state holds the lock for the length of a catch-up. A commit event that the catch-up counts gets no climax reset, because a replay gives none: an accepted edge (6). A writer that committed its memory and then waited at the lock while a recovery ran, and whose memory that recovery counted, applies it again: an accepted edge (6), recorded in a code comment, with no stored catch-up range.
 
 **The drain**, `note_active(now)`:
-1. If there is no queue file, the day has not advanced and the cached state was not loaded from a backup, return at once with no lock and no write.
-2. Take the lock; read the state (read-only walk, 2.9) and the queue. If the state came from a backup copy, catch it up first (2.11).
+1. Return at once, with no lock and no write, if the queue has no lines after the cached `queue_line` (the queue file's stat key is unchanged since this engine's last drain), the day has not advanced and the cached state was not loaded from a backup.
+2. Take the lock; read the state (read-only walk, 2.9), then the queue lines after the saved `queue_line`. If the state came from a backup copy, recover first (above).
 3. Fold the events in time order, calling `close_days` at each event's time before folding it.
 4. Call `close_days(state, now)`.
 5. If a day closed, delete change-log files older than 30 days (2.10).
-6. Write the state once.
-7. Delete the queue file, and release the lock.
+6. If any line was read or a day closed, set `queue_line` to the queue's end line and save the state once; otherwise no save.
+7. If the queue holds any lines, empty the file (it is emptied, not deleted). If that succeeds, set `queue_line` to 0 and save the state again. If it fails, `queue_line` stays at the end, so the next drain reads only the lines after it (nothing is applied twice) and retries the emptying without a new save. Release the lock.
+
+The drain keeps no in-memory record of applied lines. A crash between the state save of step 6 and the emptying applies nothing twice, because the saved position already covers those lines. A crash between the emptying and the save of position 0 is an accepted edge (6): the saved position is then past the end of the emptied file, and if the next reply's queued lines outgrow it before the next drain, those lines are skipped.
 
 **Where drains run.** Each call site calls `note_active` bare; it catches and logs its own failures.
 - the end of the supervisor's `run_folded` pass, when no reply is in flight;
@@ -216,20 +236,22 @@ Which writers fire which hook:
 - `nell chat --no-bridge` (`_chat_direct_mode`), after each reply and after each `_drain_pass2_at_exit`;
 - the CLI heartbeat (`_heartbeat_handler`), after `run_tick`.
 
-So events from inside a reply reach the averages right after the reply is sent; events outside a reply (a gate commit in a heartbeat tick, a pass-2 change after the lull) are drained by the supervisor pass. At most one turn's worth of events is ever waiting while drains succeed.
+So showings and chat changes from inside a reply reach the averages right after the reply is sent; events outside a reply (a pass-2 change after the lull) are drained by the supervisor pass. At most one turn's worth of queued events is ever waiting while drains succeed. A memory's own emotions do not wait: they are in the averages when the memory is written.
 
-**The lock.** One `file_lock` on `state/emotion_state.json` (sidecar `emotion_state.json.lock`) guards all four engine files. It blocks with no timeout and is not re-entrant, so no code path takes it twice. Hooks and drains hold it briefly; a rebuild and a catch-up hold it for their whole run, and anything arriving waits (about a second on the measured database).
+**The lock.** One `file_lock` on `state/emotion_state.json` (sidecar `emotion_state.json.lock`) guards all four engine files. It is not re-entrant, so no code path takes it twice. Every acquisition (the direct apply, a queue append, a drain, a rebuild) goes through `engine_files.state_lock`, which waits at most a fixed 5 seconds, the dev constant `EMOTION_LOCK_WAIT_S = 5.0`, so a wedged holder cannot hang a caller for good. Nothing is measured or stored for the wait; making it follow the real hold times is a follow-up (#642). On a timeout: a queue append is a lost entry (accepted, 6); a drain logs, keeps the queue and retries at the next drain; a direct apply is a failed direct apply (above); the first rebuild stops start-up with `EngineStartupError`; a recovery rebuild is caught and logged and the job returns SKIPPED. Hooks and drains hold the lock briefly; a rebuild and a catch-up hold it for their whole run, and anything arriving waits (about a second on the measured database, well inside the bound).
 
-**Shadow stage.** Hooks queue, drains fold and close days and append snapshot days into a shadow state under `state/`. No change-log lines are written, `faded_value` returns stored values, nothing rebuilds, and an unreadable state on a persona that is not live simply starts empty. Nothing reads the shadow state. The first rebuild at the switch-over discards it.
+**Shadow stage.** A memory's own emotions are applied directly and showings and chat changes are queued, both into a shadow state under `state/`; drains fold the queue and close days and append snapshot days into it. No change-log lines are written, `faded_value` returns stored values, nothing rebuilds, and an unreadable state on a persona that is not live simply starts empty. Nothing reads the shadow state. The first rebuild at the switch-over discards it.
 
 ### 2.9 The engine's files
 
-All under `<persona_dir>/state/`, a new directory for single-file records (the existing persona state files stay where they are for now; moving them is #570). The writers create the directory; no migration is needed because every file is new.
+*Updated 2026-11-05 after review on #626/#628/#629: the queue file is `emotion_pending.jsonl`, a line file that is emptied and never deleted, with its position saved in the state; `oldest_entry_at` is gone from the state.*
+
+All under `<persona_dir>/state/`, a new directory for single-file records (the existing persona state files stay where they are for now; moving them is #570). The writers create the directory (so does the first append to the queue); no migration is needed because every file is new.
 
 | File | Holds | Written with |
 |---|---|---|
-| `emotion_state.json` | per emotion: the two averages and weights, `last_entry_day` and the snapshot; global: `last_update`, `active_day`, `saved_at` (time of the write), `reset_at` (time of the last rebuild or catch-up), `persona_start_at`, `oldest_entry_at`, and the 24-hour repeat map | `write_json`, three backups (`.bak1` to `.bak3`), compact |
-| `emotion_pending.json` | the queue: a plain list of events | `write_json`, no backups (a drained queue must not come back from one), no fsync; removed when empty |
+| `emotion_state.json` | per emotion: the two averages and weights, `last_entry_day` and the snapshot; global: `last_update`, `active_day`, `saved_at` (time of the write), `reset_at` (time of the last rebuild or catch-up), `persona_start_at`, `queue_line` (the number of queue lines already folded, 2.8), and the 24-hour repeat map | `write_json`, three backups (`.bak1` to `.bak3`), compact |
+| `emotion_pending.jsonl` | the queue: one JSON event per line, no header; only showings and chat changes | `append_jsonl` under the held lock, failures logged, no fsync; never deleted, emptied after a drain with `write_jsonl(path, [], fsync=False)` |
 | `emotion_changes/YYYY-MM-DD.jsonl` | the change log (2.10) | `append_jsonl` under the held lock, failures logged |
 | `emotion_switch.json` | `{"switch_over_at"}` only | `write_json`, three backups, written only if missing |
 
@@ -237,7 +259,7 @@ The state file keeps no entry history and no memory copies. Losing it never un-s
 
 **Reading the state.** A new read-only walk, `brain/health/json_io.py: read_json_walk(path, *, expect, validate) -> JsonWalk(data, source, problem, signature)`, tries the main file and then `.bak1` to `.bak3`, takes the first that passes the validator, and reports which copy it loaded. It never heals or rewrites anything (the existing backup walk lives only inside the heal path). The felt-time state reader in #385 should use it too; its author gets a note. `brain/paths.py` gains `state_dir(persona_dir)`.
 
-**The validator.** It rejects a non-finite number, a negative weight, a missing or bad `saved_at`, a bad `reset_at`, an emotion missing a field, `last_entry_day` later than `active_day`, and `active_day` unset while `last_update` is set. An average outside 0 to 10 is held to the range, not rejected. `persona_start_at` may be missing or null. A bad snapshot day (a non-finite number, a bad felt flag, a malformed run record, or a label out of order) does not make the state unreadable: it is dropped and treated as a missing day, which counts as a day against a run, with a log line naming the emotion.
+**The validator.** It rejects a non-finite number, a negative weight, a missing or bad `saved_at`, a bad `reset_at`, an emotion missing a field, `last_entry_day` later than `active_day`, and `active_day` unset while `last_update` is set. An average outside 0 to 10 is held to the range, not rejected. `persona_start_at` may be missing or null. `queue_line` missing, or any value that is not an integer of 0 or more, reads as 0 with a log line and does not make the state unreadable. A bad snapshot day (a non-finite number, a bad felt flag, a malformed run record, or a label out of order) does not make the state unreadable: it is dropped and treated as a missing day, which counts as a day against a run, with a log line naming the emotion.
 
 ### 2.10 The change log
 
@@ -251,14 +273,17 @@ A chat change or self-correction is stored today as a memory row with its sign l
 
 ### 2.11 The rebuild and the catch-up
 
+*Updated 2026-11-05 after review on #626/#628/#629: the rebuild empties the queue instead of deleting it and resets its position; the catch-up runs under recovery first, over the rows of `list_engine_window`, and returns the ids it folded.*
+
 **The rebuild** is one function, `engine_rebuild.rebuild(persona_dir, mode, now)`, with two modes. **First** runs once per persona from the start-up step; **recovery** runs at a quiet moment when a live persona's state is lost. Its caller takes the lock once and holds it (`ensure_engine_ready` for the first mode, `recovery_rebuild` for recovery); `rebuild` itself never takes it. In order:
 1. Read the counted memory rows created or accessed in the last 30 days of wall time, active or forgotten; the creation times of all rows in that window; the change-log files from the day before the window starts; and the oldest row's `created_at` (one `SELECT MIN(created_at)`). All reads are plain SELECTs that bump nothing, fire no hook and skip the integrity check.
 2. Build the state in memory from empty with `replay(state, from, to)`: one time-ordered pass that folds each memory at `max(created_at, last_accessed_at)`, folds each change-log line at its own time, and calls `close_days` at every point, so quiet-day zeros, off-day skips and snapshot days work exactly as live. A past day counts as active if any memory row of any type was created on it, or a counted memory was accessed, or a change-log line was written. Memories created in the last 24 hours enter the repeat map as first showings. No climax reset is replayed. Then `close_days(state, now)`.
 3. In the first mode use stored values as they are (the old pass kept them faded until now); in recovery mode fade them (2.4).
 4. Set `persona_start_at`: the query result in the first mode; in recovery mode the earlier of the query result and the old state's value when one is readable, because the temp-gate write-back moves recalled rows' `created_at` forward.
-5. Check: every number finite and every average within 0 to 10; then write with `write_json(..., verify=True)`, which re-reads the result and restores `.bak1` if what landed is wrong (a False result is a failed check). `saved_at` and `reset_at` are set to now.
-6. In the first mode, write the switch file.
-7. Delete the queue: every queued commit, assignment and showing is already a row or an access, and every queued change is a log line, so the rebuild has folded them.
+5. Check: every number finite and every average within 0 to 10.
+6. The queue step: empty the queue file (emptied, not deleted), and set `queue_line` to 0 in the rebuilt state. If the emptying fails, the rebuilt state's `queue_line` is the queue's end line, so no line is folded on top of the rebuild. A queued showing is already in the rebuild through its memory's `last_accessed_at`, and a queued change through its change-log line, so the rebuild has folded them; a memory's own emotions are never queued.
+7. Write the state with `write_json(..., verify=True)`, which re-reads the result and restores `.bak1` if what landed is wrong (a False result is a failed check). `saved_at` and `reset_at` are set to now.
+8. In the first mode, write the switch file last.
 
 A failed check or an error leaves the old state, writes no switch, and logs what failed. A first rebuild's failure stops start-up (2.12); a recovery rebuild logs once per active day and retries at each quiet moment. A crash before the state write leaves the old state and the same rebuild reruns. A rebuilt state is a fresh 30-day history, not the live one: it folds each memory once where live folded every showing, and its snapshot holds only the replayed days, so flags after a rebuild may differ from those before it.
 
@@ -266,9 +291,9 @@ The prototype on the synthetic database (19,413 rows, 684 counted rows in the wi
 
 **`persona_start_at` in normal running.** No query runs: every committed row of any type min-folds it (the hook's start-only event covers uncounted types), and a new persona with no rows has null, which keeps the gate shut. A catch-up keeps the loaded state's value and folds into it.
 
-**The catch-up.** When the read-only walk falls back to a backup copy, the loaded state is as old as that copy's `saved_at`. The drain that loaded it replays everything since `saved_at` with the same `replay` function, from the loaded state, up to the time of the oldest event still in the queue (to now if the queue is empty), with no final close; the drain then applies the queue as usual and writes once, stamping `reset_at`. Stopping at the oldest queued event means no queued event is counted twice. If the catch-up errors, or the backup's `saved_at` is more than 30 days old (the change log keeps only 30 days), the drain logs, writes nothing, keeps the queue, and sets an in-memory flag that empties `read()` until a successful state write; for a live persona the recovery rebuild then runs. A `saved_at` ahead of now is held to now.
+**The catch-up** is how recovery goes first (2.8). When the read-only walk falls back to a backup copy, the loaded state is as old as that copy's `saved_at`. Whichever apply step first loads it (the drain, a direct apply or a batch) replays everything since `saved_at` with the same `replay` function, from the loaded state, with the engine lock held from the load to the save. The replay covers the rows `list_engine_window(saved_at)` returns (created or accessed on or after `saved_at`), each folded once with the emotions it has now: the directly applied kinds (commits, assigned) up to now, and the queued kinds (showings, chat changes) up to the oldest event among all the lines in the queue file, with no final close. The caught-up state's `queue_line` is set to 0, so the drain then folds every line in the file once (a backup's own position can name a line of an older queue). Stopping at the oldest queued event means no queued event is counted twice. The catch-up returns the ids of the rows its replay actually folded, so a direct apply or a batch skips its events for those rows. The apply step then writes once, stamping `reset_at`. If the catch-up errors, or the backup's `saved_at` is more than 30 days old (the change log keeps only 30 days), the step logs, writes nothing, applies nothing on top, keeps the queue, and sets an in-memory flag that empties `read()` until a successful state write; for a live persona the recovery rebuild then runs. A `saved_at` ahead of now is held to now.
 
-**The recovery job.** A new gated job of the central cadence, `emotion_recovery_rebuild`, first in `GATED_JOB_ORDER`, with no interval: `has_work=needs_recovery` (the switch exists and the state does not parse or validate with nothing readable in the backups, or a catch-up failed in this process), `run=recovery_job_run`, which catches and logs (once per active day) and returns `JobOutcome.SKIPPED` on failure. It runs only at a quiet moment (no reply in flight and the lull passed). Readers show absent until it succeeds. A queue file that does not parse never starts a rebuild: it is discarded with a log line.
+**The recovery job.** A new gated job of the central cadence, `emotion_recovery_rebuild`, first in `GATED_JOB_ORDER`, with no interval: `has_work=needs_recovery` (the switch exists and the state does not parse or validate with nothing readable in the backups, or a catch-up failed in this process), `run=recovery_job_run`, which catches and logs (once per active day) and returns `JobOutcome.SKIPPED` on failure. It runs only at a quiet moment (no reply in flight and the lull passed). Readers show absent until it succeeds. A queue line that does not parse never starts a rebuild: it is dropped with a log line.
 
 **`reset_at` and the self-model.** The engine never writes the self-model's state. Instead every rebuild and every catch-up stamps `reset_at`, and the self-model tick reads it (3.4) to avoid comparing a saved gap with flags from a different history, which could otherwise close an open gap and write a false importance-9 "resolved" memory.
 
@@ -294,14 +319,18 @@ Why a `user_version` marker: it is transactional and adds nothing to the schema.
 
 ### 2.13 Failure behaviour, in one place
 
+*Updated 2026-11-05 after review on #626/#628/#629: rows added for the direct apply and the lock wait; the queue rows describe lines, not a file.*
+
 | What fails | What happens |
 |---|---|
-| A hook raises, or its append fails | Logged; the memory write is unaffected; that event is lost (accepted, 6) |
+| A hook raises, or a queue append fails | Logged; the memory write is unaffected; that showing or chat change is lost (accepted, 6) |
+| A direct apply fails | Logged; the memory stays saved. State unreadable: the recovery rebuild's replay covers it. State readable: that memory's emotions are missing until the next rebuild (accepted, 6) |
+| The engine lock is not obtained within 5 s | A queue append is a lost entry; a drain logs, keeps the queue and retries; a direct apply is a failed direct apply; the first rebuild stops start-up with `EngineStartupError`; a recovery rebuild is logged and the job returns SKIPPED |
 | A queue event is invalid (no memory id on a showing, no emotions on a commit or assigned event, an unknown kind, a missing time, a non-finite amount) | Dropped with a log line saying why; the others fold |
-| The queue file does not parse | Discarded with a log line; no rebuild |
-| A drain fails (disk, permission) | Logged; the queue stays and the next drain retries |
-| The state is unreadable | The walk tries the backups; a backup is caught up; with nothing readable a live persona gets a recovery rebuild, a shadow-stage persona starts empty |
-| A catch-up fails | Logged; `read()` is empty until a state write; recovery rebuild |
+| A queue line does not parse | Dropped with a log line (it still counts as a line); no rebuild |
+| A drain fails (disk, permission), or the emptying after it fails | Logged; the queue stays and the next drain retries (after a failed emptying it reads only the lines after the saved position and retries the emptying) |
+| The state is unreadable | The walk tries the backups; a backup is caught up before any other change applies (recovery first); with nothing readable a live persona gets a recovery rebuild, a shadow-stage persona starts empty |
+| A catch-up fails | Logged; nothing is applied on top; `read()` is empty until a state write; recovery rebuild |
 | The first rebuild or the x10 fix fails | Start-up stops with `EngineStartupError`; the next start retries |
 | A recovery rebuild fails | Logged once per active day; retried at each quiet moment; readers show absent |
 | A change-log file is missing or corrupt | Those changes are lost at a rebuild only |
@@ -310,9 +339,11 @@ The memories are the truth; the engine is derived from them. A failed engine upd
 
 ### 2.14 How the engine is tested
 
+*Updated 2026-11-05 after review on #626/#628/#629: the queue tests follow the direct apply, the saved position, recovery first and the lock bound.*
+
 - **Fold tests:** the worked numbers above, out-of-order folds giving the same result, null against 0, a change on an emotion with no history, the future clamp, the fade with the 1/3 floor, and the climax order.
 - **State and rebuild tests:** the validator, the backup walk, the cache, `read()` immutability and the registry filter, the half-life lookup, the refresh call (a name registered by another process appears; a missing refresh function does nothing; a refresh that raises or has another signature is logged and the read still returns names), the rebuild window, any-row days, change-log replay with missing files, first against recovery fades, a failed check keeping the old state and writing no switch, and a failing start-up step stopping start-up.
-- **Queue tests:** the hook cases (never raises, which writer fires which hook) and the drain and its call sites.
+- **Queue tests:** the hook cases (never raises, which writer fires which hook, commit and assigned applied directly, showing and change queued), the drain and its call sites, the queue position (a crash between the state save and the emptying applies nothing twice; a failed emptying retries without a new save), recovery first (a corrupted state is caught up before a direct apply, a batch or a drain applies anything, and the events the catch-up counted are skipped), and the lock wait (every acquisition passes the 5 s bound).
 - **One simulation of the shift rule end to end on a known history**, instead of piece-by-piece tests, plus the live test of section 8. Its cases include the start gate: a persona whose oldest memory is under 30 days old is gated; one whose first rows are of an uncounted type opens 30 days after the oldest of them; at a first rebuild an existing persona whose oldest memory is 90 days old with entries on its last 5 days only is not gated, and one whose oldest memory is 10 days old is.
 - **Start order:** the call order of the start-up step, the dry-run cases, and a first start on a fresh persona that completes (so the lock is taken once).
 - **x10 fix tests**, and one test that a peer at trust 1.0 takes modifier 1.0 once trust is wired.
@@ -325,13 +356,19 @@ The memories are the truth; the engine is derived from them. A failed engine upd
 
 ### 3.1 Gate work (Engine 5)
 
-**The gate merge keeps emotions.** When the consolidation gate merges a candidate into an existing memory (`consolidation.py`, the merge branch of `_dispatch`) and the engine is live, it writes the merged content and merged emotions in one `store.update(target.id, content=merged, emotions=..., fold=False)`: an emotion on both memories takes the average of the two (joy 5 and 7 give 6), an emotion on one side is copied unchanged. A merge is not a new memory, so it folds nothing. Today the merge writes content only and drops the candidate's emotions. Not live, the merge stays as it is. The merge target is now pre-read with `bump=False`, live or not, so a merge does not count as an access of the target.
+*Updated 2026-11-05 after review on #626/#628/#629: a merge keeps the hook for the incoming memory's mood move (hanamorix's decision on #629), with its two accepted edges; the write-back also dates the memory's text and re-embeds it; backfill cursors walk by `rowid`.*
 
-**The temp-gate write-back.** Remembering a memory refreshes it: you remember the last time you remembered it. When a recalled memory comes back through the temp gate (`_handle_reappraisals`) and the engine is live, after its importance update succeeds the gate computes the memory's faded values from the loaded row (its importance before this re-appraisal) and calls a new store method, `refresh_faded_emotions(memory_id, faded, now)`: one `UPDATE` of `emotions_json` and `created_at` (written as `created_at.isoformat()` in `+00:00` form) together, so a crash leaves both old or both new. `peak_emotion_intensity` is untouched, no hook fires, and the method raises `KeyError` if no row changed. It covers every memory type, and resets `created_at` even when the memory has no emotions. Later fades read the row's current (re-appraised) importance from the reset date. A failing write-back is caught at its call, logged, leaves the row unchanged and is not requeued (requeueing would repeat a model call).
+**The gate merge keeps emotions.** When the consolidation gate merges a candidate into an existing memory (`consolidation.py`, the merge branch of `_dispatch`) and the engine is live, it writes the merged content and merged emotions in one `store.update(target.id, content=merged, emotions=..., fold=False)`: an emotion on both memories takes the average of the two (joy 5 and 7 give 6), an emotion on one side is copied unchanged. The merge's own `update` fires no hook, even when the target's emotions were empty, and the merged memory is never created as a row. Today the merge writes content only and drops the candidate's emotions. Not live, the merge stays as it is and sends no event. The merge target is now pre-read with `bump=False`, live or not, so a merge does not count as an access of the target.
 
-Every reader of `created_at` now sees a recalled memory as new: its shown date in search, read-full-memory results and journal entries is the date she last remembered it; a recalled dream counts as a new dream in the maker's charge; a recalled conversation memory touches her interests again; a recalled grief event blocks a new grief touch for that person. These are accepted as in keeping with a refreshed memory, with no code change.
+**The merge keeps the hook for the incoming memory's mood move.** A merged memory's emotions still move her mood, through the existing commit event. After the `store.update` returns, and under the same live gate as the emotions write, `_dispatch` calls `engine.engine_for(persona_dir).on_memory_committed(cand)` for the incoming memory `cand`: its own emotions, dated at its `created_at`, with its own type and source modifier. The engine treats it as it treats a promoted memory's commit (applied directly, 2.8; one fold path), and it follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the climax reset like any commit. It is counted once: `cand` is never created as a row, so `create` never sends its commit event; the call sits after the successful `update`, so a deferred merge (target missing, mid-fade or hard-deleted, which re-enqueue `cand`) sends nothing and the later tick that finally writes the merge sends it once; and the event's repeat-map entry is keyed by `cand`'s id. This was decided by hanamorix on 2026-11-05 (#629): keep the hook. Two edges are accepted, each with a code comment at the merge branch that points here (section 6): (a) a crash in the middle of a merge that is then retried averages the shared feelings a second time, and if the first try had already sent the incoming memory's commit event, the retry sends it again and it counts again at half weight (the repeat factor); (b) a rebuild or a catch-up counts the merged target row's current emotions once and does not restore the merge's separate mood move, since the merged memory has no row and the merge writes no change-log line.
 
-**Tests:** a live merge averages and calls no hook; a merge that is not live keeps today's behaviour; the merge leaves the target's `recall_count` and `last_accessed_at` unchanged; the write-back writes faded values and a new `created_at`, also for empty emotions; a raising write-back is logged and not requeued; and the store method's own cases.
+**The temp-gate write-back.** Remembering a memory refreshes it: you remember the last time you remembered it. When a recalled memory comes back through the temp gate (`_handle_reappraisals`) and the engine is live, after its importance update succeeds the gate computes the memory's faded values from the loaded row (its importance before this re-appraisal) and calls a new store method, `refresh_faded_emotions(memory_id, faded, now)`: one `UPDATE` of `content`, `emotions_json` and `created_at` (written as `created_at.isoformat()` in `+00:00` form) together, so a crash leaves all old or all new. Before the creation date is reset, the content gets the date the memory was made at its start, unless the text already starts with a date in that format (section 7 item 12): the date added is the row's `created_at` before the reset, which is the date it was made, since every earlier reset added its own prefix. When the write-back dates a fading memory's text, the row's `content_snapshot` is dated too, so an unfade keeps the origin date. After the `UPDATE` commits, the method calls `MemoryStore._reembed_or_clear(memory_id, content)`, as every content-changing path must; the full-text index follows by its update trigger. `peak_emotion_intensity` is untouched, no hook fires, and the method raises `KeyError` if no row changed. It covers every memory type, and resets `created_at` even when the memory has no emotions. Later fades read the row's current (re-appraised) importance from the reset date. A failing write-back is caught at its call, logged, leaves the row unchanged and is not requeued (requeueing would repeat a model call).
+
+Every reader of `created_at` now sees a recalled memory as new: its shown date in search, read-full-memory results and journal entries is the date she last remembered it; a recalled dream counts as a new dream in the maker's charge; a recalled conversation memory touches her interests again; a recalled grief event blocks a new grief touch for that person. These are accepted as in keeping with a refreshed memory, with no code change; the displays show the date the memory was made through the prefix the write-back puts at the start of its text.
+
+**Backfill cursors.** Because the write-back moves `created_at`, a backfill cursor must not walk rows by `created_at`; it walks them in insertion order. Memory ids are random, so ordering by id would not do either; the cursor uses the row's SQLite `rowid` (the table's implicit `rowid`, which the full-text triggers already key on). The one cursor this reaches is the embedding backfill's: `store.list_unembedded_since` and `embedding_backfill.py` walk `rowid > ?` in `rowid` order, and the persisted cursor becomes `{"rowid": n}`. A cursor file in the old form reads as none, so that backfill starts over once, which its docstring already allows. The heartbeat decay cursor is deleted in Engine 6, so it needs no change. This lands in the Engine 5 PR, which introduces the reset.
+
+**Tests:** a live merge averages the shared emotions and sends exactly one commit event for the incoming memory, with the target's own `update` firing none; a deferred merge sends none and the tick that later writes it sends one; a merge that is not live keeps today's behaviour and sends none; the merge leaves the target's `recall_count` and `last_accessed_at` unchanged; the write-back writes faded values and a new `created_at`, also for empty emotions; the date is added once and not added again on a second write-back; the re-embed runs after the write-back; a refreshed row is visited once by the embedding backfill's `rowid` cursor; a raising write-back is logged and not requeued; and the store method's own cases.
 
 ### 3.2 Days since the user last spoke (Engine 6)
 
@@ -446,6 +483,8 @@ Before any reader changes, tests pin what the readers do today, so a reader edit
 
 ### 4.1 The PRs
 
+*Updated 2026-11-05 after review on #626/#628/#629: the Engine 0 stub no longer includes `oldest_entry_at()`.*
+
 | PR | Contents | Owner |
 |---|---|---|
 | Plan PR | the coordination draft PR (4.5) | ThinkerOfThoughts |
@@ -466,7 +505,7 @@ Before any reader changes, tests pin what the readers do today, so a reader edit
 | Her writer, vocabulary, cleanup and weather-shift PRs, and her access-fix issue | 1.3 | hanamorix |
 
 **What each engine slice contains.**
-- **Engine 0.** `brain/emotion/engine.py` with every call of 2.7 as a stub: hooks and `fold_change` record their arguments in `recorded_calls`; `read()` returns `{}`; `is_live()` False; `status()` `(True, None)`; `faded_value()` the stored value; `oldest_entry_at()` None. `half_life()` is real from the start, because hanamorix's vocabulary work builds blend half-lives from it and can land before Engine 1: Engine 0 adds the half-life constants (`EMOTION_HALF_LIFE_DAYS`, `EMOTION_DEFAULT_HALF_LIFE_DAYS = 14.0`) and the persona-vocabulary-file cache in `engine_files.py`, with the half-life tests.
+- **Engine 0.** `brain/emotion/engine.py` with every call of 2.7 as a stub: hooks and `fold_change` record their arguments in `recorded_calls`; `read()` returns `{}`; `is_live()` False; `status()` `(True, None)`; `faded_value()` the stored value. `half_life()` is real from the start, because hanamorix's vocabulary work builds blend half-lives from it and can land before Engine 1: Engine 0 adds the half-life constants (`EMOTION_HALF_LIFE_DAYS`, `EMOTION_DEFAULT_HALF_LIFE_DAYS = 14.0`) and the persona-vocabulary-file cache in `engine_files.py`, with the half-life tests.
 - **Engine 1.** `engine_utils.py`: `day_of`, `fold_entry`, `fold_event`, `close_days`, `apply_climax_reset`, `run_tracker`, `shift_for`, `fade`, `counted_kind`, `source_modifier`; and the rest of the engine constants (`EMOTION_SHORT_HALF_LIFE_H = 24.0`, `EMOTION_LONG_HALF_LIFE_D = 30.0`, the climax numbers, `EMOTION_VALUE_CAP = 10.0`, `EMOTION_FADE_FLOOR_FRACTION`, `EMOTION_REPEAT_WINDOW_H = 24.0`, `EMOTION_REPEAT_FACTOR = 0.5`, file and folder names). `HORIZON_IMPORTANCE_GAIN` is imported inside `faded_value` to avoid an import cycle. The quiet-day zero's value 0 and weight 1 are written once in the module, not as tunables. The 30 days of the rebuild window, the change-log retention, the snapshot and the start gate are all the long half-life, not separate constants; the lock, queue, drain and day close have no constants. Engine 1 edits none of hanamorix's files.
 - **Engine 2.** The rest of `engine_files.py`, `read_json_walk`, `state_dir`, the validator, the stat-key cache, and the queue, change-log and switch I/O.
 - **Engine 3.** The hooks and the `fold` flag on `create` and `update`; `fold=False` in recovery's restore branch and the two migrators; the peer-trust stand-in; the conftest fixtures.
@@ -520,14 +559,16 @@ One draft PR whose description is the plan as a checklist of ThinkerOfThoughts's
 
 ### 4.7 Interface changes and questions, by PR
 
+*Updated 2026-11-05 after review on #626/#628/#629: the Engine 0, Engine 3, Engine 4 and Engine 5 items follow the direct apply, the dropped `oldest_entry_at()` and the merge hook.*
+
 Each item is written in the body of the PR that introduces it. A question here is what that PR asks hanamorix; a switch-over-stage PR is flipped only after her answer.
 
-- **Engine 0.** The engine is `brain/emotion/engine.py`; calls take the receiver form `engine.engine_for(persona_dir).<call>` (the earlier interface listed them without a persona); import the module so one test patch reaches every site. `read()` returns four values per feeling, `Reading(short, long, difference, shift)`, only for names in the vocabulary registry. **Question: does any caller of hers unpack `read()` as three values?** New: `status()`, `note_active(now)`. `oldest_entry_at()` has no reader any more and stays. The stub records calls in `recorded_calls`. `half_life()` is the real lookup from Engine 0, so a blend her vocabulary work mints gets a real half-life.
+- **Engine 0.** The engine is `brain/emotion/engine.py`; calls take the receiver form `engine.engine_for(persona_dir).<call>` (the earlier interface listed them without a persona); import the module so one test patch reaches every site. `read()` returns four values per feeling, `Reading(short, long, difference, shift)`, only for names in the vocabulary registry. **Question: does any caller of hers unpack `read()` as three values?** New: `status()`, `note_active(now)`. The stub records calls in `recorded_calls`. `half_life()` is the real lookup from Engine 0, so a blend her vocabulary work mints gets a real half-life.
 - **Engine 1.** The built-in half-life table is `EMOTION_HALF_LIFE_DAYS` in `dev_constants.py` from Engine 0, so the table's literals in her vocabulary files (`_BASELINE`, `_canonical_personal_emotions.py`) leave with her vocabulary work; Engine 1 edits none of her files. The line in `cli.py` that prints a growth-log event's own `decay_half_life_days`, and the persona-entry field `decay_half_life_days` in `persona_loader.py`, are hers and stay in place in the shadow stage because the old decay pass still reads the field. **If the build finds the table move forces an edit in either, Engine 1's PR body asks her for it.**
 - **Engine 2.** The engine's files are under `<persona_dir>/state/`; the switch is `state/emotion_switch.json` written with `write_json` (not `save_with_backup`); the state is read with the no-heal walk `read_json_walk` (not `attempt_heal`).
-- **Engine 3.** `create(..., fold=True)` and `update(memory_id, *, fold=True, **fields)`; hooks fire after the commit and never raise. **Question: is she content with the `fold=False` edits in her files (`recovery/engine.py` and the two migrators)?** Ingest passes `fold=False` only if she departs from the shared plan (the default folds). Peer trust is read through `engine_files.peer_trust`, 0.0 until Engine 6 wires it to her accessor, expected to open `KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)` and return `get_relationship_state(...).trust_score`, 0.0 for no database or no row. `tests/conftest.py` gains `emotion_engine_stub` and the registry-reset fixture. From Engine 3 every counted `create` in a file-backed test writes `state/emotion_pending.json`, and an uncounted one writes a start-only event there when the stored start date is null or later.
-- **Engine 4.** Hooks only append; folding happens in drains after each reply and in the supervisor pass. **The per-reply drain in the CLI chat without the bridge is ThinkerOfThoughts's edit in `cli.py`: is that fine?** `read()` calls `persona_loader.refresh_if_changed(<path of the persona vocabulary file>)`, expecting one path argument and a None return, in its own `try`. **Question: does her function match that signature, and does it re-read only a vocabulary file this process has already loaded?** `store.py` is shared: Engine 3's `fold` flag, Engine 4's three methods, Engine 5's `refresh_faded_emotions` and her `list_recent_emotions` are plain additions, and whichever lands second rebases.
-- **Engine 5.** The gate merge now writes averaged emotions (`fold=False`); the temp-gate write-back resets `created_at` and writes faded values for every recalled type, so a stored value means "as of the last time this memory was written or remembered".
+- **Engine 3.** `create(..., fold=True)` and `update(memory_id, *, fold=True, **fields)`; hooks fire after the commit and never raise. **Question: is she content with the `fold=False` edits in her files (`recovery/engine.py` and the two migrators)?** Ingest passes `fold=False` only if she departs from the shared plan (the default folds). Peer trust is read through `engine_files.peer_trust`, 0.0 until Engine 6 wires it to her accessor, expected to open `KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)` and return `get_relationship_state(...).trust_score`, 0.0 for no database or no row. `tests/conftest.py` gains `emotion_engine_stub` and the registry-reset fixture. A counted `create` or an empty-to-filled `update` applies its emotions directly under the engine lock (Engine 4 moves the commit, assigned and start-only events onto the direct apply, in the same window as Engine 3), so `MemoryStore.create` now does file I/O: a state read and write, measured at a median of 3.2 ms and a p95 of 3.6 ms on a mature state. A showing or a chat change appends a line to `state/emotion_pending.jsonl`.
+- **Engine 4.** A memory's own emotions are applied directly when it is written; showings and chat changes are appended, and folded in drains after each reply and in the supervisor pass. **The per-reply drain in the CLI chat without the bridge is ThinkerOfThoughts's edit in `cli.py`: is that fine?** `read()` calls `persona_loader.refresh_if_changed(<path of the persona vocabulary file>)`, expecting one path argument and a None return, in its own `try`. **Question: does her function match that signature, and does it re-read only a vocabulary file this process has already loaded?** `store.py` is shared: Engine 3's `fold` flag, Engine 4's three methods, Engine 5's `refresh_faded_emotions` and her `list_recent_emotions` are plain additions, and whichever lands second rebases.
+- **Engine 5.** The gate merge now writes averaged emotions (`fold=False`) and sends the incoming memory's commit event; the temp-gate write-back resets `created_at`, writes faded values for every recalled type and puts the date the memory was made at the start of its text, so a stored value means "as of the last time this memory was written or remembered"; the embedding backfill's cursor becomes `{"rowid": n}`.
 - **Engine 6.** `ensure_engine_ready` runs in `_dream_handler` (her dreams) and five other CLI handlers, with the dry-run rule. The x10 fix multiplies her writers' old rows with no cutoff, which relies on her nudge-scale change being behind `is_live()`. **Question: is it?** The decay pass is gone. **Question: will her per-memory emotion readers (grief, and the dream average over member memories) read through `faded_value`?** The peer-trust stand-in is wired to her `peer_trust(persona_dir, peer_id)`. **Question: which of her PRs deletes her five old `aggregate_state` reader branches after the switch, and when?** (Engine 7 waits on it.)
 - **Engine 7.** `aggregate.py` is deleted (her old branches must be gone first); the emotion-only row writes in her `chat/extractor.py` and `self_model/reconcile.py` are removed; `protected` leaves `store.py` (after her cleanup takes it out of the migrator transform and the recovery source reader); `GATE_BYPASS_TYPES` loses two entries (ingest imports it).
 - **Readers 1.** `_mem_to_result` gains a required `persona_dir`; `tools/impls/_common.py` is shared with her `_write_gate_check` and `_calc_importance_from_emotions`. **Question: how is it ordered with her writer PRs?** `faded_value` is available for her per-memory readers. `update_baseline` and `Baseline` stay where her plan keeps them.
@@ -561,17 +602,22 @@ Checked against `docs/DESIGN-INVARIANTS.md`.
 
 ## 6. Accepted edge cases
 
+*Updated 2026-11-05 after review on #626/#628/#629: rows follow the queue as a line file with a saved position, the direct apply, recovery first, and the gate merge's hook. The two merge rows are what the code comment at the merge branch points to.*
+
 Each gets a code comment at the place named and a note in the commit message that adds it. "Issue" means an issue is also filed when the PR that introduces the edge merges (its text shown first).
 
 | Edge | Where the comment goes | Slice |
 |---|---|---|
 | An install's first rebuild may count memories whose `last_accessed_at` was stamped without a showing (old resonance stamps, the reads in hanamorix's issue until fixed, dream dry-run or denied-slot reads). A fix being shipped does not mean it is installed, so a guard period cannot help. | directly above `rebuild`'s `replay(...)` call | Engine 6 |
-| A lost queue entry: a failed append, a raising hook, a crash between commit and append, a dropped invalid event; at most one turn's worth, and the memories from that turn still fold when committed | the hook append | Engine 3 |
-| An unparseable queue file is discarded, with no rebuild | the queue read | Engine 2 |
+| A lost queue entry: a chat change or a showing (a failed append, a raising hook, a lock wait that timed out, a dropped invalid event); at most one message's worth. A memory's own emotions are not queued, so losing one is the direct-apply edge below | the hook append | Engine 3 |
+| An unparseable queue line is dropped with an ordinary error log line, with no rebuild (a queue whose every line is bad is in effect discarded) | the queue read | Engine 2 |
 | x10: a backfilled row whose strongest new value is below 1 is multiplied once (one odd day at most, then it sinks back) | `nudge_scale_fix.py` | Engine 6 |
 | x10: a channel the old decay pass deleted at 0.01 stays deleted | `nudge_scale_fix.py` | Engine 6 |
 | x10: `memories.db` restored alone under a surviving switch keeps unfixed rows | `nudge_scale_fix.py` | Engine 6 |
 | Readers of `created_at` see a recalled memory as new | no comment | Engine 5 |
+| When the write-back adds the memory's date to a fading memory's text, the row's `content_snapshot` is dated too, so an unfade keeps the origin date | the snapshot dating | Engine 5 |
+| A crash in the middle of a gate merge that is then retried averages the shared feelings a second time; if the first try had already sent the incoming memory's commit event, the retry sends it again and it counts again at half weight (the repeat factor). A merge keeps its mood move on purpose (3.1; decided by hanamorix on #629). Issue, filed when the Engine 5 PR merges | the gate merge in `consolidation.py`, which points at this row | Engine 5 |
+| A gate merge's mood move (the incoming memory's commit event, 3.1) is not restored by a rebuild or a catch-up, which count the merged target row's current emotions once: the merged memory has no row and the merge writes no change-log line | the merge branch in `consolidation.py`, which points at this row | Engine 5 |
 | The oldest snapshot day is a pending first day against the run and the next day is also against: that day's kind cannot be read (it has no previous day), so it is read as a move the other way, and the new run starts on that oldest day with length 2 where a zero first day would have started it a day later with length 1; a bar can move by 1. No issue | `run_tracker`, at the seeded-pending branch | Engine 1 |
 | An absent comfort_seeking or rest_need gets no climax +2 | `apply_climax_reset` | Engine 1 |
 | A clock set forward: day closes freeze until real time catches up, and change-log files pile up meanwhile. Issue (telling a corrected clock from a long absence needs a new rule or a chosen number) | `close_days` | Engine 1 |
@@ -579,12 +625,14 @@ Each gets a code comment at the place named and a note in the commit message tha
 | A rollover is noticed only at the next supervisor pass; a read in between lacks the closed day's zeros | the supervisor drain call | Engine 4 |
 | Events with the same time fold in read order; catch-up and live can differ in a tie | `replay` | Engine 4 |
 | Catch-up: a late-dated queued event narrows the replay window; an append that straddles a save is missed. Issue | `catch_up` | Engine 4 |
-| A catch-up holds the lock while it replays, so a post-reply drain may wait | `catch_up` | Engine 4 |
-| A crash between the state write and the queue delete applies those events twice | `note_active` | Engine 4 |
-| A hook waiting during a rebuild or catch-up folds its row a second time (and a commit's climax reset again) | the hook append | Engine 4, Engine 6 |
+| A catch-up holds the lock while it replays, so a post-reply drain, or a writer that waits at the lock, may wait (under recovery first the first writer to meet a corrupted state runs the catch-up itself) | `catch_up` | Engine 4 |
+| A crash between the drain's emptying of the queue and its save of position 0 leaves the saved position past the end of the emptied queue; if the next reply's queued lines outgrow it before the next drain, those lines are skipped (a failed second save leaves the same state on disk and is the same edge). Code comment only | `note_active`, the position-0 step | Engine 4 |
+| A failed direct apply while the state is readable (a failed save, a crash between the memory's commit and the apply, a lock wait that timed out, which includes a wait behind a recovery, or a batch lost in a crash): the memory stays saved, nothing applies its event again, and one memory's emotions are missing from the averages until the next rebuild folds its row. No issue: it is accepted, not deferred | the failure branch of the direct apply | Engine 4 |
+| A commit event that recovery's catch-up already counts gets no climax reset: the first write to meet a corrupted state, if its memory has stored climax 7 or more, is folded by the replay, which gives no climax reset, and its own apply is skipped (2.8 "Recovery first") | the skip branch of the direct apply | Engine 4 |
+| A writer that committed its memory and then waited at the engine lock while a recovery ran, and whose memory that recovery counted, applies it again: in that overlap one memory's emotions count twice (one extra entry in the short and long averages). No stored catch-up range is added. Code comment only | the direct apply | Engine 4 |
 | A day whose only rows were refreshed by the write-back counts as off in a later rebuild | `replay`'s past-day scan | Engine 6 |
 | Missing or corrupt change-log parts lose those changes at a rebuild | the change-log replay | Engine 6 |
-| A change still queued at a rebuild with no log line (a failed append, or from the shadow stage) is lost | `rebuild`'s queue discard | Engine 6 |
+| A change still queued at a rebuild with no log line (a failed append, or from the shadow stage) is lost | `rebuild`'s queue step (the queue is emptied, then position 0) | Engine 6 |
 | The first rebuild has no chat-change history (the shadow stage writes no change log) | `rebuild`, at the change-log replay | Engine 6 |
 | A rebuilt persona's snapshot is a fresh 30-day history; flags after a rebuild or catch-up may differ | `rebuild` | Engine 6 |
 | Repeat showings beyond the first within 24 hours are not restored by a rebuild | `rebuild` | Engine 6 |
@@ -600,6 +648,8 @@ A new persona whose first rows are of an uncounted type would have opened its ga
 
 ## 7. Persona-facing wording left to the end
 
+*Updated 2026-11-05 after review on #626/#628/#629: item 12 added (the date the write-back puts at the start of a recalled memory's text).*
+
 Working text only while building; the final wording is ThinkerOfThoughts's byte-exact call at the end of the build, with no LLM tells.
 1. The mood summary: the `current emotions:` label (prompt and monologue frame), the `name:value` form, and the `long_short` and `long_difference` renderings.
 2. The body block header, the energy, temperature and exhaustion line, and the `body emotions:` label; it differs from item 1 on purpose.
@@ -612,6 +662,7 @@ Working text only while building; the final wording is ThinkerOfThoughts's byte-
 9. The heartbeat prompt segments built around `memories_decayed` and the system segment's "decay applied", which Engine 6 edits when it removes them.
 10. The live-test variants of the summary and the block framing (section 8).
 11. The research rating line: hanamorix writes the rating code; the wording of the prompt line that asks for the rating is ThinkerOfThoughts's.
+12. The date the temp gate's write-back puts at the start of a recalled memory's text (3.1): its exact format, which is also the form the "already there" test looks for. It is working text while building and stays on this list until the end of the build.
 
 Not persona-facing: the CLI dry-run message, the soul-review docstring sentence, and code comments.
 
@@ -651,13 +702,15 @@ These come back to ThinkerOfThoughts only if they happen: another sub-1 writer i
 
 ## 10. Corrections to the shared plan
 
+*Updated 2026-11-05 after review on #626/#628/#629: the state-file contents and the queue entry follow 2.8 and 2.9.*
+
 Where the shared emotion rework plan says otherwise, this design holds. Any correction that changes an interface hanamorix builds against is also stated in the PR that introduces it.
 - The switch-over time is its own file, `state/emotion_switch.json`, not a field of the state file.
-- The state file holds the average and weight pairs, `saved_at`, `reset_at`, `persona_start_at`, `oldest_entry_at` and the day-close snapshot. There is no fill marker: the switch file is the first rebuild's run-once marker. The 24-hour list of memories shown in full is the id-keyed repeat map.
+- The state file holds the average and weight pairs, `saved_at`, `reset_at`, `persona_start_at`, `queue_line` and the day-close snapshot. There is no fill marker: the switch file is the first rebuild's run-once marker. The 24-hour list of memories shown in full is the id-keyed repeat map.
 - The averages do not hold still on a day the app ran: each present emotion with no entry that day gets a zero entry in both averages at the day close. Only whole off calendar days leave them as they are.
 - There is no 24-hour rule: the shift is off until 30 days after the persona's oldest memory, which affects a new persona only.
 - The first rebuild finishes before the persona starts; a recovery rebuild runs at a quiet moment.
-- Hooks append events to `state/emotion_pending.json` and a drain after the reply folds them; one lock guards the engine's four files.
+- A memory's own emotions are applied directly when it is written; showings and chat changes are appended to `state/emotion_pending.jsonl` and a drain after the reply folds them; one lock guards the engine's four files.
 - `update_baseline` stays in `felt_time/weather_shift.py`; nothing in this rework removes it. The "prompt comments" the plan mentions are fixed in Readers 2.
 - The switch-over-stage removals are the lists of Engine 6, Engine 7 and Readers 2, without `update_baseline`.
 - There is no recorded cutoff for the x10 fix; it runs before the switch.
