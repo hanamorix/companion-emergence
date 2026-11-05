@@ -37,8 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from brain.health.json_io import _read_bytes
 from brain.utils.atomic_write import save_bytes_atomic
+from brain.utils.file_ops import read_bytes_stat
 
 _BOM = b"\xef\xbb\xbf"
 _REASON_CAP = 120
@@ -166,7 +166,7 @@ def read_toml_result(path: Path | str) -> TomlRead:
     """Read and parse ``path`` without ever raising. A Windows sharing violation is retried like ``json_io``'s reads."""
     path = Path(path)
     try:
-        raw, _sig = _read_bytes(path)
+        raw, _sig = read_bytes_stat(path)
     except FileNotFoundError:
         return TomlRead("missing", {}, kind="missing", reason="no such file", path=path)
     except OSError as exc:

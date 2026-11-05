@@ -10,8 +10,8 @@ images and file_store (:func:`save_blob_once`). The healing readers stay in ``br
 Exclusive-create cases (the machine id, model blobs) and plain moves of finished files do not belong here; they carry an
 ``# atomic-write: ok -- <why>`` marker that ``tests/unit/test_no_hand_rolled_atomic_write.py`` requires.
 
-This module imports only the standard library at module level and never ``brain.health``: it sits below it, so every
-module may call it without an import cycle.
+This module imports only the standard library and ``brain.utils.file_ops`` (the one retry for the sharing violation) at
+module level and never ``brain.health``: it sits below it, so every module may call it without an import cycle.
 """
 
 from __future__ import annotations
@@ -24,39 +24,11 @@ import secrets
 import shutil
 import stat
 import threading
-import time
 from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
-from typing import Any
 
-_REPLACE_RETRIES = 8
-_REPLACE_RETRY_SLEEP_S = 0.05
-
-
-def _retry_perm(action: Callable[[], Any]) -> Any:
-    """Run ``action`` with a short bounded retry on transient PermissionError.
-
-    Windows refuses to rename a file another handle has open (WinError 32).
-    The supervisor reads persona_config.json inside its ticks in the same
-    process as the settings writer, so a save can collide with a read (#200).
-    Mirrors brain.ingest.buffer._unlink_with_retry: a transient failure is
-    retried, and a persistent one (on POSIX that means a real permission
-    problem, which burns the whole ~1.4 s budget) is re-raised so it still
-    fails loud. ``action`` must be safe to run again from the top.
-    """
-    for attempt in range(_REPLACE_RETRIES):
-        try:
-            return action()
-        except PermissionError:
-            if attempt == _REPLACE_RETRIES - 1:
-                raise
-            time.sleep(_REPLACE_RETRY_SLEEP_S * (attempt + 1))
-
-
-def _replace_with_retry(src: Path, dst: Path) -> None:
-    """os.replace with a short bounded retry on transient PermissionError (#200)."""
-    _retry_perm(lambda: os.replace(src, dst))
+from brain.utils.file_ops import replace_file, retry_transient
 
 
 def _copy_for_backup(src: Path, dst: Path) -> bool:
@@ -89,7 +61,7 @@ def _copy_for_backup(src: Path, dst: Path) -> bool:
         return True
 
     try:
-        return _retry_perm(attempt)
+        return retry_transient(attempt)
     except Exception:
         try:
             dst.unlink(missing_ok=True)
@@ -223,13 +195,13 @@ def _save_payload(
                 dst = path.with_name(f"{path.name}.bak{i + 1}")
                 if src.exists():
                     try:
-                        _replace_with_retry(src, dst)
+                        replace_file(src, dst)
                     except FileNotFoundError:
                         pass
         if backed_up:
-            _replace_with_retry(bak1_new, bak1)
+            replace_file(bak1_new, bak1)
 
-        _replace_with_retry(new_path, path)
+        replace_file(new_path, path)
 
         if backup_mode is not None and keep_backups:
             for i in range(1, max(backup_count, 1) + 1):

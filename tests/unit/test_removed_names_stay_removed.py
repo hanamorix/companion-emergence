@@ -56,6 +56,7 @@ _TIER_REF = "44af2447 Choose each job's model with one line in the user tunables
 _IDLE_REF = "1f69f189 feat(ram-spike-fix): one shared chat-idle lull + is_chat_idle gate for every background caller (INC-6)"
 _DEVCONST_REF = "#531 shared-settings guard, the constants move into brain/dev_constants.py (draft PR #553)"
 _GUARD_REF = "#531 shared-settings guard (draft PR #553)"
+_FILE_OPS_REF = "#643 shared file accessors (draft PR #644): the four private retry loops became brain/utils/file_ops.py"
 _JSON_REF = "b826f01b refactor(brain): one shared JSON reader/writer for every JSON file read and write (#439)"
 
 # Every public writer and helper of brain/utils/atomic_write.py except save_with_backup_text (attempt_heal imports that).
@@ -536,6 +537,50 @@ REMOVED: tuple[Removed, ...] = (
         ref="#556 review follow-up (the pull request that made it public)",
         kind="code",
         scope=("brain/chat",),
+    ),
+    # --- the four private retry loops became brain/utils/file_ops.py (#643) ----------------------------------------------
+    Removed(
+        names=(
+            "_retry_perm",
+            "_replace_with_retry",
+            "_unlink_with_retry",
+            "replace_retrying",
+            "_REPLACE_RETRIES",
+            "_REPLACE_RETRY_SLEEP_S",
+            "_UNLINK_RETRIES",
+            "_UNLINK_RETRY_SLEEP_S",
+        ),
+        why="the one retry for a transient PermissionError is brain/utils/file_ops.retry_transient (replace_file, delete_file, read_bytes_stat go through it); no module keeps a private loop or its constants",
+        ref=_FILE_OPS_REF,
+        kind="code",
+    ),
+    Removed(
+        names=("_read_bytes", "_signature", "_IS_WINDOWS", "_READ_ATTEMPTS"),
+        why="json_io reads its bytes with file_ops.read_bytes_stat and takes the key it compares from file_ops.stat_path; toml_io calls file_ops.read_bytes_stat; no private reader, key or platform flag of their own",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/health/json_io.py", "brain/utils/toml_io.py"),
+    ),
+    Removed(
+        names=("stat_key",),
+        why="json_io compares the key of file_ops.stat_path(...), the one accessor for a metadata check; it does not build the key from a raw stat itself",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/health/json_io.py",),
+    ),
+    Removed(
+        names=("_RETRY_ATTEMPTS", "_RETRY_DELAY_S"),
+        why="the overlay rename uses file_ops.replace_file and its shared schedule, not a schedule of its own",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/update/overlay.py",),
+    ),
+    Removed(
+        names=("read_bytes",),
+        why="file_ops.read_bytes had no production caller once read_jsonl_from streamed through open_read; the whole-file accessor is file_ops.read_bytes_stat (pathlib's Path.read_bytes is a different, attribute-call use elsewhere)",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/utils/file_ops.py",),
     ),
 )
 
