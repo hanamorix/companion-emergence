@@ -498,7 +498,7 @@ def report(results: list[RunResult], floors: tuple[float, ...], row_names: list[
         out.append("")
         out.append("| reader row | " + " | ".join(f"floor {f:g}" for f in floors) + " |")
         out.append("|" + "---|" * (len(floors) + 1))
-        for name in _row_order(r, row_names):
+        for name in row_names:  # the derived rows (body strain, rest gate) have no shift or range arm
             cells = [
                 f"{_after(r.fire[(name, ('shift', f))], r.after30)} / {_after(r.fire[(name, ('range', f))], r.after30)}"
                 for f in floors
