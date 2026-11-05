@@ -342,7 +342,7 @@ def _mapping(parent: Mapping, key: str, what: str) -> Mapping:
 def validate_state(data: object) -> None:
     """Raise ValueError unless `data` is a state the engine can use (the validator `read_json_walk` applies to every copy).
 
-    Rejects: not an object; a missing or unparseable `saved_at`; an unparseable `reset_at`, `last_update`, `oldest_entry_at`
+    Rejects: not an object; a missing or unparseable `saved_at`; an unparseable `reset_at`, `last_update`
     or `persona_start_at` (a missing or null `persona_start_at` is accepted: a closed gate until the first memory); an
     `active_day` that is not a real day, or unset while `last_update` is set; `emotions` or `repeats` of the wrong type; an
     emotion that is not an object or lacks `short`, `long` or `last_entry_day`; a non-finite number, a bool, or a negative
@@ -355,7 +355,7 @@ def validate_state(data: object) -> None:
     if "saved_at" not in data:
         raise ValueError("saved_at is missing")
     _time(data["saved_at"], "saved_at")
-    for key in ("reset_at", "last_update", "oldest_entry_at", "persona_start_at"):
+    for key in ("reset_at", "last_update", "persona_start_at"):
         if data.get(key) is not None:
             _time(data[key], key)
     active_day = data.get("active_day")
@@ -390,9 +390,13 @@ def validate_state(data: object) -> None:
 
 
 def _snapshot_day(item: object, previous_day: str | None) -> SnapshotDay:
-    """One snapshot day, or ValueError saying what is wrong with it. Averages outside 0-10 are held, not refused."""
-    if not isinstance(item, list) or len(item) != 5:
-        raise ValueError("a snapshot day is an array of five: day, short, long, felt, run")
+    """One snapshot day, or ValueError saying what is wrong with it. Averages outside 0-10 are held, not refused.
+
+    Only the known leading fields are read: a day with more than five fields, or a run record with more than three, is read
+    by its first five (three), so a state written by a newer version is not dropped after a rollback (additive-only). Fewer is invalid.
+    """
+    if not isinstance(item, list) or len(item) < 5:
+        raise ValueError("a snapshot day is an array of at least five: day, short, long, felt, run")
     day = _day(item[0], "day")
     if previous_day is not None and day <= previous_day:
         raise ValueError(f"day {day} is not later than the day before it, {previous_day}")
@@ -404,8 +408,8 @@ def _snapshot_day(item: object, previous_day: str | None) -> SnapshotDay:
     run: RunRecord | None = None
     if item[4] is not None:
         record = item[4]
-        if not isinstance(record, list) or len(record) != 3:
-            raise ValueError("a run record is null or an array of three: start day, direction, last day with the direction")
+        if not isinstance(record, list) or len(record) < 3:
+            raise ValueError("a run record is null or an array of at least three: start day, direction, last day with the direction")
         start = _day(record[0], "run start day")
         direction = record[1]
         if type(direction) is not int or direction not in (1, -1):
@@ -463,7 +467,7 @@ _VALUE_REPR.maxlist = _VALUE_REPR.maxdict = _VALUE_REPR.maxtuple = _VALUE_REPR.m
 
 
 def _queue_line_from(data: Mapping, label: str) -> int:
-    """The stored queue position: a whole number of 0 or more, else 0 with a log line (P12b: a value outside its range is held to it).
+    """The stored queue position: a whole number of 0 or more, else 0 with a log line (a value outside its range is held to it; `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.9).
 
     A missing key reads as 0 too (a state written before the position existed). `validate_state` never refuses a state for this
     key: the worst a damaged position does is make the next drain fold the queue from its start. The log line is throttled per
@@ -524,7 +528,6 @@ def state_from_json(data: dict, *, label: str = "state") -> EngineState:
         reset_at=optional("reset_at"),
         last_update=optional("last_update"),
         active_day=data.get("active_day"),
-        oldest_entry_at=optional("oldest_entry_at"),
         persona_start_at=optional("persona_start_at"),
         repeats=repeats,
         emotions=emotions,
@@ -570,7 +573,6 @@ def state_to_json(state: EngineState) -> dict:
         "reset_at": _optional_iso(state.reset_at, "reset_at"),
         "last_update": _optional_iso(state.last_update, "last_update"),
         "active_day": state.active_day,
-        "oldest_entry_at": _optional_iso(state.oldest_entry_at, "oldest_entry_at"),
         "persona_start_at": _optional_iso(state.persona_start_at, "persona_start_at"),
         "queue_line": state.queue_line,
         "repeats": {
@@ -607,7 +609,7 @@ class LoadedState(NamedTuple):
 
     @property
     def caught_up(self) -> bool:
-        """False while the state came from a backup copy, which is as old as that copy's `saved_at` (E5.19)."""
+        """False while the state came from a backup copy, which is as old as that copy's `saved_at` (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.8, recovery first)."""
         return self.source == "main"
 
 
@@ -639,7 +641,7 @@ def read_state(persona_dir: Path) -> LoadedState:
 
 
 class StateCache:
-    """The parsed state of one persona, kept in process and re-read when the main file's stat key changes (RD6).
+    """The parsed state of one persona, kept in process and re-read when the main file's stat key changes (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.7).
 
     Only a state loaded from the main file is kept. A state from a backup, or none at all, is read again on the next call (a
     backup is a transient condition that the next drain's catch-up ends by writing a new main file). A hit needs the cached
@@ -688,7 +690,7 @@ class StateCache:
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
 # The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
-# from the floor up to floor + span). A stored modifier outside it is held to it (P12b); one far outside would otherwise fold
+# from the floor up to floor + span). A stored modifier outside it is held to it; one far outside would otherwise fold
 # to an infinite average and make every save of the state fail.
 _MODIFIER_LOW = _MODIFIER_FLOOR
 _MODIFIER_HIGH = _MODIFIER_FLOOR + _MODIFIER_SPAN
@@ -710,14 +712,13 @@ def _event_number(raw: Mapping, key: str, default: float) -> float:
 def event_from_json(raw: object) -> Event:
     """The `Event` of one queue or change-log record, or `InvalidEventError` saying why not.
 
-    Invalid (A3-L3 3.2): not an object; an unknown `kind`; a missing `at`, or an `at` that `lenient_utc` rejects or that
+    Invalid (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.13): not an object; an unknown `kind`; a missing `at`, or an `at` that `lenient_utc` rejects or that
     `day_of` cannot turn into a local day (such an event would fail the drain on every call, and a failure that comes from an
     event's own content must not repeat for ever, so the drop is the remedy); a commit, assigned or showing with no
     `memory_id` (a non-empty text); a commit or assigned with no emotion values; an emotion name that is not text or an amount
     that is not a finite number (a bool is not a number); a `modifier` or `climax`, when present, that is not a finite
     number; a `source`, when present, that is not text. A missing `climax` is 0.0. A missing `modifier` is 1.0; a finite one
-    outside the range `source_modifier` can make (0.1 to 1.0) is not invalid: it is held to the range, with a warning line
-    (P12b). The `modifier` of a change is not read (a change has weight 1, no repeat factor).
+    outside the range `source_modifier` can make (0.1 to 1.0) is not invalid: it is held to the range, with a warning line. The `modifier` of a change is not read (a change has weight 1, no repeat factor).
     """
     if not isinstance(raw, dict):
         raise InvalidEventError(f"not an object ({type(raw).__name__})")
@@ -775,7 +776,7 @@ def event_from_json(raw: object) -> Event:
 
 
 def event_to_json(event: Event) -> dict:
-    """The record of an event (A3-L3 3.2): commit, assigned and showing carry a memory id, emotions and a modifier (a commit
+    """The record of an event (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.9): commit, assigned and showing carry a memory id, emotions and a modifier (a commit
     also its climax); a change carries its source and signed amounts and no modifier; a start-only event carries only `at`."""
     if event.kind not in _EVENT_KINDS:
         raise ValueError(f"unknown event kind {event.kind!r}")
@@ -817,13 +818,12 @@ def read_queue(persona_dir: Path, *, from_line: int) -> QueueRead:
     `from_line` is the position the engine saved with its state (`EngineState.queue_line`): the lines up to it are already
     folded. A missing file is `([], 0)`. If `from_line` is larger than the file's line count, the queue was emptied since the
     position was saved, so it is read again from line 0 (`end_line` is the file's line count either way). A negative
-    `from_line` is not a position: it is read as 0, with a log line (P12b).
+    `from_line` is not a position: it is read as 0, with a log line (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.9).
 
-    Accepted edge E3 (A3 E6.18, applied per line; owner 2026-10-21 15:02, ledger:337 "Agreed with your extension of the logic
-    to the full rebuild"): a line that is not valid JSON (a line of zero bytes left by an unclean machine stop, anything else)
+    Accepted edge (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 6, "An unparseable queue line is dropped", applied per line; owner 2026-10-21 15:02): a line that is not valid JSON (a line of zero bytes left by an unclean machine stop, anything else)
     or that fails the event check is DROPPED with its own ordinary error log line naming the file, the line number and the
     reason, and the other lines are read. NO rebuild follows. What a drop loses is at most one turn's worth of events (the
-    accepted loss of R12); a rebuild would trade the long average's history older than 30 days for them. A line damaged in the
+    accepted loss of a queue entry, section 6); a rebuild would trade the long average's history older than 30 days for them. A line damaged in the
     middle takes anything glued to it along: nothing is salvaged. A dropped line still counts as a line, and so does a blank
     one. A last line with no newline yet is a torn write, or an append in flight: it is not returned, not counted and not
     logged, and is read whole once it is complete (if a crash left it torn, the next append starts a new line, and it is then
@@ -831,7 +831,7 @@ def read_queue(persona_dir: Path, *, from_line: int) -> QueueRead:
     before them) until the drain empties it.
 
     A fault in the READING (permissions, a sharing violation, a directory in the file's place) is not a drop: it raises, the
-    queue file is left alone, and the caller's failure handling keeps the queue for the next drain (E6.10).
+    queue file is left alone, and the caller's failure handling keeps the queue for the next drain (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.13).
 
     The file is read by ``json_io.read_jsonl_from`` (one bytes read, the one line classifier); this function adds the event
     check and the log lines, which name the physical line number and the reason and echo no content.
@@ -866,11 +866,11 @@ def append_event(persona_dir: Path, event: Event) -> bool:
     """Append an event as one line at the end of the queue (the caller holds the lock). True if it was written.
 
     Earlier lines are never read or rewritten, so an append costs the same at any depth of the queue. Best effort, by design
-    (E6.11): a failure (a full disk, a folder that is a file, a value that cannot be encoded) is logged and gives False, and
+    (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 2.13): a failure (a full disk, a folder that is a file, a value that cannot be encoded) is logged and gives False, and
     never raises into the caller. An OSError is logged by ``append_jsonl`` (a throttled warning); a value that cannot be
     encoded gets an error line here. No fsync, no backups.
 
-    R12 (B04.2): an entry lost to a failed append, or damaged by an unclean machine stop, is an accepted minor edge. It is not
+    Accepted edge (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 6, "A lost queue entry"): an entry lost to a failed append, or damaged by an unclean machine stop, is an accepted minor edge. It is not
     recovered; a damaged line is dropped on read (once it is a complete line), and takes any record glued to it along.
     """
     return _append_line(lambda: queue_path(persona_dir), event, "queue")
@@ -1006,7 +1006,7 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
     its absence or damage is normal: a missing file anywhere in the series, a missing folder, a file not named
     ``YYYY-MM-DD.jsonl``, an unlistable folder (logged), a torn or unparseable line (including one the JSON parser cannot
     load, such as an integer of more than 4300 digits, skipped with a warning naming the file and line) and a file that
-    cannot be read in full (what was read is used) add nothing and are not errors. A line that fails the event check, or is not a change, is dropped
+    cannot be read in full (what was read is used) add nothing and are not errors. A line that fails the event check (including one whose `kind` is not a known text), or is not a change, is dropped
     with an error log line. The reader repairs nothing.
     """
     when = lenient_utc(since)  # a naive time means UTC, as everywhere in the repo
@@ -1024,7 +1024,7 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
         for _text, record in iter_jsonl_raw(path):  # a line the parser cannot load is skipped; an I/O failure ends the file there
             try:
                 kind = record.get("kind") if isinstance(record, dict) else None
-                if kind in _MEMORY_KINDS or kind == "start":  # before the check, so a held-modifier line is not logged for it
+                if isinstance(kind, str) and (kind in _MEMORY_KINDS or kind == "start"):  # before the check, so a held-modifier line is not logged for it
                     raise InvalidEventError(f"a {kind} event is not a change")
                 event = event_from_json(record)
                 if event.kind != "change":
@@ -1060,7 +1060,8 @@ def switch_state(persona_dir: Path) -> bool | None:
     """Whether the switch file exists: True when it was seen, False when it is missing, None when the stat failed.
 
     A stat error other than "no such file" (a permission fault, a share that went away) cannot say either way. It is logged
-    (throttled) and answers None, so a caller can tell a file that was SEEN from one that is only unknown.
+    (throttled) and answers None, so a caller can tell a file that was SEEN from one that is only unknown. The engine treats an
+    unknown as not switched (owner 2026-11-05: "If the system can't tell if its switched, assume its not.") and never remembers it.
     """
     path = switch_path(persona_dir)
     try:
@@ -1069,7 +1070,7 @@ def switch_state(persona_dir: Path) -> bool | None:
         warn_throttled(
             logger,
             f"engine_files:switch:{path}:{exc}",
-            "emotion switch %s cannot be inspected (%s); the engine is treated as live for now, and not remembered as live",
+            "emotion switch %s cannot be inspected (%s); the persona is treated as not switched for now, and this is not remembered",
             path,
             exc,
         )
@@ -1077,12 +1078,12 @@ def switch_state(persona_dir: Path) -> bool | None:
 
 
 def switch_exists(persona_dir: Path) -> bool:
-    """True when the switch file exists, and also when that cannot be told (a stat error other than "no such file").
+    """True when the switch file was seen; False when it is missing, and False when that cannot be told (a stat error).
 
-    An unknown counts as live: a persona the engine cannot inspect must not be treated as a new one, whose unreadable state
-    would be replaced by an empty one. The unknown answer is the caller's to keep out of any cache (`switch_state`).
+    An unknown is not switched: the same rule `EmotionEngine.is_live` follows. `switch_state` is the three-way form for a
+    caller that must tell a missing file from an unknown one.
     """
-    return switch_state(persona_dir) is not False
+    return switch_state(persona_dir) is True
 
 
 def _switch_time(data: object) -> None:

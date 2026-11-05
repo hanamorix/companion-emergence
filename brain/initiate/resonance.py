@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain import dev_constants
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.new_sources import (
     GateThresholds,
@@ -62,7 +63,7 @@ class MemoryActivationBaseline:
         # the bridge's MemoryStore writer; WAL removes the reader/writer lock.
         if ":memory:" not in str(self._db_path):
             self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA busy_timeout = 5000")
+            self._conn.execute(f"PRAGMA busy_timeout = {int(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S * 1000)}")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_activation_baseline (

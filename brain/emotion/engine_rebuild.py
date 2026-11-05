@@ -1,12 +1,12 @@
 """The emotion engine's replay and catch-up (Engine 4, #579). The rest of this file (the rebuild, the recovery job) is Engine 6's.
 
 `replay` folds what happened in a window of time into a state: the rows of `memories.db` created or opened in it, the day each
-row was written on, and the change-log lines. `catch_up` is the recovery-first step (spec 3.0): a state that had to be loaded
+row was written on, and the change-log lines. `catch_up` is the recovery-first step (design 2.8, "Recovery first", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`): a state that had to be loaded
 from a backup copy is replayed forward from that copy's `saved_at` to now.
 
 Both are called with the engine's lock already held by the caller (the drain, a direct apply or a batch). Neither takes it,
-and the lock is not re-entrant. `catch_up` holds the caller's lock for as long as the replay takes (accepted edge, section 6
-of the spec: the post-reply drain, or a writer that waits at the lock, may wait for that time).
+and the lock is not re-entrant. `catch_up` holds the caller's lock for as long as the replay takes (accepted edge, design section 6
+of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`: the post-reply drain, or a writer that waits at the lock, may wait for that time).
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def replay(
     start-only event); one entry for each counted row of `rows` that has emotions (below); each of `changes`. Every point is
     folded in time order, `close_days` first, at `min(its time, now)`: a row dated ahead of `now` is folded at `now`. Ties
     fold in the order the points are read, stamps before rows before changes: a catch-up and the live fold can differ for two
-    things at one instant (accepted edge, spec section 6, same-time order).
+    things at one instant (accepted edge, design section 6, same-time order).
 
     A row folds ONCE, with the emotions it has now (`emotions_of`) at the weight `modifier_of` gives: at the later of its
     creation and its last access when that access is in `[after, stop)`; else at its creation when it was created at or after
@@ -190,7 +190,7 @@ def catch_up(
     one). Any other failure (a database that cannot be opened or read) propagates; the caller treats every exception as a
     failed catch-up.
 
-    Accepted edges (spec section 6): a queued event dated before its time (a late-dated one) narrows the window, and an append
+    Accepted edges (design section 6): a queued event dated before its time (a late-dated one) narrows the window, and an append
     that straddles the backup's save is missed. A change dated exactly at `saved_at` can fold twice (no skip id exists for
     it). After a clock regression together with a corrupt main state, `saved_at` can be ahead of now and is held to now, so the
     rows between the backup's true time and now are not replayed (a clock set back does not drag `saved_at` backwards, by design).
