@@ -169,6 +169,24 @@ def _with_date_prefix(text: str, created_at: datetime) -> str:
     return fmt.replace("{date}", day_of(created_at)) + text
 
 
+def carry_date_prefix(old_text: str, new_text: str) -> str:
+    """`new_text` with the date `old_text` starts with put at its start, when `old_text` has one and `new_text` does not.
+
+    For a rewrite that replaces a row's text (the gate's merge): a write-back put the day the memory was made at the start of
+    the text and moved ``created_at``, so a rewrite that drops that date would make the next write-back stamp the reset day as the
+    day it was made. A rewrite that starts with a date of its own (leading whitespace allowed), a blank rewrite, and an old text
+    with no date are returned unchanged. A rewrite's leading whitespace goes when the date is put in front of it. The form is
+    the same `DATE_PREFIX_FORMAT_PLACEHOLDER` the write-back uses, read when this is called.
+    """
+    pattern = _date_prefix_pattern(DATE_PREFIX_FORMAT_PLACEHOLDER)
+    if not new_text.strip() or pattern.match(new_text.lstrip()):
+        return new_text
+    old = pattern.match(old_text)
+    if old is None:
+        return new_text
+    return old.group(0) + new_text.lstrip()
+
+
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
     """Decode a metadata_json column value into a dict, defending against
     manual DB edits or legacy writers that stored the string "null",
@@ -3085,7 +3103,8 @@ class MemoryStore:
 
         The date: so a displayed memory keeps the day it was made once ``created_at`` moves, the row's text gets the local
         calendar day of its ``created_at`` BEFORE this reset at its start (`DATE_PREFIX_FORMAT_PLACEHOLDER`), unless it already
-        starts with a date in that form, so a second write-back adds nothing. A fading row's original text (``content_snapshot``,
+        starts with a date in that form, so a second write-back adds nothing (the gate's merge keeps that date when it rewrites
+        the text: `carry_date_prefix`). A fading row's original text (``content_snapshot``,
         which `unfade` restores) is judged and dated the same way, so the day survives an unfade. The row's own text is read
         here, in the same write transaction (`BEGIN IMMEDIATE`) as the UPDATE, so a text change that landed since the caller
         loaded the row is kept and the old date is the one the row really held. When the text changed, the same UPDATE clears
