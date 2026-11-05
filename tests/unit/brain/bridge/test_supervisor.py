@@ -903,6 +903,17 @@ def test_run_log_rotation_tick_rotates_oversize_heartbeat(tmp_path: Path) -> Non
     assert "log_rotation" in types
 
 
+def test_run_log_rotation_tick_rotates_oversize_extractor_errors(tmp_path: Path) -> None:
+    """#559: extractor_errors.jsonl is append-only with no reader (only the extractor and monologue capture write it),
+    so it is bounded like the other error logs."""
+    persona_dir = _persona_dir(tmp_path)
+    _write_oversize_log(persona_dir, "extractor_errors.jsonl", size_bytes=200_000)
+
+    _run_log_rotation_tick(persona_dir, _CapturingBus(), rolling_size_bytes=10_000)
+
+    assert (persona_dir / "extractor_errors.jsonl.1.gz").exists()
+
+
 def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
     tmp_path: Path,
 ) -> None:
