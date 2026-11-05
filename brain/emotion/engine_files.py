@@ -1060,7 +1060,8 @@ def switch_state(persona_dir: Path) -> bool | None:
     """Whether the switch file exists: True when it was seen, False when it is missing, None when the stat failed.
 
     A stat error other than "no such file" (a permission fault, a share that went away) cannot say either way. It is logged
-    (throttled) and answers None, so a caller can tell a file that was SEEN from one that is only unknown.
+    (throttled) and answers None, so a caller can tell a file that was SEEN from one that is only unknown. The engine treats an
+    unknown as not switched (owner 2026-11-05: "If the system can't tell if its switched, assume its not.") and never remembers it.
     """
     path = switch_path(persona_dir)
     try:
@@ -1069,7 +1070,7 @@ def switch_state(persona_dir: Path) -> bool | None:
         warn_throttled(
             logger,
             f"engine_files:switch:{path}:{exc}",
-            "emotion switch %s cannot be inspected (%s); the engine is treated as live for now, and not remembered as live",
+            "emotion switch %s cannot be inspected (%s); the persona is treated as not switched for now, and this is not remembered",
             path,
             exc,
         )
@@ -1077,12 +1078,12 @@ def switch_state(persona_dir: Path) -> bool | None:
 
 
 def switch_exists(persona_dir: Path) -> bool:
-    """True when the switch file exists, and also when that cannot be told (a stat error other than "no such file").
+    """True when the switch file was seen; False when it is missing, and False when that cannot be told (a stat error).
 
-    An unknown counts as live: a persona the engine cannot inspect must not be treated as a new one, whose unreadable state
-    would be replaced by an empty one. The unknown answer is the caller's to keep out of any cache (`switch_state`).
+    An unknown is not switched: the same rule `EmotionEngine.is_live` follows. `switch_state` is the three-way form for a
+    caller that must tell a missing file from an unknown one.
     """
-    return switch_state(persona_dir) is not False
+    return switch_state(persona_dir) is True
 
 
 def _switch_time(data: object) -> None:

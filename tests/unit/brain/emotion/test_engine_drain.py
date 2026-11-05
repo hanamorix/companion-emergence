@@ -26,6 +26,8 @@ from tests.unit.brain.emotion._engine_support import (
     queue,
     queue_events,
     queue_text_lines,
+    refuse_the_switch_stat,
+    ruin_the_state,
     save,
     showing,
     simple_state,
@@ -134,7 +136,7 @@ def test_the_early_out_does_not_fire_with_a_missing_or_unreadable_state_and_neve
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    engine.note_active(D[3])  # an unreadable state on a persona that is not live: starts empty and writes
+    engine.note_active(D[3])  # an unreadable state on a persona whose switch is missing: starts empty and writes
     assert len(spy.within) == 3
 
 
@@ -351,6 +353,61 @@ def test_an_unreadable_state_on_a_persona_that_is_not_live_is_replaced_by_an_emp
     saves = _count_saves(monkeypatch)
     install(persona).note_active(D[3])  # the failing load is not retried on every call
     assert saves == []
+
+
+SKIPPED = "this pass is skipped"  # the log line of a pass skipped because the switch cannot be inspected
+
+
+def _engine_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """ERROR lines of the engine itself (the file reader logs its own error for an unreadable state, a different matter)."""
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.name == "brain.emotion.engine"]
+
+
+def _skipped_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and SKIPPED in r.getMessage()]
+
+
+def test_with_the_switch_unknown_a_drain_over_an_unreadable_state_skips_the_pass_and_keeps_everything(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Owner 2026-11-05: an unknown switch is "not switched". A not-switched persona would start from an empty state, which
+    replaces the stored one, so with the switch unknown the pass is skipped: nothing is written, the queue is kept."""
+    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    ruin_the_state(persona)
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
+    engine = install(persona, D[5])
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+        engine.note_active(D[5])
+    assert len(_skipped_warnings(caplog)) == 1
+    assert _engine_errors(caplog) == []  # not a failure of a switched persona
+    assert engine._catch_up_failed is False  # no failure flag is set either
+    engine.note_active(D[5])  # the next pass is not hidden by the early-out; it skips again
+    assert tree(persona / "state") == before  # the stored state, its copies and the queue lines are exactly as they were
+    assert len(queue_events(persona)) == 1
+    monkeypatch.undo()  # the fault clears: the switch is known missing, so the retry starts empty and consumes the queue
+    engine.note_active(D[5])
+    assert queue_events(persona) == []
+    assert state_of(persona).emotions["joy"].short.avg == 6.0
+
+
+def test_with_the_switch_unknown_a_drain_over_a_missing_state_skips_the_pass_and_keeps_the_queue(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
+    engine = install(persona, D[5])
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+        engine.note_active(D[5])
+    assert len(_skipped_warnings(caplog)) == 1
+    assert _engine_errors(caplog) == []
+    assert not engine_files.state_path(persona).exists()
+    assert tree(persona / "state") == before and len(queue_events(persona)) == 1
+    monkeypatch.undo()
+    engine.note_active(D[5])
+    assert queue_events(persona) == [] and state_of(persona).emotions["joy"].short.avg == 6.0
 
 
 # --- the stamp (V1, B17) and the time given -------------------------------------------------------------------

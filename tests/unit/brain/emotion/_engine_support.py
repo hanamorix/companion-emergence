@@ -17,7 +17,7 @@ from brain.emotion import engine, engine_files
 from brain.emotion.engine import EmotionEngine
 from brain.emotion.engine_utils import Average, EmotionState, EngineState, Event
 from brain.memory.store import Memory, MemoryStore
-from brain.utils import file_lock
+from brain.utils import file_lock, file_ops
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
 DAY0 = date(2026, 5, 1)
@@ -140,6 +140,27 @@ def commit_event(memory_id: str, at: datetime, emotions: dict | None = None, cli
 def queue(persona_dir: Path, *events: Event) -> None:
     for event in events:
         assert engine_files.append_event(persona_dir, event)
+
+
+def refuse_the_switch_stat(monkeypatch) -> None:  # noqa: ANN001 - a pytest MonkeyPatch
+    """Make the stat of the switch file fail with a permission error (any error other than "no such file"): the switch is unknown."""
+    real_stat = file_ops.stat_path
+
+    def refuse(path: str | Path):
+        if Path(path).name == "emotion_switch.json":
+            raise PermissionError("denied")
+        return real_stat(path)
+
+    monkeypatch.setattr(file_ops, "stat_path", refuse)
+
+
+def ruin_the_state(persona_dir: Path) -> None:
+    """Leave every copy of the state file unreadable (main and the three backups)."""
+    base = engine_files.state_path(persona_dir)
+    for suffix in ("", ".bak1", ".bak2", ".bak3"):
+        target = base.with_name(base.name + suffix)
+        if target.exists():
+            target.write_bytes(b"\x00")
 
 
 def tree(root: Path) -> dict[str, bytes | None]:
