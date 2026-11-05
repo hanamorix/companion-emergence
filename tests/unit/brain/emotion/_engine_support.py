@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -161,6 +162,19 @@ def ruin_the_state(persona_dir: Path) -> None:
         target = base.with_name(base.name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
+
+
+SKIPPED = "this pass is skipped"  # the log line of a pass skipped because the switch cannot be inspected
+
+
+def skipped_warnings(caplog) -> list[str]:  # noqa: ANN001 - a pytest LogCaptureFixture
+    """WARNING lines saying the pass was skipped for an unknown switch."""
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and SKIPPED in r.getMessage()]
+
+
+def engine_errors(caplog) -> list[str]:  # noqa: ANN001 - a pytest LogCaptureFixture
+    """ERROR lines of the engine itself (the file reader logs its own error for an unreadable state, a different matter)."""
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.name == "brain.emotion.engine"]
 
 
 def tree(root: Path) -> dict[str, bytes | None]:

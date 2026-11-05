@@ -492,7 +492,7 @@ class EmotionEngine:
                 return
             # A persona whose switch is KNOWN missing starts from an empty state (E6.17). A state that does not exist yet is
             # nothing to save by itself; one that exists but cannot be read is replaced, so the failing load is not repeated every
-            # call. Known edge (MINOR, the same for a known-missing switch before the fail-safe change): a state reported
+            # call. Known edge (MINOR): a state reported
             # unreadable is pushed into `.bak1` by the next save, so repeated passes can rotate out copies that were only
             # transiently unreadable.
             state, fallback_empty = EngineState(), loaded.problem != "missing"

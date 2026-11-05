@@ -25,6 +25,7 @@ from tests.unit.brain.emotion._engine_support import (
     NOW,
     LockSpy,
     commit_event,
+    engine_errors,
     install,
     local_day,
     local_noon,
@@ -39,6 +40,7 @@ from tests.unit.brain.emotion._engine_support import (
     save_as_backup,
     showing,
     simple_state,
+    skipped_warnings,
     state_of,
     tree,
 )
@@ -349,18 +351,6 @@ def test_a_failed_recovery_on_a_persona_that_is_not_live_continues_from_an_empty
     assert engine_files.read_state(persona).source == "main" and queue_events(persona) == []
 
 
-SKIPPED = "this pass is skipped"  # the log line of a pass skipped because the switch cannot be inspected
-
-
-def _engine_errors(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """ERROR lines of the engine itself (the file reader logs its own error for an unreadable state, a different matter)."""
-    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.name == "brain.emotion.engine"]
-
-
-def _skipped_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and SKIPPED in r.getMessage()]
-
-
 def test_a_failed_recovery_with_the_switch_unknown_skips_the_pass_and_keeps_the_state_and_the_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -373,8 +363,8 @@ def test_a_failed_recovery_with_the_switch_unknown_skips_the_pass_and_keeps_the_
     refuse_the_switch_stat(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
         eng.note_active(D[8])
-    assert len(_skipped_warnings(caplog)) == 1
-    assert _engine_errors(caplog) == []
+    assert len(skipped_warnings(caplog)) == 1
+    assert engine_errors(caplog) == []
     assert eng._catch_up_failed is False
     assert tree(persona / "state") == before  # the backup state is still the only copy, and the queue line is kept
     assert len(queue_events(persona)) == 1
@@ -402,8 +392,8 @@ def test_a_direct_apply_with_the_switch_unknown_and_an_unreadable_state_keeps_th
     finally:
         store.close()
     assert tree(persona / "state") == before
-    assert len(_skipped_warnings(caplog)) == 1
-    assert _engine_errors(caplog) == []
+    assert len(skipped_warnings(caplog)) == 1
+    assert engine_errors(caplog) == []
     assert eng._catch_up_failed is False
 
 
@@ -427,8 +417,8 @@ def test_a_batch_with_the_switch_unknown_and_an_unreadable_state_keeps_the_memor
     finally:
         store.close()
     assert tree(persona / "state") == before
-    assert len(_skipped_warnings(caplog)) == 1  # one apply at the end of the block, so one skipped pass
-    assert _engine_errors(caplog) == []
+    assert len(skipped_warnings(caplog)) == 1  # one apply at the end of the block, so one skipped pass
+    assert engine_errors(caplog) == []
 
 
 def test_an_unreadable_state_on_a_live_persona_is_never_overwritten_and_the_direct_apply_logs_and_flags(
