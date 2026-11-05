@@ -34,6 +34,16 @@ Cost: tens of seconds, network for `uv build`. No live persona. No
 LLM calls. Adds the wheel + sdist to `dist/` (cleaned up on next
 build).
 
+### `time_old_emotion_paths.py` — tier 1
+
+Copies a synthetic `memories.db` into a fresh temporary persona directory and times three emotion code paths on the copy: one full `HeartbeatEngine._apply_emotion_decay` pass, one `write_trace_memory`, and one `get_emotional_state`. Each timing is one labelled cold first run plus nine warm repeats (minimum, median, maximum), printed with the host (CPU model, architecture, AVX2, cores, RAM; the CPU model is the `model name` field of `/proc/cpuinfo` on Linux and `unknown` on any other system or when the field is missing or unreadable), the database's sha256 and the commit. Refuses a path under the brain's home directory and removes its copy when it ends; a timing whose function is absent on the commit is skipped with a printed reason. The path is optional and defaults to `test-data/synthetic-db/memories.db`.
+
+```bash
+bash scripts/time_old_emotion_paths.sh [path to memories.db]
+```
+
+Cost: about 32 seconds with the 19,406-row synthetic database on a 4-core VM with AVX2 hidden from the guest (a Ryzen 5 5500 host with the VM's AVX2 masked); a slower machine takes longer. No LLM, no live persona, no network.
+
 ### `stress_test_image.py` — tier 2
 
 Builds a temp persona in `tempfile.mkdtemp`, starts an in-process
