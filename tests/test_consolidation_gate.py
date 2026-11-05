@@ -1343,7 +1343,7 @@ def _importance_sensitive_fade(memory, emotion):
 def test_e5_the_fade_in_a_write_back_does_not_depend_on_the_reappraised_importance(
     persona, emotion_engine_stub, monkeypatch, new_importance
 ):
-    # Planning's ruling (Q3, spec 3.2): the fade uses the importance the memory was loaded with, not the re-appraised one.
+    # Planning's ruling (Q3; design 3.1, "The temp-gate write-back"): the fade uses the importance the memory was loaded with, not the re-appraised one.
     tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     monkeypatch.setattr(emotion_engine_stub, "faded_value", _importance_sensitive_fade)
@@ -1502,7 +1502,7 @@ def test_e5_a_raising_commit_event_is_not_swallowed_by_the_merge(persona, emotio
     monkeypatch.setattr(emotion_engine_stub, "on_memory_committed", raising_hook)
     target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     # The merge had already committed; the failure reaches the per-item handler (item scope: quarantined), it is not caught
-    # inside the merge branch. The retry edge (M06) is what this records.
+    # inside the merge branch. The retry edge (design section 6, first edge) is what this records.
     assert res.merged == 0
     assert res.failed == 1
     assert res.quarantined == 1
@@ -1676,7 +1676,6 @@ def test_review_the_merge_carries_the_targets_date_over_a_judge_reply_that_dropp
     "reply",
     [
         pytest.param("2026-03-03: we walked and swam", id="reply-with-its-own-date-is-stored-as-sent", marks=pytest.mark.no_base_failure(reason=_ALREADY_HOLDS)),
-        pytest.param("\n 2026-03-03: we walked and swam", id="reply-with-leading-whitespace-and-a-date-is-stored-as-sent", marks=pytest.mark.no_base_failure(reason=_ALREADY_HOLDS)),
         pytest.param("   ", id="blank-reply-is-stored-as-sent", marks=pytest.mark.no_base_failure(reason=_ALREADY_HOLDS)),
     ],
 )
@@ -1707,3 +1706,16 @@ def test_review_the_fold_fallback_keeps_the_targets_date(persona, emotion_engine
     got = store.get(target_id, bump=False)
     assert got.content.startswith(_expected_prefix(store_module, "2026-01-10") + "we walked to the shore")
     assert "we swam there too" in got.content
+
+
+def test_review_a_reply_with_a_date_behind_leading_whitespace_is_stored_without_the_whitespace_and_a_write_back_adds_nothing(
+    persona, emotion_engine_stub, monkeypatch
+):
+    """The write-back's "already dated" test skips no whitespace, so a date behind whitespace would be stamped over."""
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module, target_id = _written_back_target(persona, monkeypatch)
+    assert _merge_into(persona, target_id, "\n 2026-03-03: we walked and swam").merged == 1
+    assert store.get(target_id, bump=False).content == "2026-03-03: we walked and swam"
+    store.refresh_faded_emotions(target_id, {"joy": 3.0}, _SECOND_WRITE_BACK)
+    assert store.get(target_id, bump=False).content == "2026-03-03: we walked and swam"

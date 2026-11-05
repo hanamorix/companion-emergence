@@ -142,7 +142,7 @@ def _emotions_column(emotions: dict[str, float]) -> str:
 # PLACEHOLDER WORDING. The date the temp gate's write-back puts at the start of a recalled memory's text (spec section 7
 # item 12, sfa S31(c)) is persona-facing: its exact form is the owner's byte-exact call at the end of the build, and this
 # constant is working text until then. `{date}` stands for the day as YYYY-MM-DD and must appear exactly once. The test for "the
-# text already starts with a date" is built from this same constant, so re-wording it changes the add and the skip together.
+# text already starts with a date" is built from this same constant, so re-wording it changes the add, the skip and `carry_date_prefix` together.
 DATE_PREFIX_FORMAT_PLACEHOLDER = "{date}: "
 
 
@@ -174,17 +174,21 @@ def carry_date_prefix(old_text: str, new_text: str) -> str:
 
     For a rewrite that replaces a row's text (the gate's merge): a write-back put the day the memory was made at the start of
     the text and moved ``created_at``, so a rewrite that drops that date would make the next write-back stamp the reset day as the
-    day it was made. A rewrite that starts with a date of its own (leading whitespace allowed), a blank rewrite, and an old text
-    with no date are returned unchanged. A rewrite's leading whitespace goes when the date is put in front of it. The form is
-    the same `DATE_PREFIX_FORMAT_PLACEHOLDER` the write-back uses, read when this is called.
+    day it was made. A blank rewrite and an old text with no date are returned unchanged. A rewrite's leading whitespace is
+    dropped (the write-back's "already dated" test does not skip whitespace, so a date behind whitespace would be stamped over
+    by the next write-back): a rewrite that starts with a date of its own keeps it, and otherwise the old date goes in front.
+    The form is the same `DATE_PREFIX_FORMAT_PLACEHOLDER` the write-back uses, read when this is called.
     """
     pattern = _date_prefix_pattern(DATE_PREFIX_FORMAT_PLACEHOLDER)
-    if not new_text.strip() or pattern.match(new_text.lstrip()):
+    if not new_text.strip():
         return new_text
+    text = new_text.lstrip()
+    if pattern.match(text):
+        return text
     old = pattern.match(old_text)
     if old is None:
         return new_text
-    return old.group(0) + new_text.lstrip()
+    return old.group(0) + text
 
 
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:

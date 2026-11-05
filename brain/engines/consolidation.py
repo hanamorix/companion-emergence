@@ -1029,7 +1029,9 @@ def _dispatch(
             # event follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the
             # climax reset like any commit. No try here: the engine's hooks never raise into their caller.
             #
-            # Accepted edges, by owner ruling (spec 3.2; section 6, M06 and MR):
+            # The merge keeps this hook: design 3.1 ("The merge keeps the hook for the incoming memory's mood move") in
+            # docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md, decided by the maintainer on #629
+            # (issue #580). Two edges are accepted there, in design section 6:
             # - If the update above commits and the item is retried before claim.settle (the process dies, or an error follows
             #   the commit), the candidate is merged again: the emotions are averaged with it a second time (the content is
             #   protected by `_fold`'s "contains it" rule, the averages are not), and the event is sent again and counts at the

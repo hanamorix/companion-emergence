@@ -584,7 +584,8 @@ def test_carry_date_prefix_leaves_a_rewrite_that_has_its_own_date_alone():
     old = _prefix("2026-01-10") + "we walked"
     new = _prefix("2026-03-03") + "we walked and swam"
     assert store_module.carry_date_prefix(old, new) == new
-    assert store_module.carry_date_prefix(old, "\n  " + new) == "\n  " + new  # leading whitespace does not hide it
+    # Leading whitespace does not hide it, and goes, so the write-back's own "already dated" test (which skips no whitespace) sees it.
+    assert store_module.carry_date_prefix(old, "\n  " + new) == new
 
 
 def test_carry_date_prefix_adds_nothing_when_the_old_text_has_no_date():
