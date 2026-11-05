@@ -695,17 +695,16 @@ class EmotionEngine:
     def feels_high(self, name: str) -> bool:
         """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.
 
-        The rule is `engine_utils.feels_high_from` (shift reads stronger, or the short average is in the upper half of the
-        feeling's own 30-day range). This gathers its inputs: the feeling's `Reading` from `read()` and its snapshot from the
-        state cache `read()` takes the shift from. A name `read()` does not return is not high, and nothing stored is
-        read or written beyond that cache. A snapshot that cannot be read leaves only the shift part. It raises only if `read()`
-        does, and `read()` never raises (it answers `{}` for any failure), so this never raises.
+        The rule is `engine_utils.feels_high_from` (never below an absolute floor; above it, the shift reads stronger, or the
+        short average is in the upper half of the feeling's own 30-day range). This gathers its inputs: the feeling's `Reading`
+        from `read()` and its snapshot from the state cache `read()` takes the shift from. A name `read()` does not return is
+        not high, and nothing stored is read or written beyond that cache. A snapshot that cannot be read is an empty one, so
+        only the shift part applies (the floor still comes first). It raises only if `read()` does, and `read()` never raises
+        (it answers `{}` for any failure), so this never raises.
         """
         reading = self.read().get(name)
         if reading is None:
             return False
-        if reading.shift > 0:
-            return True
         try:
             state = self._state_cache.get().state
             emotion = None if state is None else state.emotions.get(name)
@@ -716,7 +715,7 @@ class EmotionEngine:
                 f"engine:feels_high:{self.persona_dir}",
                 "emotion engine: feels_high could not read the snapshot; only the shift part applies",
             )
-            return False
+            snapshot = []
         return feels_high_from(reading.short, reading.shift, snapshot)
 
     # --- the real lookup ---------------------------------------------------------------------------

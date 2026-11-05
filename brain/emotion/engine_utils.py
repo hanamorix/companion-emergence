@@ -16,8 +16,8 @@ What lives here:
   day, the day's snapshot, and the skip over whole days the app was off.
 * `apply_climax_reset`, `fade`, `counted_kind`, `source_modifier`, `resolve_emotions`.
 * `run_tracker` and `shift_for`: which feelings have shifted, and which way, worked out from the snapshot.
-* `feels_high_from`: the one rule for "this feeling is high" (the shift reads stronger, or the short average is in the upper
-  half of its own 30-day range) that `engine.feels_high` answers by.
+* `feels_high_from`: the one rule for "this feeling is high" (never below an absolute floor; above it, the shift reads
+  stronger, or the short average is in the upper half of its own 30-day range) that `engine.feels_high` answers by.
 
 All constants are read as `dev_constants.NAME` at call time. Times are aware datetimes (UTC); a "day" is the machine's
 local calendar day (`day_of`), written `YYYY-MM-DD`.
@@ -720,11 +720,14 @@ def shift_for(snapshot_days: Mapping[str, Sequence[SnapshotDay]], persona_start_
 def feels_high_from(short: float, shift: int, snapshot: Sequence[SnapshotDay]) -> bool:
     """Whether a feeling is high: the one rule `engine.feels_high` (S52, S53) answers by. Change the rule here.
 
-    High when its shift reads stronger (`shift > 0`, a rising run; a falling run is not "stronger"), or when `short`, its
-    short average today, is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, where `lowest` and
+    Never high when `short`, its short average today, is below `FEELS_HIGH_FLOOR`: the floor comes first and holds for both
+    parts below. At or above it, high when its shift reads stronger (`shift > 0`, a rising run; a falling run is not
+    "stronger"), or when `short` is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, where `lowest` and
     `highest` are the lowest and highest short average among the feeling's days in `snapshot` (the 30-day snapshot). With
     fewer than two snapshot days, or a flat range (`highest == lowest`), only the shift part applies. Pure: nothing is stored.
     """
+    if short < dev_constants.FEELS_HIGH_FLOOR:
+        return False
     if shift > 0:
         return True
     if len(snapshot) < 2:
