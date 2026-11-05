@@ -19,6 +19,7 @@ from brain.emotion.engine_utils import EngineState, RepeatEntry
 from tests.unit.brain.emotion._engine_support import (
     LockSpy,
     change,
+    engine_errors,
     install,
     local_day,
     local_noon,
@@ -26,9 +27,12 @@ from tests.unit.brain.emotion._engine_support import (
     queue,
     queue_events,
     queue_text_lines,
+    refuse_the_switch_stat,
+    ruin_the_state,
     save,
     showing,
     simple_state,
+    skipped_warnings,
     state_of,
     tree,
 )
@@ -134,7 +138,7 @@ def test_the_early_out_does_not_fire_with_a_missing_or_unreadable_state_and_neve
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    engine.note_active(D[3])  # an unreadable state on a persona that is not live: starts empty and writes
+    engine.note_active(D[3])  # an unreadable state on a persona whose switch is missing: starts empty and writes
     assert len(spy.within) == 3
 
 
@@ -282,6 +286,31 @@ def test_a_drain_that_reads_nothing_and_closes_no_day_does_not_save(persona: Pat
     assert [position for position, _ in saves] == [1, 0]
 
 
+def test_a_drain_that_finds_an_empty_queue_under_a_stale_position_saves_the_position_as_zero(persona: Path) -> None:
+    """The start-up drain clears a stale position (the maintainer's narrowing of S22): the stored position 5 is past a queue that has
+    no lines (a crash between the emptying and the save of position 0, or a failed second save), so nothing is read, no day closes
+    and nothing is caught up, and the drain still saves, with position 0. Only the position changes in the state file; the control is
+    the early-out test above (a stored position 0 saves nothing).
+    """
+    before_state = simple_state(saved_at=D[3], day=_day(3), queue_line=5)
+    save(persona, before_state)
+    assert not engine_files.queue_path(persona).exists()
+    install(persona).note_active(D[3])  # a new instance: the start-up drain
+    after = state_of(persona)
+    assert after.queue_line == 0
+    before_state.queue_line = 0
+    assert after == before_state  # nothing else moved, `saved_at` included
+
+
+def test_a_stale_position_over_an_emptied_queue_file_is_cleared_the_same_way(persona: Path) -> None:
+    save(persona, simple_state(saved_at=D[3], day=_day(3), queue_line=2))
+    queue_file = engine_files.queue_path(persona)
+    queue_file.parent.mkdir(parents=True, exist_ok=True)
+    queue_file.write_bytes(b"")
+    install(persona).note_active(D[3])
+    assert state_of(persona).queue_line == 0 and queue_file.read_bytes() == b""
+
+
 def test_a_position_past_an_emptied_queue_reads_from_the_start(persona: Path) -> None:
     save(persona, simple_state(saved_at=D[3], day=_day(3), queue_line=5))
     queue(persona, showing("m1", D[3], {"grief": 3.0}), showing("m2", D[3], {"grief": 3.0}))
@@ -326,6 +355,49 @@ def test_an_unreadable_state_on_a_persona_that_is_not_live_is_replaced_by_an_emp
     saves = _count_saves(monkeypatch)
     install(persona).note_active(D[3])  # the failing load is not retried on every call
     assert saves == []
+
+
+def test_with_the_switch_unknown_a_drain_over_an_unreadable_state_skips_the_pass_and_keeps_everything(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Owner 2026-11-05: an unknown switch is "not switched". A not-switched persona would start from an empty state, which
+    replaces the stored one, so with the switch unknown the pass is skipped: nothing is written, the queue is kept."""
+    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    ruin_the_state(persona)
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
+    engine = install(persona, D[5])
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+        engine.note_active(D[5])
+    assert len(skipped_warnings(caplog)) == 1
+    assert engine_errors(caplog) == []  # not a failure of a switched persona
+    assert engine._catch_up_failed is False  # no failure flag is set either
+    engine.note_active(D[5])  # the next pass skips again, and still changes nothing
+    assert tree(persona / "state") == before  # the stored state, its copies and the queue lines are exactly as they were
+    assert len(queue_events(persona)) == 1
+    monkeypatch.undo()  # the fault clears: the switch is known missing, so the retry starts empty and consumes the queue
+    engine.note_active(D[5])
+    assert queue_events(persona) == []
+    assert state_of(persona).emotions["joy"].short.avg == 6.0
+
+
+def test_with_the_switch_unknown_a_drain_over_a_missing_state_skips_the_pass_and_keeps_the_queue(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
+    engine = install(persona, D[5])
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+        engine.note_active(D[5])
+    assert len(skipped_warnings(caplog)) == 1
+    assert engine_errors(caplog) == []
+    assert not engine_files.state_path(persona).exists()
+    assert tree(persona / "state") == before and len(queue_events(persona)) == 1
+    monkeypatch.undo()
+    engine.note_active(D[5])
+    assert queue_events(persona) == [] and state_of(persona).emotions["joy"].short.avg == 6.0
 
 
 # --- the stamp (V1, B17) and the time given -------------------------------------------------------------------
@@ -398,6 +470,7 @@ def test_a_failing_second_save_leaves_the_position_at_the_end_the_file_emptied_a
     monkeypatch.setattr(engine_files, "save_state", real)
     engine.note_active(D[3])  # nothing queued: reads nothing, folds nothing, the key was left unset so it takes the lock
     assert state_of(persona).emotions["joy"].short.weight == weight
+    assert state_of(persona).queue_line == 0  # the same drain clears the position the failed save left past the emptied file
 
 
 def test_a_queue_read_that_raises_oserror_keeps_everything_and_the_next_drain_retries(

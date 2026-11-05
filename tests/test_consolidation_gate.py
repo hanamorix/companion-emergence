@@ -1343,7 +1343,7 @@ def _importance_sensitive_fade(memory, emotion):
 def test_e5_the_fade_in_a_write_back_does_not_depend_on_the_reappraised_importance(
     persona, emotion_engine_stub, monkeypatch, new_importance
 ):
-    # Planning's ruling (Q3, spec 3.2): the fade uses the importance the memory was loaded with, not the re-appraised one.
+    # Planning's ruling (Q3; design 3.1, "The temp-gate write-back"): the fade uses the importance the memory was loaded with, not the re-appraised one.
     tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     monkeypatch.setattr(emotion_engine_stub, "faded_value", _importance_sensitive_fade)
@@ -1502,7 +1502,7 @@ def test_e5_a_raising_commit_event_is_not_swallowed_by_the_merge(persona, emotio
     monkeypatch.setattr(emotion_engine_stub, "on_memory_committed", raising_hook)
     target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     # The merge had already committed; the failure reaches the per-item handler (item scope: quarantined), it is not caught
-    # inside the merge branch. The retry edge (M06) is what this records.
+    # inside the merge branch. The retry edge (design section 6, first edge) is what this records.
     assert res.merged == 0
     assert res.failed == 1
     assert res.quarantined == 1
@@ -1612,3 +1612,110 @@ def test_e5_a_real_key_error_from_the_store_is_logged_and_not_requeued(
     assert any(r.levelno == logging.ERROR and mem.id in r.getMessage() for r in caplog.records)
     again = run_consolidation(store, persona_dir=tmp, reappraiser=lambda m: Reappraisal(1.0))
     assert again.reappraised == 0  # settled, not requeued
+
+
+# --- Review of #629, 2026-11-05: a merge keeps the date the target's text started with --------------------------------------
+
+_TRUE_ORIGIN = datetime(2026, 1, 10, 12, 0, 0, tzinfo=UTC)
+_FIRST_WRITE_BACK = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
+_SECOND_WRITE_BACK = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
+_ALREADY_HOLDS = "pins behaviour that already holds on the base: the merge adds nothing here, so the text is stored as sent"
+
+
+def _written_back_target(persona, monkeypatch, text="we walked to the shore"):
+    """A target made 2026-01-10 and written back once on 2026-10-01 (real `refresh_faded_emotions`): its text now starts with the
+    2026-01-10 date and its `created_at` is 2026-10-01. Returns (store_module, target_id)."""
+    _tmp, store, _heb, _queue = persona
+    store_module = _patch_local_day(monkeypatch)
+    target = replace(_mem(text, "conversation", emotions={"joy": 5.0}, importance=3.0), created_at=_TRUE_ORIGIN)
+    store.create(target, fold=False)
+    store.refresh_faded_emotions(target.id, {"joy": 4.0}, _FIRST_WRITE_BACK)
+    got = store.get(target.id, bump=False)
+    assert got.content == _expected_prefix(store_module, "2026-01-10") + text
+    assert got.created_at == _FIRST_WRITE_BACK
+    return store_module, target.id
+
+
+def _merge_into(persona, target_id, merged_content, cand_text="we swam there too, take one"):
+    tmp, store, hebbian, queue = persona
+    cand = _mem(cand_text, "dream", emotions={"joy": 7.0})
+    queue.enqueue(cand, source="x")
+    return run_consolidation(
+        store, persona_dir=tmp, hebbian=hebbian,
+        classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content=merged_content)}),
+    )
+
+
+def test_review_a_merge_then_a_second_write_back_keeps_the_true_made_on_date(persona, emotion_engine_stub, monkeypatch):
+    """The maintainer's scenario: origin 2026-01-10, a write-back on 2026-10-01, a judge reply that drops the date, then a second
+    write-back. The text still starts with 2026-01-10, once, and never with the reset day."""
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module, target_id = _written_back_target(persona, monkeypatch)
+    res = _merge_into(persona, target_id, "we walked to the shore and swam")
+    assert res.merged == 1
+    store.refresh_faded_emotions(target_id, {"joy": 3.0}, _SECOND_WRITE_BACK)
+    got = store.get(target_id, bump=False)
+    assert got.content == _expected_prefix(store_module, "2026-01-10") + "we walked to the shore and swam"
+    assert _expected_prefix(store_module, "2026-10-01") not in got.content
+    assert got.created_at == _SECOND_WRITE_BACK
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_review_the_merge_carries_the_targets_date_over_a_judge_reply_that_dropped_it(
+    persona, emotion_engine_stub, monkeypatch, live
+):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = live
+    store_module, target_id = _written_back_target(persona, monkeypatch)
+    assert _merge_into(persona, target_id, "we walked to the shore and swam").merged == 1
+    assert store.get(target_id, bump=False).content == _expected_prefix(store_module, "2026-01-10") + "we walked to the shore and swam"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param("2026-03-03: we walked and swam", id="reply-with-its-own-date-is-stored-as-sent", marks=pytest.mark.no_base_failure(reason=_ALREADY_HOLDS)),
+        pytest.param("   ", id="blank-reply-is-stored-as-sent", marks=pytest.mark.no_base_failure(reason=_ALREADY_HOLDS)),
+    ],
+)
+def test_review_the_merge_leaves_a_reply_that_has_a_date_or_is_blank_as_sent(persona, emotion_engine_stub, monkeypatch, reply):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    _store_module, target_id = _written_back_target(persona, monkeypatch)
+    assert _merge_into(persona, target_id, reply).merged == 1
+    assert store.get(target_id, bump=False).content == reply
+
+
+@pytest.mark.no_base_failure(reason=_ALREADY_HOLDS)
+def test_review_the_merge_adds_no_date_to_a_target_that_has_none(persona, emotion_engine_stub, monkeypatch):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    _patch_local_day(monkeypatch)
+    target_id = store.create(replace(_mem("we walked", "conversation", emotions={"joy": 5.0}), created_at=_TRUE_ORIGIN), fold=False)
+    assert _merge_into(persona, target_id, "we walked and swam").merged == 1
+    assert store.get(target_id, bump=False).content == "we walked and swam"
+
+
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base: the fold fallback keeps the target's own text, prefix included")
+def test_review_the_fold_fallback_keeps_the_targets_date(persona, emotion_engine_stub, monkeypatch):
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module, target_id = _written_back_target(persona, monkeypatch)
+    assert _merge_into(persona, target_id, None).merged == 1
+    got = store.get(target_id, bump=False)
+    assert got.content.startswith(_expected_prefix(store_module, "2026-01-10") + "we walked to the shore")
+    assert "we swam there too" in got.content
+
+
+def test_review_a_reply_with_a_date_behind_leading_whitespace_is_stored_without_the_whitespace_and_a_write_back_adds_nothing(
+    persona, emotion_engine_stub, monkeypatch
+):
+    """The write-back's "already dated" test skips no whitespace, so a date behind whitespace would be stamped over."""
+    _tmp, store, _heb, _queue = persona
+    emotion_engine_stub.live = True
+    store_module, target_id = _written_back_target(persona, monkeypatch)
+    assert _merge_into(persona, target_id, "\n 2026-03-03: we walked and swam").merged == 1
+    assert store.get(target_id, bump=False).content == "2026-03-03: we walked and swam"
+    store.refresh_faded_emotions(target_id, {"joy": 3.0}, _SECOND_WRITE_BACK)
+    assert store.get(target_id, bump=False).content == "2026-03-03: we walked and swam"

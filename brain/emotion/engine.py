@@ -6,8 +6,8 @@ engine behind every call exists.
 Real now:
 - `half_life`, the lookup of an emotion's half-life in days (the persona's vocabulary file, then
   `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `EMOTION_DEFAULT_HALF_LIFE_DAYS`), and `is_live()`, which is True once
-  `state/emotion_switch.json` exists, or cannot be inspected (nothing writes that file until the switch-over, so it answers
-  False for every persona today unless the stat itself fails; only a switch file that was seen is remembered).
+  `state/emotion_switch.json` is seen (nothing writes that file until the switch-over, so it answers False for every persona
+  today). A switch file that cannot be inspected is not switched (owner 2026-11-05); only a switch file that was seen is remembered.
 - The four hooks. A memory's own emotions (`on_memory_committed`, `on_emotions_assigned`, and the start-only date event
   that the commit hook makes for a row that counts for nothing) are APPLIED to the state under the engine's lock when the
   memory is written (`_apply_direct`, or once per `batch()` block). A showing (`on_memory_shown`) and a chat change
@@ -25,7 +25,6 @@ Shadow mode (the phase before the switch-over): the engine writes a shadow `stat
 stored value, no change-log line is written and nothing rebuilds.
 
 Stubbed now:
-- `oldest_entry_at()` returns None.
 - `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
   memory id and the emotion, when the memory has no such emotion. It never returns 0.0:
   "absent" is for the caller to decide.
@@ -157,7 +156,7 @@ class EmotionEngine:
         # The parsed state, kept by the state file's stat key (RD6): the hooks read the stored `persona_start_at` through it
         # without a lock. Owned here; `read()` and `status()` and the drain's early-out read the state through this same cache.
         self._state_cache = engine_files.StateCache(self.persona_dir)
-        self._live = False  # a True answer for a switch file that was SEEN is kept for the life of the instance
+        self._live = False  # True only for a switch file that was SEEN, and then kept for the life of the instance
         # Per-instance state of the apply step, all of it in memory (a second process has its own):
         self._catch_up_failed = False  # set by a failed recovery or an unreadable live state; cleared by a state load or write
         self._failure_logged_day: str | None = None  # the local day the failure was last logged for (once per active day)
@@ -284,7 +283,7 @@ class EmotionEngine:
     def _apply_start_if_needed(self, created_at: datetime) -> None:
         """Apply the start-only event when the stored start date is missing or later than the row's.
 
-        The start-only event is a memory's own date event: a direct apply, like a commit (spec 3.0). It carries no memory id,
+        The start-only event is a memory's own date event: a direct apply, like a commit (design 2.8, Hooks step 3, of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`). It carries no memory id,
         so recovery never skips it; its min-fold is idempotent.
         """
         if self._start_needed(created_at):
@@ -314,12 +313,12 @@ class EmotionEngine:
         self._apply_direct([event])
 
     def _apply_direct(self, events: list[Event]) -> None:
-        """The direct apply of 3.0: under the engine lock, the drain's own apply step on `events` (no queue write).
+        """The direct apply (design 2.8, Hooks step 3, and "A failed direct apply", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`): under the engine lock, the drain's own apply step on `events` (no queue write).
 
         Never raises: the memory is already saved (R8) and a failure here only costs its emotions. The clock is read once,
         inside the lock.
 
-        Accepted edges (spec section 6), the code comments the spec asks for here:
+        Accepted edges (design section 6), the code comments the design asks for here:
         - S42 (E6.14 case 1): a writer that committed its memory and then waited at the lock while a recovery ran, and that
           recovery counted that memory, applies it again: in that overlap one memory's emotions count twice (one extra entry in
           the short and long averages). No stored catch-up range is added.
@@ -390,7 +389,7 @@ class EmotionEngine:
         """A live persona's state cannot be used: set the catch-up-failed flag (it empties `read()`), log once per active day.
 
         Nothing is written, the queue and its position are kept, and a memory stays saved. The retry is the next call: a failed
-        live catch-up reruns on every tick with the lock held (the spec's cost, 3.0 "Costs recorded").
+        live catch-up reruns on every tick with the lock held (the cost named in design 2.8, "Recovery first").
         """
         self._catch_up_failed = True
         try:
@@ -404,6 +403,23 @@ class EmotionEngine:
                 why,
                 exc_info=exc,
             )
+
+    def _skip_for_unknown_switch(self, why: str) -> None:
+        """The switch cannot be inspected, so the persona counts as not switched, but the empty state a not-switched persona
+        starts from would replace stored data: skip this pass instead (owner 2026-11-05).
+
+        Nothing is written, no failure flag is set, and the queue and its position are kept; the next pass asks the switch again.
+        An emotion applied directly in a skipped pass stays out of the state until the next rebuild (the accepted edge of a
+        failed direct apply).
+        """
+        warn_throttled(
+            logger,
+            f"engine:switch-unknown:{self.persona_dir}",
+            "emotion engine: the switch cannot be inspected, so the persona is treated as not switched and no empty state is "
+            "started (%s); this pass is skipped, the queue is kept and the pass is retried",
+            why,
+            exc_info=False,
+        )
 
     def _replay_emotions(self, memory: Memory) -> Mapping[str, float]:
         """What the catch-up folds for a stored row: its faded emotions when it counts, nothing when it does not."""
@@ -444,7 +460,9 @@ class EmotionEngine:
         Steps (spec 3.1 S4): (2) read the state, recovery first when it came from a backup copy, then (for the drain) read the
         queue by position; (3-5) fold the events in time order with `close_days` before each and once at `now`, prune the
         change-log files and the repeat list; (6) one `save_state`, with the queue position, when anything was read, folded or
-        closed, when a catch-up ran, or when an empty state replaced one that could not be used; (7) the drain then empties
+        closed, when a catch-up ran, when an empty state replaced one that could not be used (only with the switch known
+        missing: an unknown switch skips the pass, `_skip_for_unknown_switch`), or (the drain) when the stored
+        position is above 0 over a queue with no lines (a stale position, saved as 0); (7) the drain then empties
         the queue file and saves position 0. A direct apply passes `events` (its own, with
         `drain=False`) and writes no queue and reads none except the catch-up's one read. `now` is held to the loaded
         `saved_at` for the whole step, so a clock read before a wait for the lock cannot rewind the state, and `saved_at`
@@ -465,11 +483,18 @@ class EmotionEngine:
         fallback_empty = False
         pre_day = state.active_day if state is not None else None  # the active day as it stood BEFORE this step's own closes
         if state is None:
-            if self.is_live():
+            switch = self._switch_seen()
+            if switch is True:
                 self._mark_failed(f"the emotion state is {loaded.problem}", now)
                 return
-            # A persona that is not live starts from an empty state (E6.17). A state that does not exist yet is nothing to
-            # save by itself; one that exists but cannot be read is replaced, so the failing load is not repeated every call.
+            if switch is None:
+                self._skip_for_unknown_switch(f"the emotion state is {loaded.problem}")
+                return
+            # A persona whose switch is KNOWN missing starts from an empty state (E6.17). A state that does not exist yet is
+            # nothing to save by itself; one that exists but cannot be read is replaced, so the failing load is not repeated every
+            # call. Known edge (MINOR): a state reported
+            # unreadable is pushed into `.bak1` by the next save, so repeated passes can rotate out copies that were only
+            # transiently unreadable.
             state, fallback_empty = EngineState(), loaded.problem != "missing"
         else:
             if state.saved_at is not None:
@@ -492,11 +517,16 @@ class EmotionEngine:
                     )
                     caught_up = True
                 except Exception as exc:  # noqa: BLE001 - every failure of the catch-up is the failed-catch-up path
-                    if self.is_live():
+                    switch = self._switch_seen()
+                    if switch is True:
                         self._mark_failed(f"the catch-up of the backup state failed ({type(exc).__name__}: {exc})", now, exc=exc)
                         return
+                    if switch is None:
+                        self._skip_for_unknown_switch(f"the catch-up of the backup state failed ({type(exc).__name__}: {exc})")
+                        return
+                    # The same known edge as above: the empty state is saved over a backup that was only transiently unusable.
                     logger.warning(
-                        "emotion engine: the catch-up failed on a persona that is not live; starting from an empty state (%s: %s)",
+                        "emotion engine: the catch-up failed on a persona whose switch is missing; starting from an empty state (%s: %s)",
                         type(exc).__name__,
                         exc,
                     )
@@ -523,7 +553,10 @@ class EmotionEngine:
         day_closed = pre_day is not None and state.active_day != pre_day
         if day_closed:
             engine_files.prune_changes(persona, pre_day)
-        if not (lines_read or day_closed or caught_up or fallback_empty or (not drain and applied)):
+        # A stored position over an empty queue is stale (the queue was emptied and the save of position 0 did not follow):
+        # save it as 0 so the next reply's lines are not skipped (the maintainer's narrowing of S22, see `_empty_and_remember`).
+        stale_position = drain and queue_read.end_line == 0 and state.queue_line > 0  # type: ignore[union-attr]
+        if not (lines_read or day_closed or caught_up or fallback_empty or stale_position or (not drain and applied)):
             if drain and queue_read is not None and queue_read.end_line > 0:
                 self._empty_and_remember(state)  # a retry of an emptying that failed before
             elif drain:
@@ -549,11 +582,16 @@ class EmotionEngine:
         (nothing is applied twice) and retries the emptying without a new save; the key is then left unset so the early-out
         does not hide the retry.
 
-        Accepted edge S22 (spec section 6; owner 2026-11-03 "That's a very narrow edge, note it in a comment but otherwise
+        Accepted edge S22 (design section 6; owner 2026-11-03 "That's a very narrow edge, note it in a comment but otherwise
         accepted."): a crash between the emptying and the save of position 0 leaves the stored position past the end of the
         emptied queue. If the next reply's queued lines outgrow it before the next drain, those lines are skipped. A failed
         second save leaves the same state on disk and is read as the same edge. Also knowingly accepted: a crash can leave a
         torn last line, which the emptying discards (an R12 loss; the reader does not log a torn tail).
+
+        Narrowed (the maintainer's suggestion on the review of this slice, 2026-11-05): a
+        drain that reads no lines (`end_line` 0) while the stored position is above 0 saves the position as 0 (`_run_apply`), so
+        a drain clears a stale position over an empty queue (the start-up drain, or the retry after a failed second save). What
+        stays accepted is the window before that drain: lines queued in it that outgrow the stale position are still skipped.
         """
         persona = self.persona_dir
         if not engine_files.empty_queue(persona):
@@ -667,22 +705,26 @@ class EmotionEngine:
         except Exception:
             return EngineStatus(False, None)
 
-    def oldest_entry_at(self) -> datetime | None:
-        return None
+    def _switch_seen(self) -> bool | None:
+        """True when the switch file was seen, False when it is missing, None when that cannot be told (a stat error).
 
-    def is_live(self) -> bool:
-        """True when the switch file exists, and also when that cannot be told (a stat error other than "no such file").
-
-        Only a switch file that was actually SEEN is remembered for the life of the instance; an unknown answer is not
-        cached, so one stat error cannot make a phase-B persona live for good. A False answer is asked again (one stat) each
-        time, so the switch-over is seen without a restart.
+        Only a switch file that was actually SEEN is remembered for the life of the instance; a missing or unknown answer is
+        asked again (one stat) each time, so the switch-over is seen without a restart and one stat error cannot make a persona
+        look switched or not for good.
         """
         if self._live:
             return True
         seen = engine_files.switch_state(self.persona_dir)
         if seen is True:
             self._live = True
-        return seen is not False
+        return seen
+
+    def is_live(self) -> bool:
+        """True when the switch file was seen. Unknown (a stat error other than "no such file") answers False and is not cached.
+
+        Owner 2026-11-05: "Fail safe, not fail broken everything. If the system can't tell if its switched, assume its not."
+        """
+        return self._switch_seen() is True
 
     def faded_value(self, memory: Memory, emotion: str) -> float:
         try:

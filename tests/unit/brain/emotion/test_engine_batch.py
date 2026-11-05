@@ -1,6 +1,6 @@
 """The S0 stub engine's `batch()` (Engine 0, #575).
 
-`engine.engine_for(persona_dir).batch()` is a context manager on the engine instance (spec 3.0 batch scope).
+`engine.engine_for(persona_dir).batch()` is a context manager on the engine instance (design 2.8, "Batches", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`).
 In the stub it does nothing: it takes no argument, yields None, writes nothing and lets an
 exception from the block go out unchanged. The engine built later (S4) collects the block's events and applies
 them once; its own tests replace the "does nothing" ones.

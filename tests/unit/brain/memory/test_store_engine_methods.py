@@ -570,3 +570,41 @@ def test_the_row_is_written_from_the_text_it_holds_not_from_a_stale_copy(store):
     store.update(memory_id, content="Bob likes coffee")
     store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     assert _raw(store, memory_id)["content"] == _prefix("2031-03-04") + "Bob likes coffee"
+
+
+# --- carry_date_prefix: a rewrite of a row's text keeps the date the old text started with (review of #629, 2026-11-05) -------
+
+
+def test_carry_date_prefix_puts_the_old_texts_date_at_the_start_of_a_rewrite_that_dropped_it():
+    old = _prefix("2026-01-10") + "we walked to the shore"
+    assert store_module.carry_date_prefix(old, "we walked to the shore and swam") == _prefix("2026-01-10") + "we walked to the shore and swam"
+
+
+def test_carry_date_prefix_leaves_a_rewrite_that_has_its_own_date_alone():
+    old = _prefix("2026-01-10") + "we walked"
+    new = _prefix("2026-03-03") + "we walked and swam"
+    assert store_module.carry_date_prefix(old, new) == new
+    # Leading whitespace does not hide it, and goes, so the write-back's own "already dated" test (which skips no whitespace) sees it.
+    assert store_module.carry_date_prefix(old, "\n  " + new) == new
+
+
+def test_carry_date_prefix_adds_nothing_when_the_old_text_has_no_date():
+    assert store_module.carry_date_prefix("we walked", "we walked and swam") == "we walked and swam"
+
+
+def test_carry_date_prefix_puts_the_date_before_the_rewrites_text_not_before_its_leading_whitespace():
+    old = _prefix("2026-01-10") + "we walked"
+    assert store_module.carry_date_prefix(old, "\n we swam") == _prefix("2026-01-10") + "we swam"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_carry_date_prefix_leaves_an_empty_or_blank_rewrite_unchanged(blank):
+    assert store_module.carry_date_prefix(_prefix("2026-01-10") + "we walked", blank) == blank
+
+
+def test_carry_date_prefix_follows_a_reworded_placeholder(monkeypatch):
+    monkeypatch.setattr(store_module, "DATE_PREFIX_FORMAT_PLACEHOLDER", "[{date}] ")
+    assert store_module.carry_date_prefix("[2026-01-10] we walked", "we swam") == "[2026-01-10] we swam"
+    assert store_module.carry_date_prefix("[2026-01-10] we walked", "[2026-02-02] we swam") == "[2026-02-02] we swam"
+    # A prefix in the old working form is not a prefix under the new one.
+    assert store_module.carry_date_prefix("2026-01-10: we walked", "we swam") == "we swam"

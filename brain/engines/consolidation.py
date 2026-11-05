@@ -54,7 +54,7 @@ from brain.memory.known_names import (
 )
 from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, ClaimedBatch, PendingQueue
 from brain.memory.semantic_recall import build_semantic_candidate_pool
-from brain.memory.store import Memory, MemoryStore, clamp_importance
+from brain.memory.store import Memory, MemoryStore, carry_date_prefix, clamp_importance
 from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
 from brain.utils.llm_output import find_json_object_block
@@ -1002,6 +1002,9 @@ def _dispatch(
         merged = decision.merged_content
         if not merged:
             merged = _fold(target.content, cand.content)
+        # A write-back put the day the target was made at the start of its text and moved `created_at`; the judge's rewrite may drop
+        # that day, and the next write-back would then stamp the reset day as the day it was made. Keep the target's day.
+        merged = carry_date_prefix(target.content, merged)
         # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
         live = engine.engine_for(persona_dir).is_live()
         fields: dict = {"content": merged}
@@ -1026,7 +1029,9 @@ def _dispatch(
             # event follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the
             # climax reset like any commit. No try here: the engine's hooks never raise into their caller.
             #
-            # Accepted edges, by owner ruling (spec 3.2; section 6, M06 and MR):
+            # The merge keeps this hook: design 3.1 ("The merge keeps the hook for the incoming memory's mood move") in
+            # docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md, decided by the maintainer on #629
+            # (issue #580). Two edges are accepted there, in design section 6:
             # - If the update above commits and the item is retried before claim.settle (the process dies, or an error follows
             #   the commit), the candidate is merged again: the emotions are averaged with it a second time (the content is
             #   protected by `_fold`'s "contains it" rule, the averages are not), and the event is sent again and counts at the
