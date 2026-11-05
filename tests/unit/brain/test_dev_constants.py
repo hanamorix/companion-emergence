@@ -1,31 +1,19 @@
 """dev_constants — INC-1 of the RAM-spike fix (C13, C27, C33).
 
-Static checks that the memories.db busy timeout and the self-tune gate are
-DEV-level constants (S26/I7): plain module attributes in `brain.dev_constants`,
-never `tunables.register()`-ed, and that the two memories.db connect sites
-(store.py, embedding_matrix.py) actually source their timeout from this
-module rather than a re-hardcoded literal. Behavioral coverage (does the
-30 s timeout actually let a chat write through a long transaction, does the
-gate fire at 201 not 200) lives in test_busy_timeout.py and
-test_judge_selftune.py respectively — this file is the "where do these
-numbers live" half of C27.
+Static checks that the self-tune gate is a DEV-level constant (S26/I7): a plain
+module attribute in `brain.dev_constants`, with the owner's value, and that the
+module never touches `brain.tunables`. Behavioral coverage (does the 30 s
+timeout actually let a chat write through a long transaction, does the gate
+fire at 201 not 200) lives in test_busy_timeout.py and test_judge_selftune.py
+respectively. The values of every dev constant are held by
+test_dev_constants_snapshot.py, which warns when one changes.
 """
 
 from __future__ import annotations
 
-import importlib
 import inspect
 
-import pytest
-
 from brain import dev_constants
-
-
-def test_memories_db_busy_timeout_is_30s() -> None:
-    """S48/S58: sized above the largest measured memories.db write
-    transaction (clustering's set_cluster_memberships, 6.7 s on F-bob20k,
-    2-plan.md §4.3) with a Phoebe-class safety margin."""
-    assert dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S == 30.0
 
 
 def test_selftune_gate_is_200() -> None:
@@ -55,47 +43,3 @@ def test_dev_constants_module_never_touches_tunables() -> None:
     assert "from brain import tunables" not in code_only
     assert ".register(" not in code_only
     assert ".get_tunable(" not in code_only
-
-
-def test_store_py_sources_busy_timeout_from_dev_constants() -> None:
-    """C27/C33: the memories.db connect site in store.py uses the shared
-    constant, not a re-hardcoded literal — so raising it later is a
-    one-file change, and the 2-plan §4.2 report's "every connect site"
-    inventory stays accurate."""
-    from brain.memory import store
-
-    source = inspect.getsource(store)
-    assert "dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S" in source
-    assert "busy_timeout = 5000" not in source, "memories.db must no longer use the old 5s literal"
-
-
-def test_embedding_matrix_py_sources_busy_timeout_from_dev_constants() -> None:
-    from brain.memory import embedding_matrix
-
-    source = inspect.getsource(embedding_matrix)
-    assert "dev_constants.MEMORIES_DB_BUSY_TIMEOUT_S" in source
-    assert "busy_timeout = 5000" not in source
-
-
-def test_sqlite_store_busy_timeout_is_five_seconds() -> None:
-    """C9: the named constant that replaced the written-out 5000 in the migrated stores."""
-    assert dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S == 5.0
-    assert isinstance(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, float)
-
-
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "brain.memory.hebbian",
-        "brain.soul.store",
-        "brain.kindled_link.store",
-        "brain.memory.store",
-        "brain.works.store",
-    ],
-)
-def test_migrated_store_modules_no_longer_write_out_the_busy_timeout(module_name: str) -> None:
-    """C9: the open sequence lives in `brain.utils.sqlite_open`; a migrated store
-    module does not carry its own `busy_timeout = 5000` any more. (A module is added
-    to this list in the commit that migrates it.)"""
-    module = importlib.import_module(module_name)
-    assert "busy_timeout = 5000" not in inspect.getsource(module)

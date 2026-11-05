@@ -185,9 +185,12 @@ def _doubles_of_rerank_for_recall(path: Path) -> list[tuple[int, str]]:
 def test_cs16_every_double_of_rerank_for_recall_accepts_the_store_keyword() -> None:
     found = 0
     for path in sorted((_REPO / "tests").rglob("test_*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "rerank_for_recall" not in source:
+            continue  # a double names it as a string constant: skip the parse of every other test file
         bad = _doubles_of_rerank_for_recall(path)
         assert not bad, (path, bad)
-        if '"rerank_for_recall"' in path.read_text(encoding="utf-8"):
+        if '"rerank_for_recall"' in source:
             found += 1
     assert found >= 3, "the scan found the doubles it is meant to check"
 

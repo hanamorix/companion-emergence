@@ -1,15 +1,8 @@
 # tests/forgetting/test_policy.py
 from datetime import UTC, datetime, timedelta
 
-from brain.forgetting.policy import (
-    FADE_THRESHOLD,
-    LOST_PASS_COUNT,
-    LOST_THRESHOLD,
-    RECENT_LIVED_HOURS,
-    Transition,
-    is_exempt,
-    next_state,
-)
+from brain import dev_constants
+from brain.forgetting.policy import Transition, is_exempt, next_state
 from brain.memory.store import Memory
 
 
@@ -20,13 +13,6 @@ def _make_memory(*, id="mem_test", state="active", created_iso=None) -> Memory:
     if created_iso:
         object.__setattr__(m, "created_at", datetime.fromisoformat(created_iso))
     return m
-
-
-def test_constants_match_spec():
-    assert FADE_THRESHOLD == 0.25
-    assert LOST_THRESHOLD == 0.10
-    assert LOST_PASS_COUNT == 2
-    assert RECENT_LIVED_HOURS == 720.0
 
 
 def test_active_to_fading_when_below_fade_threshold():
@@ -60,7 +46,7 @@ def test_fading_to_lost_only_after_consecutive_passes_below_lost_threshold():
     t1 = next_state(m, salience=0.05, consecutive_low_passes=1)
     assert t1 == Transition.NONE
     # Second consecutive low pass: cross the threshold + count
-    t2 = next_state(m, salience=0.05, consecutive_low_passes=LOST_PASS_COUNT)
+    t2 = next_state(m, salience=0.05, consecutive_low_passes=dev_constants.LOST_PASS_COUNT)
     assert t2 == Transition.LOSE
 
 
@@ -174,7 +160,7 @@ def test_narrative_weight_protects_borderline_active_memory():
     """Arc pressure lowers effective fade threshold → memory held that would otherwise fade."""
     m = _make_memory(state="active")
     # Just below the baseline threshold — fades without arc pressure
-    borderline = FADE_THRESHOLD - 0.01  # 0.24
+    borderline = dev_constants.FADE_THRESHOLD - 0.01  # 0.24
     assert next_state(m, salience=borderline, consecutive_low_passes=0) == Transition.FADE
     # Strong arc pressure halves the threshold → 0.24 is now safely above it
     assert next_state(

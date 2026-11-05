@@ -31,6 +31,7 @@ import pytest
 from brain.emotion import vocabulary
 from brain.memory.pending import PendingQueue
 from brain.memory.store import Memory, MemoryStore
+from tests.source_tree import brain_sources
 
 _BRAIN_ROOT = Path(__file__).resolve().parents[1] / "brain"
 _TEST_CHANNEL = "gatecoverage_channel"
@@ -236,11 +237,16 @@ _ROUTED_LOCI = {
 }
 
 
-def _enumerate_create_sites(root: Path = _BRAIN_ROOT) -> set[tuple[str, str]]:
+def _enumerate_create_sites(root: Path | None = None) -> set[tuple[str, str]]:
+    """Every ``.create(`` line as (path relative to brain/, stripped line). ``root`` None reads the real ``brain/`` from
+    the process-wide copy in tests/source_tree.py; a path scans that tree (the synthetic one in the can-fail test)."""
+    if root is None:
+        files = {rel.removeprefix("brain/"): text for rel, text in brain_sources().items()}
+    else:
+        files = {py.relative_to(root).as_posix(): py.read_text(encoding="utf-8") for py in root.rglob("*.py")}
     found: set[tuple[str, str]] = set()
-    for py in root.rglob("*.py"):
-        rel = py.relative_to(root).as_posix()
-        for raw in py.read_text(encoding="utf-8").splitlines():
+    for rel, text in files.items():
+        for raw in text.splitlines():
             line = raw.strip()
             if ".create(" in line and ".create_new(" not in line:
                 found.add((rel, line))

@@ -2,6 +2,9 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from brain import dev_constants
 from brain.attunement.budget import consume_call, get_remaining
 
 
@@ -64,3 +67,14 @@ def test_missing_budget_file_allows(tmp_path: Path):
     now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
     assert get_remaining(tmp_path, now=now, cap=150) == 150
     assert consume_call(tmp_path, now=now, cap=150) is True
+
+
+def test_default_cap_is_read_from_the_dev_constant_when_called(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Omitting `cap` means `dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT`, read at call time (a patched value bites)."""
+    now = datetime(2026, 5, 31, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(dev_constants, "ATTUNEMENT_DAILY_BUDGET_DEFAULT", 2)
+    assert get_remaining(tmp_path, now=now) == 2
+    assert consume_call(tmp_path, now=now) is True
+    assert consume_call(tmp_path, now=now) is True
+    assert consume_call(tmp_path, now=now) is False
+    assert get_remaining(tmp_path, now=now) == 0

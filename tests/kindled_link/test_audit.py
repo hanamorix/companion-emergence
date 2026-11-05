@@ -1,24 +1,13 @@
-"""Tests for INBOUND_FLOOD_CAP constant and transport audit logger (Phase 7a T2)."""
+"""Tests for the transport audit logger (Phase 7a T2)."""
 from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.kindled_link import limits
 from brain.kindled_link.audit import log_transport
 
 _NOW = datetime(2026, 6, 21, 12, 0, 0, tzinfo=UTC)
-
-
-def test_inbound_flood_cap_exists_and_is_positive_int():
-    assert isinstance(limits.INBOUND_FLOOD_CAP, int)
-    assert limits.INBOUND_FLOOD_CAP > 0
-
-
-def test_inbound_flood_cap_value():
-    # Pinned at 20 per spec (mirrors DAILY_OUTBOUND_CAP magnitude).
-    assert limits.INBOUND_FLOOD_CAP == 20
 
 
 def test_log_transport_writes_one_line(tmp_path: Path):

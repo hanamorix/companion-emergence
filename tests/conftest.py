@@ -8,17 +8,110 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import traceback
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from brain.bridge import cli_throttle, model_error, provider_auth
 from brain.chat import pass2_queue
 from brain.memory import pending
+from tests.claude_spawn_guard import (
+    no_real_claude_in_ci,  # noqa: F401  (autouse, J11: no real `claude` in CI)
+)
 
 pytest_plugins = ["pytester"]
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Refuse a ``no_base_failure`` or ``slow`` mark that gives no reason or sits on a module or class (tests/no_base_failure.py)."""
+    from tests.no_base_failure import marker_problems
+
+    problems = marker_problems(items) + marker_problems(items, "slow")
+    if problems:
+        raise pytest.UsageError("\n".join(problems))
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Where the slow-test budget is on, import the heavy libraries up front (setup time is not budgeted).
+
+    Whichever test imports torch or onnxruntime first pays several seconds for it. With a fixed order that is one known
+    test; with random order (pytest-randomly) it is any test, and an unmarked one would fail the budget by bad luck.
+    Imported with the budget on only, so a local run of one file does not pay for it.
+    """
+    from tests import slow_budget
+
+    if not slow_budget.enabled():
+        return
+    if getattr(session.config.option, "numprocesses", None) and not hasattr(session.config, "workerinput"):
+        return  # the xdist controller runs no test; only the workers need the libraries
+    import importlib
+
+    for name in ("torch", "sentence_transformers", "onnxruntime", "fastembed"):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - an extra that is not installed is fine
+            pass
+    # the parsed source trees (tests/source_tree.py) are shared by about thirty tests; whichever is first would pay them
+    from tests import source_tree
+
+    source_tree.brain_trees()
+    source_tree.brain_sources()
+
+
+_CALL_CPU = pytest.StashKey[float]()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
+    """Remember the CPU time (this process, all threads) the call phase used, for the slow-test budget."""
+    import time
+
+    start = time.process_time()
+    yield
+    item.stash[_CALL_CPU] = time.process_time() - start
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Iterator[None]:
+    """The slow-test budget (tests/slow_budget.py): a passing call phase over the CPU budget, without a ``slow`` mark, fails."""
+    outcome = yield
+    from tests import slow_budget
+
+    if call.when != "call":
+        return
+    cpu = item.stash.get(_CALL_CPU, 0.0)
+    log = os.environ.get("KINDLED_SLOW_BUDGET_LOG")
+    if log and cpu > 0.5:  # collected on every OS, whether or not the budget is enforced there
+        import json
+
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": item.nodeid, "cpu": round(cpu, 3), "wall": round(call.duration, 3)}) + "\n")
+    if not slow_budget.enabled():
+        return
+    report = outcome.get_result()
+    if report.outcome != "passed" or hasattr(report, "wasxfail"):
+        return
+    message = slow_budget.over_budget(
+        cpu,
+        slow_budget.budget_s(),
+        has_slow_mark=item.get_closest_marker("slow") is not None,
+        exempt=any(item.get_closest_marker(name) is not None for name in slow_budget.EXEMPT_MARKERS),
+    )
+    if message:
+        report.outcome = "failed"
+        report.longrepr = f"{item.nodeid}: {message}"
+
+
+def pytest_terminal_summary(terminalreporter: Any, config: pytest.Config) -> None:
+    """Print the pytest-randomly seed at the end too (the header line is hidden by -q), so a red order can be reproduced."""
+    seed = getattr(config.option, "randomly_seed", None)
+    if seed is not None and config.pluginmanager.hasplugin("randomly"):
+        terminalreporter.write_line(f"pytest-randomly seed: {seed} (reproduce serially with --randomly-seed={seed}, or switch it off with -p no:randomly)")
 
 
 @functools.cache
@@ -43,6 +136,23 @@ def requires_symlinks() -> None:
     """Skip (not fail) a test whose setup creates a symlink, where the host denies it (#262)."""
     if not _symlinks_available():
         pytest.skip("os.symlink needs an elevated shell or Developer Mode on Windows")
+
+
+@pytest.fixture(scope="module")
+def one_torch_thread() -> Iterator[None]:
+    """Run a torch-training module on one intra-op thread, then put the previous setting back.
+
+    Under pytest-xdist the worker that trains runs beside other busy workers; torch's default (one intra-op thread per
+    core) would make it compete with all of them for the CPU, including with the timing-sensitive tests. The tiny
+    models here gain nothing from more threads. Used via ``pytestmark = pytest.mark.usefixtures("one_torch_thread")``."""
+    import torch
+
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 # The REAL per-user directories, captured at import (before any test patches the platform directories), for the #488 isolation test.
@@ -169,26 +279,91 @@ def _reset_cli_throttle() -> Iterator[None]:
     model_error.reset()
 
 
+# --- #375 / #540: the cwd-queue guard, by attribution ------------------------------------------------------------
+#
+# A test that grows ``pending_candidates.jsonl`` in the cwd it started in must error. The repo root is shared by every
+# pytest-xdist worker, so comparing the file's size before and after a test blames whichever test happens to be running
+# when ANOTHER worker's test leaks. An audit hook (PEP 578) sees only the events of its own process, so a write is
+# attributed to the test that was running in the process that wrote it. It is installed once, when this module is
+# imported, and cannot be removed; while no test has a guard registered it returns at once.
+
+_QUEUE_FILE = pending._QUEUE_FILENAME
+_QUEUE_GUARDS: list[tuple[str, list[str]]] = []  # (directory of the guarded queue, offences of the running test)
+_WRITE_FLAGS = sum(getattr(os, name, 0) for name in ("O_WRONLY", "O_RDWR", "O_APPEND", "O_CREAT", "O_TRUNC"))
+
+
+def _queue_offence(event: str, path: str) -> str:
+    """The event and the writer's call site: the five innermost frames outside conftest files, plus the innermost
+    frame of a test module when it is deeper in the stack than those (so the test's own line is never lost)."""
+    try:
+        frames = [f for f in traceback.extract_stack() if Path(f.filename).name != "conftest.py"]
+        shown = frames[-5:]
+        own = next((f for f in reversed(frames) if Path(f.filename).name.startswith("test_")), None)
+        if own is not None and own not in shown:
+            shown.insert(0, own)
+        return f"{event} {path} <- " + " <- ".join(f"{Path(f.filename).name}:{f.lineno} in {f.name}" for f in reversed(shown))
+    except Exception:  # noqa: BLE001 - the offence must be recorded even when its call site cannot be built
+        return f"{event} {path}"
+
+
+def _queue_audit_hook(event: str, args: tuple) -> None:
+    try:
+        if not _QUEUE_GUARDS:
+            return
+        if event == "open":
+            if not args[2] & _WRITE_FLAGS:
+                return
+            candidates = [(args[0], None)]
+        elif event == "os.rename":
+            # an atomic-replace writer targets the queue as the destination; moving it away is a change too
+            candidates = [(args[0], args[2]), (args[1], args[3])]
+        elif event in ("os.remove", "os.truncate"):
+            candidates = [(args[0], args[1] if event == "os.remove" else None)]
+        else:
+            return
+        for candidate, dir_fd in candidates:
+            if isinstance(candidate, int) or dir_fd not in (None, -1):
+                continue  # a descriptor, or a name relative to a directory descriptor (shutil.rmtree): not resolvable here
+            path = os.fsdecode(candidate)
+            if os.path.normcase(os.path.basename(path)) != os.path.normcase(_QUEUE_FILE):
+                continue
+            for directory, offences in tuple(_QUEUE_GUARDS):
+                try:
+                    same = os.path.samefile(os.path.dirname(path) or ".", directory)
+                except OSError:
+                    same = False
+                if same:
+                    offences.append(_queue_offence(event, path))
+    except Exception:  # noqa: BLE001 - an audit hook that raises would fail the code under test, not report it
+        return
+
+
+sys.addaudithook(_queue_audit_hook)
+
+
 @pytest.fixture(autouse=True)
 def _no_cwd_queue_leak() -> Iterator[None]:
-    """Error a test that grows ``pending_candidates.jsonl`` in the cwd it started in (#375).
+    """Error a test that writes ``pending_candidates.jsonl`` in the cwd it started in (#375).
 
     An in-memory MemoryStore used to report the working directory as its persona dir, so 17
     tests appended gated candidates to the repo root on every run, invisibly (it is gitignored)
-    and with later tests able to read the debris back. The path is fixed at setup, so a test
-    that chdirs elsewhere still has its original cwd checked; a file that already exists is
-    fine as long as it does not grow.
+    and with later tests able to read the debris back. The directory is fixed at setup, so a test
+    that chdirs elsewhere still has its original cwd checked; a file that already exists is fine
+    as long as nothing writes, replaces, truncates, removes or moves it. The failure lands at
+    teardown (an immediate raise would be swallowed by code that catches errors) and names the
+    writer's call site. Only writes made by THIS process count: another xdist worker's leak is
+    that worker's test's failure, and a child process a test spawns is not observed.
     """
-    queue = Path.cwd() / pending._QUEUE_FILENAME
-
-    def _size() -> int | None:
-        return queue.stat().st_size if queue.exists() else None
-
-    before = _size()
-    yield
-    after = _size()
-    assert after == before, (
-        f"this test wrote to {queue} ({before} -> {after} bytes): a store with no persona "
+    directory = os.getcwd()
+    offences: list[str] = []
+    record = (directory, offences)
+    _QUEUE_GUARDS.append(record)
+    try:
+        yield
+    finally:
+        _QUEUE_GUARDS[:] = [guard for guard in _QUEUE_GUARDS if guard is not record]  # by identity: equal records may nest
+    assert not offences, (
+        f"this test wrote to {Path(directory) / _QUEUE_FILE}: " + "; ".join(offences) + ". A store with no persona "
         "directory must not enqueue; give it a file-backed store (tmp_path / 'memories.db')"
     )
 
@@ -558,6 +733,23 @@ def _tunables_registry_restore() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _vocabulary_registry_restore() -> Iterator[None]:
+    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary) or trigger the
+    warn-once log of an unregistered emotion; neither may reach the next test, whatever worker runs it (#540). Restored IN
+    PLACE (clear + update), never rebound, like ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the
+    dict and set objects themselves."""
+    from brain.emotion import aggregate, vocabulary
+
+    saved_registry = dict(vocabulary._REGISTRY)
+    saved_warned = set(aggregate._warned_unregistered)
+    yield
+    vocabulary._REGISTRY.clear()
+    vocabulary._REGISTRY.update(saved_registry)
+    aggregate._warned_unregistered.clear()
+    aggregate._warned_unregistered.update(saved_warned)
+
+
+@pytest.fixture(autouse=True)
 def _cost_series_state_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Cost-series increment (S146, S159, S163, S164): empty the in-process
     sample buffer and the warn-once flags before and after each test, and give
@@ -784,8 +976,9 @@ with file_lock(Path(sys.argv[1])):
 def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None]]:
     """Hold ``file_lock(path)`` in ANOTHER process for the length of a ``with`` block (a wedged lock holder).
 
-    Used by the lock-timeout tests: the holder never releases until the block ends, so a bounded wait must give up
-    and a caller must not write.
+    The holder never releases until the block ends, so a bounded wait must give up and a caller must not write. This
+    form starts an interpreter, so only the test that needs the lock held by another PROCESS uses it
+    (``test_locked_within.py::test_timeout_raises_and_the_body_never_runs``); the rest use ``held_lock``.
     """
 
     @contextmanager
@@ -805,6 +998,47 @@ def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None
             if proc.stdin is not None:
                 proc.stdin.close()
             proc.wait(timeout=20)
+
+    return _hold
+
+
+@pytest.fixture
+def held_lock() -> Callable[[Path], AbstractContextManager[None]]:
+    """Hold ``file_lock(path)`` on a thread of THIS process for the length of a ``with`` block (a wedged lock holder).
+
+    The cheap form of ``wedged_lock``: ``file_lock`` opens its own descriptor (``flock`` on POSIX, ``msvcrt.locking`` on its
+    own handle on Windows), so a second ``file_lock`` of the same path contends with the holder even inside one process, and
+    a test that asserts "a bounded wait gives up and nothing is written" needs no interpreter start. The holder never
+    releases until the block ends. Only a test about the lock crossing a process boundary needs ``wedged_lock``.
+    """
+    from brain.utils.file_lock import file_lock
+
+    @contextmanager
+    def _hold(path: Path) -> Iterator[None]:
+        held = threading.Event()
+        release = threading.Event()
+        failure: list[BaseException] = []
+
+        def _holder() -> None:
+            try:
+                with file_lock(path):
+                    held.set()
+                    release.wait(60)
+            except BaseException as exc:  # reported by the test thread below, not lost on a daemon thread
+                failure.append(exc)
+                held.set()
+
+        thread = threading.Thread(target=_holder, name="held-lock", daemon=True)
+        thread.start()
+        try:
+            assert held.wait(10), "the holder thread never took the lock"
+            assert not failure, f"the holder thread could not take the lock: {failure[0]!r}"
+            yield
+        finally:
+            release.set()
+            thread.join(10)
+        assert not thread.is_alive(), "the holder thread did not let go of the lock"
+        assert not failure, f"the holder thread failed: {failure[0]!r}"
 
     return _hold
 

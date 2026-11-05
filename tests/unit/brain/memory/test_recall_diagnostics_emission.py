@@ -45,6 +45,7 @@ from brain.memory.store import (
 )
 from brain.tools.dispatch import dispatch
 from brain.tools.impls.search_memories import search_memories
+from tests.source_tree import brain_trees
 from tests.unit.brain.memory.test_hybrid_family_tail import _first_rerank_case
 from tests.unit.brain.memory.test_monologue_last import (
     _QUERY,
@@ -677,13 +678,11 @@ def test_search_paragraphs_alone_writes_nothing(
 def test_the_emission_helper_is_called_only_from_the_three_call_sites() -> None:
     """The three sites (plan 1.2-1.3) and nowhere else in `brain/`."""
     callers: set[str] = set()
-    root = Path(sr.__file__).resolve().parents[1]
-    for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for rel, tree in brain_trees().items():
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
                 if name == "emit_recall_diagnostics":
-                    callers.add(path.relative_to(root).as_posix())
+                    callers.add(rel.removeprefix("brain/"))
     assert callers == {"memory/semantic_recall.py", "tools/impls/search_memories.py"}

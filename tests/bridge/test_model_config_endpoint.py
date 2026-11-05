@@ -19,6 +19,7 @@ from brain import dev_constants, tunables
 from brain.bridge import model_error, server
 from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT
 from brain.bridge.server import build_app
+from tests.thread_support import finish_threads
 from tests.tunables_file import differing_from_defaults
 
 _CHAT = "model.interactive_chat"
@@ -52,6 +53,7 @@ def test_sonnet_writes_the_chat_default_id_over_another_value_and_asks_no_claude
     assert capture_claude_argv.argvs == []
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.3 s); #540, J12')
 def test_sonnet_when_the_value_already_is_the_default_writes_nothing_and_does_not_touch_the_file(tmp_path) -> None:
     client, _ = _make_client(tmp_path)
     with client:
@@ -174,12 +176,12 @@ def test_a_damaged_settings_file_answers_500_and_is_not_touched(tmp_path) -> Non
     assert tunables._file_path().read_text() == '# mine\na = 1\nb = = 2\n'
 
 
-def test_a_wedged_lock_answers_500_and_writes_nothing(tmp_path, wedged_lock, monkeypatch) -> None:
+def test_a_wedged_lock_answers_500_and_writes_nothing(tmp_path, held_lock, monkeypatch) -> None:
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     client, _ = _make_client(tmp_path)
     with client:
         before = tunables._file_path().read_bytes()
-        with wedged_lock(tunables._file_path()):
+        with held_lock(tunables._file_path()):
             r = _post(client, "haiku")
         assert tunables._file_path().read_bytes() == before
     assert r.status_code == 500 and r.json()["error"] == "tunables_unwritable"
@@ -237,7 +239,7 @@ def test_concurrent_saves_run_their_checks_one_at_a_time(tmp_path, monkeypatch) 
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            finish_threads(t)
     assert results == [200, 200, 200] and live["max"] == 1
 
 

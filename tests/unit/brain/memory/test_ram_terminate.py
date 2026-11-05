@@ -24,6 +24,7 @@ from brain.bridge import cli_throttle
 from brain.memory import reranker as reranker_mod
 from brain.memory.reranker import RamMeasurementAbandoned, RerankerProvider, RerankTerminated
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 from tests.unit.brain.memory._ram_support import (
     FULL,
     ScriptedLadderProvider,
@@ -206,7 +207,7 @@ def test_after_disarm_and_for_other_threads_the_wrapper_forwards_untouched(make_
     provider.disarm_terminate()
     provider.rerank("q", ["d"])
     other, result = _on_thread(provider.rerank, "q", ["d"])
-    other.join(_TIMEOUT)
+    finish_threads(other)
     assert "error" not in result
     assert [c[2] is not None for c in session.calls] == [True, False, False]
 
@@ -333,7 +334,7 @@ def test_a_stop_during_the_call_ends_it_with_rerank_terminated_chained_to_the_se
     thread, result = _on_thread(_call)
     assert armed.wait(_TIMEOUT) and session.entered.wait(_TIMEOUT)
     holder["stop"]()
-    thread.join(_TIMEOUT)
+    finish_threads(thread)
     error = result["error"]
     assert isinstance(error, RerankTerminated) and isinstance(error.__cause__, RuntimeError)
     assert session.stopped_by_flag == 1
@@ -348,7 +349,7 @@ def test_a_thread_that_did_not_arm_gets_no_run_options_even_through_the_wrapper(
     provider.arm_terminate()  # armed on THIS thread
     provider.rerank("q", ["d"])  # installs the wrapper
     other, result = _on_thread(provider.rerank, "q", ["d"])
-    other.join(_TIMEOUT)
+    finish_threads(other)
     assert result == {"value": [0.0]} and session.calls[-1][2] is None
 
 
@@ -434,8 +435,8 @@ def test_a_stop_cannot_reach_another_threads_running_call_and_the_armed_call_sta
     time.sleep(0.05)
     session.block_all = False
     session.release.set()  # Y's call finishes normally
-    y_thread.join(_TIMEOUT)
-    x_thread.join(_TIMEOUT)
+    finish_threads(y_thread)
+    finish_threads(x_thread)
     assert y_result == {"value": [0.0]}, "the other thread's call was not stopped"
     assert isinstance(x_result["error"], RerankTerminated)
     assert session.calls[0][2] is None, "Y ran with no run options"
@@ -560,7 +561,7 @@ def test_a_reply_stops_the_running_call_discards_its_sample_and_the_rerun_record
     reply, reply_result = _on_thread(provider.rerank_timed, "q", ["d"])
     reply.join(_TIMEOUT / 2)
     assert not reply.is_alive() and "error" not in reply_result, "the reply did not wait for the full call"
-    worker.join(_TIMEOUT)
+    finish_threads(worker)
     assert isinstance(result.get("error"), RamMeasurementAbandoned)
     assert session.stopped_by_flag == 1, "stopped by the flag, not by the test's timeout"
     assert shapes_in_window(store, _MODEL) == {}
@@ -608,8 +609,8 @@ def test_a_reply_during_another_threads_call_does_not_stop_it_and_the_ladders_ca
     assert bootstrap.is_alive(), "the bootstrap's call is still running: the reply did not stop it"
     session.block_all = False
     session.release.set()
-    bootstrap.join(_TIMEOUT)
-    ladder.join(_TIMEOUT)
+    finish_threads(bootstrap)
+    finish_threads(ladder)
     assert bootstrap_result == {"value": [0.0]}
     assert isinstance(ladder_result["error"], RamMeasurementAbandoned)
     assert session.calls[0][2] is None
@@ -638,7 +639,7 @@ def test_through_the_real_floor_startup_thread_a_reply_stops_the_call_and_the_re
         assert shapes_in_window(loop.store, _MODEL) == {}
         session.block_lengths = set()
         cli_throttle.note_reply_end()
-        thread.join(_TIMEOUT)
+        finish_threads(thread)
         assert not thread.is_alive()
         assert reranker_mod.ram_figure_ready(_MODEL, loop.store) is True
         assert sorted(shapes_in_window(loop.store, _MODEL)) == [(1, 128), (1, 256), (1, 512), (1, 1024), (2, 1024)]

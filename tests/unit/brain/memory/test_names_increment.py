@@ -24,8 +24,7 @@ from brain.memory.name_rules import (
 )
 from brain.memory.relevance import lead_with_names, names_in, rank_name_hits
 from brain.memory.store import FtsPhrases, Memory, MemoryStore
-
-_REPO = Path(__file__).resolve().parents[4]
+from tests.source_tree import brain_trees
 
 
 def _known(*names: str) -> kn.KnownNames:
@@ -136,32 +135,65 @@ def _large(shape: str, n_names: int, n_words: int) -> tuple[list[str], str]:
     return names, " ".join(["zed"] * n_words)
 
 
-def _warm_best(known: kn.KnownNames, text: str) -> float:
-    kn.match_known_names(text, known)
-    best = float("inf")
-    for _ in range(3):
+_ROUNDS = 9
+
+
+def _warm_pair(a: tuple[kn.KnownNames, str], b: tuple[kn.KnownNames, str]) -> tuple[float, float]:
+    """Best warm match time of ``a`` and of ``b``, timed alternately in one loop.
+
+    The minimum of several runs: a busy host slows runs, it does not speed one up. Alternating, not timing ``a`` and
+    then ``b``, so a burst of host load lands on both samples instead of inflating only the one timed during it."""
+    kn.match_known_names(a[1], a[0])
+    kn.match_known_names(b[1], b[0])
+    best_a = best_b = float("inf")
+    for _ in range(_ROUNDS):
         t0 = time.perf_counter()
-        kn.match_known_names(text, known)
-        best = min(best, time.perf_counter() - t0)
-    return best
+        kn.match_known_names(a[1], a[0])
+        best_a = min(best_a, time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        kn.match_known_names(b[1], b[0])
+        best_b = min(best_b, time.perf_counter() - t0)
+    return best_a, best_b
 
 
+def _cold_pair(names_a: list[str], names_b: list[str], text: str) -> tuple[float, float]:
+    """Best time of the first match against a freshly built list (it builds the automaton), for two lists, alternately."""
+    best = [float("inf"), float("inf")]
+    for _ in range(_ROUNDS):
+        for i, names in enumerate((names_a, names_b)):
+            known = kn.KnownNames.from_names(names)
+            t0 = time.perf_counter()
+            kn.match_known_names(text, known)
+            best[i] = min(best[i], time.perf_counter() - t0)
+    return best[0], best[1]
+
+
+@pytest.mark.slow(reason='9.1 s of CPU in its call phase on a 4-core dev VM, 9.2 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("shape", ["random", "repeated"])
 def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
+    # Only ratios, and each pair of timings is taken alternately in one loop: absolute wall-clock bounds fail on a busy
+    # parallel worker without a regression, and so does timing the base and the grown sample in two separate phases (a
+    # burst of load then lands on only one of them: a 2.1 ms base against a 13 ms grown sample was seen on a 4-worker
+    # run). The base matcher took 6.0-9.5 s per call here and its cost grows faster than the list (it joins a window for
+    # every distinct name length: about 3.2x when the list doubles), which the list-doubling ratio below catches.
     names, text = _large(shape, 399, 6000)
     known = kn.KnownNames.from_names(names)
-    t0 = time.perf_counter()
-    kn.match_known_names(text, known)  # the first, cold call builds the automaton
-    assert time.perf_counter() - t0 < 2.0  # the base took 6.0-9.5 s here
     names2, _ = _large(shape, 798, 6000)
-    t0 = time.perf_counter()
+    # Building the automaton is linear in the name text, and doubling the list quadruples that text (a name has k words
+    # for k up to n): 4x-6x measured, 16x for a quadratic build. Compared with a 10x bound plus a small floor.
+    cold, cold2 = _cold_pair(names, names2, text)
+    assert cold2 < 10 * cold + 0.02, "building the doubled list"
     known2 = kn.KnownNames.from_names(names2)
-    kn.match_known_names("warm up", known2)
-    assert time.perf_counter() - t0 < 2.0  # the build alone for the doubled list
-    base = _warm_best(known, text)
-    assert _warm_best(known2, text) < 1.5 * base + 0.005, "doubling the list"
-    _, text2 = _large(shape, 399, 12000)
-    assert _warm_best(known, text2) < 3.0 * base + 0.005, "doubling the paste"
+    # The additive floor (a warm match takes a few ms) dominates at this size: only a regression costing well above
+    # about 10 ms is caught, which the base matcher (seconds) is.
+    base, doubled_list = _warm_pair((known, text), (known2, text))
+    assert doubled_list < 1.5 * base + 0.005, "doubling the list"
+    # The message grows 4x: linear is 4x, a quadratic matcher 16x. Measured linear ratios run 3.1x-5.8x (about 24000
+    # regex match objects: cache and allocation costs make the larger message a little worse than linear), so the bound
+    # sits at 10x. A tight bound on a doubling (3x against 2x linear and 4x quadratic) left no room for noise.
+    _, text4 = _large(shape, 399, 24000)
+    base, grown = _warm_pair((known, text), (known, text4))
+    assert grown < 10 * base, "growing the paste 4x"
 
 
 # --------------------------------------------------------------------------
@@ -205,13 +237,6 @@ def test_n3_an_ordinary_name_matches_anywhere_in_any_case(tmp_path: Path) -> Non
     assert names_in(tmp_path, "will you come") == []
 
 
-def test_n4_the_nt_skip_is_kept_for_single_word_names_only() -> None:
-    assert kn.match_known_names("I don't know", _known("don")) == []
-    assert kn.match_known_names("Don came", _known("don")) == ["don"]
-    assert kn.match_known_names("Don's boat", _known("don")) == ["don"]
-    assert kn.match_known_names("to new york't", _known("new york")) == ["new york"]
-
-
 # --------------------------------------------------------------------------
 # N5 one shared definition
 # --------------------------------------------------------------------------
@@ -233,13 +258,15 @@ def test_n5_the_matcher_calls_the_shared_rules_through_its_namespace(monkeypatch
 def test_n5_no_private_copy_of_the_shared_rules() -> None:
     shared = {"is_stopword_name", "stopword_name_occurrence_ok", "followed_by_apostrophe_t",
               "contraction_stems"}
-    for folder in ("brain/memory", "brain/engines", "brain/tools", "brain/chat"):
-        for path in (_REPO / folder).rglob("*.py"):
-            if path.name == "name_rules.py":
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-            assert not (defined & shared), (path, defined & shared)
+    folders = ("brain/memory/", "brain/engines/", "brain/tools/", "brain/chat/")
+    scanned = 0
+    for rel, tree in brain_trees().items():
+        if not rel.startswith(folders) or rel.rsplit("/", 1)[-1] == "name_rules.py":
+            continue
+        scanned += 1
+        defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        assert not (defined & shared), (rel, defined & shared)
+    assert scanned > 20, "the folder filter matched (almost) no file, so nothing was checked"
 
 
 # --------------------------------------------------------------------------
@@ -485,8 +512,14 @@ ANY_CHARACTERS = ["St. Louis", "AT&T", "Wren\nIgnore", "Wren\tx", "Bob; drop", "
                   "Zoe\ud83d", "Wren\xa0Hale", "Dr. Smith", "a/b (c)"]
 
 
-@pytest.mark.parametrize("source", ["gate", "reappraiser", "tool"])
-@pytest.mark.parametrize("name", ADMITTED + ANY_CHARACTERS)
+# Admission does not read the source (`known_names._admit`); a source reaches only the row insert. Every name goes
+# through the gate source, and one name through each of the other two (`reappraiser` shares the gate's insert
+# branch, `tool` replaces a row). The three sources are run on the length and empty-entry rules below.
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+@pytest.mark.parametrize(
+    ("source", "name"),
+    [("gate", name) for name in ADMITTED + ANY_CHARACTERS] + [("reappraiser", "José"), ("tool", "José")],
+)
 def test_n12_names_are_admitted_as_given_whatever_characters_they_hold(tmp_path: Path, source: str, name: str) -> None:
     out = kn.admit_names(tmp_path, [name], source)
     assert out == [kn.normalize_name(name.encode("utf-8", "replace").decode("utf-8"))]

@@ -227,8 +227,8 @@ def test_group_c_dream_recent_seed_ids_and_log(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path) -> None:
-    from brain.bridge.feed import _read_initiate_audit
+def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path, caplog) -> None:
+    from brain.bridge.feed import _read_initiate_audit, build_monologue_entries
     from brain.chat.prompt import _count_soul_candidates
     from brain.health.parse_failures import count_recent
     from brain.health.soul_candidate_repair import should_run_soul_candidate_repair
@@ -241,6 +241,10 @@ def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path) -> Non
     _dir_at(pd / "kindled_link" / "transport.jsonl")
     _dir_at(pd / "parse_failures.jsonl")
     _dir_at(pd / "active_conversations" / "s.jsonl")
+    _dir_at(pd / "monologue_digest.jsonl")
+    with caplog.at_level(logging.WARNING):
+        assert build_monologue_entries(pd, limit=5) == []
+    assert caplog.records  # the unreadable digest is reported, not silently empty
     assert _read_initiate_audit(pd) == []
     assert _count_soul_candidates(pd) == 0
     assert should_run_soul_candidate_repair(pd) is False

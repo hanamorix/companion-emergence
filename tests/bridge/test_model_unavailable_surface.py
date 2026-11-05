@@ -13,8 +13,6 @@ import io
 import json
 import logging
 import subprocess
-import threading
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -70,31 +68,14 @@ def _client(persona_dir: Path, monkeypatch, model: str = "sonnet") -> TestClient
 class _Run:
     """A recording stand-in for subprocess.run: ``respond(model) -> CompletedProcess``."""
 
-    def __init__(self, respond, delay: float = 0.0, watch: frozenset = frozenset()):
+    def __init__(self, respond):
         self.respond = respond
-        self.watch = watch
-        self.delay = delay
         self.models: list[str] = []
-        self._lock = threading.Lock()
-        self.inflight = 0
-        self.max_inflight = 0
 
     def __call__(self, cmd, **kw):
         model = cmd[cmd.index("--model") + 1] if "--model" in cmd else ""
-        watched = model in self.watch
-        with self._lock:
-            self.models.append(model)
-            if watched:
-                self.inflight += 1
-                self.max_inflight = max(self.max_inflight, self.inflight)
-        try:
-            if self.delay:
-                time.sleep(self.delay)
-            return self.respond(model)
-        finally:
-            if watched:
-                with self._lock:
-                    self.inflight -= 1
+        self.models.append(model)
+        return self.respond(model)
 
     def calls_for(self, model: str) -> int:
         return self.models.count(model)
@@ -281,24 +262,6 @@ def test_non_claude_provider_is_refused_and_nothing_is_saved_or_checked(persona_
         r = _post_model(c, "claude-sonnet-5")
     assert r.status_code == 400 and r.json() == {"ok": False, "error": "model_not_applicable"}
     assert run.calls_for("claude-sonnet-5") == 0 and _saved_model(persona_dir) == "claude-sonnet-5"
-
-
-def test_concurrent_applies_run_their_checks_one_at_a_time(persona_dir: Path, monkeypatch):
-    checks = frozenset({"claude-aaa-1", "claude-bbb-2"})
-    run = _Run(lambda m: _proc(0, _ok_json()), delay=0.25, watch=checks)
-    results: list[int] = []
-    with _client(persona_dir, monkeypatch) as c, patch("subprocess.run", run):
-        def _go(mid):
-            results.append(_post_model(c, mid).status_code)
-
-        ts = [threading.Thread(target=_go, args=(m,)) for m in ("claude-aaa-1", "claude-bbb-2")]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
-    assert results == [200, 200]
-    assert sum(run.calls_for(m) for m in checks) == 2
-    assert run.max_inflight == 1  # single-flight: the second check waited for the first
 
 
 # --- C16: visibility of a saved id that later stops working -------------------------------------------

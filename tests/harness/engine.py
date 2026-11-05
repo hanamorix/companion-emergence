@@ -104,7 +104,8 @@ class BridgeServer:
     """Start/stop the REAL bridge on a background uvicorn thread inside the sandbox.
 
     Only the token-spending example uses this (a real provider is required). Constructed with the
-    persona_dir + port; ``start()`` blocks until the app is serving. NOT unit-tested (would need a
+    persona_dir + port (0 = let the OS pick a free one; ``port`` holds the bound port after
+    ``start()``); ``start()`` blocks until the app is serving. NOT unit-tested (would need a
     live provider); the unit-tested surface is the pure helpers above.
     """
 
@@ -133,7 +134,11 @@ class BridgeServer:
         deadline = time.time() + ready_timeout
         while time.time() < deadline:
             if getattr(self._server, "started", False):
+                if self.port == 0:  # asked the OS for a free port: report the one it bound
+                    self.port = int(self._server.servers[0].sockets[0].getsockname()[1])
                 return
+            if not self._thread.is_alive():  # uvicorn exits its thread when it cannot bind or start
+                raise RuntimeError(f"bridge thread exited before it started serving on {self.host}:{self.port}")
             time.sleep(0.1)
         raise TimeoutError(f"bridge did not start on {self.host}:{self.port}")
 

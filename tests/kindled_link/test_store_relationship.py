@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from brain.kindled_link import limits
+from brain import dev_constants
 from brain.kindled_link.store import KindledLinkStore
 
 
@@ -48,5 +48,5 @@ def test_peer_emotion_window_decays(tmp_path):
     now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
     s.add_peer_emotion("kid_a", 0.6, now)
     # after a full window the accumulator has fully decayed
-    later = now + timedelta(hours=limits.PEER_EMOTION_WINDOW_HOURS)
+    later = now + timedelta(hours=dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS)
     assert s.get_peer_emotion_accumulated("kid_a", later) == 0.0

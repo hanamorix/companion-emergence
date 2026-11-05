@@ -12,7 +12,7 @@ def test_load_default_is_none(tmp_path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "user_name": "zero",
+                "user_name": "bob",
                 "provider": "claude-cli",
                 "model": "sonnet",
             }

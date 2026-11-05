@@ -258,8 +258,8 @@ def test_orchestrator_member_cap_evicts_lowest_salience(tmp_path: Path):
     bus = _StubEventBus()
     # Hand-craft a state where an open arc has MAX_ARC_MEMBERS=50 members and
     # one new candidate is added with higher salience than the lowest.
+    from brain import dev_constants
     from brain.narrative_memory.arc import Arc, ArcMember
-    from brain.narrative_memory.policy import MAX_ARC_MEMBERS
 
     seed_member = ArcMember(
         memory_id="mem_seed",
@@ -274,7 +274,7 @@ def test_orchestrator_member_cap_evicts_lowest_salience(tmp_path: Path):
             lived_age_at_join=412.0,
             salience_at_join=0.10 + i * 0.001,  # increasing
         )
-        for i in range(MAX_ARC_MEMBERS - 1)
+        for i in range(dev_constants.MAX_ARC_MEMBERS - 1)
     )
     initial_arc = Arc(
         id="arc_full",
@@ -312,7 +312,7 @@ def test_orchestrator_member_cap_evicts_lowest_salience(tmp_path: Path):
     )
     state = load_or_recover(tmp_path)
     arc = state.open["arc_full"]
-    assert len(arc.members) == MAX_ARC_MEMBERS
+    assert len(arc.members) == dev_constants.MAX_ARC_MEMBERS
     assert any(m.memory_id == "mem_high" for m in arc.members)
     # Lowest-salience filler (filler_0 with salience 0.10) should be gone
     assert not any(m.memory_id == "mem_filler_0" for m in arc.members)

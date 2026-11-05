@@ -2816,36 +2816,37 @@ mod tests {
     fn list_personas_at_reports_memories_db_and_recency_sort() {
         let dir = tempdir().unwrap();
         let personas = dir.path().join("personas");
-        // phoebe: has memories.db + a recent last_opened_at
-        fs::create_dir_all(personas.join("phoebe")).unwrap();
-        write(&personas.join("phoebe").join("memories.db"), "");
+        // canary: has memories.db + an older last_opened_at (alphabetically first, so a sort by name would put it
+        // first and fail the order below: the recency check bites)
+        fs::create_dir_all(personas.join("canary")).unwrap();
+        write(&personas.join("canary").join("memories.db"), "");
         write(
-            &personas.join("phoebe").join("persona_config.json"),
-            r#"{"last_opened_at": "2026-05-23T09:00:00Z"}"#,
+            &personas.join("canary").join("persona_config.json"),
+            r#"{"last_opened_at": "2026-05-22T09:00:00Z"}"#,
         );
-        // nell: has memories.db + an older last_opened_at
+        // nell: has memories.db + a recent last_opened_at
         fs::create_dir_all(personas.join("nell")).unwrap();
         write(&personas.join("nell").join("memories.db"), "");
         write(
             &personas.join("nell").join("persona_config.json"),
-            r#"{"last_opened_at": "2026-05-22T09:00:00Z"}"#,
+            r#"{"last_opened_at": "2026-05-23T09:00:00Z"}"#,
         );
         // broken: no memories.db, no config
         fs::create_dir_all(personas.join("broken")).unwrap();
 
         let summaries = list_personas_at(&personas).unwrap();
         let names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
-        // phoebe (most recent) → nell (older) → broken (no timestamp, name asc last)
+        // nell (most recent) → canary (older) → broken (no timestamp, name asc last)
         assert_eq!(
             names,
-            vec!["phoebe".to_string(), "nell".to_string(), "broken".to_string()]
+            vec!["nell".to_string(), "canary".to_string(), "broken".to_string()]
         );
         let broken = summaries.iter().find(|s| s.name == "broken").unwrap();
         assert!(!broken.has_memories_db);
         assert!(broken.last_opened_at.is_none());
-        let phoebe = summaries.iter().find(|s| s.name == "phoebe").unwrap();
-        assert!(phoebe.has_memories_db);
-        assert_eq!(phoebe.last_opened_at.as_deref(), Some("2026-05-23T09:00:00Z"));
+        let canary = summaries.iter().find(|s| s.name == "canary").unwrap();
+        assert!(canary.has_memories_db);
+        assert_eq!(canary.last_opened_at.as_deref(), Some("2026-05-22T09:00:00Z"));
     }
 
     #[test]

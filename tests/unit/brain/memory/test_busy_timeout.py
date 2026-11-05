@@ -21,13 +21,15 @@ but failed on macOS (`DID NOT RAISE OperationalError`): under CI scheduling
 jitter, the gap between the holder thread actually acquiring its lock and
 the waiter issuing its statement (or the holder's own remaining hold time by
 the time the waiter got CPU) could eat most of that 1.0s margin. The fix
-widens the margin by an order of magnitude (an explicit 0.5s timeout against
-a 3.0s hold — a 2.5s margin) and moves the lock holder into its own OS
+moves the lock holder into its own OS
 PROCESS (a `python -c` subprocess), synchronized via a ready-file the
 subprocess writes only AFTER it has actually acquired the write transaction
 — removing any same-process thread-scheduling/GIL ambiguity about when the
-lock is really held. The mechanism under test (sqlite's busy_timeout) is
-identical; only the timing margin and the isolation are different, and the
+lock is really held. A later change (#540) took the margin out of the
+short-timeout test altogether: its holder holds until the test releases it
+(a release file), against an explicit 0.2s timeout. The mechanism under test
+(sqlite's busy_timeout) is identical; only the hold and the isolation are
+different, and the
 oracle still fails against a too-short timeout and passes against
 `MemoryStore`'s real (30s) one.
 
@@ -42,6 +44,7 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -51,16 +54,20 @@ from brain.memory.store import MemoryStore
 
 # A short EXPLICIT timeout standing in for "any timeout shorter than the
 # hold" (the mechanism under test, not the literal pre-change 5.0s value —
-# see the module docstring) and a hold several times longer, so CI
-# scheduling jitter of even a second or two cannot close the gap.
-_SHORT_TIMEOUT_S = 0.5
-_HOLD_SECONDS = 3.0
+# see the module docstring). The short-timeout test's holder holds until the
+# parent tells it to release (a release file written AFTER the waiter has
+# failed), so no scheduling jitter can close the gap between the timeout and
+# the hold; _HOLD_CAP_S only bounds a holder whose parent died. The 30 s test
+# releases it _HOLD_SECONDS after its waiter starts.
+_SHORT_TIMEOUT_S = 0.2
+_HOLD_SECONDS = 1.0
+_HOLD_CAP_S = 20.0
 _READY_POLL_S = 0.05
 _READY_WAIT_TIMEOUT_S = 15.0
 
 _HOLDER_SCRIPT = """
-import sqlite3, sys, time
-db_path, ready_path, hold_seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+import os, sqlite3, sys, time
+db_path, ready_path, release_path, hold_seconds = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 conn = sqlite3.connect(db_path, timeout=30.0)
 conn.execute("PRAGMA busy_timeout = 30000")
 conn.execute("BEGIN IMMEDIATE")
@@ -69,7 +76,9 @@ conn.execute("UPDATE _lock_probe SET x = x + 1")
 # the parent process treats its existence as proof the lock is held.
 with open(ready_path, "w") as f:
     f.write("1")
-time.sleep(hold_seconds)
+deadline = time.monotonic() + hold_seconds
+while time.monotonic() < deadline and not os.path.exists(release_path):
+    time.sleep(0.01)
 conn.commit()
 conn.close()
 """
@@ -83,12 +92,20 @@ def _make_probe_table(db_path: str) -> None:
     conn.close()
 
 
+def _release_path(ready_path: Path) -> Path:
+    return ready_path.with_suffix(".release")
+
+
 def _start_holder(db_path: str, ready_path: Path, hold_seconds: float) -> subprocess.Popen:
     """Launch a genuinely separate OS process that holds a write
-    transaction on `db_path` for `hold_seconds`, once it has actually
-    acquired it (signaled by creating `ready_path`)."""
+    transaction on `db_path` for up to `hold_seconds`, once it has actually
+    acquired it (signaled by creating `ready_path`); it commits early when
+    `_release_path(ready_path)` appears."""
     return subprocess.Popen(
-        [sys.executable, "-c", _HOLDER_SCRIPT, db_path, str(ready_path), str(hold_seconds)],
+        [
+            sys.executable, "-c", _HOLDER_SCRIPT, db_path, str(ready_path),
+            str(_release_path(ready_path)), str(hold_seconds),
+        ],
     )
 
 
@@ -116,7 +133,7 @@ def test_short_timeout_fails_against_a_longer_held_write_txn(tmp_path) -> None:
     MemoryStore(db_path).close()  # creates the file + schema + WAL mode
     _make_probe_table(db_path)
 
-    holder = _start_holder(db_path, ready_path, _HOLD_SECONDS)
+    holder = _start_holder(db_path, ready_path, _HOLD_CAP_S)
     try:
         _wait_for_ready(ready_path, holder)
 
@@ -129,15 +146,15 @@ def test_short_timeout_fails_against_a_longer_held_write_txn(tmp_path) -> None:
         finally:
             elapsed = time.monotonic() - start
             waiter.close()
-        # Sanity bound: it must have actually waited close to its own
-        # timeout (not failed instantly for an unrelated reason, and not
-        # suspiciously slow either).
-        assert elapsed < _HOLD_SECONDS, (
-            f"waiter took {elapsed:.2f}s — longer than the full hold; "
+        # Sanity bound: it must have failed on its own short timeout (not
+        # have waited out the holder, which holds until released below).
+        assert elapsed < _HOLD_CAP_S / 2, (
+            f"waiter took {elapsed:.2f}s — far longer than its own timeout; "
             "something other than busy_timeout may be at play"
         )
     finally:
-        returncode = holder.wait(timeout=_HOLD_SECONDS + 10.0)
+        _release_path(ready_path).write_text("1")  # the holder commits and exits
+        returncode = holder.wait(timeout=_HOLD_CAP_S + 10.0)
         assert returncode == 0, f"holder process exited with {returncode}"
 
 
@@ -147,15 +164,22 @@ def test_new_30s_timeout_waits_out_the_same_hold(tmp_path) -> None:
     store = MemoryStore(db_path)
     _make_probe_table(db_path)
 
-    holder = _start_holder(db_path, ready_path, _HOLD_SECONDS)
+    # The holder commits when the parent releases it, a timer started just before the write, so the hold the waiter
+    # sees is at least _HOLD_SECONDS by construction (a hold timed from the holder's own start could shrink by however
+    # long the parent stalls before it issues the write); the cap only bounds a holder whose parent died.
+    holder = _start_holder(db_path, ready_path, _HOLD_CAP_S)
+    timer = threading.Timer(_HOLD_SECONDS, lambda: _release_path(ready_path).write_text("1"))
     try:
         _wait_for_ready(ready_path, holder)
 
+        timer.start()
         start = time.monotonic()
         store.bump_recall("nonexistent-memory-id-for-this-test", 1.0)  # must NOT raise
         elapsed = time.monotonic() - start
     finally:
-        returncode = holder.wait(timeout=_HOLD_SECONDS + 10.0)
+        timer.cancel()
+        _release_path(ready_path).write_text("1")  # no-op if the timer already wrote it
+        returncode = holder.wait(timeout=_HOLD_CAP_S + 10.0)
         assert returncode == 0, f"holder process exited with {returncode}"
         store.close()
 

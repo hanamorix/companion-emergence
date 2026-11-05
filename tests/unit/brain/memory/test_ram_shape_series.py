@@ -65,6 +65,7 @@ def test_the_window_comes_back_as_one_group_per_packed_shape(store, shapes, cloc
     assert _by_shape(groups) == {(1, 1024): (2, 382.0), (2, 512): (2, 138.0)}
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on ubuntu in CI (wall 1.5 s); #540, J12')
 def test_a_hundred_thousand_samples_of_one_shape_are_one_group(store, shapes, clock) -> None:
     x = _x(7, 300)
     shapes.record_many(store, MODEL, [(x, 5.0)] * 100_000)
@@ -188,6 +189,7 @@ def test_the_retired_per_token_series_is_deleted_by_the_first_shape_flush(
     )
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_the_flush_of_many_large_packed_shapes_does_not_overflow_sqlite(
     store, shapes, clock
 ) -> None:

@@ -26,7 +26,6 @@ import pytest
 
 from brain.bridge import model_tier
 from brain.chat.prompt import _build_recall_block
-from brain.dev_constants import MONOLOGUE_FAMILY_TYPES
 from brain.memory import reranker as reranker_mod
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
@@ -191,10 +190,6 @@ def _tool(tmp_path: Path, store: MemoryStore, **args) -> list[str]:
 # ---------------------------------------------------------------------------
 # P-20: the family set, and how a memory is classified
 # ---------------------------------------------------------------------------
-
-
-def test_the_monologue_family_is_the_four_spec_types() -> None:
-    assert MONOLOGUE_FAMILY_TYPES == frozenset(_FAMILY)
 
 
 @pytest.mark.parametrize("memory_type", _FAMILY)

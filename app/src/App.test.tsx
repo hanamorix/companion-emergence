@@ -250,7 +250,7 @@ describe("App boot routing", () => {
     readAppConfig.mockResolvedValue(baseConfig(null));
     listPersonas.mockResolvedValue([
       { name: "nell",   last_opened_at: "2026-05-22T10:00:00Z", has_memories_db: true },
-      { name: "phoebe", last_opened_at: "2026-05-23T09:00:00Z", has_memories_db: true },
+      { name: "canary", last_opened_at: "2026-05-23T09:00:00Z", has_memories_db: true },
     ]);
 
     render(<App />);
@@ -259,7 +259,7 @@ describe("App boot routing", () => {
       expect(screen.getByText(/Which Kindled/i)).toBeInTheDocument()
     );
     expect(screen.getByText(/nell/)).toBeInTheDocument();
-    expect(screen.getByText(/phoebe/)).toBeInTheDocument();
+    expect(screen.getByText(/canary/)).toBeInTheDocument();
     expect(writeAppConfig).not.toHaveBeenCalled();
   });
 });

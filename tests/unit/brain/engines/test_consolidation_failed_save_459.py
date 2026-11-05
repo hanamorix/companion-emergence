@@ -128,21 +128,16 @@ def _errors_naming(caplog, memory: Memory) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.levelno >= logging.ERROR and memory.id in r.getMessage()]
 
 
+# Which exception classes are environment or item faults is `failure_scope`'s table (utils/test_failure_scope.py);
+# the consolidation code only branches on the verdict, so two of each (a sqlite error and an OS error, a sqlite
+# error and a plain value error) run both queue branches here.
 _ENVIRONMENT_FAULTS = [
     sqlite3.OperationalError("database is locked"),
     OSError(errno.ENOSPC, "No space left on device"),
-    OSError(errno.EIO, "Input/output error"),
-    PermissionError("denied"),
-    TimeoutError("slow"),
-    sqlite3.DatabaseError("database disk image is malformed"),
-    sqlite3.OperationalError("no such table: memories"),
 ]
 _ITEM_FAULTS = [
     sqlite3.ProgrammingError("Error binding parameter 1"),
-    sqlite3.DataError("string or blob too big"),
-    TypeError("Object of type object is not JSON serializable"),
     ValueError("bad value"),
-    RuntimeError("boom"),
 ]
 
 
@@ -151,6 +146,7 @@ _ITEM_FAULTS = [
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='4.5 s of CPU in its call phase on a 4-core dev VM, 14.2 s wall (serial run for #540, J12)')
 def test_an_environment_failure_requeues_the_item_ends_the_pass_and_loses_nothing(persona, monkeypatch, caplog):
     # C459-a
     tmp, store, heb, queue = persona
@@ -178,6 +174,7 @@ def test_an_environment_failure_requeues_the_item_ends_the_pass_and_loses_nothin
     assert sorted(clf.calls) == sorted([A, B, B, C]) and clf.calls.count(A) == 1  # exactly 4, none for A twice
 
 
+@pytest.mark.slow(reason='5.6 s of CPU in its call phase on a 4-core dev VM, 35.2 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("exc", _ENVIRONMENT_FAULTS, ids=lambda e: f"{type(e).__name__}:{str(e)[:18]}")
 def test_every_environment_fault_type_is_requeued_not_quarantined(persona, monkeypatch, exc):
     # C459-b
@@ -322,6 +319,7 @@ def test_a_wrong_thread_store_is_environment_for_every_item_and_nothing_is_quara
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.2 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 def test_a_pass1_probe_environment_failure_requeues_and_nothing_is_lost(persona, monkeypatch):
     # C459-f
     tmp, store, heb, queue = persona
@@ -361,6 +359,7 @@ def test_a_pass1_probe_item_failure_is_quarantined_and_the_others_continue(perso
     assert _quarantine(tmp)[0]["stage"] == "pass1"
 
 
+@pytest.mark.slow(reason='2.2 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("exc, expect", [(sqlite3.OperationalError("database is locked"), "requeue"),
                                          (sqlite3.IntegrityError("constraint"), "quarantine")])
 def test_a_merge_branch_update_failure_follows_the_same_rules(persona, monkeypatch, exc, expect):
@@ -397,6 +396,7 @@ def _reappraiser(m):
     return Reappraisal(importance=9.0)
 
 
+@pytest.mark.slow(reason='2.0 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_a_reappraise_item_environment_failure_is_requeued_as_a_reappraise_item(persona, monkeypatch):
     # C459-h
     tmp, store, heb, queue = persona
@@ -470,6 +470,7 @@ def test_a_post_commit_failure_is_neither_requeued_nor_quarantined(persona, monk
     assert _contents(store).count(B) == 1
 
 
+@pytest.mark.slow(reason='2.0 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_a_failed_requeue_leaves_the_item_unsettled_and_the_next_run_handles_it(persona, monkeypatch, caplog):
     # C459-j (environment failure, the requeue itself raises)
     tmp, store, heb, queue = persona
@@ -526,6 +527,7 @@ def test_the_saved_already_probe_failing_counts_as_not_saved(persona, monkeypatc
     assert _contents(store).count(A) == 1
 
 
+@pytest.mark.slow(reason='2.1 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_settle_itself_failing_never_escapes_and_leaves_the_item_for_the_next_run(persona, monkeypatch, caplog):
     # C459-k(2)
     tmp, store, heb, queue = persona
@@ -696,6 +698,7 @@ def test_a_kill_mid_run_loses_nothing_and_the_next_run_finishes_the_batch(person
     assert not (tmp / _PROCESSING).exists() and not (tmp / _SETTLED).exists()
 
 
+@pytest.mark.slow(reason='1.9 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_a_kill_between_the_effect_and_its_settle_record_is_replayed_without_duplicating(persona, monkeypatch):
     # C459-q(3)
     from brain.memory.pending import ClaimedBatch

@@ -170,7 +170,9 @@ def test_http_stop_waits_for_work_reports_progress_and_ends_honestly(tmp_path, b
     assert rec["tasks"] == ["stub task 0", "stub task 1", "stub task 2"]
     assert rec["pid"] == b.proc.pid and rec["pid_token"] == token and rec["reason"] == "user_stop"
     assert rec["requested_at"] == first.stop_requested_at
-    time.sleep(2.0)  # well past any internal limit an earlier bridge had (none must apply now)
+    # Past a short internal limit (an earlier bridge had one; none must apply now). Half a second is five monitor polls
+    # (shutdown.POLL_S 0.1) and nothing in the stop path waits that long; a limit between 0.5 s and 2 s would pass.
+    time.sleep(0.5)
     assert b.proc.poll() is None and b.record().phase == "stopping" and not b.lock_free()
     for i, left in ((0, 2), (1, 1), (2, 0)):
         b.release(i)
@@ -194,14 +196,15 @@ def test_http_stop_reasons(tmp_path, bridges, reason):
     assert b.record().stop_reason == (reason or "manual_restart")
 
 
-def test_sigterm_stop_marks_stopping_within_one_poll_and_exits_0(tmp_path, bridges):
-    """C11 (SIGTERM leg), C13 (OS signal), C15 (SIGTERM)."""
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+def test_sigterm_stop_marks_stopping_and_exits_0(tmp_path, bridges):
+    """C11 (SIGTERM leg), C13 (OS signal), C15 (SIGTERM). The monitor polls every 0.1 s; the mark must show within 3 s
+    (30 polls), a bound a loaded host meets and a handler that never marks "stopping" misses."""
     b = Bridge(tmp_path, tasks=1)
     bridges.append(b)
     b.proc.send_signal(signal.SIGTERM)
-    time.sleep(0.3)  # one monitor poll is 0.1 s
-    st = b.record()
-    assert st.phase == "stopping" and st.stop_reason == "os_signal"
+    st = _until(lambda: (s := b.record()) and s.phase == "stopping" and s, timeout=3.0)
+    assert st.stop_reason == "os_signal"
     assert b.proc.poll() is None
     b.release(0)
     assert b.wait_exit() == 0
@@ -281,21 +284,29 @@ def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
     b = Bridge(tmp_path, tasks=1)
     bridges.append(b)
     env = dict(os.environ, KINDLED_HOME=str(b.home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
+    waiter_err = tmp_path / "waiter-stderr.txt"
+    err_file = waiter_err.open("w")
     waiter = subprocess.Popen(
         [sys.executable, "-c",
          "import sys; from types import SimpleNamespace; import tests.bridge._hooked_bridge as h; h.install(); "
          "from brain.bridge import daemon; "
          "sys.exit(daemon.cmd_run(SimpleNamespace(persona='nell', idle_shutdown=0, client_origin='tests')))"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env, stdout=subprocess.DEVNULL, stderr=err_file,
     )
     try:
-        time.sleep(3.0)
+        # cmd_run prints this line just before it blocks on the lock the running bridge holds.
+        def _waiter_waits() -> bool:
+            assert waiter.poll() is None, f"the second run ended on its own: {waiter_err.read_text()}"
+            return "waiting for the running bridge" in waiter_err.read_text()
+
+        _until(_waiter_waits, timeout=60)
+        time.sleep(0.3)  # and it keeps waiting rather than exiting
         assert waiter.poll() is None
         assert b.post("/supervisor/shutdown", {"reason": "app_restart"}).status_code == 202
         b.release(0)
         assert b.wait_exit() == 0
         st = _until(lambda: (s := b.record()) and s.pid == waiter.pid and s.phase == "running" and s, timeout=60)
-        time.sleep(1.0)
+        time.sleep(0.3)  # the old bridge has released the lock; it must write nothing more
         assert b.record().pid == waiter.pid and b.record().phase == "running"
         assert st.pid_token
     finally:
@@ -305,6 +316,7 @@ def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
         except subprocess.TimeoutExpired:
             waiter.kill()
             waiter.wait(10)
+        err_file.close()
 
 
 def test_sighup_starts_a_graceful_stop(tmp_path, bridges):
@@ -326,7 +338,7 @@ def test_a_runner_started_with_sighup_ignored_keeps_ignoring_it(tmp_path, bridge
     b = Bridge(tmp_path, sighup_ignored=True)
     bridges.append(b)
     b.proc.send_signal(signal.SIGHUP)
-    time.sleep(1.0)
+    time.sleep(0.5)  # five monitor polls: a SIGHUP that stopped the bridge would have marked "stopping" by now
     assert b.proc.poll() is None and b.record().phase == "running"
     assert b.post("/supervisor/shutdown", {"reason": "user_stop"}).status_code == 202
     assert b.wait_exit() == 0

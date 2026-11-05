@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from brain.bridge import shutdown_progress
 from brain.bridge.server import build_app
+from tests.thread_support import finish_threads
 
 _PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -72,7 +73,7 @@ def test_upload_does_not_block_the_event_loop_and_the_worker_is_counted(
             assert shutdown_progress.registry.seal() is False
         finally:
             release.set()
-            uploader.join(timeout=30)
+            finish_threads(uploader)
         # (c) released: the upload completes with its record and the worker is uncounted
         resp = results["up"]
         assert resp.status_code == 200, resp.text

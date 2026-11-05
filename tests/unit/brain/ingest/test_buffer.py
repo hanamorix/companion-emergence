@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.ingest.buffer import (
     delete_backoff,
     delete_cursor,
@@ -22,6 +24,7 @@ from brain.ingest.buffer import (
     write_backoff,
     write_cursor,
 )
+from brain.utils import file_ops
 
 
 def test_ingest_turn_appends_to_session_file(tmp_path: Path) -> None:
@@ -128,7 +131,6 @@ def test_delete_session_buffer_retries_transient_permission_error(
     must retry briefly instead of failing close_session with ingest_failed."""
     from pathlib import Path as _PathCls
 
-    from brain.ingest import buffer as buffer_mod
 
     ingest_turn(tmp_path, {"session_id": "sess_retry", "speaker": "x", "text": "y"})
     path = tmp_path / "active_conversations" / "sess_retry.jsonl"
@@ -144,28 +146,11 @@ def test_delete_session_buffer_retries_transient_permission_error(
         return real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(_PathCls, "unlink", flaky_unlink)
-    monkeypatch.setattr(buffer_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
 
     delete_session_buffer(tmp_path, "sess_retry")
     assert attempts["n"] == 3
     assert not path.exists()
-
-
-def test_brain_ingest_makes_no_direct_os_kill_call() -> None:
-    """Windows CI regression: a raw ``os.kill(pid, 0)`` probe on Windows delivers a REAL Ctrl+C (signal 0 is
-    CTRL_C_EVENT) to our own console group (this once aborted the whole pytest session on windows-latest). Holder
-    liveness goes through ``process_identity`` (#472); brain/ingest must contain no direct os.kill at all."""
-    # Source-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
-    # class). Doc mentions (backtick-quoted) are allowed. Scanned in-process —
-    # shelling out to ``grep`` failed on stock Windows (#262).
-    ingest_dir = Path(__file__).resolve().parents[4] / "brain" / "ingest"
-    code_hits = [
-        f"{py.relative_to(ingest_dir.parent.parent).as_posix()}:{lineno}:{line}"
-        for py in sorted(ingest_dir.rglob("*.py"))
-        for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1)
-        if "os.kill(" in line and "``" not in line
-    ]
-    assert code_hits == [], f"raw os.kill call in brain/ingest:\n{code_hits}"
 
 
 # ---- I-2 follow-up audit: session_id validation ----
@@ -411,8 +396,8 @@ def test_write_backoff_rejects_malformed_ts(tmp_path: Path) -> None:
 
 # ── #198: rewrite_session_atomic survives a transient os.replace refusal ─────
 # Windows refuses os.replace over a file another handle holds open (a GET
-# /chat/history streaming the buffer). Mirror _unlink_with_retry: bounded
-# retry, and never leave the .jsonl.tmp behind.
+# /chat/history streaming the buffer). Same bounded retry as the shared
+# file_ops.retry_transient, and never leave the .jsonl.tmp behind.
 
 
 def _seed_session(persona_dir: Path, sid: str) -> Path:
@@ -439,7 +424,7 @@ def test_rewrite_session_atomic_retries_transient_permission_error(tmp_path, mon
         return real_replace(src, dst)
 
     monkeypatch.setattr(buf.os, "replace", flaky)
-    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0.0)
     buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "rewritten"}])
     assert calls["n"] == 3
     assert path.read_text(encoding="utf-8").strip() == '{"speaker": "assistant", "text": "rewritten"}'
@@ -457,8 +442,130 @@ def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
         raise PermissionError(32, "in use")
 
     monkeypatch.setattr(buf.os, "replace", always)
-    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0.0)
     with pytest.raises(PermissionError):
         buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "x"}])
     assert path.read_text(encoding="utf-8") == before  # old buffer untouched
     assert not path.with_suffix(".jsonl.tmp").exists()  # no litter
+
+
+# --- archive_once: the one archive-with-dedup write (#556) ------------------------------------------------------
+
+
+def _turns(n: int, *, tag: str = "t") -> list[dict]:
+    return [
+        {"session_id": "s1", "speaker": "user" if i % 2 == 0 else "assistant", "text": f"{tag}-{i}", "ts": f"2026-01-01T00:00:{i:02d}+00:00"}
+        for i in range(n)
+    ]
+
+
+def test_archive_once_writes_a_batch_once_per_marker_key(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    rows = _turns(3)
+    assert archive_once(tmp_path, "s1", rows, new_gen=1) > 0
+    # The identical batch again (a crash-retry) is proven archived by the marker: no second write, still success.
+    assert archive_once(tmp_path, "s1", rows, new_gen=1) > 0
+    assert read_archive(tmp_path, "s1") == rows
+
+
+def test_archive_once_writes_a_different_batch(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    rows = _turns(3)
+    archive_once(tmp_path, "s1", rows, new_gen=1)
+    archive_once(tmp_path, "s1", rows, new_gen=2)  # same rows, other generation: a different batch
+    more = _turns(2, tag="u")
+    archive_once(tmp_path, "s1", more, new_gen=2)
+    assert read_archive(tmp_path, "s1") == rows + rows + more
+
+
+def test_archive_once_empty_batch_writes_nothing(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive, read_archive_marker
+
+    assert archive_once(tmp_path, "s1", [], new_gen=1) == 0
+    assert read_archive(tmp_path, "s1") == []
+    assert read_archive_marker(tmp_path, "s1") is None
+
+
+def test_archive_once_keeps_two_byte_identical_turns(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    row = _turns(1)[0]
+    archive_once(tmp_path, "s1", [row, dict(row)], new_gen=1)
+    assert read_archive(tmp_path, "s1") == [row, row]
+
+
+# --- session_append_lock (#556) ---------------------------------------------------------------------------------
+
+
+def test_session_append_lock_excludes_a_lock_respecting_appender(tmp_path):
+    from brain.health.json_io import append_jsonl
+    from brain.ingest.buffer import session_append_lock
+
+    sid = "sess_lock"
+    path = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    with session_append_lock(tmp_path, sid):
+        assert append_jsonl(path, {"text": "while held"}, lock="try") is None
+    assert append_jsonl(path, {"text": "after"}, lock="try") > 0
+    assert [r["text"] for r in read_session(tmp_path, sid)] == ["after"]
+
+
+@pytest.mark.parametrize("raise_on", ["call", "enter"])
+def test_session_append_lock_runs_the_body_once_unlocked_when_the_lock_is_refused(tmp_path, monkeypatch, caplog, raise_on):
+    from contextlib import contextmanager
+
+    from brain.ingest import buffer as buf
+
+    if raise_on == "call":
+
+        def refuse(path, **kw):
+            raise OSError("no locks here")
+
+    else:
+
+        @contextmanager
+        def refuse(path, **kw):
+            raise OSError("no locks here")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(buf, "file_lock", refuse)
+    runs: list[int] = []
+    with caplog.at_level("WARNING", logger=buf.logger.name):
+        with buf.session_append_lock(tmp_path, "sess_lock"):
+            runs.append(1)
+    assert runs == [1]
+    assert any("without it" in r.getMessage() for r in caplog.records)
+
+
+def test_session_append_lock_propagates_a_body_error_once(tmp_path):
+    from brain.ingest.buffer import session_append_lock
+
+    runs: list[int] = []
+    with pytest.raises(OSError, match="body failed"):
+        with session_append_lock(tmp_path, "sess_lock"):
+            runs.append(1)
+            raise OSError("body failed")
+    assert runs == [1]
+
+
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
+def test_read_session_raises_a_named_error_on_an_over_long_integer_line(tmp_path: Path) -> None:
+    """A line holding an integer past the interpreter's digit limit stops the read with ``UnloadableJsonlLineError`` (a known
+    defect, kept as it was before #643 and filed as #646; it is a ``ValueError``, so the bridge's ``read_session`` handler
+    still skips the session). A fix for #646 that makes the read skip the line must change this test on purpose."""
+    from brain.health import jsonl_reader
+
+    folder = tmp_path / "active_conversations"
+    folder.mkdir()
+    huge = '{"speaker": "user", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
+    good1 = json.dumps({"speaker": "user", "text": "one"})
+    good2 = json.dumps({"speaker": "assistant", "text": "two"})
+    session = folder / "sess_big.jsonl"
+    session.write_text("\n".join([good1, huge, good2]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        read_session(tmp_path, "sess_big")
+    assert type(exc.value).__name__ == "UnloadableJsonlLineError"
+    assert type(exc.value) is jsonl_reader.UnloadableJsonlLineError
+    assert (exc.value.code, exc.value.line, exc.value.path) == ("jsonl_unloadable_line", 2, session)
+    assert type(exc.value.__cause__) is ValueError

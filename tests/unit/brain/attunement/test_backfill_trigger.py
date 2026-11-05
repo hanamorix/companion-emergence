@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.backfill import should_run_backfill
-from brain.attunement.schemas import SCHEMA_VERSION
 
 
 def _seed_buffer(persona_dir: Path, n_turns: int) -> None:
@@ -47,7 +47,7 @@ def test_does_not_trigger_when_backfill_complete(tmp_path: Path):
         "patterns_emitted": 0,
         "status": "complete",
         "last_cursor": "window-0",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     }))
     assert should_run_backfill(tmp_path) is False
 
@@ -63,7 +63,7 @@ def test_triggers_when_prior_state_was_deferred(tmp_path: Path):
         "patterns_emitted": 0,
         "status": "deferred_to_next_day",
         "last_cursor": "",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     }))
     assert should_run_backfill(tmp_path) is True
 

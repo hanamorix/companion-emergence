@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from brain import dev_constants
 from brain.bridge import job_progress
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.felt_time.state import load_or_recover as load_felt_time
@@ -51,8 +52,8 @@ class SoulExemptionsUnavailableError(RuntimeError):
 
 def _load_soul_linked_ids(persona_dir: Path, *, caller: str = "forgetting") -> tuple[set[str], set[str]]:
     """Returns (crystallised_ids, under_review_ids), each extended with the consolidation merge targets
-    of its ids (#430). ``caller`` prefixes the warnings: the dedup sweep passes its own name; the
-    narrative pass keeps the default until supervisor.py can be edited.
+    of its ids (#430). ``caller`` prefixes the warnings: the dedup sweep and the narrative pass pass
+    their own names.
 
     Three legs are read: crystallised ids, under-review ids and the merge-target map. Fails CLOSED
     (#392): if any leg cannot be read this raises ``SoulExemptionsUnavailableError`` and the caller
@@ -232,7 +233,7 @@ def run_pass(
             )
             prev_low = counters.get(memory_id, 0)
             # Update consecutive_low_passes for this pass.
-            if s < policy.LOST_THRESHOLD:
+            if s < dev_constants.LOST_THRESHOLD:
                 next_low = prev_low + 1
             else:
                 next_low = 0
@@ -268,7 +269,7 @@ def run_pass(
                     salience_at_drop=s,
                     inputs=inputs,
                     lived_age_hours=felt_state.lived_age_hours,
-                    reason=f"salience<{policy.LOST_THRESHOLD} for {next_low} consecutive passes",
+                    reason=f"salience<{dev_constants.LOST_THRESHOLD} for {next_low} consecutive passes",
                     hebbian_neighbors=neighbors_at_drop,
                 )
                 store.hard_delete(memory_id)

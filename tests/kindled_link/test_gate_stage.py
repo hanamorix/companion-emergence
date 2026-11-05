@@ -28,22 +28,6 @@ def test_prompt_adds_self_disclosure_latitude_only_at_friend_close():
     assert _DISALLOWED_MARKER in stranger and _DISALLOWED_MARKER in close
 
 
-def test_user_detail_clause_byte_identical_across_stages():
-    # M1: the USER-detail disallowed clause must be IDENTICAL at every stage —
-    # only the own-interior latitude sentence may differ. Diff the prompts and
-    # assert the sole difference is the latitude sentence.
-    stranger = _build_gate_prompt(body="b", relationship_hint_json="{}",
-        transcript_summary="s", reason="r", stage="stranger", budget_ok=True)
-    close = _build_gate_prompt(body="b", relationship_hint_json="{}",
-        transcript_summary="s", reason="r", stage="close", budget_ok=True)
-    extra = [ln for ln in close.split("\n\n") if ln not in stranger.split("\n\n")]
-    assert len(extra) == 1 and "interior" in extra[0].lower()
-    # the user-detail clause line is present + identical in both
-    su = [ln for ln in stranger.split("\n\n") if _DISALLOWED_MARKER in ln]
-    cu = [ln for ln in close.split("\n\n") if _DISALLOWED_MARKER in ln]
-    assert su == cu and len(su) == 1
-
-
 def test_budget_depleted_suppresses_latitude_even_at_close():
     # §12 (n11): a depleted disclosure budget reduces self-disclosure latitude
     # regardless of stage.
@@ -146,3 +130,7 @@ def test_user_detail_clause_byte_identical_across_all_five_stages():
         assert clause == ref, (
             f"stage '{st}' user-detail clause differs from stranger: {clause}"
         )
+    # M1: only the own-interior latitude paragraph may differ between the first and the closest stage.
+    stranger_paras = prompts["stranger"].split("\n\n")
+    extra = [ln for ln in prompts["close"].split("\n\n") if ln not in stranger_paras]
+    assert len(extra) == 1 and "interior" in extra[0].lower()

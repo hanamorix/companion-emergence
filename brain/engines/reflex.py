@@ -8,7 +8,6 @@ evaluation + firing logic lands in Task 2.
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -17,6 +16,7 @@ from typing import TYPE_CHECKING, Literal
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
+from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
 from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.emotion import format_emotion_summary
@@ -69,7 +69,10 @@ class ReflexArc:
         trigger_raw = data["trigger"]
         if not isinstance(trigger_raw, dict) or not trigger_raw:
             raise ValueError(f"ReflexArc {data.get('name')!r}: trigger must be non-empty dict")
-        trigger = {str(k): float(v) for k, v in trigger_raw.items()}
+        # Keys are canonical emotion names, the key space of aggregate_state's output. Two spellings of one
+        # emotion keep the higher threshold: every threshold must be met, so "above both" is "above the higher".
+        # Only this in-memory arc is canonical; the file it was read from is not rewritten.
+        trigger = pool_by_canonical_name({str(k): float(v) for k, v in trigger_raw.items()})
 
         created_by = data.get("created_by", "og_migration")
         if created_by not in _ALLOWED_CREATED_BY:
@@ -433,13 +436,11 @@ class ReflexEngine:
         dry_run: bool = False,
     ) -> ArcFire:
         """Render prompt → call LLM → write memory → return ArcFire."""
-        context: dict = defaultdict(lambda: "0")
+        context = _PromptContext(emotions)
         context["persona_name"] = self.persona_name
         context["days_since_human"] = f"{days_since_human:.1f}"
         context["emotion_summary"] = format_emotion_summary(emotions)
         context["memory_summary"] = _format_memory_summary(all_mems)
-        for name, value in emotions.items():
-            context[name] = f"{value:.1f}"
 
         prompt = arc.prompt_template.format_map(context)
         raw = self.provider.generate(prompt, system=self.persona_system_prompt)
@@ -510,6 +511,23 @@ class ReflexEngine:
             trigger_state=trigger_state,
             output_memory_id=mem.id,
         )
+
+
+class _PromptContext(dict):
+    """Format context for an arc's prompt template.
+
+    A placeholder naming an emotion resolves by canonical name, so ``{comfort-seeking}`` reads the
+    ``comfort_seeking`` channel of the aggregate; any other missing placeholder renders "0".
+    """
+
+    def __init__(self, emotions: Mapping[str, float]) -> None:
+        super().__init__()
+        self._emotion_text = {
+            name: f"{value:.1f}" for name, value in pool_by_canonical_name(emotions).items()
+        }
+
+    def __missing__(self, key: str) -> str:
+        return self._emotion_text.get(canonical_name(key), "0")
 
 
 def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:

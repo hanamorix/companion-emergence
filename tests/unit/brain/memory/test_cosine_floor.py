@@ -369,6 +369,7 @@ def _seed_scale(store: MemoryStore, rng, *, n: int, model_id: str, scale: str, r
     return pairs
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_c2d_the_tick_fits_each_scale_from_its_own_rows_never_pooled() -> None:
     """Both scales are seeded under BOTH model ids (as if the ids collided), so
     only the scale filter, not the id filter, keeps a fit from being pooled."""
@@ -501,6 +502,7 @@ def _seed_skewed_day(store: MemoryStore, *, relevant_fraction: float, seed: int)
                     scale=COSINE_SCORE_SCALE)
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on windows in CI (wall 1.3 s); #540, J12')
 @pytest.mark.parametrize(("fraction", "seed"), [(0.7, 1), (0.8, 3), (0.95, 2)])
 def test_a_skewed_overlapping_cosine_day_never_persists_a_gates_nothing_floor(
     store: MemoryStore, fraction: float, seed: int
@@ -563,6 +565,7 @@ def _persisted(pd: Path):
         check.close()
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_a_failing_rerank_floor_step_does_not_skip_the_cosine_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*a, **kw):
         raise RuntimeError("simulated rerank floor derivation failure")
@@ -576,6 +579,7 @@ def test_a_failing_rerank_floor_step_does_not_skip_the_cosine_floor(monkeypatch:
     assert rerank_row is None and cosine_row is not None
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_a_failing_cosine_floor_step_does_not_fail_the_tick_or_undo_the_rerank_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -595,6 +599,7 @@ def test_a_failing_cosine_floor_step_does_not_fail_the_tick_or_undo_the_rerank_f
     assert rerank_row is not None and cosine_row is None
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_a_paused_labeling_pass_defers_the_cosine_floor_too(monkeypatch: pytest.MonkeyPatch) -> None:
     from brain.memory import relevance_judge
 

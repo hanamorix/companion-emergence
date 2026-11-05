@@ -9,6 +9,7 @@ import time
 import pytest
 
 from brain.bridge import cli_throttle
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +83,7 @@ def test_concurrent_overlapping_turns_from_real_threads_never_corrupt_the_counte
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10.0)
+        finish_threads(t)
 
     assert not errors, f"worker thread(s) raised: {errors}"
     assert cli_throttle._inflight_replies == 0, (  # noqa: SLF001 — the exact invariant under test

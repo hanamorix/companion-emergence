@@ -23,6 +23,7 @@ from brain.bridge.server import build_app
 from brain.health.json_io import JsonFileError
 from brain.model_migration import MARKER_NAME, migrate_persona_models, pending_legacy
 from brain.persona_config import PersonaConfig
+from tests.thread_support import finish_threads
 
 _CHAT = "model.interactive_chat"
 _CHAT_JOB = "interactive-chat"
@@ -606,7 +607,7 @@ def test_a_cli_write_during_the_migration_and_the_migration_both_survive(monkeyp
         migrate_persona_models(_home(), None)
     finally:
         tunables._LOCKED_WINDOW_HOOK = None
-    cli_thread.join(timeout=20)
+    finish_threads(cli_thread)
     assert inside == [True]  # it could not get in while the migration's window was open
     assert _overrides() == {_CHAT: "claude-opus-5", "model.compaction": "claude-haiku-4-5"}
 
@@ -631,11 +632,11 @@ def test_the_migration_clears_the_rejection_record_of_the_id_it_writes_c30e(capt
 # ---------------------------------------------------------------------------
 
 
-def test_a_wedged_migration_lock_leaves_no_marker_and_no_persona_file_changed(wedged_lock, monkeypatch, caplog) -> None:
+def test_a_wedged_migration_lock_leaves_no_marker_and_no_persona_file_changed(held_lock, monkeypatch, caplog) -> None:
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     a = _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     before = (a / "persona_config.json").read_bytes()
-    with wedged_lock(_marker()), caplog.at_level(logging.WARNING):
+    with held_lock(_marker()), caplog.at_level(logging.WARNING):
         migrate_persona_models(_home(), a)
     assert not _marker().exists() and _overrides() == {}
     assert (a / "persona_config.json").read_bytes() == before
@@ -643,12 +644,12 @@ def test_a_wedged_migration_lock_leaves_no_marker_and_no_persona_file_changed(we
     assert _overrides()[_CHAT] == "claude-opus-5" and _marker().exists()
 
 
-def test_a_wedged_tunables_lock_leaves_no_marker_either(wedged_lock, monkeypatch) -> None:
+def test_a_wedged_tunables_lock_leaves_no_marker_either(held_lock, monkeypatch) -> None:
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     a = _persona("a", model="opus", opened="2026-01-01T00:00:00Z")
     before = (a / "persona_config.json").read_bytes()
     tunables.set_values({"other.key": 1})
-    with wedged_lock(tunables._file_path()):
+    with held_lock(tunables._file_path()):
         migrate_persona_models(_home(), a)
     assert not _marker().exists() and (a / "persona_config.json").read_bytes() == before
     assert _overrides() == {"other.key": 1}

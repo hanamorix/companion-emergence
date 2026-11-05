@@ -2,8 +2,9 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.ambient import build_attunement_block
-from brain.attunement.schemas import SCHEMA_VERSION, CurrentRead, LearnedPattern
+from brain.attunement.schemas import CurrentRead, LearnedPattern
 from brain.attunement.store import _append_pattern, write_current_read
 
 
@@ -22,7 +23,7 @@ def _make_read():
         mood_valence=0.3,
         mood_intensity=0.5,
         predicted_arc_shape="settling in for a long evening",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
 
 
@@ -40,7 +41,7 @@ def _make_pattern(id_: str, maturity: str, last_addressed_at=None, description="
         crystallised_at="2026-05-15T00:00:00Z" if maturity == "known" else None,
         falsified_at=None,
         examples=[],
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
 
 

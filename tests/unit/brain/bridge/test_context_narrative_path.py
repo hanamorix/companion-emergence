@@ -116,7 +116,7 @@ def test_c2a_respond_sends_narrative_lines_named_after_the_configured_user(tmp_p
     assert re.match(r"^\S+ Hana: hey nell$", said[0])
     assert re.match(r"^\S+ you: i am here$", said[1])
     assert re.match(r"^\S+ Hana: two\\nlines$", said[2])  # one line: the newline stays escaped
-    assert said[4] == "Hana: what do you remember?"  # the live message has no time yet (stamped at persist)
+    assert re.match(r"^\S+ Hana: what do you remember\?$", said[4])  # stamped at turn start (#390)
     assert not any(line.startswith("{") for line in prompt.split("\n"))
     assert '"speaker"' not in prompt and "JSONL" not in prompt
     assert "`ts`" not in prompt  # the ambient tail no longer describes a field
@@ -130,7 +130,7 @@ def test_c2c_without_a_configured_name_the_lines_say_user(tmp_path: Path) -> Non
     prompt = _run_turn(tmp_path, user_name=None)
     said = [line for line in prompt.split("\n") if re.match(r"^(?:\S+ )?(?:User|you): ", line)]
     assert said[0].endswith(" User: hey nell")
-    assert said[4] == "User: what do you remember?"
+    assert re.match(r"^\S+ User: what do you remember\?$", said[4])
 
 
 class _KeepStdin(io.StringIO):

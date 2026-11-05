@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 import pytest
 
+from brain import dev_constants
 from brain.attunement.detector import _build_user_message, run_detector
-from brain.attunement.schemas import SCHEMA_VERSION
 from brain.attunement.store import BufferTurn
 
 
@@ -42,7 +42,7 @@ def test_detector_returns_structured_output_on_valid_json(buffer):
     with patch("brain.attunement.detector._call_haiku", return_value=fake_response):
         output = run_detector(buffer_slice=buffer, reply_text="goodnight love")
     assert output.current_read.tone_label == "tired"
-    assert output.current_read.schema_version == SCHEMA_VERSION
+    assert output.current_read.schema_version == dev_constants.ATTUNEMENT_SCHEMA_VERSION
     assert output.pattern_candidates == []
 
 

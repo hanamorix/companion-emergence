@@ -6,6 +6,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -208,6 +209,7 @@ def _saved_cost_samples(persona_dir: Path) -> int:
         con.close()
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.1 s); #540, J12')
 def test_clean_stop_saves_the_buffered_cost_series_samples(persona_dir: Path) -> None:
     """S146/S164 (CS17e): the lifespan teardown flushes, so a normal stop does
     not lose the samples taken since the last lull. No supervisor runs here, so

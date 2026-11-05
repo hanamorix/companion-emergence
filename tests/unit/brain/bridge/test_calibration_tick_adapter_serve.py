@@ -14,6 +14,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from brain.bridge.supervisor import _run_calibration_tick
 from brain.memory import judge_lora, relevance_judge
 from brain.memory.relevance_judge import FakeRelevanceJudgeProvider
@@ -53,6 +55,7 @@ def _capture_full_model_dir(monkeypatch) -> list[str | None]:
     return seen
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.1 s); #540, J12')
 def test_tick_serves_the_persona_checkpoint_when_present(monkeypatch) -> None:
     seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
@@ -63,6 +66,7 @@ def test_tick_serves_the_persona_checkpoint_when_present(monkeypatch) -> None:
         assert seen == [str(ckpt)], f"expected the pointer's checkpoint dir, got {seen}"
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.3 s); #540, J12')
 def test_tick_serves_base_judge_when_no_checkpoint(monkeypatch) -> None:
     seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:
@@ -72,6 +76,7 @@ def test_tick_serves_base_judge_when_no_checkpoint(monkeypatch) -> None:
         assert seen == [None], f"expected base judge (full_model_dir=None), got {seen}"
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_tick_serves_base_judge_for_a_legacy_adapter_dir(monkeypatch) -> None:
     # S5: a pointer naming an inc5/inc6 adapter dir is not a plain checkpoint;
     # the plain loader is never handed it.
@@ -84,6 +89,7 @@ def test_tick_serves_base_judge_for_a_legacy_adapter_dir(monkeypatch) -> None:
         assert seen == [None], f"adapter dir must resolve to the base judge, got {seen}"
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on ubuntu in CI (wall 1.0 s); #540, J12')
 def test_tick_ignores_a_legacy_full_sub_store(monkeypatch) -> None:
     # S1/S5: the removed per-tier `full/` sub-store is never consulted.
     seen = _capture_full_model_dir(monkeypatch)
@@ -98,6 +104,7 @@ def test_tick_ignores_a_legacy_full_sub_store(monkeypatch) -> None:
         assert seen == [None], f"a legacy full/ sub-store must not be served, got {seen}"
 
 
+@pytest.mark.slow(reason='2.0 s of CPU in its call phase on ubuntu in CI (wall 2.0 s); #540, J12')
 def test_no_cross_persona_bleed(monkeypatch) -> None:
     seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as da, tempfile.TemporaryDirectory() as db:
@@ -114,6 +121,7 @@ def test_no_cross_persona_bleed(monkeypatch) -> None:
         assert seen[1] is None, "persona B must not see A's checkpoint"
 
 
+@pytest.mark.slow(reason='1.0 s of CPU in its call phase on windows in CI (wall 1.8 s); #540, J12')
 def test_injected_judge_is_not_clobbered_by_a_disk_checkpoint(monkeypatch) -> None:
     seen = _capture_full_model_dir(monkeypatch)
     with tempfile.TemporaryDirectory() as d:

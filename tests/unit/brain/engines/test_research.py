@@ -587,16 +587,6 @@ def test_research_log_load_missing_returns_empty(tmp_path: Path) -> None:
     assert log.fires == ()
 
 
-def test_research_log_load_corrupt_returns_empty(tmp_path: Path) -> None:
-    """Corrupt file is healed to empty via json_io's HEAL recovery; fires == ()."""
-    from brain.engines.research import ResearchLog
-
-    path = tmp_path / "research_log.json"
-    path.write_text("{{{not json", encoding="utf-8")
-    log = ResearchLog.load(path)
-    assert log.fires == ()
-
-
 def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog) -> None:
     """Corrupt primary is quarantined and a WARNING is emitted."""
     import logging
@@ -606,7 +596,8 @@ def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog)
     caplog.set_level(logging.WARNING)
     path = tmp_path / "research_log.json"
     path.write_text("{{{not json", encoding="utf-8")
-    ResearchLog.load(path)
+    log = ResearchLog.load(path)
+    assert log.fires == ()  # healed to an empty log
     corrupt_files = list(tmp_path.glob("research_log.json.corrupt-*"))
     assert len(corrupt_files) == 1
     warn_msgs = [r.getMessage() for r in caplog.records if "ResearchLog anomaly" in r.getMessage()]
@@ -905,3 +896,109 @@ def test_compute_topic_overlap_provider_keyerror_still_scores_zero(tmp_path: Pat
         provider=P(), user_name="Hana", persona_dir=tmp_path,
     ) == 0.0
     assert _pf_sites(tmp_path) == []
+
+
+# ── #591: a marker and its text on one line ─────────────────────────────────────────────────────────────────────────
+_SELECT_I1 = '{"choice": "i1", "why": "curious"}'
+
+
+def _fire_with_reply(tmp_path: Path, reply: str, *, interests: list[dict] | None = None):
+    _write_interests(tmp_path / "interests.json", interests or [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = _build_engine(tmp_path, store, provider=ScriptedProvider([_SELECT_I1, reply]))
+        result = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        if result.fired is not None:
+            run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
+        memory = store.get(result.fired.output_memory_id) if result.fired and result.fired.output_memory_id else None
+        return engine, result, memory
+    finally:
+        store.close()
+
+
+def _session_rows(persona_dir: Path) -> list[str]:
+    return [raw for site, raw in _pf_sites(persona_dir) if site == "research_session"]
+
+
+def _session_errors(persona_dir: Path) -> list[str]:
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    if not path.exists():
+        return []
+    rows = map(_json.loads, path.read_text(encoding="utf-8").splitlines())
+    return [r["error"] for r in rows if r["site"] == "research_session"]
+
+
+def test_inline_reply_creates_the_memory_applies_close_and_saves_clean_notes(tmp_path: Path):
+    reply = (
+        "NOTES:\nread two papers about light\nsecond finding\n"
+        "MEMORY: It felt like watching the sea answer back.\nVERDICT: close\n"
+    )
+    engine, result, memory = _fire_with_reply(tmp_path, reply)
+    assert result.fired is not None and result.fired.output_memory_id is not None
+    assert memory is not None and memory.memory_type == "research"
+    assert memory.content == "It felt like watching the sea answer back."
+    saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+    assert saved.interests[0].status == "dormant"
+    notes = read_notes_tail(tmp_path, "i1")
+    assert "read two papers about light" in notes and "second finding" in notes
+    assert "MEMORY:" not in notes and "VERDICT:" not in notes
+    assert _session_rows(tmp_path) == []
+
+
+def test_inline_spawn_verdict_creates_side_quest_interests(tmp_path: Path):
+    reply = "NOTES:\nfound stuff\nMEMORY: Good session.\nVERDICT: spawn: brand new topic; another new topic; a third topic\n"
+    engine, result, memory = _fire_with_reply(tmp_path, reply)
+    assert memory is not None and memory.content == "Good session."
+    saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+    spawned = sorted(i.topic for i in saved.interests if i.origin == "side_quest")
+    assert spawned == ["another new topic", "brand new topic"]
+    assert saved.interests[0].status == "active"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "just some rambling prose with no markers at all",
+        "NOTES:\nfound stuff\n\nVERDICT:\ncontinue",
+        "NOTES:\nfound stuff\n\nMEMORY:\n\nVERDICT:\ncontinue",
+        "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.",
+        "NOTES:\nfound stuff\nMEMORY: I explored it today.\nVERDICT: maybe later\nand a closing remark\n",
+    ],
+    ids=["degraded", "no-memory", "empty-memory", "no-verdict", "inline-verdict-line-not-taken"],
+)
+def test_a_reply_the_parser_could_not_read_is_recorded_as_a_parse_failure(tmp_path: Path, reply: str):
+    _engine, result, _memory = _fire_with_reply(tmp_path, reply)
+    assert result.fired is not None  # the fire itself is unchanged
+    assert _session_rows(tmp_path) == [reply]
+    (error,) = _session_errors(tmp_path)
+    if "NOTES:" in reply:
+        assert error.startswith("no readable ") and error.endswith(" section in the reply")
+    else:
+        assert error == "no NOTES marker, reply kept as notes"
+
+
+def test_the_parse_failure_error_names_the_missing_section(tmp_path: Path):
+    _fire_with_reply(tmp_path, "NOTES:\nfound stuff\n\nVERDICT:\ncontinue")
+    assert _session_errors(tmp_path) == ["no readable MEMORY section in the reply"]
+
+
+@pytest.mark.no_base_failure(
+    reason="negative arm of the #591 parse-failure record: on the old code nothing is recorded for a well-formed reply "
+    "either, so it passes by design"
+)
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.\n\nVERDICT:\ncontinue",
+        "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.\n\nVERDICT:\nmaybe??",
+    ],
+    ids=["well-formed", "unknown-verdict-value"],
+)
+def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
+    _engine, result, memory = _fire_with_reply(tmp_path, reply)
+    assert result.fired is not None and memory is not None
+    assert _session_rows(tmp_path) == []

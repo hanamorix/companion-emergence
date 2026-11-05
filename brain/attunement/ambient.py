@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.attunement.schemas import ADDRESS_COOLDOWN_HOURS
+from brain import dev_constants
 from brain.attunement.store import read_current_read, read_learned_patterns
 
 _ATTUNEMENT_RENDER_CAP = 8
@@ -36,7 +36,7 @@ def _is_addressed_recently(last_addressed_at: str | None) -> bool:
     except ValueError:
         return False
     now = datetime.now(UTC)
-    return (now - addressed).total_seconds() < ADDRESS_COOLDOWN_HOURS * 3600
+    return (now - addressed).total_seconds() < dev_constants.ATTUNEMENT_ADDRESS_COOLDOWN_HOURS * 3600
 
 
 def build_attunement_block(persona_dir: Path) -> str:

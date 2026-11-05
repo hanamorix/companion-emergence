@@ -41,7 +41,7 @@ def compute_drop_intensity(*, emotion_at_ingest_max: float) -> float:
 
     Note:
         salience_at_drop is NOT a factor — at drop time it is by
-        definition near zero (LOST_THRESHOLD = 0.10), and multiplying
+        definition near zero (LOST_THRESHOLD = 0.10 in brain/dev_constants.py), and multiplying
         would silently suppress grief. See spec §3.
     """
     raw = emotion_at_ingest_max * policy.DROP_SCALE

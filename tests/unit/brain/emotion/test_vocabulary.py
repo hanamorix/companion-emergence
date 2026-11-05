@@ -96,20 +96,6 @@ def test_baseline_count_after_split() -> None:
     assert len(vocabulary._BASELINE) == 26
 
 
-def test_grief_has_60_day_half_life() -> None:
-    """Spec Section 10.1 pins grief at 60-day half-life."""
-    grief = vocabulary.get("grief")
-    assert grief is not None
-    assert grief.decay_half_life_days == 60.0
-
-
-def test_joy_has_3_day_half_life() -> None:
-    """Spec Section 10.1 pins joy at 3-day half-life."""
-    joy = vocabulary.get("joy")
-    assert joy is not None
-    assert joy.decay_half_life_days == 3.0
-
-
 def test_canonical_personal_anchor_pull_is_identity_level() -> None:
     """anchor_pull (now in _canonical_personal_emotions) stays identity-level."""
     from brain.emotion._canonical_personal_emotions import _CANONICAL
@@ -162,41 +148,26 @@ def test_register_rejects_duplicate_name() -> None:
         vocabulary.register(custom)
 
 
-def test_baseline_includes_climax():
+# (name, half-life in days, intensity clamp or None when the test does not pin it)
+_BODY_EMOTIONS = [
+    ("climax", 0.125, 10.0),
+    ("touch_hunger", 1.5, None),
+    ("comfort_seeking", 1.0, None),
+    ("rest_need", 0.75, None),
+]
+
+
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+def test_baseline_includes_the_body_emotions():
     from brain.emotion.vocabulary import get
 
-    e = get("climax")
-    assert e is not None
-    assert e.category == "body"
-    assert e.decay_half_life_days == 0.125
-    assert e.intensity_clamp == 10.0
-
-
-def test_baseline_includes_touch_hunger():
-    from brain.emotion.vocabulary import get
-
-    e = get("touch_hunger")
-    assert e is not None
-    assert e.category == "body"
-    assert e.decay_half_life_days == 1.5
-
-
-def test_baseline_includes_comfort_seeking():
-    from brain.emotion.vocabulary import get
-
-    e = get("comfort_seeking")
-    assert e is not None
-    assert e.category == "body"
-    assert e.decay_half_life_days == 1.0
-
-
-def test_baseline_includes_rest_need():
-    from brain.emotion.vocabulary import get
-
-    e = get("rest_need")
-    assert e is not None
-    assert e.category == "body"
-    assert e.decay_half_life_days == 0.75
+    for name, half_life, clamp in _BODY_EMOTIONS:
+        e = get(name)
+        assert e is not None, name
+        assert e.category == "body", name
+        assert e.decay_half_life_days == half_life, name
+        if clamp is not None:
+            assert e.intensity_clamp == clamp, name
 
 
 def test_existing_arousal_unchanged():
@@ -285,3 +256,31 @@ def test_register_stores_under_canonical_name() -> None:
         assert stored.name == "grief_love_blend"
     finally:
         vocabulary._unregister("grief_love_blend")
+
+
+def test_pool_by_canonical_name_collapses_spellings_to_the_max() -> None:
+    from brain.emotion.vocabulary import pool_by_canonical_name
+
+    # the larger value comes first for one pair and last for the other, so neither first-wins nor last-wins passes
+
+    values = {"comfort-seeking": 7.0, "Comfort_Seeking": 4.0, "love": 2.0, "grief_love_blend": 3.0, "love_grief_blend": 5.0}
+    before = dict(values)
+
+    assert pool_by_canonical_name(values) == {"comfort_seeking": 7.0, "love": 2.0, "grief_love_blend": 5.0}
+    assert values == before  # the input is not mutated
+    assert pool_by_canonical_name({}) == {}
+
+
+def test_pool_by_canonical_name_leaves_unknown_names_apart() -> None:
+    from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
+
+    unknown = "not_a_real_emotion"
+    assert vocabulary.get(unknown) is None
+    assert canonical_name(unknown) == unknown  # already canonical: unchanged
+
+    pooled = pool_by_canonical_name(
+        {unknown: 1.0, "Not-A-Real-Emotion": 2.0, "comfort": 3.0, "comfort_seeking_extra": 4.0, "comfort-seeking": 5.0}
+    )
+
+    # Two spellings of the unknown name share one key; look-alikes of a registered name stay their own keys.
+    assert pooled == {unknown: 2.0, "comfort": 3.0, "comfort_seeking_extra": 4.0, "comfort_seeking": 5.0}

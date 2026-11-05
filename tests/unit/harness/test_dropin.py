@@ -2,8 +2,9 @@
 
 Covers the gating criteria C1, C2, C12, C3, C4a/b/c, C5a/b and the C5-fires (ST1.5f) self-test.
 ALL offline / network-free: a tiny zero-dependency ``fakebrain`` tree stands in for the real
-``brain`` package, and every venv is a BARE venv (``deps="none"``) built with ``uv venv`` /
-``python -m venv --without-pip`` — both verified offline. The ``.pth`` startup hook is exercised in
+``brain`` package, and every real venv is a BARE venv (``deps="none"``) built with ``uv venv`` /
+``python -m venv --without-pip`` — both verified offline. The tests of the copy semantics alone
+(C1, C2, #235) stub the venv build: no venv is needed to check what was copied. The ``.pth`` startup hook is exercised in
 a REAL venv ``site-packages`` (a ``.pth`` does NOT fire from a bare ``PYTHONPATH`` dir), which is the
 same ``site.py`` mechanism a ``-m brain.mcp_server`` child uses.
 
@@ -98,10 +99,19 @@ def _clean_env() -> dict[str, str]:
     return dict(os.environ)
 
 
+@pytest.fixture
+def no_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For the tests of the copy semantics: `ingest_version` returns the interpreter path a venv would have, but no
+    venv is built (the tests that look at a venv or its startup hook build real ones)."""
+    monkeypatch.setattr(
+        dropin_mod, "_build_venv", lambda dest, deps: dropin_mod._venv_python(dest / dropin_mod._VENV_DIRNAME)
+    )
+
+
 # --- C1: copy independence -----------------------------------------------------------------------
 
 
-def test_c1_copy_independent_of_source(tmp_path: Path) -> None:
+def test_c1_copy_independent_of_source(tmp_path: Path, no_venv: None) -> None:
     src = _source_repo(tmp_path)
     dest = tmp_path / "dest"
     build = ingest_version(src, dest, deps="none", install_guard=False)
@@ -115,7 +125,7 @@ def test_c1_copy_independent_of_source(tmp_path: Path) -> None:
 # --- C2: prior-copy lifecycle --------------------------------------------------------------------
 
 
-def test_c2_delete_replaces_prior_copy(tmp_path: Path) -> None:
+def test_c2_delete_replaces_prior_copy(tmp_path: Path, no_venv: None) -> None:
     src = _source_repo(tmp_path)
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -127,7 +137,7 @@ def test_c2_delete_replaces_prior_copy(tmp_path: Path) -> None:
     assert (build.repo / "brain" / "__init__.py").is_file()  # new copy present
 
 
-def test_c2_archive_zips_prior_copy_and_excludes_venv(tmp_path: Path) -> None:
+def test_c2_archive_zips_prior_copy_and_excludes_venv(tmp_path: Path, no_venv: None) -> None:
     src = _source_repo(tmp_path)
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -376,7 +386,7 @@ def test_c5_fires_on_known_bad_inputs(tmp_path: Path) -> None:
 # --- #235: dangling symlinks in the source tree must not abort the copy -------------------------
 
 
-def test_ingest_survives_dangling_symlink_in_source(tmp_path: Path, requires_symlinks) -> None:
+def test_ingest_survives_dangling_symlink_in_source(tmp_path: Path, requires_symlinks, no_venv: None) -> None:
     """A tool-left dangling symlink (e.g. an untracked ``.claude/skills/x``) is not part of the
     version under test and must not abort ``ingest_version`` (#235)."""
     src = _source_repo(tmp_path)

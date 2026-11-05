@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,10 +152,16 @@ def test_soul_store_transient_disk_io_error_retries_then_succeeds(
         kwargs.setdefault("factory", _FlakyConn)
         return real_connect(*args, **kwargs)
 
+    sleeps: list[float] = []
+    monkeypatch.setattr("brain.health.integrity_retry.time", SimpleNamespace(sleep=sleeps.append))
     monkeypatch.setattr("brain.soul.store.sqlite3.connect", _connect)
     store = SoulStore(str(tmp_path / "soul.db"))
     store.close()
     assert calls["n"] == dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS
+    # one pause per failed attempt, each the configured delay (nothing really slept)
+    assert sleeps == [dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S] * (
+        dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS - 1
+    )
 
 
 def test_save_and_list_voice_evolution(tmp_path: Path) -> None:

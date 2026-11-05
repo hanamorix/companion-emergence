@@ -24,10 +24,30 @@ on:
           - macos-latest
           - windows-latest
         default: all
+      workers:
+        description: >-
+          pytest-xdist worker processes (#540): 1 is the serial run, auto is one worker per CPU.
+          Any other value than 1 also switches on --dist loadgroup and turns off the tdd-guard plugin.
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "auto"
+        default: "1"
+      seed:
+        description: >-
+          pytest-randomly seed to reproduce a red random order (digits only; empty = a fresh random seed). Use
+          workers 1 for a faithful reproduction.
+        type: string
+        required: false
+        default: ""
 
 jobs:
   python:
     name: python ${{ matrix.os }}
+    # A hung parallel trial must not hold a runner for the default six hours.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -51,20 +71,45 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
+      # #540: the suite runs in parallel (pytest-xdist, one worker per CPU). `--dist loadgroup` keeps each
+      # xdist_group mark's tests on one worker (the tests sharing a real resource: the Hugging Face cache, the
+      # systemd user manager, a network install); `-p no:tdd-guard` stops the tdd-guard plugin, which every worker
+      # would otherwise load and make write the same status file. KINDLED_SLOW_BUDGET switches on the slow-test
+      # budget (tests/slow_budget.py), on ubuntu only: a test that uses more than 2 s of CPU must say why with
+      # @pytest.mark.slow(reason=...); the CPU time of every test over 0.5 s is logged on all three systems (uploaded
+      # below). Test order is
+      # random (pytest-randomly): the seed is printed in the header and at the end; to reproduce a red order run
+      # serially with `--randomly-seed=N`, or switch it off with `-p no:randomly`.
       - name: Run pytest
         if: github.event_name != 'workflow_dispatch'
-        run: uv run pytest -v --tb=short
+        env:
+          KINDLED_SLOW_BUDGET: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
+          KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
+        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml
 
-      # Manual run only. The input reaches the shell as an environment variable (never
-      # spliced into the script), is split on all whitespace (newlines included) with globbing switched off, and
-      # every word is passed to pytest as one quoted argument. `shell: bash` so the
-      # same script runs on all three OSes (Windows would otherwise use pwsh).
+      # Manual run only. The inputs reach the shell as environment variables (never
+      # spliced into the script). TESTS is split on all whitespace (newlines included) with
+      # globbing switched off, and every word is passed to pytest as one quoted argument.
+      # WORKERS other than 1 runs pytest-xdist: `--dist loadgroup` keeps each xdist_group
+      # mark's tests on one worker (the tests sharing a real resource), and `-p no:tdd-guard`
+      # stops the tdd-guard plugin, which every worker would otherwise load and make write the
+      # same status file. The push and pull_request run above uses `-n auto` too; this step
+      # defaults to 1 (serial) so a single failing test can be reproduced faithfully. `shell: bash`
+      # so the same script runs on all three OSes (Windows would otherwise use pwsh).
       - name: Run pytest (selected tests)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           TESTS: ${{ inputs.tests }}
+          WORKERS: ${{ inputs.workers }}
+          SEED: ${{ inputs.seed }}
+          KINDLED_SLOW_BUDGET: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
+          KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
         run: |
+          case "$WORKERS" in
+            1|2|4|auto) ;;
+            *) echo "::error::refusing workers '$WORKERS': use 1, 2, 4 or auto"; exit 1 ;;
+          esac
           set -f
           selected=($TESTS)
           set +f
@@ -73,11 +118,77 @@ jobs:
               -*) echo "::error::refusing '$word': pass test paths or node ids only, not pytest options"; exit 1 ;;
             esac
           done
-          uv run pytest -v --tb=short "${selected[@]}"
+          parallel=()
+          if [ "$WORKERS" != "1" ]; then
+            parallel=(-n "$WORKERS" --dist loadgroup -p no:tdd-guard)
+          fi
+          seed=()
+          if [ -n "$SEED" ]; then
+            case "$SEED" in
+              *[!0-9]*) echo "::error::refusing seed '$SEED': digits only"; exit 1 ;;
+            esac
+            seed=(-p randomly "--randomly-seed=$SEED")
+          fi
+          uv run pytest -v --tb=short --durations=100 --junitxml=pytest-junit.xml "${parallel[@]}" "${seed[@]}" "${selected[@]}"
+
+      # Per-test timings (#540): the junit file carries every test's duration so
+      # the slow ones can be found per OS.
+      - name: Upload pytest junit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-junit-${{ matrix.os }}
+          path: pytest-junit.xml
+          if-no-files-found: warn
+
+      # The CPU time of every test that used more than 0.5 s (tests/slow_budget.py), per OS: the data the
+      # @pytest.mark.slow marks are made from.
+      - name: Upload the slow-test CPU log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: slow-budget-cpu-${{ matrix.os }}
+          path: slow-budget-cpu.jsonl
+          if-no-files-found: ignore
 
       - name: Lint with ruff
         if: github.event_name != 'workflow_dispatch'
         run: uv run ruff check .
+
+  # #540: a test that cannot fail proves nothing. Every NEW test a PR adds must fail against the product
+  # code the PR branched from (or be marked `no_base_failure(reason=...)`, which is counted and listed).
+  # What "new" means and how to run this locally: CONTRIBUTING.md, "New tests must be able to fail".
+  # Pull requests only (a push to main has no base to compare with). The script builds its own git
+  # worktrees of the PR head and the merge-base and never touches this checkout.
+  new-tests-fail-on-base:
+    name: new tests must fail on the old code
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PR head with its history
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run the new tests against the base code
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          base="$(git merge-base HEAD "origin/${BASE_REF}")"
+          uv run python scripts/new_tests_fail_on_base.py --base "$base" --head HEAD --workers auto
 
   # #363: the shipped runtime is Python 3.13 (app/build_python_runtime.sh) but
   # the job above runs 3.12. The bridge tests (threads, sockets, streaming, the
@@ -104,7 +215,7 @@ jobs:
 
       - name: Run bridge tests
         env:
-          KINDLED_RUN_STRESS: "1"  # adds the 60s C15(c) write-lock stress test (#421)
+          KINDLED_RUN_STRESS: "1"  # adds the 60s C15(c) write-lock stress test and its stand-in tests (#421, #540)
         run: uv run --python 3.13 pytest tests/bridge tests/unit/brain/bridge -v --tb=short
 
   # Audit 2026-05-07 P2-5: frontend tests + production build now gate

@@ -17,7 +17,6 @@ Diagnosis: hunts/harness-vocab-registry-leak/diagnosis.md.
 
 from __future__ import annotations
 
-import socket
 from pathlib import Path
 
 import pytest
@@ -42,16 +41,6 @@ def _seed_fake_cred(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (fake_home / ".claude" / ".credentials.json").write_text('{"fake": true}')
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
-
-
-def _free_port() -> int:
-    """Ask the OS for a free loopback port; raises OSError if it cannot bind (callers skip)."""
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-    finally:
-        s.close()
 
 
 @pytest.fixture(autouse=True)
@@ -81,22 +70,14 @@ def test_sandbox_does_not_leak_persona_emotion_registration(
     _seed_fake_cred(monkeypatch, tmp_path)
     assert vocabulary.get("warmth") is None, "precondition: warmth unregistered before the run"
 
-    try:
-        port = _free_port()
-    except OSError:
-        pytest.skip("cannot bind a loopback port in this environment")
-
     with sandbox() as sb:
         # default MemorySeed emotion is {"warmth": 0.3} -> a non-baseline persona extension.
         live = build_persona(PersonaSpec(memories=[MemorySeed(content="Bob has a dog.")]), sb)
         # build_persona alone does NOT register (no vocab file, no load yet).
         assert vocabulary.get("warmth") is None, "build_persona must not register on its own"
 
-        server = BridgeServer(live.persona_dir, port=port)
-        try:
-            server.start()
-        except OSError:
-            pytest.skip("cannot start the bridge on this port in this environment")
+        server = BridgeServer(live.persona_dir, port=0)
+        server.start()  # port 0: the OS picks a free port, so there is no bind race; a start failure fails the test
         # The real bridge start reconstructed the vocab and registered warmth (representativeness
         # anchor: the leak IS present inside the run, so a None-after is a real restore, not a no-op).
         assert vocabulary.get("warmth") is not None, "bridge start should register warmth in-run"
@@ -117,11 +98,6 @@ def test_sandbox_registry_restore_survives_a_leak_raise(
     _seed_fake_cred(monkeypatch, tmp_path)
     assert vocabulary.get("warmth") is None
 
-    try:
-        port = _free_port()
-    except OSError:
-        pytest.skip("cannot bind a loopback port in this environment")
-
     guarded = tmp_path / "guarded-root"
     guarded.mkdir()
     (guarded / "existing.txt").write_text("original")
@@ -131,11 +107,8 @@ def test_sandbox_registry_restore_survives_a_leak_raise(
             live = build_persona(
                 PersonaSpec(memories=[MemorySeed(content="Bob has a dog.")]), sb
             )
-            server = BridgeServer(live.persona_dir, port=port)
-            try:
-                server.start()
-            except OSError:
-                pytest.skip("cannot start the bridge on this port in this environment")
+            server = BridgeServer(live.persona_dir, port=0)
+            server.start()  # port 0: the OS picks a free port, so there is no bind race; a start failure fails the test
             assert vocabulary.get("warmth") is not None, "bridge start should register warmth"
             server.stop()
             # MAJOR-2: confirm the uvicorn thread joined (is dead) before we rely on the restore's
@@ -171,11 +144,6 @@ def test_sandbox_does_not_leak_a_nonwarmth_extension(
     _seed_fake_cred(monkeypatch, tmp_path)
     assert vocabulary.get("reverence") is None, "precondition: reverence unregistered"
 
-    try:
-        port = _free_port()
-    except OSError:
-        pytest.skip("cannot bind a loopback port in this environment")
-
     with sandbox() as sb:
         live = build_persona(
             PersonaSpec(
@@ -183,11 +151,8 @@ def test_sandbox_does_not_leak_a_nonwarmth_extension(
             ),
             sb,
         )
-        server = BridgeServer(live.persona_dir, port=port)
-        try:
-            server.start()
-        except OSError:
-            pytest.skip("cannot start the bridge on this port in this environment")
+        server = BridgeServer(live.persona_dir, port=0)
+        server.start()  # port 0: the OS picks a free port, so there is no bind race; a start failure fails the test
         assert vocabulary.get("reverence") is not None, "bridge start should register reverence"
         server.stop()
 

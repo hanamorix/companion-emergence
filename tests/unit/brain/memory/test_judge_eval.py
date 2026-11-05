@@ -4,10 +4,10 @@ rollback evaluation INFRASTRUCTURE for the weight-retrain tiers (spec
 [champion/challenger + rollback]).
 
 TORCH-FREE (I6/AC8): every judge below is a scripted plain callable; see
-`test_run_champion_challenger_does_not_import_torch_or_sentence_
-transformers` for the fresh-subprocess proof this module (and everything
-it transitively imports) never pulls torch/sentence_transformers into
-`sys.modules`, mirroring `test_judge_selftune.py`'s own sibling test.
+`tests/unit/brain/test_import_hygiene.py::test_judge_modules_stay_torch_free`
+for the fresh-subprocess proof this module (and everything it transitively
+imports) never pulls torch/sentence_transformers/peft/datasets into
+`sys.modules`.
 
 This increment does NOT wire into `judge_selftune`'s tier dispatch or the
 live tick (inc5/6 does) — these tests exercise `judge_eval`'s pure
@@ -18,10 +18,6 @@ train/eval/rollback stand-ins, never a real model or `MemoryStore`.
 from __future__ import annotations
 
 import math
-import subprocess
-import sys
-import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -433,59 +429,3 @@ def test_run_champion_challenger_uses_tunable_defaults_when_alpha_min_n_omitted(
         # alpha/min_n omitted -> resolved from tunables.get_tunable at call time
     )
     assert result.accepted is False  # 5 < the overridden floor of 100
-
-
-# ---------------------------------------------------------------------------
-# AC8 — off hot path / torch scoping: a fresh subprocess proves exercising
-# the champion/challenger path never imports torch/sentence_transformers.
-# ---------------------------------------------------------------------------
-
-
-def test_run_champion_challenger_does_not_import_torch_or_sentence_transformers() -> None:
-    """Mirrors `test_judge_selftune.py`'s
-    `test_tick_does_not_import_torch_or_sentence_transformers`: a FRESH
-    subprocess (never inheriting this test process's own `sys.modules`)
-    imports `judge_eval`, runs a full scripted `run_champion_challenger`
-    pass (including a challenger REJECTION, which also exercises
-    `rollback.restore`), and only then asserts neither package landed in
-    `sys.modules`.
-    """
-    script = textwrap.dedent(
-        """
-        import sys
-
-        from brain.memory.judge_eval import RollbackHandle, run_champion_challenger
-
-        test_items = [(f"t{i}", "relevant") for i in range(8)]
-        champion = lambda item: "relevant"
-        labels = {f"t{i}": "irrelevant" for i in range(8)}
-
-        def retrain_fn(train_items):
-            return lambda item: labels[item]
-
-        result = run_champion_challenger(
-            champion=champion,
-            retrain_fn=retrain_fn,
-            train_items=["x"],
-            test_items=test_items,
-            rollback=RollbackHandle(),
-            alpha=0.05,
-            min_n=1,
-        )
-        assert result.accepted is False, result
-
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"

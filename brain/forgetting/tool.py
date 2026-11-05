@@ -12,12 +12,13 @@ from typing import Any
 
 from brain.forgetting import graveyard
 from brain.memory.relevance import names_in
+from brain.tools.naming import TOOL_PREFIX_SLOT
 
 
 def recall_forgotten(*, arguments: dict[str, Any], persona_dir: Path) -> dict[str, Any]:
     query = arguments.get("query")
     if not query or not isinstance(query, str):
-        raise ValueError("recall_forgotten requires a non-empty 'query' string")
+        raise ValueError(f"{TOOL_PREFIX_SLOT}recall_forgotten requires a non-empty 'query' string")
     # The listed names in the query are searched too, and their hits lead (S119, S120).
     hits = graveyard.search(persona_dir, query, limit=5, names=names_in(persona_dir, query))
     return {"hits": hits}

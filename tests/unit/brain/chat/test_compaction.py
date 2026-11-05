@@ -228,12 +228,12 @@ def test_c6_archive_failure_leaves_buffer_untouched(tmp_path: Path, monkeypatch)
     write_cursor(tmp_path, sid, tss[-1])
     before = Path(tmp_path / "active_conversations" / f"{sid}.jsonl").read_bytes()
 
-    import brain.chat.compaction as comp
+    import brain.ingest.buffer as buffer_mod
 
     def _boom(*a, **k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(comp, "append_archive", _boom)
+    monkeypatch.setattr(buffer_mod, "append_archive", _boom)
     res = compact_conversation(tmp_path, sid, older_than=timedelta(hours=1),
                                fold_existing_summary=True, provider=_StubProvider())
     assert res.compacted is False

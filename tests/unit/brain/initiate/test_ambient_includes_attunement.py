@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from brain.attunement.schemas import SCHEMA_VERSION, CurrentRead
+from brain import dev_constants
+from brain.attunement.schemas import CurrentRead
 from brain.attunement.store import write_current_read
 from brain.chat.prompt import build_system_message
 from brain.engines.daemon_state import DaemonState
@@ -57,7 +58,7 @@ def test_attunement_block_appears_in_assembled_system_message(
             mood_valence=0.3,
             mood_intensity=0.5,
             predicted_arc_shape="settling in",
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
     )
 

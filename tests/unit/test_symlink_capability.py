@@ -37,5 +37,5 @@ def test_requires_symlinks_fixture_skips_when_denied(pytester) -> None:
         "c._symlinks_available = functools.cache(lambda: False)\n"
     )
     pytester.makepyfile("def test_x(requires_symlinks):\n    assert False\n")
-    result = pytester.runpytest("-p", "no:cacheprovider")
+    result = pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly")
     result.assert_outcomes(skipped=1)

@@ -6,12 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from brain import dev_constants
 from brain.narrative_memory.arc import Arc, ArcMember
 from brain.narrative_memory.membership import (
-    MEMBER_EMBEDDING_THRESHOLD,
-    MEMBER_HEBBIAN_THRESHOLD,
-    EmbeddingsView,
-    HebbianView,
     centroid_for,
     is_candidate,
 )
@@ -72,19 +69,10 @@ class FakeMemory:
     id: str
 
 
-def test_module_exports_protocols_and_thresholds():
-    # Public-surface contract — protocol classes and the embedding threshold
-    # are imported above; this test pins them so the import isn't
-    # flagged as unused and the contract stays stable.
-    assert MEMBER_EMBEDDING_THRESHOLD == 0.6
-    assert HebbianView is not None
-    assert EmbeddingsView is not None
-
-
 def test_is_candidate_hebbian_path_above_threshold():
     arc = _arc_with_members(("mem_a", "mem_b"))
     candidate = FakeMemory(id="mem_c")
-    hebbian = FakeHebbian(weights={("mem_c", "mem_b"): MEMBER_HEBBIAN_THRESHOLD})
+    hebbian = FakeHebbian(weights={("mem_c", "mem_b"): dev_constants.MEMBER_HEBBIAN_THRESHOLD})
     embeddings = FakeEmbeddings(vectors={})
     cache: dict[str, np.ndarray] = {}
     result, via = is_candidate(
@@ -97,7 +85,7 @@ def test_is_candidate_hebbian_path_above_threshold():
 def test_is_candidate_hebbian_path_below_threshold():
     arc = _arc_with_members(("mem_a",))
     candidate = FakeMemory(id="mem_c")
-    hebbian = FakeHebbian(weights={("mem_c", "mem_a"): MEMBER_HEBBIAN_THRESHOLD - 0.5})
+    hebbian = FakeHebbian(weights={("mem_c", "mem_a"): dev_constants.MEMBER_HEBBIAN_THRESHOLD - 0.5})
     embeddings = FakeEmbeddings(vectors={})
     cache: dict[str, np.ndarray] = {}
     result, via = is_candidate(

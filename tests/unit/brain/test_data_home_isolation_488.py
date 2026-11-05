@@ -7,25 +7,60 @@ default, the real `~/.local/share/companion-emergence` of whoever ran the suite.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from brain import paths
+from brain import paths, process_identity
 from brain.bridge.server import build_app
+from brain.bridge.state_file import ALIVE, STATE_FILENAME, BridgeState, bridge_liveness
+from brain.state_compat import from_known_fields
 from tests.conftest import REAL_PLATFORM_DIRS, REAL_XDG_CACHE_HOME
 
 
-def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
+def _snapshot(root: Path) -> dict[str, tuple[int, int] | None]:
+    """mtime and size of every file under `root`, plus a key per persona directory (so a new empty one shows). SQLite sidecars inside a
+    persona are skipped: whoever opens its database creates them, so they say nothing about who wrote it (#600)."""
     if not root.exists():
         return {}
-    return {
-        str(p.relative_to(root)): (p.stat().st_mtime_ns, p.stat().st_size)
-        for p in sorted(root.rglob("*"))
-        if p.is_file()
-    }
+    snap: dict[str, tuple[int, int] | None] = {}
+    for p in root.rglob("*"):
+        rel = p.relative_to(root)
+        in_persona = rel.parts[0] == "personas" and len(rel.parts) >= 2
+        if in_persona and len(rel.parts) == 2 and p.is_dir():
+            snap[f"personas/{rel.parts[1]}/"] = None
+            continue
+        if in_persona and p.name.endswith(("-wal", "-shm", "-journal")):
+            continue
+        try:
+            st = p.stat()
+        except FileNotFoundError:  # removed by that persona's supervisor mid-walk
+            continue
+        if p.is_file():
+            snap[rel.as_posix()] = (st.st_mtime_ns, st.st_size)
+    return snap
+
+
+def _live_personas(root: Path) -> set[str]:
+    """Personas whose own supervisor is running now (the installed app on a dev machine, #600): their files are theirs to write.
+    bridge.json is parsed here, not through state_file.read, whose heal of a corrupt file would itself write into the real home."""
+    live = set()
+    for d in (root / "personas").glob("*"):
+        try:
+            state = from_known_fields(BridgeState, json.loads((d / STATE_FILENAME).read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError):
+            continue
+        if bridge_liveness(state, d) == ALIVE:
+            live.add(d.name)
+    return live
+
+
+def _outside(snap: dict[str, tuple[int, int] | None], personas: set[str]) -> dict[str, tuple[int, int] | None]:
+    """`snap` without the files of `personas`; their directory keys stay, so removing one still shows."""
+    return {k: v for k, v in snap.items() if k.endswith("/") or not (k.startswith("personas/") and k.split("/")[1] in personas)}
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -65,15 +100,92 @@ def test_building_the_app_leaves_the_real_data_home_untouched(tmp_path, monkeypa
     monkeypatch.delenv("KINDLED_HOME", raising=False)
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
     real = REAL_PLATFORM_DIRS['user_data_path']
-    before = _snapshot(real)
+    live_before, before = _live_personas(real), _snapshot(real)
     persona = tmp_path / "p"
     persona.mkdir()
     app = build_app(persona_dir=persona, client_origin="tests")
     with TestClient(app):
         pass
-    assert _snapshot(real) == before
+    # #600: a persona whose supervisor was live at either check writes its own files; everything else must be untouched
+    live = live_before | _live_personas(real)
+    assert _outside(_snapshot(real), live) == _outside(before, live)
     # the lifespan did write its tunables file: into the test's own home
     assert (paths.get_home() / "tunables.toml").exists()
+
+
+def _bridge_record(persona_dir: Path, pid_token: str | None) -> None:
+    """A bridge.json for a bridge running as this test process (`pid_token=own_token()`), or a stale one (another token)."""
+    (persona_dir / "bridge.json").write_text(
+        json.dumps({
+            "persona": persona_dir.name, "pid": os.getpid(), "port": 1, "started_at": "2026-11-01T00:00:00+00:00",
+            "stopped_at": None, "shutdown_clean": False, "client_origin": "launchd", "pid_token": pid_token, "identity": "token",
+        }),
+        encoding="utf-8",
+    )
+
+
+def _changed(real: Path, before: dict, live_before: set[str]) -> bool:
+    """What the isolation test asserts: a change outside the personas whose supervisor was live at either check."""
+    live = live_before | _live_personas(real)
+    return _outside(_snapshot(real), live) != _outside(before, live)
+
+
+@pytest.mark.no_base_failure(reason="#600 test infrastructure: it checks this file's own snapshot helpers, not brain code")
+def test_a_live_supervisor_writing_its_own_persona_is_not_a_leak(tmp_path):
+    """#600: the installed app's supervisor writes `personas/<name>/` (and its SQLite sidecars) whenever it likes. That must not read
+    as this test writing into the real home; a new persona directory still must."""
+    real = tmp_path / "home"
+    live = real / "personas" / "live"
+    live.mkdir(parents=True)
+    _bridge_record(live, process_identity.own_token())
+    (live / "hebbian.db").write_bytes(b"a")
+    live_before, before = _live_personas(real), _snapshot(real)
+    assert live_before == {"live"}
+
+    (live / "hebbian.db").write_bytes(b"ab")
+    (live / "hebbian.db-wal").write_bytes(b"")
+    (live / "new_cadence.json").write_text("{}")
+    assert not _changed(real, before, live_before)
+
+    (real / "personas" / "p").mkdir()
+    assert _changed(real, before, live_before)
+
+
+@pytest.mark.no_base_failure(reason="#600 guard: only a live supervisor's own persona is skipped")
+@pytest.mark.parametrize("record", ["none", "stale"])
+def test_a_write_into_a_persona_without_a_live_supervisor_is_a_leak(tmp_path, record):
+    """ToT's review of #617: the first fix skipped every persona's files on every machine. A persona with no bridge.json, or one whose
+    recorded bridge is not running, gets the full comparison."""
+    real = tmp_path / "home"
+    idle = real / "personas" / "idle"
+    idle.mkdir(parents=True)
+    if record == "stale":
+        _bridge_record(idle, "not-this-process")
+    (idle / "memories.db").write_bytes(b"a")
+    live_before, before = _live_personas(real), _snapshot(real)
+    assert live_before == set()
+
+    (idle / "memories.db").write_bytes(b"ab")
+    assert _changed(real, before, live_before)
+
+
+@pytest.mark.no_base_failure(reason="#600 guard: the sidecar filter is limited to persona directories")
+def test_a_sidecar_outside_a_persona_is_a_leak(tmp_path):
+    real = tmp_path / "home"
+    real.mkdir()
+    before = _snapshot(real)
+    (real / "settings.db-wal").write_bytes(b"")
+    assert _changed(real, before, set())
+
+
+@pytest.mark.no_base_failure(reason="#600 guard: the narrower snapshot must still see the #488 leak, which the old one saw too")
+def test_a_top_level_write_is_still_a_leak(tmp_path):
+    real = tmp_path / "home"
+    real.mkdir()
+    (real / "tunables.toml").write_text("x = 1\n")
+    before = _snapshot(real)
+    (real / "tunables.toml").write_text("x = 22\n")
+    assert _changed(real, before, set())
 
 
 def test_the_isolated_dirs_keep_the_appauthor_distinction():

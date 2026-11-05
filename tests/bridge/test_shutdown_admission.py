@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import signal
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +13,7 @@ from fastapi.testclient import TestClient
 from brain.bridge import cli_throttle, shutdown_progress
 from brain.bridge.server import build_app
 from brain.bridge.shutdown import BridgeShutdownController
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -126,7 +126,7 @@ def test_a_turn_admitted_before_the_stop_finishes_its_tool_loop(persona_dir: Pat
         assert c.post("/supervisor/shutdown", json={"reason": "app_restart"}).status_code == 202
         assert "chat reply" in shutdown_progress.registry.snapshot()
         release.set()
-        t.join(30)
+        finish_threads(t)
         assert result["r"].status_code == 200 and result["r"].json()["reply"] == "the rain again"
     assert len(calls) == 2
     buffer = (persona_dir / "active_conversations" / f"{sid}.jsonl").read_text(encoding="utf-8")
@@ -161,23 +161,28 @@ def test_the_stop_neither_drains_sessions_nor_runs_a_close_heartbeat(persona_dir
 def test_the_stop_waits_for_a_running_worker_without_a_time_limit(persona_dir: Path, monkeypatch):
     """C10 (in-process half): the lifespan ends only once every counted task has ended (no 30 s / 180 s cap)."""
     ctrl = _controller(persona_dir)
-    release = threading.Event()
     handle_box: dict = {}
+    registered = threading.Event()  # set once the task is counted and the stop has begun (or the client thread failed)
     exited = threading.Event()
 
     def run_client():
-        with _client(persona_dir, ctrl):
-            handle_box["h"] = shutdown_progress.registry.register("stub task")
-            ctrl.begin_stop("user_stop")
-        exited.set()
+        try:
+            with _client(persona_dir, ctrl):
+                handle_box["h"] = shutdown_progress.registry.register("stub task")
+                ctrl.begin_stop("user_stop")
+                registered.set()
+            exited.set()
+        except BaseException as exc:  # noqa: BLE001 - handed to the main thread, which reports it
+            handle_box["error"] = exc
+            registered.set()
 
     t = threading.Thread(target=run_client, daemon=True)
     t.start()
-    time.sleep(1.0)
-    assert not exited.is_set(), "the lifespan ended while a task was still running"
+    assert registered.wait(30), "the client never reached the point where the task is counted"
+    assert "error" not in handle_box, f"the client thread failed: {handle_box.get('error')!r}"
+    assert not exited.wait(1.0), "the lifespan ended while a task was still running"
     shutdown_progress.registry.unregister(handle_box["h"])
-    release.set()
-    assert exited.wait(30)
+    assert exited.wait(30), f"the lifespan never ended once the task was released (client error: {handle_box.get('error')!r})"
     assert shutdown_progress.registry.sealed
 
 

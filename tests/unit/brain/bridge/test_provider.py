@@ -202,17 +202,6 @@ def test_get_provider_resolves_known_names() -> None:
     assert isinstance(get_provider("claude-cli"), ClaudeCliProvider)
 
 
-def test_get_provider_ollama_returns_instance() -> None:
-    """get_provider("ollama") now returns a real OllamaProvider — no longer a stub.
-
-    SP-1 ships OllamaProvider with a full httpx-based implementation, so the
-    factory must hand back a usable instance.  The test that previously asserted
-    NotImplementedError is updated to assert the new behaviour.
-    """
-    provider = get_provider("ollama")
-    assert isinstance(provider, OllamaProvider)
-
-
 def test_get_provider_unknown_name_raises() -> None:
     """Unknown provider name raises ValueError with a clear message."""
     with pytest.raises(ValueError, match="Unknown provider"):

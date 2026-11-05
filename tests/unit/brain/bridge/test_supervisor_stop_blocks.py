@@ -19,6 +19,7 @@ import brain.bridge.supervisor as supervisor_mod
 from brain.bridge import cli_throttle
 from brain.bridge.events import EventBus
 from brain.paths import cadence_state_path
+from tests.thread_support import finish_threads
 
 # (block, work function name in supervisor.py, cadence file or None when the block has no supervisor-owned cadence)
 _BLOCKS = [
@@ -111,7 +112,7 @@ def test_a_stop_requested_before_a_block_skips_it(tmp_path, monkeypatch, index):
     t.start()
     t.join(timeout=30)
     stop_event.set()
-    t.join(timeout=10)
+    finish_threads(t)
     assert not t.is_alive()
 
     assert name not in called, f"{name} ran after the stop: {called}"

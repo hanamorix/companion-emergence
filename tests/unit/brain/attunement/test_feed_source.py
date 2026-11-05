@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from brain.attunement.schemas import SCHEMA_VERSION, LearnedPattern
+from brain import dev_constants
+from brain.attunement.schemas import LearnedPattern
 from brain.attunement.store import _append_pattern
 from brain.bridge.feed import FeedEntry
 
@@ -26,7 +27,7 @@ def _write_backfill_complete(persona_dir: Path) -> None:
                 "patterns_emitted": 5,
                 "status": "complete",
                 "last_cursor": "window-19",
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": dev_constants.ATTUNEMENT_SCHEMA_VERSION,
             }
         )
     )
@@ -56,7 +57,7 @@ def test_feed_source_skips_when_backfill_not_complete(tmp_path: Path) -> None:
                 "patterns_emitted": 1,
                 "status": "running",
                 "last_cursor": "window-4",
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": dev_constants.ATTUNEMENT_SCHEMA_VERSION,
             }
         )
     )
@@ -83,7 +84,7 @@ def test_feed_source_emits_crystallisation_for_known_patterns(tmp_path: Path) ->
             crystallised_at="2026-05-30T12:00:00Z",
             falsified_at=None,
             examples=[],
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
     )
     entries = build_attunement_entries(tmp_path)
@@ -110,7 +111,7 @@ def test_feed_source_skips_uncrystallised_patterns(tmp_path: Path) -> None:
             crystallised_at=None,
             falsified_at=None,
             examples=[],
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
     )
     entries = build_attunement_entries(tmp_path)
@@ -136,7 +137,7 @@ def test_feed_entries_are_feed_entry_instances(tmp_path: Path) -> None:
             crystallised_at="2026-05-30T12:00:00Z",
             falsified_at=None,
             examples=[],
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
     )
     entries = build_attunement_entries(tmp_path)
@@ -173,7 +174,7 @@ def test_crystal_entry_ts_matches_crystallised_at(tmp_path: Path) -> None:
             crystallised_at="2026-05-30T12:00:00Z",
             falsified_at=None,
             examples=[],
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
     )
     entries = build_attunement_entries(tmp_path)
@@ -217,7 +218,7 @@ def test_multiple_crystallised_patterns_each_get_entry(tmp_path: Path) -> None:
                 crystallised_at=f"2026-05-30T1{i}:00:00Z",
                 falsified_at=None,
                 examples=[],
-                schema_version=SCHEMA_VERSION,
+                schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
             ),
         )
     entries = build_attunement_entries(tmp_path)

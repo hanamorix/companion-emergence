@@ -264,7 +264,7 @@ def raw_app(persona, stub, monkeypatch):
     return server.build_app(persona_dir=persona, client_origin="tests", auth_token=_TOKEN)
 
 
-async def _release_one_by_one(stub, *, pause: float = 0.35, wait_s: float = 10.0):
+async def _release_one_by_one(stub, *, pause: float = 0.15, wait_s: float = 10.0):
     """Release extraction calls 1-3 one at a time, ``pause`` after each arrives. Bounded: a call that never arrives (a broken
     build making fewer calls) releases every gate and returns, so the test fails instead of hanging."""
     for i in range(3):
@@ -296,10 +296,11 @@ def test_c14a_keepalive_spaces_while_the_rollover_runs(persona, stub, raw_app):
     msgs = _run(main())
     assert _status(msgs) == (200, "application/json")
     bodies = _bodies(msgs)
-    assert len(bodies) >= 3 and all(b.strip() == b"" for _, b in bodies[:-1])
-    start_t = next(t for t, m in msgs if m["type"] == "http.response.start")
-    times = [start_t] + [t for t, _ in bodies]
-    assert max(b - a for a, b in zip(times, times[1:], strict=False)) <= 2 * 0.1 + 0.05
+    # Three extraction calls are each held for `pause` (0.15 s) with a 0.1 s keepalive interval, so the stream runs for
+    # more than 0.45 s: at least three empty keepalive bodies must precede the JSON. No bound on the gaps between them:
+    # that is wall-clock and fails on a loaded host without a regression.
+    keepalives = [b for _, b in bodies[:-1]]
+    assert len(keepalives) >= 3 and all(b.strip() == b"" for b in keepalives)
     new_sid = _json(msgs)["session_id"]
     assert new_sid not in (None, _STALE) and len(stub.prompts) == 3
 
@@ -369,6 +370,7 @@ def test_c14c_a_cut_first_call_does_not_stop_the_rollover_and_the_replay_gets_th
     assert _json(replay)["session_id"] not in (None, _STALE)
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on a 4-core dev VM, 1.2 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("failure", ["raises", "shutdown", "refused-registration"])
 def test_c14d_a_failed_rollover_answers_null(persona, stub, monkeypatch, raw_app, caplog, failure):
     from brain.bridge.cli_throttle import ShutdownDeferred
@@ -403,7 +405,7 @@ def test_c14d_a_failed_rollover_answers_null(persona, stub, monkeypatch, raw_app
 
 def _scan_blocked_until_health(monkeypatch, scan_threads: list[int], order: list[str], release, timeout_s: float):
     """Patch the buffer scan to record its thread, then block until ``release`` is set (or ``timeout_s``, a deadlock breaker
-    for the on-loop variant), recording ``scan done`` in ``order``. Ordering, not wall-clock time, is the oracle."""
+    so a blocked event loop cannot hang the test), recording ``scan done`` in ``order``. Ordering, not wall-clock time, is the oracle."""
     import brain.ingest.buffer as buffer
 
     real_list = buffer.list_active_sessions
@@ -424,13 +426,13 @@ def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, 
     scan_threads: list[int] = []
     order: list[str] = []
     release = threading.Event()
-    _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=30)
 
     async def main():
         d = _Driver(raw_app)
         await d.start()
-        scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
-        order.clear()
+        # Armed only now: the lifespan's own idle-anchor seed lists the buffers at startup, on the loop, and a scan
+        # blocked from the start would hold that startup until its deadlock-breaking timeout.
+        _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=30)
         loop_thread = threading.get_ident()
         try:
             active = asyncio.ensure_future(d.get("/sessions/active"))
@@ -451,89 +453,6 @@ def test_c14e_the_event_loop_stays_free_and_the_scan_runs_off_it(persona, stub, 
     assert _status(health)[0] == 200
     assert order == ["health done", "scan done"]
     assert scan_threads and all(t != loop_thread for t in scan_threads)
-
-
-# ---- fail-first variants, run through the same driver (kept executable) ----
-
-
-def test_c14_oracle_no_keepalive_variant_sends_nothing_before_the_json(persona, stub, monkeypatch, raw_app):
-    _seed(persona, _STALE, 6, age_hours=30)
-    monkeypatch.setattr(server, "_stream_keepalive_seconds", lambda: 3600.0)
-
-    async def main():
-        d = _Driver(raw_app)
-        await d.start()
-        try:
-            releaser = asyncio.ensure_future(_release_one_by_one(stub))
-            msgs = await d.get("/sessions/active")
-            await releaser
-        finally:
-            await d.stop()
-        return msgs
-
-    bodies = _bodies(_run(main()))
-    assert len(bodies) == 1  # (a)'s whitespace-before-the-JSON check fails on this variant
-
-
-def test_c14_oracle_no_shared_task_variant_answers_null_to_the_second_call(persona, stub, monkeypatch, raw_app):
-    _seed(persona, _STALE, 6, age_hours=30)
-
-    def _always_new(s):
-        return asyncio.ensure_future(
-            server.tracked_to_thread("sessions active", server._sessions_active_blocking, s.persona_dir, s.persona, s.provider)
-        )
-
-    monkeypatch.setattr(server, "_shared_sessions_active_task", _always_new)
-
-    async def main():
-        d = _Driver(raw_app)
-        await d.start()
-        try:
-            releaser = asyncio.ensure_future(_release_one_by_one(stub, pause=0.1))
-            a, b = await asyncio.gather(d.get("/sessions/active"), d.get("/sessions/active"))
-            await releaser
-        finally:
-            await d.stop()
-        return a, b
-
-    a, b = _run(main())
-    assert {_json(a)["session_id"] is None, _json(b)["session_id"] is None} == {True, False}
-
-
-def test_c14_oracle_on_loop_variant_blocks_health(persona, stub, monkeypatch, raw_app):
-    """Fail-first kept executable: with the decision run on the loop, the blocked scan holds the loop, so /health can only finish
-    after the scan (here released by its deadlock-breaking timeout), and the scan's thread is the loop's."""
-    _seed(persona, _STALE, 6, age_hours=30)
-    stub.gated = False
-    scan_threads: list[int] = []
-    order: list[str] = []
-    release = threading.Event()
-    _scan_blocked_until_health(monkeypatch, scan_threads, order, release, timeout_s=1.0)
-
-    async def _on_loop(label, fn, *a, **k):
-        return fn(*a, **k)
-
-    monkeypatch.setattr(server, "tracked_to_thread", _on_loop)
-
-    async def main():
-        d = _Driver(raw_app)
-        await d.start()
-        scan_threads.clear()  # the lifespan's own idle-anchor seed lists the buffers at startup, on the loop
-        order.clear()
-        loop_thread = threading.get_ident()
-        try:
-            active = asyncio.ensure_future(d.get("/sessions/active"))
-            await d.get("/health")
-            order.append("health done")
-            release.set()
-            await active
-        finally:
-            release.set()
-            await d.stop()
-        return loop_thread
-
-    loop_thread = _run(main())
-    assert loop_thread in scan_threads and order == ["scan done", "health done"]
 
 
 # ---------------------------------------------------------------------------

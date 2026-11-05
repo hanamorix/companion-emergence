@@ -18,6 +18,7 @@ from brain.bridge.model_tier import MODEL_EMBEDDING_DIM
 from brain.memory.embedding_matrix import EmbeddingMatrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads, release_at_teardown
 
 # F1 #259 increment 7: derived from the model_tier.py constant rather than a
 # literal — a future multilingual embedding model swap (different dim) must
@@ -325,7 +326,7 @@ def test_rebuild_without_model_id_keeps_current_model_id(seeded_db) -> None:
 
 
 def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
-    seeded_db, monkeypatch
+    seeded_db, monkeypatch, request
 ) -> None:
     """The slow DB scan must happen BEFORE the lock is taken — assert the
     matrix still serves the OLD full snapshot while a rebuild's (stubbed
@@ -340,12 +341,16 @@ def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
 
     def slow_load(*args, **kwargs):
         started.set()
+        # Bounded on purpose: a rebuild that held the matrix lock across this scan would block the test's own
+        # snapshot()/put() below, and only the test thread opens this gate. Expiry lets the rebuild go on, so that
+        # regression ends as the assert on the reader's wait instead of a hang.
         release.wait(timeout=5)
         return real_load(*args, **kwargs)
 
     monkeypatch.setattr(matrix, "_load_from_db", slow_load)
 
     rebuild_thread = threading.Thread(target=matrix.rebuild)
+    release_at_teardown(request, release, [rebuild_thread])
     rebuild_thread.start()
     assert started.wait(timeout=5)
 
@@ -358,7 +363,7 @@ def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
     assert set(snap_during.keys()) == old_keys
 
     release.set()
-    rebuild_thread.join(timeout=5)
+    finish_threads(rebuild_thread)
     assert not rebuild_thread.is_alive()
 
 
@@ -372,7 +377,7 @@ def test_rebuild_is_a_reference_swap_readers_never_see_a_half_built_dict(
 # ---------------------------------------------------------------------------
 
 
-def test_rebuild_reconciles_concurrent_put_and_evict(coherence_db, monkeypatch) -> None:
+def test_rebuild_reconciles_concurrent_put_and_evict(coherence_db, monkeypatch, request) -> None:
     """DETERMINISTIC coherence proof (fails on the pre-fix wholesale-swap).
 
     A rebuild's slow DB scan is pinned mid-flight (its off-lock window held
@@ -399,12 +404,16 @@ def test_rebuild_reconciles_concurrent_put_and_evict(coherence_db, monkeypatch) 
 
     def slow_load(*args, **kwargs):
         started.set()
+        # Bounded on purpose: a rebuild that held the matrix lock across this scan would block the test's own
+        # snapshot()/put() below, and only the test thread opens this gate. Expiry lets the rebuild go on, so that
+        # regression ends as the assert on the reader's wait instead of a hang.
         release.wait(timeout=5)
         return real_load(*args, **kwargs)
 
     monkeypatch.setattr(matrix, "_load_from_db", slow_load)
 
     rebuild_thread = threading.Thread(target=matrix.rebuild)
+    release_at_teardown(request, release, [rebuild_thread])
     rebuild_thread.start()
     # The rebuild has entered its off-lock scan; the pending overlay is now
     # recording. Land the mutations INSIDE this window.
@@ -415,7 +424,7 @@ def test_rebuild_reconciles_concurrent_put_and_evict(coherence_db, monkeypatch) 
     matrix.evict("mem-co-1")
 
     release.set()
-    rebuild_thread.join(timeout=5)
+    finish_threads(rebuild_thread)
     assert not rebuild_thread.is_alive()
 
     # Lost-update guard: the concurrent put must WIN over the stale reload.
@@ -523,12 +532,12 @@ def test_concurrent_reads_survive_writer_puts_and_rebuild(coherence_db) -> None:
     for t in cosine_reader_threads:
         t.start()
     writer_thread.start()
-    writer_thread.join(timeout=30)
+    finish_threads(writer_thread)
     stop.set()
     for t in reader_threads:
-        t.join(timeout=5)
+        finish_threads(t)
     for t in cosine_reader_threads:
-        t.join(timeout=5)
+        finish_threads(t)
 
     assert not writer_thread.is_alive()
     assert not any(t.is_alive() for t in reader_threads)

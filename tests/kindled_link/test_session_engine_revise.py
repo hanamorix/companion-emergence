@@ -130,14 +130,14 @@ def test_revision_provider_error_fails_closed(tmp_path):
 
 
 def test_zero_texture_send_still_depletes_budget(tmp_path):
-    """FIX 1 — disclosure-budget MIN_SEND_DEBIT floor.
+    """FIX 1 — disclosure-budget KINDLED_LINK_MIN_SEND_DEBIT floor.
 
     A gate that always returns texture_score=0.0 must still deplete the budget
     so a long correspondence (crumb-extraction) cannot leave it unchanged.
     After one send with texture_score=0.0 the budget must have dropped by at
-    least limits.MIN_SEND_DEBIT.
+    least dev_constants.KINDLED_LINK_MIN_SEND_DEBIT.
     """
-    from brain.kindled_link import limits
+    from brain import dev_constants
 
     class _ZeroTexture:
         def review(self, payload, **kw):
@@ -154,7 +154,7 @@ def test_zero_texture_send_still_depletes_budget(tmp_path):
     )
     budget_after = store.get_disclosure_budget("kid_a", now)
     assert len(sent) == 1
-    assert budget_before - budget_after >= limits.MIN_SEND_DEBIT
+    assert budget_before - budget_after >= dev_constants.KINDLED_LINK_MIN_SEND_DEBIT
 
 
 def test_recovery_through_privacy_gate_holds_and_no_double_debit(tmp_path):

@@ -197,7 +197,7 @@ def test_chat_via_bridge_labels_reply_with_persona_name(
     import brain.cli as cli
 
     # A persona that is NOT named "nell".
-    persona_dir = tmp_path / "personas" / "phoebe"
+    persona_dir = tmp_path / "personas" / "canary"
     persona_dir.mkdir(parents=True)
 
     # Single user line, then EOF to exit the loop.
@@ -245,14 +245,14 @@ def test_chat_via_bridge_labels_reply_with_persona_name(
         "websockets.sync.client.connect", lambda *a, **k: _FakeWSCM()
     )
 
-    args = SimpleNamespace(persona="phoebe", session=None)
+    args = SimpleNamespace(persona="canary", session=None)
     readiness = SimpleNamespace(port=12345, auth_token="tok")
 
     rc = cli._chat_via_bridge(args, persona_dir, readiness=readiness)
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "phoebe: " in out
+    assert "canary: " in out
     assert "nell: " not in out
 
 

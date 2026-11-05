@@ -25,6 +25,8 @@ from pathlib import Path
 
 from brain.utils.atomic_write import save_blob_once
 
+# The four kinds `sniff_media_type` can recognise and `_MEDIA_TYPE_TO_EXT` can store. Not the `files.image_types`
+# setting, which says which images the read_file tool opens and can only narrow this set.
 _ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _MEDIA_TYPE_TO_EXT = {
     "image/png": "png",

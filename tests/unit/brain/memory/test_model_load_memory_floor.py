@@ -10,7 +10,6 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -613,24 +612,3 @@ def test_a_host_between_the_file_size_and_twice_it_never_loads_the_model(store, 
     assert _MODEL in reranker_mod._ram_figure_needed  # noqa: SLF001
     assert reranker_mod.ram_figure_due("m2", lambda: _open(store)) is True, "retried at the next lull"
     assert reranker_mod.run_ram_figure("m2", store) is False and built == []
-
-
-# ---- text ----
-
-
-def _flat(obj) -> str:
-    return re.sub(r"\s+", " ", inspect.getdoc(obj) or "")
-
-
-def test_the_docstrings_state_the_s253_floor() -> None:
-    ladder = _flat(reranker_mod.measure_ram_figure)
-    assert "S253" in ladder and "kept fit's one-pair prediction" in ladder and "model file's size" in ladder
-    assert "held to a positive headroom only" not in ladder
-    run = _flat(reranker_mod.run_ram_figure)
-    assert "S253" in run and "S257" in run and "model file's size" in run and "first rung" in run
-    stop = _flat(reranker_mod._ladder_headroom_stop)  # noqa: SLF001
-    assert "S253" in stop and "the first rung, the model load, the warm-up" not in stop
-    assert "S253" in _flat(floor_startup.run_rerank_floor) and "model file's size" in _flat(floor_startup.run_rerank_floor)
-    assert "S257" in _flat(reranker_mod.model_load_blocked_by_memory)
-    assert "first-rung bound" in _flat(reranker_mod.model_load_blocked_by_memory)
-    assert "S257" in _flat(floor_startup.run_rerank_floor)

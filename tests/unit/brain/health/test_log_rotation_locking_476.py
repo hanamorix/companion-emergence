@@ -23,6 +23,7 @@ import pytest
 
 import brain.health.log_rotation as lr
 from brain.health.json_io import append_jsonl
+from tests.thread_support import finish_threads
 
 
 def _row(i, **extra):
@@ -70,7 +71,7 @@ def test_a_row_appended_during_a_rolling_rotation_is_not_lost(tmp_path, monkeypa
     threads = _appender_started_inside(monkeypatch, lr.shutil, "copyfileobj", log, _row("late"))
     lr.rotate_rolling_size(log, max_bytes=10_000, archive_keep=3)
     for t in threads:
-        t.join(timeout=5)
+        finish_threads(t)
     everywhere = _read_gz(tmp_path / "chat_usage.jsonl.1.gz") + (_rows(log) if log.exists() else [])
     assert any(r["i"] == "late" for r in everywhere)
 
@@ -128,7 +129,7 @@ def test_a_row_appended_during_a_yearly_rotation_is_not_lost(tmp_path, monkeypat
     monkeypatch.setattr(lr, "iter_jsonl_raw", iter_then_append)
     lr.rotate_age_archive_yearly(log, now=NOW, timestamp_field="ts")
     for t in started:
-        t.join(timeout=5)
+        finish_threads(t)
     assert [r["i"] for r in _rows(log)] == [2, "late"]
     assert [r["i"] for r in _read_gz(tmp_path / "soul_audit.2025.jsonl.gz")] == [1]
 

@@ -40,6 +40,7 @@ from brain.tools.impls.remove_known_name import remove_known_name
 from brain.tools.impls.save_work import save_work
 from brain.tools.impls.search_memories import search_memories
 from brain.tools.impls.search_works import search_works
+from brain.tools.naming import TOOL_PREFIX_SLOT
 from brain.tools.schemas import ADD_NAME_TOOL_NAME, REMOVE_NAME_TOOL_NAME, SCHEMAS
 
 log = logging.getLogger(__name__)
@@ -101,7 +102,7 @@ def _list_open_arcs_wrapper(*, store, hebbian, persona_dir, **_):
 
 def _recall_arc_wrapper(*, store, hebbian, persona_dir, query="", **_):
     if not isinstance(query, str):
-        raise ToolDispatchError("recall_arc: 'query' must be a string")
+        raise ToolDispatchError(f"{TOOL_PREFIX_SLOT}recall_arc: 'query' must be a string")
     return _recall_arc_impl(query=query, persona_dir=persona_dir)
 
 
@@ -291,7 +292,7 @@ def dispatch(
     if name == "add_memory" and "emotions" in arguments:
         if not isinstance(arguments["emotions"], dict):
             raise ToolDispatchError(
-                f"tool 'add_memory' arg 'emotions' must be a dict, "
+                f"tool '{TOOL_PREFIX_SLOT}add_memory' arg 'emotions' must be a dict, "
                 f"got {type(arguments['emotions']).__name__!r}"
             )
 
@@ -301,7 +302,7 @@ def dispatch(
                 session_hours_float = float(arguments["session_hours"])
             except (TypeError, ValueError) as exc:
                 raise ToolDispatchError(
-                    f"tool 'get_body_state' arg 'session_hours' must be a number, "
+                    f"tool '{TOOL_PREFIX_SLOT}get_body_state' arg 'session_hours' must be a number, "
                     f"got {type(arguments['session_hours']).__name__!r}"
                 ) from exc
             # M-4: don't mutate the caller's dict — shallow-copy then update.

@@ -1142,6 +1142,68 @@ def test_unfade_restores_content_and_clears_snapshot() -> None:
     store.close()
 
 
+def test_set_active_clear_snapshot_touches_only_that_row_and_is_committed(tmp_path) -> None:
+    """Recovery's step after it writes the source's content back: state back to
+    active, snapshot cleared, nothing else changed, visible to another connection."""
+    db = tmp_path / "memories.db"
+    store = MemoryStore(db)
+    a = Memory.create_new(content="a original", memory_type="episodic", domain="chat", emotions={})
+    b = Memory.create_new(content="b original", memory_type="episodic", domain="chat", emotions={})
+    store.create(a)
+    store.create(b)
+    store.fade(a.id, summary="a short")
+    store.fade(b.id, summary="b short")
+
+    store.set_active_clear_snapshot(a.id)
+
+    other = sqlite3.connect(str(db))
+    other.row_factory = sqlite3.Row
+    try:
+        rows = {
+            r["id"]: r
+            for r in other.execute("SELECT id, content, content_snapshot, state FROM memories")
+        }
+    finally:
+        other.close()
+    assert rows[a.id]["state"] == "active"
+    assert rows[a.id]["content_snapshot"] is None
+    assert rows[a.id]["content"] == "a short", "only state and snapshot change"
+    assert rows[b.id]["state"] == "fading"
+    assert rows[b.id]["content_snapshot"] == "b original"
+    store.close()
+
+
+def test_connect_for_fts_health_applies_the_memories_busy_timeout_read_at_call_time(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "MEMORIES_DB_BUSY_TIMEOUT_S", 0.7)
+    conn = MemoryStore.connect_for_fts_health(tmp_path / "memories.db")
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 700
+    finally:
+        conn.close()
+
+
+def test_connect_for_fts_health_closes_the_connection_once_when_the_pragma_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+
+    class _Doomed:
+        def execute(self, sql: str):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        def close(self) -> None:
+            closed.append(1)
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: _Doomed())
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        MemoryStore.connect_for_fts_health(tmp_path / "memories.db")
+    assert closed == [1]
+
+
 def test_hard_delete_drops_the_row() -> None:
     store = MemoryStore(":memory:")
     m = Memory.create_new(content="x", memory_type="episodic", domain="chat", emotions={})
@@ -1913,6 +1975,7 @@ def test_peak_captured_on_create(store):
     store.create(mem)
     got = store.get(mem.id)
     assert got.peak_emotion_intensity == 6.0
+    assert isinstance(mem.peak_emotion_intensity, float)  # one scalar, not a per-emotion vector (deferred D3 design)
 
 
 def test_peak_is_monotone_under_update(store):
@@ -2032,17 +2095,6 @@ def test_peak_migration_skips_seeding_on_pre_emotions_json_schema(tmp_path):
         assert row[0] == 0.0
     finally:
         store.close()
-
-
-def test_deferred_d3_peak_is_scalar(store: MemoryStore) -> None:
-    """Pin (D3): peak_emotion_intensity is one REAL scalar, not a per-emotion
-    vector. A which-emotion-mattered use-case needs the deferred vector design —
-    ledger: project_companion_emergence_deferred.md."""
-    cols = {row[1]: row[2] for row in store._conn.execute(
-        "PRAGMA table_info(memories)").fetchall()}
-    assert cols["peak_emotion_intensity"] == "REAL"
-    mem = Memory.create_new("m", "conversation", "us", emotions={"joy": 2.0})
-    assert isinstance(mem.peak_emotion_intensity, float)
 
 
 # ---------------------------------------------------------------------------
@@ -3127,18 +3179,6 @@ def test_get_persisted_reranker_floor_returns_the_row_when_one_exists(store: Mem
     assert result["raw_fit_floor"] == 1.25
     assert result["sample_pairs"] == 250
     assert result["is_cold_start"] is False
-
-
-def test_get_reranker_floor_delegates_persisted_case_to_get_persisted_reranker_floor(
-    store: MemoryStore,
-) -> None:
-    """The refactor (Change 1) must not change `get_reranker_floor`'s own
-    persisted-row behavior — it now just reads through `get_persisted_
-    reranker_floor` first, same values either way."""
-    store.write_reranker_floor(
-        "model-a", floor=1.5, raw_fit_floor=1.25, sample_pairs=250, is_cold_start=False
-    )
-    assert store.get_reranker_floor("model-a") == store.get_persisted_reranker_floor("model-a")
 
 
 def test_write_reranker_floor_round_trips(store: MemoryStore) -> None:

@@ -24,6 +24,7 @@ from brain.memory import reranker as reranker_mod
 from brain.memory.reranker import RerankerProvider
 from brain.memory.semantic_recall import COSINE_PATH, RERANKED_PATH, run_semantic_recall
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads, release_at_teardown, wait_at_gate
 from tests.unit.brain.memory._ram_support import ScriptedLadderProvider, seed_window
 from tests.unit.brain.memory.test_monologue_last import (
     _RERANKER_ID,
@@ -366,7 +367,7 @@ def _store_factory(store: MemoryStore):
 
 
 def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_on_a_background_thread(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _background_on: None, request: pytest.FixtureRequest
 ) -> None:
     """S210: the flagged turn starts nothing; the thread starts only when the REPL calls
     `start_requested_ram_figure` after the reply."""
@@ -378,10 +379,13 @@ def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_o
     floor_startup.enable_background_ram_figure(tmp_path)
     ran: list[tuple[str, object]] = []
     gate = threading.Event()
+    owner = threading.current_thread()
+    started: list = []
+    release_at_teardown(request, gate, started)
 
     def _run(marker, st, **_kw):
         ran.append((threading.current_thread().name, st.db_path))
-        gate.wait(10)
+        wait_at_gate(gate, owner)
         seed_window(st, _RERANKER_ID)
         return True
 
@@ -395,11 +399,12 @@ def test_s201_with_no_figure_and_a_registered_direct_chat_the_measurement_runs_o
     assert reranker_mod._ram_figure_needed == {_RERANKER_ID}
 
     thread = floor_startup.start_requested_ram_figure()  # the REPL, after the reply is printed
+    started.append(thread)
     assert thread is not None
     assert floor_startup.inflight("ram-figure"), "the measurement is in flight in the background"
     assert floor_startup.start_requested_ram_figure() is None, "the recorded need was consumed"
     gate.set()
-    thread.join(timeout=10)
+    finish_threads(thread)
     assert [name for name, _ in ran] == ["ram-figure-measure"], "one thread, not the calling one"
     assert ran[0][1] == store.db_path, "on the persona's own database (a store of its own)"
     assert not floor_startup.inflight("ram-figure")
@@ -541,7 +546,7 @@ def test_s201_a_failing_measurement_is_logged_not_raised_and_frees_the_slot(
     with caplog.at_level("ERROR"):
         thread = floor_startup.start_requested_ram_figure()
         assert thread is not None
-        thread.join(timeout=10)
+        finish_threads(thread)
     assert not floor_startup.inflight("ram-figure")
     assert any("ram-figure bootstrap raised" in r.getMessage() for r in caplog.records), "logged, not raised"
     assert closed, "the thread's own store was closed even though the measurement raised"

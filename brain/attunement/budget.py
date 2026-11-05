@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from brain.attunement.schemas import DAILY_BUDGET_DEFAULT
+from brain import dev_constants
 from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
 from brain.utils.file_lock import file_lock
 
@@ -74,8 +74,10 @@ def lock(persona_dir: Path) -> Iterator[None]:
 
 
 def get_remaining(
-    persona_dir: Path, *, now: datetime, cap: int = DAILY_BUDGET_DEFAULT
+    persona_dir: Path, *, now: datetime, cap: int | None = None
 ) -> int:
+    if cap is None:
+        cap = dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT
     try:
         state = _load(persona_dir)
     except _BudgetCorruptError:
@@ -87,9 +89,11 @@ def get_remaining(
 
 
 def consume_call(
-    persona_dir: Path, *, now: datetime, cap: int = DAILY_BUDGET_DEFAULT
+    persona_dir: Path, *, now: datetime, cap: int | None = None
 ) -> bool:
     """Return True if call permitted (and decrements counter); False if cap reached."""
+    if cap is None:
+        cap = dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT
     # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
     # pass2_queue.py's drain_all_locked pop-after-process step) can call
     # this twice for one logical item, consuming one extra daily-budget

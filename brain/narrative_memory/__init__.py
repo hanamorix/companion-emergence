@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from brain import dev_constants
 from brain.narrative_memory.arc import Arc, ArcMember
 from brain.narrative_memory.membership import (
     EmbeddingsView,
@@ -29,7 +30,6 @@ from brain.narrative_memory.membership import (
     is_candidate,
 )
 from brain.narrative_memory.policy import (
-    MAX_ARC_MEMBERS,
     should_close,
     should_open,
 )
@@ -279,11 +279,11 @@ def run_pass(
 
     # --- Member-cap enforcement ---
     for arc_id, arc in list(state.open.items()):
-        if len(arc.members) <= MAX_ARC_MEMBERS:
+        if len(arc.members) <= dev_constants.MAX_ARC_MEMBERS:
             continue
         # Sort by salience ascending; drop lowest until at cap
         sorted_members = sorted(arc.members, key=lambda m: m.salience_at_join)
-        evictions = len(arc.members) - MAX_ARC_MEMBERS
+        evictions = len(arc.members) - dev_constants.MAX_ARC_MEMBERS
         evicted = sorted_members[:evictions]
         kept = sorted(sorted_members[evictions:], key=lambda m: m.joined_at_iso)
         for ev in evicted:
@@ -487,7 +487,7 @@ def _compute_arc_close_emotion_inputs(
         emotion_norm = float(inputs.get("emotion") or 0.0)
         # Reconstruct the original 0-10 emotion at the same scale as a live lookup.
         # Spec §3 caller responsibility: no salience factor — salience_at_drop is
-        # near zero by definition (LOST_THRESHOLD = 0.10 in forgetting/policy.py),
+        # near zero by definition (LOST_THRESHOLD = 0.10 in dev_constants.py),
         # so multiplying suppressed grief for fully-forgotten arcs.
         proxy = emotion_norm * 10.0
         if proxy > best_emotion_value:

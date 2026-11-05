@@ -46,8 +46,9 @@ def test_self_test_leaves_no_residue_in_real_store(tmp_path: Path):
             store.close()
 
 
-def test_self_test_reports_relay_unreachable(tmp_path: Path):
+def test_self_test_reports_relay_unreachable(tmp_path: Path, monkeypatch):
     """A dead relay → relay_reachable ❌, run ok False, later stages short-circuit."""
+    monkeypatch.setattr("brain.kindled_link.relay_client._BACKOFF_BASE_S", 0.0)  # the retry pauses are not under test
     KindledIdentity.load_or_create(tmp_path)
     # A client pointed at a closed port-like transport that errors on every call.
     transport = httpx.MockTransport(lambda req: (_ for _ in ()).throw(httpx.ConnectError("boom")))

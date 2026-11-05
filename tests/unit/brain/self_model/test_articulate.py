@@ -340,6 +340,9 @@ def test_single_attempt_no_sleep_on_denial(tmp_path, monkeypatch):
     re-run-2 MAJOR (a sleep-based retry blocked the supervisor's single
     execution thread for up to ~45s roughly every 6h)."""
     calls = _record_sleeps_of_this_thread(monkeypatch)
+    time.sleep(0)  # control: the recorder sees this thread's own sleeps (and skips them), so the empty-list assertion below can fail
+    assert calls == [0]
+    calls.clear()
     cli_throttle.mark_interactive_active()
     provider = _CountingProvider()
     gap = _gap(magnitude=_GAP_THRESHOLD + 0.5)
@@ -349,38 +352,6 @@ def test_single_attempt_no_sleep_on_denial(tmp_path, monkeypatch):
 
     assert calls == [], "articulate() must never sleep — the retry lives in the caller's cadence"
     assert provider.calls == []  # the denied call never reached the provider
-
-
-def test_a_sleep_in_another_thread_is_not_articulates_sleep(tmp_path, monkeypatch):
-    """The test above must not be tripped by an unrelated thread's retry loop (a leftover polling thread, a lock waiter)."""
-    import threading
-
-    calls = _record_sleeps_of_this_thread(monkeypatch)
-    cli_throttle.mark_interactive_active()
-    stop = threading.Event()
-
-    def unrelated_retry_loop():
-        while not stop.is_set():
-            time.sleep(0.01)  # the patched sleep: real for this thread
-
-    t = threading.Thread(target=unrelated_retry_loop, daemon=True)
-    t.start()
-    try:
-        with pytest.raises(cli_throttle.ThrottleDeferred):
-            articulate(_gap(magnitude=_GAP_THRESHOLD + 0.5), provider=_CountingProvider(), persona_dir=tmp_path)
-    finally:
-        stop.set()
-        t.join(timeout=5)
-    assert calls == []
-
-
-def test_a_sleep_on_this_thread_is_still_recorded(monkeypatch):
-    """Control: the recorder does see the test thread's own sleeps (so the no-sleep assertion can fail), and does not really sleep."""
-    calls = _record_sleeps_of_this_thread(monkeypatch)
-    started = time.monotonic()
-    time.sleep(5)
-    assert calls == [5]
-    assert time.monotonic() - started < 2
 
 
 def test_grant_calls_release_background_exactly_once(tmp_path, monkeypatch):

@@ -20,6 +20,7 @@ import io
 import pytest
 
 from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED
+from tests.thread_support import finish_threads
 
 
 def test_builtin_disallow_list_covers_the_costly_tools():
@@ -313,7 +314,7 @@ def test_probe_is_thread_safe(monkeypatch):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5)
+        finish_threads(t)
     assert results == [True] * 8
     assert calls == [["claude", "--help"]]
 

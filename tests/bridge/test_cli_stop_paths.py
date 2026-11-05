@@ -163,6 +163,8 @@ def test_a_proven_pre_pr_bridge_is_asked_then_killed_with_its_tree(pd, tmp_path,
             time.sleep(0.05)
         child = int((pd / "stub-child").read_text())
         assert state_file.is_legacy(state_file.read(pd))
+        # The request is asked for, ignored by the old runner, then waited on for this budget (3 s in production).
+        monkeypatch.setattr(daemon, "_PRE_PR_REQUEST_BUDGET_S", 0.5)
         asked: list = []
         real_post = daemon._request_shutdown_via_http
         monkeypatch.setattr(daemon, "_request_shutdown_via_http", lambda s, **k: asked.append(1) or real_post(s, **k))

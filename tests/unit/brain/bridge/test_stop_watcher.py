@@ -24,6 +24,7 @@ class Clock:
     def __init__(self, start: float = T0):
         self.t = start
         self.events: list[tuple[float, object]] = []
+        self._threads_at_start = set(threading.enumerate())
 
     def now(self) -> float:
         return self.t
@@ -37,7 +38,11 @@ class Clock:
         self.events = [e for e in self.events if e[0] > self.t]
         for _, fn in due:
             fn()
-        time.sleep(0.001)  # let the prompt thread run
+        if any(t not in self._threads_at_start for t in threading.enumerate()):
+            # A thread has started since the clock was created (the watcher's prompt thread): let it run. A sleep
+            # on every one of the thousands of ticks (the real poll is 0.2 s of fake time) cost over 20 s on macOS,
+            # where a 1 ms sleep takes about 10 ms.
+            time.sleep(0.001)
 
 
 class Bridge:

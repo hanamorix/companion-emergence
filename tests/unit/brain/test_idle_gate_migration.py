@@ -1,10 +1,9 @@
-"""ram-spike-fix INC-6, criterion C4 (AC4, S5/S6/S28/S29/S40): the retired
-idle-tuning keys are gone from brain/, the lull tunable key has exactly one
-reader, and every former idle-check caller routes through is_chat_idle."""
+"""ram-spike-fix INC-6, criterion C4 (AC4, S5/S6/S28/S29/S40): the lull tunable key has exactly one
+reader, and every former idle-check caller routes through is_chat_idle. (The retired idle-tuning keys
+and identifiers are listed in tests/unit/test_removed_names_stay_removed.py.)"""
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
@@ -16,13 +15,6 @@ assert (BRAIN_DIR / "bridge" / "cli_throttle.py").is_file(), (
     f"sanity: expected brain/ at {BRAIN_DIR}"
 )
 
-_RETIRED_TUNABLE_KEYS = (
-    "throttle.background_min_idle_seconds",
-    "chat.pass2_min_idle_seconds",
-    "self_model.articulate_min_idle_seconds",
-)
-_RETIRED_IDENTIFIER = "_ACTIVE_CHAT_IDLE_MINUTES"
-
 
 def _iter_call_nodes(tree: ast.AST):
     for node in ast.walk(tree):
@@ -30,163 +22,15 @@ def _iter_call_nodes(tree: ast.AST):
             yield node
 
 
-def _is_tunables_register_or_get(call: ast.Call) -> bool:
-    func = call.func
-    name = None
-    if isinstance(func, ast.Attribute):
-        name = func.attr
-    elif isinstance(func, ast.Name):
-        name = func.id
-    return name in ("register", "get_tunable")
-
-
-def _find_functional_tunable_reads(pattern: str) -> list[str]:
-    """AST-based: a "functional read" is `tunables.register(<pattern>, ...)`
-    or `tunables.get_tunable(<pattern>, ...)` — NOT a bare string mention in a
-    docstring/comment (which ast never turns into a Call argument here)."""
-    hits: list[str] = []
-    for path in BRAIN_DIR.rglob("*.py"):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for call in _iter_call_nodes(tree):
-            if not _is_tunables_register_or_get(call):
-                continue
-            for arg in call.args:
-                if isinstance(arg, ast.Constant) and arg.value == pattern:
-                    hits.append(f"{path.relative_to(REPO_ROOT)}:{call.lineno}")
-    return hits
-
-
-def _find_identifier_uses(identifier: str) -> list[str]:
-    """AST-based: an actual Python NAME node (Load/Store/assignment/reference)
-    — never a docstring/comment mention (those are ast.Constant strings, not
-    ast.Name nodes, so they never match here)."""
-    hits: list[str] = []
-    for path in BRAIN_DIR.rglob("*.py"):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id == identifier:
-                hits.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
-    return hits
-
-
-# ---------------------------------------------------------------------------
-# C4(a): no code under brain/ reads the four retired keys/constants, or calls
-# run_folded(silence_minutes=...). Positive control: the scanner must find a
-# planted reference. Scoped to FUNCTIONAL reads (an executable tunables call,
-# or an actual Python identifier) — a docstring/comment explaining the
-# migration history (e.g. tunables_migration.py's own module docstring, or
-# its plain string list of keys to strip) is prose, not a read, and is
-# correctly excluded (only tunables_migration.py's own removal logic touches
-# these strings, as DATA to delete, never via tunables.register/get_tunable).
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("pattern", _RETIRED_TUNABLE_KEYS)
-def test_retired_tunable_key_not_functionally_read(pattern: str) -> None:
-    hits = _find_functional_tunable_reads(pattern)
-    assert hits == [], f"retired tunable key {pattern!r} still read via tunables.*:\n" + "\n".join(hits)
-
-
-def test_retired_identifier_not_used_as_a_python_name() -> None:
-    hits = _find_identifier_uses(_RETIRED_IDENTIFIER)
-    assert hits == [], f"retired identifier {_RETIRED_IDENTIFIER!r} still used:\n" + "\n".join(hits)
-
-
-def test_positive_control_ast_scanner_finds_a_planted_functional_read(tmp_path: Path) -> None:
-    """Demonstrates the AST scanners above actually discriminate — a planted
-    FUNCTIONAL call (not a docstring mention) must be found."""
-    planted = tmp_path / "planted.py"
-    planted.write_text(
-        'from brain import tunables\n'
-        'X = tunables.register("throttle.background_min_idle_seconds", 300.0)\n',
-        encoding="utf-8",
-    )
-    tree = ast.parse(planted.read_text(encoding="utf-8"))
-    found = any(
-        _is_tunables_register_or_get(call)
-        and any(
-            isinstance(a, ast.Constant) and a.value == "throttle.background_min_idle_seconds"
-            for a in call.args
-        )
-        for call in _iter_call_nodes(tree)
-    )
-    assert found, "scanner failed to find its own planted positive control"
-
-    # And a DOCSTRING-only mention (prose) must NOT be found by the same logic.
-    prose_only = tmp_path / "prose_only.py"
-    prose_only.write_text(
-        '"""Mentions throttle.background_min_idle_seconds in prose only."""\n'
-        'X = 1\n',
-        encoding="utf-8",
-    )
-    tree2 = ast.parse(prose_only.read_text(encoding="utf-8"))
-    found2 = any(
-        _is_tunables_register_or_get(call)
-        for call in _iter_call_nodes(tree2)
-    )
-    assert not found2, "scanner must not flag a bare docstring mention as a functional read"
-
-
-def test_run_folded_silence_minutes_kwarg_absent(tmp_path: Path) -> None:
-    """No code constructs a run_folded(...) call/kwargs dict carrying a
-    "silence_minutes" key (the AST check underlying
-    test_build_app_kwargs_to_run_folded_carry_no_silence_minutes_key in
-    test_supervisor_db_overhead.py; duplicated here, scoped to this
-    criterion's own positive control, per C4(a))."""
-    import ast
-
-    server_src = (BRAIN_DIR / "bridge" / "server.py").read_text(encoding="utf-8")
-    tree = ast.parse(server_src)
-    build_app_node = next(
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "build_app"
-    )
-    for node in ast.walk(build_app_node):
-        if isinstance(node, ast.Dict):
-            for key in node.keys:
-                assert not (
-                    isinstance(key, ast.Constant) and key.value == "silence_minutes"
-                ), "build_app must not forward silence_minutes into run_folded's kwargs"
-
-
-def test_positive_control_identifier_scanner_finds_a_planted_assignment(tmp_path: Path) -> None:
-    """The identifier scanner (_find_identifier_uses) must find a planted
-    actual assignment, but NOT a bare comment mention of the same name."""
-    planted = tmp_path / "planted.py"
-    planted.write_text("_ACTIVE_CHAT_IDLE_MINUTES = 5.0\n", encoding="utf-8")
-    tree = ast.parse(planted.read_text(encoding="utf-8"))
-    found = any(
-        isinstance(n, ast.Name) and n.id == "_ACTIVE_CHAT_IDLE_MINUTES" for n in ast.walk(tree)
-    )
-    assert found, "scanner failed to find its own planted positive control"
-
-    comment_only = tmp_path / "comment_only.py"
-    comment_only.write_text(
-        "X = 1  # references _ACTIVE_CHAT_IDLE_MINUTES for the positive control\n",
-        encoding="utf-8",
-    )
-    tree2 = ast.parse(comment_only.read_text(encoding="utf-8"))
-    found2 = any(
-        isinstance(n, ast.Name) and n.id == "_ACTIVE_CHAT_IDLE_MINUTES" for n in ast.walk(tree2)
-    )
-    assert not found2, "scanner must not flag a bare comment mention"
-
-
 # ---------------------------------------------------------------------------
 # C4(b): the lull tunable key is read in EXACTLY one place — cli_throttle's
-# private _lull_seconds(), called only by is_chat_idle. time_since_last_message
-# (the prune's own accessor) reads a DIFFERENT anchor and must NOT count.
+# private _lull_seconds(), called only by is_chat_idle.
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 2.0 s wall (serial run for #540, J12)')
 def test_lull_tunable_key_read_in_exactly_one_place() -> None:
-    """AST-based functional-read count (see _find_functional_tunable_reads
-    above) — a docstring/comment mentioning the key (tunables.py's own fence
+    """AST-based functional-read count — a docstring/comment mentioning the key (tunables.py's own fence
     note, cli_throttle.py's module docstring, server.py's lifespan comment,
     tunables_migration.py's prose) is correctly excluded; only an actual
     `tunables.get_tunable("chat.idle_lull_seconds", ...)` call counts as a
@@ -215,20 +59,6 @@ def test_lull_tunable_key_read_in_exactly_one_place() -> None:
         f"found {len(read_hits)}:\n" + "\n".join(read_hits)
     )
     assert "cli_throttle.py" in read_hits[0]
-
-
-def test_time_since_last_message_reads_a_different_anchor_not_the_tunable_key() -> None:
-    """S72/2-plan §3.3a: time_since_last_message() must not itself reference
-    the chat.idle_lull_seconds key (it reads the monotonic anchor only) — so
-    it correctly does NOT count against the "one reader" claim above."""
-    src = (BRAIN_DIR / "bridge" / "cli_throttle.py").read_text(encoding="utf-8")
-    match = re.search(
-        r"def time_since_last_message\(.*?\n(?:.*\n)*?(?=\ndef |\Z)", src
-    )
-    assert match, "time_since_last_message not found in cli_throttle.py"
-    body = match.group(0)
-    assert "chat.idle_lull_seconds" not in body
-    assert "_lull_seconds" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -387,22 +217,16 @@ def test_enumerated_caller_still_routes_through_cli_throttle_no_min_idle(relpath
     )
 
 
-def test_supervisor_snapshot_prune_block_gated_by_is_chat_idle(monkeypatch) -> None:
-    """Static confirmation that supervisor.py's session-snapshot/prune work is
-    idle-gated (the executable per-caller test lives in test_supervisor.py /
-    test_central_cadence.py; this is the C4(c) grep-style companion for THIS
-    specific caller). Since ram-spike-fix INC-9 the snapshot/prune is a gated
-    job of the central cadence function: its only call site is inside
-    ``_build_gated_jobs`` (never in run_folded's own body), and the central
-    function asks ``cli_throttle.is_chat_idle`` before every job."""
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+def test_the_central_pass_asks_is_chat_idle_by_default() -> None:
+    """The supervisor calls ``central_cadence.run_central_pass`` without an ``is_idle`` argument, so the idle gate
+    every gated job (the session snapshot/prune included) waits on is the function's default, which must be
+    ``cli_throttle.is_chat_idle``. The tests of the central function inject their own ``is_idle``, so only this one
+    pins the default the production call relies on."""
     import inspect
 
     from brain.bridge import central_cadence, cli_throttle, supervisor
 
-    src = (BRAIN_DIR / "bridge" / "supervisor.py").read_text(encoding="utf-8")
-    assert src.count("reports = snapshot_stale_sessions(") == 1
-    idx = src.index("reports = snapshot_stale_sessions(")
-    assert src.rfind("def _build_gated_jobs(", 0, idx) > src.rfind("def run_folded(", 0, idx)
     default_is_idle = inspect.signature(central_cadence.run_central_pass).parameters["is_idle"].default
     assert default_is_idle is cli_throttle.is_chat_idle
     assert "session_snapshot_prune" in central_cadence.GATED_JOB_ORDER

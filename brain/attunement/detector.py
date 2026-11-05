@@ -12,9 +12,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from brain import dev_constants
 from brain.attunement.prompts import build_detector_system_prompt
 from brain.attunement.schemas import (
-    SCHEMA_VERSION,
     CurrentRead,
     DetectorOutput,
     Evidence,
@@ -47,7 +47,7 @@ def _decline_output(source_turn_id: str) -> DetectorOutput:
         mood_valence=0.0,
         mood_intensity=0.0,
         predicted_arc_shape="",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     return DetectorOutput(current_read=read, pattern_candidates=[])
 
@@ -152,7 +152,7 @@ def _parse_output(raw: str, source_turn_id: str, persona_dir: Path | None = None
             mood_valence=float(cr.get("mood_valence", 0.0)),
             mood_intensity=float(cr.get("mood_intensity", 0.0)),
             predicted_arc_shape=str(cr.get("predicted_arc_shape", "")),
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         )
     except (AttributeError, TypeError, ValueError) as exc:
         record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"current_read shape: {exc}")

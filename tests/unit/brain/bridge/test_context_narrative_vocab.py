@@ -12,7 +12,10 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from brain.bridge import provider
+from tests.source_tree import brain_trees
 
 _BRAIN = Path(__file__).parents[4] / "brain"
 _OLD_FORMAT_PHRASES = (
@@ -54,6 +57,7 @@ def _old_wording_hits(bound: list[str], docs: list[str]) -> list[str]:
     return hits
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on a 4-core dev VM, 1.3 s wall (serial run for #540, J12)')
 def test_c6_two_call_sites_of_the_print_prompt_formatter_both_pass_user_name() -> None:
     tree = ast.parse((_BRAIN / "bridge" / "provider.py").read_text(encoding="utf-8"))
     calls = [
@@ -68,14 +72,14 @@ def test_c6_two_call_sites_of_the_print_prompt_formatter_both_pass_user_name() -
         assert "user_name" in {kw.arg for kw in call.keywords}
     # and no other module under brain/ references it in code (comments aside)
     users = []
-    for path in _BRAIN.rglob("*.py"):
-        if path.name == "provider.py":
+    for rel, parsed in brain_trees().items():
+        if rel.rsplit("/", 1)[-1] == "provider.py":
             continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        for node in ast.walk(parsed):
             if (isinstance(node, ast.Name) and node.id == "_format_claude_print_prompt") or (
                 isinstance(node, ast.Attribute) and node.attr == "_format_claude_print_prompt"
             ):
-                users.append(str(path.relative_to(_BRAIN)))
+                users.append(Path(rel).relative_to("brain").as_posix())
     assert users == []
 
 
@@ -83,15 +87,6 @@ def test_c6_user_name_is_a_context_key_and_the_engine_sets_it() -> None:
     assert "user_name" in provider._PROVIDER_CONTEXT_OPTION_KEYS
     engine = (_BRAIN / "chat" / "engine.py").read_text(encoding="utf-8")
     assert 'chat_options["user_name"]' in engine
-
-
-def test_c6_the_old_renderer_name_is_gone_everywhere_under_brain() -> None:
-    offenders = [
-        str(p.relative_to(_BRAIN))
-        for p in _BRAIN.rglob("*.py")
-        if "_claude_context_jsonl_lines" in p.read_text(encoding="utf-8")
-    ]
-    assert offenders == []
 
 
 def test_c6_no_model_bound_string_or_docstring_describes_the_format_as_jsonl() -> None:

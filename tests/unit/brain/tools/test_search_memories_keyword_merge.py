@@ -326,8 +326,14 @@ def _base_corpus(store: MemoryStore) -> None:
         _mem(store, f"harbour filler line {i} about nothing in particular")
 
 
-@pytest.mark.parametrize("query", _QUERIES)
-@pytest.mark.parametrize("limit", [3, 8])
+# `AI` and `will` return the same ids at both limits (0 and 1 results), so limit 8 adds nothing for them; every other
+# query returns more results at 8 than at 3 and keeps both.
+_QUERY_LIMITS = [
+    pytest.param(q, limit, id=f"{limit}-{q}") for limit in (3, 8) for q in _QUERIES if not (q in ("AI", "will") and limit == 8)
+]
+
+
+@pytest.mark.parametrize(("query", "limit"), _QUERY_LIMITS)
 def test_lexical_results_equal_today_s_ranker_output(tmp_path: Path, query: str, limit: int) -> None:
     """The base-equality pin: with no listed name in the query, lexical mode
     returns exactly `rank_memories(store, hebbian, <raw query>, limit=)` (what

@@ -10,11 +10,14 @@ Reads tolerate corrupt lines via brain.health.json_io.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
-import time
 import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +31,10 @@ from brain.health.json_io import (
     write_jsonl,
 )
 from brain.utils.atomic_write import fsync_dir, save_with_backup_text
+from brain.utils.file_lock import file_lock
+from brain.utils.file_ops import delete_file
+
+logger = logging.getLogger(__name__)
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -111,6 +118,30 @@ def ingest_turn(persona_dir: Path, turn: dict) -> str:
     return session_id
 
 
+@contextmanager
+def session_append_lock(persona_dir: Path, session_id: str) -> Iterator[None]:
+    """Hold the buffer's append lock: the lock ``ingest_turn`` takes (through ``append_jsonl``) for this session.
+
+    A caller that reads the buffer and then removes it (the session rollover) holds this across the read,
+    the archive write and the removal, so a row appended in between waits and cannot be removed unseen.
+    Not re-entrant: an ``ingest_turn`` of the same session inside the block, on any thread of this process,
+    waits for the block to end. Lock order: take the chat registry lock (``brain.chat.session.registry_lock``)
+    first when a caller needs both, and never take the registry lock while holding this one.
+
+    When the sidecar lock cannot be taken (``OSError``: a filesystem that refuses the lock) a warning is logged
+    and the block runs unlocked, as ``append_jsonl`` does, since the appenders are unlocked there too and
+    refusing would stop the caller for good. An exception raised by the block propagates once."""
+    stack = ExitStack()
+    try:
+        stack.enter_context(file_lock(_session_path(persona_dir, session_id)))
+    except OSError as exc:
+        logger.warning(
+            "could not take the append lock for session %s (%s); continuing without it", session_id, exc
+        )
+    with stack:
+        yield
+
+
 def list_active_sessions(persona_dir: Path) -> list[str]:
     """Return session_ids of all active buffer files."""
     d = persona_dir / "active_conversations"
@@ -120,7 +151,7 @@ def list_active_sessions(persona_dir: Path) -> list[str]:
 
 
 def read_session(persona_dir: Path, session_id: str) -> list[dict]:
-    """Return the turns from a session buffer, skipping malformed lines."""
+    """Return the turns from a session buffer, skipping malformed lines (a line the JSON parser cannot load stops the read)."""
     # RAISE: compaction rewrites the buffer from this read and ingest advances its cursor on it, so a failed
     # read must raise (as it always did), never look like an empty session.
     return read_jsonl(_session_path(persona_dir, session_id), recover=Recovery.RAISE)
@@ -144,33 +175,10 @@ def session_silence_minutes(turns: list[dict]) -> float:
     return delta.total_seconds() / 60.0
 
 
-_UNLINK_RETRIES = 8
-_UNLINK_RETRY_SLEEP_S = 0.05
-
-
-def _unlink_with_retry(path: Path) -> None:
-    """Unlink with a short bounded retry on transient PermissionError.
-
-    Windows cannot delete a file another handle holds open (WinError 32) —
-    a just-flushed writer, a not-yet-GC'd reader generator, or the CI
-    runner's antivirus/indexer briefly pins freshly-written files. On POSIX
-    the retry never triggers. Re-raises after the budget so a *real*
-    permission problem still surfaces (fail-loud, matching the ingest
-    pipeline's error counters)."""
-    for attempt in range(_UNLINK_RETRIES):
-        try:
-            path.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            if attempt == _UNLINK_RETRIES - 1:
-                raise
-            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
-
-
 def delete_session_buffer(persona_dir: Path, session_id: str) -> None:
-    """Unlink the buffer file. Idempotent — no-op when file is missing."""
+    """Delete the buffer file. Idempotent — no-op when file is missing; a transient sharing violation is retried."""
     path = _session_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def _cursor_path(persona_dir: Path, session_id: str) -> Path:
@@ -221,9 +229,9 @@ def write_cursor(persona_dir: Path, session_id: str, ts: str) -> None:
 
 
 def delete_cursor(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the cursor file (retry — see _unlink_with_retry)."""
+    """Idempotent delete of the cursor file (retried: ``file_ops.delete_file``)."""
     path = _cursor_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
@@ -299,9 +307,9 @@ def write_backoff(
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the backoff sidecar (retry — see _unlink_with_retry)."""
+    """Idempotent delete of the backoff sidecar (retried: ``file_ops.delete_file``)."""
     path = _backoff_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]) -> None:
@@ -313,7 +321,7 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     compaction to install ``[summary, *retained_tail]``. Temp file + os.replace
     mirrors ``write_cursor`` so a reader never sees a torn buffer.
 
-    The replace gets the same bounded retry as ``_unlink_with_retry`` (#198):
+    The replace gets the shared bounded retry (``file_ops.retry_transient``, #198):
     Windows refuses ``os.replace`` over a file another handle holds open — a
     ``GET /chat/history`` streaming this buffer is the realistic case, and it
     finishes in milliseconds. On POSIX the retry never triggers. After the
@@ -458,6 +466,51 @@ def write_archive_marker(persona_dir: Path, session_id: str, key: str) -> None:
         # fsync the containing dir so the new sidecar's directory entry is durable
         # (crash-mid-create), matching append_archive's new-segment durability.
         fsync_dir(path.parent)
+
+
+def turn_identity(t: dict) -> tuple:
+    """A stable identity for a buffer turn, used to match archived turns against
+    a re-read buffer (race-safe rewrite). (ts, speaker, text) is unique enough;
+    a collision means two byte-identical turns in the same second, where keeping
+    or dropping one is harmless."""
+    return (t.get("ts"), t.get("speaker"), t.get("text"))
+
+
+def _archive_batch_key(records: list[dict], new_gen: int) -> str:
+    """A stable identity for one archive-append batch: sha256 over ``new_gen`` and
+    the ORDERED ``(ts, speaker, text)`` identity of every record — never any
+    generated fold text. Two invocations that recompute the identical batch (a
+    crash-retry over an unchanged buffer) hash to the SAME key; a later,
+    genuinely-different batch (different ``new_gen`` or different records) never
+    collides (Bug 3)."""
+    h = hashlib.sha256()
+    h.update(str(new_gen).encode("utf-8"))
+    for r in records:
+        h.update(repr(turn_identity(r)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def archive_once(persona_dir: Path, session_id: str, records: list[dict], *, new_gen: int) -> int:
+    """The one archive-with-dedup write: archive ``records`` exactly once for this batch, proven by a
+    durable commit marker (Bug 3). Compaction, the cascade and the session rollover archive the turns they
+    remove from a conversation buffer through this, before they remove anything.
+
+    ``new_gen`` is the generation the batch belongs to (the summary generation being written, or the one
+    the rollover carries); it is part of the batch key. Skips the append ONLY when the marker key matches
+    — i.e. the marker PROVES a completed prior append of this exact batch — never by inferring from turn
+    identity, so two byte-identical raw turns are always both archived (or both re-archived on a true
+    partial-write retry), never silently collapsed (L2). Returns the byte count written, or ``1`` as a
+    skip sentinel (a proven-already-archived batch; still ``> 0`` for the caller's write-verify). An
+    empty batch writes nothing and returns 0. A crash between the append and the marker write repeats
+    the batch on the retry (repeats, never a missing row)."""
+    if not records:
+        return 0
+    key = _archive_batch_key(records, new_gen)
+    if read_archive_marker(persona_dir, session_id) == key:
+        return 1  # proven already archived this pass -> skip append (no dup, no loss)
+    n = append_archive(persona_dir, session_id, records)
+    write_archive_marker(persona_dir, session_id, key)
+    return n
 
 
 def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:

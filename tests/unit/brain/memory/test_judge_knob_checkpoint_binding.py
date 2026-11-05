@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.memory import judge_full_ft, judge_lora, judge_selftune, relevance_judge
 from brain.memory.relevance_judge import FakeRelevanceJudgeProvider, label_for_score
@@ -95,7 +96,7 @@ def _seed_serving_knob(store: MemoryStore, monkeypatch: pytest.MonkeyPatch, pers
     1.0/1.0 (P's knob)."""
     _small_tunables(monkeypatch)
     _seed_scenario(store, "w0")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT)
     result = _tick(store, persona_dir)
     assert result["fired"] is True and result["error"] is None
     n = store._conn.execute("SELECT COUNT(*) AS n FROM judge_knob_calibration").fetchone()["n"]
@@ -132,6 +133,7 @@ def _discriminating_raw(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='3.1 s of CPU in its call phase on a 4-core dev VM, 3.1 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k1_double_fault_never_serves_a_stale_knob(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -169,6 +171,7 @@ def test_k1_double_fault_never_serves_a_stale_knob(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='3.8 s of CPU in its call phase on a 4-core dev VM, 3.9 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k2_accept_writes_knob_first_then_swaps_then_deletes_the_previous(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -242,6 +245,7 @@ def test_k2_accept_writes_knob_first_then_swaps_then_deletes_the_previous(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='4.5 s of CPU in its call phase on a 4-core dev VM, 4.5 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k3_crash_between_knob_write_and_swap_keeps_prior_and_next_tick_reaps_orphan(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -273,6 +277,7 @@ def test_k3_crash_between_knob_write_and_swap_keeps_prior_and_next_tick_reaps_or
     assert not staged.exists()
 
 
+@pytest.mark.slow(reason='3.6 s of CPU in its call phase on a 4-core dev VM, 3.6 s wall (serial run for #540, J12)')
 def test_k3b_first_ever_crash_before_swap_keeps_base_and_reaps_orphan(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -280,7 +285,7 @@ def test_k3b_first_ever_crash_before_swap_keeps_base_and_reaps_orphan(
     _seed_serving_knob(store, monkeypatch, tmp_path)  # base judge's knob week
     env = Env(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     real_swap = judge_lora.swap_champion_pointer
     monkeypatch.setattr(judge_lora, "swap_champion_pointer", _raise)
 
@@ -339,6 +344,7 @@ def test_k5_keyed_knob_load_is_torch_free() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_k7b_pre_inc9_base_keyed_knob_is_not_applied_and_heals(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -349,7 +355,7 @@ def test_k7b_pre_inc9_base_keyed_knob_is_not_applied_and_heals(
     Env(monkeypatch)
     _small_tunables(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_KNOB_REFIT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT)
     assert _tick(store, tmp_path)["fired"] is True
     knob = store.get_judge_knob_calibration(_key(prior))
     assert knob is not None, "the knob week binds a knob to the serving checkpoint"
@@ -385,6 +391,7 @@ def test_k8_injected_full_model_judge_never_reads_the_base_knob(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.9 s of CPU in its call phase on a 4-core dev VM, 2.9 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize("grade", GRADES)
 def test_k9_rejected_challenger_leaves_no_knob_row(
     grade: str, store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -412,13 +419,14 @@ def test_k9_rejected_challenger_leaves_no_knob_row(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.7 s of CPU in its call phase on a 4-core dev VM, 2.7 s wall (serial run for #540, J12)')
 def test_k10a_reap_keeps_the_served_checkpoints_row_after_an_accept(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     env = Env(monkeypatch)
     _small_tunables(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_LORA)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_LORA)
     assert _tick(store, tmp_path)["accepted"] is True
     new = Path(env.builds[-1]["staged"])
     _gate_off(monkeypatch)
@@ -449,6 +457,7 @@ def test_k10c_absent_pointer_reaps_tuned_rows_only(store: MemoryStore, tmp_path:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='4.0 s of CPU in its call phase on a 4-core dev VM, 4.0 s wall (serial run for #540, J12)')
 def test_k11_faulted_post_commit_row_delete_is_swept_next_tick(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -457,7 +466,7 @@ def test_k11_faulted_post_commit_row_delete_is_swept_next_tick(
     _seed_serving_knob(store, monkeypatch, tmp_path)
     env = Env(monkeypatch)
     _seed_scenario(store, "w1")
-    _set_tier(monkeypatch, judge_selftune.TUNE_GRADE_FULL_FT)
+    _set_tier(monkeypatch, dev_constants.JUDGE_TUNE_GRADE_FULL_FT)
     real_delete = store.delete_judge_knob_calibration
     monkeypatch.setattr(store, "delete_judge_knob_calibration", _raise)
 

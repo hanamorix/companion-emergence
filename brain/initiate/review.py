@@ -107,7 +107,7 @@ def _process_one_candidate(
     voice_template: str,
     now: datetime,
     user_name: str = "my user",
-    companion_name: str = "Nell",
+    companion_name: str,
     user_presence: UserPresence | None = None,
 ) -> None:
     """Run the three-prompt pipeline on a single candidate, write audit, remove.

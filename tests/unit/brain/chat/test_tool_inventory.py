@@ -43,8 +43,8 @@ def test_inventory_carries_the_reach_valve() -> None:
 
 
 def test_inventory_uses_the_companion_name() -> None:
-    out = build_tool_inventory("Phoebe")
-    assert "Phoebe" in out
+    out = build_tool_inventory("Canary")
+    assert "Canary" in out
 
 
 def test_inventory_falls_soft_on_a_tool_with_no_schema(monkeypatch) -> None:

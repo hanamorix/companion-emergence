@@ -25,7 +25,6 @@ Design invariants this module upholds:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -36,13 +35,12 @@ from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.ingest.buffer import (
     acquire_compaction_lock,
-    append_archive,
-    read_archive_marker,
+    archive_once,
     read_cursor,
     read_session,
     release_compaction_lock,
     rewrite_session_atomic,
-    write_archive_marker,
+    turn_identity,
 )
 from brain.utils.time import to_local
 
@@ -458,51 +456,12 @@ def _split_buffer(turns: list[dict]) -> tuple[dict | None, list[dict]]:
     return existing, raw
 
 
-def _turn_identity(t: dict) -> tuple:
-    """A stable identity for a buffer turn, used to match archived turns against
-    a re-read buffer (race-safe rewrite). (ts, speaker, text) is unique enough;
-    a collision means two byte-identical turns in the same second, where keeping
-    or dropping one is harmless."""
-    return (t.get("ts"), t.get("speaker"), t.get("text"))
-
-
-def _archive_batch_key(records: list[dict], new_gen: int) -> str:
-    """A stable identity for one archive-append batch: sha256 over ``new_gen`` and
-    the ORDERED ``(ts, speaker, text)`` identity of every record — never any
-    generated fold text. Two invocations that recompute the identical batch (a
-    crash-retry over an unchanged buffer) hash to the SAME key; a later,
-    genuinely-different batch (different ``new_gen`` or different records) never
-    collides (Bug 3)."""
-    h = hashlib.sha256()
-    h.update(str(new_gen).encode("utf-8"))
-    for r in records:
-        h.update(repr(_turn_identity(r)).encode("utf-8"))
-    return h.hexdigest()
-
-
-def _archive_once(persona_dir, session_id: str, records: list[dict], *, new_gen: int) -> int:
-    """Archive ``records`` exactly once for this batch, proven by a durable commit
-    marker (Bug 3). Skips the append ONLY when the marker key matches — i.e. the
-    marker PROVES a completed prior append of this exact batch — never by
-    inferring from turn identity, so two byte-identical raw turns are always both
-    archived (or both re-archived on a true partial-write retry), never silently
-    collapsed (L2). Returns the byte count written, or ``1`` as a skip sentinel
-    (a proven-already-archived batch; still ``> 0`` for the caller's write-verify)."""
-    if not records:
-        return 0
-    key = _archive_batch_key(records, new_gen)
-    if read_archive_marker(persona_dir, session_id) == key:
-        return 1  # proven already archived this pass -> skip append (no dup, no loss)
-    n = append_archive(persona_dir, session_id, records)
-    write_archive_marker(persona_dir, session_id, key)
-    return n
-
-
 def _summary_text(row: dict | None) -> str:
     return (row or {}).get("text", "") or ""
 
 
-def _summary_gen(row: dict | None) -> int:
+def summary_gen(row: dict | None) -> int:
+    """The compaction generation recorded on a summary row (``compaction.gen``); 0 for no row or a row without one."""
     if not row:
         return 0
     try:
@@ -545,7 +504,7 @@ def compact_conversation(
         cursor = read_cursor(persona_dir, session_id)
         if cursor is None:
             return CompactionResult(
-                False, 0, _summary_gen(existing_summary), False, reaped,
+                False, 0, summary_gen(existing_summary), False, reaped,
                 reason="cursor_none",
             )
         cursor_dt = _parse_ts(cursor)
@@ -566,7 +525,7 @@ def compact_conversation(
 
         if not removable:
             return CompactionResult(
-                False, 0, _summary_gen(existing_summary), False, reaped,
+                False, 0, summary_gen(existing_summary), False, reaped,
                 reason="nothing_aged",
             )
 
@@ -658,7 +617,7 @@ def compact_conversation(
             # Tool append (fold=False, prior exists): keep prior verbatim, append.
             new_text = f"{prior_text}\n\n{new_part}" if prior_text else new_part
 
-        new_gen = _summary_gen(existing_summary) + 1
+        new_gen = summary_gen(existing_summary) + 1
         covers_until = removable[-1].get("ts") or cutoff.isoformat()
         summary_row = {
             "session_id": session_id,
@@ -679,7 +638,7 @@ def compact_conversation(
         if fold_existing_summary and existing_summary is not None:
             archive_records.append(existing_summary)
         try:
-            written = _archive_once(persona_dir, session_id, archive_records, new_gen=new_gen)
+            written = archive_once(persona_dir, session_id, archive_records, new_gen=new_gen)
             if written <= 0 and archive_records:
                 raise OSError("archive append wrote zero bytes")
         except Exception:
@@ -688,7 +647,7 @@ def compact_conversation(
                 session_id,
             )
             return CompactionResult(
-                False, 0, _summary_gen(existing_summary), fell_soft, reaped,
+                False, 0, summary_gen(existing_summary), fell_soft, reaped,
                 reason="archive_failed",
             )
 
@@ -702,12 +661,12 @@ def compact_conversation(
         # re-read preserves them — shrinking the loss window from the whole
         # summarize to the µs between this re-read and os.replace. (`ingest_turn`
         # takes no compaction lock by design — appends must stay fast.)
-        archived_ids: list[tuple] = [_turn_identity(t) for t in removable]
+        archived_ids: list[tuple] = [turn_identity(t) for t in removable]
         current = read_session(persona_dir, session_id)
         _, current_raw = _split_buffer(current)
         retained_now: list[dict] = []
         for t in current_raw:
-            tid = _turn_identity(t)
+            tid = turn_identity(t)
             if tid in archived_ids:
                 archived_ids.remove(tid)  # consume once (multiset-safe vs dup turns)
             else:
@@ -895,7 +854,7 @@ def _install_cascade_row(
     """Archive (removed raw + old summary) BEFORE rewrite, then install the new
     sectioned summary row + retained tail in ONE atomic rewrite. Returns the new
     gen, or ``None`` on an archive failure (buffer left untouched)."""
-    new_gen = _summary_gen(existing_summary) + 1
+    new_gen = summary_gen(existing_summary) + 1
     all_untils = [_parse_ts(s.get("covers_until_ts")) for s in new_sections.values()]
     covers_until = _iso_seconds(max([u for u in all_untils if u], default=now))
     summary_row = {
@@ -918,7 +877,7 @@ def _install_cascade_row(
         archive_records.append(existing_summary)
     if archive_records:
         try:
-            written = _archive_once(persona_dir, session_id, archive_records, new_gen=new_gen)
+            written = archive_once(persona_dir, session_id, archive_records, new_gen=new_gen)
             if written <= 0:
                 raise OSError("archive append wrote zero bytes")
         except Exception:
@@ -929,12 +888,12 @@ def _install_cascade_row(
 
     # Atomic single write: re-read the live buffer and subtract the archived raw by
     # identity so a concurrent append during the slow fold is not clobbered.
-    archived_ids: list[tuple] = [_turn_identity(t) for t in removable]
+    archived_ids: list[tuple] = [turn_identity(t) for t in removable]
     current = read_session(persona_dir, session_id)
     _, current_raw = _split_buffer(current)
     retained_now: list[dict] = []
     for t in current_raw:
-        tid = _turn_identity(t)
+        tid = turn_identity(t)
         if tid in archived_ids:
             archived_ids.remove(tid)
         else:
@@ -973,7 +932,7 @@ def cascade_conversation(
 
         cursor = read_cursor(persona_dir, session_id)
         if cursor is None:
-            return CascadeResult(False, 0, _summary_gen(existing_summary), reason="cursor_none")
+            return CascadeResult(False, 0, summary_gen(existing_summary), reason="cursor_none")
         cursor_dt = _parse_ts(cursor)
         age_cutoff = now - _AGE_24H
 
@@ -1026,7 +985,7 @@ def cascade_conversation(
         # → no-op.
         if not removable and not needs_graduate:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="nothing_aged"
+                False, 0, summary_gen(existing_summary), reason="nothing_aged"
             )
 
         # Assemble oldest-first (72 → 48 → 24). Tier 3 is REPLACED each pass: the
@@ -1065,7 +1024,7 @@ def cascade_conversation(
         )
         if new_gen is None:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="archive_failed"
+                False, 0, summary_gen(existing_summary), reason="archive_failed"
             )
         logger.info(
             "cascade: session=%s gen=%d compacted_n=%d tiers=%s evicted=%d",
@@ -1109,7 +1068,7 @@ def emergency_fold_24h(
 
         cursor = read_cursor(persona_dir, session_id)
         if cursor is None:
-            return CascadeResult(False, 0, _summary_gen(existing_summary), reason="cursor_none")
+            return CascadeResult(False, 0, summary_gen(existing_summary), reason="cursor_none")
         cursor_dt = _parse_ts(cursor)
 
         protected = set(range(max(0, len(raw_turns) - min_keep_tail), len(raw_turns)))
@@ -1123,7 +1082,7 @@ def emergency_fold_24h(
             removable.append(t)  # older_than=0: any extracted turn beyond the tail
         if not removable:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="nothing_aged"
+                False, 0, summary_gen(existing_summary), reason="nothing_aged"
             )
 
         existing_sections = _read_sections(existing_summary, now)
@@ -1156,7 +1115,7 @@ def emergency_fold_24h(
         )
         if new_gen is None:
             return CascadeResult(
-                False, 0, _summary_gen(existing_summary), reason="archive_failed"
+                False, 0, summary_gen(existing_summary), reason="archive_failed"
             )
         logger.info(
             "cascade: emergency_fold session=%s gen=%d compacted_n=%d evicted=%d",

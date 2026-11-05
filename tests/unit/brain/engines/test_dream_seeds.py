@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from brain.emotion.aggregate import aggregate_state
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.memory.store import Memory
@@ -209,3 +210,36 @@ def test_select_seed_refractory_pushes_to_breadth():
     ]
     seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=["g3"])
     assert seed.id in {"g1", "g2"}  # g3 demoted by the refractory penalty
+
+
+def test_congruence_matches_a_variant_spelled_candidate_against_the_aggregate_mood():
+    # The aggregate pools by canonical name, so its channel is `comfort_seeking`; a candidate
+    # stored under the hyphen spelling still has to score against that channel.
+    mood = aggregate_state([_mem("seed", emotions={"comfort_seeking": 7.0})])
+    assert mood.emotions == {"comfort_seeking": 7.0}
+
+    candidate = _mem("a", emotions={"comfort-seeking": 7.0})
+
+    assert dream_seeds.emotional_congruence(candidate, mood) == 49.0
+    assert candidate.emotions == {"comfort-seeking": 7.0}  # the stored key is not rewritten
+
+
+@pytest.mark.parametrize(
+    "memory_emotions",
+    [
+        {"comfort-seeking": 4.0, "Comfort_Seeking": 2.0},
+        {"Comfort_Seeking": 2.0, "comfort-seeking": 4.0},
+    ],
+)
+def test_congruence_counts_two_spellings_once_and_ignores_look_alikes(memory_emotions):
+    mood = EmotionalState(emotions={"comfort_seeking": 6.0, "not_a_real_emotion": 5.0})
+    look_alikes = {"comfort": 9.0, "comfort_seeking_extra": 9.0, "not-a-real-emotion-2": 9.0}
+    mem = _mem("a", emotions={**memory_emotions, **look_alikes})
+
+    # the larger spelling counts once (6 * 4), not summed (36) and not first-wins on the smaller one;
+    # none of the look-alikes lands on a mood channel
+    assert dream_seeds.emotional_congruence(mem, mood) == 24.0
+
+    # a memory key that canonicalises to the unknown mood channel does match it
+    spelled = _mem("b", emotions={"Not-A-Real-Emotion": 2.0})
+    assert dream_seeds.emotional_congruence(spelled, mood) == 10.0

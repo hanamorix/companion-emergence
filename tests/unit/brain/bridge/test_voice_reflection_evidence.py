@@ -55,6 +55,3 @@ def test_read_recent_dreams_reads_dream_memories_with_text(tmp_path: Path) -> No
     assert [d["id"] for d in out] == [fresh.id]
     assert "sailor kept the boat" in out[0]["text"]
 
-
-def test_message_tone_placeholder_is_retired() -> None:
-    assert not hasattr(supervisor, "_read_recent_message_tones")

@@ -438,3 +438,12 @@ def test_baseline_db_uses_wal_and_busy_timeout(tmp_path: Path):
         assert mode.lower() == "wal", f"expected WAL, got {mode!r}"
         timeout = b._conn.execute("PRAGMA busy_timeout").fetchone()[0]
         assert timeout == 5000, f"expected busy_timeout 5000, got {timeout}"
+
+
+def test_baseline_busy_timeout_reads_the_dev_constant(tmp_path: Path, monkeypatch) -> None:
+    """#602: the busy timeout comes from the dev constant, not a hand-written 5000."""
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "SQLITE_STORE_BUSY_TIMEOUT_S", 12.0)
+    with MemoryActivationBaseline(tmp_path / "baseline.db") as b:
+        assert b._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 12000

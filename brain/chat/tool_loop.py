@@ -42,6 +42,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
+from brain.tools.naming import fill_tool_prefix, fill_tool_result, tool_prefix_of
 from brain.tools.schemas import build_schemas
 
 logger = logging.getLogger(__name__)
@@ -255,6 +256,7 @@ def build_tools_list(
     companion_name: str = "Nell",
     *,
     allowed: list[str] | None = None,
+    tool_prefix: str = "",
 ) -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
@@ -271,7 +273,7 @@ def build_tools_list(
         names appear in *allowed* are included.  ``None`` (default) returns
         the full suite; existing callers are unaffected.
     """
-    schemas = build_schemas(companion_name)
+    schemas = build_schemas(companion_name, tool_prefix=tool_prefix)
     names: tuple[str, ...] | list[str]
     if allowed is None:
         names = NELL_TOOL_NAMES
@@ -331,14 +333,15 @@ def _maybe_recruit_and_rerun(
         ]
         if not allowed_now:
             return None
-        tools = build_tools_list(companion_name, allowed=allowed_now)
+        prefix = tool_prefix_of(provider)
+        tools = build_tools_list(companion_name, allowed=allowed_now, tool_prefix=prefix)
         # Tell the model it already reached, so it uses the real tool now instead of re-reaching.
         rerun_messages = list(messages) + [
             ChatMessage(
                 role="user",
                 content=("[The faculty you reached for is now available to you this turn. "
-                         "Call the specific tool you need now (e.g. search_memories, read_file) — "
-                         "do not call reach_for_capability again.]"),
+                         f"Call the specific tool you need now (e.g. {prefix}search_memories, "
+                         f"{prefix}read_file): do not call {prefix}reach_for_capability again.]"),
             )
         ]
         rerun = provider.chat(
@@ -520,14 +523,17 @@ def run_tool_loop(
                 "arguments": tc.arguments,
             }
             try:
-                result = dispatch(
-                    tc.name,
-                    tc.arguments,
-                    store=store,
-                    hebbian=hebbian,
-                    persona_dir=persona_dir,
-                    provider=provider,
-                    session_id=session_id,
+                result = fill_tool_result(
+                    dispatch(
+                        tc.name,
+                        tc.arguments,
+                        store=store,
+                        hebbian=hebbian,
+                        persona_dir=persona_dir,
+                        provider=provider,
+                        session_id=session_id,
+                    ),
+                    tool_prefix_of(provider),
                 )
                 record["result_summary"] = _summarize_result(result)
                 # #96: a tool that RETURNS {"error": ...} is a refusal, not a
@@ -552,10 +558,11 @@ def run_tool_loop(
                 tool_content = json.dumps(result, default=str, ensure_ascii=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("tool dispatch error: %s — %s", tc.name, exc)
-                record["error"] = str(exc)
-                record["result_summary"] = f"error: {exc}"
+                error = fill_tool_prefix(str(exc), tool_prefix_of(provider))
+                record["error"] = error
+                record["result_summary"] = f"error: {error}"
                 record["outcome"] = "error"
-                tool_content = json.dumps({"error": str(exc)})
+                tool_content = json.dumps({"error": error})
 
             invocations.append(record)
             messages.append(

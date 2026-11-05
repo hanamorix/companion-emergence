@@ -140,16 +140,16 @@ def test_an_io_unreadable_notice_stays_until_the_runtime_actually_reloads(tunabl
     path.write_text('"a.b" = 1.0\n', encoding="utf-8")
     from brain.utils import toml_io
 
-    real = toml_io._read_bytes
+    real = toml_io.read_bytes_stat
 
     def boom(p):
         raise PermissionError("busy")
 
-    monkeypatch.setattr(toml_io, "_read_bytes", boom)
+    monkeypatch.setattr(toml_io, "read_bytes_stat", boom)
     assert tunables.get_tunable("a.b", 60.0) == 60.0
     notice = tunables.current_notice()
     assert notice is not None and notice["kind"] == "unreadable" and notice["line"] is None
-    monkeypatch.setattr(toml_io, "_read_bytes", real)
+    monkeypatch.setattr(toml_io, "read_bytes_stat", real)
     # Rev-4 review bycatch: a transient I/O failure says nothing about the content, so the notice ends as soon as a read
     # succeeds, even though the file's mtime never changed (it used to stay until the mtime moved, saying "could not be read"
     # while the settings were in effect).
@@ -263,9 +263,8 @@ def test_a_marker_write_that_hits_a_programming_error_is_not_swallowed(tunables,
         tunables._write_marker({"kind": "unreadable"})
 
 
-def test_the_names_of_the_removed_heal_notices_are_gone(tunables):
-    for gone in ("_record_heal", "quarantine_damaged"):
-        assert not hasattr(tunables, gone)
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+def test_an_old_notice_marker_kind_is_never_reported(tunables):
     marker = Path(tunables._notice_path())
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({"kind": "reset", "kept_as": "x"}), encoding="utf-8")

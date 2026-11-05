@@ -34,6 +34,7 @@ from typing import Any
 
 from brain import prompt_strings
 from brain.memory.known_names import confirm_readd
+from brain.tools.naming import TOOL_PREFIX_SLOT
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,11 @@ def add_known_name(name: Any, *, persona_dir: Path, **_unused: Any) -> dict:
         return {"added": False, "name": given}
     outcome = confirm_readd(persona_dir, given)
     if outcome == "asked":
-        return {"added": False, "name": given, "message": _REJECTED_REPLY.format(name=given)}
+        return {
+            "added": False,
+            "name": given,
+            "message": _REJECTED_REPLY.format(name=given, tool_prefix=TOOL_PREFIX_SLOT),
+        }
     if outcome == "too_long":
         return {"added": False, "name": given, "message": _TOO_LONG_REPLY.format(name=given)}
     return {"added": outcome == "added", "name": given}

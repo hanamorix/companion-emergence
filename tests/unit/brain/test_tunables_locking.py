@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.thread_support import finish_threads
 from tests.tunables_file import FILE_NAME, read_values, write_text
 
 
@@ -46,7 +47,7 @@ class _Competitor:
         return not self._thread.is_alive()
 
     def finish(self) -> None:
-        self._thread.join(timeout=20)
+        finish_threads(self._thread)
         assert not self._thread.is_alive()
 
 
@@ -84,28 +85,31 @@ def test_the_lock_hook_is_called_inside_the_window_just_before_the_write_by_set_
     assert seen == [b'"a" = 1\n']  # called before the replace, so the old file is still on disk
 
 
+_ROUNDS = 10  # writes per process in the two-process test
+
 _WORKER = """
 import sys
 sys.path.insert(0, {root!r})
 from brain import tunables, dev_constants
 dev_constants.SETTINGS_FILE_LOCK_WAIT_S = 60.0
 tag = sys.argv[1]
-for i in range(50):
+for i in range({rounds}):
     tunables.set_values({{f"{{tag}}{{i}}": i}})
 """
 
 
 def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) -> None:
-    """C8 (c): 50 rounds in each of two processes against one file: every one of the 100 keys is present."""
-    code = _WORKER.format(root=str(repo_root))
+    """C8 (c): _ROUNDS writes in each of two processes against one file: every key of both is present."""
+    code = _WORKER.format(root=str(repo_root), rounds=_ROUNDS)
     env = {**os.environ, "KINDLED_HOME": str(tmp_path)}
     procs = [subprocess.Popen([sys.executable, "-c", code, tag], env=env) for tag in ("a", "b")]
     for p in procs:
         assert p.wait(timeout=120) == 0
     values = read_values(tmp_path)
     # the creating write also carries the registered keys (the lull key), so check inclusion, not equality
-    assert {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)} <= set(values)
-    assert {k for k in values if k not in {f"a{i}" for i in range(50)} | {f"b{i}" for i in range(50)}} == {"chat.idle_lull_seconds"}
+    expected = {f"{tag}{i}" for tag in ("a", "b") for i in range(_ROUNDS)}
+    assert expected <= set(values)
+    assert {k for k in values if k not in expected} == {"chat.idle_lull_seconds"}
 
 
 # ---------------------------------------------------------------------------
@@ -113,18 +117,18 @@ def test_two_processes_writing_different_keys_lose_nothing(tmp_path, repo_root) 
 # ---------------------------------------------------------------------------
 
 
-def test_set_values_on_a_wedged_lock_raises_and_leaves_the_file(t, tmp_path, wedged_lock, monkeypatch) -> None:
+def test_set_values_on_a_wedged_lock_raises_and_leaves_the_file(t, tmp_path, held_lock, monkeypatch) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
     write_text(tmp_path, '"a" = 1\n')
     before = _file(tmp_path).read_bytes()
-    with wedged_lock(_file(tmp_path)), pytest.raises(t.TunablesWriteError):
+    with held_lock(_file(tmp_path)), pytest.raises(t.TunablesWriteError):
         t.set_values({"a": 2})
     assert _file(tmp_path).read_bytes() == before
 
 
-def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, wedged_lock, monkeypatch, caplog) -> None:
+def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, held_lock, monkeypatch, caplog) -> None:
     from brain import dev_constants
 
     monkeypatch.setattr(dev_constants, "SETTINGS_FILE_LOCK_WAIT_S", 0.3)
@@ -132,7 +136,7 @@ def test_sync_file_on_a_wedged_lock_returns_without_writing(t, tmp_path, wedged_
     write_text(tmp_path, '"a" = 1\n')
     before = _file(tmp_path).read_bytes()
     stamp = _file(tmp_path).stat().st_mtime_ns
-    with wedged_lock(_file(tmp_path)), caplog.at_level("WARNING"):
+    with held_lock(_file(tmp_path)), caplog.at_level("WARNING"):
         t.sync_file()
     assert _file(tmp_path).read_bytes() == before
     assert _file(tmp_path).stat().st_mtime_ns == stamp

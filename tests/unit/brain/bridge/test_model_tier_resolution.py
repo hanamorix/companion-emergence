@@ -505,18 +505,50 @@ def test_the_chat_choice_follows_the_effective_id(persona_dir, model_override) -
 
 
 # ---------------------------------------------------------------------------
-# C38: no import cycle, whichever module is imported first
+# C38: no import cycle, whichever of the distinct import orders comes first
 # ---------------------------------------------------------------------------
 
-_FIRST = ["brain.bridge.model_error", "brain.bridge.model_tier", "brain.bridge.provider", "brain.bridge.persona_state", "brain.tunables"]
+# Every fresh interpreter imports all of these; only the module imported FIRST varies.
+_MODULES = [
+    "brain.bridge.model_error",
+    "brain.bridge.model_tier",
+    "brain.bridge.provider",
+    "brain.bridge.persona_state",
+    "brain.tunables",
+]
+# Three first imports are enough, read off the import graph. Importing any `brain.bridge.X` first runs
+# `brain/bridge/__init__.py` first, which imports provider, which loads tunables, model_error and model_tier in one fixed
+# order, so model_error-, model_tier- and provider-first are the same load sequence (the cycle between model_error and
+# model_tier is broken by the function-scoped `from brain.bridge import model_error` in model_tier.py `model_for_tier` and
+# `set_job_models`), and persona_state-first is that sequence plus its own imports (nothing in the chain imports it).
+# tunables-first is the one other order (tunables imports nothing from brain.bridge). So there are two distinct orders
+# today; the third entry is persona_state, the one module the chain does not load. The premise is checked, not assumed:
+# the bridge entries first import the bare package and check that the chain was loaded by it; if that fails the five
+# orders are different processes again and the dropped entries (model_tier, provider) must be restored.
+_FIRST = ["brain.bridge.model_error", "brain.bridge.persona_state", "brain.tunables"]
+_PREMISE = (
+    "import sys\n"
+    "import brain.bridge\n"
+    "_missing = [m for m in ('brain.bridge.provider', 'brain.bridge.model_error', 'brain.bridge.model_tier', "
+    "'brain.tunables') if m not in sys.modules]\n"
+    "if _missing:\n"
+    "    raise SystemExit(f'importing brain.bridge no longer loads {_missing}, so the import orders are different "
+    "again: restore the first-import entries of the modules named (model_tier, provider)')\n"
+)
+
+
+def _import_script(first: str) -> str:
+    """The program a fresh interpreter runs: (for a bridge module, check the premise,) import ``first``, then every other
+    module of ``_MODULES``."""
+    premise = _PREMISE if first.startswith("brain.bridge.") else ""
+    others = [m for m in _MODULES if m != first]
+    return premise + f"import {first}\n" + "".join(f"import {m}\n" for m in others) + "print('ok')\n"
 
 
 @pytest.mark.parametrize("first", _FIRST)
 def test_every_import_order_succeeds_in_a_fresh_interpreter(first, tmp_path) -> None:
-    others = [m for m in _FIRST if m != first]
-    code = f"import {first}\n" + "".join(f"import {m}\n" for m in others) + "print('ok')\n"
     out = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", _import_script(first)],
         capture_output=True,
         text=True,
         env={**os.environ, "PYTHONPATH": str(_REPO_ROOT), "KINDLED_HOME": str(tmp_path)},

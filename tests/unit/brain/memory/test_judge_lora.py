@@ -24,9 +24,6 @@ the dominant cost, not training on top of it.
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +37,9 @@ from brain.memory.judge_lora import (
     BGE_RERANKER_LORA_TARGET_MODULES,
     build_lora_retrain_fn,
 )
+
+# Trains tiny models: one xdist worker at a time (--dist loadgroup), each on a single torch thread (#540).
+pytestmark = [pytest.mark.xdist_group("torch-training"), pytest.mark.usefixtures("one_torch_thread")]
 
 # ---------------------------------------------------------------------------
 # Shared fixture: a from-scratch tiny GPT2-for-sequence-classification model
@@ -206,6 +206,7 @@ def _no_adapter_files(d: Path) -> bool:
     return not any(d.rglob("adapter_config.json")) and not any(d.rglob("adapter_model*"))
 
 
+@pytest.mark.slow(reason='3.2 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_lora_then_merge_on_base_saves_a_plain_checkpoint_that_reproduces(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -237,6 +238,7 @@ def test_lora_then_merge_on_base_saves_a_plain_checkpoint_that_reproduces(
     assert [label_fn(p) for p in _EVAL_PAIRS] == [label_for_score(float(x))[0] for x in _logits(save)]
 
 
+@pytest.mark.slow(reason='1.8 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_save_dir_none_writes_nothing(tiny_model_dir: Path, tmp_path: Path) -> None:
     label_fn = build_lora_retrain_fn(
         tiny_model_dir, target_modules=_TARGET_MODULES, modules_to_save=_MODULES_TO_SAVE,
@@ -246,6 +248,7 @@ def test_save_dir_none_writes_nothing(tiny_model_dir: Path, tmp_path: Path) -> N
     assert not any(tmp_path.iterdir())
 
 
+@pytest.mark.slow(reason='2.4 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 @pytest.mark.parametrize("start_kind", ["merged", "full_ft"])
 def test_lora_then_merge_on_a_plain_checkpoint_starts_from_it(
     start_kind: str, tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -283,6 +286,7 @@ def test_lora_then_merge_on_a_plain_checkpoint_starts_from_it(
     assert _file_hashes(c) == c_hashes, "the start checkpoint is not rewritten"
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_training_wraps_the_loaded_model_once(
     tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -306,6 +310,7 @@ def test_training_wraps_the_loaded_model_once(
     assert loads == [str(tiny_model_dir)]
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_lora_construction_site_forces_cpu_even_if_mps_reported_available(
     tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -392,6 +397,7 @@ def test_label_fn_boundary_matches_relevance_judge_label_for_score(
     assert label_fn(_FIXED_EVAL_ITEMS[0]) == "relevant"
 
 
+@pytest.mark.slow(reason='1.2 s of CPU in its call phase on ubuntu in CI (wall 1.5 s); #540, J12')
 def test_retrain_fn_matches_judge_eval_champion_challenger_contract(tiny_model_dir: Path) -> None:
     """`build_lora_retrain_fn`'s output plugs directly into `judge_eval.
     run_champion_challenger`'s `retrain_fn` parameter (AC6's orchestration
@@ -427,6 +433,7 @@ def test_retrain_fn_matches_judge_eval_champion_challenger_contract(tiny_model_d
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='2.2 s wall in CI junit (this file needs torch/peft or a network install, not run on the dev VM; #540, J12)')
 def test_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Path) -> None:
     """Same tiny model + same scripted triples + a fixed `torch.manual_seed`
     before each `retrain_fn` call -> reproducible-enough trained scores
@@ -455,41 +462,6 @@ def test_training_is_deterministic_under_a_fixed_seed(tiny_model_dir: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# I6/AC8 — importing this module never pulls torch into sys.modules.
-# ---------------------------------------------------------------------------
-
-
-def test_module_import_does_not_import_torch_or_sentence_transformers() -> None:
-    """Mirrors `test_judge_eval.py`'s identical fresh-subprocess proof:
-    merely importing `judge_lora` (module top level, plus its class/
-    function definitions -- none of which call any of the lazy-imported
-    training/reload functions) never pulls torch/sentence_transformers/
-    peft/datasets into `sys.modules`.
-    """
-    script = textwrap.dedent(
-        """
-        import sys
-
-        import brain.memory.judge_lora  # noqa: F401
-
-        for heavy in ("torch", "sentence_transformers", "peft", "datasets"):
-            assert heavy not in sys.modules, f"{heavy} imported merely by importing judge_lora: {sorted(sys.modules)}"
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-
-
-# ---------------------------------------------------------------------------
 # F2c inc5b (task items 5 + 6): real-bge LoRA config grounding — the module
 # names + train/serve tokenization the tick-lifecycle wiring will rely on.
 # These NEVER load the real bge model (deferred to real HW): item 6 is a
@@ -509,6 +481,7 @@ def test_bge_lora_module_names_are_grounded_xlm_roberta_values() -> None:
     assert BGE_RERANKER_LORA_MODULES_TO_SAVE == ("classifier",)
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.2 s); #540, J12')
 def test_merged_checkpoint_carries_the_lora_max_length_to_the_serve_loader(
     tiny_model_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

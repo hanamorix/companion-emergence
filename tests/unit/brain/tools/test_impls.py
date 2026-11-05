@@ -155,26 +155,6 @@ def test_get_body_state_returns_real_shape(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_search_memories_with_hits(tmp_path: Path) -> None:
-    """search_memories returns matching memories in formatted shape."""
-    from brain.tools.impls.search_memories import search_memories
-
-    store = _make_store()
-    hebbian = _make_hebbian()
-    _seed_memory(store, content="Hana said I love you and it stayed with me")
-
-    result = search_memories("love", store=store, hebbian=hebbian, persona_dir=tmp_path)
-
-    assert result["query"] == "love"
-    assert result["count"] > 0
-    assert len(result["memories"]) > 0
-    m = result["memories"][0]
-    assert "id" in m
-    assert "content" in m
-    assert "memory_type" in m
-    assert "emotions" in m
-
-
 def test_search_memories_no_hits_returns_empty(tmp_path: Path) -> None:
     """search_memories with no matching content returns empty list, not error."""
     from brain.tools.impls.search_memories import search_memories
@@ -247,7 +227,7 @@ def test_search_memories_emotion_partition_uses_id_not_object_identity(tmp_path:
 
 def test_search_memories_multiword_query_matches_individual_tokens(tmp_path: Path) -> None:
     """Multi-word query should match memories containing any token, not require
-    the full phrase as an exact substring.
+    the full phrase as an exact substring; the result is in the formatted shape.
 
     Regression: previously search_memories passed the full query string to
     LIKE '%full query string%', so 'Henryk preferences personality identity'
@@ -270,6 +250,14 @@ def test_search_memories_multiword_query_matches_individual_tokens(tmp_path: Pat
         "multi-word query must find memories containing any of the tokens; "
         "got zero results even though memory contains 'Henryk'"
     )
+    # and the result comes back in the formatted shape
+    assert result["query"] == "Henryk preferences personality identity"
+    assert len(result["memories"]) > 0
+    m = result["memories"][0]
+    assert "id" in m
+    assert "content" in m
+    assert "memory_type" in m
+    assert "emotions" in m
 
 
 # ─────────────────────────────────────────────────────────────────────────────

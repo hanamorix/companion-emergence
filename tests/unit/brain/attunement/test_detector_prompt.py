@@ -14,11 +14,7 @@ def test_prompt_requires_evidence_list() -> None:
     assert "quote" in prompt               # entry field
     assert "turn_id" in prompt             # entry field
     assert "verbatim" in prompt.lower()
-
-
-def test_prompt_requires_evidence_turn_id() -> None:
-    prompt = build_detector_system_prompt()
-    assert "turn_id" in prompt
+    assert "addressed_pattern_ids" in prompt  # the schema field the detector fills in
 
 
 def test_prompt_lists_all_five_categories() -> None:
@@ -37,17 +33,12 @@ def test_prompt_includes_decline_on_uncertainty_instruction() -> None:
     assert "cannot" in prompt.lower() or "can't" in prompt.lower()
 
 
-def test_prompt_is_deterministic() -> None:
-    """Snapshot equality — the prompt is a constant, not a generator."""
-    assert build_detector_system_prompt() == build_detector_system_prompt()
-
-
 def test_prompt_grounds_companion_identity() -> None:
     """v0.0.33 fix: without identity grounding, the CLI-wrapped detector
     falls back to its self-concept and names the companion 'Claude' in
-    pattern descriptions (live Phoebe report, 2026-06-11)."""
-    prompt = build_detector_system_prompt(companion_name="Phoebe", user_name="Hana")
-    assert "between Hana (the user) and the user's companion, Phoebe" in prompt
+    pattern descriptions (a live persona's report, 2026-06-11)."""
+    prompt = build_detector_system_prompt(companion_name="Canary", user_name="Bob")
+    assert "between Bob (the user) and the user's companion, Canary" in prompt
     assert 'never "Claude"' in prompt
 
 

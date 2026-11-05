@@ -17,10 +17,11 @@ import socket
 import socketserver
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests.source_tree import brain_sources, brain_trees
 
 TOKEN = "secret-token-475"
 _PROXY_VARS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "WS_PROXY", "ws_proxy"]
@@ -243,7 +244,6 @@ def test_the_direct_websocket_connect_never_uses_a_proxy(world):
 # A scan, so a new loopback call cannot be added the old way
 # ---------------------------------------------------------------------------
 
-_BRAIN = Path(__file__).resolve().parents[4] / "brain"
 _HTTPX_VERBS = {"get", "post", "put", "patch", "delete", "head", "request", "stream"}
 _HTTPX_CLIENTS = {"Client", "AsyncClient"}
 # provider.py talks to an Ollama host the user configures (possibly remote, possibly behind a proxy on purpose).
@@ -259,10 +259,12 @@ def _is_false(node: ast.AST | None) -> bool:
     return isinstance(node, ast.Constant) and node.value is False
 
 
-def violations(source: str, rel: str) -> list[str]:
-    """Every way the source could reach the bridge through the environment's proxy settings (code review 3b, S1)."""
+def violations(source: str, rel: str, tree: ast.Module | None = None) -> list[str]:
+    """Every way the source could reach the bridge through the environment's proxy settings (code review 3b, S1).
+
+    ``tree`` is ``source`` already parsed (parsed here when omitted)."""
     out: list[str] = []
-    tree = ast.parse(source)
+    tree = ast.parse(source) if tree is None else tree
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
 
     def enclosing_function(node: ast.AST) -> str | None:
@@ -312,8 +314,9 @@ def violations(source: str, rel: str) -> list[str]:
 
 def _brain_violations() -> list[str]:
     found: list[str] = []
-    for path in sorted(_BRAIN.rglob("*.py")):
-        found += violations(path.read_text(encoding="utf-8"), path.relative_to(_BRAIN).as_posix())
+    trees = brain_trees()
+    for full, source in brain_sources().items():
+        found += violations(source, full.removeprefix("brain/"), trees[full])
     return found
 
 

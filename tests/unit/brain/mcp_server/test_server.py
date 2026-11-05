@@ -39,7 +39,7 @@ def test_run_server_opens_and_closes_stores(tmp_path: Path) -> None:
 
     captured: dict = {}
 
-    def _capture_register(server, *, persona_dir, store, hebbian):
+    def _capture_register(server, *, persona_dir, store, hebbian, tool_prefix=""):
         captured["store"] = store
         captured["hebbian"] = hebbian
         captured["persona_dir"] = persona_dir
@@ -76,7 +76,7 @@ def test_main_entry_runs(tmp_path: Path) -> None:
     persona = _seed_persona(tmp_path)
 
     # Use subprocess so we exercise the real argparse path. The MCP server
-    # would normally hang on stdio_server() — we kill it after a moment.
+    # would normally wait on stdio_server(): closing stdin below ends it.
     proc = subprocess.Popen(
         [sys.executable, "-m", "brain.mcp_server", "--persona-dir", str(persona)],
         stdin=subprocess.PIPE,
@@ -86,7 +86,8 @@ def test_main_entry_runs(tmp_path: Path) -> None:
     try:
         # Passing empty bytes causes communicate() to close stdin (EOF),
         # which the stdio MCP server detects and exits cleanly.
-        stdout, stderr = proc.communicate(input=b"", timeout=5)
+        # The call returns as soon as the child exits; 60 s is only a hang guard for a loaded host.
+        stdout, stderr = proc.communicate(input=b"", timeout=60)
         # Exit code 0 means the entry point parsed args and the server
         # ran cleanly. Non-zero means a crash before stdio_server returned.
         assert proc.returncode == 0, f"Server exited {proc.returncode}.\nstderr:\n{stderr.decode()}"
@@ -102,7 +103,7 @@ def test_main_entry_missing_flag_exits_nonzero() -> None:
         [sys.executable, "-m", "brain.mcp_server"],
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=60,  # a hang guard: argparse exits at once
     )
     assert proc.returncode != 0
     assert "--persona-dir" in proc.stderr

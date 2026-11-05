@@ -349,14 +349,6 @@ def test_heartbeat_engine_construction(tmp_path: Path) -> None:
     hebbian.close()
 
 
-def test_heartbeat_config_load_invalid_json_returns_defaults(tmp_path: Path) -> None:
-    """Malformed JSON in config → defaults, no crash."""
-    path = tmp_path / "cfg.json"
-    path.write_text("not json at all {[}")
-    c = HeartbeatConfig.load(path)
-    assert c.dream_every_hours == 24.0
-
-
 def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path) -> None:
     """Hand-edited config with wrong-type values (dream_every_hours={} etc.)
     must NOT crash the CLI with TypeError. Graceful degrade to defaults.
@@ -365,15 +357,6 @@ def test_heartbeat_config_load_wrong_type_value_returns_defaults(tmp_path: Path)
     path.write_text(json.dumps({"dream_every_hours": {}}))
     c = HeartbeatConfig.load(path)
     assert c.dream_every_hours == 24.0
-
-
-def test_heartbeat_state_load_corrupt_returns_none(tmp_path: Path) -> None:
-    """A corrupt state file returns None (→ engine treats as first-ever tick
-    and reinitialises) rather than crashing with a traceback.
-    """
-    path = tmp_path / "state.json"
-    path.write_text("not json")
-    assert HeartbeatState.load(path) is None
 
 
 def test_heartbeat_state_load_missing_keys_returns_none(tmp_path: Path) -> None:
@@ -1726,8 +1709,9 @@ def test_heartbeat_config_load_corrupt_file_restores_from_bak(tmp_path: Path) ->
     assert "bak1" in anomaly.action
 
 
-def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
-    """Corrupt heartbeat_state.json → None returned + quarantine file present."""
+def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path, caplog) -> None:
+    """Corrupt heartbeat_state.json → None returned + quarantine file present; the public `load` returns None
+    too and logs the anomaly."""
     path = tmp_path / "heartbeat_state.json"
     path.write_text("{corrupt json{{", encoding="utf-8")
 
@@ -1738,6 +1722,13 @@ def test_heartbeat_state_load_corrupt_file_quarantines_and_resets(tmp_path: Path
     assert anomaly.kind == "json_parse_error"
     corrupt_files = list(tmp_path.glob("heartbeat_state.json.corrupt-*"))
     assert len(corrupt_files) == 1
+
+    public = tmp_path / "public" / "heartbeat_state.json"
+    public.parent.mkdir()
+    public.write_text("not json", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert HeartbeatState.load(public) is None
+    assert any("HeartbeatState anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_heartbeat_state_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
@@ -2256,6 +2247,34 @@ def test_emotion_within_baseline_does_not_emit(tmp_path: Path) -> None:
         engine.hebbian.close()
 
 
+def test_emotion_spike_draft_is_written_in_this_personas_and_users_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#135: the spike-draft call passed neither name, so every persona's draft prompt said "Nell" and "my user"."""
+    prompts: list[str] = []
+
+    class _Recorder:
+        def complete(self, prompt: str) -> str:
+            prompts.append(prompt)
+            return "a quiet note"
+
+    monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", lambda *_a, **_k: _Recorder())
+    engine, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    (persona_dir / "persona_config.json").write_text(json.dumps({"user_name": "Bob"}), encoding="utf-8")
+    try:
+        for i in range(24):
+            engine.run_tick(trigger="close", forced_resonance=5.0 + 0.2 * (i % 3))
+        engine.run_tick(trigger="close", forced_resonance=5.4)  # the draft band, as in the test below
+    finally:
+        engine.store.close()
+        engine.hebbian.close()
+
+    drafts = [p for p in prompts if "emotion_spike" in p]
+    assert drafts, "the spike tick never composed a draft"
+    assert persona_dir.name in drafts[-1] and "Nell" not in drafts[-1]
+    assert "Bob" in drafts[-1] and "my user" not in drafts[-1]
+
+
 def test_emotion_subthreshold_writes_draft_not_initiate(tmp_path: Path) -> None:
     """A 0.5σ ≤ delta < 1.5σ spike writes a draft fragment, not an initiate."""
     from brain.initiate.emit import read_candidates
@@ -2443,6 +2462,9 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         "brain.engines.heartbeat.build_tier_provider",
         lambda persona_dir, tier: provider,
     )
+    # The completion-candidate step builds its own classifier-tier provider (topic overlap); without this it starts the
+    # real claude CLI on a machine that has it (the CI guard, tests/claude_spawn_guard.py, caught it).
+    monkeypatch.setattr("brain.engines.research.build_tier_provider", lambda persona_dir, tier: FakeProvider())
 
     # On-disk so store.persona_dir == tmp_path (== interests_path.parent, the
     # heartbeat's persona_dir): the gated "research" candidate lands in that

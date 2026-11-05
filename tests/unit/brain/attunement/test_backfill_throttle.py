@@ -2,7 +2,7 @@
 
 `run_backfill` loops `detector_fn` once per sampled window, and each call is a
 fresh `claude -p` subprocess. It took no `cli_throttle` slot, so it could issue
-up to `DAILY_BUDGET_DEFAULT = 150` back-to-back spawns while another background
+up to `ATTUNEMENT_DAILY_BUDGET_DEFAULT = 150` back-to-back spawns while another background
 engine held the single slot — and `_inflight_background` never saw it, so
 nothing backed off for it either.
 
@@ -21,8 +21,9 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+from brain import dev_constants
 from brain.attunement.backfill import run_backfill
-from brain.attunement.schemas import SCHEMA_VERSION, CurrentRead, DetectorOutput
+from brain.attunement.schemas import CurrentRead, DetectorOutput
 
 
 def _make_buffer_file(persona_dir: Path, n_turns: int) -> None:
@@ -53,7 +54,7 @@ def _fake_detector_output() -> DetectorOutput:
             mood_valence=0.0,
             mood_intensity=0.0,
             predicted_arc_shape="z",
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
         pattern_candidates=[],
     )

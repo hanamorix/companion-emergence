@@ -8,8 +8,8 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from starlette.testclient import TestClient
 
+from brain import dev_constants
 from brain.kindled_link.identity import KindledIdentity
-from brain.kindled_link.limits import INBOUND_FLOOD_CAP
 from brain.kindled_link.protocol import (
     ROLE_INITIATOR,
     ROLE_RESPONDER,
@@ -157,10 +157,10 @@ def test_tampered_envelope_rejected_no_transcript(tmp_path):
     assert len(sb.recent_transcript(idn_a.key_id)) == 0
 
 
-# C1: flood cap — INBOUND_FLOOD_CAP + N envelopes, only cap processed, N left un-acked
+# C1: flood cap — KINDLED_LINK_INBOUND_FLOOD_CAP + N envelopes, only cap processed, N left un-acked
 
 def test_flood_cap_limits_processed_envelopes(tmp_path):
-    """A peer-group of INBOUND_FLOOD_CAP + 5 → exactly CAP processed, 5 left un-acked,
+    """A peer-group of KINDLED_LINK_INBOUND_FLOOD_CAP + 5 → exactly CAP processed, 5 left un-acked,
     peer marked degraded."""
     idn_a, idn_b = _idn_pair()
     rc_a, rc_b = _make_relay_pair(idn_a, idn_b)
@@ -169,7 +169,7 @@ def test_flood_cap_limits_processed_envelopes(tmp_path):
     sa, sb = _paired_stores(tmp_path, idn_a, idn_b, sk, sid)
 
     excess = 5
-    total = INBOUND_FLOOD_CAP + excess
+    total = dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP + excess
 
     # Push total envelopes from A → B's mailbox, each with a unique seq
     for seq in range(1, total + 1):
@@ -190,8 +190,8 @@ def test_flood_cap_limits_processed_envelopes(tmp_path):
     summary = poll_and_ingest(sb, idn_b, rc_b, now=_NOW)
 
     # Exactly CAP transcript rows accepted
-    assert summary["accepted"].get(idn_a.key_id, 0) == INBOUND_FLOOD_CAP
-    assert len(sb.recent_transcript(idn_a.key_id, limit=total + 1)) == INBOUND_FLOOD_CAP
+    assert summary["accepted"].get(idn_a.key_id, 0) == dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP
+    assert len(sb.recent_transcript(idn_a.key_id, limit=total + 1)) == dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP
 
     # Peer marked degraded
     assert idn_a.key_id in summary["degraded"]
@@ -201,7 +201,7 @@ def test_flood_cap_limits_processed_envelopes(tmp_path):
     assert len(remaining) == excess
 
 
-# C2: verify_and_open call count ≤ INBOUND_FLOOD_CAP in a flooded poll
+# C2: verify_and_open call count ≤ KINDLED_LINK_INBOUND_FLOOD_CAP in a flooded poll
 
 def test_flood_cap_bounds_verify_and_open_call_count(tmp_path):
     """The number of verify_and_open/decrypt calls in a flooded poll is ≤ cap.
@@ -214,7 +214,7 @@ def test_flood_cap_bounds_verify_and_open_call_count(tmp_path):
     sa, sb = _paired_stores(tmp_path, idn_a, idn_b, sk, sid)
 
     excess = 3
-    total = INBOUND_FLOOD_CAP + excess
+    total = dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP + excess
 
     for seq in range(1, total + 1):
         env = build_envelope(
@@ -244,8 +244,8 @@ def test_flood_cap_bounds_verify_and_open_call_count(tmp_path):
     with patch.object(transport_mod, "verify_and_open", side_effect=counting_vao):
         poll_and_ingest(sb, idn_b, rc_b, now=_NOW)
 
-    assert len(call_count) <= INBOUND_FLOOD_CAP, (
-        f"verify_and_open called {len(call_count)} times — must be ≤ {INBOUND_FLOOD_CAP}"
+    assert len(call_count) <= dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP, (
+        f"verify_and_open called {len(call_count)} times — must be ≤ {dev_constants.KINDLED_LINK_INBOUND_FLOOD_CAP}"
     )
 
 

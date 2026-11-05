@@ -6,12 +6,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from brain import dev_constants
 from brain.attunement.backfill import run_backfill
-from brain.attunement.schemas import (
-    SCHEMA_VERSION,
-    CurrentRead,
-    DetectorOutput,
-)
+from brain.attunement.schemas import CurrentRead, DetectorOutput
 
 
 def _make_buffer_file(persona_dir: Path, n_turns: int) -> None:
@@ -42,7 +39,7 @@ def _fake_detector_output() -> DetectorOutput:
             mood_valence=0.0,
             mood_intensity=0.0,
             predicted_arc_shape="z",
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         ),
         pattern_candidates=[],
     )
@@ -156,7 +153,7 @@ def test_run_backfill_persists_state_after_each_window(tmp_path: Path):
     assert state_path.exists()
     payload = json.loads(state_path.read_text())
     assert payload["status"] == "complete"
-    assert payload["schema_version"] == SCHEMA_VERSION
+    assert payload["schema_version"] == dev_constants.ATTUNEMENT_SCHEMA_VERSION
 
 
 def test_run_backfill_default_detector_threads_identity(tmp_path: Path):

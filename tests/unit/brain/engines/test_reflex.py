@@ -117,13 +117,6 @@ def test_reflex_arc_set_load_missing_logs_info_not_warning(tmp_path: Path, caplo
         )
 
 
-def test_reflex_arc_set_load_corrupt_falls_back_to_defaults(tmp_path: Path):
-    bad = tmp_path / "arcs.json"
-    bad.write_text("not valid json{{{", encoding="utf-8")
-    loaded = ReflexArcSet.load(bad, default_path=DEFAULT_ARCS_PATH)
-    assert len(loaded.arcs) == 4
-
-
 def test_reflex_arc_set_load_valid_file(tmp_path: Path):
     path = tmp_path / "arcs.json"
     path.write_text(
@@ -172,8 +165,9 @@ def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Pat
     assert len(corrupt_files) == 1
 
 
-def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path):
-    """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default."""
+def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path, caplog):
+    """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default; the public
+    `load` returns the same default arcs and logs the anomaly."""
     path = tmp_path / "reflex_arcs.json"
     path.write_text("{corrupt{{", encoding="utf-8")
 
@@ -183,6 +177,14 @@ def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path):
     assert anomaly.action == "reset_to_default"
     # default_path arcs loaded (4 OG arcs)
     assert len(result.arcs) == 4
+
+    public = tmp_path / "public" / "reflex_arcs.json"
+    public.parent.mkdir()
+    public.write_text("not valid json{{{", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        loaded = ReflexArcSet.load(public, default_path=DEFAULT_ARCS_PATH)
+    assert len(loaded.arcs) == 4
+    assert any("ReflexArcSet anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_reflex_log_save_with_backup_creates_bak(tmp_path: Path):
@@ -206,13 +208,6 @@ def test_reflex_log_save_with_backup_creates_bak(tmp_path: Path):
 
 def test_reflex_log_load_missing_returns_empty(tmp_path: Path):
     log = ReflexLog.load(tmp_path / "nope.json")
-    assert log.fires == ()
-
-
-def test_reflex_log_load_corrupt_returns_empty(tmp_path: Path):
-    path = tmp_path / "log.json"
-    path.write_text("{{{not json", encoding="utf-8")
-    log = ReflexLog.load(path)
     assert log.fires == ()
 
 
@@ -987,5 +982,122 @@ def test_reflex_firing_below_threshold_does_not_emit_candidate(tmp_path: Path):
         row = _json.loads(lines[0])
         assert row["source"] == "reflex_firing"
         assert row["gate_name"] == "flinch_intensity_min"
+    finally:
+        store.close()
+
+
+# ---- spelling variants of an emotion name in an arc ----
+
+
+def _variant_arc_dict(name: str, trigger: dict, template: str = "t") -> dict:
+    return {
+        "name": name,
+        "description": "d",
+        "trigger": trigger,
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": template,
+    }
+
+
+def test_reflex_arc_from_dict_keys_trigger_by_canonical_name(tmp_path: Path):
+    trigger = {"comfort-seeking": 5, "not_a_real_emotion": 6}
+    expected = {"comfort_seeking": 5.0, "not_a_real_emotion": 6.0}  # an unknown name in canonical form is kept as is
+
+    assert ReflexArc.from_dict(_variant_arc_dict("a", trigger)).trigger == expected
+
+    path = tmp_path / "arcs.json"
+    path.write_text(json.dumps({"version": 1, "arcs": [_variant_arc_dict("a", trigger)]}), encoding="utf-8")
+    before = path.read_bytes()
+    loaded = ReflexArcSet.load(path, default_path=DEFAULT_ARCS_PATH)
+
+    assert loaded.arcs[0].trigger == expected
+    assert path.read_bytes() == before  # the user's file keeps their spelling
+
+
+@pytest.mark.parametrize(
+    ("trigger", "expected"),
+    [
+        ({"comfort-seeking": 5, "Comfort_Seeking": 8}, 8.0),
+        ({"Comfort_Seeking": 8, "comfort-seeking": 5}, 8.0),
+        ({"comfort-seeking": 6, "Comfort_Seeking": 6}, 6.0),
+    ],
+)
+def test_reflex_arc_trigger_spelling_variants_keep_the_higher_threshold(trigger, expected):
+    arc = ReflexArc.from_dict(_variant_arc_dict("a", trigger))
+
+    assert arc.trigger == {"comfort_seeking": expected}
+
+
+@pytest.mark.parametrize(
+    ("arc_spelling", "stored_spelling"),
+    [("comfort-seeking", "comfort_seeking"), ("Comfort_Seeking", "comfort-seeking")],
+)
+def test_run_tick_fires_a_variant_triggered_arc_on_the_canonical_channel(
+    tmp_path: Path, arc_spelling: str, stored_spelling: str
+):
+    arcs_path = tmp_path / "arcs.json"
+    payload = {
+        "version": 1,
+        "arcs": [
+            _variant_arc_dict("variant_arc", {arc_spelling: 5}),
+            # an unregistered look-alike of a registered name must not merge into the channel
+            _variant_arc_dict("look_alike_arc", {"comfort": 5}),
+        ],
+    }
+    arcs_path.write_text(json.dumps(payload), encoding="utf-8")
+    arcs_before = arcs_path.read_bytes()
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        seed_id = _seed_emotion_memory(store, {stored_spelling: 8.0})
+        engine = _build_engine(tmp_path, store)
+        engine.arcs_path = arcs_path
+        result = engine.run_tick(dry_run=False)
+
+        assert [f.arc_name for f in result.arcs_fired] == ["variant_arc"]
+        assert result.arcs_fired[0].trigger_state == {"comfort_seeking": 8.0}
+        assert any(
+            s.arc_name == "look_alike_arc" and s.reason == "trigger_not_met" for s in result.arcs_skipped
+        )
+        assert arcs_path.read_bytes() == arcs_before  # arcs file untouched
+        assert store.get(seed_id).emotions == {stored_spelling: 8.0}  # stored row untouched
+    finally:
+        store.close()
+
+
+def test_run_tick_prompt_resolves_variant_spelled_placeholders(tmp_path: Path):
+    arcs_path = tmp_path / "arcs.json"
+    template = "{comfort-seeking}|{Comfort_Seeking}|{no_such_field}|{love}"
+    arcs_path.write_text(
+        json.dumps({"version": 1, "arcs": [_variant_arc_dict("a", {"comfort_seeking": 5}, template)]}),
+        encoding="utf-8",
+    )
+    captured: list[str] = []
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "ok"
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _seed_emotion_memory(store, {"comfort_seeking": 8.0})
+        engine = ReflexEngine(
+            store=store,
+            provider=CapturingProvider(),
+            persona_name="Nell",
+            persona_system_prompt="",
+            arcs_path=arcs_path,
+            log_path=tmp_path / "log.json",
+            default_arcs_path=DEFAULT_ARCS_PATH,
+        )
+        result = engine.run_tick(dry_run=False)
+
+        assert len(result.arcs_fired) == 1
+        # a variant spelling reads the channel; a name that is not an emotion, and an emotion with no value, stay "0"
+        assert captured[0] == "8.0|8.0|0|0"
     finally:
         store.close()

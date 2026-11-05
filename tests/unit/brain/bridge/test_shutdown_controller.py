@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from brain.bridge.shutdown import BridgeShutdownController
+from tests.thread_support import finish_threads
 
 
 class FakeServer:
@@ -274,7 +275,7 @@ def test_update_never_loses_a_competing_write(own_record, monkeypatch):
 
     monkeypatch.setattr(state_file, "_update_between", _between)
     assert state_file.update(own_record, lambda st: setattr(st, "phase", "stopping"))
-    other.join(5)
+    finish_threads(other)
     st = state_file.read(own_record)
     assert st.phase == "stopping" and st.stop_reason == "x"
 

@@ -13,6 +13,7 @@ import threading
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from brain.kindled_link.identity import _KEY_DIRNAME, _KEY_FILENAME, KindledIdentity
+from tests.thread_support import finish_threads
 
 
 def _race(persona_dir, monkeypatch, n=2):
@@ -38,7 +39,7 @@ def _race(persona_dir, monkeypatch, n=2):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=20)
+        finish_threads(t)
     monkeypatch.setattr(Ed25519PrivateKey, "generate", staticmethod(real_generate))
     return results
 

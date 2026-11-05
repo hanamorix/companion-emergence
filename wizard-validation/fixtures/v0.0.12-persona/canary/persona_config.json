@@ -1,0 +1,7 @@
+{
+  "persona_name": "canary",
+  "user_name": "bob",
+  "voice_template": "nell-example",
+  "provider": "claude-cli",
+  "model": "sonnet"
+}

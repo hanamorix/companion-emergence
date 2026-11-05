@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.files.read_guard import PROTECTED, is_read_denied
 from brain.health.json_io import append_jsonl
 from brain.images import media_type_to_ext, save_image_bytes, sniff_media_type
 from brain.tools.impls import _read_cache
@@ -19,8 +20,8 @@ _FILE_READ_MAX_BYTES = tunables.register(
 # Viewable-image support. The image branch runs BEFORE the 256KB text cap so
 # a real photo (>256KB text cap, <= image_max_bytes) is returned as a viewable
 # image rather than refused by the text cap (P0 red-team F-1 cap-ordering).
-# image_max_bytes defaults >= the 20MB /upload cap so there is no
-# upload-succeeds-but-read-refuses dead zone.
+# image_max_bytes defaults to the same 20 MiB as files.upload_max_bytes (a
+# separate setting), so an image uploaded at the default is not refused here.
 _FILE_IMAGE_TYPES = tunables.register(
     "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"],
     description="Kinds of image the kindled can look at when it opens an image file.",
@@ -29,7 +30,7 @@ _FILE_IMAGE_MAX_BYTES = tunables.register(
     "files.image_max_bytes", 20 * 1024 * 1024,
     description="Largest image the kindled will look at, in bytes.",
 )
-# #126: PDFs are read as extracted text (pypdf, pure-Python). Cap matches /upload.
+# #126: PDFs are read as extracted text (pypdf, pure-Python). The cap defaults to the upload cap's 20 MiB.
 _FILE_PDF_MAX_BYTES = tunables.register(
     "files.pdf_max_bytes", 20 * 1024 * 1024,
     description="Largest PDF the kindled will read, in bytes.",
@@ -203,6 +204,10 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     except Exception as exc:  # noqa: BLE001
         _audit(persona_dir, tool="read_file", path=raw, resolved="", bytes_=0, ok=False, error=str(exc))
         return {"error": f"bad path: {exc}"}
+
+    if is_read_denied(p, persona_dir=persona_dir):
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=False, error=PROTECTED)
+        return {"error": f"refused: {p} is in a {PROTECTED}"}
 
     if not p.exists() or not p.is_file():
         suggestions = _suggest(p)

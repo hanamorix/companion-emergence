@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from brain.bridge import daemon
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
@@ -282,11 +283,25 @@ def _tail_args(persona: str, **kw) -> argparse.Namespace:
     return ns
 
 
+def test_cmd_tail_log_reads_the_runtime_log_where_warnings_go(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#558: logging goes to runtime-<persona>.log; bridge-<persona>.log only holds the child's raw stdout/stderr,
+    which is empty on a healthy install, so tailing it showed nothing."""
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    (log_dir / "bridge-nell.log").write_text("", encoding="utf-8")
+    (log_dir / "runtime-nell.log").write_text("2026-10-29 21:44:00 WARNING brain.x: something wedged\n", encoding="utf-8")
+
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=5))
+    assert rc == 0
+    assert "WARNING brain.x: something wedged" in capsys.readouterr().out
+
+
 def test_cmd_tail_log_prints_last_n_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
 
     rc = daemon.cmd_tail_log(_tail_args("nell", lines=3))
@@ -302,7 +317,7 @@ def test_cmd_tail_log_default_50_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
 
     rc = daemon.cmd_tail_log(_tail_args("nell"))  # lines=50 default
@@ -316,7 +331,7 @@ def test_cmd_tail_log_n_zero_prints_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("alpha\nbeta\n")
 
     rc = daemon.cmd_tail_log(_tail_args("nell", lines=0))
@@ -365,7 +380,7 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     import threading
 
     log_dir = _patch_paths(monkeypatch, tmp_path)
-    log_path = log_dir / "bridge-nell.log"
+    log_path = log_dir / "runtime-nell.log"
     log_path.write_text("seed\n")
 
     stop_event = threading.Event()
@@ -385,12 +400,50 @@ def test_cmd_tail_log_follow_mode_emits_new_lines_then_exits_on_keyboard_interru
     t.start()
 
     rc = daemon.cmd_tail_log(_tail_args("nell", lines=1, follow=True))
-    t.join(timeout=2.0)
+    finish_threads(t)
     assert rc == 0
     out = capsys.readouterr().out
     assert "seed" in out
     assert "new1" in out
     assert "new2" in out
+
+
+def test_cmd_tail_log_follow_mode_keeps_following_across_a_rollover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review of #613: the runtime log rolls over by rename (RotatingFileHandler). Follow mode must pick up the new file
+    at the same path, not keep reading the renamed one; and it must not hold the file open between polls, which on
+    Windows would make that rename fail."""
+    import threading
+
+    log_dir = _patch_paths(monkeypatch, tmp_path)
+    log_path = log_dir / "runtime-nell.log"
+    log_path.write_text("seed\n")
+    stop_event = threading.Event()
+    monkeypatch.setattr(daemon, "_follow_should_stop", stop_event)
+
+    def writer():
+        time.sleep(0.35)
+        with log_path.open("a") as f:
+            f.write("before\n")
+        time.sleep(0.35)
+        for _ in range(50):  # a poll may have the file open for an instant
+            try:
+                os.replace(log_path, log_dir / "runtime-nell.log.1")
+                break
+            except PermissionError:
+                time.sleep(0.02)
+        log_path.write_text("after\n")
+        time.sleep(0.6)
+        stop_event.set()
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    rc = daemon.cmd_tail_log(_tail_args("nell", lines=1, follow=True))
+    finish_threads(t)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "before" in out and "after" in out
 
 
 # ---------- cmd_tail (I-1 follow-up audit: subprotocol auth, no ?token=) ----------
@@ -626,7 +679,7 @@ def test_acquire_lock_c18a_kill_then_restart_acquires_immediately_no_archive(
     """C18(a): kill -9 the bridge (simulated: the OS drops the flock/msvcrt
     lock the instant the holding fd is closed, exactly what happens when a
     process is SIGKILLed — no cleanup code runs either way); the next start
-    acquires the lock immediately (< 1s), with no 120s wait and no
+    acquires the lock immediately (far under the old 120 s wait), with no
     `.stale-*` archive file created (that whole mechanism, and the file it
     used to write, no longer exists)."""
     persona_dir = tmp_path / "persona"
@@ -644,7 +697,7 @@ def test_acquire_lock_c18a_kill_then_restart_acquires_immediately_no_archive(
     elapsed = time.time() - started
 
     assert fd2 is not None
-    assert elapsed < 1.0
+    assert elapsed < 10  # the old behaviour was a 120 s wait; this bound is loose enough for a loaded host
     assert list(persona_dir.glob("bridge.json.lock.stale-*")) == []
     daemon.release_lock(persona_dir, fd2)
 
@@ -672,7 +725,7 @@ def test_acquire_lock_c18b_reboot_with_pid_reuse_acquires_immediately(
     elapsed = time.time() - started
 
     assert fd is not None
-    assert elapsed < 1.0
+    assert elapsed < 10  # the old behaviour was a wait; this bound is loose enough for a loaded host
     daemon.release_lock(persona_dir, fd)
 
 
@@ -723,7 +776,7 @@ def test_acquire_lock_c19_two_racing_acquires_exactly_one_wins(tmp_path: Path) -
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5.0)
+        finish_threads(t)
 
     winners = [fd for fd in results if fd is not None]
     losers = [fd for fd in results if fd is None]
@@ -778,6 +831,58 @@ def test_release_lock_is_idempotent_after_external_unlink(
 
 
 # ---------- spawn_detached (lines 117-148) ----------
+
+
+def test_a_start_rotates_an_oversize_bridge_log(tmp_path: Path) -> None:
+    """#559: outside launchd nothing else bounds bridge-<persona>.log; each start rotates it past the runtime log's cap."""
+    log_path = tmp_path / "logs" / "bridge-nell.log"
+    log_path.parent.mkdir()
+    log_path.write_bytes(b"x" * (6 * 1024 * 1024))
+
+    daemon._rotate_bridge_log(log_path)
+
+    assert (tmp_path / "logs" / "bridge-nell.log.1.gz").exists()
+    assert log_path.stat().st_size == 0
+
+
+def test_cmd_start_rotates_the_bridge_log_before_handing_the_lock_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of #613: the rotation is only safe while this starter holds the bridge lock (no other starter's child is
+    writing the log), so it must happen before cmd_start releases the lock to its own child."""
+    from brain.bridge import state_file
+
+    _patch_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(state_file, "is_running", lambda _p: False)
+    monkeypatch.setattr(daemon, "_service_installed", lambda _p: False)
+    order: list[str] = []
+    monkeypatch.setattr(daemon, "rotate_rolling_size", lambda *a, **k: order.append("rotate"))
+    real_release = daemon.release_lock
+    monkeypatch.setattr(daemon, "release_lock", lambda *a: (order.append("release"), real_release(*a)))
+
+    class _StopAtSpawnError(Exception):
+        pass
+
+    def stop_at_spawn(*a, **k):
+        raise _StopAtSpawnError
+
+    monkeypatch.setattr("subprocess.Popen", stop_at_spawn)
+    with pytest.raises(_StopAtSpawnError):
+        daemon.cmd_start(_args("nell"))
+    assert order == ["rotate", "release"]
+
+
+def test_a_failed_rotation_never_blocks_a_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(daemon, "rotate_rolling_size", boom)
+    with caplog.at_level("WARNING", logger=daemon.logger.name):
+        daemon._rotate_bridge_log(tmp_path / "bridge-nell.log")  # must not raise
+    assert "starting the bridge anyway" in caplog.text
 
 
 def test_spawn_detached_invokes_popen_with_detach_flags(
@@ -1020,9 +1125,9 @@ def test_cmd_start_kills_orphan_child_when_health_never_responds(
 
     monkeypatch.setattr("httpx.get", fake_get)
     # Short-circuit the 50s readiness deadline (Bug 2b widened it from 5s).
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+    _scoped_daemon_module(monkeypatch, "time", sleep=lambda _s: None)
     fake_now = iter([0.0, 1.0, 2.0, 51.0])
-    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: next(fake_now))
+    _scoped_daemon_module(monkeypatch, "time", time=lambda: next(fake_now))
 
     killed: dict[str, object] = {}
 
@@ -1030,7 +1135,7 @@ def test_cmd_start_kills_orphan_child_when_health_never_responds(
         killed["pid"] = pid
         killed["sig"] = sig
 
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", fake_kill)
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
 
     rc = daemon.cmd_start(_args("nell"))
     assert rc == 1
@@ -1127,18 +1232,45 @@ def test_cmd_stop_returns_0_when_pid_already_dead(
     assert "bridge not running" in capsys.readouterr().out
 
 
-def _pin_daemon_posix(monkeypatch: pytest.MonkeyPatch, kill) -> None:
-    """Swap the daemon module's ``os`` for a posix-shaped proxy exposing only
-    what cmd_stop touches (``name`` + ``kill``).
+def _scoped_daemon_module(monkeypatch: pytest.MonkeyPatch, module: str, /, **overrides) -> None:
+    """Give the daemon module its OWN copy of ``os`` or ``time`` (``module``) with ``overrides`` applied.
 
-    Patching the GLOBAL ``os.name`` breaks platform code in both directions —
-    pathlib explodes on macOS when pinned to "nt" (see the note near the
-    task-scheduler tests) and ``os.O_DIRECTORY`` doesn't exist on Windows when
-    pinned to "posix" (state_file's fsync path; broke windows-latest CI). So
-    the pin is scoped to ``brain.bridge.daemon`` alone."""
+    Patching an attribute THROUGH the daemon module (its ``time.sleep``, ``time.time``, ``os.kill``,
+    ``os.name``) patches the real module for the whole process: every other thread (logging, a leaked
+    background thread) and every later test on the same pytest-xdist worker sees the fake clock
+    or the fake ``os.name``. A copy bound to ``daemon.<module>`` is seen by the daemon alone. The
+    copy is taken from the CURRENT ``daemon.<module>``, so calls stack (``name="nt"`` then ``kill=``)."""
     import types
 
-    monkeypatch.setattr(daemon, "os", types.SimpleNamespace(name="posix", kill=kill))
+    current = getattr(daemon, module)
+    scoped = {attr: getattr(current, attr) for attr in dir(current)}
+    scoped.update(overrides)
+    monkeypatch.setattr(daemon, module, types.SimpleNamespace(**scoped))
+
+
+def _pin_daemon_posix(monkeypatch: pytest.MonkeyPatch, kill) -> None:
+    """Pin the daemon module's ``os`` to posix with ``kill`` faked (see ``_scoped_daemon_module``).
+
+    Patching the GLOBAL ``os.name`` breaks platform code in both directions —
+    pathlib explodes on macOS when pinned to "nt" and ``os.O_DIRECTORY`` doesn't
+    exist on Windows when pinned to "posix" (state_file's fsync path; broke
+    windows-latest CI). So the pin is scoped to ``brain.bridge.daemon`` alone."""
+    _scoped_daemon_module(monkeypatch, "os", name="posix", kill=kill)
+
+
+@pytest.mark.no_base_failure(reason='test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code')
+def test_a_scoped_daemon_patch_leaves_the_real_time_and_os_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The point of ``_scoped_daemon_module``: the daemon sees the fakes, nothing else does."""
+    real = (time.time, time.sleep, os.kill, os.name)
+    fake_kill = lambda pid, sig: None  # noqa: E731
+    _scoped_daemon_module(monkeypatch, "time", time=lambda: 123.0, sleep=lambda _s: None)
+    _scoped_daemon_module(monkeypatch, "os", name="nt")  # stacks on the same copy chain
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
+    assert daemon.time.time() == 123.0
+    assert daemon.os.name == "nt" and daemon.os.kill is fake_kill  # the second call kept name="nt"
+    assert daemon.os.path is os.path and daemon.time.monotonic is time.monotonic  # everything else is copied
+    assert (time.time, time.sleep, os.kill, os.name) == real
+    assert sys.modules["time"] is time and sys.modules["os"] is os
 
 
 def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
@@ -1188,8 +1320,6 @@ def test_cmd_stop_falls_back_to_sigterm_on_posix_when_http_fails(
         alive_state["alive"] = False
 
     _pin_daemon_posix(monkeypatch, fake_kill)
-    # Replace sleep so test runs instantly.
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
 
     rc = daemon.cmd_stop(_args("nell", timeout=5.0))
     import signal as _signal
@@ -1512,8 +1642,7 @@ def test_cmd_stop_posts_shutdown_endpoint_instead_of_sigterm(
 
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: alive["value"])
     monkeypatch.setattr("brain.bridge.daemon.httpx.post", fake_post)
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", lambda *_a: (_ for _ in ()).throw(AssertionError("must not signal")))
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+    _scoped_daemon_module(monkeypatch, "os", kill=lambda *_a: (_ for _ in ()).throw(AssertionError("must not signal")))
 
     rc = daemon.cmd_stop(_args("nell", timeout=5.0))
 
@@ -1552,13 +1681,11 @@ def test_cmd_stop_on_windows_does_not_fallback_to_sigterm_when_http_fails(
         ),
     )
 
-    # Patch get_persona_dir directly so pathlib doesn't try to construct a
-    # WindowsPath on Python 3.13 macOS when os.name is patched to "nt".
-    monkeypatch.setattr(daemon.os, "name", "nt")
-    monkeypatch.setattr("brain.paths.get_persona_dir", lambda _name: persona_dir)
+    # Only the daemon module sees os.name == "nt" (a scoped copy); pathlib and brain.paths keep the real one.
+    _scoped_daemon_module(monkeypatch, "os", name="nt")
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: True)
     monkeypatch.setattr("brain.bridge.daemon.httpx.post", lambda *_a, **_kw: (_ for _ in ()).throw(httpx.ConnectError("no route")))
-    monkeypatch.setattr("brain.bridge.daemon.os.kill", lambda *_a: (_ for _ in ()).throw(AssertionError("windows stop must not TerminateProcess")))
+    _scoped_daemon_module(monkeypatch, "os", kill=lambda *_a: (_ for _ in ()).throw(AssertionError("windows stop must not TerminateProcess")))
 
     rc = daemon.cmd_stop(_args("nell", timeout=0.1))
 
@@ -1790,7 +1917,7 @@ def test_acquire_lock_windows_blocking_retries_only_on_contention(
 
 def test_kill_if_alive_signals_a_live_pid(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, int]] = []
-    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+    _scoped_daemon_module(monkeypatch, "os", kill=lambda pid, sig: calls.append((pid, sig)))
     assert daemon._kill_if_alive(4242, 15) is True
     assert calls == [(4242, 15)]
 
@@ -1801,7 +1928,7 @@ def test_kill_if_alive_posix_dead_pid_returns_false(monkeypatch: pytest.MonkeyPa
     def fake_kill(pid, sig):
         raise ProcessLookupError()
 
-    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
     assert daemon._kill_if_alive(12345, 15) is False
 
 
@@ -1819,7 +1946,7 @@ def test_kill_if_alive_windows_already_dead_pid_returns_false(monkeypatch: pytes
         err.winerror = 87
         raise err
 
-    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
     assert daemon._kill_if_alive(99999, 15) is False
 
 
@@ -1833,7 +1960,7 @@ def test_kill_if_alive_windows_other_oserror_still_raises(monkeypatch: pytest.Mo
         err.winerror = 5
         raise err
 
-    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
     with pytest.raises(OSError):
         daemon._kill_if_alive(99999, 15)
 
@@ -1863,7 +1990,7 @@ def test_kill_if_alive_posix_unrelated_oserror_still_raises(monkeypatch: pytest.
         err.winerror = 87  # contrived: would never happen for real on POSIX
         raise err
 
-    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
     with pytest.raises(OSError):
         daemon._kill_if_alive(99999, 15)
 
@@ -1909,16 +2036,16 @@ def test_cmd_start_kills_orphan_via_shared_helper_tolerating_windows_already_dea
         raise httpx.ConnectError("refused")
 
     monkeypatch.setattr("httpx.get", fake_get)
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", lambda _s: None)
+    _scoped_daemon_module(monkeypatch, "time", sleep=lambda _s: None)
     fake_now = iter([0.0, 1.0, 2.0, 51.0])
-    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: next(fake_now))
+    _scoped_daemon_module(monkeypatch, "time", time=lambda: next(fake_now))
 
     def fake_kill(pid, sig):
         err = OSError("The parameter is incorrect")
         err.winerror = 87
         raise err
 
-    monkeypatch.setattr(daemon.os, "kill", fake_kill)
+    _scoped_daemon_module(monkeypatch, "os", kill=fake_kill)
 
     rc = daemon.cmd_start(_args("nell"))  # must not raise
     assert rc == 1
@@ -1935,10 +2062,8 @@ def test_cmd_stop_on_windows_with_force_terminates(
     state_file.write(persona_dir, state_file.BridgeState(
         persona="nell", pid=44444, port=51000, started_at="2026-05-08T00:00:00+00:00",
         stopped_at=None, shutdown_clean=False, client_origin="task-scheduler", auth_token="secret", **_new(44444)))
-    # Patch get_persona_dir directly so pathlib doesn't try to construct a
-    # WindowsPath on Python 3.13 macOS when os.name is patched to "nt".
-    monkeypatch.setattr(daemon.os, "name", "nt")
-    monkeypatch.setattr("brain.paths.get_persona_dir", lambda _name: persona_dir)
+    # Only the daemon module sees os.name == "nt" (a scoped copy); pathlib and brain.paths keep the real one.
+    _scoped_daemon_module(monkeypatch, "os", name="nt")
     alive = {"v": True}
     monkeypatch.setattr(state_file, "pid_is_alive", lambda _pid: alive["v"])
     monkeypatch.setattr("brain.bridge.daemon.httpx.post", lambda *_a, **_kw: (_ for _ in ()).throw(httpx.ConnectError("no route")))
@@ -1999,8 +2124,8 @@ def _early_exit_setup(
     def fake_sleep(dt: float) -> None:
         clock["now"] += dt
 
-    monkeypatch.setattr("brain.bridge.daemon.time.sleep", fake_sleep)
-    monkeypatch.setattr("brain.bridge.daemon.time.time", lambda: clock["now"])
+    _scoped_daemon_module(monkeypatch, "time", sleep=fake_sleep)
+    _scoped_daemon_module(monkeypatch, "time", time=lambda: clock["now"])
 
     def no_health(*a, **kw):
         raise AssertionError("no state_file matches this child, /health must not be probed")

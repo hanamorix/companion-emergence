@@ -11,7 +11,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from brain.kindled_link import limits
+from brain import dev_constants
 from brain.utils.sqlite_open import open_store_connection
 
 
@@ -431,7 +431,7 @@ class KindledLinkStore:
         """Refund one reserved provider slot, floored at 0. A gate/reflection call
         reserves a slot atomically BEFORE the LLM call; if the call never happens
         (throttle defer) or fails before completing, the slot is released so only
-        completed calls net-count against DAILY_PROVIDER_CAP (defer ≠ failure)."""
+        completed calls net-count against KINDLED_LINK_DAILY_PROVIDER_CAP (defer ≠ failure)."""
         self._ensure_counter_row(peer_id, today)
         self._conn.execute(
             "UPDATE peer_counters "
@@ -520,7 +520,7 @@ class KindledLinkStore:
             (peer_id,),
         ).fetchone()
         if row is None:
-            return limits.BUDGET_MAX
+            return dev_constants.KINDLED_LINK_BUDGET_MAX
         return self._refilled(row["budget"], row["updated_at"], now)
 
     def debit_disclosure_budget(
@@ -545,8 +545,8 @@ class KindledLinkStore:
             ).total_seconds() / 86400.0
         except (ValueError, TypeError):
             elapsed_days = 0.0
-        refilled = stored + max(0.0, elapsed_days) * limits.BUDGET_REFILL_PER_DAY
-        return min(limits.BUDGET_MAX, max(0.0, refilled))
+        refilled = stored + max(0.0, elapsed_days) * dev_constants.KINDLED_LINK_BUDGET_REFILL_PER_DAY
+        return min(dev_constants.KINDLED_LINK_BUDGET_MAX, max(0.0, refilled))
 
     # --- relationship_state (Phase 5, parent §13) ---
     def get_relationship_row(self, peer_id: str) -> dict | None:
@@ -610,7 +610,7 @@ class KindledLinkStore:
             return stored
         if elapsed_h <= 0:
             return stored
-        frac = max(0.0, 1.0 - elapsed_h / limits.PEER_EMOTION_WINDOW_HOURS)
+        frac = max(0.0, 1.0 - elapsed_h / dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS)
         return stored * frac
 
     # --- local identity (Phase 7a — decoupled mailbox) ---

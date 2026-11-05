@@ -27,6 +27,7 @@ from brain.memory.embeddings import FastEmbedProvider
 from brain.memory.reranker import CrossEncoderProvider
 from brain.memory.semantic_recall import allocate_widths, run_semantic_recall, search_paragraphs
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads
 from tests.unit.brain.memory.test_monologue_last import _EMBEDDER_ID, _RERANKER_ID
 from tests.unit.brain.memory.test_per_paragraph_recall import (
     _OTHER,
@@ -469,7 +470,7 @@ def _held(lock: threading.Lock, clock: _StepClock, call):
     t.join(0.2)
     clock.now += 5.0
     lock.release()
-    t.join(5.0)
+    finish_threads(t)
     return out[0]
 
 

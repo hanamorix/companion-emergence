@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from brain import dev_constants
 from brain.forgetting import run_pass
 from brain.memory.store import Memory, MemoryStore
 
@@ -62,7 +63,6 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
     """
     from brain.felt_time.state import FeltTimeState
     from brain.felt_time.state import persist as persist_felt_time
-    from brain.forgetting import policy as forgetting_policy
 
     persist_felt_time(
         FeltTimeState(lived_age_hours=720.0 * 5, last_tick_ts="2026-05-18T00:00:00+00:00"),
@@ -73,9 +73,9 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
     store.close()
 
     # Raise LOST_THRESHOLD high enough that joy=9.0 (salience ~0.27) is below it.
-    monkeypatch.setattr(forgetting_policy, "LOST_THRESHOLD", 0.5)
-    monkeypatch.setattr(forgetting_policy, "FADE_THRESHOLD", 0.6)
-    monkeypatch.setattr(forgetting_policy, "LOST_PASS_COUNT", 1)
+    monkeypatch.setattr(dev_constants, "LOST_THRESHOLD", 0.5)
+    monkeypatch.setattr(dev_constants, "FADE_THRESHOLD", 0.6)
+    monkeypatch.setattr(dev_constants, "LOST_PASS_COUNT", 1)
 
     bus = _NullBus()
     # Five passes is belt-and-suspenders: with LOST_PASS_COUNT=1, the memory

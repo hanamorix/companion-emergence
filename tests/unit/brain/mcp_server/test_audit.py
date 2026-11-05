@@ -15,6 +15,7 @@ import pytest
 from brain.health import log_rotation
 from brain.mcp_server import audit
 from brain.mcp_server.audit import log_invocation
+from tests.thread_support import finish_threads, release_at_teardown
 
 
 def test_log_invocation_writes_jsonl_line(tmp_path: Path) -> None:
@@ -159,7 +160,7 @@ def test_log_invocation_swallows_oserror(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_stale_rotator_does_not_clobber_the_backup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:
     """#357: a writer that saw an oversize log must not rotate a fresh one.
 
@@ -182,7 +183,7 @@ def test_stale_rotator_does_not_clobber_the_backup(
     def replace(self: Path, target: Any) -> Any:
         if getattr(stalled, "on", False) and not release.is_set():
             at_gate.set()
-            release.wait(timeout=5)
+            release.wait()
         return real_replace(self, target)
 
     monkeypatch.setattr(Path, "replace", replace)
@@ -192,16 +193,19 @@ def test_stale_rotator_does_not_clobber_the_backup(
         audit._rotate_if_needed(log_path)
 
     b = threading.Thread(target=stale_rotator)
+    threads = [b]
+    release_at_teardown(request, release, threads)
     b.start()
     assert at_gate.wait(timeout=5), "B never reached its rename"
     a = threading.Thread(target=audit._rotate_if_needed, args=(log_path,))
+    threads.append(a)
     a.start()
     a.join(timeout=0.5)  # unguarded: A finishes here; guarded: A is waiting on B's lock
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write("new-row\n")
     release.set()
-    b.join(timeout=10)
-    a.join(timeout=10)
+    finish_threads(b)
+    finish_threads(a)
 
     surviving = "".join(p.read_text(encoding="utf-8") for p in (backup, log_path) if p.exists())
     assert old_rows in surviving

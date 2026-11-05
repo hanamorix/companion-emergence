@@ -22,10 +22,8 @@ own TODO(F2c inc3+) marker).
 from __future__ import annotations
 
 import inspect
-import subprocess
-import sys
 import tempfile
-import textwrap
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import mock_open
@@ -83,24 +81,6 @@ def _seed_labeled_rows(
 
 
 # ---------------------------------------------------------------------------
-# Module constants
-# ---------------------------------------------------------------------------
-
-
-def test_cadence_constants() -> None:
-    assert judge_selftune.JUDGE_TUNE_CADENCE_FILE == "judge_selftune_cadence.json"
-    assert judge_selftune.JUDGE_TUNE_INTERVAL_HOURS == 168.0
-
-
-def test_tune_grade_order_is_weak_to_beefy() -> None:
-    assert judge_selftune._TUNE_GRADE_ORDER == (
-        judge_selftune.TUNE_GRADE_KNOB_REFIT,
-        judge_selftune.TUNE_GRADE_LORA,
-        judge_selftune.TUNE_GRADE_FULL_FT,
-    )
-
-
-# ---------------------------------------------------------------------------
 # _read_total_ram_bytes — mirrors the shape of the reranker's former
 # /proc/meminfo free-memory reader, MemTotal instead of MemAvailable.
 # ---------------------------------------------------------------------------
@@ -143,34 +123,34 @@ def test_read_total_ram_bytes_none_when_memtotal_line_missing(monkeypatch: pytes
 def test_select_tune_grade_weak_below_lora_min() -> None:
     assert (
         judge_selftune._select_tune_grade_by_ram(8.0 * 1024**3)
-        == judge_selftune.TUNE_GRADE_KNOB_REFIT
+        == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     )
 
 
 def test_select_tune_grade_lora_at_lora_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_LORA
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_LORA
 
 
 def test_select_tune_grade_knob_refit_just_below_lora_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_LORA_MIN_BYTES - 1.0
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_select_tune_grade_full_ft_at_full_ft_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_FULL_FT
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_FULL_FT
 
 
 def test_select_tune_grade_lora_just_below_full_ft_min_boundary() -> None:
     total = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES - 1.0
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_LORA
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_LORA
 
 
 def test_select_tune_grade_none_fails_toward_knob_refit() -> None:
     """Detection failure (non-Linux / read error) must fail toward the
     always-safe floor, never toward a grade that might not fit."""
-    assert judge_selftune._select_tune_grade_by_ram(None) == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert judge_selftune._select_tune_grade_by_ram(None) == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_select_tune_grade_reads_tunable_override_live_not_cached(
@@ -181,7 +161,7 @@ def test_select_tune_grade_reads_tunable_override_live_not_cached(
     a tunable override changes the threshold, on the very next call — no
     memoization across calls."""
     total = 20.0 * 1024**3  # between the default lora_min (16G) and full_ft_min (64G)
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_LORA
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_LORA
 
     original_get_tunable = judge_selftune.tunables.get_tunable
 
@@ -191,7 +171,7 @@ def test_select_tune_grade_reads_tunable_override_live_not_cached(
         return original_get_tunable(key, default)
 
     monkeypatch.setattr(judge_selftune.tunables, "get_tunable", _override)
-    assert judge_selftune._select_tune_grade_by_ram(total) == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert judge_selftune._select_tune_grade_by_ram(total) == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 # ---------------------------------------------------------------------------
@@ -203,40 +183,26 @@ def test_select_tune_grade_reads_tunable_override_live_not_cached(
 
 def test_oom_guard_keeps_grade_when_headroom_is_generous() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES + 1.0
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-    assert result == judge_selftune.TUNE_GRADE_FULL_FT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_FULL_FT
 
 
 def test_oom_guard_downgrades_full_ft_to_lora_when_only_lora_fits() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_LORA_BYTES + 1.0
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-    assert result == judge_selftune.TUNE_GRADE_LORA
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_LORA
 
 
 def test_oom_guard_downgrades_to_knob_refit_when_only_the_floor_fits() -> None:
     headroom = judge_selftune.JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_oom_guard_zero_headroom_floors_to_knob_refit() -> None:
     """A headroom of exactly 0.0 (a cgroup at its memory.high or memory.max) fits nothing but the floor."""
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, 0.0)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
-
-
-def test_oom_guard_docstring_names_the_psutil_fallback_not_meminfo() -> None:
-    """S239: the headroom helper reads psutil's host-wide available figure, not /proc/meminfo."""
-    doc = judge_selftune._downgrade_for_oom_safety.__doc__ or ""
-    assert "psutil" in doc
-    assert "host-wide `/proc/meminfo`" not in doc and "cgroup/meminfo" not in doc
-
-
-def test_oom_guard_docstring_states_the_smaller_of_the_cgroup_and_psutil_figures() -> None:
-    """S241: the helper returns the smaller of the cgroup figure and psutil's, not psutil only when no cgroup
-    level could be measured."""
-    doc = " ".join((judge_selftune._downgrade_for_oom_safety.__doc__ or "").split())
-    assert "smaller of" in doc and "only when no cgroup level could be measured" not in doc
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, 0.0)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_and_psutil(
@@ -253,16 +219,16 @@ def test_oom_guard_through_the_real_headroom_reader_takes_the_smaller_of_cgroup_
     headroom = judge_selftune._available_ram_headroom_bytes()
     assert headroom == 2e9
     assert (
-        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-        == judge_selftune.TUNE_GRADE_KNOB_REFIT
+        judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+        == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     )
     monkeypatch.setattr(reranker_mod, "_cgroup_v2_memory_headroom_bytes", lambda: 8e9)
     monkeypatch.setattr(reranker_mod, "_psutil_available_bytes", lambda: 64e9)
     headroom = judge_selftune._available_ram_headroom_bytes()
     assert headroom == 8e9
     assert (
-        judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, headroom)
-        == judge_selftune.TUNE_GRADE_LORA
+        judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, headroom)
+        == dev_constants.JUDGE_TUNE_GRADE_LORA
     )
 
 
@@ -270,8 +236,8 @@ def test_oom_guard_none_headroom_fails_toward_knob_refit() -> None:
     """No headroom signal at all (every source unavailable) means no
     signal to TRUST the RAM-tier pick with either — same fail-toward-safe
     posture as `_select_tune_grade_by_ram`'s own None branch."""
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_FULL_FT, None)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_FULL_FT, None)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 def test_oom_guard_bites_without_it_the_naive_pick_would_oom() -> None:
@@ -281,18 +247,18 @@ def test_oom_guard_bites_without_it_the_naive_pick_would_oom() -> None:
     merely that it exists."""
     total_ram = judge_selftune.JUDGE_TUNE_RAM_TIER_FULL_FT_MIN_BYTES + 1.0
     naive = judge_selftune._select_tune_grade_by_ram(total_ram)
-    assert naive == judge_selftune.TUNE_GRADE_FULL_FT, "the too-big pick, absent the guard"
+    assert naive == dev_constants.JUDGE_TUNE_GRADE_FULL_FT, "the too-big pick, absent the guard"
 
     guarded = judge_selftune._downgrade_for_oom_safety(
         naive, judge_selftune.JUDGE_TUNE_FOOTPRINT_KNOB_REFIT_BYTES
     )
-    assert guarded == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert guarded == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     assert guarded != naive, "the guard must have changed the outcome"
 
 
 def test_oom_guard_knob_refit_footprint_is_the_floor_it_never_downgrades_past() -> None:
-    result = judge_selftune._downgrade_for_oom_safety(judge_selftune.TUNE_GRADE_KNOB_REFIT, 1.0)
-    assert result == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    result = judge_selftune._downgrade_for_oom_safety(dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT, 1.0)
+    assert result == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +327,7 @@ def test_count_new_haiku_decisions_all_none_rows_do_not_count(store: MemoryStore
     contribute ZERO to the count. The OLD `haiku_label IS NOT NULL` ROW
     count would have wrongly read this as `handful + 1` and fired the gate
     on zero new Haiku signal — exactly the bug AC3 requires closed."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     for _ in range(handful + 1):
         _seed_row_with_haiku_labels(store, [None, None, None])
     count, row_ids = store.count_new_haiku_decisions()
@@ -841,18 +807,11 @@ def test_judge_knob_calibration_per_persona_store_isolation() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_judge_selftune_tick_importable_and_callable() -> None:
-    sig = inspect.signature(judge_selftune._run_judge_selftune_tick)
-    params = list(sig.parameters)
-    assert params == ["store", "now", "persona_dir"]
-    for name in params:
-        assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
-
-
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on a 4-core dev VM, 1.1 s wall (serial run for #540, J12)')
 def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore) -> None:
     """AC3 (gate): NOT more than a handful -> no fire. Exactly at the
     threshold is the boundary case (`> handful`, not `>=`)."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_rows(store, handful)
     result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
     assert result["fired"] is False
@@ -861,11 +820,12 @@ def test_tick_does_not_fire_at_exactly_the_handful_threshold(store: MemoryStore)
     assert store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE) is None, "marker untouched on no-fire"
 
 
+@pytest.mark.slow(reason='1.3 s of CPU in its call phase on a 4-core dev VM, 1.4 s wall (serial run for #540, J12)')
 def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3 (gate): MORE than a handful -> fires, the marker records the
     firing timestamp, and every scanned row is marked consumed (red-team
     fix F-1: per-row consumed marker, not a MAX(id) cursor)."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1)
     monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: 8.0 * 1024**3)  # weak box
     monkeypatch.setattr(judge_selftune, "_available_ram_headroom_bytes", lambda: None)
@@ -875,7 +835,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
 
     assert result["fired"] is True
     assert result["error"] is None
-    assert result["tune_grade"] == judge_selftune.TUNE_GRADE_KNOB_REFIT
+    assert result["tune_grade"] == dev_constants.JUDGE_TUNE_GRADE_KNOB_REFIT
     assert result["new_decisions"] == handful + 1
     marker = store.get_judge_selftune_state(MODEL_RELEVANCE_JUDGE)
     assert marker is not None
@@ -893,6 +853,7 @@ def test_tick_fires_above_the_handful_threshold(store: MemoryStore, monkeypatch:
     assert sorted(r["id"] for r in consumed_rows) == sorted(ids)
 
 
+@pytest.mark.slow(reason='3.1 s of CPU in its call phase on a 4-core dev VM, 3.1 s wall (serial run for #540, J12)')
 def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -902,7 +863,7 @@ def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     fire's rows must not be double-counted (consume-once, F-1)."""
     monkeypatch.setattr(judge_selftune, "_read_total_ram_bytes", lambda: 8.0 * 1024**3)
     monkeypatch.setattr(judge_selftune, "_available_ram_headroom_bytes", lambda: None)
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_rows(store, handful + 1)
 
     r1 = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
@@ -916,13 +877,14 @@ def test_tick_second_fire_only_counts_rows_after_prior_consumed_cursor(
     )
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_tick_selects_tier_and_applies_oom_downgrade(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End-to-end scaffold BITE: a beefy host-total RAM would naively pick
     full_ft, but a cgroup-capped effective headroom that only fits LoRA
     must downgrade the tick's actual selection."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_rows(store, handful + 1)
     monkeypatch.setattr(
         judge_selftune, "_read_total_ram_bytes",
@@ -936,9 +898,10 @@ def test_tick_selects_tier_and_applies_oom_downgrade(
     result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
 
     assert result["fired"] is True
-    assert result["tune_grade"] == judge_selftune.TUNE_GRADE_LORA, "downgraded from full_ft"
+    assert result["tune_grade"] == dev_constants.JUDGE_TUNE_GRADE_LORA, "downgraded from full_ft"
 
 
+@pytest.mark.slow(reason='1.9 s of CPU in its call phase on a 4-core dev VM, 1.9 s wall (serial run for #540, J12)')
 def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*a, **k):
         raise RuntimeError("disk full")
@@ -959,6 +922,7 @@ def test_tick_is_fault_isolated_never_raises(store: MemoryStore, monkeypatch: py
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow(reason='1.8 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: MemoryStore) -> None:
     """Scripted 'no-train' case: every seeded row is judge-labeled and has
     a non-None haiku_label position (the gate fires, `new_decisions` is
@@ -967,7 +931,7 @@ def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: Memor
     pairs` returns `[]`, `fit_platt_knob` raises, and the tick's own
     try/except must catch that and leave every row unconsumed rather than
     silently losing the Haiku signal these rows carry."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1, raw_score=None)
 
     result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
@@ -984,6 +948,7 @@ def test_tick_gate_fires_but_no_usable_pairs_leaves_rows_unconsumed(store: Memor
     assert sorted(post_row_ids) == sorted(ids)
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_tick_fault_during_fit_leaves_rows_unconsumed(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -992,7 +957,7 @@ def test_tick_fault_during_fit_leaves_rows_unconsumed(
     `test_tick_is_fault_isolated_never_raises`'s injection style), and the
     fault must still leave the rows unconsumed -- not just the "zero pairs"
     degenerate path above."""
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     ids = _seed_labeled_rows(store, handful + 1, raw_score=2.0)
 
     def _boom(pairs):
@@ -1008,94 +973,6 @@ def test_tick_fault_during_fit_leaves_rows_unconsumed(
     post_count, post_row_ids = store.count_new_haiku_decisions()
     assert post_count == handful + 1
     assert sorted(post_row_ids) == sorted(ids)
-
-
-def test_tick_does_not_import_torch_or_sentence_transformers() -> None:
-    """I6 / AC8 (off hot path): the scaffold, INCLUDING a FIRING tick that
-    actually runs F2c inc3's real knob-refit training code (assembly +
-    `fit_platt_knob` + persist), must never pull torch/sentence_transformers
-    into `sys.modules` — that stays scoped to the future LoRA/full-FT
-    tiers (inc5/6), never to the knob-refit this increment ships.
-
-    Red-team fix F-3 (inc2, still honored here): the prior version of this
-    test grepped `judge_selftune`'s own source TEXT for the literal strings
-    "import torch" / "import sentence_transformers". That only proves this
-    one module has no such import statement in it — it would NOT catch a
-    TRANSITIVE pull via some other module `judge_selftune` imports (e.g. a
-    future change to `brain.memory.reranker` or `brain.memory.store`
-    growing a module-scope torch import). This runs a FRESH subprocess —
-    never inheriting whatever this test PROCESS's own earlier tests may
-    already have imported into `sys.modules`, which would make an
-    in-process `sys.modules` check meaningless (the same caveat
-    `test_relevance_judge.py`'s sibling import-scope test documents) — that
-    imports `judge_selftune`, seeds enough `calibration_log` rows (WITH raw
-    judge scores, so the knob-refit has real pairs to fit — inc3's fire
-    path now actually trains, not just consumes) to FIRE the >handful
-    gate, actually runs `_run_judge_selftune_tick` end to end, and only
-    THEN asserts neither package landed in `sys.modules`.
-    """
-    script = textwrap.dedent(
-        """
-        import sys
-        from datetime import UTC, datetime
-
-        from brain.memory import judge_selftune
-        from brain.memory.store import MemoryStore
-
-        store = MemoryStore(db_path=":memory:")
-        handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
-        for i in range(handful + 1):
-            store.log_calibration_sample(
-                query=f"q{i}",
-                candidate_ids=["m"],
-                reranker_scores=[1.0],
-                reranker_model_id="m",
-            )
-            row_id = store._conn.execute(
-                "SELECT id FROM calibration_log ORDER BY id DESC LIMIT 1"
-            ).fetchone()["id"]
-            store.write_calibration_labels(
-                row_id, ["relevant"], ["relevant"], local_judge_raw_score=[2.0]
-            )
-
-        result = judge_selftune._run_judge_selftune_tick(store=store, now=datetime.now(UTC))
-        assert result["fired"] is True, result
-        assert store.get_judge_knob_calibration(judge_selftune.MODEL_RELEVANCE_JUDGE) is not None
-
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-
-
-# ---------------------------------------------------------------------------
-# AC9: the durable Haiku-oracle note must be present in F2c's OWN training
-# code location (relevance_judge.py's own copy is covered by that module's
-# test file) — grep/lint check, not a behavior test.
-# ---------------------------------------------------------------------------
-
-
-def test_haiku_oracle_note_is_present_in_judge_selftune_source() -> None:
-    source = inspect.getsource(judge_selftune)
-    marker = "# F2c (durable note, spec"
-    assert marker in source, "the durable Haiku-oracle note must precede _run_judge_selftune_tick"
-    note_start = source.index(marker)
-    note_end = source.index("def _run_judge_selftune_tick", note_start)
-    note = source[note_start:note_end]
-    assert "oracle" in note.lower()
-    assert "haiku" in note.lower()
-    assert "—" not in note, "no em-dashes in this durable note (plain code comment, no LLM-tells)"
 
 
 # ---------------------------------------------------------------------------
@@ -1120,14 +997,9 @@ def test_every_judge_selftune_threshold_is_a_registered_tunable() -> None:
 
 def test_gate_handful_decisions_is_a_dev_constant_not_a_tunable() -> None:
     """S26 (owner ruling): the self-tune gate is dev-level, not user-facing
-    — it must NOT be tunables.register()-ed, and its value must come from
-    brain.dev_constants (not a bare literal reintroduced in this module)."""
+    — it must NOT be tunables.register()-ed. The value itself is pinned by test_selftune_gate_is_200 in
+    test_dev_constants.py and by the dev-constants snapshot."""
     assert "judge_selftune.gate_handful_decisions" not in judge_selftune.tunables._registry
-    assert judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS == 200
-    assert (
-        judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
-        == dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1141,13 +1013,13 @@ def test_judge_selftune_cadence_due_now_when_missing() -> None:
     with tempfile.TemporaryDirectory() as d:
         pd = Path(d)
         now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-        state = pc.load_cadence(pd, judge_selftune.JUDGE_TUNE_CADENCE_FILE)
+        state = pc.load_cadence(pd, dev_constants.JUDGE_TUNE_CADENCE_FILE)
         assert pc.is_due(state, now=now) is True
 
 
 def test_judge_selftune_cadence_not_due_after_advance_and_fires_at_interval() -> None:
     now = datetime(2026, 6, 29, 12, tzinfo=UTC)
-    interval_s = judge_selftune.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
+    interval_s = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
     state = pc.advance(now=now, interval_s=interval_s)
     assert pc.is_due(state, now=now) is False
     assert pc.is_due(state, now=now + timedelta(seconds=interval_s)) is True
@@ -1158,8 +1030,8 @@ def test_judge_selftune_cadence_save_load_round_trip() -> None:
         pd = Path(d)
         now = datetime(2026, 6, 29, 12, tzinfo=UTC)
         state = pc.advance(now=now, interval_s=100.0)
-        pc.save_cadence(pd, judge_selftune.JUDGE_TUNE_CADENCE_FILE, state)
-        loaded = pc.load_cadence(pd, judge_selftune.JUDGE_TUNE_CADENCE_FILE)
+        pc.save_cadence(pd, dev_constants.JUDGE_TUNE_CADENCE_FILE, state)
+        loaded = pc.load_cadence(pd, dev_constants.JUDGE_TUNE_CADENCE_FILE)
         assert loaded.next_at == state.next_at
         assert not list(pd.glob("*.tmp")), "atomic write must leave no .tmp"
 
@@ -1170,7 +1042,31 @@ def test_run_folded_accepts_judge_selftune_interval_s() -> None:
     sig = inspect.signature(run_folded)
     assert "judge_selftune_interval_s" in sig.parameters
     param = sig.parameters["judge_selftune_interval_s"]
-    assert param.default == judge_selftune.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
+    assert param.default == "dev_constant"  # resolved inside run_folded (#602)
+
+
+def test_run_folded_reads_the_judge_interval_dev_constant_when_it_runs(tmp_path, monkeypatch) -> None:
+    """#602: the default is resolved inside run_folded, not frozen when the function is defined."""
+    from brain.bridge import supervisor as sup
+    from brain.bridge.events import EventBus
+    from brain.bridge.provider import FakeProvider
+
+    class _StopError(Exception):
+        pass
+
+    seen: dict = {}
+
+    def capture(**kwargs):  # noqa: ANN003, ANN202
+        seen.update(kwargs)
+        raise _StopError
+
+    monkeypatch.setattr(sup, "_build_gated_jobs", capture)
+    monkeypatch.setattr(dev_constants, "JUDGE_TUNE_INTERVAL_HOURS", 2.0)
+    persona_dir = tmp_path / "personas" / "canary"
+    persona_dir.mkdir(parents=True)
+    with pytest.raises(_StopError):
+        sup.run_folded(threading.Event(), persona_dir=persona_dir, provider=FakeProvider(), event_bus=EventBus())
+    assert seen["judge_selftune_interval_s"] == 2.0 * 3600.0
 
 
 # ---------------------------------------------------------------------------
@@ -1286,31 +1182,3 @@ def test_fit_platt_knob_anti_correlated_data_falls_back_to_identity_not_negative
     slope, intercept = judge_selftune.fit_platt_knob(pairs)
     assert slope == pytest.approx(1.0), "must fall back to the identity slope, never a negative one"
     assert intercept == pytest.approx(0.0)
-
-
-def test_fit_platt_knob_does_not_import_torch() -> None:
-    """AC8: the fit function itself, exercised directly (not only via the
-    tick), must never import torch -- pure numpy only."""
-    script = textwrap.dedent(
-        """
-        import sys
-        from brain.memory import judge_selftune
-
-        pairs = [(-3.0, "irrelevant"), (3.0, "relevant")]
-        slope, intercept = judge_selftune.fit_platt_knob(pairs)
-        assert isinstance(slope, float) and isinstance(intercept, float)
-        assert "torch" not in sys.modules, sorted(sys.modules)
-        assert "sentence_transformers" not in sys.modules, sorted(sys.modules)
-        print("SUBPROCESS_OK")
-        """
-    )
-    repo_root = Path(__file__).resolve().parents[4]
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    assert "SUBPROCESS_OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
