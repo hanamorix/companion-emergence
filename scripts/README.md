@@ -42,7 +42,7 @@ Copies a synthetic `memories.db` into a fresh temporary persona directory and ti
 bash scripts/time_old_emotion_paths.sh [path to memories.db]
 ```
 
-Cost: no LLM, no live persona, no network. The wall time is filled in from the record run on the low-end baseline host.
+Cost: about 32 seconds with the 19,406-row synthetic database on a 4-core VM with AVX2 hidden from the guest (a Ryzen 5 5500 host with the VM's AVX2 masked); a slower machine takes longer. No LLM, no live persona, no network.
 
 ### `stress_test_image.py` — tier 2
 
