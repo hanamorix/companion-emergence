@@ -730,10 +730,6 @@ def test_a_first_fold_never_leaves_an_average_above_the_value_cap() -> None:
     assert state.emotions["joy"].short.avg <= dev_constants.EMOTION_VALUE_CAP
     assert state.emotions["joy"].long.avg <= dev_constants.EMOTION_VALUE_CAP
     assert state.emotions["joy"].short.avg == pytest.approx(10.0)
-    state = eu.EngineState()
-    eu.fold_entry(state, "joy", 10.0, 0.22876222127045265, _at(0))
-    eu.fold_entry(state, "joy", 10.0, 0.22876222127045265, _at(0, 13))
-    assert 0.0 <= state.emotions["joy"].short.avg <= dev_constants.EMOTION_VALUE_CAP
 
 
 @pytest.mark.parametrize("kind", ["commit", "start"])

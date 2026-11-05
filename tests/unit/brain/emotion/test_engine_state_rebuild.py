@@ -1340,7 +1340,7 @@ _BAD_QUEUE_LINES = {
 def test_a_queue_position_that_is_not_a_whole_number_of_zero_or_more_reads_as_zero_with_a_log_line(
     case: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """P12b. `count_throttled` keeps process-global state and the suite runs in random order: the label is unique to the case."""
+    """design doc section 2.9. `count_throttled` keeps process-global state and the suite runs in random order: the label is unique to the case."""
     data = _valid_json()
     if case == "missing":
         del data["queue_line"]

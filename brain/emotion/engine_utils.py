@@ -260,7 +260,7 @@ def fold_entry(
     An entry at or after `last_update` ages all weights to its time and becomes the new `last_update`; an earlier one is
     pre-aged and ages nothing else. An entry that is not a quiet-day zero (even one whose value is 0) sets the emotion's last-entry
     day (the later of the old and the entry's day). `zero=True` is a quiet-day zero: it goes only to an emotion that
-    already has an average and does not set it. The caller holds a future `at` to now (`fold_event` does).
+    already has an average and does not set the last-entry day. The caller holds a future `at` to now (`fold_event` does).
     """
     if not math.isfinite(value):
         raise ValueError(f"cannot fold a non-finite value for {emotion!r}: {value!r}")
@@ -303,7 +303,7 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
 def fold_event(state: EngineState, event: Event, now: datetime) -> None:
     """Apply one event to the state.
 
-    A future event time and a future `last_update` are held to `now` first. A commit, an assignment and a showing fold each
+    A future event time and a future `last_update` are held to `now` first (the persona's start date is dated at the held time too). A commit, an assignment and a showing fold each
     of the event's emotions at weight `modifier x repeat factor`; a commit then keeps the persona's start date and, when its
     stored climax is 7 or more, applies the climax reset after its own emotions are in. An event with no emotions folds
     nothing and writes or advances no repeat record; a commit or an assignment of a memory that is already a window old keeps
@@ -666,13 +666,13 @@ def close_days(state: EngineState, t: datetime) -> None:
     snapshot day, and snapshot days 30 or more calendar days before D are dropped; then `last_update` moves past the whole
     calendar days the app was off (weights do not age across them) and `active_day` becomes `day_of(t)`.
 
-    Accepted edges (A3 E5.8, E5.13):
+    Accepted edges (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 6):
 
     * A system clock set forward and then corrected: this function closes the open day and sets `active_day` to the far-future
       day, and then day closes stop until real time reaches that day, so the shift stays frozen at its last value and, with
       no day closing, the change-log files the drain would delete pile up. The deletion half belongs to the drain (it
       anchors on the active day as it stood before its closes). The open design call, telling a corrected clock from a long
-      absence, needs a chosen number or a new rule; it is tracked in an issue filed when this slice merges.
+      absence, needs a chosen number or a new rule; it is tracked in #660.
     * An entry dated in a day that has already closed cannot undo the zero already folded for it: that day holds both the zero
       and the entry.
     """
