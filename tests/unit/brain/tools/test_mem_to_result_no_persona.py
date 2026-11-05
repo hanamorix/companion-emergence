@@ -55,6 +55,10 @@ def test_a_result_with_no_persona_does_not_raise() -> None:
     assert _mem_to_result(memory, None)["emotions"] == _STORED
 
 
+@pytest.mark.no_base_failure(
+    reason="pins behaviour that is the same on origin/main and here: read_full_memory with no persona directory returns "
+    "the stored emotions and asks no engine; the other two tests in this file carry the fix"
+)
 def test_read_full_memory_with_no_persona_carries_the_stored_emotions_and_asks_no_engine(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, emotion_engine_stub
 ) -> None:

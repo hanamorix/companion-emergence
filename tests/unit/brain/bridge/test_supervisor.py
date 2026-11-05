@@ -1514,7 +1514,10 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
     persona_dir = _persona_dir(tmp_path)
     emotion_engine_stub.live = True
 
+    asked: list[str] = []
+
     def boom():
+        asked.append("read")
         raise RuntimeError("engine fault")
 
     emotion_engine_stub.read = boom
@@ -1528,6 +1531,7 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+    assert asked, "the live rest gate must ask the engine for its read"
     assert captured["is_rest_state"] is False
 
 

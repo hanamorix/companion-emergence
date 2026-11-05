@@ -1053,8 +1053,9 @@ def test_live_gate_stays_closed_while_the_engine_calls_nothing_high_at_any_value
 
 
 def test_live_gate_only_asks_about_feelings_the_read_returned(tmp_path: Path, emotion_engine_stub):
+    # stored grief at 9.5 would open the gate through the old peak test; the live gate must ignore the store
     reason = _live_gate_reason(
-        tmp_path, emotion_engine_stub, {"awe": 10.0}, stored={}, high={"grief"}
+        tmp_path, emotion_engine_stub, {"awe": 10.0}, stored={"grief": 9.5}, high={"grief"}
     )
     assert reason == "not_due"
 
