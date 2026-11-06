@@ -10,6 +10,7 @@ The design's sixth row (spelling variants pooling as separate channels) has no p
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -34,9 +35,13 @@ CAP = dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_CAP
 WINDOW_HOURS = dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS
 
 
-def _flipped_by(pr: str) -> pytest.MarkDecorator:
+_PINNED = pytest.mark.no_base_failure(reason="pins a writer bug that is on main until a B1 PR fixes it, so the old code cannot fail it")
+
+
+def _flipped_by(pr: str) -> Callable[[Callable[..., None]], Callable[..., None]]:
     # raises=AssertionError: a broken setup must fail loudly, not pass as the expected failure.
-    return pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"writer bug, fixed by {pr}")
+    xfail = pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"writer bug, fixed by {pr}")
+    return lambda test: _PINNED(xfail(test))
 
 
 @pytest.fixture
@@ -128,6 +133,7 @@ def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]
     return first, second
 
 
+@_PINNED
 def test_today_extractor_negative_delta_raises_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
     assert "joy" not in _felt(store)
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
@@ -141,6 +147,7 @@ def test_intended_extractor_negative_delta_lowers_the_feeling(persona_dir: Path,
     assert _felt(store)["joy"] < 5.0
 
 
+@_PINNED
 def test_today_reconcile_negative_delta_raises_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
     assert "joy" not in _felt(store)
     result = reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
@@ -155,6 +162,7 @@ def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path,
     assert _felt(store)["joy"] < 5.0
 
 
+@_PINNED
 def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
@@ -172,6 +180,7 @@ def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemorySto
     assert store.get(dream.id).emotions["love"] <= 10.0
 
 
+@_PINNED
 def test_today_negative_peer_value_is_erased_by_one_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
@@ -190,6 +199,7 @@ def test_intended_peer_values_are_never_negative(store: MemoryStore) -> None:
     assert all(value >= 0.0 for value in store.get(memory_id).emotions.values())
 
 
+@_PINNED
 def test_today_peer_bucket_caps_summed_size_across_emotions(persona_dir: Path) -> None:
     first, second = _peer_changes(persona_dir)
     # One change is scaled down to the cap across both emotions.
