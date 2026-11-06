@@ -4,14 +4,15 @@ This is the stub. Every public call exists with its final signature, so the code
 the engine can be written and tested before the engine behind the calls exists.
 
 Real now: `half_life`, the lookup of an emotion's half-life in days (the persona's vocabulary
-file, then `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `EMOTION_DEFAULT_HALF_LIFE_DAYS`).
+file, then `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `EMOTION_DEFAULT_HALF_LIFE_DAYS`), and
+`is_live()`, which is True once `state/emotion_switch.json` exists (nothing writes that file until
+the switch-over, so it answers False for every persona today).
 
 Stubbed now:
 - `on_memory_committed`, `on_emotions_assigned`, `fold_change` and `on_memory_shown` append their
   arguments to `recorded_calls` and do nothing else.
 - `batch()` is a context manager that does nothing: it takes no argument, yields None and records nothing.
-- `read()` returns `{}`; `is_live()` is False (a constant until Engine 2 builds the switch-file
-  check); `status()` returns `EngineStatus(True, None)`; `oldest_entry_at()` returns None.
+- `read()` returns `{}`; `status()` returns `EngineStatus(True, None)`.
 - `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
   memory id and the emotion, when the memory has no such emotion. It never returns 0.0:
   "absent" is for the caller to decide.
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from brain import dev_constants
-from brain.emotion import vocabulary
+from brain.emotion import engine_files, vocabulary
 from brain.emotion.engine_files import VocabularyHalfLives
 
 if TYPE_CHECKING:
@@ -80,6 +81,7 @@ class EmotionEngine:
         # the caller's own objects, not copies. Read by tests; the stub writes it.
         self.recorded_calls: list[tuple[Any, ...]] = []
         self._vocabulary = VocabularyHalfLives(self.persona_dir)
+        self._live = False  # a True answer is kept for the life of the instance
 
     # --- hooks the memory store and the extractor call (stubbed: record and return) ---------------
 
@@ -115,11 +117,12 @@ class EmotionEngine:
     def status(self) -> EngineStatus:
         return EngineStatus(True, None)
 
-    def oldest_entry_at(self) -> datetime | None:
-        return None
-
     def is_live(self) -> bool:
-        return False
+        """True when the switch file exists. A True answer is cached for the life of the instance; a False one is asked
+        again (one stat) each time, so the switch-over is seen without a restart."""
+        if not self._live:
+            self._live = engine_files.switch_exists(self.persona_dir)
+        return self._live
 
     def faded_value(self, memory: Memory, emotion: str) -> float:
         try:

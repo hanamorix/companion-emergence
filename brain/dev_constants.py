@@ -126,7 +126,7 @@ EMOTION_LOCK_WAIT_S: float = 5.0
 # The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
-EMOTION_PENDING_FILENAME: str = "emotion_pending.json"
+EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
 EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 

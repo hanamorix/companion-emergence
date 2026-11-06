@@ -582,6 +582,11 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/utils/file_ops.py",),
     ),
+    Removed(
+        names=("oldest_entry_at",),
+        why="the emotion state's oldest-entry time (and the engine's `oldest_entry_at()` stub) had no reader; dropped before any live persona's state file was written with it, so no migration is needed",
+        ref="the maintainer's decision on PR #626 (Engine 2), 2026-11-05",
+    ),
 )
 
 
