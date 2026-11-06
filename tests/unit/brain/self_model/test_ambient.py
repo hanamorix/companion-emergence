@@ -75,3 +75,67 @@ def test_open_gap_with_only_subfloor_channels_returns_none():
         current_gap=_open_gap(per_channel={"grief": 0.1}, magnitude=0.1, note=None)
     )
     assert render_block(state) is None
+
+
+# ── B2 phase B: the live render (the engine's shifted channels, position and direction) ──
+
+
+def _live_block(per_channel, directions, **kw) -> str | None:
+    gap = Gap(
+        per_channel=per_channel,
+        magnitude=sum(abs(v) for v in per_channel.values()),
+        unnamed_pressure=0.0,
+        directions=directions,
+        **kw,
+    )
+    return render_block(SelfModelState(current_gap=gap), live=True)
+
+
+def test_live_four_position_direction_pairs_render_four_distinct_fragments():
+    fragments = set()
+    for delta, direction in [(2.0, 1), (2.0, -1), (-2.0, 1), (-2.0, -1)]:
+        block = _live_block({"joy": delta}, {"joy": direction})
+        assert block is not None and "joy" in block
+        line = [ln for ln in block.splitlines() if ln.startswith("joy")][0]
+        fragments.add(line)
+    assert len(fragments) == 4
+
+
+def test_live_zero_difference_renders_direction_only_and_missing_direction_renders_position_only():
+    rising = _live_block({"joy": 0.0}, {"joy": 1})
+    fading = _live_block({"joy": 0.0}, {"joy": -1})
+    assert rising is not None and fading is not None
+    rising_line = [ln for ln in rising.splitlines() if ln.startswith("joy")][0]
+    fading_line = [ln for ln in fading.splitlines() if ln.startswith("joy")][0]
+    assert rising_line != fading_line
+    assert "above" not in rising_line and "below" not in rising_line
+    above_only = [ln for ln in _live_block({"joy": 1.5}, {}).splitlines() if ln.startswith("joy")][0]
+    below_only = [ln for ln in _live_block({"joy": -1.5}, {}).splitlines() if ln.startswith("joy")][0]
+    assert above_only != below_only
+    assert "rising" not in above_only and "fading" not in above_only
+
+
+def test_live_zero_difference_with_no_direction_has_nothing_to_say():
+    assert _live_block({"joy": 0.0}, {}) is None
+
+
+def test_live_has_no_floor_and_cuts_to_the_largest_three_by_absolute_difference(monkeypatch):
+    per_channel = {"a": 0.1, "b": -3.0, "c": 2.0, "d": 2.0, "e": 0.9}
+    directions = dict.fromkeys(per_channel, 1)
+    block = _live_block(per_channel, directions)
+    assert block is not None
+    named = {n for n in per_channel if any(ln.startswith(n + " ") for ln in block.replace("; ", "\n").splitlines())}
+    # b (3.0), then c and d tie at 2.0 and break by name; a (0.1, under the old 0.5 floor) is a live channel too
+    # but loses the cut.
+    assert named == {"b", "c", "d"}
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "SELF_MODEL_BLOCK_CHANNEL_COUNT", 5)
+    block = _live_block(per_channel, directions)
+    named = {n for n in per_channel if any(ln.startswith(n + " ") for ln in block.replace("; ", "\n").splitlines())}
+    assert named == set(per_channel)
+
+
+def test_not_live_still_applies_the_floor_and_the_sign_render():
+    gap = Gap(per_channel={"joy": 0.2}, magnitude=0.2, unnamed_pressure=0.0, directions={"joy": 1})
+    assert render_block(SelfModelState(current_gap=gap)) is None

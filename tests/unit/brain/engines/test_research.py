@@ -1002,3 +1002,64 @@ def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
     _engine, result, memory = _fire_with_reply(tmp_path, reply)
     assert result.fired is not None and memory is not None
     assert _session_rows(tmp_path) == []
+
+
+# ── B2 phase B: the research gate asks the engine whether a feeling is high when it is live ──
+
+
+def _live_gate_reason(
+    tmp_path: Path,
+    stub,
+    readings: dict[str, float],
+    *,
+    stored: dict[str, float],
+    high: set[str] | None = None,
+) -> str | None:
+    from brain.emotion.engine import Reading
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    stub.live = True
+    stub.high = set(high or ())
+    stub.readings = {
+        n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()
+    }
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        if stored:
+            store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored))
+        runner = _build_engine(tmp_path, store)
+        result = runner.run_tick(
+            trigger="manual", dry_run=True, days_since_human_override=0.0, emotion_state_override=None
+        )
+    finally:
+        store.close()
+    return result.reason
+
+
+def test_live_gate_opens_on_a_feeling_the_engine_calls_high_whatever_its_value_and_the_store(
+    tmp_path: Path, emotion_engine_stub
+):
+    reason = _live_gate_reason(tmp_path, emotion_engine_stub, {"awe": 0.5}, stored={}, high={"awe"})
+    assert reason != "not_due"
+
+
+def test_live_gate_stays_closed_while_the_engine_calls_nothing_high_at_any_value(
+    tmp_path: Path, emotion_engine_stub
+):
+    reason = _live_gate_reason(
+        tmp_path, emotion_engine_stub, {"awe": 10.0, "grief": 9.0}, stored={"awe": 9.5}
+    )
+    assert reason == "not_due"
+
+
+def test_live_gate_only_asks_about_feelings_the_read_returned(tmp_path: Path, emotion_engine_stub):
+    # stored grief at 9.5 would open the gate through the old peak test; the live gate must ignore the store
+    reason = _live_gate_reason(
+        tmp_path, emotion_engine_stub, {"awe": 10.0}, stored={"grief": 9.5}, high={"grief"}
+    )
+    assert reason == "not_due"
+
+
+def test_live_gate_with_an_empty_read_is_closed(tmp_path: Path, emotion_engine_stub):
+    reason = _live_gate_reason(tmp_path, emotion_engine_stub, {}, stored={"awe": 9.5}, high={"awe"})
+    assert reason == "not_due"

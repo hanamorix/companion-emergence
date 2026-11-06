@@ -154,3 +154,20 @@ def test_append_without_neighbors_defaults_empty(tmp_path):
     graveyard.append(tmp_path, memory=mem, salience_at_drop=0.05, inputs=inputs,
                      lived_age_hours=1.0, reason="test")
     assert graveyard.read_all(tmp_path)[0]["hebbian_neighbors"] == []
+
+
+def test_append_writes_the_faded_emotion_at_ingest_and_the_inputs_as_given(tmp_path, emotion_engine_stub):
+    """B2 phase B: the entry's emotions are faded once, at the write; the salience inputs are not faded again."""
+    m = _make_memory(id="mem_faded", emotions={"sorrow": 7.2, "love": 3.0})
+    emotion_engine_stub.faded = {("mem_faded", "sorrow"): 4.0, ("mem_faded", "love"): 2.5}
+    append(
+        tmp_path,
+        memory=m,
+        salience_at_drop=0.07,
+        inputs=SalienceInputs(emotion=0.72, hebbian=0.05, recall=0.0, soul=0.0, freshness=0.0),
+        lived_age_hours=612.4,
+        reason="r",
+    )
+    entry = json.loads((tmp_path / GRAVEYARD_FILENAME).read_text().strip())
+    assert entry["emotion_at_ingest"] == {"sorrow": 4.0, "love": 2.5}
+    assert entry["salience_inputs_at_drop"]["emotion"] == 0.72

@@ -456,9 +456,10 @@ class EmotionEngineStub:
 
     Every public call of the engine exists. `recorded_calls` holds one entry per hook call and per `note_active` call, `(name,
     *arguments in the call's own order)`, for example `("on_memory_shown", memory, at)` or `("note_active", now)`; the real engine keeps no such list. The rest is
-    settable: `readings` (what `read()` returns), `live`, `faded` (`(memory_id, emotion) -> value`, else the stored value),
-    `engine_status` and `last_fold_at` (a fixed instant well before any test's "now", so a site that
-    compares its own time with it sees a nonzero interval).
+    settable: `readings` (what `read()` returns), `live`, `high` (the names `feels_high` answers True for, whatever
+    `readings` holds, so a reader's test says which feelings are high independently of the numbers it feeds), `faded`
+    (`(memory_id, emotion) -> value`, else the stored value), `engine_status` and `last_fold_at` (a fixed
+    instant well before any test's "now", so a site that compares its own time with it sees a nonzero interval).
     """
 
     def __init__(self) -> None:
@@ -469,6 +470,7 @@ class EmotionEngineStub:
         self.recorded_calls: list[tuple[Any, ...]] = []
         self.readings: dict[str, Any] = {}
         self.live = False
+        self.high: set[str] = set()
         self.faded: dict[tuple[str, str], float] = {}
         self.engine_status = EngineStatus(True, None)
         self.last_fold_at = datetime(2000, 1, 1, tzinfo=UTC)
@@ -497,6 +499,9 @@ class EmotionEngineStub:
 
     def is_live(self) -> bool:
         return self.live
+
+    def feels_high(self, name: str) -> bool:
+        return name in self.high
 
     def faded_value(self, memory: Any, emotion: str) -> float:
         return self.faded.get((memory.id, emotion), memory.emotions[emotion])

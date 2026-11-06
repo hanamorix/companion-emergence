@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from brain.health.json_io import read_json_result, write_json
-from brain.self_model.gap import Gap
+from brain.self_model.gap import UNSET, Gap
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ _UNRESOLVED_STATUSES = frozenset({"open", "acknowledged"})
 
 
 def _gap_to_dict(gap: Gap) -> dict:
-    return {
+    out = {
         "per_channel": gap.per_channel,
         "magnitude": gap.magnitude,
         "unnamed_pressure": gap.unnamed_pressure,
@@ -45,7 +45,22 @@ def _gap_to_dict(gap: Gap) -> dict:
         "last_seen_ts": gap.last_seen_ts,
         "sustained_ticks": gap.sustained_ticks,
         "channel_cooldowns": gap.channel_cooldowns,
+        "directions": gap.directions,
     }
+    # A gap that never carried the field stays without the key, so it reads back as UNSET.
+    if gap.reset_seen is not UNSET:
+        out["reset_seen"] = gap.reset_seen
+    return out
+
+
+def _directions_from(value: object) -> dict[str, int]:
+    """`{str: int}` from a saved value; an empty dict for a missing key or a malformed value."""
+    if not isinstance(value, dict):
+        return {}
+    try:
+        return {str(k): int(v) for k, v in value.items()}
+    except (TypeError, ValueError):
+        return {}
 
 
 def _gap_from_dict(d: dict) -> Gap:
@@ -59,6 +74,8 @@ def _gap_from_dict(d: dict) -> Gap:
         last_seen_ts=d.get("last_seen_ts"),
         sustained_ticks=int(d.get("sustained_ticks", 0)),
         channel_cooldowns=d.get("channel_cooldowns") or {},
+        directions=_directions_from(d.get("directions")),
+        reset_seen=d["reset_seen"] if "reset_seen" in d else UNSET,
     )
 
 

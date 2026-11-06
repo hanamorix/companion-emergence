@@ -462,8 +462,10 @@ def _compute_arc_close_emotion_inputs(
     Per spec §3 graveyard-proxy fallback: arcs whose members have largely been
     forgotten still produce honest arc-close grief.
     """
+    from brain.emotion import engine
     from brain.forgetting import graveyard as _grave
 
+    live_engine = engine.engine_for(persona_dir)
     grave_entries = _grave.read_all(persona_dir)
     grave_by_id = {e.get("memory_id"): e for e in grave_entries}
 
@@ -472,10 +474,10 @@ def _compute_arc_close_emotion_inputs(
     for member in arc.members:
         live = store.get(member.memory_id)
         if live is not None and live.emotions:
-            for name, val in live.emotions.items():
+            for name in live.emotions:
                 if name == "memory_grief":
                     continue
-                v = float(val)
+                v = float(live_engine.faded_value(live, name))
                 if v > best_emotion_value:
                     best_emotion_value = v
                     best_named = (name, v)

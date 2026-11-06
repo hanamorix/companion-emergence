@@ -552,3 +552,153 @@ def test_connection_includes_kindled_link_fields(tmp_path: Path) -> None:
     conn = build_persona_state(persona_dir)["connection"]
     assert conn["kindled_link_enabled"] is True
     assert conn["kindled_relay_url"] == "http://127.0.0.1:9000"
+
+
+# ── B2 phase B: the panels read the engine's short averages when it is live ───
+
+
+def _stub_reading(short: float):
+    from brain.emotion.engine import Reading
+
+    return Reading(short=short, long=0.0, difference=0.0, shift=0)
+
+
+def _seed_stored_emotions(persona_dir: Path) -> None:
+    from brain.memory.store import Memory, MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        store.create(
+            Memory.create_new(
+                content="stored",
+                memory_type="fact",
+                domain="us",
+                emotions={"joy": 9.0, "rest_need": 9.0, "love": 1.0},
+            )
+        )
+    finally:
+        store.close()
+
+
+def test_build_emotions_live_shows_a_present_zero_and_omits_an_absent_name(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.bridge.persona_state import _build_emotions
+
+    _seed_stored_emotions(tmp_path)  # the stored joy 9.0 must not appear
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"calm": _stub_reading(0.0), "love": _stub_reading(6.25), "awe": _stub_reading(3.04)}
+    result = _build_emotions(tmp_path)
+    assert result == {"love": 6.2, "awe": 3.0, "calm": 0.0}
+    assert list(result) == ["love", "awe", "calm"]
+    assert "joy" not in result
+
+
+def test_build_emotions_live_with_an_empty_read_is_empty(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.bridge.persona_state import _build_emotions
+
+    _seed_stored_emotions(tmp_path)
+    emotion_engine_stub.live = True
+    assert _build_emotions(tmp_path) == {}
+
+
+def test_build_body_live_omits_absent_body_emotions_and_never_shows_nan(tmp_path: Path, emotion_engine_stub) -> None:
+    import math
+
+    from brain.bridge.persona_state import _build_body
+
+    _seed_stored_emotions(tmp_path)  # stored rest_need 9.0 must not appear
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"arousal": _stub_reading(6.0), "love": _stub_reading(8.0)}
+    body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
+    assert body is not None
+    assert body["body_emotions"] == {"arousal": 6.0}
+    for key in ("energy", "temperature", "exhaustion", "session_hours", "days_since_contact"):
+        assert not math.isnan(body[key])
+
+
+def _body_numbers(tmp_path: Path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+    from brain.bridge.persona_state import _build_body
+
+    stub.live = True
+    stub.high = set(high)
+    stub.readings = {n: _stub_reading(v) for n, v in readings.items()}
+    body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
+    assert body is not None
+    return body["energy"], body["temperature"]
+
+
+def test_build_body_live_energy_and_temperature_follow_the_engines_predicate_not_a_level(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    energy, temperature = _body_numbers(tmp_path, emotion_engine_stub, {}, set())
+    top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
+    assert _body_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
+    low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
+    assert _body_numbers(tmp_path, emotion_engine_stub, low, set(low)) == (energy - 1, temperature + 1)
+
+
+# ── the feeling names the frontend's expressions read instead of their own levels (HR1 item 4) ───
+
+
+def test_build_feels_high_live_lists_exactly_the_read_names_the_engine_calls_high(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "love": _stub_reading(0.5),
+        "desire": _stub_reading(0.4),
+        "arousal": _stub_reading(9.9),
+        "awe": _stub_reading(3.0),
+    }
+    # `grief` is high for the stub but the read does not return it: it must not appear. `arousal` is read at 9.9 but the
+    # engine does not call it high: it must not appear either (no level is compared here).
+    emotion_engine_stub.high = {"love", "desire", "grief"}
+    assert _build_feels_high(tmp_path) == ["desire", "love"]
+
+
+def test_build_feels_high_live_with_nothing_high_or_an_empty_read_is_an_empty_list(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"love": _stub_reading(9.0)}
+    assert _build_feels_high(tmp_path) == []
+    emotion_engine_stub.readings = {}
+    emotion_engine_stub.high = {"love"}
+    assert _build_feels_high(tmp_path) == []
+
+
+def test_build_feels_high_not_live_is_none_so_the_old_levels_stay_in_force(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+
+    emotion_engine_stub.live = False
+    emotion_engine_stub.readings = {"love": _stub_reading(9.0)}
+    emotion_engine_stub.high = {"love"}
+    assert _build_feels_high(tmp_path) is None
+
+
+def test_build_feels_high_never_raises_and_is_none_when_the_engine_cannot_be_asked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+    from brain.emotion import engine
+
+    def boom(persona_dir: Path):
+        raise RuntimeError("no engine")
+
+    monkeypatch.setattr(engine, "engine_for", boom)
+    assert _build_feels_high(tmp_path) is None
+
+
+def test_build_persona_state_carries_the_feels_high_key(tmp_path: Path, emotion_engine_stub) -> None:
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"love": _stub_reading(0.5), "awe": _stub_reading(3.0)}
+    emotion_engine_stub.high = {"love"}
+    state = build_persona_state(tmp_path)
+    assert state["feels_high"] == ["love"]
+    emotion_engine_stub.live = False
+    assert build_persona_state(tmp_path)["feels_high"] is None

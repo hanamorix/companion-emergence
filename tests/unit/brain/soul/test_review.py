@@ -1080,3 +1080,45 @@ def test_expired_not_forgetting_exempt(tmp_path: Path) -> None:
     assert expired_mem_id not in under_review, "expired memory_id must NOT be under-review"
     assert accepted_mem_id not in under_review, "accepted memory_id must NOT be under-review"
     assert rejected_mem_id not in under_review, "rejected memory_id must NOT be under-review"
+
+
+# ── B2 phase B: the review's emotional summary when the engine is live ────────
+
+
+def test_current_emotional_summary_live_is_the_top_three_short_averages(tmp_path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import Reading
+    from brain.memory.store import Memory, MemoryStore
+    from brain.soul.review import _current_emotional_summary
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"anger": 9.0}))
+        emotion_engine_stub.live = True
+        emotion_engine_stub.readings = {
+            "love": Reading(short=6.25, long=0.0, difference=0.0, shift=0),
+            "joy": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+            "awe": Reading(short=3.0, long=0.0, difference=0.0, shift=0),
+            "calm": Reading(short=1.0, long=0.0, difference=0.0, shift=0),
+        }
+        assert _current_emotional_summary(store) == "love:6.2, awe:3.0, calm:1.0"
+        emotion_engine_stub.readings = {}
+        assert _current_emotional_summary(store) == "neutral"
+    finally:
+        store.close()
+
+
+def test_current_emotional_summary_live_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
+    from brain.memory.store import MemoryStore
+    from brain.soul.review import _current_emotional_summary
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        emotion_engine_stub.live = True
+
+        def boom():
+            raise RuntimeError("engine fault")
+
+        emotion_engine_stub.read = boom
+        assert _current_emotional_summary(store) == "unknown"
+    finally:
+        store.close()

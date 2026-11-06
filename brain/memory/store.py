@@ -1213,7 +1213,7 @@ class MemoryStore:
             ),
         )
 
-    def _emotion_engine(self) -> Any | None:
+    def emotion_engine(self) -> Any | None:
         """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
 
         `brain.emotion.engine` is imported here, not at the top: it pulls `brain.utils.memory`, which imports this module.
@@ -1229,7 +1229,7 @@ class MemoryStore:
     def _notify_committed(self, memory: Memory) -> None:
         """Tell the engine a row was committed. All of it is inside the guard: a failure here must not reach the write."""
         try:
-            target = self._emotion_engine()
+            target = self.emotion_engine()
             if target is not None:
                 target.on_memory_committed(memory)
         except Exception:
@@ -1240,7 +1240,7 @@ class MemoryStore:
         try:
             if before.emotions or not new_emotions:
                 return
-            target = self._emotion_engine()
+            target = self.emotion_engine()
             if target is not None:
                 target.on_emotions_assigned(replace(before, emotions=dict(new_emotions)))
         except Exception:
@@ -3020,6 +3020,76 @@ class MemoryStore:
                 )
             self._conn.commit()
 
+    def refresh_faded_emotions(
+        self, memory_id: str, emotions: dict[str, float], created_at: datetime
+    ) -> None:
+        """Write a remembered memory's faded emotion values and a fresh ``created_at`` in ONE UPDATE (the temp gate's write-back),
+        and put the date the row had before the reset at the start of its text.
+
+        A stored emotion value means "as of the last time this memory was written or remembered", so ``created_at`` moves with
+        it. ``created_at`` is written as ``created_at.isoformat()`` (the ``+00:00`` form `create` writes, because rows are
+        compared as text); the caller passes a timezone-aware UTC value. ``emotions`` may be ``{}``: the row's emotions stay
+        empty and ``created_at`` is still written. ``peak_emotion_intensity`` is NOT touched: it is monotone and exists to survive
+        fading. No hook fires. Not gated here: the caller decides whether the engine is live.
+
+        The date: so a displayed memory keeps the day it was made once ``created_at`` moves, the row's text gets the local
+        calendar day of its ``created_at`` BEFORE this reset at its start (`DATE_PREFIX_FORMAT_PLACEHOLDER`), unless it already
+        starts with a date in that form, so a second write-back adds nothing (the gate's merge keeps that date when it rewrites
+        the text: `carry_date_prefix`). A fading row's original text (``content_snapshot``,
+        which `unfade` restores) is judged and dated the same way, so the day survives an unfade. The row's own text is read
+        here, in the same write transaction (`BEGIN IMMEDIATE`) as the UPDATE, so a text change that landed since the caller
+        loaded the row is kept and the old date is the one the row really held. When the text changed, the same UPDATE clears
+        the row's embedding (a crash then leaves a backfill-eligible NULL, never a vector for the old text), and after the commit
+        the matrix entry is evicted and the row is re-embedded as every content-changing path does (`_reembed_or_clear`); the
+        full-text index follows by its update trigger. An unchanged text keeps its vector.
+
+        Raises KeyError if memory_id does not exist and RuntimeError when the connection is already inside a transaction. On any
+        error the transaction is rolled back and the error raised again, so the store never stays holding the write lock.
+        """
+        if self._conn.in_transaction:
+            raise RuntimeError("refresh_faded_emotions: cannot write inside an open transaction")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT content, content_snapshot, created_at FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown memory id: {memory_id!r}")
+            before = _coerce_utc(row["created_at"])
+            content = _with_date_prefix(row["content"], before)
+            snapshot = row["content_snapshot"]
+            # A fading row's snapshot (the original text `unfade` restores) is dated with the same origin day, so an unfade after
+            # this write-back keeps the day the memory was made. Accepted edge: a summary made by `fade` after an earlier write-back
+            # has no prefix, so a later write-back dates that summary with the last reset day while the snapshot keeps the origin day.
+            new_snapshot = None if snapshot is None else _with_date_prefix(snapshot, before)
+            assignments = ["emotions_json = ?", "created_at = ?"]
+            values: list[Any] = [_emotions_column(emotions), created_at.isoformat()]
+            text_changed = content != row["content"]
+            if text_changed:
+                assignments += ["content = ?", "embedding = NULL", "embedding_model_id = NULL"]
+                values.append(content)
+            if new_snapshot != snapshot:
+                assignments.append("content_snapshot = ?")
+                values.append(new_snapshot)
+            values.append(memory_id)
+            self._conn.execute(f"UPDATE memories SET {', '.join(assignments)} WHERE id = ?", values)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        if text_changed:
+            # As `update(content=...)` does: evict the warm matrix entry (a concurrent recall degrades to lexical rather than
+            # serving the old text's vector), then re-embed synchronously (or clear on failure).
+            try:
+                from brain.memory.embedding_matrix import build_embedding_matrix
+
+                build_embedding_matrix(self.db_path).evict(memory_id)
+            except Exception:  # noqa: BLE001 (best-effort, must not block the write)
+                logger.warning(
+                    "MemoryStore.refresh_faded_emotions: matrix evict failed for id=%s", memory_id, exc_info=True
+                )
+            self._reembed_or_clear(memory_id, content)
+
     # --- the emotion engine's window reads (Engine 4, #579) -------------------------------------------------
     #
     # Plain SELECTs on the engine's behalf, in the one module that owns `memories.db`: no bump of `recall_count` or
@@ -3095,76 +3165,6 @@ class MemoryStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("MemoryStore.oldest_created_at: the oldest created_at %r cannot be read (%s)", row["oldest"], exc)
             return None
-
-    def refresh_faded_emotions(
-        self, memory_id: str, emotions: dict[str, float], created_at: datetime
-    ) -> None:
-        """Write a remembered memory's faded emotion values and a fresh ``created_at`` in ONE UPDATE (the temp gate's write-back),
-        and put the date the row had before the reset at the start of its text.
-
-        A stored emotion value means "as of the last time this memory was written or remembered", so ``created_at`` moves with
-        it. ``created_at`` is written as ``created_at.isoformat()`` (the ``+00:00`` form `create` writes, because rows are
-        compared as text); the caller passes a timezone-aware UTC value. ``emotions`` may be ``{}``: the row's emotions stay
-        empty and ``created_at`` is still written. ``peak_emotion_intensity`` is NOT touched: it is monotone and exists to survive
-        fading. No hook fires. Not gated here: the caller decides whether the engine is live.
-
-        The date: so a displayed memory keeps the day it was made once ``created_at`` moves, the row's text gets the local
-        calendar day of its ``created_at`` BEFORE this reset at its start (`DATE_PREFIX_FORMAT_PLACEHOLDER`), unless it already
-        starts with a date in that form, so a second write-back adds nothing (the gate's merge keeps that date when it rewrites
-        the text: `carry_date_prefix`). A fading row's original text (``content_snapshot``,
-        which `unfade` restores) is judged and dated the same way, so the day survives an unfade. The row's own text is read
-        here, in the same write transaction (`BEGIN IMMEDIATE`) as the UPDATE, so a text change that landed since the caller
-        loaded the row is kept and the old date is the one the row really held. When the text changed, the same UPDATE clears
-        the row's embedding (a crash then leaves a backfill-eligible NULL, never a vector for the old text), and after the commit
-        the matrix entry is evicted and the row is re-embedded as every content-changing path does (`_reembed_or_clear`); the
-        full-text index follows by its update trigger. An unchanged text keeps its vector.
-
-        Raises KeyError if memory_id does not exist and RuntimeError when the connection is already inside a transaction. On any
-        error the transaction is rolled back and the error raised again, so the store never stays holding the write lock.
-        """
-        if self._conn.in_transaction:
-            raise RuntimeError("refresh_faded_emotions: cannot write inside an open transaction")
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT content, content_snapshot, created_at FROM memories WHERE id = ?", (memory_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Unknown memory id: {memory_id!r}")
-            before = _coerce_utc(row["created_at"])
-            content = _with_date_prefix(row["content"], before)
-            snapshot = row["content_snapshot"]
-            # A fading row's snapshot (the original text `unfade` restores) is dated with the same origin day, so an unfade after
-            # this write-back keeps the day the memory was made. Accepted edge: a summary made by `fade` after an earlier write-back
-            # has no prefix, so a later write-back dates that summary with the last reset day while the snapshot keeps the origin day.
-            new_snapshot = None if snapshot is None else _with_date_prefix(snapshot, before)
-            assignments = ["emotions_json = ?", "created_at = ?"]
-            values: list[Any] = [_emotions_column(emotions), created_at.isoformat()]
-            text_changed = content != row["content"]
-            if text_changed:
-                assignments += ["content = ?", "embedding = NULL", "embedding_model_id = NULL"]
-                values.append(content)
-            if new_snapshot != snapshot:
-                assignments.append("content_snapshot = ?")
-                values.append(new_snapshot)
-            values.append(memory_id)
-            self._conn.execute(f"UPDATE memories SET {', '.join(assignments)} WHERE id = ?", values)
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        if text_changed:
-            # As `update(content=...)` does: evict the warm matrix entry (a concurrent recall degrades to lexical rather than
-            # serving the old text's vector), then re-embed synchronously (or clear on failure).
-            try:
-                from brain.memory.embedding_matrix import build_embedding_matrix
-
-                build_embedding_matrix(self.db_path).evict(memory_id)
-            except Exception:  # noqa: BLE001 (best-effort, must not block the write)
-                logger.warning(
-                    "MemoryStore.refresh_faded_emotions: matrix evict failed for id=%s", memory_id, exc_info=True
-                )
-            self._reembed_or_clear(memory_id, content)
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""

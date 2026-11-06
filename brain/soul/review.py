@@ -337,11 +337,17 @@ def _related_memory_snippets(
 def _current_emotional_summary(store: MemoryStore) -> str:
     """One-line summary of current dominant emotion + intensity."""
     try:
-        from brain.emotion.aggregate import aggregate_state
+        live_engine = store.emotion_engine()
+        if live_engine is not None and live_engine.is_live():
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the summary says neutral.
+            scores = {name: r.short for name, r in live_engine.read().items()}
+        else:
+            from brain.emotion.aggregate import aggregate_state
 
-        recent = store.list_active(limit=50)
-        state = aggregate_state(recent)
-        scores = dict(state.emotions)
+            recent = store.list_active(limit=50)
+            state = aggregate_state(recent)
+            scores = dict(state.emotions)
     except Exception as exc:
         logger.warning("emotional state lookup failed: %s", exc)
         return "unknown"

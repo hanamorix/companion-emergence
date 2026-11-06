@@ -605,6 +605,19 @@ REMOVED: tuple[Removed, ...] = (
             "brain/chat/prompt.py",
         ),
     ),
+    # --- the readers move onto the engine (#583, Readers 1) ---------------------------------------------------------------
+    Removed(
+        names=("_compute_unnamed_pressure",),
+        why="renamed compute_unnamed_pressure: the supervisor's live self-model tick imports it, so it is public",
+        ref="#583 (draft PR #632): Readers 1",
+        kind="code",
+    ),
+    Removed(
+        names=("_emotion_engine",),
+        why="renamed MemoryStore.emotion_engine: the readers that hold a store use it, so it is public",
+        ref="#583 (draft PR #632): Readers 1",
+        kind="code",
+    ),
 )
 
 
