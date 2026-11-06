@@ -2,8 +2,8 @@
 
 Everything here works on in-memory state and takes the time as an argument: no files, no lock, no clock, no memory
 store. The engine module (Engine 0 and later) orchestrates; this file is what its numbers come from. The JSON form
-of `EngineState` and the queue are in `engine_files.py`; the drain and the rebuild belong to the later slices. Callers pass names already resolved
-(`resolve_emotions`): the fold functions do not canonicalise.
+of `EngineState` and the queue are in `engine_files.py`; the drain and the direct apply are in `engine.py`, the replay in
+`engine_rebuild.py`. Callers pass names already resolved (`resolve_emotions`): the fold functions do not canonicalise.
 
 What lives here:
 
@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, NamedTuple, get_args
 
@@ -34,6 +34,7 @@ from brain import dev_constants
 from brain.emotion.vocabulary import canonical_name
 from brain.initiate.schemas import StateName
 from brain.memory import memory_utils
+from brain.utils.log_throttle import warn_throttled
 from brain.utils.memory import is_conversation_derived
 from brain.utils.time import to_local
 
@@ -137,8 +138,8 @@ class Event:
     stored climax). "assigned": an existing counted memory got its feelings later (`at` is the row's creation time, as for a
     commit, not the time of the assignment). "showing": a counted memory was shown in full. "change": signed amounts to add to
     the stored averages (`source` names the caller). "start": the start-only event for a committed row of a type that
-    does not count (a memory's own date event, which the spec makes a direct apply; Engine 4 moves it, and until then the
-    commit hook appends it to the queue); it carries only `at`, the row's creation time, and keeps the persona's start date.
+    does not count (a memory's own date event, applied directly like a commit, never queued); it carries only `at`, the row's
+    creation time, and keeps the persona's start date.
 
     `modifier` is the source modifier of a commit, an assigned or a showing event. A change has no modifier (its weight is
     always 1) and a start event folds nothing, so neither reads the field.
@@ -151,6 +152,63 @@ class Event:
     modifier: float = 1.0
     climax: float = 0.0
     source: str | None = None
+
+
+def copy_state(state: EngineState) -> EngineState:
+    """A copy of `state` that shares nothing mutable with it: the checkpoint an apply step restores after a fold that raised.
+
+    The scalar fields are copied by `dataclasses.replace` (so a field added later is carried without a change here); the
+    averages, the repeat entries and each emotion's snapshot list are copied one level down. A `SnapshotDay` is an immutable
+    tuple, so the list is a shallow copy. Cheaper than `copy.deepcopy`, which an import of thousands of events would pay for
+    on every event.
+    """
+    return replace(
+        state,
+        repeats={memory_id: RepeatEntry(entry.first_at, entry.count) for memory_id, entry in state.repeats.items()},
+        emotions={
+            name: EmotionState(
+                Average(emotion.short.avg, emotion.short.weight),
+                Average(emotion.long.avg, emotion.long.weight),
+                emotion.last_entry_day,
+                list(emotion.snapshot),
+            )
+            for name, emotion in state.emotions.items()
+        },
+    )
+
+
+def restore_state(state: EngineState, checkpoint: EngineState) -> None:
+    """Put the fields of `checkpoint` (a `copy_state` result) back into `state`, in place, so every holder of `state` sees it."""
+    for item in fields(EngineState):
+        setattr(state, item.name, getattr(checkpoint, item.name))
+
+
+# What a fold step may raise for an event's own content: an ordinary skip, logged as a line. Anything else is a bug and is
+# logged with its traceback (throttled), but the event is still skipped and the others still fold.
+_SKIPPABLE = (ValueError, OverflowError, OSError, TypeError)
+
+
+def fold_guarded(state: EngineState, step: Callable[[], None], what: str, *, key: str) -> bool:
+    """Run one fold `step` on `state`; if it raises, put the state back exactly as it was, log, and return False.
+
+    `_fold` changes the averages before its last `day_of`, so a step that raises can leave a half-folded event; the apply step
+    would then save it. The state is therefore checkpointed (`copy_state`) before the step and restored on ANY exception. An
+    error of the event's own content (`_SKIPPABLE`) is an ordinary warning line; any other is logged with its traceback, once
+    per throttle interval for the same `key` (the caller puts the persona and the step in it), so a persistent bug does not
+    flood the log. `BaseException`s that are not `Exception` (an interrupt) are not caught.
+    """
+    checkpoint = copy_state(state)
+    try:
+        step()
+    except _SKIPPABLE as exc:
+        restore_state(state, checkpoint)
+        logger.warning("emotion engine: %s skipped (%s: %s)", what, type(exc).__name__, exc)
+        return False
+    except Exception as exc:
+        restore_state(state, checkpoint)
+        warn_throttled(logger, f"{key}:{type(exc).__name__}", "emotion engine: %s skipped, an unexpected %s", what, type(exc).__name__)
+        return False
+    return True
 
 
 # --- days ----------------------------------------------------------------------------------------------------------

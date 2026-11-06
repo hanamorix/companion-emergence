@@ -1819,13 +1819,13 @@ def test_a_false_answer_is_re_stated_each_time_and_a_true_one_never(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[Path] = []
-    real = engine_files.switch_exists
+    real = engine_files.switch_state
 
-    def counting(persona_dir: Path) -> bool:
+    def counting(persona_dir: Path) -> bool | None:
         calls.append(persona_dir)
         return real(persona_dir)
 
-    monkeypatch.setattr(engine_files, "switch_exists", counting)
+    monkeypatch.setattr(engine_files, "switch_state", counting)
     engine = EmotionEngine(tmp_path)
     engine.is_live()
     engine.is_live()
@@ -1837,11 +1837,7 @@ def test_a_false_answer_is_re_stated_each_time_and_a_true_one_never(
     assert len(calls) == 3
 
 
-def test_a_stat_error_other_than_not_found_answers_false_logs_and_is_not_cached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    engine_files.write_switch(tmp_path, NOW)
-    engine = EmotionEngine(tmp_path)
+def _refuse_the_switch_stat(monkeypatch: pytest.MonkeyPatch) -> None:
     real_stat = file_ops.stat_path
 
     def refuse(path: str | Path):
@@ -1850,11 +1846,65 @@ def test_a_stat_error_other_than_not_found_answers_false_logs_and_is_not_cached(
         return real_stat(path)
 
     monkeypatch.setattr(file_ops, "stat_path", refuse)
+
+
+def test_switch_state_tells_a_seen_file_from_a_missing_one_from_an_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """V3: True seen, False missing, None on a stat error other than "no such file" (logged)."""
+    engine_files.write_switch(tmp_path / "seen", NOW)
+    assert engine_files.switch_state(tmp_path / "seen") is True
+    assert engine_files.switch_state(tmp_path / "missing") is False
+    _refuse_the_switch_stat(monkeypatch)
     with caplog.at_level(logging.WARNING, logger=FILES_LOGGER):
-        assert engine.is_live() is False
+        assert engine_files.switch_state(tmp_path / "seen") is None
     assert any("emotion_switch.json" in r.getMessage() for r in caplog.records)
+
+
+def test_a_stat_error_other_than_not_found_answers_not_switched_and_switch_exists_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Owner 2026-11-05: "If the system can't tell if its switched, assume its not." A switch file that is on disk but
+    cannot be inspected is still answered False, with a warning that names the error."""
+    engine_files.write_switch(tmp_path, NOW)
+    _refuse_the_switch_stat(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=FILES_LOGGER):
+        assert engine_files.switch_exists(tmp_path) is False
+    assert any("emotion_switch.json" in r.getMessage() and "denied" in r.getMessage() for r in caplog.records)
+
+
+def test_is_live_is_false_on_a_stat_error_and_the_unknown_is_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[Path] = []
+    real = engine_files.switch_state
+
+    def counting(persona_dir: Path) -> bool | None:
+        calls.append(persona_dir)
+        return real(persona_dir)
+
+    monkeypatch.setattr(engine_files, "switch_state", counting)
+    engine_files.write_switch(tmp_path, NOW)  # switched, but the stat of the file fails
+    engine = EmotionEngine(tmp_path)
+    with monkeypatch.context() as fault:
+        _refuse_the_switch_stat(fault)
+        assert engine.is_live() is False
+        assert engine.is_live() is False
+        assert len(calls) == 2  # asked again on the next call: an unknown is never remembered
+    assert engine.is_live() is True  # the fault cleared; the file is seen now
+    assert len(calls) == 3
+
+
+def test_only_a_switch_file_that_was_seen_is_cached_as_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine_files.write_switch(tmp_path, NOW)
+    engine = EmotionEngine(tmp_path)
+    assert engine.is_live() is True
+    _refuse_the_switch_stat(monkeypatch)
+    assert engine.is_live() is True  # a seen file is remembered for the life of the instance, even under a later stat error
+    assert EmotionEngine(tmp_path).is_live() is False  # a new instance meeting the fault cannot tell, so not switched
     monkeypatch.undo()
-    assert engine.is_live() is True  # the error was not cached as an answer
+    engine_files.switch_path(tmp_path).unlink()
+    assert engine.is_live() is True
 
 
 def test_fold_change_queues_its_event_and_read_is_still_empty(tmp_path: Path) -> None:
@@ -1867,4 +1917,4 @@ def test_fold_change_queues_its_event_and_read_is_still_empty(tmp_path: Path) ->
     assert engine.read() == {}
     engine_files.write_switch(tmp_path, NOW)
     assert engine.is_live() is True
-    assert engine.read() == {}  # S4 gives read() its body
+    assert engine.read() == {}  # no state file yet: nothing to read

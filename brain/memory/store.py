@@ -32,6 +32,7 @@ from brain import dev_constants, tunables
 from brain.memory import cost_series
 from brain.memory.floor_calibration import RETENTION_WINDOW_DAYS_DEFAULT
 from brain.utils.sqlite_open import OpenProfile, close_on_error, open_store_connection
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -1069,8 +1070,8 @@ class MemoryStore:
         A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
         had open is left as it was), so a failure does not leave one open for the next writer.
 
-        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook appends one
-        event to the engine's queue and never raises into this call. `fold=False` is for a write that is not new
+        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook applies the
+        memory's own emotions to the engine's state under its lock (a commit is never queued) and never raises into this call. `fold=False` is for a write that is not new
         experience (a restore, an import). An in-memory store tells nobody.
 
         Deliberately does NOT itself touch embeddings — MemoryStore has no
@@ -2948,6 +2949,82 @@ class MemoryStore:
                     (json.dumps(emotions), new_max, memory_id),
                 )
             self._conn.commit()
+
+    # --- the emotion engine's window reads (Engine 4, #579) -------------------------------------------------
+    #
+    # Plain SELECTs on the engine's behalf, in the one module that owns `memories.db`: no bump of `recall_count` or
+    # `last_accessed_at`, no hook, no embedding column. The catch-up replays what happened since a backup state was saved.
+
+    _ENGINE_WINDOW_COLUMNS = (
+        "id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
+        "last_accessed_at, active, protected, metadata_json, state, content_snapshot, recall_count, "
+        "peak_emotion_intensity"
+    )
+
+    @staticmethod
+    def _window_bounds(since: datetime) -> tuple[datetime, str]:
+        """`since` as an aware UTC time and the TEXT bound of the SQL prefilter: a day earlier than `since`.
+
+        The stored times are ISO text in whatever offset the writer used, so a text compare alone can miss a row whose
+        instant is inside the window; the prefilter is therefore widened by a day and the caller filters on parsed times.
+        """
+        when = lenient_utc(since)
+        if when is None:
+            raise ValueError(f"since is not a usable time: {since!r}")
+        return when, (when - timedelta(days=1)).isoformat()
+
+    def list_engine_window(self, since: datetime) -> list[Memory]:
+        """The rows created OR last accessed at or after `since` (any type, any state), oldest first. Bumps nothing.
+
+        A row whose columns cannot be parsed (a bad time or bad JSON) is logged with its id and skipped, so one damaged row
+        does not stop every catch-up.
+        """
+        when, bound = self._window_bounds(since)
+        rows = self._conn.execute(
+            f"SELECT {self._ENGINE_WINDOW_COLUMNS} FROM memories WHERE created_at >= ? OR last_accessed_at >= ?",  # noqa: S608
+            (bound, bound),
+        ).fetchall()
+        found: list[Memory] = []
+        for row in rows:
+            try:
+                memory = _row_to_memory(row)
+            except Exception as exc:  # noqa: BLE001 - one damaged row must not stop the window
+                logger.warning("MemoryStore.list_engine_window: row %s skipped, its columns cannot be read (%s)", row["id"], exc)
+                continue
+            if memory.created_at >= when or (memory.last_accessed_at is not None and memory.last_accessed_at >= when):
+                found.append(memory)
+        found.sort(key=lambda m: (m.created_at, m.id))
+        return found
+
+    def creation_stamps_since(self, since: datetime) -> list[datetime]:
+        """The creation time of every row (any type, any state) created at or after `since`, oldest first.
+
+        A row whose time cannot be parsed is logged with its id and skipped.
+        """
+        when, bound = self._window_bounds(since)
+        rows = self._conn.execute("SELECT id, created_at FROM memories WHERE created_at >= ?", (bound,)).fetchall()
+        stamps: list[datetime] = []
+        for row in rows:
+            try:
+                created = _coerce_utc(row["created_at"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MemoryStore.creation_stamps_since: row %s skipped, its time cannot be read (%s)", row["id"], exc)
+                continue
+            if created >= when:
+                stamps.append(created)
+        stamps.sort()
+        return stamps
+
+    def oldest_created_at(self) -> datetime | None:
+        """The creation time of the oldest row of any type and state (`SELECT MIN(created_at)`), None for an empty database or an unreadable minimum."""
+        row = self._conn.execute("SELECT MIN(created_at) AS oldest FROM memories").fetchone()
+        if row is None or row["oldest"] is None:
+            return None
+        try:
+            return _coerce_utc(row["oldest"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MemoryStore.oldest_created_at: the oldest created_at %r cannot be read (%s)", row["oldest"], exc)
+            return None
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
