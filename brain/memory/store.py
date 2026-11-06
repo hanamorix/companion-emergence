@@ -2823,13 +2823,16 @@ class MemoryStore:
         return _row_to_memory(row)
 
     def bump_recall(self, memory_id: str, amount: float) -> None:
-        """Fractional ``recall_count`` bump for the passive-recall surface path.
+        """Fractional ``recall_count`` bump for the snippet surface path.
 
-        A single atomic ``UPDATE`` incrementing ``recall_count`` ONLY — this
-        deliberately does NOT touch ``last_accessed_at``. A per-turn ambient
-        surface is not a genuine "access event" the way a full read is;
-        resetting the freshness anchor at full strength for every surfaced
-        memory (including the rank-bottom ~0.1 one) would give an
+        A single atomic ``UPDATE`` incrementing ``recall_count`` ONLY: it
+        deliberately does NOT touch ``last_accessed_at``. Only the recall block's
+        snippet rows use it (``_bump_active_entries`` and the fading tier in
+        ``prompt.py``), at 0.8 for the top rank down to 0.1. A memory shown in
+        full does not: it goes through ``open_memory``, which uses
+        ``get(bump=True)`` and sets ``last_accessed_at`` too. A snippet is not a
+        full showing, and resetting the freshness anchor at full strength for
+        every snippet (including the rank-bottom ~0.1 one) would give an
         un-discounted freshness boost, defeating the rank-discount rationale
         (``salience.py``'s freshness arm anchors on ``last_accessed_at``).
         Callers already hold the ``Memory`` objects (``_build_recall_block``),

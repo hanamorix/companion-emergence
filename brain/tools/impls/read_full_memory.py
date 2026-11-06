@@ -4,11 +4,12 @@ The deliberate-read companion to the snippet-then-read flow (P2): recall and
 search_memories surface truncated snippets + ids without bumping recall_count;
 the model pulls the few it actually wants in full through this tool. A full
 read opens the memory in full, so it routes through the ONE ``open_memory`` door
-(#231 consolidation) — the same door the passive full-render sites use. As a
-deliberate open it bumps ``recall_count`` (+1.0) AND touches ``last_accessed_at``
-(the honest "I engaged with this" signal that feeds the forgetting pass) and,
-per reconciliation C, now ALSO enqueues the memory for reappraisal — "if a
-memory gets opened, it goes back into the reappraisal queue, doesn't matter how".
+(#231 consolidation), the same door the recall block's full renders use. Every
+open through it bumps ``recall_count`` (+1.0) AND sets ``last_accessed_at`` (the
+honest "I engaged with this" signal that feeds the forgetting pass), enqueues the
+memory for reappraisal ("if a memory gets opened, it goes back into the
+reappraisal queue, doesn't matter how") and reports the showing to the emotion
+engine.
 """
 
 from __future__ import annotations
@@ -31,9 +32,9 @@ def read_full_memory(
     """Return the full (untruncated) memory body for ``memory_id``.
 
     Fetches the row (no bump) for the existence check + result, then routes the
-    open through ``open_memory(deliberate=True)`` — which applies the same +1.0
-    recall_count and ``last_accessed_at`` touch as before AND enqueues a
-    reappraisal (reconciliation C). Returns the full ``_mem_to_result`` dict, or
+    open through ``open_memory``, which applies the +1.0 recall_count and
+    ``last_accessed_at`` touch, enqueues a reappraisal (reconciliation C) and
+    reports the showing to the emotion engine. Returns the full ``_mem_to_result`` dict, or
     ``{"error": "not found", "id": memory_id}`` when the id is unknown.
 
     ``hebbian`` is injected by dispatch but unused here.
@@ -41,5 +42,5 @@ def read_full_memory(
     mem = store.get(memory_id, bump=False)
     if mem is None:
         return {"error": "not found", "id": memory_id}
-    open_memory(mem, store=store, persona_dir=persona_dir, deliberate=True, seen=None)
+    open_memory(mem, store=store, persona_dir=persona_dir, seen=None)
     return _mem_to_result(mem)

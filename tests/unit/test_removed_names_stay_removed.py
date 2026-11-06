@@ -593,6 +593,18 @@ REMOVED: tuple[Removed, ...] = (
         why="the emotion state's oldest-entry time (and the engine's `oldest_entry_at()` stub) had no reader; dropped before any live persona's state file was written with it, so no migration is needed",
         ref="the maintainer's decision on PR #626 (Engine 2), 2026-11-05",
     ),
+    # --- every full open is an access (#582) ----------------------------------------------------------------------------
+    Removed(
+        names=("deliberate",),
+        why="open_memory has no deliberate parameter: every full open sets last_accessed_at and reports to the emotion engine, so no caller says whether the open was deliberate",
+        ref="#582 (draft PR #631): the access fixes",
+        kind="code",
+        scope=(
+            "brain/memory/recall_open.py",
+            "brain/tools/impls/read_full_memory.py",
+            "brain/chat/prompt.py",
+        ),
+    ),
 )
 
 

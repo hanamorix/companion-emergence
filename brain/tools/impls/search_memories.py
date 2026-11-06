@@ -340,9 +340,9 @@ def search_memories(
     If emotion is provided, memories whose emotions dict contains that emotion
     key are boosted to the front of the result list. Cap at limit.
 
-    Retrieval is **bump-free** in both modes — surfacing does not touch
-    ``recall_count`` (only a deliberate ``read_full_memory`` → ``store.get()``
-    bumps). ND-1 resolved (owner, 2026-08-14): ``store.update()``/
+    Retrieval is **bump-free** in both modes: surfacing does not touch
+    ``recall_count`` (only opening a memory in full does, through ``open_memory``:
+    ``read_full_memory`` and the recall block's full renders). ND-1 resolved (owner, 2026-08-14): ``store.update()``/
     ``store.deactivate()``'s internal existence-check now also passes
     ``bump=False``, so only a genuine full-read bumps ``recall_count``. See
     ``changes/p2-relevance/decisions.md``. The semantic path never calls

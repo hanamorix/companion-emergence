@@ -65,6 +65,25 @@ def test_read_full_memory_touches_last_accessed_and_enqueues_reappraisal(tmp_pat
     assert ids.count(m.id) == 1
 
 
+def test_read_full_memory_reports_the_showing_to_the_engine_once(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """The tool's full open is reported to the emotion engine once, with the memory it opened; an unknown id reports
+    nothing."""
+    store = MemoryStore(":memory:")
+    hebbian = HebbianMatrix(":memory:")
+    m = Memory.create_new(content="Jordan mattered", memory_type="event", domain="d")
+    store.create(m)
+
+    read_full_memory("no-such-id", store=store, hebbian=hebbian, persona_dir=tmp_path)
+    assert emotion_engine_stub.recorded_calls == []
+
+    read_full_memory(m.id, store=store, hebbian=hebbian, persona_dir=tmp_path)
+
+    shown = [c[1].id for c in emotion_engine_stub.recorded_calls if c[0] == "on_memory_shown"]
+    assert shown == [m.id]
+
+
 def test_c7_read_full_memory_not_found(tmp_path: Path) -> None:
     store = MemoryStore(":memory:")
     hebbian = HebbianMatrix(":memory:")

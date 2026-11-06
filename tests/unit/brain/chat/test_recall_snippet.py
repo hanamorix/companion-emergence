@@ -193,7 +193,7 @@ def test_lost_bucket_entries_are_never_bumped(tmp_path: Path) -> None:
 def test_g19_fading_memory_surfaced_as_snippet_is_bumped_last_accessed_unchanged(
     tmp_path: Path,
 ) -> None:
-    """G19: a fading memory surfaced as a snippet IS bumped, but the passive
+    """G19: a fading memory surfaced as a snippet IS bumped, but the snippet
     bump leaves last_accessed_at unchanged (bump_recall touches recall_count
     only)."""
     store = _store()
@@ -206,7 +206,7 @@ def test_g19_fading_memory_surfaced_as_snippet_is_bumped_last_accessed_unchanged
     assert "softened (fading" in block
 
     assert _rc(store, m.id) > before_rc, "fading memory surfaced as a snippet is bumped"
-    assert _la(store, m.id) == before_la, "passive bump must not touch last_accessed_at"
+    assert _la(store, m.id) == before_la, "snippet bump must not touch last_accessed_at"
 
 
 def test_g18_multi_turn_bump_accumulates_additively_and_stays_bounded(
