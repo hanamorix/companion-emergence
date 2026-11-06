@@ -331,26 +331,6 @@ def save_reflection_cadence(persona_dir, now: datetime) -> None:
     )
 
 
-# base + per-source accent (mirrors the W8 / maker reach_emotion map shape)
-_EMOTION_BASE = {"tenderness": 0.08}
-_EMOTION_ACCENT = {
-    "warmth": {"tenderness": 0.06},
-    "repair": {"relief": 0.06},
-    "delight": {"joy": 0.06},
-}
-
-
-def relationship_emotion_delta(*, dominant_source: str) -> dict[str, float]:
-    """Small vocab-filtered, decay-subordinate emotion delta for a peer moment."""
-    from brain.chat.extractor import _filter_to_registered
-    raw = dict(_EMOTION_BASE)
-    for name, v in _EMOTION_ACCENT.get(dominant_source, {}).items():
-        raw[name] = raw.get(name, 0.0) + v
-    # drop any non-finite values before they can reach felt state (stage-6 review)
-    raw = {k: v for k, v in raw.items() if math.isfinite(v)}
-    return _filter_to_registered(raw)
-
-
 def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: datetime) -> dict[str, float]:
     """Scale `delta` so the peer's cumulative windowed influence stays ≤ cap
     (parent §14.3, anti love-bomb). Returns the delta actually applied ({} if the

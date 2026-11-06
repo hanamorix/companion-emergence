@@ -1,18 +1,10 @@
 from datetime import UTC, datetime
 
 from brain import dev_constants
-from brain.kindled_link.relationship import (
-    apply_peer_emotion,
-    relationship_emotion_delta,
-)
+from brain.kindled_link.relationship import apply_peer_emotion
 from brain.kindled_link.store import KindledLinkStore
 
 NOW = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
-
-
-def test_delta_is_vocab_filtered_and_small():
-    d = relationship_emotion_delta(dominant_source="warmth")
-    assert all(0.0 < v <= 0.2 for v in d.values())
 
 
 def test_apply_scales_down_as_window_fills(tmp_path):
@@ -53,9 +45,3 @@ def test_nan_magnitude_does_not_defeat_cap(tmp_path):
     # repeat: still bounded
     apply_peer_emotion(s, "kid_a", {"tenderness": float("nan")}, NOW)
     assert s.get_peer_emotion_accumulated("kid_a", NOW) == 0.0
-
-
-def test_emotion_delta_is_all_finite():
-    d = relationship_emotion_delta(dominant_source="warmth")
-    import math as _m
-    assert all(_m.isfinite(v) for v in d.values())
