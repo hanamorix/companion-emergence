@@ -139,7 +139,9 @@ line-length = 100
 target-version = "py312"
 # wizard-validation holds a staged .app whose bundled python-runtime
 # (stdlib + site-packages) must never count against the repo gate.
-extend-exclude = ["wizard-validation", "migrated-nell"]
+# test-data holds the synthetic memory database with its standalone build and
+# check scripts (not part of the package or the sdist).
+extend-exclude = ["wizard-validation", "migrated-nell", "test-data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "C4", "UP"]

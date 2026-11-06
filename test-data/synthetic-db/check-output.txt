@@ -1,0 +1,19 @@
+PASS: total_row_count -- total=19413 target=19452 (+-5%) range=[18479, 20425]
+PASS: memory_type_budgets -- all 19 types within band
+PASS: window_and_day_coverage -- all 16 windows and all 109 days present
+PASS: not_null_and_json -- no NULLs in 14 NOT NULL columns; all JSON columns parse
+PASS: house_style_banned_phrases -- no em-dash; banned-phrase hits=0 <= limit 19.41
+PASS: banned_names -- clean
+PASS: duplicates -- 0 exact duplicates; near-dup rows=106 rate=0.0055
+PASS: fading_fraction -- fading=6656/19413=0.3429 target=0.3428 range=[0.3086, 0.3771]
+PASS: content_snapshot_semantics -- content_snapshot non-NULL on exactly the 6656 fading rows; snapshot != content and strictly longer on all of them
+PASS: decay_coherence -- 6656/6656 fading rows end coherently
+PASS: domain_type_mapping -- domain matches SKELETON.md section 3 for every memory_type
+PASS: tag_count_shape -- tagged_fraction=0.3973 mean_tags/row=1.2578 mode=3 share_exactly_3=0.7810
+PASS: peak_emotion_intensity -- median=1.4827 mean=3.0098
+PASS: recall_count -- median=89.0513 range=[70.0, 150.0]
+PASS: id_column -- no NULLs, 19413/19413 unique
+PASS: fts_integrity -- docsize=19413 == memories=19413; MATCH 'the' -> 14263 rows
+PASS: brain_open_smoke_test -- MemoryStore(...).list_active() ran cleanly: OK 50
+
+RESULT: PASS (17/17 checks passed)
