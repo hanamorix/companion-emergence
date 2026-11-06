@@ -638,7 +638,6 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     print(f"importance: {memory.importance:.2f}")
     print(f"score: {memory.score:.2f}")
     print(f"active: {'yes' if memory.active else 'no'}")
-    print(f"protected: {'yes' if memory.protected else 'no'}")
     print(f"tags: {', '.join(memory.tags) if memory.tags else '(none)'}")
     print(f"emotions: {_format_mapping(memory.emotions)}")
     print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")

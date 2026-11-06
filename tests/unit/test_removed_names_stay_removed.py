@@ -642,6 +642,19 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/emotion/state.py",),
     ),
+    Removed(
+        names=("_EMOTION_BASE", "_EMOTION_ACCENT", "relationship_emotion_delta"),
+        why="the peer emotion table had no live producer; a peer's emotion comes from the reflection reply through apply_peer_emotion",
+        ref="#672 A2a cleanup",
+        scope=("brain/kindled_link",),
+    ),
+    Removed(
+        names=("protected",),
+        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field, the column and the heartbeat check stay until phase C",
+        ref="#672 A2a cleanup",
+        kind="code",
+        scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
+    ),
 )
 
 

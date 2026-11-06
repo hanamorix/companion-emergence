@@ -66,7 +66,6 @@ def read_source_memories(source_dir: Path) -> dict[str, Memory]:
             score=float(d.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(d.get("active", 1)),
-            protected=bool(d.get("protected", 0)),
             metadata=_loads_dict(d.get("metadata_json")),
             state=d.get("state") or "active",
             content_snapshot=d.get("content_snapshot"),
