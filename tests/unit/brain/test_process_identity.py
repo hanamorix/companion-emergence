@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -144,3 +145,73 @@ def test_windows_reader_reads_the_error_saved_by_ctypes_not_a_clobbered_one(monk
     monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": k32})(), raising=False)
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 87, raising=False)
     assert pi._windows_token(4242) == pi.GONE
+
+
+@pytest.mark.no_base_failure(
+    reason="pins the stable answer that state_file.update relies on; a test for what must not change"
+)
+def test_a_failed_first_read_stays_the_answer_so_a_bridge_keeps_its_own_record(
+    tmp_path, monkeypatch
+):
+    """A bridge whose first read failed records no token (runner.py) and `state_file.update` then requires the record to equal
+    `own_token()`. If a later read could succeed, the two would differ and the bridge could never write its own record again."""
+    from brain.bridge import state_file
+
+    real_token_of = pi.token_of
+    monkeypatch.setattr(pi, "_OWN", None)
+    monkeypatch.setattr(pi, "token_of", lambda pid: pi.UNKNOWN)
+    recorded = pi.own_token()
+    assert recorded is None
+    state_file.write(
+        tmp_path,
+        state_file.BridgeState(
+            persona=tmp_path.name,
+            pid=os.getpid(),
+            port=1,
+            started_at="2026-11-05T00:00:00+00:00",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="tests",
+            pid_token=recorded,
+            identity="unavailable",
+        ),
+    )
+
+    monkeypatch.setattr(pi, "token_of", real_token_of)  # the failure has passed
+    assert pi.own_token() is None
+    assert state_file.update(tmp_path, lambda st: setattr(st, "shutdown_clean", True)) is True
+    assert state_file.read(tmp_path).shutdown_clean is True
+
+
+@pytest.mark.no_base_failure(
+    reason="the fix is in tests/conftest.py, which the check carries onto the old code too"
+)
+def test_a_test_that_fakes_the_platform_cannot_leave_later_tests_without_a_token():
+    """#662: this test fakes win32 and starts the app. As the first caller it cached the failed read, so every later test in
+    that worker saw no token. Runs in its own pytest so it really is the first caller, whatever ran in this one."""
+    root = Path(__file__).resolve().parents[3]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "no:xdist",
+            "tests/bridge/test_lifespan_claude_workdir.py::test_lifespan_warns_when_no_neutral_dir",
+            "tests/unit/brain/test_data_home_isolation_488.py::test_a_live_supervisor_writing_its_own_persona_is_not_a_leak",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout[-2000:]
