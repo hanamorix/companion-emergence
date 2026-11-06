@@ -576,6 +576,12 @@ REMOVED: tuple[Removed, ...] = (
         scope=("brain/update/overlay.py",),
     ),
     Removed(
+        names=("exists_recent_grief_touch",),
+        why="the grief touch's recent-touch check and its insert are one store call, MemoryStore.create_grief_touch_unless_recent (the race, #342); a lookup kept alone would let a caller check and write in two steps again",
+        ref="#627 emotion rework Engine 3 (issue #578; the grief-touch race #342)",
+        kind="code",
+    ),
+    Removed(
         names=("read_bytes",),
         why="file_ops.read_bytes had no production caller once read_jsonl_from streamed through open_read; the whole-file accessor is file_ops.read_bytes_stat (pathlib's Path.read_bytes is a different, attribute-call use elsewhere)",
         ref=_FILE_OPS_REF,

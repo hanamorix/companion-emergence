@@ -19,8 +19,9 @@ import re
 import sqlite3
 import sys
 import uuid
-from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -1044,8 +1045,33 @@ class MemoryStore:
             raise ValueError("an in-memory MemoryStore has no persona directory")
         return self._db_path.parent
 
-    def create(self, memory: Memory) -> str:
+    @contextmanager
+    def _rolls_back_on_error(self) -> Iterator[None]:
+        """Run a write and its commit; if either raises, roll back the transaction this block opened and re-raise.
+
+        sqlite3 opens a transaction before a write, and a write that fails leaves the connection inside it: the next
+        writer's commit would then take the failed call's earlier statements with it, and the code that refuses to start
+        inside an open transaction would refuse until then. A transaction the caller already had open on entry is not
+        this block's to end, so it is left as it was. If the rollback itself raises, that error goes out and the original
+        one stays attached to it as its context.
+        """
+        opened_here = not self._conn.in_transaction
+        try:
+            yield
+        except BaseException:
+            if opened_here and self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+
+    def create(self, memory: Memory, *, fold: bool = True) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id.
+
+        A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
+        had open is left as it was), so a failure does not leave one open for the next writer.
+
+        After the commit, when `fold` is true, the emotion engine is told (`on_memory_committed`): the hook appends one
+        event to the engine's queue and never raises into this call. `fold=False` is for a write that is not new
+        experience (a restore, an import). An in-memory store tells nobody.
 
         Deliberately does NOT itself touch embeddings — MemoryStore has no
         embeddings dependency baked into `create()` (~11 call sites use it
@@ -1075,6 +1101,15 @@ class MemoryStore:
         full backfill reasoning (Stage 2 of the local semantic-retrieval
         build).
         """
+        with self._rolls_back_on_error():
+            self._insert_memory_row(memory)
+            self._conn.commit()
+        if fold:
+            self._notify_committed(memory)
+        return memory.id
+
+    def _insert_memory_row(self, memory: Memory) -> None:
+        """The one INSERT of a memory row, uncommitted: `create` and `create_grief_touch_unless_recent` both run it, so the column list is written once."""
         try:
             metadata_json = json.dumps(memory.metadata)
         except TypeError as exc:
@@ -1109,8 +1144,39 @@ class MemoryStore:
                 ),
             ),
         )
-        self._conn.commit()
-        return memory.id
+
+    def _emotion_engine(self) -> Any | None:
+        """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
+
+        `brain.emotion.engine` is imported here, not at the top: it pulls `brain.utils.memory`, which imports this module.
+        """
+        try:
+            persona_dir = self.persona_dir
+        except ValueError:
+            return None
+        from brain.emotion import engine
+
+        return engine.engine_for(persona_dir)
+
+    def _notify_committed(self, memory: Memory) -> None:
+        """Tell the engine a row was committed. All of it is inside the guard: a failure here must not reach the write."""
+        try:
+            target = self._emotion_engine()
+            if target is not None:
+                target.on_memory_committed(memory)
+        except Exception:
+            logger.error("MemoryStore.create: telling the emotion engine about %s failed", memory.id, exc_info=True)
+
+    def _notify_assigned(self, before: Memory, new_emotions: dict[str, float]) -> None:
+        """Tell the engine a row that had no feelings now has some: the row as it was before the update, with the new emotions."""
+        try:
+            if before.emotions or not new_emotions:
+                return
+            target = self._emotion_engine()
+            if target is not None:
+                target.on_emotions_assigned(replace(before, emotions=dict(new_emotions)))
+        except Exception:
+            logger.error("MemoryStore.update: telling the emotion engine about %s failed", before.id, exc_info=True)
 
     def embed_row(self, memory_id: str, content: str) -> None:
         """Compute + persist the retrieval embedding for one existing row
@@ -2743,15 +2809,22 @@ class MemoryStore:
                     break
         return results
 
-    def update(self, memory_id: str, **fields: Any) -> None:
+    def update(self, memory_id: str, *, fold: bool = True, **fields: Any) -> None:
         """Update the given fields on an existing memory.
 
         Accepts: content, memory_type, domain, emotions (dict), tags (list),
         importance, score, last_accessed_at, active, protected.
 
+        `fold` is not a field. When true and `emotions` is among the fields, a row that had no emotions and gets some now
+        is reported to the emotion engine (`on_emotions_assigned`), once the update, and the re-embed of a changed content,
+        are done; the hook never raises into this call. Whether the row counts is judged on the row as it was BEFORE this
+        update (its type, tags and metadata included, whatever else is updated together with the emotions). A content-only
+        update, or emotions written onto a row that already had some, report nothing.
+
         Raises KeyError if memory_id does not exist.
         """
-        if self.get(memory_id, bump=False) is None:
+        before = self.get(memory_id, bump=False)
+        if before is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
 
         column_map: dict[str, tuple[str, Any]] = {}
@@ -2809,8 +2882,9 @@ class MemoryStore:
         )
         values = [v for _, v in column_map.values()] + extra_values
         values.append(memory_id)
-        self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
+            self._conn.commit()
 
         # F1 #259 step 5 (increment-2 red-team fix): a content mutation
         # invalidates the row's embedding — row-id keying has no
@@ -2837,6 +2911,9 @@ class MemoryStore:
             # belt-and-suspenders, since the row is already NULL going in.
             self._reembed_or_clear(memory_id, fields["content"])
 
+        if fold and "emotions" in fields:
+            self._notify_assigned(before, fields["emotions"])
+
     def update_emotions_batch(self, rows: Sequence[tuple[str, dict[str, float]]]) -> None:
         """Write a batch of emotions-only updates in ONE transaction (C10(b),
         S17/S45): the heartbeat's batched decay pass, not the per-row
@@ -2862,21 +2939,23 @@ class MemoryStore:
         """
         if not rows:
             return
-        for memory_id, emotions in rows:
-            new_max = max((float(v) for v in emotions.values()), default=0.0)
-            self._conn.execute(
-                "UPDATE memories SET emotions_json = ?, "
-                "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-                (json.dumps(emotions), new_max, memory_id),
-            )
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            for memory_id, emotions in rows:
+                new_max = max((float(v) for v in emotions.values()), default=0.0)
+                self._conn.execute(
+                    "UPDATE memories SET emotions_json = ?, "
+                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
+                    (json.dumps(emotions), new_max, memory_id),
+                )
+            self._conn.commit()
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
         if self.get(memory_id, bump=False) is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
-        self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
-        self._conn.commit()
+        with self._rolls_back_on_error():
+            self._conn.execute("UPDATE memories SET active = 0 WHERE id = ?", (memory_id,))
+            self._conn.commit()
 
     def fade(self, memory_id: str, *, summary: str) -> None:
         """Fade a memory: snapshot content into content_snapshot, replace
@@ -3506,14 +3585,13 @@ class MemoryStore:
         )
         return int(self._conn.execute(sql, (current_model_id, min_chars)).fetchone()[0])
 
-    def exists_recent_grief_touch(self, referent_id: str, *, hours: float) -> bool:
-        """Return True if a grief_event memory with grief_referent_id == referent_id
-        exists in the memories table created within the last `hours`.
+    def _recent_grief_touch_exists(self, referent_id: str, hours: float) -> bool:
+        """True if a grief_event memory with grief_referent_id == referent_id was created within the last `hours`.
 
-        Implementation: SQL filter on (memory_type='grief_event', created_at >= cutoff),
-        then Python-side filter on metadata.grief_referent_id. Recent grief volume is
-        sparse — linear filter cost is negligible. Avoids depending on SQLite
-        json_extract. Spec §4 + §6.
+        SQL filter on (memory_type='grief_event', created_at >= cutoff), then a Python-side filter on
+        metadata.grief_referent_id. Recent grief volume is sparse, so the linear filter costs nothing, and it avoids
+        depending on SQLite json_extract. Spec §4 + §6. The one place this query is written: both checks of
+        `create_grief_touch_unless_recent` run it.
         """
         cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
         cursor = self._conn.execute(
@@ -3526,6 +3604,44 @@ class MemoryStore:
             if meta.get("grief_referent_id") == referent_id:
                 return True
         return False
+
+    def create_grief_touch_unless_recent(self, memory: Memory, *, hours: float, fold: bool = True) -> str | None:
+        """Insert a grief touch unless one for the same referent was created within the last `hours`; the check and the insert are one step (#342).
+
+        Two turns that recall the same forgotten memory at once used to both pass the check and both write a touch,
+        because the check and the write were two calls. Here the referent is read from
+        `memory.metadata["grief_referent_id"]` (a missing, non-text or empty one raises ValueError), so the referent that
+        is checked is the referent that is written.
+
+        A read-only look comes first: on most turns the touch is debounced, and that path takes no write lock. Only when
+        the look finds no touch does the method begin one write transaction (`BEGIN IMMEDIATE`) and check again; that
+        second check is the one that closes the race, since another writer may have inserted between the look and the
+        lock. Returns the new id, or None when a touch for that referent already exists (nothing is written and the
+        engine is told nothing). After the commit, when `fold` is true, the engine hears of the row as `create` tells it.
+
+        Raises RuntimeError when the connection is already inside a transaction, as its siblings do, and, on any
+        database error inside the transaction, rolls back and raises it again.
+        """
+        referent_id = memory.metadata.get("grief_referent_id")
+        if not isinstance(referent_id, str) or not referent_id:
+            raise ValueError("a grief touch needs a non-empty text metadata['grief_referent_id']")
+        if self._conn.in_transaction:
+            raise RuntimeError("grief touch: cannot write inside an open transaction")
+        if self._recent_grief_touch_exists(referent_id, hours):
+            return None
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._recent_grief_touch_exists(referent_id, hours):
+                self._conn.rollback()
+                return None
+            self._insert_memory_row(memory)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        if fold:
+            self._notify_committed(memory)
+        return memory.id
 
     def list_since_iso(self, opened_at_iso: str, *, include_fading: bool = True) -> list[Memory]:
         """Return memories with created_at > opened_at_iso, ordered ascending.

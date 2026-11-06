@@ -3,31 +3,38 @@
 The queue (`state/emotion_pending.jsonl`) is an append-only file of events waiting to be folded, one JSON event per line;
 the change log (`state/emotion_changes/YYYY-MM-DD.jsonl`) is a crash-recovery record of chat-derived changes. These are
 the file-level cases: the per-event check, the queue file's append, read by position and emptying (a bad line is dropped on
-its own), the accessor each file operation goes through, the change log's append, list, prune and tolerant reader. Cases that
-need a hook or a drain (fold order, early-out, wiring) belong to the slices that build them and extend this file.
+its own), the accessor each file operation goes through, the change log's append, list, prune and tolerant reader. The hook
+cases (Engine 3, #578: what a memory write queues, the start-only event, the guard, the lock) are at the end. Cases that need a
+drain (fold order, early-out, wiring) belong to the slice that builds it and extend this file.
 """
 
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import dataclasses
 import io
 import json
 import logging
 import math
+import sqlite3
 import sys
+import threading
 import time
+import uuid
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from brain import dev_constants
+from brain.emotion import engine as engine_module
 from brain.emotion import engine_files, engine_utils
 from brain.emotion.engine_utils import EngineState, Event, day_of, fold_event, source_modifier
 from brain.health import json_io
-from brain.memory.store import Memory
+from brain.memory.store import Memory, MemoryStore
 from brain.utils import file_lock, file_ops
 
 LOGGER = "brain.emotion.engine_files"
@@ -1476,3 +1483,881 @@ def test_a_change_written_then_read_round_trips(tmp_path: Path) -> None:
 def test_the_first_append_creates_only_the_folder_and_the_day_file(tmp_path: Path) -> None:
     engine_files.append_change(tmp_path, _change(NOW))
     assert {p.name for p in (tmp_path / "state").rglob("*")} == {"emotion_changes", f"{day_of(NOW)}.jsonl"}
+
+
+# ================================================================================================
+# The hooks (Engine 3, #578): memory writes queue events; a hook appends, never folds, never raises
+# ================================================================================================
+
+HOOK_LOGGER = "brain.emotion.engine"
+HOOK_AT = datetime(2026, 6, 1, 9, 0, tzinfo=UTC)
+EngineCls = engine_module.EmotionEngine
+
+
+def _hook_mem(
+    memory_type: str = "conversation",
+    *,
+    emotions: dict | None = None,
+    tags: list | None = None,
+    metadata: dict | None = None,
+    created_at: datetime | None = None,
+    mid: str | None = None,
+) -> Memory:
+    emo = {"joy": 6.0} if emotions is None else dict(emotions)
+    numbers = [v for v in emo.values() if isinstance(v, (int, float)) and math.isfinite(v)]
+    return Memory(
+        id=mid or str(uuid.uuid4()),
+        content="a hook test memory",
+        memory_type=memory_type,
+        domain="us",
+        created_at=created_at or HOOK_AT,
+        emotions=emo,
+        tags=list(tags or []),
+        importance=1.0,
+        score=float(sum(numbers)),
+        metadata=dict(metadata or {}),
+        peak_emotion_intensity=max(numbers, default=0.0),
+    )
+
+
+@pytest.fixture
+def hook_store(tmp_path: Path) -> Iterator[MemoryStore]:
+    store = MemoryStore(tmp_path / "memories.db")
+    yield store
+    store.close()
+
+
+def _events(persona_dir: Path) -> list[Event]:
+    return _read(persona_dir)
+
+
+def _lines(persona_dir: Path) -> list[dict]:
+    path = engine_files.queue_path(persona_dir)
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _start_state(persona_dir: Path, start: datetime | None) -> None:
+    engine_files.save_state(persona_dir, EngineState(saved_at=NOW, persona_start_at=start))
+
+
+class _Probe:
+    """Call-through spies. Each call records its arguments and whether the engine lock was held (the "held flag").
+
+    `state_lock` is wrapped so `held` is True for the body of the `with`. A spy that is never called proves nothing, so a
+    test that relies on one asserts `n(name) >= 1`.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._monkeypatch = monkeypatch
+        self.held = False
+        self.lock_calls = 0
+        self.calls: dict[str, list[tuple[tuple, bool]]] = {}
+        real_lock = engine_files.state_lock
+        probe = self
+
+        @contextlib.contextmanager
+        def lock(persona_dir: Path) -> Iterator[bool]:
+            probe.lock_calls += 1
+            with real_lock(persona_dir) as got:
+                probe.held = True
+                try:
+                    yield got
+                finally:
+                    probe.held = False
+
+        monkeypatch.setattr(engine_files, "state_lock", lock)
+
+    def wrap(self, owner: object, name: str, key: str | None = None) -> None:
+        real = getattr(owner, name)
+        label = key or name
+
+        def spy(*args: object, **kwargs: object) -> object:
+            self.calls.setdefault(label, []).append((args, self.held))
+            return real(*args, **kwargs)
+
+        self._monkeypatch.setattr(owner, name, spy)
+
+    def n(self, name: str) -> int:
+        return len(self.calls.get(name, []))
+
+    def held_at(self, name: str) -> list[bool]:
+        return [held for _args, held in self.calls.get(name, [])]
+
+
+# --- C1: a counted create appends one commit event; nothing is folded -----------------------------
+
+
+def test_a_counted_create_appends_one_commit_event_and_folds_nothing(tmp_path: Path, hook_store: MemoryStore) -> None:
+    mem = _hook_mem(emotions={"joy": 6.0, "climax": 8.0})
+    hook_store.create(mem)
+    events = _events(tmp_path)
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == "commit" and event.memory_id == mem.id and event.at == mem.created_at
+    assert dict(event.emotions) == {"joy": 6.0, "climax": 8.0}
+    assert event.modifier == 1.0 and event.climax == 8.0
+    assert not engine_files.state_path(tmp_path).exists()  # appended, not folded
+    before = engine_files.queue_path(tmp_path).read_bytes()
+    hook_store.create(_hook_mem(emotions={"grief": 2.0}))
+    after = engine_files.queue_path(tmp_path).read_bytes()
+    assert after.startswith(before) and len(_events(tmp_path)) == 2
+    assert not engine_files.state_path(tmp_path).exists()
+
+
+def test_create_with_fold_false_writes_no_queue_and_no_state_folder(tmp_path: Path, hook_store: MemoryStore) -> None:
+    hook_store.create(_hook_mem(), fold=False)
+    assert not engine_files.queue_path(tmp_path).exists()
+    assert not (tmp_path / "state").exists()
+    hook_store.create(_hook_mem())  # the positive control: the same store queues when fold is on
+    assert len(_events(tmp_path)) == 1
+
+
+# --- C1b: faded versus stored --------------------------------------------------------------------
+
+
+def test_commit_and_assigned_carry_faded_emotions_and_the_stored_climax(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] / 4)
+    hook_store.create(_hook_mem(emotions={"joy": 8.0, "climax": 8.0}))
+    empty = _hook_mem(emotions={})
+    hook_store.create(empty, fold=False)
+    hook_store.update(empty.id, emotions={"joy": 8.0, "climax": 8.0})
+    commit, assigned = _events(tmp_path)
+    assert commit.kind == "commit" and dict(commit.emotions) == {"joy": 2.0, "climax": 2.0}
+    assert commit.climax == 8.0
+    assert assigned.kind == "assigned" and dict(assigned.emotions) == {"joy": 2.0, "climax": 2.0}
+    assert "climax" not in _lines(tmp_path)[1]
+
+
+def test_a_faded_value_that_raises_drops_that_name_with_a_line_and_queues_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def faded(self: object, memory: Memory, emotion: str) -> float:
+        if emotion == "grief":
+            raise RuntimeError("no half-life")
+        return memory.emotions[emotion]
+
+    monkeypatch.setattr(EngineCls, "faded_value", faded)
+    engine = engine_module.engine_for(tmp_path)
+    with caplog.at_level(logging.WARNING, logger=HOOK_LOGGER):
+        engine.on_memory_committed(_hook_mem(emotions={"joy": 6.0, "grief": 3.0}))
+    assert [dict(e.emotions) for e in _events(tmp_path)] == [{"joy": 6.0}]
+    assert any("grief" in r.getMessage() for r in caplog.records)
+    # every name failing leaves nothing to fold: this hook appends the start-only event instead (B02.6; the spec makes it a direct apply, Engine 4 moves it)
+    monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: 1 / 0)
+    engine.on_memory_committed(_hook_mem(emotions={"joy": 6.0}))
+    assert [e.kind for e in _events(tmp_path)] == ["commit", "start"]
+
+
+def test_a_nan_value_is_dropped_and_a_row_left_with_nothing_queues_the_start_only_event(tmp_path: Path) -> None:
+    engine = engine_module.engine_for(tmp_path)
+    engine.on_memory_committed(_hook_mem(emotions={"joy": math.nan, "grief": 3.0}))
+    engine.on_memory_committed(_hook_mem(emotions={"joy": math.nan}))
+    first, second = _events(tmp_path)
+    assert first.kind == "commit" and dict(first.emotions) == {"grief": 3.0}
+    assert second.kind == "start" and second.at == HOOK_AT
+
+
+def test_a_non_text_emotion_key_does_not_abort_the_hook_and_the_callers_data_is_untouched(tmp_path: Path) -> None:
+    mem = _hook_mem(emotions={"Joy": 4.0, "joy": 6.0, 7: 1.0, "climax": 8.0})
+    before = copy.deepcopy(mem)
+    engine_module.engine_for(tmp_path).on_memory_committed(mem)
+    event = _events(tmp_path)[0]
+    assert dict(event.emotions) == {"joy": 5.0, "climax": 8.0}  # two spellings of one name are averaged
+    assert event.climax == 8.0
+    assert mem == before
+
+
+def test_the_hooks_leave_the_callers_memory_and_update_argument_alone(tmp_path: Path, hook_store: MemoryStore) -> None:
+    engine = engine_module.engine_for(tmp_path)
+    mem = _hook_mem(emotions={"Joy": 4.0, "joy": 6.0, "Grief": 2.0})
+    before = copy.deepcopy(mem)
+    engine.on_memory_committed(mem)
+    engine.on_emotions_assigned(mem)
+    engine.on_memory_shown(mem, None)
+    assert mem == before
+    empty = _hook_mem(emotions={})
+    hook_store.create(empty, fold=False)
+    given = {"Joy": 4.0, "joy": 6.0}
+    given_before = dict(given)
+    hook_store.update(empty.id, emotions=given)
+    assert given == given_before
+    assert [e.kind for e in _events(tmp_path)][-1] == "assigned"
+
+
+# --- C2: which types count ----------------------------------------------------------------------
+
+_COUNTED_ROWS = {
+    "conversation type": {"memory_type": "conversation"},
+    "conversation tag": {"memory_type": "heartbeat", "tags": ["conversation"]},
+    "conversation summary": {"memory_type": "heartbeat", "metadata": {"source_summary": "conversation:abc"}},
+    "add_memory": {"memory_type": "meta", "metadata": {"tags": [], "importance": 5}},
+    "making": {"memory_type": "making"},
+    "reach-out delivered": {"memory_type": "initiate_outbound", "metadata": {"initiate_state": "delivered"}},
+    "note": {"memory_type": "initiate_outbound", "metadata": {"initiate_state": "note"}},
+    "peer": {"memory_type": "kindled_peer", "metadata": {"peer_id": "p1"}},
+    "research": {"memory_type": "research"},
+}
+
+_UNCOUNTED_ROWS = {
+    "monologue": {"memory_type": "monologue_inner"},
+    "monologue reflex": {"memory_type": "monologue_reflex"},
+    "emotion only": {"memory_type": "emotion_only"},
+    "journal": {"memory_type": "journal"},
+    "climax journal": {"memory_type": "climax_journal"},
+    "grief breadcrumb": {"memory_type": "grief_breadcrumb"},
+    "dream": {"memory_type": "dream"},
+    "heartbeat": {"memory_type": "heartbeat"},
+    "reflex": {"memory_type": "reflex"},
+    "file write": {"memory_type": "file_write"},
+    "self model resolved": {"memory_type": "self_model_resolved"},
+    "reach-out pending": {"memory_type": "initiate_outbound", "metadata": {"initiate_state": "pending"}},
+    "reach-out unknown state": {"memory_type": "initiate_outbound", "metadata": {"initiate_state": "sent-ish"}},
+    "reach-out non-text state": {"memory_type": "initiate_outbound", "metadata": {"initiate_state": 3}},
+    "conversation tag with a session id": {"memory_type": "heartbeat", "tags": ["conversation:abc"]},
+}
+
+
+@pytest.mark.parametrize("label", sorted(_COUNTED_ROWS))
+def test_a_counted_type_queues_a_commit_event(tmp_path: Path, hook_store: MemoryStore, label: str) -> None:
+    hook_store.create(_hook_mem(**_COUNTED_ROWS[label]))
+    events = _events(tmp_path)
+    assert [e.kind for e in events] == ["commit"]
+
+
+@pytest.mark.parametrize("label", sorted(_UNCOUNTED_ROWS))
+def test_an_uncounted_type_queues_no_commit_and_asks_for_no_modifier_or_trust(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    _start_state(tmp_path, HOOK_AT - timedelta(days=30))  # an earlier start: no start event is wanted either
+    probe = _Probe(monkeypatch)
+    probe.wrap(engine_module, "source_modifier")
+    probe.wrap(engine_files, "peer_trust")
+    hook_store.create(_hook_mem(**_UNCOUNTED_ROWS[label]))
+    assert _events(tmp_path) == []
+    assert probe.n("source_modifier") == 0 and probe.n("peer_trust") == 0
+    # the positive control: a counted peer row on the same store queues, and then both spies are called
+    hook_store.create(_hook_mem(**_COUNTED_ROWS["peer"]))
+    assert [e.kind for e in _events(tmp_path)] == ["commit"]
+    assert probe.n("source_modifier") >= 1 and probe.n("peer_trust") >= 1
+
+
+# --- C3: modifiers (read from the raw line: the reader holds a modifier into range) ---------------
+
+
+def _raw_modifier(persona_dir: Path) -> float:
+    return _lines(persona_dir)[-1]["modifier"]
+
+
+def test_modifiers_of_each_source(tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    hook_store.create(_hook_mem())
+    assert _raw_modifier(tmp_path) == 1.0
+    hook_store.create(_hook_mem(**_COUNTED_ROWS["peer"]))  # no relationship record: the 0.0 stand-in
+    assert _raw_modifier(tmp_path) == pytest.approx(0.1)
+    hook_store.create(_hook_mem(**_COUNTED_ROWS["research"]))  # no rating
+    assert _raw_modifier(tmp_path) == pytest.approx(0.1)
+    seen: list[tuple] = []
+
+    def trust(persona_dir: Path, peer_id: str) -> float:
+        seen.append((persona_dir, peer_id))
+        return 1.0 if len(seen) == 1 else 0.5
+
+    monkeypatch.setattr(engine_files, "peer_trust", trust)
+    hook_store.create(_hook_mem(**_COUNTED_ROWS["peer"]))
+    assert _raw_modifier(tmp_path) == pytest.approx(1.0)
+    hook_store.create(_hook_mem(**_COUNTED_ROWS["peer"]))
+    assert _raw_modifier(tmp_path) == pytest.approx(0.55)
+    assert seen == [(tmp_path.resolve(), "p1")] * 2
+
+
+def test_a_peer_row_without_a_peer_id_does_not_ask_for_trust(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _Probe(monkeypatch)
+    probe.wrap(engine_files, "peer_trust")
+    hook_store.create(_hook_mem("kindled_peer", metadata={}))
+    assert probe.n("peer_trust") == 0 and _raw_modifier(tmp_path) == pytest.approx(0.1)
+    hook_store.create(_hook_mem("kindled_peer", metadata={"peer_id": "p1"}))
+    assert probe.n("peer_trust") == 1  # the control
+
+
+# --- C4: the start-only event -------------------------------------------------------------------
+
+
+def _uncounted(created_at: datetime = HOOK_AT) -> Memory:
+    return _hook_mem("heartbeat", created_at=created_at)
+
+
+def test_an_uncounted_row_queues_a_start_event_when_no_start_is_stored(tmp_path: Path, hook_store: MemoryStore) -> None:
+    hook_store.create(_uncounted())
+    events = _events(tmp_path)
+    assert [(e.kind, e.at) for e in events] == [("start", HOOK_AT)]
+    assert not engine_files.state_path(tmp_path).exists()
+
+
+def test_an_uncounted_row_queues_a_start_event_when_the_state_is_unreadable(tmp_path: Path, hook_store: MemoryStore) -> None:
+    path = engine_files.state_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"{ this is not json")
+    hook_store.create(_uncounted())
+    assert [e.kind for e in _events(tmp_path)] == ["start"]
+
+
+def test_the_start_event_follows_the_stored_start(tmp_path: Path, hook_store: MemoryStore) -> None:
+    _start_state(tmp_path, HOOK_AT + timedelta(days=1))  # stored start later than the row
+    hook_store.create(_uncounted())
+    assert [e.kind for e in _events(tmp_path)] == ["start"]
+    _start_state(tmp_path, HOOK_AT - timedelta(days=1))  # stored start earlier: nothing
+    hook_store.create(_uncounted())
+    assert len(_events(tmp_path)) == 1
+    _start_state(tmp_path, HOOK_AT)  # equal: the rule is "later than", so nothing
+    hook_store.create(_uncounted())
+    assert len(_events(tmp_path)) == 1
+
+
+def test_the_start_check_reads_naive_and_offset_times_as_instants(tmp_path: Path, hook_store: MemoryStore) -> None:
+    _start_state(tmp_path, HOOK_AT)  # 09:00 UTC
+    hook_store.create(_uncounted(datetime(2026, 6, 1, 9, 0)))  # naive: read as UTC, equal
+    hook_store.create(_uncounted(datetime(2026, 6, 1, 14, 0, tzinfo=timezone(timedelta(hours=5)))))  # 09:00 UTC, equal
+    assert _events(tmp_path) == []
+    hook_store.create(_uncounted(datetime(2026, 6, 1, 13, 59, tzinfo=timezone(timedelta(hours=5)))))  # 08:59 UTC
+    assert [e.kind for e in _events(tmp_path)] == ["start"]
+
+
+def test_a_backup_state_supplies_the_stored_start(tmp_path: Path, hook_store: MemoryStore) -> None:
+    _start_state(tmp_path, HOOK_AT)
+    _start_state(tmp_path, HOOK_AT)  # a second save makes the first a backup copy
+    engine_files.state_path(tmp_path).write_bytes(b"not json")  # the main file is damaged, the backup is readable
+    hook_store.create(_uncounted(HOOK_AT + timedelta(days=1)))  # later than the backup's start: nothing
+    assert _events(tmp_path) == []
+    hook_store.create(_uncounted(HOOK_AT - timedelta(days=1)))
+    assert [e.kind for e in _events(tmp_path)] == ["start"]
+
+
+def test_the_start_check_takes_no_lock_but_an_append_takes_it_once(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _start_state(tmp_path, HOOK_AT - timedelta(days=1))
+    probe = _Probe(monkeypatch)
+    hook_store.create(_uncounted())
+    assert probe.lock_calls == 0 and _events(tmp_path) == []
+    hook_store.create(_hook_mem())  # a commit event: one lock
+    assert probe.lock_calls == 1
+    hook_store.create(_uncounted(HOOK_AT - timedelta(days=9)))  # a start event: one more
+    assert probe.lock_calls == 2
+    assert [e.kind for e in _events(tmp_path)] == ["commit", "start"]
+
+
+def test_the_state_is_read_through_the_cache_not_on_every_create(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _start_state(tmp_path, HOOK_AT - timedelta(days=1))
+    probe = _Probe(monkeypatch)
+    probe.wrap(engine_files, "read_state")
+    hook_store.create(_uncounted())
+    hook_store.create(_uncounted())
+    assert probe.n("read_state") == 1
+    _start_state(tmp_path, HOOK_AT - timedelta(days=2))  # the file is replaced: the stat key changes
+    hook_store.create(_uncounted())
+    assert probe.n("read_state") == 2
+
+
+def test_a_counted_row_with_no_emotions_queues_the_start_event_and_moves_persona_start_at(
+    tmp_path: Path, hook_store: MemoryStore
+) -> None:
+    mem = _hook_mem(emotions={})
+    hook_store.create(mem)
+    events = _events(tmp_path)
+    assert [(e.kind, e.at) for e in events] == [("start", mem.created_at)]
+    state = EngineState()
+    assert state.persona_start_at is None
+    for event in events:
+        fold_event(state, event, NOW)
+    assert state.persona_start_at == mem.created_at
+
+
+# --- C5: update -> assigned ---------------------------------------------------------------------
+
+
+def _row_without_emotions(store: MemoryStore, memory_type: str = "conversation", **kw: object) -> Memory:
+    mem = _hook_mem(memory_type, emotions={}, **kw)  # type: ignore[arg-type]
+    store.create(mem, fold=False)
+    return mem
+
+
+def test_an_emotions_write_onto_an_empty_counted_row_queues_one_assigned_event(
+    tmp_path: Path, hook_store: MemoryStore
+) -> None:
+    mem = _row_without_emotions(hook_store)
+    hook_store.update(mem.id, emotions={"joy": 3.0})
+    events = _events(tmp_path)
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == "assigned" and event.memory_id == mem.id and event.at == mem.created_at
+    assert dict(event.emotions) == {"joy": 3.0} and event.modifier == 1.0
+    assert "climax" not in _lines(tmp_path)[0]
+
+
+def test_an_update_that_must_not_fire_fires_nothing(tmp_path: Path, hook_store: MemoryStore) -> None:
+    filled = _hook_mem()
+    hook_store.create(filled, fold=False)
+    hook_store.update(filled.id, emotions={"grief": 4.0})  # filled to filled
+    empty = _row_without_emotions(hook_store)
+    hook_store.update(empty.id, content="reworded")  # content only
+    hook_store.update(empty.id, emotions={"joy": 3.0}, fold=False)  # fold=False
+    uncounted = _row_without_emotions(hook_store, "heartbeat")
+    hook_store.update(uncounted.id, emotions={"joy": 3.0})  # an uncounted row: no assigned, no start event
+    assert _events(tmp_path) == []
+    control = _row_without_emotions(hook_store)
+    hook_store.update(control.id, emotions={"joy": 3.0})
+    assert [e.kind for e in _events(tmp_path)] == ["assigned"]
+
+
+def test_fold_is_not_a_column_and_an_unknown_field_still_raises(hook_store: MemoryStore) -> None:
+    mem = _row_without_emotions(hook_store)
+    hook_store.update(mem.id, fold=False, content="ok")
+    assert hook_store.get(mem.id, bump=False).content == "ok"
+    with pytest.raises(ValueError, match="Unknown update field"):
+        hook_store.update(mem.id, bogus=1)
+
+
+def test_update_asks_the_database_once_for_the_row_and_the_hook_adds_no_second_select(
+    tmp_path: Path, hook_store: MemoryStore
+) -> None:
+    def selects(fold: bool) -> int:
+        mem = _row_without_emotions(hook_store)
+        seen: list[str] = []
+        hook_store._conn.set_trace_callback(seen.append)
+        try:
+            hook_store.update(mem.id, fold=fold, emotions={"joy": 3.0})
+        finally:
+            hook_store._conn.set_trace_callback(None)
+        return sum(1 for s in seen if "SELECT" in s.upper() and "FROM MEMORIES" in s.upper())
+
+    assert selects(False) == 1
+    assert selects(True) == 1
+    assert len(_events(tmp_path)) == 1  # the fold=True update did queue (the count is not of a silent path)
+
+
+def test_a_combined_update_is_judged_on_the_row_as_it_was(tmp_path: Path, hook_store: MemoryStore) -> None:
+    counted = _row_without_emotions(hook_store, "conversation")
+    hook_store.update(counted.id, memory_type="dream", emotions={"joy": 3.0})  # was counted: fires
+    uncounted = _row_without_emotions(hook_store, "heartbeat")
+    hook_store.update(uncounted.id, memory_type="conversation", emotions={"joy": 3.0})  # was uncounted: silent
+    assert [e.memory_id for e in _events(tmp_path)] == [counted.id]
+
+
+def test_a_pending_reach_out_flipped_to_delivered_without_emotions_queues_nothing(
+    tmp_path: Path, hook_store: MemoryStore
+) -> None:
+    pending = _hook_mem("initiate_outbound", metadata={"initiate_state": "pending"})
+    hook_store.create(pending, fold=False)
+    hook_store.update(pending.id, metadata={"initiate_state": "delivered"})
+    assert _events(tmp_path) == []
+    control = _row_without_emotions(hook_store)
+    hook_store.update(control.id, emotions={"joy": 3.0})
+    assert len(_events(tmp_path)) == 1
+
+
+# --- the hook is after the commit ---------------------------------------------------------------
+
+
+def test_a_duplicate_id_create_queues_nothing(tmp_path: Path, hook_store: MemoryStore) -> None:
+    mem = _hook_mem()
+    hook_store.create(mem)
+    with pytest.raises(sqlite3.IntegrityError):
+        hook_store.create(mem)
+    assert len(_events(tmp_path)) == 1
+
+
+def test_the_hooks_run_after_the_commit_and_after_the_reembed(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def readable_elsewhere(mid: str) -> tuple | None:
+        other = sqlite3.connect(tmp_path / "memories.db")
+        try:
+            return other.execute("SELECT id, embedding FROM memories WHERE id = ?", (mid,)).fetchone()
+        finally:
+            other.close()
+
+    def committed(self: object, memory: Memory) -> None:
+        seen["create_in_transaction"] = hook_store._conn.in_transaction
+        seen["create_row"] = readable_elsewhere(memory.id)
+
+    def assigned(self: object, memory: Memory) -> None:
+        seen["update_in_transaction"] = hook_store._conn.in_transaction
+        seen["update_row"] = readable_elsewhere(memory.id)
+
+    monkeypatch.setattr(EngineCls, "on_memory_committed", committed)
+    monkeypatch.setattr(EngineCls, "on_emotions_assigned", assigned)
+    mem = _hook_mem(emotions={})
+    hook_store.create(mem)
+    assert seen["create_in_transaction"] is False and seen["create_row"] is not None
+    hook_store.update(mem.id, content="new words", emotions={"joy": 3.0})
+    assert seen["update_in_transaction"] is False
+    assert seen["update_row"] is not None and seen["update_row"][1] is not None  # re-embedded before the hook
+
+
+# --- C5b: methods that stay silent ---------------------------------------------------------------
+
+
+def test_update_emotions_batch_and_set_active_clear_snapshot_fire_no_hook(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _Probe(monkeypatch)
+    probe.wrap(engine_module, "engine_for")
+    mem = _row_without_emotions(hook_store)
+    hook_store.update_emotions_batch([(mem.id, {"joy": 3.0})])
+    hook_store.set_active_clear_snapshot(mem.id)
+    assert not engine_files.queue_path(tmp_path).exists() and probe.n("engine_for") == 0
+    other = _row_without_emotions(hook_store)
+    hook_store.update(other.id, emotions={"joy": 3.0})  # the control: update does ask for the engine and queue
+    assert probe.n("engine_for") >= 1 and len(_events(tmp_path)) == 1
+
+
+# --- C6: a hook never raises into the write ------------------------------------------------------
+
+
+def _one_error(caplog: pytest.LogCaptureFixture, cause: BaseException) -> None:
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None and errors[0].exc_info[1] is cause
+
+
+def test_a_failure_inside_a_hook_is_logged_once_and_the_row_stays(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    boom = RuntimeError("boom")
+
+    def raiser(*args: object, **kwargs: object) -> object:
+        raise boom
+
+    for owner, name in ((engine_module, "resolve_emotions"), (engine_files, "append_event")):
+        with monkeypatch.context() as patch, caplog.at_level(logging.ERROR):
+            caplog.clear()
+            patch.setattr(owner, name, raiser)
+            mem = _hook_mem()
+            assert hook_store.create(mem) == mem.id
+            assert hook_store.get(mem.id, bump=False) is not None
+            _one_error(caplog, boom)
+    with monkeypatch.context() as patch, caplog.at_level(logging.ERROR):
+        caplog.clear()
+        patch.setattr("brain.memory.store.replace", raiser)
+        empty = _row_without_emotions(hook_store)
+        hook_store.update(empty.id, emotions={"joy": 3.0})  # returns
+        assert hook_store.get(empty.id, bump=False).emotions == {"joy": 3.0}
+        _one_error(caplog, boom)
+    with monkeypatch.context() as patch, caplog.at_level(logging.ERROR):
+        caplog.clear()
+        patch.setattr(engine_files, "append_event", raiser)
+        engine = engine_module.engine_for(tmp_path)
+        assert engine.on_memory_shown(_hook_mem(), None) is None
+        _one_error(caplog, boom)
+        caplog.clear()
+        assert engine.fold_change({"joy": 1.0}, None, "test") is None
+        _one_error(caplog, boom)
+        caplog.clear()
+        assert engine.on_emotions_assigned(_hook_mem()) is None
+        _one_error(caplog, boom)
+
+
+def test_a_queue_that_cannot_be_written_is_logged_by_the_append_and_the_row_stays(
+    tmp_path: Path, hook_store: MemoryStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine_files.queue_path(tmp_path).mkdir(parents=True)  # a directory where the file should be
+    mem = _hook_mem()
+    with caplog.at_level(logging.WARNING):
+        assert hook_store.create(mem) == mem.id
+    assert hook_store.get(mem.id, bump=False) is not None
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_an_unwritable_state_folder_logs_one_line_without_a_traceback_not_one_per_write(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def denied(persona_dir: Path) -> object:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(engine_files, "state_lock", denied)
+    with caplog.at_level(logging.DEBUG):
+        mem = _hook_mem()
+        assert hook_store.create(mem) == mem.id
+        first = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(first) == 1 and first[0].exc_info is None and "denied" in first[0].getMessage()
+        caplog.clear()
+        assert hook_store.create(_hook_mem()) is not None
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []  # throttled to DEBUG
+    assert hook_store.get(mem.id, bump=False) is not None
+
+
+# --- C7: an in-memory store is a silent no-op ------------------------------------------------------
+
+
+def test_an_in_memory_store_never_asks_for_an_engine_and_logs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    probe = _Probe(monkeypatch)
+    probe.wrap(engine_module, "engine_for")
+    store = MemoryStore(":memory:")
+    try:
+        with caplog.at_level(logging.WARNING):
+            mem = _hook_mem(emotions={})
+            store.create(mem)
+            store.update(mem.id, emotions={"joy": 3.0})
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert probe.n("engine_for") == 0
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        store.close()
+    (tmp_path / "p").mkdir()
+    file_backed = MemoryStore(tmp_path / "p" / "memories.db")
+    try:
+        file_backed.create(_hook_mem())  # the control: a file-backed store does ask, once
+        assert probe.n("engine_for") == 1
+    finally:
+        file_backed.close()
+
+
+# --- C8: locking and data safety ----------------------------------------------------------------
+
+
+def test_every_hook_appends_while_the_lock_is_held(tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _Probe(monkeypatch)
+    probe.wrap(engine_files, "append_event")
+    hook_store.create(_hook_mem())  # commit
+    empty = _row_without_emotions(hook_store)
+    hook_store.update(empty.id, emotions={"joy": 3.0})  # assigned
+    engine = engine_module.engine_for(tmp_path)
+    engine.on_memory_shown(_hook_mem(), None)  # showing
+    engine.fold_change({"joy": 1.0}, None, "test")  # change
+    hook_store.create(_uncounted())  # start (no state file)
+    kinds = {args[1].kind for args, _held in probe.calls["append_event"]}
+    assert kinds == {"commit", "assigned", "showing", "change", "start"}
+    assert all(probe.held_at("append_event"))
+
+
+def test_the_hook_resolves_everything_before_it_takes_the_lock_and_touches_no_database_inside_it(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = _Probe(monkeypatch)
+    for owner, name in (
+        (engine_module, "source_modifier"),
+        (engine_files, "peer_trust"),
+        (EngineCls, "faded_value"),
+        (engine_module, "resolve_emotions"),
+        (MemoryStore, "get"),
+    ):
+        probe.wrap(owner, name)
+    hook_store.create(_hook_mem(**_COUNTED_ROWS["peer"]))
+    for name in ("source_modifier", "peer_trust", "faded_value", "resolve_emotions"):
+        assert probe.n(name) >= 1, name
+        assert not any(probe.held_at(name)), name
+    assert not any(probe.held_at("get"))  # never read from memories.db while the lock is held
+    assert probe.lock_calls == 1
+
+
+def test_an_existing_queued_event_is_kept_when_another_is_appended(tmp_path: Path, hook_store: MemoryStore) -> None:
+    hook_store.create(_hook_mem(emotions={"joy": 1.0}))
+    first = engine_files.queue_path(tmp_path).read_bytes().splitlines()[0]
+    hook_store.create(_hook_mem(emotions={"joy": 2.0}))
+    lines = engine_files.queue_path(tmp_path).read_bytes().splitlines()
+    assert lines[0] == first and len(lines) == 2
+
+
+# --- C9: showing and change ---------------------------------------------------------------------
+
+
+def test_a_showing_carries_the_faded_value_at_the_given_or_the_entry_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] / 2)
+    engine = EngineCls(tmp_path, now=lambda: NOW)
+    mem = _hook_mem(emotions={"joy": 8.0})
+    shown_at = NOW - timedelta(hours=1)
+    engine.on_memory_shown(mem, shown_at)
+    engine.on_memory_shown(mem, None)
+    first, second = _events(tmp_path)
+    assert (first.kind, first.at, dict(first.emotions)) == ("showing", shown_at, {"joy": 4.0})
+    assert second.at == NOW
+    engine.on_memory_shown(_hook_mem("heartbeat"), None)  # uncounted
+    engine.on_memory_shown(_hook_mem(emotions={}), None)  # nothing to fold
+    assert len(_events(tmp_path)) == 2
+
+
+def test_fold_change_queues_one_change_event_and_writes_no_change_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(EngineCls, "is_live", lambda self: True)
+    engine = EngineCls(tmp_path, now=lambda: NOW)
+    engine.fold_change({"joy": -2.0, "grief": 1.0}, None, "pass2")
+    engine.fold_change({"joy": 1.0}, NOW - timedelta(hours=2), "chat")
+    first, second = _events(tmp_path)
+    assert (first.kind, first.at, first.source, dict(first.emotions)) == ("change", NOW, "pass2", {"joy": -2.0, "grief": 1.0})
+    assert second.at == NOW - timedelta(hours=2) and second.source == "chat"
+    assert not engine_files.changes_dir(tmp_path).exists()  # the change-log line is the switch-over's step
+    engine.fold_change({}, None, "x")
+    engine.fold_change({"joy": math.nan}, None, "x")
+    assert len(_events(tmp_path)) == 2
+
+
+# --- C10 --------------------------------------------------------------------------------------
+
+
+def test_peer_trust_is_zero_and_does_no_io(tmp_path: Path) -> None:
+    assert engine_files.peer_trust(tmp_path, "anyone") == 0.0
+    assert engine_files.peer_trust(tmp_path / "no" / "such", "") == 0.0
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- C12(c): the store reaches the stub through the module attribute ----------------------------
+
+
+def test_the_store_calls_out_through_engine_for(tmp_path: Path, hook_store: MemoryStore, emotion_engine_stub) -> None:
+    assert engine_module.engine_for(tmp_path / "anywhere") is emotion_engine_stub
+    mem = _hook_mem(emotions={})
+    hook_store.create(mem)
+    hook_store.update(mem.id, emotions={"joy": 3.0})
+    hook_store.update(mem.id, content="again", fold=False)
+    names = [call[0] for call in emotion_engine_stub.recorded_calls]
+    assert names == ["on_memory_committed", "on_emotions_assigned"]
+    assert emotion_engine_stub.recorded_calls[1][1].emotions == {"joy": 3.0}
+    assert not engine_files.queue_path(tmp_path).exists()  # the stub queued nothing
+
+
+# --- the bounded engine lock (Engine 3 delta): every hook passes the owner's wait; a timeout is not a disk fault ----
+
+
+class _WaitRecorder:
+    """A call-through recorder around `file_lock.locked_within`, patched where `engine_files.state_lock` looks it up.
+
+    It records each call's path and wait, and whether its context was open when `append_event` ran.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[tuple[Path, float]] = []
+        self.open = False
+        self.append_open: list[bool] = []
+        real = file_lock.locked_within
+        real_append = engine_files.append_event
+        rec = self
+
+        @contextlib.contextmanager
+        def locked_within(path: Path, seconds: float, **kwargs: object) -> Iterator[None]:
+            rec.calls.append((path, seconds))
+            with real(path, seconds, **kwargs):
+                rec.open = True
+                try:
+                    yield
+                finally:
+                    rec.open = False
+
+        def append(*args: object, **kwargs: object) -> object:
+            rec.append_open.append(rec.open)
+            return real_append(*args, **kwargs)
+
+        monkeypatch.setattr(file_lock, "locked_within", locked_within)
+        monkeypatch.setattr(engine_files, "append_event", append)
+
+
+@pytest.mark.parametrize("kind", ["commit", "assigned", "showing", "change", "start"])
+def test_every_hook_takes_the_engine_lock_once_with_the_owners_wait_and_appends_inside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 7.25)
+    recorder = _WaitRecorder(monkeypatch)
+    engine = engine_module.engine_for(tmp_path)
+    fire = {
+        "commit": lambda: engine.on_memory_committed(_hook_mem()),
+        "assigned": lambda: engine.on_emotions_assigned(_hook_mem()),
+        "showing": lambda: engine.on_memory_shown(_hook_mem(), None),
+        "change": lambda: engine.fold_change({"joy": 1.0}, None, "test"),
+        "start": lambda: engine.on_memory_committed(_uncounted()),
+    }
+    fire[kind]()
+    assert recorder.calls == [(engine_files.state_path(tmp_path), 7.25)]
+    assert recorder.append_open == [True]
+    assert [e.kind for e in _events(tmp_path)] == [kind]
+
+
+def test_a_held_engine_lock_does_not_hang_a_write_and_the_row_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, held_lock
+) -> None:
+    monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 0.2)
+    db = tmp_path / "memories.db"
+    mem = _hook_mem()
+    outcome: dict[str, object] = {}
+
+    def worker() -> None:
+        store = MemoryStore(db)  # opened in this thread: the connection is bound to the thread that makes it
+        try:
+            outcome["id"] = store.create(mem)
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            store.close()
+
+    thread = threading.Thread(target=worker, name="create-under-held-lock", daemon=True)
+    started = False
+    with caplog.at_level(logging.DEBUG, logger=HOOK_LOGGER):
+        try:
+            with held_lock(engine_files.state_path(tmp_path)):
+                thread.start()
+                started = True
+                thread.join(5)
+                finished = not thread.is_alive()
+        finally:
+            if started:
+                thread.join(5)  # a regression that hangs is released by the holder's exit, never left running
+    assert finished, "create hung behind a held engine lock"
+    assert outcome == {"id": mem.id}
+    assert _lines(tmp_path) == []  # the event was not recorded
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "gave up on the engine lock" in errors[0] and "on_memory_committed" in errors[0] and "not recorded" in errors[0]
+    reader = MemoryStore(db)
+    try:
+        assert reader.get(mem.id, bump=False) is not None  # the row is committed
+        later = _hook_mem()
+        reader.create(later)  # the positive control: with the holder gone the next create appends its line
+    finally:
+        reader.close()
+    assert [e.memory_id for e in _events(tmp_path)] == [later.id]
+
+
+def test_a_lock_wait_that_runs_out_is_logged_as_that_not_as_a_disk_fault(
+    tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def timed_out(persona_dir: Path) -> object:
+        raise file_lock.LockTimeoutError("could not lock the state file within 5 s")
+
+    def disk_fault(persona_dir: Path) -> object:
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(engine_files, "state_lock", timed_out)
+    with caplog.at_level(logging.DEBUG, logger=HOOK_LOGGER):
+        mem = _hook_mem()
+        assert hook_store.create(mem) == mem.id
+        first = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(first) == 1 and first[0].exc_info is None
+        wording = first[0].getMessage()
+        assert "gave up on the engine lock" in wording and "on_memory_committed" in wording and "not recorded" in wording
+        assert "could not queue" not in wording
+        caplog.clear()
+        hook_store.create(_hook_mem())
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []  # throttled to DEBUG
+        assert hook_store.get(mem.id, bump=False) is not None
+        assert _lines(tmp_path) == []
+        # the generic OSError line keeps its own wording and its own throttle: the timeout's did not swallow it
+        monkeypatch.setattr(engine_files, "state_lock", disk_fault)
+        caplog.clear()
+        hook_store.create(_hook_mem())
+        other = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(other) == 1 and other[0].exc_info is None
+        assert "could not queue its event" in other[0].getMessage()
+        assert "gave up on the engine lock" not in other[0].getMessage()

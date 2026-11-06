@@ -259,6 +259,18 @@ def state_lock(persona_dir: Path) -> AbstractContextManager[None]:
     return file_lock.locked_within(state_path(persona_dir), dev_constants.EMOTION_LOCK_WAIT_S)
 
 
+def peer_trust(persona_dir: Path, peer_id: str) -> float:
+    """How far this persona trusts one peer (0 to 1): the engine's one door to the peer-trust score.
+
+    Engine-internal stand-in that answers 0.0 for every peer and does no I/O, so until Engine 6 (#584) every peer memory
+    weighs the modifier floor, 0.1. Engine 6 replaces this body with a call to the kindled-link accessor
+    ``peer_trust(persona_dir, peer_id)`` (not built here, not ours). Its expected shape: open
+    ``KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)``, read
+    ``get_relationship_state(...).trust_score``, and give 0.0 for no database or no relationship row.
+    """
+    return 0.0
+
+
 # ================================================================================================
 # The state file
 # ================================================================================================
@@ -660,7 +672,8 @@ class StateCache:
 # ================================================================================================
 
 # The kinds the queue knows. "start" is the start-only event Engine 1 added: it carries only `at`, the creation time of a
-# committed row of a type that does not count, and keeps the persona's start date.
+# committed row of a type that does not count, and keeps the persona's start date. It is a memory's own date event, which
+# the spec makes a direct apply (Engine 4 moves it); until then the commit hook appends it to the queue like the others.
 _MEMORY_KINDS = frozenset({"commit", "assigned", "showing"})
 _EVENT_KINDS = _MEMORY_KINDS | {"change", "start"}
 # The range of a modifier: what `engine_utils.source_modifier` can make (1.0 for the user and her own, a peer or research memory
