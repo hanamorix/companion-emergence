@@ -26,7 +26,8 @@ Done means: all seven PRs are merged with their tests, the `test_intended_*` pin
 **Faded reads.** Pure functions that read per-memory values take `eng` with no default, following salience's `_emotion_input`; `None` means use stored values. Iterate the memory's own keys, because `faded_value` raises `KeyError` for an absent emotion.
 
 **Tests.**
-- Live tests use the real engine and a real switch file in a temp `KINDLED_HOME`, and run through the real entry point, not the helper.
+- Live tests use the real engine and a real switch file in a temp `KINDLED_HOME`, and run through the real entry point, not the helper. A live persona with no state file applies nothing, so a test seeds a memory before it writes the switch.
+- Until Engine 6 merges, `faded_value` returns the stored value. Tests that must tell faded from stored patch that one method to a smaller value.
 - Each PR pins the off path against today's behaviour.
 - Each PR removes the `xfail` from the `test_intended_*` pins it fixes and rewrites them with the switch on. The `test_today_*` pins stay as the switch-off record.
 - Tests that pass on base carry `no_base_failure(reason=...)`.
@@ -39,7 +40,7 @@ New `peer_trust(persona_dir, peer_id) -> float` in `kindled_link/relationship.py
 
 1. If `kindled_db_path(persona_dir)` doesn't exist, return 0.0. Reading must never create the database.
 2. Open `KindledLinkStore(path, integrity_check=False)`, read `get_relationship_state(store, peer_id).trust_score`, and close.
-3. A missing row gives 0.0, the dataclass default. `sqlite3.Error` logs a warning and returns 0.0.
+3. A missing row gives 0.0, the dataclass default. `sqlite3.Error`, or a row that can't be read (`ValueError`, `TypeError`), logs a warning and returns 0.0, because an exception here would fail the engine's catch-up.
 
 There is no caching, marked with a `shortcut:` comment, because it runs once per peer row under the engine lock. ThinkerOfThoughts swaps out the stand-in `engine_files.peer_trust` (`:270`) in Engine 6.
 
@@ -67,7 +68,7 @@ Tests, through the real pass-2 and reconcile entry points: a negative value lowe
 **`run_relationship_reflection` (`kindled_link/relationship.py:156`):**
 - Read `is_live()` once at the top. The production caller (`kindled_link/tick.py:354`) passes `persona_dir`.
 - A second version of the prompt's last segment asks for 0-10 values. The old text stays byte-identical (`prompt_strings.toml`, `[kindled_link.relationship]`).
-- Live values: drop negative and non-finite values, and hold the rest to 10.
+- Live values: drop non-numeric, negative and non-finite values, and hold the rest to 10. A bad value never loses the memory.
 - `apply_peer_emotion` isn't called on the live path, so the bucket stops applying.
 - `hard_breach` still returns early.
 
@@ -92,6 +93,7 @@ This is working text; ThinkerOfThoughts may edit the rating line (their design, 
 - **Emotions:** a JSON object. Drop unregistered, zero, negative and non-finite values, and hold the rest to 10.
 - **Rating:** the starting number (`7/10` gives 7). A negative is treated as missing. Held to 10.
 - **Storage:** `build_research_memory` (`:616`) gains optional `emotions` and `engagement_rating`. The metadata key `engagement_rating` is written only when present.
+- **User prompt:** when live, its last line asks for `EMOTIONS` and `ENGAGEMENT` too, so it can't contradict the system prompt.
 - **Failure:** a missing or broken line never fails the fire. The memory is written and `record_parse_failure(site="research_felt")` logs it.
 - `research_recovery.py` is unchanged.
 
@@ -99,7 +101,7 @@ Tests: a table of reply shapes, including `Engagement: 7` in the middle of the n
 
 ### PR 5: dreams, grief, growth
 
-**Dream row (`engines/dream.py` `_write_dream_memory`, `:241`).** Live: for each emotion, the mean of the faded values across the seed and neighbours that carry it, held to 10. Off or `persona_dir=None`: today's sum. The emotions snapshot at `dream.py:342` gets the mean too. Flips the dream pin.
+**Dream row (`engines/dream.py` `_write_dream_memory`, `:241`).** Live: for each emotion, the mean of the faded values across the seed and neighbours that carry it, held to 0-10 (old rows can be negative or over 10), dropping what lands at 0. Off or `persona_dir=None`: today's sum. The emotions snapshot at `dream.py:342` gets the mean too. Flips the dream pin.
 
 **Mood (`dream.py:172`).** Live: `EmotionalState(emotions={name: r.short ...})`, as `research.py:213` does. This widens mood to all counted sources. A breadcrumb still can't set its own mood, because `grief_event` isn't counted. An empty read during a rebuild is accepted.
 
@@ -177,8 +179,8 @@ These also go in `project_companion_emergence_deferred.md` and the next brainsto
 ## 7. Merge order and coordination
 
 - PR 1 can land any time.
-- PR 2 waits for #671.
-- PRs 3 to 6 are independent of each other. All six land before Engine 6.
+- PRs 2, 3 and 5 wait for #671, because each flips its pins.
+- PRs 2 to 6 are independent of each other. All six land before Engine 6.
 - PR 7 lands after Engine 6 and before Engine 7.
 - #673 (draft) removes `relationship_emotion_delta` and `_EMOTION_BASE`, so PR 3 and PR 7 don't touch them. Whichever of #673 and PR 3 lands second rebases in `relationship.py`.
 - #543 has merged, so the parent's "rebase after #543" no longer applies.
