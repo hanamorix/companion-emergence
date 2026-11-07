@@ -31,7 +31,7 @@ Done means: each work item in §4 is merged with its tests, the A1 expected-fail
 ## 3. Decisions (Hana, 2026-10-28)
 
 1. **Old words:** run the heal scan one final time, then delete it. No reappraisal hook.
-2. **B1 split:** five PRs by mechanism (§4).
+2. **B1 split:** seven PRs (updated 2026-11-07; see the B1 spec).
 3. **Digest voice:** first person. The schema text for `record_monologue.feed_digest` asks for "I…". Final wording goes to the end-of-plan wording pass.
 
 ## 4. Work items
@@ -91,38 +91,13 @@ New file `tests/unit/brain/emotion/test_rework_writer_pins.py`, temp `KINDLED_HO
 
 ### B1 — writers (after the step 0 stub; every change gated on the switch)
 
-With the switch off, each writer keeps today's code path exactly.
-
-- **B1-1 Signed changes** — `chat/extractor.py`, `self_model/reconcile.py`.
-  - Switch on: send a signed change entry to the engine (`value = sign(v) × min(|v| × 10, 3.0)`), and write no `monologue_emotion` / `self_model_reconcile` row.
-  - Flips the two A1 sign pins.
-- **B1-2 Nudge scale + kindled-link**
-  - `maker/wiring.py`, `initiate/reach_emotion.py`, `notes/runner.py`: constants ×10.
-  - `kindled_link/relationship.py`, `prompt_strings.toml:772`: ask for 0-10 values; stop using the bucket cap. The `peer_emotion_window` table stays.
-  - New `kindled_link.peer_trust(persona_dir, peer_id) -> float` (0-1) reading `relationship_state.trust_score`.
-- **B1-3 Research** — `engines/research.py`, `research_session.py`, `prompt_strings.toml:538`.
-  - Add `EMOTIONS:` (JSON, 0-10) and `ENGAGEMENT:` (0-10) markers.
-  - Emotions are stored on the research memory, filtered to registered names; engagement goes in metadata under the step 0 field name.
-  - A missing or unparsable marker means no emotions / no rating, never a failure.
-- **B1-4 Dreams** — `engines/dream.py`.
-  - Each emotion's value is the sum over the memories in the dream that carry it, divided by how many carry it, held to 10.
-  - The mood read (`dream.py:172`) moves to the engine's short average.
-- **B1-5 Monologue note + remaining writers**
-  - `monologue/trace.py`, `chat/monologue_capture.py`, `tools/dispatch.py:170-205`, `tools/schemas.py:597-640`.
-  - Switch on: the trace's content is the first-person `feed_digest`. Its emotions hold the strongest short-average and strongest long-average feelings from the engine (one key with the larger value if both are the same emotion), with importance from the existing `_trace_importance`. The #93 guard compares digests. `monologue_digest.jsonl` and the Feed are unchanged.
-  - `add_memory`'s climax journal uses `body/events.CLIMAX_THRESHOLD`.
-  - Ingest, emotion backfill, file-commit and grief writers: tests that they store 0-10 values; no code change expected. (Emotion backfill is also touched by #543 — rebase after it.)
+The design is in `2026-11-07-emotion-rework-b1-writers-design.md`. Names used elsewhere in this spec map to its PRs: B1-1 is PR 2, B1-2 is PRs 1 and 3, B1-3 is PR 4, B1-4 is PR 5, B1-5 is PR 6.
 
 ## 5. Wiring
 
 | Item | Reads from | Feeds into |
 |---|---|---|
-| Signed changes (B1-1) | pass-2 extraction; her `reconcile_self_read` call | engine short/long averages → every reader in shared plan §1 |
-| Nudges (B1-2) | making / reach-out / note events | memory rows → commit hook → engine |
-| Peer memories (B1-2) | model's reading of the exchange; `peer_trust` | memory rows → engine, weighted by trust (A3 modifier) |
-| Research (B1-3) | the research session's own output | memory row + engagement → engine via the modifier |
-| Dreams (B1-4) | engine short average (mood read); seed memories | dream row (not counted); recall |
-| Monologue note (B1-5) | `feed_digest`; engine averages | interior-continuity block, monologue recall, interest sweep, Feed |
+| B1 writers | see §5 of the B1 spec | see §5 of the B1 spec |
 | Vocabulary gate (A4) | `add_memory`; crystallizer | vocabulary file → both processes via `refresh_if_changed` → engine name lookup |
 
 ## 6. Needed from ThinkerOfThoughts at step 0
@@ -139,7 +114,6 @@ With the switch off, each writer keeps today's code path exactly.
 
 - Assign #125 to Hana (its fix is B1-1), or note it there.
 - #385 (ThinkerOfThoughts) touches `felt_time/state.py` and pins `weather_shift`, so A2b waits for it.
-- #543 (ThinkerOfThoughts) touches `ingest/emotion_backfill.py`; B1-5 rebases after it.
 - #417 (Hana) touches `tools/schemas.py`. A4 / A2b / B1-5 edit different tools there; whichever lands second rebases.
 - Discord heads-up at each sequential point (shared plan §9).
 
