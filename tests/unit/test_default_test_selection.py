@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[2]
 _MODULE = "tests/integration/brain/attunement/test_adversarial_corpus.py"
 _REAL_CALL_TEST = "test_adversarial_corpus_does_not_crystallise_any_pattern"
@@ -23,6 +25,7 @@ def _collected(*args: str) -> str:
     return done.stdout
 
 
+@pytest.mark.no_base_failure(reason="the fix is in pyproject.toml, which the base check keeps at the PR's version")
 def test_real_call_tests_only_run_when_asked_for():
     plain = _collected()
     assert _OFFLINE_TEST in plain

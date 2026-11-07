@@ -57,6 +57,7 @@ def _run_detector_rounds(persona_dir: Path, buffer: list[BufferTurn], *, rounds:
     assert answered, f"the model never answered in {rounds} rounds, so this proves nothing"
 
 
+@pytest.mark.no_base_failure(reason="the helper it guards is in this test file, which the base check keeps at the PR's version")
 def test_rounds_fail_when_the_model_never_answered(tmp_path: Path, monkeypatch) -> None:
     """A failed call declines quietly, so without this a dead CLI would pass as "no pattern formed"."""
     declined = _decline_output(source_turn_id="")
