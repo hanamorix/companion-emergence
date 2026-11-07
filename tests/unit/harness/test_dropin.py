@@ -108,6 +108,7 @@ def no_venv(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.no_base_failure(reason="the fix is in tests/harness, which the base check keeps at the PR's version")
 @pytest.mark.parametrize("deps", ["auto", "none"])
 def test_uv_venv_uses_the_interpreter_running_the_tests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deps: str
