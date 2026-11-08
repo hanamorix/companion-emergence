@@ -634,3 +634,11 @@ def test_run_that_loses_the_slot_after_tagging_some_is_not_marked_complete(tmp_p
     saved = emotion_backfill._load_state(tmp_path)
     assert saved is not None and saved.status != "complete"
     assert should_run_emotion_backfill(tmp_path)
+
+
+def test_normalize_drops_nan_and_inf_and_holds_to_ten():
+    """Emotion rework B1 PR 6: a tagger reply of NaN or inf is not a feeling; 12 is held to 10, 3 is kept."""
+    from brain.ingest.emotion_backfill import _normalize
+
+    raw = {"joy": float("nan"), "grief": float("inf"), "calm": "-inf", "love": 12, "awe": 3}
+    assert _normalize(raw, frozenset()) == {"love": 10.0, "awe": 3.0}
