@@ -16,7 +16,7 @@ from pathlib import Path
 
 from brain.health.json_io import append_jsonl
 from brain.memory.store import MemoryStore
-from brain.monologue.trace import MONOLOGUE_TRACE_TYPE, write_trace_memory
+from brain.monologue.trace import MONOLOGUE_TRACE_TYPE, _is_live, write_trace_memory
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +81,15 @@ def capture_monologue(
     # reads (recall.py, ambient.py) read PendingQueue, so this same-turn dedup
     # guard must too, or it goes blind to the just-enqueued trace and writes a
     # duplicate digest line (the #93 bug this guard exists to prevent).
+    # One answer to "is the engine live" for this capture, so the guard and the trace write never disagree (emotion
+    # rework B1 PR 6). Once live the stored trace is the digest, so the guard compares digests. Accepted edges: the
+    # same digest on a different thought is dropped, the same thought with a new digest is kept twice.
+    live = _is_live(persona_dir)
     try:
         from brain.memory.pending import PendingQueue
 
         recent = PendingQueue(store.persona_dir).read_recent(MONOLOGUE_TRACE_TYPE, limit=1)
-        if recent and recent[0].content == monologue:
+        if recent and recent[0].content == (feed_digest if live else monologue):
             # #175: None tells the caller this was a dedupe, not a capture, so
             # dispatch does not emit monologue_text for the duplicate (the key
             # the audit row and the pass-2 trigger key on).
@@ -93,10 +97,11 @@ def capture_monologue(
     except Exception:  # noqa: BLE001
         logger.debug("monologue dedupe lookup failed; capturing anyway", exc_info=True)
 
-    # Tier 2 — persist the verbatim trace FIRST (most important; never lose her
-    # thought). Best-effort: a failure logs but does not block the reply.
+    # Tier 2 — persist the trace FIRST (most important; never lose her thought): the verbatim monologue today, the digest
+    # once the engine is live (pass 2 still gets the raw thought from the return value). Best-effort: a failure logs but
+    # does not block the reply.
     try:
-        write_trace_memory(store, monologue)
+        write_trace_memory(store, monologue, feed_digest=feed_digest, persona_dir=persona_dir, live=live)
     except Exception as exc:  # noqa: BLE001
         logger.warning("monologue trace memory write failed: %s", exc)
         try:

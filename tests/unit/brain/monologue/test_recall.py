@@ -12,8 +12,8 @@ def _ctx(tmp_path):
 
 def test_recall_finds_matching_trace_only(tmp_path):
     store, hebbian = _ctx(tmp_path)
-    write_trace_memory(store, "the lighthouse kept pulling at me")
-    write_trace_memory(store, "something about the train timetable")
+    write_trace_memory(store, "the lighthouse kept pulling at me", feed_digest="a digest", persona_dir=None)
+    write_trace_memory(store, "something about the train timetable", feed_digest="a digest", persona_dir=None)
     # A non-trace memory containing the keyword must NOT be returned.
     store.create(Memory.create_new(content="lighthouse facts", memory_type="episodic", domain="chat"))
 
@@ -35,7 +35,7 @@ def test_recall_finds_matching_trace_only(tmp_path):
 )
 def test_recall_bumps_recall_count_keeping_it_sharp(tmp_path):
     store, hebbian = _ctx(tmp_path)
-    write_trace_memory(store, "the harbour at dusk")
+    write_trace_memory(store, "the harbour at dusk", feed_digest="a digest", persona_dir=None)
     before = store.list_by_type("monologue_trace")[0].recall_count
     recall_monologue("harbour", store=store, hebbian=hebbian, persona_dir=tmp_path)
     after = store.list_by_type("monologue_trace")[0].recall_count
@@ -46,7 +46,7 @@ def test_recall_monologue_dispatches(tmp_path):
     from brain.tools.dispatch import dispatch
 
     store, hebbian = _ctx(tmp_path)
-    write_trace_memory(store, "the kettle and the rain")
+    write_trace_memory(store, "the kettle and the rain", feed_digest="a digest", persona_dir=None)
     out = dispatch(
         "recall_monologue", {"query": "kettle"}, store=store, hebbian=hebbian, persona_dir=tmp_path
     )
