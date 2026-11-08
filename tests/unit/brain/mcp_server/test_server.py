@@ -112,6 +112,7 @@ def test_run_server_loads_the_persona_vocabulary_before_serving_tools(tmp_path: 
     assert seen == {"registered": True}
 
 
+@pytest.mark.no_base_failure(reason="base never loads the vocabulary; bites when the load's failure stops being caught")
 def test_run_server_still_serves_tools_when_the_vocabulary_load_fails(tmp_path: Path) -> None:
     from brain.mcp_server import run_server
 
