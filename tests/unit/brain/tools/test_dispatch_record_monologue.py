@@ -141,6 +141,33 @@ def test_live_duplicate_guard_compares_digests(tmp_path: Path):
         hebbian.close()
 
 
+@pytest.mark.no_base_failure(reason="base guard always compares the raw thought; bites when the live guard drops the raw match")
+def test_rerun_across_the_switch_over_is_still_deduped(tmp_path: Path):
+    """#93 at the switch-over: the first call of a recruit-on-reach pair is captured off (raw trace), the switch appears,
+    and the rerun is live. It must still be recognised as the same thought."""
+    from brain.emotion import engine_files
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    try:
+        store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+        first = _record(persona_dir, store, hebbian, "raw drift", "she drifted")
+        assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+        rerun = _record(persona_dir, store, hebbian, "raw drift", "she drifted")
+        traces = _traces(persona_dir)
+    finally:
+        store.close()
+        hebbian.close()
+    assert first == {"ok": True, "monologue_text": "raw drift"}
+    assert rerun == {"ok": True, "deduped": True}
+    assert [t.content for t in traces] == ["raw drift"]
+    assert len(_digest_lines(persona_dir)) == 1
+
+
 def test_one_live_answer_per_capture(tmp_path: Path, monkeypatch):
     """The guard and the trace write share one answer: a switch that flips between the two asks can't split them."""
     from brain.emotion.engine import EmotionEngine
@@ -192,6 +219,31 @@ def test_switch_read_that_raises_counts_as_off_and_keeps_the_thought(tmp_path: P
         store.close()
         hebbian.close()
     assert result == {"ok": True, "monologue_text": "raw drift"}
+    assert trace.content == "raw drift"
+
+
+@pytest.mark.no_base_failure(reason="base never reads the switch; bites if an uninspectable switch file ever counts as live")
+def test_uninspectable_switch_file_counts_as_off_through_dispatch(tmp_path: Path, monkeypatch):
+    """A real unknown switch: the file is there but its stat fails. Owner 2026-11-05: "If the system can't tell if its
+    switched, assume its not." Unlike patching is_live, this goes through the engine's own handling of the unknown."""
+    from brain.emotion import engine_files
+
+    persona_dir, store, hebbian, _eng = _live_persona(tmp_path)
+    real_stat = engine_files.file_ops.stat_path
+    switch = engine_files.switch_path(persona_dir)
+
+    def stat(path, *args, **kwargs):
+        if Path(path) == switch:
+            raise PermissionError("switch cannot be inspected")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_files.file_ops, "stat_path", stat)
+    try:
+        _record(persona_dir, store, hebbian, "raw drift", "she drifted")
+        trace = _traces(persona_dir)[0]
+    finally:
+        store.close()
+        hebbian.close()
     assert trace.content == "raw drift"
 
 

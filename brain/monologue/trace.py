@@ -8,9 +8,9 @@ thought formed in a charged moment carries more salience (emotion is the
 heaviest forgetting weight) and persists longer than flat idle drift. With the
 engine live (emotion rework B1 PR 6) it is the note: the feed digest, seeded
 with the engine's strongest short-average and long-average feelings; the raw
-drift still reaches pass 2 from the capture's return value. Importance now also feeds the
-forgetting decay lever (P3 retention rework, Change 2) — kept modest here
-because traces are high-volume.
+drift still reaches pass 2 from the capture's return value. Importance now
+also feeds the forgetting decay lever (P3 retention rework, Change 2) — kept
+modest here because traces are high-volume.
 """
 from __future__ import annotations
 
@@ -30,8 +30,9 @@ _TRACE_IMPORTANCE_SCALE = 0.3  # peak emotion intensity (0..10) * scale, then cl
 
 
 def _trace_importance(emotions: dict[str, float]) -> float:
-    """Derive a per-trace importance from the aggregate's peak emotion
-    intensity (P3 retention rework, Change 1 — replaces the flat 0.3
+    """Derive a per-trace importance from the peak of the trace's own feelings
+    (the aggregate with the switch off, the engine's strongest feelings once
+    live) (P3 retention rework, Change 1 — replaces the flat 0.3
     constant so traces differentiate by how charged the moment was).
     Floored/capped modest: traces are high-volume, so even a peak trace
     should stay well below a deliberate write like a journal entry."""
@@ -41,7 +42,11 @@ def _trace_importance(emotions: dict[str, float]) -> float:
 
 def _is_live(persona_dir: Path | None) -> bool:
     """Whether the emotion engine is live for this persona; a failure to tell counts as off, so the thought is never
-    lost."""
+    lost.
+
+    Shared only by this writer's two halves (capture and the trace write), so they use one answer. Other writers check
+    `engine_for(persona_dir).is_live()` inline (B1 design decision 3: no shared gate helper); don't import this one.
+    """
     if persona_dir is None:
         return False
     try:

@@ -123,8 +123,9 @@ def build_breadcrumb(
     emotions: dict[str, float] = {"memory_grief": float(intensity)}
     if residue_emotion is not None:
         name, value = residue_emotion
-        # Skip if name is the primary grief key (avoid double-counting) or value <= 0. Held to 10: old dream rows store
-        # unclamped sums, so a dropped memory's strongest feeling can be above 20 (emotion rework B1 PR 6).
+        # Skip if name is the primary grief key (avoid double-counting) or value <= 0. Held to 10: dream rows store
+        # unclamped sums (switch-off dreams still do, dream.py), so a dropped memory's strongest feeling can be above 20
+        # (emotion rework B1 PR 6).
         if name != "memory_grief" and value > 0.0:
             emotions[name] = min(10.0, float(value) * policy.RESIDUE_FACTOR)
 

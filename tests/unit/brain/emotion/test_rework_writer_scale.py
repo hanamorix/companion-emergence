@@ -51,7 +51,7 @@ def test_file_commit_memory_stores_no_feelings(tmp_path: Path, monkeypatch):
 
 
 def test_grief_breadcrumb_residue_is_held_to_ten(tmp_path: Path):
-    """Old dream rows store unclamped sums, so a dropped memory's strongest feeling can be above 20; the residue the
+    """Dream rows store unclamped sums (switch-off dreams still do), so a dropped memory's strongest feeling can be above 20; the residue the
     drop breadcrumb carries (half of it) is held to 10."""
     from brain.grief import handle_drop
     from brain.memory.store import Memory, MemoryStore

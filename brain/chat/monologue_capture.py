@@ -82,14 +82,16 @@ def capture_monologue(
     # guard must too, or it goes blind to the just-enqueued trace and writes a
     # duplicate digest line (the #93 bug this guard exists to prevent).
     # One answer to "is the engine live" for this capture, so the guard and the trace write never disagree (emotion
-    # rework B1 PR 6). Once live the stored trace is the digest, so the guard compares digests. Accepted edges: the
-    # same digest on a different thought is dropped, the same thought with a new digest is kept twice.
+    # rework B1 PR 6). Once live the stored trace is the digest, so the guard compares digests. It also matches the raw
+    # thought, which only a trace stored just before the switch appeared can hold: a rerun straddling the switch-over is
+    # still the same thought. Accepted edges: the same digest on a different thought is dropped, the same thought with
+    # a new digest is kept twice.
     live = _is_live(persona_dir)
     try:
         from brain.memory.pending import PendingQueue
 
         recent = PendingQueue(store.persona_dir).read_recent(MONOLOGUE_TRACE_TYPE, limit=1)
-        if recent and recent[0].content == (feed_digest if live else monologue):
+        if recent and (recent[0].content == monologue or (live and recent[0].content == feed_digest)):
             # #175: None tells the caller this was a dedupe, not a capture, so
             # dispatch does not emit monologue_text for the duplicate (the key
             # the audit row and the pass-2 trigger key on).
