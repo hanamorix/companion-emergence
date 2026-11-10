@@ -230,9 +230,9 @@ Message: `scale making, reach-out and note nudges to 0-10 once the engine is liv
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_live_reflection_stores_held_values_and_drops_negatives(tmp_path):
+def test_live_reflection_stores_held_values_and_holds_negatives_to_zero(tmp_path):
     # persona_dir=tmp_path, MemoryStore(tmp_path / "memories.db"), _go_live, reply emotion {"joy": 9, "grief": -3, "love": 40}
-    assert peer_memory.emotions == {"joy": 9.0, "love": 10.0}
+    assert peer_memory.emotions == {"joy": 9.0, "grief": 0.0, "love": 10.0}
 
 def test_live_reflection_drops_non_numeric_and_non_finite_and_keeps_the_memory(tmp_path):
     # emotion {"joy": 4, "love": "lots", "awe": null, "fear": true, "grief": NaN}
@@ -252,7 +252,7 @@ def test_off_prompt_is_byte_identical():
 def test_hard_breach_writes_no_memory_when_live(tmp_path): ...
 ```
 
-In the pins file: remove `@_flipped_by("B1-2")` from both peer pins, and rewrite them to drive `run_relationship_reflection` with the switch on (never-negative, and two reflections unscaled). The existing `tests/kindled_link/test_relationship_memory_wiring.py` off tests stay as they are.
+In the pins file: remove `@_flipped_by("B1-2")` from both peer pins, and rewrite them to drive `run_relationship_reflection` with the switch on (never-negative: a negative is stored as 0; and two reflections unscaled). The existing `tests/kindled_link/test_relationship_memory_wiring.py` off tests stay as they are.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -265,7 +265,7 @@ Add the string, the old last segment with these two changes: "a small dict of re
 
 At the top of `run_relationship_reflection`: `live = persona_dir is not None and engine_for(persona_dir).is_live()`, with a lazy import, as the file already does for `brain.chat.extractor`. Pass `live` to the prompt build.
 
-In the §14 block, branch before the old `{str(k): float(v)}` comprehension. Live values go through a new private `_live_peer_values(raw) -> dict[str, float]`: numbers only (`bool` excluded), finite, above 0, held to 10, then `_filter_to_registered`. Don't call `apply_peer_emotion` on the live path. Leave the off path as it is.
+In the §14 block, branch before the old `{str(k): float(v)}` comprehension. Live values go through a new private `_live_peer_values(raw) -> dict[str, float]`: numbers only (`bool` excluded) and finite, with a negative held to 0 and the rest held to 10 (a 0 is kept), then `_filter_to_registered`. Don't call `apply_peer_emotion` on the live path. Leave the off path as it is.
 
 - [ ] **Step 4: Run them to verify they pass**
 
@@ -297,7 +297,7 @@ BODY = "NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose"
     ('EMOTIONS: {"joy": 7}\nENGAGEMENT: 7', {"joy": 7.0}, 7.0),
     ('ENGAGEMENT: 7/10\n\nEMOTIONS: {"joy": 7}\n', {"joy": 7.0}, 7.0),
     ('**EMOTIONS:** {"joy": 7}\n__ENGAGEMENT__: 7', {"joy": 7.0}, 7.0),
-    ('**EMOTIONS**: {"joy": 12, "awe": -1, "fear": 0, "zorble": 3, "love": NaN}', {"joy": 10.0}, None),
+    ('**EMOTIONS**: {"joy": 12, "awe": -1, "fear": 0, "zorble": 3, "love": NaN}', {"joy": 10.0, "awe": 0.0, "fear": 0.0}, None),
     ("ENGAGEMENT: -2", None, None),
     ("ENGAGEMENT: 40", None, 10.0),
     ("ENGAGEMENT: lots", None, None),
@@ -328,7 +328,7 @@ Expected: FAIL with `ImportError`.
 
 Walk lines back from the end, skipping blanks, and stop at the first line that isn't a felt marker. Marker regex (ASCII, ignore case): the name `EMOTIONS` or `ENGAGEMENT`, optionally wrapped in `**` or `__`, with the colon inside or outside the wrap. The nearest occurrence of a name wins.
 
-Emotions: `json.loads`, must be a dict. Keep numeric (not `bool`), finite, above 0, min with 10, then `_filter_to_registered` (lazy import). A bad value inside a valid object is dropped, not fatal. Rating: first number at the start of the value; a negative is `None`; min with 10. `rest` is the text before the earliest accepted line, so `raw` comes back unchanged when none is accepted.
+Emotions: `json.loads`, must be a dict. Keep numeric (not `bool`) and finite values, holding a negative to 0 and the rest to 10 (min with 10); a 0 is kept. Then `_filter_to_registered` (lazy import). A bad value inside a valid object is dropped, not fatal. Rating: first number at the start of the value; a negative is `None`; min with 10. `rest` is the text before the earliest accepted line, so `raw` comes back unchanged when none is accepted.
 
 Leave `parse_session_output` untouched.
 
@@ -429,6 +429,7 @@ def test_live_cycle_stores_the_mean_of_faded_values(persona_dir, store, hebbian,
 def test_live_dream_holds_old_rows_within_range(...):
     # neighbours carrying love=18.0 and tenderness=-0.3 stored directly
     assert all(0.0 <= v <= 10.0 for v in result.memory.emotions.values())
+    assert result.memory.emotions["tenderness"] == 0.0  # a negative mean is held to 0 and kept, not dropped
 
 def test_live_mood_comes_from_the_engine_read(...):
     # a grief_event row cannot set its own mood; a live short average on "joy" picks the joy-congruent seed
@@ -449,7 +450,7 @@ Expected: FAIL with `TypeError` on `eng` until the signatures change, then on th
 
 `dream_seeds.py`: add `_values(memory, eng) -> dict[str, float]` (stored when `eng is None`, else faded by the memory's own keys). `emotional_congruence` pools `_values`. `grief_pull` reads `memory_grief` through it when present. Import `EmotionEngine` under `TYPE_CHECKING` and update the module docstring's "no engine dependencies" line.
 
-`run_cycle`: `eng = engine_for(self.persona_dir) if self.persona_dir else None`, set to `None` when not live, and passed down once. `_select_seed`: mood is `EmotionalState(emotions={name: r.short for name, r in eng.read().items()})` when `eng`, else `aggregate_state(convo)`. `_write_dream_memory`: when `eng`, take the mean per emotion of faded values across the seed and the neighbours carrying it, hold it to 0-10, and drop what lands at 0; else today's sum. The snapshot at `dream.py:342` copies the row and needs no change.
+`run_cycle`: `eng = engine_for(self.persona_dir) if self.persona_dir else None`, set to `None` when not live, and passed down once. `_select_seed`: mood is `EmotionalState(emotions={name: r.short for name, r in eng.read().items()})` when `eng`, else `aggregate_state(convo)`. `_write_dream_memory`: when `eng`, take the mean per emotion of faded values across the seed and the neighbours carrying it, hold it to 0-10 and keep it, a mean held to 0 included; else today's sum. The snapshot at `dream.py:342` copies the row and needs no change.
 
 - [ ] **Step 4: Run them to verify they pass**
 

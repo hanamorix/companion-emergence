@@ -68,13 +68,13 @@ Tests, through the real pass-2 and reconcile entry points: a negative value lowe
 **`run_relationship_reflection` (`kindled_link/relationship.py:156`):**
 - Read `is_live()` once at the top. The production caller (`kindled_link/tick.py:354`) passes `persona_dir`.
 - A second version of the prompt's last segment asks for 0-10 values. The old text stays byte-identical (`prompt_strings.toml`, `[kindled_link.relationship]`).
-- Live values: drop non-numeric, negative and non-finite values, and hold the rest to 10. A bad value never loses the memory.
+- Live values: drop non-numeric and non-finite values; hold a negative to 0 (an emotion can't be negative, rule of 2026-10-06) and the rest to 10. A held 0 is stored and counts in the averages. A bad value never loses the memory.
 - `apply_peer_emotion` isn't called on the live path, so the bucket stops applying.
 - `hard_breach` still returns early.
 
 Old rows and pending-queue rows keep their small values, with no migration.
 
-Tests: each writer through its real entry point. A stubbed reflection returning `{"joy": 9, "grief": -3, "love": 40}` stores joy 9 and love 10 and drops grief. The live prompt asks for 0-10. Off pinned. Flips the two peer pins. Prompt-string tests may need the new segment.
+Tests: each writer through its real entry point. A stubbed reflection returning `{"joy": 9, "grief": -3, "love": 40}` stores joy 9, grief 0 and love 10. The live prompt asks for 0-10. Off pinned. Flips the two peer pins. Prompt-string tests may need the new segment.
 
 ### PR 4: research
 
@@ -90,7 +90,7 @@ ENGAGEMENT: <0-10>
 This is working text; ThinkerOfThoughts may edit the rating line (their design, item 11).
 
 - **Switch:** `is_live()` once per fire (`engines/research.py:203`).
-- **Emotions:** a JSON object. Drop unregistered, zero, negative and non-finite values, and hold the rest to 10.
+- **Emotions:** a JSON object. Drop unregistered and non-finite values; hold a negative to 0 and the rest to 10. A 0, given or held, is kept.
 - **Rating:** the starting number (`7/10` gives 7). A negative is treated as missing. Held to 10.
 - **Storage:** `build_research_memory` (`:616`) gains optional `emotions` and `engagement_rating`. The metadata key `engagement_rating` is written only when present.
 - **User prompt:** when live, its last line asks for `EMOTIONS` and `ENGAGEMENT` too, so it can't contradict the system prompt.
@@ -101,7 +101,7 @@ Tests: a table of reply shapes, including `Engagement: 7` in the middle of the n
 
 ### PR 5: dreams, grief, growth
 
-**Dream row (`engines/dream.py` `_write_dream_memory`, `:241`).** Live: for each emotion, the mean of the faded values across the seed and neighbours that carry it, held to 0-10 (old rows can be negative or over 10), dropping what lands at 0. Off or `persona_dir=None`: today's sum. The emotions snapshot at `dream.py:342` gets the mean too. Flips the dream pin.
+**Dream row (`engines/dream.py` `_write_dream_memory`, `:241`).** Live: for each emotion, the mean of the faded values across the seed and neighbours that carry it, held to 0-10 (old rows can be negative or over 10). A mean held to 0 is kept, not dropped. Off or `persona_dir=None`: today's sum. The emotions snapshot at `dream.py:342` gets the mean too. Flips the dream pin.
 
 **Mood (`dream.py:172`).** Live: `EmotionalState(emotions={name: r.short ...})`, as `research.py:213` does. This widens mood to all counted sources. A breadcrumb still can't set its own mood, because `grief_event` isn't counted. An empty read during a rebuild is accepted.
 
