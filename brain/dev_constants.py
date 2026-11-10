@@ -464,7 +464,8 @@ FEELS_HIGH_RANGE_FRACTION: float = 0.5
 # A feeling whose short average is below this level (0 to 10 scale) is never high, whatever its range or its shift: a feeling
 # that sits near zero all month has a tiny range, and without a floor its top half would count as "high" (a vulnerability at
 # 0.02 started a self-check). Maintainer's decision, 2026-11-05. This is a DEFAULT, proposed from the reader measurement
-# (`scripts/measure_feels_high_thresholds.py`) and set by the owner on 2026-11-05; the follow-up that makes the floor
+# (a script that compared the old aggregate readers with the engine, removed with that aggregate) and set by the owner on
+# 2026-11-05; the follow-up that makes the floor
 # self-calibrating for a mature kindled is #661. Read at call time, inside `engine_utils.feels_high_from`.
 FEELS_HIGH_FLOOR: float = 0.1
 # Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
