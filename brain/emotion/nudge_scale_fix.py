@@ -22,8 +22,11 @@ Accepted edges (the commit that adds this file names them):
   gate can hold a candidate for a long time, so how many sit in a real queue depends on its backlog. `kindled_peer` rows are
   written straight to the database and `initiate_outbound` is a gate-bypass type, so neither has this gap. A second writer of the
   queue file for one one-time pass is not worth it (the queue file has one writer).
-- A peer row can hold a NEGATIVE value (a model delta keeps its sign). It passes "below 1" but x10 would take it out of 0-10, so
-  the store method leaves such a row alone, with a warning naming its id, and counts nothing for it.
+- A peer row can hold a NEGATIVE value (a model delta keeps its sign). It passes "below 1", and the whole row is multiplied,
+  the negative member too (Planning B18 Q11b, derived from the owner's R13, one threshold for all three types). The engine
+  holds a stored negative at 0.0 before any fold, so that member still reads as 0.0, and the row's positive members reach the
+  0-10 scale. A row with no feelings has nothing to multiply and is not counted. A row whose product would not be a finite
+  number (a damaged value such as 1e308) is skipped with a warning and not counted.
 """
 
 from __future__ import annotations

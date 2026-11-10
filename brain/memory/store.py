@@ -143,9 +143,13 @@ def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) ->
     """The new `(emotions_json, score, peak)` of one row of the x10 fix (`MemoryStore.scale_up_small_nudge_rows`), or None to leave it.
 
     None, without a log line, for a row with no feelings (nothing to multiply). None WITH a warning naming the row's id (never
-    its content) for a row that cannot be multiplied safely: feelings that are not a mapping of numbers, a number below 0 or
-    not below the threshold, or a score that is not a number. The caller has already selected rows whose stored peak is below
-    the threshold, so a feeling at or above it is a row whose own columns disagree.
+    its content) for a row that cannot be multiplied safely: feelings that are not a mapping of numbers, a number at or above the
+    threshold or whose product is not finite (`_small_feeling_times`), a score that is not a number, or a score or peak whose
+    product is not finite (the peak is a REAL column the caller's selector has already compared with the threshold, so it is a
+    number). A negative number is multiplied like any other (a peer's model delta keeps its sign; the engine holds a stored
+    negative at 0.0 before any fold, so the multiply leaves what it reads for that member at 0.0 and puts the row's positive
+    members on the 0-10 scale). The caller has already selected rows whose stored peak is below the threshold, so a feeling at or above it
+    is a row whose own columns disagree.
     """
     memory_id = row["id"]
     try:
@@ -157,19 +161,38 @@ def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) ->
         return None
     if not emotions:
         return None
-    for value in emotions.values():
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < threshold:
-            logger.warning("x10 fix: row %s skipped, a stored feeling is not a number from 0 up to %s", memory_id, threshold)
+    multiplied: dict[str, float] = {}
+    for name, value in emotions.items():
+        product = _small_feeling_times(value, factor, threshold)
+        if product is None:
+            logger.warning("x10 fix: row %s skipped, a stored feeling is not a number below %s that times %s stays finite", memory_id, threshold, factor)
             return None
+        multiplied[name] = product
     score = row["score"]
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
         logger.warning("x10 fix: row %s skipped, its score is not a number", memory_id)
         return None
-    return (
-        _emotions_column({name: value * factor for name, value in emotions.items()}),
-        score * factor,
-        float(row["peak_emotion_intensity"]) * factor,
-    )
+    new_score, new_peak = score * factor, float(row["peak_emotion_intensity"]) * factor
+    if not (math.isfinite(new_score) and math.isfinite(new_peak)):
+        logger.warning("x10 fix: row %s skipped, its score or peak times %s is not a finite number", memory_id, factor)
+        return None
+    return _emotions_column(multiplied), new_score, new_peak
+
+
+def _small_feeling_times(value: object, factor: float, threshold: float) -> float | None:
+    """`value * factor` for a stored feeling the x10 fix can multiply, else None.
+
+    A number (not a bool) below the threshold, a negative one included, whose product is finite. NaN, an infinity, and a number
+    whose product overflows (a finite 1e308-sized value, or a whole number too large for a float, which `json.loads` accepts and
+    whose product raises `OverflowError`) are None: storing an infinity would be a new damaged row.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value >= threshold:
+        return None
+    try:
+        product = value * factor
+    except OverflowError:
+        return None
+    return product if math.isfinite(product) else None
 
 
 # PLACEHOLDER WORDING. The date the temp gate's write-back puts at the start of a recalled memory's text (spec section 7
@@ -3204,12 +3227,14 @@ class MemoryStore:
         """The one-time x10 fix of small feelings (the emotion engine's first start, `brain/emotion/nudge_scale_fix.py`): returns how many rows it multiplied.
 
         Rows of the types in `dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES` whose stored peak is below the threshold AND whose
-        feelings are all numbers from 0 up to (not including) the threshold get `emotions_json`, `score` and
-        `peak_emotion_intensity` multiplied by the factor (`importance` is not touched). A row that holds no feelings has
+        feelings are all numbers below the threshold get `emotions_json`, `score` and `peak_emotion_intensity` multiplied by
+        the factor, the whole row at once (`importance` is not touched). A negative feeling (in practice only a peer's model
+        delta is one) is multiplied with the rest of its row: the engine holds a stored negative at 0.0 before any fold
+        (Planning B18 Q11b, derived from owner R13: one threshold for all three types). A row that holds no feelings has
         nothing to multiply and is left alone. A row whose `emotions_json` cannot be read as a mapping of numbers, whose score
-        is not a number, with a value below 0 (times the factor it would leave the 0-10 scale), or with a stored peak below the
-        threshold while a feeling is not, is skipped with a logged warning naming its id, and is not counted: one damaged row
-        must not stop every start-up for good, and no value may leave 0-10.
+        is not a number, with a stored peak below the threshold while a feeling is not, or whose multiplied values would not
+        be finite, is skipped with a logged warning naming its id, and is not counted: one damaged row must not stop every
+        start-up for good.
 
         ONE write transaction (`BEGIN IMMEDIATE`) holds the done-check (`PRAGMA user_version` at or above the marker: nothing
         is read or changed, 0 is returned), the updates, the marker, and a check that every update changed exactly one row; a

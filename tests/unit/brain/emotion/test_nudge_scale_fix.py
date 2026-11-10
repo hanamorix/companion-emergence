@@ -144,7 +144,43 @@ def test_a_row_whose_stored_peak_is_small_while_a_feeling_is_not_is_skipped_with
         (json.dumps({"tenderness": "0.2"}), "a text value"),
         (json.dumps({"tenderness": True}), "a boolean value"),
         (json.dumps({"tenderness": None}), "a null value"),
-        (json.dumps({"tenderness": 0.2, "x": -0.3}), "a negative value"),
+        # json.loads accepts NaN and Infinity. The range test used to reject them without naming them; it must keep doing so
+        # (C4 of the Q11b record). These cases pass on the code before Q11b by design: the behaviour is unchanged.
+        pytest.param(
+            '{"tenderness": NaN}',
+            "a NaN value",
+            marks=pytest.mark.no_base_failure(reason="retained behaviour: the old range test rejected NaN too; this pins that the Q11b rewrite keeps it"),
+        ),
+        pytest.param(
+            '{"tenderness": Infinity}',
+            "an infinite value",
+            marks=pytest.mark.no_base_failure(reason="retained behaviour: the old range test rejected Infinity too; this pins that the Q11b rewrite keeps it"),
+        ),
+        pytest.param(
+            '{"tenderness": -Infinity}',
+            "a negative infinite value",
+            marks=pytest.mark.no_base_failure(reason="retained behaviour: the old range test rejected -Infinity too; this pins that the Q11b rewrite keeps it"),
+        ),
+        # Review F1/F2: a whole-number feeling too big for a float, and a finite one whose product would overflow to -Infinity.
+        # json.loads accepts both. The row stays skipped, as before Q11b (then for the range, now for the product).
+        pytest.param(
+            '{"tenderness": 1' + "0" * 400 + "}",
+            "a whole number too large for a float",
+            id="huge positive int",
+            marks=pytest.mark.no_base_failure(reason="retained behaviour: the old range test rejected a huge int too; this pins that the Q11b rewrite does not raise on it"),
+        ),
+        pytest.param(
+            '{"tenderness": -1' + "0" * 400 + "}",
+            "a negative whole number too large for a float",
+            id="huge negative int",
+            marks=pytest.mark.no_base_failure(reason="retained behaviour: the old range test rejected a negative huge int too; this pins that the Q11b rewrite does not raise on it"),
+        ),
+        pytest.param(
+            '{"tenderness": -1e308}',
+            "a negative number whose product would overflow",
+            id="negative overflow",
+            marks=pytest.mark.no_base_failure(reason="retained behaviour: the row stays skipped (before: a negative; now: ten times it is not a finite number, which a multiply would store as -Infinity)"),
+        ),
     ],
 )
 def test_a_damaged_row_is_skipped_and_not_counted_and_does_not_stop_the_others(
@@ -161,6 +197,25 @@ def test_a_damaged_row_is_skipped_and_not_counted_and_does_not_stop_the_others(
     assert _marker(persona) == dev_constants.NUDGE_SCALE_FIX_MARKER  # one damaged row does not stop the fix for good
 
 
+@pytest.mark.parametrize(
+    "damage",
+    ["UPDATE memories SET score = 1e308 WHERE id = ?", "UPDATE memories SET peak_emotion_intensity = -1e308 WHERE id = ?"],
+    ids=["score too large", "peak too negative"],
+)
+def test_a_row_whose_score_or_peak_times_ten_is_not_finite_is_skipped_with_a_warning_and_not_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, damage: str
+) -> None:
+    """Review F1 of Q11b: ten times these columns is an infinity, which the multiply must not store."""
+    persona = _persona(tmp_path, _memory("big", "making", {"pride": 0.2}), _memory("fine", "making", {"pride": 0.3}))
+    _raw(persona, damage, "big")
+    before = tuple(_read(persona, "big"))
+    caplog.set_level(logging.WARNING)
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    assert tuple(_read(persona, "big")) == before  # nothing of the row was written
+    assert _feelings(persona, "fine") == pytest.approx({"pride": 3.0})
+    assert any("big" in r.getMessage() and "skipped" in r.getMessage() for r in caplog.records)
+
+
 def test_a_row_with_a_score_that_is_not_a_number_is_skipped(tmp_path: Path) -> None:
     persona = _persona(tmp_path, _memory("bad", "making", {"pride": 0.2}))
     _raw(persona, "UPDATE memories SET score = ? WHERE id = ?", "lots", "bad")
@@ -168,18 +223,42 @@ def test_a_row_with_a_score_that_is_not_a_number_is_skipped(tmp_path: Path) -> N
     assert _feelings(persona, "bad") == {"pride": 0.2}
 
 
-def test_a_row_with_no_feelings_is_left_alone_and_not_counted(tmp_path: Path) -> None:
+def test_a_row_with_no_feelings_is_left_alone_and_not_counted(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     persona = _persona(tmp_path, _memory("empty", "kindled_peer", {}), _memory("some", "kindled_peer", {"warmth": 0.4}))
+    caplog.set_level(logging.WARNING)
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
     assert _feelings(persona, "empty") == {}
+    empty = _read(persona, "empty")
+    assert empty["score"] == 0.0 and empty["peak_emotion_intensity"] == 0.0  # nothing to multiply: every column as it was
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # a no-op, not a skipped row
 
 
-def test_a_negative_peer_value_is_not_multiplied_because_ten_times_it_would_leave_the_scale(tmp_path: Path) -> None:
-    """G0 review F8: a model delta keeps its sign and passes "below 1"; x10 would give -3.0, outside 0-10. The row is left whole."""
-    persona = _persona(tmp_path, _memory("peer", "kindled_peer", {"warmth": 0.4}))
-    _raw(persona, "UPDATE memories SET emotions_json = ?, peak_emotion_intensity = ? WHERE id = ?", json.dumps({"warmth": 0.4, "fear": -0.3}), 0.4, "peer")
-    assert nudge_scale_fix.scale_up_small_feelings(persona) == 0
-    assert _feelings(persona, "peer") == {"warmth": 0.4, "fear": -0.3}
+@pytest.mark.parametrize("memory_type", ["kindled_peer", "making", "initiate_outbound"])
+def test_a_row_with_a_negative_member_is_multiplied_whole_like_any_other_small_row(tmp_path: Path, memory_type: str) -> None:
+    """Planning B18 Q11b (owner R13, one threshold for all three types): a negative member is multiplied with the rest of its row.
+
+    The engine holds a stored negative at 0.0 before any fold, so the negative changes nothing it reads; the positive member is put
+    on the 0-10 scale, which the old skip of the whole row left at a tenth of its size."""
+    persona = _persona(tmp_path, _memory("mixed", memory_type, {"warmth": 0.4, "fear": -0.3}, importance=4.0))
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    # hand-worked: 0.4 x 10 = 4.0 and -0.3 x 10 = -3.0; score (0.4 - 0.3) x 10 = 1.0; peak 0.4 x 10 = 4.0
+    row = _read(persona, "mixed")
+    assert json.loads(row["emotions_json"]) == pytest.approx({"warmth": 4.0, "fear": -3.0})
+    assert row["score"] == pytest.approx(1.0)
+    assert row["peak_emotion_intensity"] == pytest.approx(4.0)
+    assert row["importance"] == 4.0
+
+
+def test_a_row_whose_feelings_are_all_negative_is_multiplied_whole_too(tmp_path: Path) -> None:
+    """Its stored peak is negative, which is below the threshold, so the selector picks it like any small row."""
+    persona = _persona(tmp_path, _memory("cold", "kindled_peer", {"fear": -0.3, "anger": -0.2}), _memory("warm", "kindled_peer", {"warmth": 0.5}))
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 2
+    # hand-worked: -0.3 x 10 = -3.0, -0.2 x 10 = -2.0; score -0.5 x 10 = -5.0; peak -0.2 x 10 = -2.0
+    row = _read(persona, "cold")
+    assert json.loads(row["emotions_json"]) == pytest.approx({"fear": -3.0, "anger": -2.0})
+    assert row["score"] == pytest.approx(-5.0)
+    assert row["peak_emotion_intensity"] == pytest.approx(-2.0)
+    assert _feelings(persona, "warm") == pytest.approx({"warmth": 5.0})
 
 
 # --- the transaction: all or nothing, marker included -----------------------------------------
