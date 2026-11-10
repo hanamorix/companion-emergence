@@ -1779,7 +1779,7 @@ def test_the_files_are_written_with_the_modes_the_design_names(
     engine_files.save_state(tmp_path, _full_state())
     engine_files.write_switch(tmp_path, NOW)
     assert calls == [
-        ("emotion_state.json", {"backups": 3, "indent": None}),
+        ("emotion_state.json", {"backups": 3, "indent": None, "verify": False}),
         ("emotion_switch.json", {"backups": 3, "if_missing": True}),
     ]
 

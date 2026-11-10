@@ -270,17 +270,13 @@ def state_lock(persona_dir: Path) -> AbstractContextManager[None]:
 def peer_trust(persona_dir: Path, peer_id: str) -> float:
     """How far this persona trusts one peer (0 to 1): the engine's one door to the peer-trust score.
 
-    Engine-internal stand-in that answers 0.0 for every peer and does no I/O, so until Engine 6 (#584) every peer memory
-    weighs the modifier floor, 0.1. Engine 6 replaces this body with a call to the kindled-link accessor
-    ``peer_trust(persona_dir, peer_id)`` (not built here, not ours). Its expected shape: open
-    ``KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)``, read
-    ``get_relationship_state(...).trust_score``, and give 0.0 for no database or no relationship row.
-
-    Heads-up for that wiring: the engine's `modifier_of` (which calls this) runs INSIDE the catch-up, which holds the engine
-    lock (``engine_rebuild.catch_up``), once per peer row of the replay. A kindled-link read there is a database read under
-    the engine lock.
+    Passes straight through to the kindled-link accessor ``brain.kindled_link.relationship.peer_trust``, which answers 0.0 for
+    no database, no row, an error or an unreadable row and creates nothing. The engine calls it only through here (tests wrap
+    and patch this name). The import is inside the function because that module imports the memory store.
     """
-    return 0.0
+    from brain.kindled_link.relationship import peer_trust as _peer_trust
+
+    return _peer_trust(persona_dir, peer_id)
 
 
 # ================================================================================================
@@ -583,12 +579,14 @@ def state_to_json(state: EngineState) -> dict:
     }
 
 
-def save_state(persona_dir: Path, state: EngineState) -> None:
+def save_state(persona_dir: Path, state: EngineState, *, verify: bool = False) -> bool:
     """Write the state file atomically with three backups, compact. The caller holds the lock and has set `state.saved_at`.
 
-    Does not change `state`. Serialization is strict: a non-finite number fails before any file is touched.
+    Does not change `state`. Serialization is strict: a non-finite number fails before any file is touched. With `verify=True`
+    the file is read back under the same lock as the write and `.bak1` is put back if it is not what was written; the result is
+    False then (the rebuild treats that as a failed check). Without it the result is True once the write is done.
     """
-    write_json(state_path(persona_dir), state_to_json(state), backups=_BACKUPS, indent=None)
+    return write_json(state_path(persona_dir), state_to_json(state), backups=_BACKUPS, indent=None, verify=verify)
 
 
 class LoadedState(NamedTuple):

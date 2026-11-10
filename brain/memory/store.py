@@ -139,6 +139,39 @@ def _emotions_column(emotions: dict[str, float]) -> str:
     return json.dumps(emotions)
 
 
+def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) -> tuple[str, float, float] | None:
+    """The new `(emotions_json, score, peak)` of one row of the x10 fix (`MemoryStore.scale_up_small_nudge_rows`), or None to leave it.
+
+    None, without a log line, for a row with no feelings (nothing to multiply). None WITH a warning naming the row's id (never
+    its content) for a row that cannot be multiplied safely: feelings that are not a mapping of numbers, a number below 0 or
+    not below the threshold, or a score that is not a number. The caller has already selected rows whose stored peak is below
+    the threshold, so a feeling at or above it is a row whose own columns disagree.
+    """
+    memory_id = row["id"]
+    try:
+        emotions = json.loads(row["emotions_json"])
+    except (TypeError, ValueError):
+        emotions = None
+    if not isinstance(emotions, dict):
+        logger.warning("x10 fix: row %s skipped, its feelings are not a mapping of numbers", memory_id)
+        return None
+    if not emotions:
+        return None
+    for value in emotions.values():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < threshold:
+            logger.warning("x10 fix: row %s skipped, a stored feeling is not a number from 0 up to %s", memory_id, threshold)
+            return None
+    score = row["score"]
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+        logger.warning("x10 fix: row %s skipped, its score is not a number", memory_id)
+        return None
+    return (
+        _emotions_column({name: value * factor for name, value in emotions.items()}),
+        score * factor,
+        float(row["peak_emotion_intensity"]) * factor,
+    )
+
+
 # PLACEHOLDER WORDING. The date the temp gate's write-back puts at the start of a recalled memory's text (spec section 7
 # item 12, sfa S31(c)) is persona-facing: its exact form is the owner's byte-exact call at the end of the build, and this
 # constant is working text until then. `{date}` stands for the day as YYYY-MM-DD and must appear exactly once. The test for "the
@@ -3166,6 +3199,65 @@ class MemoryStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("MemoryStore.oldest_created_at: the oldest created_at %r cannot be read (%s)", row["oldest"], exc)
             return None
+
+    def scale_up_small_nudge_rows(self) -> int:
+        """The one-time x10 fix of small feelings (the emotion engine's first start, `brain/emotion/nudge_scale_fix.py`): returns how many rows it multiplied.
+
+        Rows of the types in `dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES` whose stored peak is below the threshold AND whose
+        feelings are all numbers from 0 up to (not including) the threshold get `emotions_json`, `score` and
+        `peak_emotion_intensity` multiplied by the factor (`importance` is not touched). A row that holds no feelings has
+        nothing to multiply and is left alone. A row whose `emotions_json` cannot be read as a mapping of numbers, whose score
+        is not a number, with a value below 0 (times the factor it would leave the 0-10 scale), or with a stored peak below the
+        threshold while a feeling is not, is skipped with a logged warning naming its id, and is not counted: one damaged row
+        must not stop every start-up for good, and no value may leave 0-10.
+
+        ONE write transaction (`BEGIN IMMEDIATE`) holds the done-check (`PRAGMA user_version` at or above the marker: nothing
+        is read or changed, 0 is returned), the updates, the marker, and a check that every update changed exactly one row; a
+        mismatch or any error rolls everything back, marker included, and raises. A second run multiplies nothing. The cut is
+        not by date: a row written at the old scale after the fix and before the switch-over would be multiplied too (the
+        caller's comment names that edge). The count and every multiplied row's id are logged once, after the commit.
+        """
+        types = dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES
+        factor = dev_constants.NUDGE_SCALE_FIX_FACTOR
+        threshold = dev_constants.NUDGE_SCALE_FIX_THRESHOLD
+        marker = dev_constants.NUDGE_SCALE_FIX_MARKER
+        if self._conn.in_transaction:
+            raise RuntimeError("the x10 fix cannot run inside an open transaction (its commit would take the caller's writes)")
+        with self._rolls_back_on_error():
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self._conn.execute("PRAGMA user_version").fetchone()[0] >= marker:
+                self._conn.commit()
+                return 0
+            marks = ",".join("?" * len(types))
+            rows = self._conn.execute(
+                "SELECT id, emotions_json, score, peak_emotion_intensity FROM memories "  # noqa: S608
+                f"WHERE memory_type IN ({marks}) AND peak_emotion_intensity < ?",
+                (*types, threshold),
+            ).fetchall()
+            scaled: list[tuple[str, str, float, float]] = []
+            for row in rows:
+                new_values = _scaled_small_feelings(row, factor, threshold)
+                if new_values is not None:
+                    scaled.append((row["id"], *new_values))
+            changed = 0
+            for memory_id, emotions_json, score, peak in scaled:
+                changed += self._conn.execute(
+                    "UPDATE memories SET emotions_json = ?, score = ?, peak_emotion_intensity = ? WHERE id = ?",
+                    (emotions_json, score, peak, memory_id),
+                ).rowcount
+            if changed != len(scaled):
+                raise RuntimeError(f"the x10 fix meant to change {len(scaled)} rows and changed {changed}; nothing was changed")
+            self._conn.execute(f"PRAGMA user_version = {int(marker)}")  # PRAGMA takes no bound parameter; the marker is an int constant
+            self._conn.commit()
+        # The ids go in the log in full, in this one record, so the rows can be found by hand if the fix ever has to be undone
+        # (a multiplied row cannot be told from one that was always on this scale).
+        logger.info(
+            "MemoryStore.scale_up_small_nudge_rows: multiplied the feelings of %d rows by %s (ids: %s)",
+            len(scaled),
+            factor,
+            ", ".join(memory_id for memory_id, *_ in scaled),
+        )
+        return len(scaled)
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""

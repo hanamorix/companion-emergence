@@ -21,15 +21,20 @@ Real now:
 - `read()` and `status()`: the readings and whether the state is current. Reads never write and never take the lock.
 - `batch()`: a bulk writer's block; the events of its hooks apply once, when the outermost block ends.
 
-Shadow mode (the phase before the switch-over): the engine writes a shadow `state/`, nothing reads it, `faded_value` returns the
-stored value, no change-log line is written and nothing rebuilds.
+Shadow mode (the phase before the switch-over, the state of every persona until its first start under Engine 6): the engine
+writes a shadow `state/`, nothing reads it, `faded_value` returns the stored value, no change-log line is written and nothing
+rebuilds.
 
-Stubbed now:
-- `faded_value(memory, emotion)` returns the stored value and raises `KeyError`, naming the
-  memory id and the emotion, when the memory has no such emotion. It never returns 0.0:
-  "absent" is for the caller to decide.
-- `needs_recovery`, `recovery_rebuild` and `ensure_engine_ready` do nothing; `EngineStartupError` is defined and
-  nothing raises it yet.
+The switch-over and the live engine (Engine 6, #584):
+- `ensure_ready()` (the module function `ensure_engine_ready(persona_dir)` calls it): at a persona's first start it runs the
+  one-time x10 fix of small feelings (`nudge_scale_fix`), then rebuilds the state from the last 30 days under the engine lock
+  (`engine_rebuild.rebuild`, which writes `state/emotion_switch.json` last). A switch that cannot be inspected skips all of it
+  for this start with one warning (owner 2026-11-05: assume not switched); any other failure raises `EngineStartupError`.
+- `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
+  time when that is later; before the switch it returns the stored value. It raises `KeyError`, naming the memory id and the
+  emotion, when the memory has no such emotion. It never returns 0.0: "absent" is for the caller to decide.
+- `needs_recovery()` and `recovery_rebuild()`: a live persona whose state is missing or unreadable is rebuilt from its rows.
+- `fold_change` also writes a change-log line once the persona is live.
 
 Callers use the receiver form `engine.engine_for(persona_dir).<call>` and import the module
 (`from brain.emotion import engine`), not its names, so one patch reaches every call site.
@@ -44,10 +49,10 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, NoReturn
 
 from brain import dev_constants
-from brain.emotion import engine_files, engine_rebuild, persona_loader, vocabulary
+from brain.emotion import engine_files, engine_rebuild, nudge_scale_fix, persona_loader, vocabulary
 from brain.emotion.engine_files import VocabularyHalfLives
 from brain.emotion.engine_utils import (
     EngineState,
@@ -55,6 +60,7 @@ from brain.emotion.engine_utils import (
     close_days,
     counted_kind,
     day_of,
+    fade,
     feels_high_from,
     fold_event,
     fold_guarded,
@@ -62,6 +68,7 @@ from brain.emotion.engine_utils import (
     shift_for,
     source_modifier,
 )
+from brain.health.anomaly import BrainIntegrityError
 from brain.utils import file_ops
 from brain.utils.file_lock import LockTimeoutError
 from brain.utils.log_throttle import count_throttled, warn_throttled
@@ -157,6 +164,7 @@ class EmotionEngine:
         # without a lock. Owned here; `read()` and `status()` and the drain's early-out read the state through this same cache.
         self._state_cache = engine_files.StateCache(self.persona_dir)
         self._live = False  # True only for a switch file that was SEEN, and then kept for the life of the instance
+        self._switch_over_at: datetime | None = None  # the switch-over time as read from the file, kept once it was read; a failed read is never kept
         # Per-instance state of the apply step, all of it in memory (a second process has its own):
         self._catch_up_failed = False  # set by a failed recovery or an unreadable live state; cleared by a state load or write
         self._failure_logged_day: str | None = None  # the local day the failure was last logged for (once per active day)
@@ -257,13 +265,42 @@ class EmotionEngine:
         stored = {name: value for name, value in memory.emotions.items() if isinstance(name, str) and vocabulary.canonical_name(name) == "climax"}
         return resolve_emotions(stored).get("climax", 0.0)
 
-    def _modifier(self, memory: Memory, kind: str) -> float:
-        """The source modifier: trust is asked for a peer memory that names its peer, and is 0.0 otherwise."""
+    def _modifier(self, memory: Memory, kind: str, *, trust_memo: dict[str, float] | None = None) -> float:
+        """The source modifier: trust is asked for a peer memory that names its peer, and is 0.0 otherwise.
+
+        `trust_memo` is the memo of one catch-up or rebuild (`_replay_modifier_with_memo`: a peer is asked once per call); a
+        hook passes none and asks once per event.
+        """
         trust = 0.0
         peer_id = memory.metadata.get("peer_id")
         if kind == "peer" and isinstance(peer_id, str) and peer_id:
-            trust = engine_files.peer_trust(self.persona_dir, peer_id)
+            trust = self._trust_in(peer_id, trust_memo)
         return source_modifier(memory, trust)
+
+    def _trust_in(self, peer_id: str, memo: dict[str, float] | None) -> float:
+        """How far the persona trusts `peer_id`, the one place that calls `engine_files.peer_trust`.
+
+        The kindled-link accessor answers 0.0 for no database, no row, a database error or an unreadable row. Anything else it
+        raises (an `OSError` from a permission fault on its database path) becomes 0.0 here, the lowest weight, with a throttled
+        warning: a raise would drop a hook's event (`_never_raises`), fail a catch-up, or, inside a rebuild's replay, skip the
+        peer's row for good (a first rebuild cannot repair that later).
+        """
+        if memo is not None and peer_id in memo:
+            return memo[peer_id]
+        try:
+            trust = engine_files.peer_trust(self.persona_dir, peer_id)
+        except Exception as exc:  # noqa: BLE001 - the floor weight instead of a lost event or a skipped row; logged below
+            warn_throttled(
+                logger,
+                f"engine:peer_trust:{self.persona_dir}:{type(exc).__name__}",
+                "emotion engine: the trust in a peer could not be read (%s: %s); the lowest weight is used for it",
+                type(exc).__name__,
+                exc,
+            )
+            trust = 0.0
+        if memo is not None:
+            memo[peer_id] = trust
+        return trust
 
     def _start_needed(self, created_at: datetime) -> bool:
         """True when the persona's stored start date is missing, unreadable (a state that cannot be read reads as none) or later than this row's date.
@@ -298,8 +335,13 @@ class EmotionEngine:
         guard (`_never_raises`) handles its `LockTimeoutError`. It is not recovered. A lost entry is a minor edge while
         appends succeed; a fault that persists loses every entry for as long as it lasts, and the log line is then the only
         signal. `append_event` logs a failed append and returns False; nothing more is done with that here.
+
+        A chat change of a LIVE persona also goes to the change log first, inside the same lock hold: a rebuild replays it
+        from there, because the queue is emptied at a rebuild.
         """
         with engine_files.state_lock(self.persona_dir):
+            if event.kind == "change" and self.is_live():
+                engine_files.append_change(self.persona_dir, event)
             engine_files.append_event(self.persona_dir, event)
 
     # --- the direct apply and the batch scope --------------------------------------------------------
@@ -425,9 +467,20 @@ class EmotionEngine:
         """What the catch-up folds for a stored row: its faded emotions when it counts, nothing when it does not."""
         return self._resolved_faded(memory) if counted_kind(memory) is not None else {}
 
-    def _replay_modifier(self, memory: Memory) -> float:
-        kind = counted_kind(memory)
-        return self._modifier(memory, kind) if kind is not None else 1.0
+    def _replay_modifier_with_memo(self) -> Callable[[Memory], float]:
+        """The `modifier_of` of ONE catch-up or rebuild: a peer's trust is asked once, the memo is a dict of this call.
+
+        Each call of a catch-up or a rebuild makes its own (they run under the engine lock, and a kindled-link read per peer row
+        is a database open under that lock); the dict is dropped with the closure when the call ends, success or failure. It is
+        not kept on the instance, so a later call asks again.
+        """
+        trust_memo: dict[str, float] = {}
+
+        def modifier_of(memory: Memory) -> float:
+            kind = counted_kind(memory)
+            return self._modifier(memory, kind, trust_memo=trust_memo) if kind is not None else 1.0
+
+        return modifier_of
 
     def _fold_events(self, state: EngineState, events: list[Event], now: datetime, skip_ids: frozenset[str]) -> bool:
         """Fold `events` in time order, each with the days closing first; True when at least one event folded.
@@ -513,7 +566,7 @@ class EmotionEngine:
                         now,
                         queued=queue_read.events,
                         emotions_of=self._replay_emotions,
-                        modifier_of=self._replay_modifier,
+                        modifier_of=self._replay_modifier_with_memo(),
                     )
                     caught_up = True
                 except Exception as exc:  # noqa: BLE001 - every failure of the catch-up is the failed-catch-up path
@@ -726,13 +779,41 @@ class EmotionEngine:
         """
         return self._switch_seen() is True
 
+    def _switch_over_time(self) -> datetime | None:
+        """The switch-over time from the switch file, read once and kept for the life of the instance; None when it cannot be read.
+
+        A failed read (a corrupt switch file, a fault) is not kept: the next call reads again.
+        """
+        if self._switch_over_at is None:
+            self._switch_over_at = engine_files.read_switch(self.persona_dir)
+        return self._switch_over_at
+
     def faded_value(self, memory: Memory, emotion: str) -> float:
+        """The memory's stored value for `emotion`, faded by its age once the persona is live.
+
+        Live: `engine_utils.fade` with the emotion's half-life (`half_life`), the memory's importance and the floor of the
+        emotion (love and belonging only), at an age counted from the memory's creation or from the switch-over time when that
+        is later (a value stored before the switch-over was never faded by the engine, and is not faded for the time before
+        it). Before the switch, and when the switch file cannot be read, the stored value: never a fade from `created_at`
+        alone, which would fade a pre-switch value twice. It works from the memory it is given and this instance's own switch
+        time and half-life lookup, and reads no store, so it also serves a row that `hard_delete` has already removed. Raises
+        `KeyError` naming the memory id and the emotion when the memory has no such emotion: "absent" is for the caller to decide.
+        """
         try:
-            return memory.emotions[emotion]
+            stored = memory.emotions[emotion]
         except KeyError:
             raise KeyError(
                 f"memory {memory.id} has no stored value for emotion {emotion!r}"
             ) from None
+        if not self.is_live():
+            return stored
+        switched = self._switch_over_time()
+        created = lenient_utc(memory.created_at)
+        if switched is None or created is None:
+            return stored
+        age_days = (self._now() - max(created, switched)).total_seconds() / 86400.0
+        floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION.get(vocabulary.canonical_name(emotion))
+        return fade(stored, age_days, self.half_life(emotion), memory.importance, floor)
 
     def feels_high(self, name: str) -> bool:
         """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.
@@ -823,11 +904,115 @@ class EmotionEngine:
                 type(exc).__name__,
             )
 
+    # --- the switch-over and the recovery rebuild (Engine 6, #584) ---------------------------------
+
+    def ensure_ready(self) -> None:
+        """Make the engine ready to run: the persona's first start does its one-time switch-over here.
+
+        1. The switch is asked through `_switch_seen` (cached when seen): seen, return at once (no transaction, no lock).
+        Not inspectable (None, owner 2026-11-05): skip the whole switch-over for this start with one warning and return; no x10
+        fix, no lock, no rebuild, no write, nothing cached, and the next start asks again.
+        2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock.
+        3. The engine lock, taken once, the switch asked again under it (a second process that waited runs nothing), then
+        `engine_rebuild.rebuild` in first mode with the lock held, which writes the switch last. The clock is read once inside
+        the hold.
+
+        Any other failure (the x10 error or its integrity check, a lock that did not come, a failed rebuild check or write) is
+        logged and raised as `EngineStartupError(what, cause)`; a failure stops start-up and the next start runs it again (every
+        step is idempotent: the marker, the empty-state rebuild, the write-once switch).
+        """
+        seen = self._switch_seen()
+        if seen is True:
+            return
+        if seen is None:
+            self._skip_start_for_unknown_switch()
+            return
+        try:
+            nudge_scale_fix.scale_up_small_feelings(self.persona_dir)
+        except BrainIntegrityError as exc:
+            self._start_failed("the memories.db integrity check", exc)
+        except Exception as exc:  # noqa: BLE001 - every failure of the x10 fix stops start-up, named
+            self._start_failed("the x10 fix of small feelings", exc)
+        self._locked_rebuild("first", self._first_rebuild_needed)
+
+    def _skip_start_for_unknown_switch(self) -> None:
+        logger.warning(
+            "emotion engine: the switch file %s cannot be inspected, so this start skips the switch-over (nothing is changed or "
+            "written, the persona stays not switched) and the next start tries again",
+            engine_files.switch_path(self.persona_dir),
+        )
+
+    def _first_rebuild_needed(self) -> bool:
+        """Under the lock: False when the switch appeared meanwhile, or cannot be inspected (the same skip and warning as at the fast path)."""
+        seen = self._switch_seen()
+        if seen is None:
+            self._skip_start_for_unknown_switch()
+        return seen is False
+
+    @staticmethod
+    def _start_failed(what: str, cause: BaseException) -> NoReturn:
+        """Log a failed start-up step with its traceback and raise it as `EngineStartupError(what, cause)`."""
+        logger.error("emotion engine: %s failed (%s: %s); start-up stops", what, type(cause).__name__, cause, exc_info=cause)
+        raise EngineStartupError(what, cause) from cause
+
+    def _locked_rebuild(self, mode: str, needed: Callable[[], bool]) -> None:
+        """Take the engine lock ONCE, ask `needed()` under it, and rebuild in `mode` ("first" or "recovery") if it says so.
+
+        The one place that holds the lock for a rebuild, so "lock taken once" is true by construction. `needed` runs with the
+        lock held (a re-check: another process may have done the work while this one waited). The clock is read inside the
+        hold, once, and is the clock `faded_value` uses. The peer-trust memo is made for this call (`_replay_modifier_with_memo`)
+        and dropped when the call ends, success or failure. A failure (a lock that did not come within its wait, a failed
+        rebuild) is logged and raised as `EngineStartupError`.
+        """
+        modifier_of = self._replay_modifier_with_memo()
+        held = False
+        try:
+            with engine_files.state_lock(self.persona_dir):
+                held = True
+                if not needed():
+                    return
+                engine_rebuild.rebuild(
+                    self.persona_dir,
+                    mode,
+                    self._now(),
+                    faded_emotions_of=self._replay_emotions,
+                    modifier_of=modifier_of,
+                )
+        except Exception as exc:  # noqa: BLE001 - every failure is named and raised as the start-up error
+            self._start_failed(f"the {mode} rebuild" if held else "the engine lock", exc)
+
     def needs_recovery(self) -> bool:
-        return False
+        """True when a live persona's state cannot be used: missing or unreadable (through the cache), or the catch-up-failed flag is set.
+
+        An unknown switch answers False (no recovery on an unknown, `is_live`), and so does a persona that is not switched yet.
+        A state that came from a backup copy is read and healed by the drain's own catch-up, not by this. A stat and a cached
+        read per call; takes no lock.
+        """
+        if not self.is_live():
+            return False
+        return self._catch_up_failed or self._state_cache.get().state is None
 
     def recovery_rebuild(self) -> None:
-        return None
+        """Rebuild a live persona's state from its rows, under the engine lock taken once; raises `EngineStartupError` on a failure.
+
+        A persona that is not live has nothing to recover: this returns before the lock is taken (the switch never goes away
+        once written, so that check needs no re-check). Under the lock it re-checks that recovery is still needed: it is not
+        when a fresh read finds a readable state from the main file (another process repaired the file, the failed flag is
+        cleared, nothing is written: a rebuild from empty would drop that state's snapshot and shift history). Needed means a
+        fresh read has no state, or only a backup copy. The queue and the state are left as the rebuild leaves them.
+        """
+        if not self.is_live():
+            return
+
+        def still_needed() -> bool:
+            loaded = engine_files.read_state(self.persona_dir)
+            if loaded.state is not None and loaded.source == "main":
+                self._catch_up_failed = False
+                return False
+            return True
+
+        self._locked_rebuild("recovery", still_needed)
+        self._catch_up_failed = False
 
 
 # One engine per resolved persona directory. Any other code that touches `_engines` (a test fixture that
@@ -848,5 +1033,8 @@ def engine_for(persona_dir: Path) -> EmotionEngine:
 
 
 def ensure_engine_ready(persona_dir: Path) -> None:
-    """Make the engine ready to run (inert until Engine 6: writes nothing, raises nothing)."""
-    return None
+    """Make the engine ready to run: `engine_for(persona_dir).ensure_ready()`, so a test stub that patches `engine_for` gets the call.
+
+    Raises `EngineStartupError(what, cause)` when the switch-over fails; a failure stops start-up.
+    """
+    engine_for(persona_dir).ensure_ready()
