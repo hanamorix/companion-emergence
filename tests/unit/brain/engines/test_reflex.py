@@ -363,10 +363,10 @@ def _seed_emotion_memory(store: MemoryStore, emotions: dict[str, float]) -> str:
 
     The ingest pipeline tags each extracted memory with
     `metadata.source_summary = "conversation:<sid>"` (see
-    brain/ingest/commit.py). days_since_human reads that marker to
-    detect closed-session conversation activity. Tests that want to
-    simulate "user spoke recently" should match this shape — NOT use
-    memory_type="conversation" which no production code path writes.
+    brain/ingest/commit.py). Not memory_type="conversation", which no
+    production code path writes. days_since_human does not read memories:
+    a test that wants "the user spoke recently" writes a user turn into
+    `active_conversations/` instead.
     """
     mem = Memory.create_new(
         content="seed",
@@ -619,9 +619,16 @@ def test_run_tick_days_since_human_gate(tmp_path: Path, emotion_engine_stub):
 
     store = MemoryStore(":memory:")
     try:
-        # Recent conversation memory — days_since_human ~0
+        # The user spoke a moment ago: a user turn in the conversation files of the directory the engine reads
+        # (log_path's folder), so days_since_human is ~0. The memory only makes the emotion trigger true.
         _seed_emotion_memory(store, {"love": 8.0})
         _engine_reads(emotion_engine_stub, {"love": 8.0}, high={"love"})
+        active = tmp_path / "active_conversations"
+        active.mkdir()
+        (active / "sess_recent.jsonl").write_text(
+            json.dumps({"speaker": "user", "text": "hi", "ts": datetime.now(UTC).isoformat()}) + "\n",
+            encoding="utf-8",
+        )
         engine = _build_engine(tmp_path, store)
         engine.arcs_path = arcs_path
         result = engine.run_tick(dry_run=False)

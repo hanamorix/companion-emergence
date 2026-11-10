@@ -299,7 +299,7 @@ def _heartbeat(c: SimpleNamespace) -> None:
             persona_system_prompt="You are Test.",
         )
         engine._write_daemon_state_for_heartbeat(
-            c.persona_dir, elapsed_seconds=900.0, memories_decayed=0, edges_pruned=0, dream_id=None
+            c.persona_dir, elapsed_seconds=900.0, edges_pruned=0, dream_id=None
         )
     finally:
         hebbian.close()

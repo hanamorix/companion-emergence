@@ -119,7 +119,9 @@ class EngineState:
     creation time of the persona's oldest memory (a future time is held to now when it is folded), which the shift's start gate
     counts from (null: no memory yet, the gate is closed). `queue_line` is the
     number of lines of the queue file the engine has already folded: the next drain reads the lines after it. It is saved
-    with the state so that the fold and the position reach the disk in one write.
+    with the state so that the fold and the position reach the disk in one write. `switch_over_at` is the persona's one
+    switch-over time and the only record that it was switched over: the first rebuild at start-up sets it, in its one verified
+    state write; nothing else sets it, and every later save of a loaded state writes it back unchanged (None: not switched).
     """
 
     saved_at: datetime | None = None
@@ -130,6 +132,7 @@ class EngineState:
     repeats: dict[str, RepeatEntry] = field(default_factory=dict)
     emotions: dict[str, EmotionState] = field(default_factory=dict)
     queue_line: int = 0
+    switch_over_at: datetime | None = None
 
 
 @dataclass(frozen=True)

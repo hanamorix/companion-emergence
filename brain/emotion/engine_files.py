@@ -3,7 +3,9 @@
 Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code of ours creates that folder, because
 ``write_json``, ``write_jsonl``, ``append_jsonl`` and ``file_lock`` each create a missing parent.
 
-* ``emotion_state.json`` (+ ``.bak1``-``.bak3``): the averages, the weights and a 30-day snapshot per emotion. Written with
+* ``emotion_state.json`` (+ ``.bak1``-``.bak3``): the averages, the weights and a 30-day snapshot per emotion, and the
+  persona's one switch-over time, ``switch_over_at`` (the only record that the persona was switched over; there is no separate
+  switch file: ``switch_over_state`` reads "switched" off a loaded state). Written with
   ``write_json(backups=3, indent=None)``. Read through ``json_io.read_json_walk``, the read-only walk with the validator
   below: a read never heals, quarantines, rotates or rewrites anything, and says which copy it loaded. ``read_state`` reads
   fresh objects (what a drain mutates); ``StateCache`` keeps the parsed state for readers by a stat key.
@@ -16,7 +18,6 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
   whole once it is complete.
 * ``emotion_changes/YYYY-MM-DD.jsonl``: the change log, one file a day, a crash-recovery record of chat-derived changes.
   Whole files are deleted once they are older than the retention boundary.
-* ``emotion_switch.json``: ``{"switch_over_at": ...}`` and nothing else, written once; its existence means the engine is live.
 * ``emotion_vocabulary.json`` (the persona's own file, owned by the persona loader and the growth code): only READ here, for
   the half-life cache (``VocabularyHalfLives``, behind ``EmotionEngine.half_life``).
 
@@ -24,12 +25,12 @@ The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a non-re-
 waits at most ``dev_constants.EMOTION_LOCK_WAIT_S`` (``file_lock.locked_within``) and raises ``LockTimeoutError`` when the wait
 runs out. Every acquisition of it passes the wait; what a caller does on the timeout is that caller's. No other function in
 this module takes it; every caller holds it (a hook around its appends, a drain around its whole run, the rebuild around
-everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``, ``switch_state``, ``switch_exists``,
-``read_switch``, ``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a writer; the state and
-switch files are replaced atomically, the queue is appended to and emptied atomically, the change log is appended to and
+everything) and no code path may take it twice. Lock-free by design: ``read_state``, ``StateCache``, ``switch_over_state``,
+``read_queue``, ``read_changes`` and ``list_change_files`` (a reader never waits for a writer; the state file is replaced
+atomically, the queue is appended to and emptied atomically, the change log is appended to and
 deleted whole; a queue reader that is not the drain, which holds the lock, can meet a line being appended and does not count
-it until it is complete). Expecting the caller's lock: ``save_state``, ``append_event``, ``empty_queue``, ``append_change``,
-``prune_changes`` and ``write_switch``.
+it until it is complete). Expecting the caller's lock: ``save_state``, ``append_event``, ``empty_queue``, ``append_change``
+and ``prune_changes``.
 
 Times are UTC ISO strings written with ``iso_utc`` (``Z``) and read with ``lenient_utc``; day labels are local ``YYYY-MM-DD``
 from ``engine_utils.day_of``. All constants (file and folder names, the retention length, the value cap) are read as
@@ -89,7 +90,7 @@ from brain.utils.time import iso_utc, lenient_utc
 
 logger = logging.getLogger(__name__)
 
-# The state file and the switch keep three backups; `json_io.read_json_walk` reads exactly `.bak1` to `.bak3`.
+# The state file keeps three backups; `json_io.read_json_walk` reads exactly `.bak1` to `.bak3`.
 _BACKUPS = 3
 
 _VOCABULARY_FILENAME = "emotion_vocabulary.json"
@@ -241,12 +242,14 @@ def state_path(persona_dir: Path) -> Path:
     return paths.state_dir(persona_dir) / dev_constants.EMOTION_STATE_FILENAME
 
 
+def state_copy_paths(persona_dir: Path) -> list[Path]:
+    """The state file and its backups, newest first: the copies `read_state`'s walk looks at (they need not exist)."""
+    base = state_path(persona_dir)
+    return [base, *(base.with_name(f"{base.name}.bak{n}") for n in range(1, _BACKUPS + 1))]
+
+
 def queue_path(persona_dir: Path) -> Path:
     return paths.state_dir(persona_dir) / dev_constants.EMOTION_PENDING_FILENAME
-
-
-def switch_path(persona_dir: Path) -> Path:
-    return paths.state_dir(persona_dir) / dev_constants.EMOTION_SWITCH_FILENAME
 
 
 def changes_dir(persona_dir: Path) -> Path:
@@ -270,17 +273,13 @@ def state_lock(persona_dir: Path) -> AbstractContextManager[None]:
 def peer_trust(persona_dir: Path, peer_id: str) -> float:
     """How far this persona trusts one peer (0 to 1): the engine's one door to the peer-trust score.
 
-    Engine-internal stand-in that answers 0.0 for every peer and does no I/O, so until Engine 6 (#584) every peer memory
-    weighs the modifier floor, 0.1. Engine 6 replaces this body with a call to the kindled-link accessor
-    ``peer_trust(persona_dir, peer_id)`` (not built here, not ours). Its expected shape: open
-    ``KindledLinkStore(kindled_db_path(persona_dir), integrity_check=False)``, read
-    ``get_relationship_state(...).trust_score``, and give 0.0 for no database or no relationship row.
-
-    Heads-up for that wiring: the engine's `modifier_of` (which calls this) runs INSIDE the catch-up, which holds the engine
-    lock (``engine_rebuild.catch_up``), once per peer row of the replay. A kindled-link read there is a database read under
-    the engine lock.
+    Passes straight through to the kindled-link accessor ``brain.kindled_link.relationship.peer_trust``, which answers 0.0 for
+    no database, no row, an error or an unreadable row and creates nothing. The engine calls it only through here (tests wrap
+    and patch this name). The import is inside the function because that module imports the memory store.
     """
-    return 0.0
+    from brain.kindled_link.relationship import peer_trust as _peer_trust
+
+    return _peer_trust(persona_dir, peer_id)
 
 
 # ================================================================================================
@@ -342,8 +341,9 @@ def _mapping(parent: Mapping, key: str, what: str) -> Mapping:
 def validate_state(data: object) -> None:
     """Raise ValueError unless `data` is a state the engine can use (the validator `read_json_walk` applies to every copy).
 
-    Rejects: not an object; a missing or unparseable `saved_at`; an unparseable `reset_at`, `last_update`
-    or `persona_start_at` (a missing or null `persona_start_at` is accepted: a closed gate until the first memory); an
+    Rejects: not an object; a missing or unparseable `saved_at`; an unparseable `reset_at`, `last_update`, `switch_over_at`
+    or `persona_start_at` (a missing or null `persona_start_at` is accepted: a closed gate until the first memory; a missing or
+    null `switch_over_at` is accepted: the persona is not switched over); an
     `active_day` that is not a real day, or unset while `last_update` is set; `emotions` or `repeats` of the wrong type; an
     emotion that is not an object or lacks `short`, `long` or `last_entry_day`; a non-finite number, a bool, or a negative
     weight in an average; a `last_entry_day` that is not a real day or is later than `active_day`. An average outside 0-10 is
@@ -355,7 +355,10 @@ def validate_state(data: object) -> None:
     if "saved_at" not in data:
         raise ValueError("saved_at is missing")
     _time(data["saved_at"], "saved_at")
-    for key in ("reset_at", "last_update", "persona_start_at"):
+    # Accepted edge (Planning B28 SW3, P4, falls under the open owner question Q17): a malformed `switch_over_at` makes the
+    # WHOLE state unreadable here, exactly like a malformed `persona_start_at` (one validation rule for the state, P1), so
+    # the walk falls to a backup copy, and when no copy is readable the persona reads as unreadable (not switched, not cached).
+    for key in ("reset_at", "last_update", "persona_start_at", "switch_over_at"):
         if data.get(key) is not None:
             _time(data[key], key)
     active_day = data.get("active_day")
@@ -532,6 +535,7 @@ def state_from_json(data: dict, *, label: str = "state") -> EngineState:
         repeats=repeats,
         emotions=emotions,
         queue_line=_queue_line_from(data, label),
+        switch_over_at=optional("switch_over_at"),
     )
 
 
@@ -574,6 +578,7 @@ def state_to_json(state: EngineState) -> dict:
         "last_update": _optional_iso(state.last_update, "last_update"),
         "active_day": state.active_day,
         "persona_start_at": _optional_iso(state.persona_start_at, "persona_start_at"),
+        "switch_over_at": _optional_iso(state.switch_over_at, "switch_over_at"),
         "queue_line": state.queue_line,
         "repeats": {
             memory_id: {"first_at": _iso(entry.first_at, "first_at"), "count": entry.count}
@@ -583,12 +588,14 @@ def state_to_json(state: EngineState) -> dict:
     }
 
 
-def save_state(persona_dir: Path, state: EngineState) -> None:
+def save_state(persona_dir: Path, state: EngineState, *, verify: bool = False) -> bool:
     """Write the state file atomically with three backups, compact. The caller holds the lock and has set `state.saved_at`.
 
-    Does not change `state`. Serialization is strict: a non-finite number fails before any file is touched.
+    Does not change `state`. Serialization is strict: a non-finite number fails before any file is touched. With `verify=True`
+    the file is read back under the same lock as the write and `.bak1` is put back if it is not what was written; the result is
+    False then (the rebuild treats that as a failed check). Without it the result is True once the write is done.
     """
-    write_json(state_path(persona_dir), state_to_json(state), backups=_BACKUPS, indent=None)
+    return write_json(state_path(persona_dir), state_to_json(state), backups=_BACKUPS, indent=None, verify=verify)
 
 
 class LoadedState(NamedTuple):
@@ -1038,61 +1045,30 @@ def read_changes(persona_dir: Path, since: datetime) -> list[Event]:
 
 
 # ================================================================================================
-# The switch
+# Whether the persona was switched over
 # ================================================================================================
 
 
-def write_switch(persona_dir: Path, switch_over_at: datetime) -> bool:
-    """Write ``{"switch_over_at": ...}`` once (the caller holds the lock). True if written, False if the switch already exists.
+def switch_over_state(loaded: LoadedState) -> bool | None:
+    """Whether a persona is switched over, read off one load of its state: True, False, or None when that cannot be told.
 
-    ``write_json(..., backups=3, if_missing=True)``: an existing switch is never replaced, so the persona's switch-over time
-    never moves. Its existence is what makes a persona live.
+    There is no switch file: the first rebuild at start-up writes `switch_over_at` into the state file, in its one verified
+    write, and every later save keeps it, so "switched" is the loaded state holding it (any copy the walk accepted, main or a
+    backup, so a persona recovered from a backup copy stays switched). True: the loaded state holds `switch_over_at`. False: it
+    holds none, or there is no state file at all. None: the state exists but no copy can be read (`loaded.problem` is
+    "unreadable"): that cannot say either way. Owner 2026-11-05: "If the system can't tell if its switched, assume its not."
+    The engine reads None as not switched and never remembers it. The start-up does not skip on it (Planning B31 SW4, owner
+    S79): it decides from the database's x10 record (`nudge_scale_fix`), runs the first-mode rebuild, which keeps the damaged
+    copies aside as `<name>.corrupt-<stamp>`; the drain and the direct apply skip their pass and keep the queue until then.
+
+    Accepted edges (Planning B25 SW2, P4). (a) Every copy of the state file lost or unreadable, live and backups: the persona
+    reads as not switched until the first rebuild runs again at the next start, and that run records a later switch-over time. The x10 fix's progress note in `memories.db` (`PRAGMA user_version`) stops it
+    multiplying anything again on the re-run. (b) The live state is corrupted right after the first rebuild while `.bak1` is still the pre-switch
+    state: the backup has no `switch_over_at`, so the persona reads as not switched until the first rebuild runs again (the
+    same as (a)). Narrowed (Planning B28 Q18): a process that has already SEEN `switch_over_at` and loads a backup without it
+    puts the value it saw back before its drain saves (`EmotionEngine._run_apply`), so (b) still applies to a new process
+    that starts after the live state is corrupted.
     """
-    return write_json(
-        switch_path(persona_dir),
-        {"switch_over_at": _iso(switch_over_at, "switch_over_at")},
-        backups=_BACKUPS,
-        if_missing=True,
-    )
-
-
-def switch_state(persona_dir: Path) -> bool | None:
-    """Whether the switch file exists: True when it was seen, False when it is missing, None when the stat failed.
-
-    A stat error other than "no such file" (a permission fault, a share that went away) cannot say either way. It is logged
-    (throttled) and answers None, so a caller can tell a file that was SEEN from one that is only unknown. The engine treats an
-    unknown as not switched (owner 2026-11-05: "If the system can't tell if its switched, assume its not.") and never remembers it.
-    """
-    path = switch_path(persona_dir)
-    try:
-        return file_ops.stat_path(path) is not None
-    except OSError as exc:
-        warn_throttled(
-            logger,
-            f"engine_files:switch:{path}:{exc}",
-            "emotion switch %s cannot be inspected (%s); the persona is treated as not switched for now, and this is not remembered",
-            path,
-            exc,
-        )
-        return None
-
-
-def switch_exists(persona_dir: Path) -> bool:
-    """True when the switch file was seen; False when it is missing, and False when that cannot be told (a stat error).
-
-    An unknown is not switched: the same rule `EmotionEngine.is_live` follows. `switch_state` is the three-way form for a
-    caller that must tell a missing file from an unknown one.
-    """
-    return switch_state(persona_dir) is True
-
-
-def _switch_time(data: object) -> None:
-    if not isinstance(data, dict):
-        raise ValueError("the switch must be an object")
-    _time(data.get("switch_over_at"), "switch_over_at")
-
-
-def read_switch(persona_dir: Path) -> datetime | None:
-    """The switch-over time, or None when there is no switch or no copy of it holds a usable time. Read-only walk."""
-    walk = read_json_walk(switch_path(persona_dir), expect=dict, validate=_switch_time)
-    return None if walk.problem is not None else lenient_utc(walk.data["switch_over_at"])
+    if loaded.state is not None:
+        return loaded.state.switch_over_at is not None
+    return None if loaded.problem == "unreadable" else False

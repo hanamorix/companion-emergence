@@ -44,7 +44,9 @@ def test_nell_dream_dry_run_with_fake_provider(
 ) -> None:
     """nell dream --dry-run --provider fake runs without writes + prints summary."""
     from brain.cli import main
+    from brain.emotion.engine import ensure_engine_ready
 
+    ensure_engine_ready(nell_persona)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     rc = main(["dream", "--persona", "nell", "--dry-run", "--provider", "fake"])
     assert rc == 0
     out = capsys.readouterr().out

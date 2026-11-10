@@ -38,8 +38,24 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl_raw, read_jsonl, write_jsonl
-from brain.memory.store import Memory, MemoryStore
+from brain import dev_constants
+from brain.health.json_io import (
+    Recovery,
+    append_jsonl,
+    encode_jsonl,
+    iter_jsonl_raw,
+    read_jsonl,
+    write_jsonl,
+    write_jsonl_bytes,
+)
+from brain.memory.store import (
+    Memory,
+    MemoryStore,
+    has_feeling_at_or_above,
+    scaled_small_emotions,
+    times_if_finite,
+)
+from brain.utils import file_ops
 from brain.utils.file_lock import file_lock
 from brain.utils.finite import clamp_nonfinite
 
@@ -80,6 +96,91 @@ GATE_BYPASS_TYPES: frozenset[str] = frozenset(
 SALIENCE_ELIGIBLE_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_emotion", "monologue_soul_candidate"}
 )
+
+# The one type of the x10 fix (`dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES`) that waits in this queue: `initiate_outbound` is a
+# gate-bypass type and `kindled_peer` rows are written straight to the database, so only a `making` can be a candidate.
+_X10_QUEUED_TYPE = "making"
+
+
+def _scaled_candidate(entry: dict, factor: float, threshold: float) -> dict | None:
+    """The queue entry `entry` with its feelings (negatives held to 0.0 first) and its score multiplied (`scale_up_small_making_candidates`), or None to leave it.
+
+    None, without a log line, for an entry that is not selected: not a `making`, or a feeling at or above the threshold (the
+    largest value is not below it). An entry with no feelings is selected (peak 0) and its score multiplied, like a database row
+    with no feelings (Planning B27 Q15); the multiply is the shared one (`store.scaled_small_emotions`), not a branch here. None
+    WITH a warning naming the entry's id (never content) for an entry that cannot be multiplied safely (P4: left unchanged,
+    nothing is lost): feelings that cannot be multiplied (not a mapping of numbers, NaN, a product that is not finite), a `score`
+    that is present and not a number or whose product is not finite, or `metadata` that is not a mapping. An absent or null
+    `score` is not multiplied (`Memory.from_dict` reads null as missing); absent emotions are the empty mapping, which is selected.
+    No marker is written: the fix's progress is the number in `memories.db` (`MemoryStore.x10_progress`).
+    """
+    if entry.get("memory_type") != _X10_QUEUED_TYPE:
+        return None
+    where = f"pending candidate {entry.get('id')}"
+    metadata = entry.get("metadata") or {}  # as `Memory.from_dict` reads it
+    if not isinstance(metadata, dict):
+        logger.warning("x10 fix: %s skipped, its metadata is not a mapping", where)
+        return None
+    emotions = entry.get("emotions", {})
+    if has_feeling_at_or_above(emotions, threshold):
+        return None  # the largest value is not below the threshold: an entry already on the 0-10 scale (no warning: most are)
+    multiplied = scaled_small_emotions(emotions, factor=factor, threshold=threshold, where=where)
+    if multiplied is None:
+        return None
+    scaled = {**entry, "emotions": multiplied}
+    if entry.get("score") is not None:
+        new_score = times_if_finite(entry["score"], factor)
+        if new_score is None:
+            logger.warning("x10 fix: %s skipped, its score is not a number, or its score times %s is not a finite number", where, factor)
+            return None
+        scaled["score"] = new_score
+    return scaled
+
+
+def _x10_copy_path(path: Path) -> Path:
+    """The fixed temporary sibling the x10 fix writes a file's new copy to (`<file>.x10tmp`), so a later start finds it."""
+    return path.with_name(path.name + ".x10tmp")
+
+
+def _check_x10_copy(copy: Path, read: list[tuple[str, dict | None, bool]], factor: float) -> None:
+    """Check the written copy of a queue file against what was read (the x10 fix, Planning B29 C2 item 3, P8a); raise `RuntimeError` on any difference.
+
+    The copy is read back through `iter_jsonl_raw`, the reader that read the original, so lines are counted the same way on both
+    sides (a leading byte-order mark and a carriage-return line ending are handled by that one reader). The same number of lines;
+    every unselected line has the same text; every multiplied entry has the same keys and the same fields apart from its feelings
+    and score, its feelings are exactly `factor` times its held old values (a negative one becomes 0.0: the rule here is
+    "negative is 0.0", written by hand, it shares no code with the multiply) and its score, when it had one, is exactly `factor`
+    times the old score. The value compares are hand-written: there is no shared one. The caller keeps the original on a failure.
+    """
+    written = list(iter_jsonl_raw(copy, recover=Recovery.RAISE, bad_lines=True))
+    if len(written) != len(read):
+        raise RuntimeError(f"the x10 copy {copy.name} has {len(written)} lines where the original has {len(read)}; nothing was replaced")
+    for number, ((text, entry, was_multiplied), (new_text, new_entry)) in enumerate(zip(read, written, strict=True), start=1):
+        if not was_multiplied:
+            # The reader drops a byte-order mark at the start of a stream, so a first line that itself begins with one (a double
+            # mark, or blank lines before a mark) reads back one mark shorter; a byte-order mark is not content.
+            expected = text[1:] if number == 1 and text.startswith("﻿") else text
+            if new_text != expected:
+                raise RuntimeError(f"the x10 copy {copy.name} changed line {number}, which it must keep as it was; nothing was replaced")
+            continue
+        assert entry is not None  # a multiplied line was an object
+        if not isinstance(new_entry, dict):
+            raise RuntimeError(f"the x10 copy {copy.name} line {number} is not an entry; nothing was replaced")
+        old_feelings = entry.get("emotions", {})
+        new_feelings = new_entry.get("emotions")
+        if not isinstance(new_feelings, dict) or new_feelings.keys() != old_feelings.keys():
+            raise RuntimeError(f"the x10 copy {copy.name} line {number} has other feelings than the original; nothing was replaced")
+        for name, value in old_feelings.items():
+            if new_feelings[name] != (0.0 if value < 0 else value) * factor:
+                raise RuntimeError(f"the x10 copy {copy.name} line {number} has a feeling that is not ten times the held old one; nothing was replaced")
+        old_score = entry.get("score")
+        if old_score is not None and new_entry.get("score") != old_score * factor:
+            raise RuntimeError(f"the x10 copy {copy.name} line {number} has a score that is not ten times the old one; nothing was replaced")
+        others = [k for k in {*entry, *new_entry} if k not in ("emotions", "score")]
+        if any(entry.get(k) != new_entry.get(k) or (k in entry) != (k in new_entry) for k in others) or (
+            old_score is None and entry.get("score") != new_entry.get("score")
+        ):
+            raise RuntimeError(f"the x10 copy {copy.name} line {number} differs from the original in a field it must keep; nothing was replaced")
 
 
 class PendingQueue:
@@ -316,6 +417,109 @@ class PendingQueue:
             if queued or queue_damaged:
                 write_jsonl(self.path, [], fsync=False)  # empty the data file (the lock sidecar is separate)
         return ClaimedBatch(self, entries)
+
+    def scale_up_small_making_candidates(self, store: MemoryStore) -> int:
+        """The x10 fix of small feelings for the candidates still waiting here: returns how many entries it multiplied in the copies it prepared.
+
+        The emotion engine's first start (`brain/emotion/nudge_scale_fix.py`, after the database half) calls this, because a
+        `making` candidate that waits in the queue is not a `memories.db` row yet and the fix of the rows cannot reach it: the
+        gate would promote it later at the old small size (owner, Planning B21 Q10c: "They're memories so they should get treated
+        as such"). Both files are reached, the queue and the claimed batch in the processing file, under the queue's own lock
+        (the one `enqueue` and `claim` take), so the queue keeps one writer. `store` is the persona's open `MemoryStore`: the
+        fix's progress note lives in its database (`MemoryStore.x10_progress`, read and written only through its methods).
+
+        An entry is selected when its type is `making` and the largest of its emotion values is below the threshold (the peak is
+        not carried in an entry, so it is computed here; an empty or absent emotions mapping counts as 0 and is selected, as is a
+        database row with no feelings). The whole entry's emotions are held to 0.0 or more and multiplied, and its `score` if it
+        carries one, as stored (`store.scaled_small_emotions` and `store.times_if_finite`: the shared rule of the database half). No marker is written (the owner
+        ruled out per-entry markers, S77). An entry that cannot be multiplied safely (feelings or metadata that are not a
+        mapping of numbers, a score that is not a number, NaN) is left unchanged and logged by its id; a line that cannot be
+        parsed, a line that is not an object, and every entry not selected are written back as the shared reader yielded them (their
+        bytes without the line terminator: a blank line, a carriage return before the newline and a leading byte-order mark are
+        not kept; the app writes none of them).
+
+        Order, all under the queue's lock, from the number `store.x10_progress()` (re-read here): below
+        `NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED`, any `<file>.x10tmp` left by a failed or crashed earlier start is deleted
+        and the copies are made again from the untouched originals; each file with something to multiply gets its new copy
+        written to `<file>.x10tmp` and CHECKED (the copy is re-read through `iter_jsonl_raw`, the same line count, every
+        unselected line the same text, every selected entry's feelings and score exactly ten times its held old values, every
+        other field unchanged); only when every copy has passed is the number set to that value; then each original is replaced by its
+        copy (`file_ops.replace_file`). With the number already set and a copy still there (a crash after setting it) the
+        replacing is finished from the checked copies. A failed check, or a failure to set the number, raises before any
+        original is replaced (a start-up failure), so a retry never multiplies twice. A file with nothing to multiply gets no
+        copy and is not rewritten; with neither file nor copy present nothing is created, not even the lock sidecar.
+
+        The lock (`file_lock`) waits without a timeout, so a stuck holder delays start-up: existing behaviour of every queue
+        writer, unchanged here. Accepted edge (owner S77; P4): an entry appended while the app is down between the steps of a start-up
+        is missed, and one appended before a roll-forward is overwritten by the checked copy.
+        """
+        factor = dev_constants.NUDGE_SCALE_FIX_FACTOR
+        threshold = dev_constants.NUDGE_SCALE_FIX_THRESHOLD
+        checked = dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+        files = (self.path, self.processing_path)
+        copies = tuple(_x10_copy_path(path) for path in files)
+        if all(file_ops.stat_path(p) is None for p in (*files, *copies)):
+            # No queue file and no copy: nothing to multiply, and no lock to take (it would create its sidecar). The queue step is
+            # done all the same, so the number reaches 2 and a later re-run (SW2 edges (a), (b)) multiplies nothing.
+            if store.x10_progress() < checked:
+                store.set_x10_progress(checked)
+            return 0
+        count = 0
+        with file_lock(self.path):
+            if store.x10_progress() < checked:
+                for copy in copies:
+                    if file_ops.stat_path(copy) is not None:
+                        file_ops.delete_file(copy)  # before the number is set: a failed or crashed earlier start; start again from the originals
+                prepared: dict[Path, list[str]] = {}
+                for path, copy in zip(files, copies, strict=True):
+                    prepared[path] = self._prepare_x10_copy(path, copy, factor, threshold)
+                store.set_x10_progress(checked)  # raises before any original is replaced
+                count = sum(len(ids) for ids in prepared.values())
+            for path, copy in zip(files, copies, strict=True):
+                if file_ops.stat_path(copy) is not None:
+                    file_ops.replace_file(copy, path)  # atomic-write: ok -- renames a finished, checked copy over its original (the copy itself was written by `write_jsonl_bytes`), not a write
+                    logger.info("pending queue: replaced %s with its checked x10 copy", path.name)
+        return count
+
+    def _prepare_x10_copy(self, path: Path, copy: Path, factor: float, threshold: float) -> list[str]:
+        """Write and check the copy of one queue-shaped file with its small `making` entries multiplied; the ids it multiplied (the caller holds the lock).
+
+        Nothing is written (and no copy exists) when the file is missing or nothing in it is selected. A copy that fails its check
+        raises `RuntimeError` and the original is untouched. The count and every multiplied entry's id are logged once, with the
+        copy's name, so the entries can be found by hand if the fix ever has to be undone.
+        """
+        if file_ops.stat_path(path) is None:
+            return []
+        read: list[tuple[str, dict | None, bool]] = []  # (the line as read, its entry, whether it was multiplied)
+        lines: list[bytes] = []
+        multiplied: list[str] = []
+        # RAISE: a file that cannot be read must stop the start-up, not be skipped and rewritten without its lines.
+        for text, entry in iter_jsonl_raw(path, recover=Recovery.RAISE, bad_lines=True):
+            scaled = None if entry is None else _scaled_candidate(entry, factor, threshold)
+            encoded = None
+            if scaled is not None:
+                try:
+                    # "raise", not "null": an entry holding a NaN or an infinity in a field the fix does not touch would be changed by
+                    # the encoder, so it is left as it is and logged like any entry that cannot be multiplied safely (P4, P9b).
+                    encoded = encode_jsonl(scaled, nonfinite="raise")
+                except (ValueError, TypeError) as exc:
+                    logger.warning("x10 fix: pending candidate %s skipped, it cannot be written back unchanged (%s)", entry.get("id"), exc)  # type: ignore[union-attr]
+            read.append((text, entry, encoded is not None))
+            if encoded is None:
+                lines.append(text.encode("utf-8", "surrogateescape") + b"\n")
+            else:
+                lines.append(encoded)
+                multiplied.append(str(entry.get("id")))  # type: ignore[union-attr]
+        if not multiplied:
+            return []
+        # Not `write_jsonl`: it decodes its payload as UTF-8, and a line kept byte for byte may not be valid UTF-8.
+        write_jsonl_bytes(copy, b"".join(lines))  # atomic and durable
+        _check_x10_copy(copy, read, factor)
+        logger.info(
+            "pending queue: prepared %s with the feelings of %d candidate(s) multiplied by %s (ids: %s)",
+            copy.name, len(multiplied), factor, ", ".join(multiplied),
+        )
+        return multiplied
 
 
 class ClaimedBatch:
