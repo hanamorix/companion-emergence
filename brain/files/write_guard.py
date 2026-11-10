@@ -7,6 +7,7 @@ at BOTH propose and commit (TOCTOU). Pure + exhaustively tested."""
 from __future__ import annotations
 
 import os
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,8 +42,17 @@ def _real(p: Path) -> Path | None:
         return None
 
 
+def _is_windows() -> bool:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib (#662)."""
+    return sys.platform == "win32"
+
+
 def _fold(name: str) -> str:
-    """Canonical caseless form: equal for any case or Unicode-normalisation variant."""
+    """Canonical caseless form: equal for any case or Unicode-normalisation variant,
+    and on Windows for the trailing dots and spaces Win32 drops from a segment
+    (``.aws.`` creates ``.aws``)."""
+    if _is_windows():
+        name = name.rstrip(". ")
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
 
 
@@ -107,6 +117,9 @@ def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardRes
         resolved = Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
     except (OSError, ValueError) as exc:
         return GuardResult(ok=False, error=f"bad path: {exc}")
+    if _is_windows() and any(":" in part for part in resolved.parts[1:]):
+        # an NTFS stream (``.aws::$INDEX_ALLOCATION`` creates the directory) slips past both comparisons
+        return GuardResult(ok=False, error=f"bad path: {resolved} names an NTFS stream")
     if _denied(resolved, persona_dir):
         return GuardResult(ok=False, error=f"denied: {resolved} is in a protected location")
     if op == "create":

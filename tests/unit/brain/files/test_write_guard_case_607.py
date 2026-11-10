@@ -164,3 +164,51 @@ def test_a_deleted_notes_folder_gets_a_consent_card_not_an_auto_commit(tmp_path,
     assert out.get("status") != "written", out
     assert not notes.exists()
     assert len(list_pending(persona, now=datetime.now(UTC))) == 1
+
+
+@_REGRESSION
+def test_shared_identity_helper_does_not_swallow_a_nul_path(tmp_path):
+    # The ancestor walk moved into path_identity; main's read guard raised on a NUL path (fail closed)
+    # and must not start answering "not denied" for one.
+    from brain.files.read_guard import is_read_denied
+
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    with pytest.raises(ValueError):
+        is_read_denied(tmp_path / "a\x00b", persona_dir=persona)
+
+
+@pytest.mark.parametrize("seg", [".aws.", ".aws ", ".AWS. .", ".aws..."])
+def test_windows_trailing_dots_and_spaces_on_a_missing_denied_dir_are_refused(home, tmp_path, monkeypatch, seg):
+    # Win32 drops trailing dots and spaces from each segment, so commit's mkdir of ``.aws.`` creates ``.aws``.
+    # Through the platform seam, so it runs (and bites on main) on every OS.
+    import brain.files.write_guard as wg
+
+    monkeypatch.setattr(wg, "_is_windows", lambda: True)
+    r = check_write_target(str(home / seg / "credentials"), op="create", persona_dir=tmp_path / "persona")
+    assert not r.ok and "denied" in r.error.lower()
+
+
+@pytest.mark.parametrize("seg", [".aws::$INDEX_ALLOCATION", "notes.md:hidden"])
+def test_windows_stream_suffix_is_refused(home, tmp_path, monkeypatch, seg):
+    # An NTFS stream name (``dir::$INDEX_ALLOCATION`` creates the directory) can't be compared by
+    # spelling or identity, and Win32 refuses ``:`` in an ordinary name anyway, so refuse it outright.
+    import brain.files.write_guard as wg
+
+    monkeypatch.setattr(wg, "_is_windows", lambda: True)
+    r = check_write_target(str(home / "Documents" / seg / "x"), op="create", persona_dir=tmp_path / "persona")
+    assert not r.ok
+
+
+@pytest.mark.parametrize("rel", [".CONFIG/GH/hosts.yml", ".config/GH/hosts.yml", "library/launchagents/x.plist"])
+def test_multi_component_missing_denied_path_is_refused(home, tmp_path, rel):
+    # ~/.config/gh and ~/Library/LaunchAgents don't exist here: the anchor is home and the tail is two parts.
+    r = check_write_target(str(home / rel), op="create", persona_dir=tmp_path / "persona")
+    assert not r.ok and "denied" in r.error.lower(), rel
+
+
+@_REGRESSION
+@pytest.mark.parametrize("rel", [".config/ghx/f", ".config/g/f", ".awsx/f", ".ssh-notes/f", "Documents/.ssh.txt"])
+def test_tail_match_does_not_refuse_a_neighbour(home, tmp_path, rel):
+    r = check_write_target(str(home / rel), op="create", persona_dir=tmp_path / "persona")
+    assert r.ok, (rel, r.error)

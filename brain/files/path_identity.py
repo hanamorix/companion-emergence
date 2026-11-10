@@ -15,9 +15,11 @@ from pathlib import Path
 
 
 def stat_or_none(p: Path) -> os.stat_result | None:
+    """None if `p` doesn't exist or can't be statted. A path that can't be a path
+    at all (NUL byte) raises ValueError, so a caller can't mistake it for "absent"."""
     try:
         return os.stat(p)
-    except (OSError, ValueError):
+    except OSError:
         return None
 
 
