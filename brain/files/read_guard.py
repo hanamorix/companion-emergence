@@ -20,7 +20,7 @@ from pathlib import Path
 
 from brain.bridge.state_file import STATE_FILENAME
 from brain.files.path_identity import stat_or_none as _stat
-from brain.files.path_identity import under_any
+from brain.files.path_identity import under_any, unusable
 from brain.paths import get_home
 
 PROTECTED = "protected location (credentials or secrets)"
@@ -108,8 +108,9 @@ def denied_stats(persona_dir: Path) -> list[os.stat_result]:
 
 
 def is_read_denied(resolved: Path, *, persona_dir: Path, denied: list[os.stat_result] | None = None) -> bool:
-    """True if `resolved` (already .resolve()d) is, or is inside, a protected location."""
-    if _secret_name(resolved):
+    """True if `resolved` (already .resolve()d) is, or is inside, a protected location.
+    A path the OS can't use (too long, no permission) counts as protected: fail closed (#695)."""
+    if unusable(resolved) is not None or _secret_name(resolved):
         return True
     if resolved.parts[:2] == ("/", "proc") and resolved.name == "environ":  # a process's environment: tokens, keys
         return True
