@@ -152,7 +152,11 @@ def is_token(value: str | None) -> bool:
 
 
 def own_token() -> str | None:
-    """This process's token (cached), or None when it cannot be read here."""
+    """This process's token, or None when it cannot be read here.
+
+    The first answer stands for the life of the process, a failed read included: a bridge that recorded no token
+    (runner.py, identity "unavailable") must keep matching its own record in ``state_file.update``.
+    """
     global _OWN
     if _OWN is None:
         tok = token_of(os.getpid())
