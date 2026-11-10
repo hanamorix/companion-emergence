@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from brain.files import pending
 from brain.tools.impls.propose_write import propose_write
 
 
@@ -95,3 +96,67 @@ def test_an_ordinary_append_inside_the_notes_folder_still_auto_commits(env):
     out = propose_write(path=str(target), content="more", op="append", persona_dir=env["persona"])
     assert out.get("status") == "written", out
     assert target.read_text(encoding="utf-8").endswith("more")
+
+
+def _swap_at_claim(monkeypatch, swap):
+    """Run `swap()` when commit claims the card: after its guard re-run, before it opens the target."""
+    from brain.files import commit as commit_mod
+
+    real_mark = commit_mod.pending.mark
+
+    def mark(persona_dir, rid, *, status, **kw):
+        ok = real_mark(persona_dir, rid, status=status, **kw)
+        if status == "committing":
+            swap()
+        return ok
+
+    monkeypatch.setattr(commit_mod.pending, "mark", mark)
+
+
+def _commit(env, rid):
+    from brain.files.commit import commit_write
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(env["persona"] / "memories.db")
+    try:
+        return commit_write(env["persona"], rid, store=store)
+    finally:
+        store.close()
+
+
+def test_a_hard_link_swapped_in_after_the_commit_guard_is_not_written(env, monkeypatch):
+    # the guard's nlink check reads the path; commit then opened the path again, so a swap in between won
+    target = env["home"] / "Notes" / "log.md"
+    target.write_text("start\n", encoding="utf-8")
+    rid = propose_write(path=str(target), content="ssh-ed25519 AAAA planted", op="append", persona_dir=env["persona"])["id"]
+
+    def swap():
+        target.unlink()
+        _link(env["keys"], target)
+
+    _swap_at_claim(monkeypatch, swap)
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    assert env["keys"].read_text(encoding="utf-8") == "ssh-ed25519 AAAA original\n"
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_a_link_planted_at_a_create_target_after_the_commit_guard_is_not_overwritten(env, monkeypatch, kind, request):
+    # create used open("w"): a link planted after the guard was followed and the protected file truncated
+    if kind == "symlink":
+        request.getfixturevalue("requires_symlinks")
+    target = env["home"] / "Notes" / "new.md"
+    rid = propose_write(path=str(target), content="ssh-ed25519 AAAA planted", op="create", persona_dir=env["persona"])["id"]
+
+    def plant():
+        if kind == "symlink":
+            target.symlink_to(env["keys"])
+        else:
+            _link(env["keys"], target)
+
+    _swap_at_claim(monkeypatch, plant)
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    assert env["keys"].read_text(encoding="utf-8") == "ssh-ed25519 AAAA original\n"
+    assert pending.get(env["persona"], rid)["status"] == "refused"
