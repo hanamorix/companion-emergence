@@ -17,7 +17,7 @@ def _none_high(name: str) -> bool:
     return False
 
 
-@pytest.mark.no_base_failure(reason="its pinned values were measured from the fixed-level projection it replaces (the old oracle test, now pinned), so the base commit gives the same numbers by design")
+@pytest.mark.no_base_failure(reason="its pinned values were measured from the fixed-level projection that the old oracle test compared against, so the base commit gives the same numbers by design")
 def test_the_projections_combine_the_predicate_with_the_session_words_and_contact_rules():
     """Pinned values (measured from the fixed-level projection that this one replaced, with its levels read as the
     predicate): session 1.5 h, 3000 words, 2 days; love, desire and rest_need high; arousal and peace not."""
@@ -31,6 +31,9 @@ def test_body_emotions_absent_from_short_are_absent_from_the_state():
     short = {"arousal": 6.0, "love": 8.0}
     body = body_state_from_short(short, feels_high=_none_high, **INPUTS)
     assert set(body.body_emotions) == {"arousal"}
+    # The body emotions are exactly these six names; a feeling outside the set is never copied in.
+    six = {"arousal": 1.0, "desire": 2.0, "climax": 3.0, "touch_hunger": 4.0, "comfort_seeking": 5.0, "rest_need": 6.0}
+    assert body_state_from_short({**six, "love": 9.0}, feels_high=_none_high, **INPUTS).body_emotions == six
 
 
 def test_a_present_zero_is_kept():

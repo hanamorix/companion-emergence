@@ -40,7 +40,7 @@ class BodyState:
     exhaustion derived as max(0, 7 - energy).
 
     body_emotions carries the six body-class emotions as a snapshot —
-    callers shouldn't have to re-aggregate to read them.
+    callers shouldn't have to read them again from the engine.
     """
 
     energy: int

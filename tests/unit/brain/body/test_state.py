@@ -1,4 +1,4 @@
-"""Unit tests for brain/body/state.py — the body projection rules shared by every body state.
+"""Unit tests for brain/body/state.py: the body projection rules shared by every body state.
 
 Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
 
