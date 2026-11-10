@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from brain.body.state import BODY_EMOTION_NAMES, body_state_from_short, compute_body_state
+import pytest
+
+from brain.body.state import body_state_from_short
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
 INPUTS = {"session_hours": 1.5, "words_written": 3000, "days_since_contact": 2.0, "now": NOW}
@@ -15,30 +17,20 @@ def _none_high(name: str) -> bool:
     return False
 
 
-def _old_levels(short: dict[str, float]):
-    """A predicate that says "high" exactly where `compute_body_state` fires on its fixed levels."""
-    levels = {"belonging": 8.0, "love": 8.0, "climax": 5.0}
-    return lambda name: short.get(name, 0.0) >= levels.get(name, 7.0)
-
-
-def test_projections_match_compute_body_state_when_high_is_where_the_old_levels_fire():
+@pytest.mark.no_base_failure(reason="its pinned values were measured from the fixed-level projection it replaces (the old oracle test, now pinned), so the base commit gives the same numbers by design")
+def test_the_projections_combine_the_predicate_with_the_session_words_and_contact_rules():
+    """Pinned values (measured from the fixed-level projection that this one replaced, with its levels read as the
+    predicate): session 1.5 h, 3000 words, 2 days; love, desire and rest_need high; arousal and peace not."""
     short = {"arousal": 6.0, "love": 8.0, "rest_need": 7.5, "peace": 2.0, "desire": 7.0}
-    from_short = body_state_from_short(short, feels_high=_old_levels(short), **INPUTS)
-    reference = compute_body_state(emotions=short, **INPUTS)
-    assert (from_short.energy, from_short.temperature, from_short.exhaustion) == (
-        reference.energy,
-        reference.temperature,
-        reference.exhaustion,
-    )
-    assert from_short.computed_at == NOW
+    body = body_state_from_short(short, feels_high=lambda name: name in ("love", "desire", "rest_need"), **INPUTS)
+    assert (body.energy, body.temperature, body.exhaustion) == (4, 6, 3)
+    assert body.computed_at == NOW
 
 
 def test_body_emotions_absent_from_short_are_absent_from_the_state():
     short = {"arousal": 6.0, "love": 8.0}
     body = body_state_from_short(short, feels_high=_none_high, **INPUTS)
     assert set(body.body_emotions) == {"arousal"}
-    # The projection that fills six names with 0.0 is the one the helper replaces.
-    assert set(compute_body_state(emotions=short, **INPUTS).body_emotions) == BODY_EMOTION_NAMES
 
 
 def test_a_present_zero_is_kept():
@@ -53,12 +45,7 @@ def test_an_empty_short_gives_baseline_projections_and_no_body_emotions():
     assert body.body_emotions == {}
     assert "body_emotions" in body.to_dict()
     assert body.to_dict()["body_emotions"] == {}
-    reference = compute_body_state(emotions={}, **INPUTS)
-    assert (body.energy, body.temperature, body.exhaustion) == (
-        reference.energy,
-        reference.temperature,
-        reference.exhaustion,
-    )
+    assert (body.energy, body.temperature, body.exhaustion) == (5, 4, 2)  # pinned, as above
 
 
 # --- the predicate decides, not a fixed level (S53) -----------------------------------------------------------------
@@ -82,20 +69,18 @@ def test_more_than_six_high_feelings_lower_energy_by_one_and_six_do_not():
     assert _body(short, *names).energy == BASE_ENERGY - 1
 
 
-def test_the_high_feeling_count_is_one_dev_constant_read_at_call_time_on_both_paths(monkeypatch):
-    """The count that lowers energy ("more than six") is `dev_constants.BODY_ENERGY_HIGH_COUNT`, used by the engine path
-    (`body_state_from_short`) and the old path (`compute_body_state`) alike: lowering it to 2 makes three high feelings enough."""
+@pytest.mark.no_base_failure(reason="renamed from the test of the same dev constant on both projections; its engine-path assertions are the ones the old test already made and pass on the base commit by design")
+def test_the_high_feeling_count_is_one_dev_constant_read_at_call_time(monkeypatch):
+    """The count that lowers energy ("more than six") is `dev_constants.BODY_ENERGY_HIGH_COUNT`, read when
+    `body_state_from_short` runs: lowering it to 2 makes three high feelings enough."""
     from brain import dev_constants
 
     names = [f"feeling_{i}" for i in range(3)]
     short = dict.fromkeys(names, 0.5)
-    old_short = dict.fromkeys(names, 7.5)  # at the old path's fixed level of 7.0
     assert dev_constants.BODY_ENERGY_HIGH_COUNT == 6
     assert _body(short, *names).energy == BASE_ENERGY
-    assert compute_body_state(emotions=old_short, **FRESH).energy == BASE_ENERGY
     monkeypatch.setattr(dev_constants, "BODY_ENERGY_HIGH_COUNT", 2)
     assert _body(short, *names).energy == BASE_ENERGY - 1
-    assert compute_body_state(emotions=old_short, **FRESH).energy == BASE_ENERGY - 1
 
 
 def test_all_values_at_the_top_but_nothing_high_leaves_energy_and_temperature_at_baseline():

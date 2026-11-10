@@ -17,7 +17,7 @@ from typing import Any
 
 import brain.dev_constants as dev_constants  # pure data, listed in the purity guard's _PURE_BRAIN_MODULES
 
-# The 6-emotion body set tracked by compute_body_state.
+# The 6-emotion body set tracked by body_state_from_short.
 # Reconciliation 2026-04-30: arousal + desire are existing core emotions
 # (not new); the four new ones live in vocabulary._BASELINE under category="body".
 BODY_EMOTION_NAMES: frozenset[str] = frozenset(
@@ -69,48 +69,6 @@ class BodyState:
         }
 
 
-def compute_body_state(
-    *,
-    emotions: Mapping[str, float],
-    session_hours: float,
-    words_written: int,
-    days_since_contact: float,
-    now: datetime,
-) -> BodyState:
-    """Pure projection — no I/O, no LLM call, no cache. Sub-millisecond.
-
-    `emotions` MUST be the already pooled, post-climax-reset state the old
-    emotion path hands it. compute_body_state does not re-pool or re-reset.
-
-    This is the projection for the old emotion path: it fires on fixed levels (the only place that holds them).
-    `body_state_from_short` is the one for the emotion engine.
-    """
-    energy = _energy_from_flags(
-        session_hours,
-        words_written,
-        many_high=sum(1 for v in emotions.values() if v >= 7.0) > dev_constants.BODY_ENERGY_HIGH_COUNT,
-        rest_need_high=emotions.get("rest_need", 0.0) >= 7.0,
-        peace_high=emotions.get("peace", 0.0) >= 7.0,
-    )
-    ups = (
-        (emotions.get("arousal", 0.0) >= 7.0)
-        + (emotions.get("desire", 0.0) >= 7.0)
-        + (emotions.get("belonging", 0.0) >= 8.0)
-        + (emotions.get("love", 0.0) >= 8.0)
-        + (emotions.get("climax", 0.0) >= 5.0)
-    )
-    downs = (emotions.get("body_grief", 0.0) >= 7.0) + (emotions.get("touch_hunger", 0.0) >= 7.0)
-    temperature = _temperature_from_flags(days_since_contact, ups=ups, downs=downs)
-    return _assemble(
-        energy=energy,
-        temperature=temperature,
-        session_hours=session_hours,
-        days_since_contact=days_since_contact,
-        body_emotions={name: float(emotions.get(name, 0.0)) for name in BODY_EMOTION_NAMES},
-        now=now,
-    )
-
-
 def body_state_from_short(
     short: Mapping[str, float],
     *,
@@ -122,11 +80,11 @@ def body_state_from_short(
 ) -> BodyState:
     """The body state from the engine's short averages (`{name: short}` taken from `engine.read()`).
 
-    Same projection as `compute_body_state` (the session, words and contact-gap rules are shared code), but the emotion
-    conditions ask `feels_high(name)` (`engine.feels_high`) instead of comparing to fixed levels, and a body emotion the
-    engine did not return is absent from `body_emotions` instead of filled with 0.0. A present 0.0 is kept. The caller
-    passes the one `short` snapshot it read; the predicate asks the engine again for each name it is given, so it can
-    disagree with that snapshot if the engine changes between the two reads.
+    Pure projection: no I/O, no LLM call, no cache. The emotion conditions ask `feels_high(name)` (`engine.feels_high`),
+    so no emotion level is compared here. A body emotion the engine did not return is absent from `body_emotions`
+    (not filled with 0.0); a present 0.0 is kept. The caller passes the one `short` snapshot it read; the predicate
+    asks the engine again for each name it is given, so it can disagree with that snapshot if the engine changes
+    between the two reads.
     """
     energy = _energy_from_flags(
         session_hours,
