@@ -2,7 +2,7 @@
 
 Ensures the bulk conversation extractor seeds emotions on each ExtractedItem,
 those emotions are clamped/filtered correctly, and the committed memories
-carry non-empty emotion vectors that the emotion aggregate can read.
+carry non-empty emotion vectors that the emotion readers can use.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
     assert len(report.memory_ids) >= 1
 
     # The gated "feeling" candidate is enqueued; promote it into memories.db so
-    # the emotion aggregate (which reads store rows) sees it. Id is preserved.
+    # it is an active row with its emotions. Id is preserved.
     run_consolidation(
         store,
         persona_dir=store.persona_dir,

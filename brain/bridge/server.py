@@ -151,7 +151,7 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
 
     Idempotent — re-registering emotions is a no-op. Mirrors the supervisor tick
     load (brain/bridge/supervisor.py ~line 639), but called at bridge startup so
-    the chat path never aggregates with an empty vocab during the ~15-min window
+    the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
     Missing file → silent no-op (fresh personas have no vocabulary file yet).

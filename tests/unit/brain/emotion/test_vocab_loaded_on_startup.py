@@ -79,8 +79,10 @@ def test_ensure_persona_vocabulary_loaded_registers_extension_emotion(tmp_path: 
         # After the call the extension emotion must be in the registry.
         assert vocabulary.get(_EXTENSION_EMOTION_NAME) is not None
 
-        # And it is a registered name, so a memory carrying it keeps it.
-        assert vocabulary.get(_EXTENSION_EMOTION_NAME).name == _EXTENSION_EMOTION_NAME
+        # And a reader that filters to registered names keeps it.
+        from brain.chat.extractor import _filter_to_registered
+
+        assert _filter_to_registered({_EXTENSION_EMOTION_NAME: 0.5}) == {_EXTENSION_EMOTION_NAME: 0.5}
     finally:
         store.close()
 
@@ -91,8 +93,10 @@ def test_without_startup_load_extension_emotion_is_dropped(tmp_path: Path):
     # fixture just removed it).
     assert vocabulary.get(_EXTENSION_EMOTION_NAME) is None
 
-    # Unknown to the registry, so every reader would drop it.
-    assert vocabulary.get(_EXTENSION_EMOTION_NAME) is None
+    # Unknown to the registry, so a reader that filters to registered names drops it.
+    from brain.chat.extractor import _filter_to_registered
+
+    assert _filter_to_registered({_EXTENSION_EMOTION_NAME: 0.5}) == {}
 
 
 def test_ensure_persona_vocabulary_loaded_is_idempotent(tmp_path: Path):

@@ -557,7 +557,7 @@ class _PromptContext(dict):
     """Format context for an arc's prompt template.
 
     A placeholder naming an emotion resolves by canonical name, so ``{comfort-seeking}`` reads the
-    ``comfort_seeking`` channel of the aggregate; any other missing placeholder renders "0".
+    ``comfort_seeking`` channel of the mood; any other missing placeholder renders "0".
     """
 
     def __init__(self, emotions: Mapping[str, float]) -> None:
