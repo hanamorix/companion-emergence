@@ -137,30 +137,17 @@ def _fd_chain(dir_fd: int) -> list[os.stat_result]:
         os.close(cur)
 
 
-def dir_fd_denied(dir_fd: int, names: tuple[str, ...], persona_dir: Path) -> bool:
-    """POSIX. True if `names` below the open directory `dir_fd` is, or is inside, a
-    protected location, judged on the descriptor's real ancestry (#699).
+def dir_fd_denied(dir_fd: int, persona_dir: Path) -> bool:
+    """POSIX. True if the open directory `dir_fd`, or any ancestor of it, is a protected
+    location, judged on the descriptor's real ancestry (#699).
 
-    Each protected location is split at its nearest existing ancestor as it is now,
-    after the chain is walked, so a folder swapped in between counts as existing.
-    One that exists must not be the directory or any ancestor of it; one that
-    doesn't yet must not be reached by creating `names` (folded) below its anchor.
+    The protected locations are looked up after the chain is walked, so a folder
+    swapped in meanwhile counts. Only existing ones can match: a file the caller
+    creates can't turn a not-yet-existing protected name into this folder.
     """
     chain = _fd_chain(dir_fd)
-    for p in _protected(persona_dir):
-        rp = _real(p)
-        st, tail = _split_at_existing(rp) if rp is not None else (None, ())
-        if st is None:
-            continue
-        if not tail:
-            if any(os.path.samestat(c, st) for c in chain):
-                return True
-        elif os.path.samestat(chain[0], st) and len(names) >= len(tail) and all(
-            _fold(a) == _fold(b) for a, b in zip(names, tail, strict=False)
-        ):
-            return True
-    return False
-
+    protected = [st for st in (stat_or_none(p) for p in _protected(persona_dir)) if st is not None]
+    return any(os.path.samestat(c, st) for c in chain for st in protected)
 
 def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardResult:
     try:
