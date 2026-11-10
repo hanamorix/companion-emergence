@@ -16,12 +16,13 @@ from brain.chat.extractor import (
     ReflexAuditEntry,
     apply_side_effects,
 )
+from brain.emotion import vocabulary  # noqa: I001
 
 
 def _promote_pending(persona_dir: Path) -> None:
     """Promote the persona's pending-candidate queue into memories.db.
 
-    memory-consolidation migration: the extractor's monologue
+    memory-consolidation migration: the extractor's monologue / monologue_emotion
     / monologue_soul_candidate writes are GATED types — apply_side_effects enqueues
     them as candidates rather than writing memories.db rows. Tests that assert the
     end-state DB memory run the consolidation gate with a promote-all classifier
@@ -39,6 +40,29 @@ def _promote_pending(persona_dir: Path) -> None:
         )
     finally:
         store.close()
+
+# ---------------------------------------------------------------------------
+# Extension emotion fixture — register/unregister cleanly (registry is
+# process-global; tests MUST clean up per vocab_loaded_on_startup pattern).
+# ---------------------------------------------------------------------------
+
+_TEST_EMOTION_NAME = "test_sadness_extractor"
+
+
+@pytest.fixture
+def registered_test_emotion():
+    """Register a test extension emotion and clean it up after the test."""
+    vocabulary._unregister(_TEST_EMOTION_NAME)
+    vocab_emotion = vocabulary.Emotion(
+        name=_TEST_EMOTION_NAME,
+        description="test-only extension emotion for extractor vocab tests",
+        category="persona_extension",
+        decay_half_life_days=7.0,
+    )
+    vocabulary.register(vocab_emotion)
+    yield _TEST_EMOTION_NAME
+    vocabulary._unregister(_TEST_EMOTION_NAME)
+
 
 @pytest.fixture
 def persona_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -100,6 +124,31 @@ def test_empty_output_writes_nothing(persona_dir: Path):
     assert not (persona_dir / "reflex_audit.jsonl").exists()
 
 
+def test_emotion_delta_applies_memory_with_emotion(persona_dir: Path):
+    """Emotion delta writes a memory carrying the emotion channels to MemoryStore.
+
+    The emotion system derives state from memory aggregation — the monologue
+    write acts as a tiny influence event. We verify a memory was committed
+    with the emotion vector and that no exception was raised.
+    """
+    from brain.memory.store import MemoryStore
+
+    out = ExtractorOutput(emotion_delta={"curiosity": 0.15})
+    apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        recent = store.list_active(limit=10)
+        emotion_memories = [m for m in recent if m.emotions.get("curiosity", 0.0) > 0]
+        assert emotion_memories, (
+            f"expected at least one memory with curiosity emotion, got: "
+            f"{[m.to_dict() for m in recent]}"
+        )
+    finally:
+        store.close()
+
+
 def test_crystallisation_queues_soul_candidate(persona_dir: Path):
     """Crystallisation candidates land in soul_candidates.jsonl."""
     out = ExtractorOutput(
@@ -124,6 +173,34 @@ def test_crystallisation_queues_soul_candidate(persona_dir: Path):
     )
 
 
+def test_emotion_delta_excludes_zero_channels_from_both_content_and_vector(persona_dir: Path):
+    """Zero channels appear in neither the content string nor the stored vector."""
+    from brain.memory.store import MemoryStore
+
+    # Use registered vocab names: "curiosity" (baseline) and "fear" (baseline).
+    out = ExtractorOutput(emotion_delta={"curiosity": 0.1, "fear": 0.0})
+    apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        recent = list(store.list_active(limit=10))
+        emotion_mems = [m for m in recent if "monologue emotion influence" in m.content]
+        assert emotion_mems, "no emotion-influence memory written"
+        m = emotion_mems[0]
+        assert "fear" not in m.content, (
+            f"zero-value channel 'fear' should not appear in content: {m.content!r}"
+        )
+        assert "curiosity" in m.content, (
+            f"non-zero channel 'curiosity' should appear in content: {m.content!r}"
+        )
+        assert "fear" not in m.emotions, (
+            f"zero-value channel 'fear' should not be in emotions dict: {m.emotions}"
+        )
+    finally:
+        store.close()
+
+
 def test_partial_failure_is_isolated(persona_dir: Path):
     """If one apply step throws, others still run + the failure is logged."""
     # Make memories.db a directory so SQLite can't write to it.
@@ -144,21 +221,93 @@ def test_partial_failure_is_isolated(persona_dir: Path):
     assert entry["step"] == "memory_writes"
 
 
-def test_emotion_delta_writes_no_row_and_queues_nothing(persona_dir: Path):
-    """The pass-2 emotion delta no longer becomes a standalone `monologue_emotion` row: the old aggregate that
-    pooled those rows is gone, so such a row would only be a recallable memory with no reader of its emotions."""
-    from brain.memory.pending import PendingQueue
+# ---------------------------------------------------------------------------
+# Vocabulary-constraint tests (R1 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_emotion_delta_drops_unregistered_channels(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """Unregistered channel names are silently dropped; registered ones land.
+
+    The monologue_emotion memory must contain the registered channel
+    and must NOT contain the LLM-invented name "zorblefright".
+    """
     from brain.memory.store import MemoryStore
 
-    apply_side_effects(ExtractorOutput(emotion_delta={"curiosity": 0.15}), persona_dir=persona_dir)
+    out = ExtractorOutput(
+        emotion_delta={registered_test_emotion: 0.2, "zorblefright": 0.5}
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+    _promote_pending(persona_dir)
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
-        assert [m for m in store.list_active(limit=50) if m.memory_type == "monologue_emotion"] == []
+        recent = list(store.list_active(limit=10))
+        emotion_mems = [m for m in recent if m.memory_type == "monologue_emotion"]
+        assert emotion_mems, (
+            f"expected a monologue_emotion memory; got types: "
+            f"{[m.memory_type for m in recent]}"
+        )
+        m = emotion_mems[0]
+        assert registered_test_emotion in m.emotions, (
+            f"registered channel should be in emotions dict: {m.emotions}"
+        )
+        assert "zorblefright" not in m.emotions, (
+            f"unregistered channel 'zorblefright' must be dropped: {m.emotions}"
+        )
+        assert "zorblefright" not in m.content, (
+            f"unregistered channel 'zorblefright' must not appear in content: {m.content!r}"
+        )
     finally:
         store.close()
-    assert PendingQueue(persona_dir).read_recent("monologue_emotion", limit=5) == []
-    assert not (persona_dir / "extractor_errors.jsonl").exists()
+
+
+def test_emotion_delta_all_unregistered_skips_memory_write(persona_dir: Path):
+    """When every channel is off-vocab, no monologue_emotion memory is written."""
+    from brain.memory.store import MemoryStore
+
+    out = ExtractorOutput(
+        emotion_delta={"zorblefright": 0.5, "frumblywump": 0.3}
+    )
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        recent = list(store.list_active(limit=10))
+        emotion_mems = [m for m in recent if m.memory_type == "monologue_emotion"]
+        assert not emotion_mems, (
+            f"no monologue_emotion memory should be written when all channels are "
+            f"unregistered; found: {[m.to_dict() for m in emotion_mems]}"
+        )
+    finally:
+        store.close()
+
+
+def test_emotion_delta_vocab_failure_never_raises(
+    persona_dir: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A raising filter must never propagate out of apply_side_effects.
+
+    Note the actual fail-soft layering: _filter_to_registered itself catches
+    registry errors and passes channels through unfiltered; if the filter
+    function somehow raises anyway (as forced here), _safely() catches it and
+    the emotion write for that turn is skipped. The invariant under test is
+    no-crash/no-corrupt-state, not write-through.
+    """
+    import brain.chat.extractor as _extractor_module
+
+    # Monkeypatch _filter_to_registered to raise so we verify the fail-soft wrapper.
+    def _raising_filter(emotions: dict) -> dict:
+        raise RuntimeError("vocab exploded")
+
+    monkeypatch.setattr(_extractor_module, "_filter_to_registered", _raising_filter)
+
+    out = ExtractorOutput(emotion_delta={"curiosity": 0.15})
+    # Must not raise — _safely() wraps _apply_emotion_delta; any internal
+    # exception is caught and logged.
+    apply_side_effects(out, persona_dir=persona_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +491,66 @@ def test_crystallisation_within_batch_dedup_same_theme(persona_dir: Path):
     assert len(lines) == 1, (
         f"Expected 1 queued candidate (dedup), got {len(lines)}: {lines}"
     )
+
+
+def test_emotion_delta_is_capped_at_max_intensity(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """#94: a maximal delta is a strong nudge, not a peak. One extraction must
+    not be able to peg a channel to the full 10.0 clamp."""
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY
+    from brain.memory.store import MemoryStore
+
+    # Pin the constant meaningfully below the uncapped 10.0 clamp — otherwise
+    # a regression that reset _MAX_DELTA_INTENSITY back to 10.0 would still
+    # satisfy the equality assertion below by coincidence, and this canary
+    # could never fail.
+    assert _MAX_DELTA_INTENSITY < 10.0
+
+    out = ExtractorOutput(emotion_delta={registered_test_emotion: 1.0})
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        mems = [
+            m for m in store.list_active()
+            if m.emotions.get(registered_test_emotion, 0.0) > 0
+        ]
+        assert len(mems) == 1, f"expected exactly one emotion memory, got {len(mems)}"
+        m = mems[0]
+        assert m.emotions[registered_test_emotion] == _MAX_DELTA_INTENSITY, (
+            f"delta 1.0 must mint {_MAX_DELTA_INTENSITY}, got "
+            f"{m.emotions[registered_test_emotion]}"
+        )
+        # The coupling is deliberate: importance is derived from the vector and
+        # must stay consistent with it. Asserted so a later edit can't decouple.
+        assert m.importance == _MAX_DELTA_INTENSITY, (
+            f"importance must track the capped vector, got {m.importance}"
+        )
+    finally:
+        store.close()
+
+
+def test_emotion_delta_below_cap_is_unchanged(
+    persona_dir: Path, registered_test_emotion: str
+):
+    """The x10 mapping is preserved for the whole range under the ceiling —
+    the documented '0.15 nudge becomes 1.5' behaviour must not move."""
+    from brain.memory.store import MemoryStore
+
+    out = ExtractorOutput(emotion_delta={registered_test_emotion: 0.15})
+    apply_side_effects(out, persona_dir=persona_dir)
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        mems = [
+            m for m in store.list_active()
+            if m.emotions.get(registered_test_emotion, 0.0) > 0
+        ]
+        assert len(mems) == 1
+        assert abs(mems[0].emotions[registered_test_emotion] - 1.5) < 0.001
+    finally:
+        store.close()
 
 
 def test_crystallisation_rejected_theme_does_not_block_requeue(persona_dir: Path):

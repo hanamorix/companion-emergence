@@ -5,9 +5,11 @@ diverged (the ambient gap block), this is how she acts on it — by her own
 choice, never anyone else's insistence.
 
 Actions:
-  accept / revise  — mark the gap ``acknowledged`` and give the channel a
-                     cooldown (R-B2 anti-oscillation). No emotion row is written:
-                     the old aggregate that pooled such rows is gone.
+  accept / revise  — write a self-authored emotion delta for one channel,
+                     bounded [-1, 1] + clamped, routed through the registered
+                     vocabulary filter (off-vocab channels are dropped). The gap
+                     is marked ``acknowledged`` and the channel gets a cooldown
+                     (R-B2 anti-oscillation).
   dismiss          — let the gap pass; mark it ``dismissed`` + channel cooldown.
   name             — name an *unnamed pressure*. This NEVER mints a vocabulary
                      entry directly. It runs the existing guarded crystalliser
@@ -16,6 +18,12 @@ Actions:
                      evidence with a proper half-life + description and dedups
                      against existing channels (R-A — the v0.0.32 stub-flood
                      stays closed).
+
+The emotion write mirrors ``brain/chat/extractor.py::_apply_emotion_delta`` — a
+tiny emotion-carrying Memory committed through MemoryStore, importance from
+magnitude. There is no separate persisted emotion file; felt state is derived
+from memory aggregation, so this is the correct (non-bypassing) way to influence
+it.
 """
 from __future__ import annotations
 
@@ -31,7 +39,8 @@ logger = logging.getLogger(__name__)
 # Channel cooldown after a reconcile, expressed in cadence ticks. The self-model
 # reflection cadence runs on a 6-hour base interval (brain/self_model/cadence.py),
 # so 4 ticks ≈ 24h of "don't re-surface this channel" — long enough to let the
-# acknowledged gap settle before a new one can re-open on the same channel (R-B2).
+# self-authored delta settle into the derived read before a new gap can re-open
+# on the same channel (R-B2).
 _RECONCILE_COOLDOWN_TICKS = 4
 _TICK_HOURS = 6.0
 
@@ -82,6 +91,51 @@ def is_channel_in_cooldown(gap, channel: str, *, now: datetime | None = None) ->
     return now < expiry
 
 
+def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) -> bool:
+    """Commit a tiny emotion-carrying memory for a self-authored revision.
+
+    Mirrors brain/chat/extractor.py::_apply_emotion_delta: the delta is routed
+    through ``_filter_to_registered`` (off-vocab channel → dropped) and clamped
+    to [-1, 1]; importance is abs(delta) * 10 on the 0..10 MemoryStore scale,
+    then capped at ``extractor._MAX_DELTA_INTENSITY`` — one reconcile can't peg
+    a channel to the full clamp any more than one chat-turn extraction can.
+
+    Returns True if a memory was written, False if the channel was off-vocab or
+    the delta was effectively zero (nothing to write).
+    """
+    from brain.chat.extractor import _MAX_DELTA_INTENSITY, _filter_to_registered
+    from brain.memory.store import Memory, MemoryStore
+
+    clamped = _clamp_delta(delta)
+    registered = _filter_to_registered({channel: clamped})
+    emotions = {
+        ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
+        for ch, v in registered.items()
+        if abs(v) > 1e-9
+    }
+    if not emotions:
+        return False
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        channel_str = ", ".join(f"{ch}:{v:.2f}" for ch, v in emotions.items())
+        mem = Memory.create_new(
+            content=f"[self-model reconcile: {channel_str}]",
+            memory_type="self_model_reconcile",
+            domain="self",
+            emotions=emotions,
+            importance=max(emotions.values()),
+        )
+        # Automatic generated write → route through the consolidation gate (enqueue as a
+        # candidate) rather than straight into memories.db. Gated by memory_type.
+        from brain.memory.pending import route_write
+
+        route_write(store, mem, source="self_model_reconcile")
+    finally:
+        store.close()
+    return True
+
+
 def _propose_vocabulary_candidate(persona_dir: Path) -> dict[str, Any]:
     """Run the guarded vocabulary-crystalliser path for a named unnamed pressure.
 
@@ -130,6 +184,7 @@ def reconcile_self_read(
     if action in ("accept", "revise"):
         if not channel:
             return {"error": f"{action} requires a 'channel'"}
+        wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
         if gap is not None:
             gap.status = "acknowledged"
             gap.channel_cooldowns = {**(gap.channel_cooldowns or {}), channel: _cooldown_until(now)}
@@ -138,7 +193,7 @@ def reconcile_self_read(
         # Dead-loop observability (R-E4): record a successful reconcile so the
         # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
         increment_reconciles(persona_dir)
-        return {"ok": True, "action": action, "channel": channel}
+        return {"ok": True, "action": action, "channel": channel, "delta_written": wrote}
 
     if action == "dismiss":
         if gap is not None:
