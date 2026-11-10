@@ -136,6 +136,12 @@ def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardRes
     elif op == "append":
         if not resolved.exists() or not resolved.is_file():
             return GuardResult(ok=False, error=f"append target must exist as a file: {resolved}")
+        # #694: a hard link has no path back to the directory it came from, so neither comparison above can
+        # tell ~/Notes/ak from ~/.ssh/authorized_keys. Nothing can say where the other links are: refuse.
+        if resolved.stat().st_nlink > 1:
+            return GuardResult(ok=False, error=(
+                f"refused: {resolved} has more than one hard link, so it can't be checked against the protected locations"
+            ))
     else:
         return GuardResult(ok=False, error=f"unknown op: {op!r}")
     return GuardResult(ok=True, resolved=resolved)
