@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_CREATED_BY = ("og_migration", "brain_emergence", "user_authored")
 
+# How many of the newest active memories an arc prompt's `memory_summary` prints. The tick loads exactly this many
+# rows, and `_format_memory_summary` keeps exactly this many.
+_MEMORY_SUMMARY_COUNT = 3
+
 
 # ---------- Types ----------
 
@@ -326,7 +330,6 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        all_mems = self.store.list_active(limit=None)
         live_engine = engine.engine_for(self.log_path.parent)
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and no arc fires.
@@ -382,7 +385,9 @@ class ReflexEngine:
                     evaluated_at=now,
                 )
 
-            fire = self._fire(winner, emotions, days_since, all_mems, now)
+            # Only the rows the prompt prints, and only now that a prompt is about to be rendered.
+            recent_memories = self.store.list_active(limit=_MEMORY_SUMMARY_COUNT)
+            fire = self._fire(winner, emotions, days_since, recent_memories, now)
             new_log = log.appended(fire)
             new_log.save(self.log_path)
 
@@ -460,7 +465,7 @@ class ReflexEngine:
         arc: ReflexArc,
         emotions: Mapping[str, float],
         days_since_human: float,
-        all_mems: list,
+        recent_memories: list,
         now: datetime,
         *,
         dry_run: bool = False,
@@ -470,7 +475,7 @@ class ReflexEngine:
         context["persona_name"] = self.persona_name
         context["days_since_human"] = f"{days_since_human:.1f}"
         context["emotion_summary"] = format_emotion_summary(emotions)
-        context["memory_summary"] = _format_memory_summary(all_mems)
+        context["memory_summary"] = _format_memory_summary(recent_memories)
 
         prompt = arc.prompt_template.format_map(context)
         raw = self.provider.generate(prompt, system=self.persona_system_prompt)
@@ -601,7 +606,7 @@ def _template_emotions_absent(arc: ReflexArc, emotions: Mapping[str, float]) -> 
 
 
 def _format_memory_summary(memories: list) -> str:
-    top = list(memories)[:3]
+    top = list(memories)[:_MEMORY_SUMMARY_COUNT]
     return "\n".join(f"- {m.content[:140]}" for m in top)
 
 

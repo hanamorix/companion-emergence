@@ -1314,3 +1314,123 @@ def test_live_ranking_orders_by_value_minus_the_arcs_own_threshold(tmp_path: Pat
         tmp_path, emotion_engine_stub, {"love": 6.0, "grief": 8.0}, arcs, stored={}
     )
     assert [f.arc_name for f in result.arcs_fired] == ["a"]
+
+
+# ── the tick loads only the memories the prompt prints ────────────────────────
+#
+# The arc prompt's `memory_summary` prints the first 140 characters of the three newest active memories. The tick
+# reads those three rows, and only when it is about to render a prompt; it never loads the whole store.
+
+
+def _spied_reflex(tmp_path: Path, stub, *, high: set[str], count: int = 5):
+    """A reflex engine on a file-backed store of `count` active memories (oldest first, distinct times), with the
+    store's `list_active` recorded. Returns (runner, store, calls, prompts, newest_first_contents)."""
+    from dataclasses import replace
+
+    from brain.emotion.engine import Reading
+
+    stub.high = set(high)
+    stub.readings = {"love": Reading(short=8.0, long=0.0, difference=0.0, shift=0)}
+    arcs_path = tmp_path / "arcs.json"
+    arcs_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "arcs": [
+                    {
+                        "name": "spy_arc",
+                        "description": "d",
+                        "trigger": {"love": 5},
+                        "days_since_human_min": 0,
+                        "cooldown_hours": 1.0,
+                        "action": "a",
+                        "output_memory_type": "reflex_journal",
+                        "prompt_template": "Recent:\n{memory_summary}",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    prompts: list[str] = []
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            prompts.append(prompt)
+            return "ok"
+
+    store = MemoryStore(tmp_path / "memories.db")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    contents = []
+    for i in range(count):
+        content = f"memory number {i} " + "x" * 200
+        contents.append(content)
+        mem = Memory.create_new(content=content, memory_type="observation", domain="brain")
+        store.create(replace(mem, created_at=base + timedelta(hours=i)))
+
+    calls: list[int | None] = []
+    real_list_active = store.list_active
+
+    def spy(limit=None):
+        calls.append(limit)
+        return real_list_active(limit=limit)
+
+    store.list_active = spy  # type: ignore[method-assign]
+    runner = ReflexEngine(
+        store=store,
+        provider=CapturingProvider(),
+        persona_name="Nell",
+        persona_system_prompt="",
+        arcs_path=arcs_path,
+        log_path=tmp_path / "log.json",
+        default_arcs_path=DEFAULT_ARCS_PATH,
+    )
+    return runner, store, calls, prompts, list(reversed(contents))
+
+
+def test_a_fired_tick_loads_only_the_three_newest_memories_and_prints_the_same_lines(
+    tmp_path: Path, emotion_engine_stub
+):
+    runner, store, calls, prompts, newest_first = _spied_reflex(tmp_path, emotion_engine_stub, high={"love"})
+    try:
+        result = runner.run_tick(dry_run=False)
+    finally:
+        store.close()
+    assert len(result.arcs_fired) == 1
+    assert calls == [3]
+    assert prompts == ["Recent:\n" + "\n".join(f"- {c[:140]}" for c in newest_first[:3])]
+
+
+def test_a_tick_with_no_eligible_arc_loads_no_memories(tmp_path: Path, emotion_engine_stub):
+    runner, store, calls, prompts, _ = _spied_reflex(tmp_path, emotion_engine_stub, high=set())
+    try:
+        result = runner.run_tick(dry_run=False)
+    finally:
+        store.close()
+    assert result.arcs_fired == ()
+    assert calls == []
+    assert prompts == []
+
+
+def test_a_dry_run_loads_no_memories(tmp_path: Path, emotion_engine_stub):
+    runner, store, calls, _, _ = _spied_reflex(tmp_path, emotion_engine_stub, high={"love"})
+    try:
+        result = runner.run_tick(dry_run=True)
+    finally:
+        store.close()
+    assert result.would_fire == "spy_arc"
+    assert calls == []
+
+
+def test_a_tick_that_gets_no_background_slot_loads_no_memories(tmp_path: Path, emotion_engine_stub, monkeypatch):
+    from brain.bridge import cli_throttle
+
+    monkeypatch.setattr(cli_throttle, "acquire_background", lambda **_kw: False)
+    runner, store, calls, prompts, _ = _spied_reflex(tmp_path, emotion_engine_stub, high={"love"})
+    try:
+        result = runner.run_tick(dry_run=False)
+    finally:
+        store.close()
+    assert result.arcs_fired == ()
+    assert calls == []
+    assert prompts == []

@@ -156,7 +156,7 @@ const ACHING_FAMILY = new Set(["body_grief", "freedom_ache"]);
  * Body-emotion thresholds — when these fire, override whatever the
  * social emotions are saying. Spec principle: physiology speaks first.
  * AROUSAL_DESIRE_SUM_OVERRIDE (and the intent level of 7 below) apply only when the
- * server sends no `feels_high` list (the old path); with the list, the engine decides.
+ * server sends no `feels_high` list (its call failed, or an older bridge); with the list, the engine decides.
  */
 const CLIMAX_OVERRIDE = 7;
 const AROUSAL_DESIRE_SUM_OVERRIDE = 12;
@@ -166,8 +166,9 @@ const DAYS_SINCE_CONTACT_ACHING = 5;
 export interface ExpressionInput {
   emotions: Record<string, number>;
   body: BodyState | null;
-  /** The feeling names the engine calls high (an array only when the engine is live). When it is an array, the arousal
-   *  and intent expressions follow it instead of their own levels; null or undefined keeps the levels. */
+  /** The feeling names the engine calls high (an array whenever the server's read of the engine worked, possibly
+   *  empty). When it is an array, the arousal and intent expressions follow it instead of their own levels; null or
+   *  undefined (the server's call failed, or an older bridge does not send it) keeps the levels. */
   feelsHigh?: string[] | null;
 }
 
