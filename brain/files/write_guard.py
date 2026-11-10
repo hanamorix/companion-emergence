@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from brain.files.path_identity import stat_or_none, under_any
+
 _MAX_WRITE_BYTES = 1 * 1024 * 1024          # 1 MB per proposal
 _MAX_RESULT_FILE_BYTES = 25 * 1024 * 1024   # 25 MB resulting-file ceiling (append)
 
@@ -31,24 +33,43 @@ class GuardResult:
     error: str | None = None
 
 
-def _is_within(child: Path, parent: Path) -> bool:
-    """True if child == parent or is under it, comparing casefolded real paths
-    (macOS is case-insensitive — block ~/.SSH too)."""
+def _real(p: Path) -> Path | None:
     try:
-        c = os.path.normcase(os.path.realpath(child))
-        p = os.path.normcase(os.path.realpath(parent))
-    except OSError:
+        return Path(os.path.realpath(p))
+    except (OSError, ValueError):
+        return None
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """Deny-list test: True if child is parent or under it (#607).
+
+    By file identity when `parent` exists, so a case or Unicode-normalisation
+    variant on a case-insensitive volume still matches. Also by casefolded
+    spelling, because commit creates missing parents: ``~/.AWS/credentials`` with
+    no ``~/.aws`` yet has nothing to compare by identity but would create the
+    directory the AWS CLI then reads. On a case-sensitive volume that refuses a
+    differently-cased sibling too, which is the safe side for a deny list."""
+    c, p = _real(child), _real(parent)
+    if c is None or p is None:
         return False
-    return c == p or c.startswith(p + os.sep)
+    st = stat_or_none(p)
+    if st is not None and under_any(c, [st]):
+        return True
+    cs, ps = os.path.normcase(str(c)).casefold(), os.path.normcase(str(p)).casefold()
+    return cs == ps or cs.startswith(ps.rstrip(os.sep) + os.sep)
 
 
 def is_within_authorized(resolved: Path, folder: Path | None) -> bool:
-    """True only if `resolved`'s real path is inside `folder`. Escape-proof
-    (realpath collapses .. and symlinks). None folder → always False (notes
-    disabled = nothing authorized)."""
+    """True only if `resolved`'s real path is inside `folder`, by file identity
+    (#607), so the folder may be given in any case the volume accepts. Escape-proof
+    (realpath collapses .. and symlinks before the ancestors are compared). No
+    spelling fallback: this is an allow-list, and a folder that does not exist
+    authorizes nothing. None folder → always False (notes disabled = nothing
+    authorized)."""
     if folder is None:
         return False
-    return _is_within(resolved, folder)
+    c, st = _real(resolved), stat_or_none(folder)
+    return c is not None and st is not None and under_any(c, [st])
 
 
 def _denied(resolved: Path, persona_dir: Path) -> bool:
