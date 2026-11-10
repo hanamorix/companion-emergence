@@ -4,9 +4,10 @@
 #   1. Bump pyproject.toml + app/src-tauri/Cargo.toml +
 #      app/src-tauri/tauri.conf.json + app/package.json, then refresh
 #      uv.lock (`uv lock`) and the nellface entry in app/src-tauri/Cargo.lock.
-#   2. Land the bump on main through a PR.
-#   3. Run `bash scripts/release_preflight.sh <tag>` and see GREEN.
-#   4. Tag via `gh api`, which triggers the GitHub Actions release build.
+#   2. Add the release entry to CHANGELOG.md (docs/release-checklist.md).
+#   3. Land the bump and the entry on main through a PR.
+#   4. Run `bash scripts/release_preflight.sh <tag>` and see GREEN.
+#   5. Tag via `gh api`, which triggers the GitHub Actions release build.
 #
 # The generic script does NOT understand pyproject.toml or uv.lock, and
 # `origin` here is the PUBLIC repo (hanamorix/companion-emergence), where main
