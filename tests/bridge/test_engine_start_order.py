@@ -12,7 +12,6 @@ real work), and with the real engine for what the first start leaves behind.
 
 from __future__ import annotations
 
-import logging
 from datetime import timedelta
 from pathlib import Path
 
@@ -254,20 +253,20 @@ def test_a_first_start_of_the_bridge_switches_the_persona_over_before_the_superv
     assert engine_files.read_state(persona_dir).state is not None
 
 
-def test_a_bridge_whose_state_cannot_be_read_starts_and_skips_the_switch_over(
-    persona_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_bridge_whose_state_cannot_be_read_starts_and_repairs_it_with_the_first_rebuild(
+    persona_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     make_persona(persona_dir, [row(T35, emotions={"joy": 6.0}, mid="seed")])
     make_live(persona_dir, T35 - timedelta(days=1))
     ruin_the_state(persona_dir)
+    damaged = {p.name: p.read_bytes() for p in engine_files.state_path(persona_dir).parent.iterdir() if p.name.startswith(engine_files.state_path(persona_dir).name) and p.suffix != ".lock"}
     spawned = _supervisor_spawns(monkeypatch)
-    with caplog.at_level(logging.WARNING, logger="brain.emotion.engine"):
-        with TestClient(build_app(persona_dir=persona_dir, client_origin="tests", background_threads=True)):
-            assert engine.engine_for(persona_dir).is_live() is False
-    assert spawned == ["supervisor"]  # an unreadable state is not a failure: the bridge comes up
-    skip_lines = [r.getMessage() for r in caplog.records if "skips the switch-over" in r.getMessage()]
-    assert skip_lines and "cannot be read" in skip_lines[0]
-    # `ensure` rebuilt nothing and recorded no switch-over (no x10 either); the start-up drain that follows it starts the
-    # unreadable state over from an empty one (accepted edge (a), Planning B25 SW2), so the next start runs the switch-over again
+    with TestClient(build_app(persona_dir=persona_dir, client_origin="tests", background_threads=True)):
+        assert engine.engine_for(persona_dir).is_live() is True
+    assert spawned == ["supervisor"]
+    # Planning B31 SW4: `ensure` decided from the database's x10 record, wrote a readable state with a switch-over time, and
+    # kept every damaged copy aside; the drain that follows it has a readable state to work on
     after = engine_files.read_state(persona_dir).state
-    assert after is not None and after.switch_over_at is None and after.emotions == {}
+    assert after is not None and after.switch_over_at is not None
+    kept = [p.read_bytes() for p in engine_files.state_path(persona_dir).parent.iterdir() if ".corrupt-" in p.name]
+    assert sorted(kept) == sorted(damaged.values())

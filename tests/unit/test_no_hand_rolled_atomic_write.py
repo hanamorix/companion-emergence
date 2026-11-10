@@ -41,8 +41,8 @@ OS_FUNCS = {"replace", "rename", "renames"}
 # shutil.move directory moves, and the three heal moves in attempt_heal.py. (The base scan had 15 until #524 replaced the
 # whole-buffer poison rename in brain/ingest/pipeline.py with a span-only append, which has no rename to mark.) Plus one
 # for the settings migration, which renames the finished old tunables.json aside as its backup (#529). Plus one for the x10 fix's
-# queue step, which renames a finished, checked copy (`<file>.x10tmp`, written by `write_jsonl_bytes`) over its original.
-EXPECTED_MARKERS = 21
+# queue step, which renames a finished, checked copy (`<file>.x10tmp`, written by `write_jsonl_bytes`) over its original. Plus one for the rebuild's move-aside of an unreadable state copy to a `.corrupt-<stamp>` name (SW4).
+EXPECTED_MARKERS = 22
 
 
 def flagged_calls(source: str, tree: ast.Module | None = None) -> list[tuple[int, int, str]]:

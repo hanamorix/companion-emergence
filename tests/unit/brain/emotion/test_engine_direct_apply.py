@@ -336,28 +336,30 @@ def test_a_failed_recovery_on_a_live_persona_applies_nothing_keeps_the_queue_fla
     assert len([r for r in caplog.records if "catch-up of the backup state failed" in r.getMessage()]) == 1  # once per active day
 
 
-def test_a_failed_recovery_on_a_persona_that_is_not_live_continues_from_an_empty_state_and_writes(
+def test_a_failed_recovery_on_a_persona_that_is_not_live_skips_the_pass_keeps_the_queue_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Planning B31 SW4: the failed-catch-up site follows the unreadable-state rule: no start from an empty state."""
     persona, eng = _backup_world(tmp_path)
     _failing_catch_up(monkeypatch)
     queue(persona, showing("s", D[7], {"joy": 6.0}))
+    before = tree(persona / "state")
     eng.note_active(D[8])
-    state = state_of(persona)
-    assert state.emotions["joy"].short.avg == 6.0 and state.emotions["joy"].short.weight == 1.0  # from empty, not the backup's 4
-    assert engine_files.read_state(persona).source == "main" and queue_events(persona) == []
+    assert tree(persona / "state") == before  # no new main file, the queue line and its position kept
+    assert engine_files.read_state(persona).source == "bak1" and len(queue_events(persona)) == 1
 
 
-def test_a_direct_apply_on_an_unreadable_state_of_a_persona_this_instance_has_not_seen_switched_starts_from_an_empty_state(
+def test_a_direct_apply_on_an_unreadable_state_of_a_persona_this_instance_has_not_seen_switched_skips_and_writes_nothing(
     tmp_path: Path,
 ) -> None:
-    """Accepted edge (a), Planning B25 SW2: with every copy of the state unreadable nothing can say whether the persona was
-    switched over, so it reads as not switched, and the drain's empty-state fallback replaces the unreadable copy (the first
-    rebuild runs again at the next start). The memory is saved and its emotions are applied to the empty state."""
+    """Planning B31 SW4 (supersedes B25 edge (a)): with every copy of the state unreadable nothing can say whether the persona
+    was switched over, so it reads as not switched, and the apply is skipped: the unreadable copies are left for the first
+    rebuild at the next start, which decides from the database's x10 record. The memory is saved all the same."""
     persona = make_persona(tmp_path / "persona")
     save(persona, simple_state(saved_at=D[3], day=_day(3), switch_over_at=D[1]))
     ruin_the_state(persona)
     eng = install(persona, D[8])  # a new instance: it never saw the switch-over
+    before = tree(persona / "state")
     store = MemoryStore(persona / "memories.db")
     try:
         memory = row(D[7], emotions={"joy": 6.0})
@@ -365,8 +367,8 @@ def test_a_direct_apply_on_an_unreadable_state_of_a_persona_this_instance_has_no
         assert store.get(memory.id, bump=False) is not None
     finally:
         store.close()
-    state = state_of(persona)
-    assert state.emotions["joy"].short.avg == 6.0 and state.switch_over_at is None
+    assert tree(persona / "state") == before
+    assert engine_files.read_state(persona).problem == "unreadable"
     assert eng.is_live() is False
 
 

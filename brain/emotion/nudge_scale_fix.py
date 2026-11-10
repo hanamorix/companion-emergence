@@ -7,9 +7,10 @@ numbers are `dev_constants.NUDGE_SCALE_FIX_*`, and the work is in two places tha
 for the rows of `memories.db` (the store is the one writer of that file) and `PendingQueue.scale_up_small_making_candidates` for
 the `making` candidates still waiting in the pending queue (the queue is the one writer of its files; a waiting candidate is a
 memory the gate has not promoted yet, so it is multiplied too, Planning B21 Q10c). This module only decides WHEN: never on a
-persona that is switched over (its state holds `switch_over_at`), never when the state exists but cannot be read (that cannot
-say whether it was switched, and nothing irreversible runs on an unknown), and never with no `memories.db` (nothing to multiply
-and nowhere to record progress; skipped deliberately and logged). The database runs first, then the queue. It goes, with its
+persona that is switched over (its state holds `switch_over_at`), and never with no `memories.db` (nothing to multiply and
+nowhere to record progress; skipped deliberately and logged). A state that exists but cannot be read cannot say whether the
+persona was switched, so it does not stop the fix: the two steps below read the database's progress number themselves and skip
+what is done (Planning B31 SW4, owner S79). The database runs first, then the queue. It goes, with its
 constants and the two methods, when #388 removes it.
 
 Negative feelings (a peer's model delta keeps its sign) are held to 0.0 and then multiplied, in rows and queue entries alike
@@ -79,8 +80,8 @@ logger = logging.getLogger(__name__)
 def scale_up_small_feelings(persona_dir: Path) -> int | None:
     """Run the fix for one persona, the database half and then the queue half: the number of DATABASE rows multiplied, or None when it was not run.
 
-    None when the persona is not known to be not switched (its state holds `switch_over_at`, or exists but cannot be read; see
-    the module docstring) and when there is no `memories.db`: with no database there is nothing to multiply and nowhere to
+    None when the persona is switched (its state holds `switch_over_at`; an unreadable state is not a reason to skip, see the
+    module docstring) and when there is no `memories.db`: with no database there is nothing to multiply and nowhere to
     record progress, so BOTH halves are skipped deliberately and the skip is logged (P9b; practically unreachable, since a queue
     entry is written through a store that creates the database). Otherwise the rows are done (0 when an earlier start did them),
     then the queue under the same open store, which logs its own count.
@@ -91,8 +92,8 @@ def scale_up_small_feelings(persona_dir: Path) -> int | None:
     fault, a failed copy check, a failure to set the number: raised before any original is replaced) also goes out to the
     caller, which stops the start-up.
     """
-    if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is not False:
-        return None
+    if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is True:
+        return None  # switched; a state that cannot be read (None) goes on: the progress number below decides (Planning B31 SW4)
     database = persona_dir / "memories.db"
     if file_ops.stat_path(database) is None:
         logger.warning("x10 fix: there is no memories.db, so nothing to multiply and nowhere to record progress; both halves skipped")

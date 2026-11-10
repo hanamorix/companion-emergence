@@ -136,8 +136,9 @@ def test_the_early_out_does_not_fire_with_a_missing_or_unreadable_state_and_neve
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    engine.note_active(D[3])  # an unreadable state on a persona not seen switched over: starts empty and writes
+    engine.note_active(D[3])  # an unreadable state on a persona not seen switched over: the pass is skipped and nothing is written
     assert len(spy.within) == 3
+    assert engine_files.read_state(persona).problem == "unreadable"
 
 
 def test_a_saved_state_with_no_open_day_is_never_skipped_past(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,20 +340,26 @@ def test_a_fresh_persona_that_is_not_live_drains_a_first_showing_into_a_new_stat
     assert engine.status().caught_up
 
 
-def test_an_unreadable_state_on_a_persona_that_is_not_live_is_replaced_by_an_empty_one_once(
-    persona: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_drain_over_an_unreadable_state_of_a_persona_that_is_not_live_skips_its_pass_and_keeps_the_queue(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Planning B31 SW4: an unreadable state is never replaced by an empty one. The first rebuild at the next start writes the
+    readable state from the database (`ensure`); until then the drain does nothing and the queue is kept, its bytes and position."""
     save(persona, simple_state(saved_at=D[3]))
-    for suffix in ("", ".bak1", ".bak2", ".bak3"):
-        target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
-        if target.exists():
-            target.write_bytes(b"\x00")
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
+    ruin_the_state(persona)
     engine = install(persona)
-    engine.note_active(D[3])  # no lines and no day closed, yet the fallback to an empty state is saved
-    assert engine_files.read_state(persona).problem is None
+    state_dir = persona / "state"
+    before = tree(state_dir)
     saves = _count_saves(monkeypatch)
-    install(persona).note_active(D[3])  # the failing load is not retried on every call
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.engine"):
+        engine.note_active(D[4])
+        engine.note_active(D[4])  # and again: the pass is skipped every time, never started empty
     assert saves == []
+    assert tree(state_dir) == before  # no new state, no emptied queue, no moved copy
+    assert len(queue_events(persona)) == 1
+    assert engine_files.read_state(persona).problem == "unreadable"
+    assert [r for r in caplog.records if r.name == "brain.emotion.engine" and "cannot be read" in r.getMessage()]
 
 
 def test_a_drain_over_an_unreadable_state_of_a_persona_this_instance_saw_switched_over_flags_it_and_keeps_everything(

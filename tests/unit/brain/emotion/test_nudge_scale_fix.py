@@ -564,18 +564,15 @@ def test_it_runs_on_a_persona_with_a_state_that_holds_no_switch_over_time(tmp_pa
     assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # no queue file: the queue step is done all the same
 
 
-def test_it_is_skipped_when_the_state_cannot_be_read_and_the_store_is_never_opened(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_it_runs_when_the_state_cannot_be_read_and_the_progress_note_decides(tmp_path: Path) -> None:
+    """Planning B31 SW4: an unreadable state cannot say whether the persona was switched, so the database's own record
+    decides: the steps read the progress number themselves. Unstarted (0) runs; finished (2) multiplies nothing again."""
     persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
     engine_files.save_state(persona, EngineState(saved_at=NOW))
-    ruin_the_state(persona)  # cannot tell whether the persona was switched over: nothing irreversible runs
-    opened: list[object] = []
-    real = nudge_scale_fix.MemoryStore
-    monkeypatch.setattr(nudge_scale_fix, "MemoryStore", lambda *a, **k: opened.append(a) or real(*a, **k))
-    assert nudge_scale_fix.scale_up_small_feelings(persona) is None
-    assert opened == []
-    assert _unchanged(persona, "a", {"pride": 0.2}) and _user_version(persona) == 0
+    ruin_the_state(persona)
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 0  # the same start again: nothing is multiplied twice
 
 
 def test_with_no_database_both_halves_are_skipped_and_logged_and_nothing_is_created(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

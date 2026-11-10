@@ -668,6 +668,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 Q10c and C2 (#584, draft PR #633)",
         kind="code",
     ),
+    # --- an unreadable emotion state is decided from the x10 record, never skipped (Engine 6 SW4) ---------------------------
+    Removed(
+        names=("_skip_start_for_unreadable_state",),
+        why="the start-up skip for a state that exists but cannot be read; the owner ruled (S79) that such a state is decided from the database's x10 progress note and rebuilt, with the damaged copies kept aside",
+        ref="Engine 6 SW4 (#584, draft PR #633)",
+        kind="code",
+    ),
     # --- "switched over" is read off the state, not off a switch file (Engine 6 SW2) ----------------------------------------
     Removed(
         names=(

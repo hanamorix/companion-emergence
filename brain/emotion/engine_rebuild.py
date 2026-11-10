@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -306,7 +306,8 @@ def rebuild(
     any type, the replay's own and (recovery) the old state's.
 
     The order is fixed. (1) The check (`_check_rebuilt`). (2) The queue step: `empty_queue`, then the new state's `queue_line` is 0;
-    if the emptying fails, `queue_line` is the queue's end line, so no line is folded on top of the rebuild. (3) ONE
+    if the emptying fails, `queue_line` is the queue's end line, so no line is folded on top of the rebuild. (2b) When the state
+    exists but no copy of it can be read, the state file and each backup are renamed aside (`_move_unreadable_state_aside`). (3) ONE
     `save_state(..., verify=True)` with `saved_at` and `reset_at` both `now` and `switch_over_at` set as above; a False result
     is a failed check. That write is the last step of the switch-over. A failed check or write raises (`RebuildCheckError`, or
     the writer's own error) and the old state stays. Nothing is written before step 2, so a failed check leaves the queue intact.
@@ -402,8 +403,35 @@ def rebuild(
         state.queue_line = 0
     else:
         state.queue_line = engine_files.read_queue(persona_dir, from_line=0).end_line
+    _move_unreadable_state_aside(persona_dir, now)
     if not engine_files.save_state(persona_dir, state, verify=True):
         raise RebuildCheckError("the rebuilt state did not verify after it was written (the previous copy is put back when there is one)")
+
+
+def _move_unreadable_state_aside(persona_dir: Path, now: datetime) -> None:
+    """When the state exists but no copy of it can be read, rename the state file and each backup to `<name>.corrupt-<UTC stamp>`.
+
+    Planning B31 SW4 (owner S79): the damaged copies are kept for a repair, and the verified write that follows finds no
+    unreadable copy to rotate into `.bak1`. The caller holds the engine lock. "Unreadable" is the walk's own answer (every copy
+    that exists failed), asked fresh here. A name already taken gets `-1`, `-2`, ...: an older damaged copy is never overwritten.
+    A failed rename raises with the copies that were not yet moved still in place; a crash after the renames leaves the state
+    missing, which the next start reads as not switched and re-runs (its x10 steps skip as done). The private look-alikes
+    (`json_io._quarantine_copy`, `known_names._rename_aside`, `consolidation._quarantine`) are not shared helpers (#465).
+    """
+    if engine_files.read_state(persona_dir).problem != "unreadable":
+        return
+    stamp = now.astimezone(UTC).strftime("%Y-%m-%dT%H-%M-%S.%fZ")  # UTC, no colon (Windows), like the heal's quarantine names
+    for source in engine_files.state_copy_paths(persona_dir):
+        if file_ops.stat_path(source) is None:
+            continue
+        for attempt in range(100):
+            target = source.with_name(f"{source.name}.corrupt-{stamp}" + (f"-{attempt}" if attempt else ""))
+            if file_ops.stat_path(target) is None:
+                break
+        else:
+            raise OSError(f"no free name for the damaged copy {source}")
+        file_ops.replace_file(source, target)  # atomic-write: ok -- moves an unreadable state copy aside to a .corrupt name, a rename of a finished file, not a write
+        logger.warning("emotion engine: the unreadable state copy %s was kept aside as %s", source.name, target.name)
 
 
 def _stored_emotions(memory: Memory) -> Mapping[str, float]:

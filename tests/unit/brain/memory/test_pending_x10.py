@@ -687,11 +687,11 @@ def test_the_first_start_runs_the_queue_half_only_when_the_persona_is_known_not_
     other.mkdir()
     _enqueue(other, _memory("b", {"joy": 0.05}))
     make_live(other, NOW)
-    ruin_the_state(other)  # cannot tell whether it was switched over: nothing irreversible runs
-    assert nudge_scale_fix.scale_up_small_feelings(other) is None
-    assert _entries(other)["b"]["emotions"] == {"joy": 0.05}
+    ruin_the_state(other)  # cannot tell whether it was switched over: the database's progress note decides (SW4)
+    assert nudge_scale_fix.scale_up_small_feelings(other) == 0
+    assert _entries(other)["b"]["emotions"] == pytest.approx({"joy": 0.5})
     lose_the_state(tmp_path)  # no state at all: not switched
     nudge_scale_fix.scale_up_small_feelings(tmp_path)
     assert _entries(tmp_path)["a"]["emotions"] == pytest.approx({"joy": 0.5})
     assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
-    assert _progress(other) == 0  # the persona that could not be told, and the switched one, were never touched
+    assert _progress(other) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # the one that could not be told ran too

@@ -30,8 +30,9 @@ The switch-over and the live engine (Engine 6, #584):
 - `ensure_ready()` (the module function `ensure_engine_ready(persona_dir)` calls it): at a persona's first start it runs the
   one-time x10 fix of small feelings (`nudge_scale_fix`: database rows and queued `making` candidates), then rebuilds the state from the last 30 days under the engine lock
   (`engine_rebuild.rebuild`, whose one verified state write records `switch_over_at` as the switch-over's last step). A state
-  that exists but cannot be read skips all of it for this start with one warning (owner 2026-11-05: assume not switched); any
-  other failure raises `EngineStartupError`.
+  that exists but cannot be read is decided from the database's own record of the x10 fix (owner S79, Planning B31 SW4): the
+  same two steps run, and the first rebuild writes a fresh state while the damaged copies are kept aside; only when
+  `memories.db` cannot be read either is that start skipped with one warning. Any other failure raises `EngineStartupError`.
 - `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
   time when that is later; before the switch it returns the stored value. It raises `KeyError`, naming the memory id and the
   emotion, when the memory has no such emotion. It never returns 0.0: "absent" is for the caller to decide.
@@ -501,10 +502,11 @@ class EmotionEngine:
         Steps (spec 3.1 S4): (2) read the state, recovery first when it came from a backup copy, then (for the drain) read the
         queue by position; (3-5) fold the events in time order with `close_days` before each and once at `now`, prune the
         change-log files and the repeat list; (6) one `save_state`, with the queue position, when anything was read, folded or
-        closed, when a catch-up ran, when an empty state replaced one that could not be used (only for a persona this instance has
-        not seen switched over: a switched one is marked failed and left to the recovery job), or (the drain) when the stored
-        position is above 0 over a queue with no lines (a stale position, saved as 0); (7) the drain then empties
-        the queue file and saves position 0. A direct apply passes `events` (its own, with
+        closed, when a catch-up ran, or (the drain) when the stored position is above 0 over a queue with no lines (a stale
+        position, saved as 0); (7) the drain then empties the queue file and saves position 0. A state that exists but cannot be
+        read, or a backup whose catch-up failed, is never replaced here: a persona this instance has seen switched over is marked
+        failed and left to the recovery job, and any other persona's pass is skipped with its queue kept (`_skip_unreadable_pass`;
+        Planning B31 SW4), the first rebuild at the next start deciding from the database's x10 record. A direct apply passes `events` (its own, with
         `drain=False`) and writes no queue and reads none except the catch-up's one read. `now` is held to the loaded
         `saved_at` for the whole step, so a clock read before a wait for the lock cannot rewind the state, and `saved_at`
         never moves backwards (a clock set back does not drag it back, by design).
@@ -521,20 +523,21 @@ class EmotionEngine:
         skip_ids: frozenset[str] = frozenset()
         queue_read: engine_files.QueueRead | None = None
         caught_up = False
-        fallback_empty = False
         pre_day = state.active_day if state is not None else None  # the active day as it stood BEFORE this step's own closes
         if state is None:
             if self._switched(loaded):
                 self._mark_failed(f"the emotion state is {loaded.problem}", now)
                 return
-            # A persona this instance has not seen switched over starts from an empty state (E6.17). A state that does not exist
-            # yet is nothing to save by itself; one that exists but cannot be read is replaced, so the failing load is not
-            # repeated every call. That is accepted edge (a) of `engine_files.switch_over_state` when the persona WAS switched
-            # over (another process's work, or this process before it started): its `switch_over_at` is gone with the state, it
-            # reads as not switched, and the first rebuild runs again at the next start. Known edge (MINOR): a state reported
-            # unreadable is pushed into `.bak1` by the next save, so repeated passes can rotate out copies that were only
-            # transiently unreadable.
-            state, fallback_empty = EngineState(), loaded.problem != "missing"
+            # A persona this instance has not seen switched over starts from an empty state when there is no state file (E6.17);
+            # that is nothing to save by itself. A state that exists but cannot be read is NEVER replaced here (Planning B31
+            # SW4, owner S79): the pass is skipped and the queue and its position are kept, so nothing is lost and nothing is
+            # started empty. The first rebuild at the next start decides from the database's x10 record, writes a readable
+            # state and keeps the damaged copies aside (`engine_rebuild.rebuild`). A direct apply has no queue: its event is
+            # dropped, and the row it came from is folded by that rebuild.
+            if loaded.problem == "unreadable":
+                self._skip_unreadable_pass()
+                return
+            state = EngineState()
         else:
             if state.saved_at is not None:
                 now = max(now, state.saved_at)
@@ -568,13 +571,10 @@ class EmotionEngine:
                     if self._switched(loaded):
                         self._mark_failed(f"the catch-up of the backup state failed ({type(exc).__name__}: {exc})", now, exc=exc)
                         return
-                    # The same known edge as above: the empty state is saved over a backup that was only transiently unusable.
-                    logger.warning(
-                        "emotion engine: the catch-up failed on a persona not seen switched over; starting from an empty state (%s: %s)",
-                        type(exc).__name__,
-                        exc,
-                    )
-                    state, queue_read, fallback_empty, pre_day = EngineState(), None, True, None
+                    # The same rule as for an unreadable state (Planning B31 SW4): never start empty over a backup. The pass is
+                    # skipped, the queue and its position are kept, and the first rebuild at the next start rebuilds the state.
+                    self._skip_unreadable_pass(f"the catch-up of the backup state failed ({type(exc).__name__}: {exc})")
+                    return
         if drain:
             if queue_read is None:
                 queue_read = engine_files.read_queue(persona, from_line=state.queue_line)
@@ -600,7 +600,7 @@ class EmotionEngine:
         # A stored position over an empty queue is stale (the queue was emptied and the save of position 0 did not follow):
         # save it as 0 so the next reply's lines are not skipped (the maintainer's narrowing of S22, see `_empty_and_remember`).
         stale_position = drain and queue_read.end_line == 0 and state.queue_line > 0  # type: ignore[union-attr]
-        if not (lines_read or day_closed or caught_up or fallback_empty or stale_position or (not drain and applied)):
+        if not (lines_read or day_closed or caught_up or stale_position or (not drain and applied)):
             if drain and queue_read is not None and queue_read.end_line > 0:
                 self._empty_and_remember(state)  # a retry of an emptying that failed before
             elif drain:
@@ -618,6 +618,19 @@ class EmotionEngine:
                 self._empty_and_remember(state)
             else:
                 self._remember_queue_key()
+
+    def _skip_unreadable_pass(self, why: str | None = None) -> None:
+        """A pass of a persona not seen switched over, skipped because its state cannot be used: log (throttled), change nothing.
+
+        Nothing is written and the queue and its position are kept; `_last_queue_key` stays unset, so the next drain tries again.
+        """
+        count_throttled(
+            logger,
+            f"engine:skip_unreadable:{self.persona_dir}",
+            logging.WARNING,
+            "emotion engine: %s; this pass is skipped and the queue is kept until the first rebuild at the next start writes a readable state",
+            why or f"the emotion state {engine_files.state_path(self.persona_dir)} exists but cannot be read",
+        )
 
     def _empty_and_remember(self, state: EngineState) -> None:
         """Drain step 7: empty the queue file, and on success save position 0; remember the queue's key when all went clean.
@@ -898,21 +911,26 @@ class EmotionEngine:
         There is no switch file: "switched" is the state holding `switch_over_at` (`engine_files.switch_over_state`).
 
         1. The state is read (through `_switched`, cached when seen): it holds `switch_over_at`, return at once (no transaction,
-        no lock). A state that exists but cannot be read (owner 2026-11-05: assume not switched, and nothing irreversible runs on
-        an unknown): skip the whole switch-over for this start with one warning and return; no x10 fix, no lock, no rebuild, no
-        write, nothing cached, and the next start asks again. A missing state file means not switched: go on.
+        no lock). A missing state file means not switched: go on. A state that exists but cannot be read cannot say whether the
+        persona was switched; the decision comes from the database's own record of the x10 fix (Planning B31 SW4, owner S79):
+        it goes on exactly like a missing one, nothing is written for it yet, nothing is cached.
         2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock: the rows of `memories.db`, then the `making`
-        candidates still waiting in the pending queue.
+        candidates still waiting in the pending queue. Each step reads the progress number itself, so a finished step is skipped,
+        a checked queue copy is rolled forward or discarded, and an unstarted step runs. When the state is unreadable and
+        `memories.db` fails its integrity check too, this start is skipped with one warning and nothing is written.
         3. The engine lock, taken once, the state read again under it (a second process that waited runs nothing), then
-        `engine_rebuild.rebuild` in first mode with the lock held; its one verified state write records `switch_over_at` and is
-        the switch-over's last step. The clock is read once inside the hold.
+        `engine_rebuild.rebuild` in first mode with the lock held; its one verified state write records `switch_over_at` (now) and
+        is the switch-over's last step. First mode, not recovery mode: a recovery copies `switch_over_at` from a loaded state, and
+        an unreadable state has none to load. Inside `rebuild` the unreadable state file and each unreadable backup are renamed
+        aside to `<name>.corrupt-<UTC stamp>` before that write, so the damaged copies are kept for a repair.
+        The clock is read once inside the hold.
 
-        Accepted edges (Planning B25 SW2): see `engine_files.switch_over_state` (every copy of the state lost or unreadable, or
-        the live state corrupted while `.bak1` is still the pre-switch state: the persona reads as not switched and this runs
-        again at the next start, recording a later switch-over time; the x10 fix does not multiply anything on that re-run, because
-        its progress note in `memories.db` (`PRAGMA user_version`) says it is done).
+        Accepted edges (Planning B25 SW2, B31 SW4): see `engine_files.switch_over_state` (every copy of the state lost or
+        unreadable, or the live state corrupted while `.bak1` is still the pre-switch state: the persona reads as not switched
+        and this runs again at the next start, recording a later switch-over time; the x10 fix does not multiply anything on that
+        re-run, because its progress note in `memories.db` (`PRAGMA user_version`) says it is done).
 
-        Any other failure (the x10 error or its integrity check, a lock that did not come, a failed rebuild check or write) is
+        Any other failure (the x10 error or its integrity check on a state that is not unreadable, a lock that did not come, a failed rebuild check or write) is
         logged and raised as `EngineStartupError(what, cause)`; a failure stops start-up and the next start runs it again (every
         step is idempotent: the x10 fix's progress note in `memories.db`, the empty-state rebuild, the `switch_over_at` that only
         the one verified write records).
@@ -920,34 +938,30 @@ class EmotionEngine:
         loaded = self._state_cache.get()
         if self._switched(loaded):
             return
-        if loaded.problem == "unreadable":
-            self._skip_start_for_unreadable_state()
-            return
         try:
             nudge_scale_fix.scale_up_small_feelings(self.persona_dir)
         except BrainIntegrityError as exc:
+            if loaded.problem == "unreadable":
+                # Planning B31 SW4: with the state unreadable the database's own record is the only thing that can say what the
+                # switch-over did, and it cannot be read either: skip this start (nothing is written), retry at the next (S61).
+                # Accepted edge (P4): a persona that switched while `memories.db` was ABSENT (nowhere to record the x10) and
+                # later loses its whole state file is rebuilt as never switched, with a later `switch_over_at`.
+                logger.warning(
+                    "emotion engine: the emotion state %s cannot be read and memories.db fails its integrity check (%s), so what "
+                    "the switch-over already did cannot be told: this start skips the switch-over and writes nothing, and the "
+                    "next start tries again",
+                    engine_files.state_path(self.persona_dir),
+                    exc,
+                )
+                return
             self._start_failed("the memories.db integrity check", exc)
         except Exception as exc:  # noqa: BLE001 - every failure of the x10 fix stops start-up, named
             self._start_failed("the x10 fix of small feelings", exc)
         self._locked_rebuild("first", self._first_rebuild_needed)
 
-    def _skip_start_for_unreadable_state(self) -> None:
-        logger.warning(
-            "emotion engine: the emotion state %s exists but cannot be read, so whether this persona was switched over cannot be "
-            "told: this start skips the switch-over (nothing is changed or written, the persona stays not switched) and the next "
-            "start tries again",
-            engine_files.state_path(self.persona_dir),
-        )
-
     def _first_rebuild_needed(self) -> bool:
-        """Under the lock: False when the state now holds `switch_over_at` (another process switched over while this one waited), or exists but cannot be read (the same skip and warning as at the fast path)."""
-        loaded = engine_files.read_state(self.persona_dir)
-        if self._switched(loaded):
-            return False
-        if loaded.problem == "unreadable":
-            self._skip_start_for_unreadable_state()
-            return False
-        return True
+        """Under the lock: False when the state now holds `switch_over_at` (another process switched over while this one waited). A state that exists but cannot be read is not switched: the rebuild runs."""
+        return not self._switched(engine_files.read_state(self.persona_dir))
 
     @staticmethod
     def _start_failed(what: str, cause: BaseException) -> NoReturn:

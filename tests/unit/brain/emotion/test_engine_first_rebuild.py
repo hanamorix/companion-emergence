@@ -404,35 +404,24 @@ def test_a_failed_queue_copy_stops_start_up_and_the_next_start_completes_without
     assert entries["late-candidate"]["emotions"] == pytest.approx({"pride": 2.0})
 
 
-def test_a_state_that_exists_but_cannot_be_read_skips_the_switch_over_with_one_warning_and_writes_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_state_that_exists_but_cannot_be_read_gets_the_first_rebuild_decided_from_the_databases_x10_record(
+    tmp_path: Path,
 ) -> None:
-    """Owner 2026-11-05: "If the system can't tell if its switched, assume its not." Nothing irreversible runs on an unknown."""
+    """Planning B31 SW4 (owner S79, option c): no skip. The x10 steps read the database's progress number themselves, then the
+    first-mode rebuild writes a fresh state with `switch_over_at` = now. The result is the clean first start's state."""
     persona = _standard_persona(tmp_path)
     save(persona, simple_state(saved_at=T[39]))
     ruin_the_state(persona)  # the state file is there and no copy of it can be read
     instance = install(persona, NOW)
-    before = tree(persona)
-    spy = LockSpy(monkeypatch)
-    opened = _Spy(monkeypatch)
-    caplog.set_level(logging.WARNING)
-    ensure_engine_ready(persona)  # returns normally
-    warnings = [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]
-    assert len(warnings) == 1 and str(engine_files.state_path(persona)) in warnings[0] and "cannot be read" in warnings[0]
-    assert spy.calls == 0 and opened.opened == []  # no x10, no lock, no rebuild
-    assert instance.is_live() is False and instance.needs_recovery() is False
-    assert tree(persona) == before  # no state, no queue change, no progress note
-    # nothing about the unknown is cached: the next call in the same process, with the state gone or fixed, completes
-    lose_the_state(persona)
     ensure_engine_ready(persona)
+    assert state_of(persona).switch_over_at == NOW and instance.is_live()
     clean = _standard_persona(tmp_path / "clean")
     _ensure(clean)
     assert _first_state_bytes(persona) == _first_state_bytes(clean)
-    assert instance.is_live()
 
 
-def test_a_state_that_cannot_be_read_only_at_the_locked_recheck_runs_x10_but_no_rebuild_and_raises_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_state_that_cannot_be_read_only_at_the_locked_recheck_still_gets_the_first_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     persona = _standard_persona(tmp_path)
     install(persona, NOW)
@@ -445,16 +434,10 @@ def test_a_state_that_cannot_be_read_only_at_the_locked_recheck_runs_x10_but_no_
         return answers.pop(0) if answers else real(path)
 
     monkeypatch.setattr(engine_files, "read_state", scripted)
-    caplog.set_level(logging.WARNING)
     ensure_engine_ready(persona)
     assert answers == []
-    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # x10 ran to its end (this persona has no queue file: nothing to copy)
-    assert not engine_files.state_path(persona).exists()
-    assert len([r for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]) == 1
-    ensure_engine_ready(persona)  # the fault is gone
-    clean = _standard_persona(tmp_path / "clean")
-    _ensure(clean)
-    assert _first_state_bytes(persona) == _first_state_bytes(clean)
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert state_of(persona).switch_over_at == NOW  # an unreadable state at the re-check is not a skip
 
 
 def test_a_missing_state_means_not_switched_and_the_switch_over_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
