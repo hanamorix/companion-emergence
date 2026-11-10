@@ -169,13 +169,12 @@ def test_a_deleted_notes_folder_gets_a_consent_card_not_an_auto_commit(tmp_path,
 @_REGRESSION
 def test_shared_identity_helper_does_not_swallow_a_nul_path(tmp_path):
     # The ancestor walk moved into path_identity; main's read guard raised on a NUL path (fail closed)
-    # and must not start answering "not denied" for one.
+    # and must not start answering "not denied" for one. Since #695 it answers "denied" instead of raising.
     from brain.files.read_guard import is_read_denied
 
     persona = tmp_path / "persona"
     persona.mkdir()
-    with pytest.raises(ValueError):
-        is_read_denied(tmp_path / "a\x00b", persona_dir=persona)
+    assert is_read_denied(tmp_path / "a\x00b", persona_dir=persona) is True
 
 
 @pytest.mark.parametrize("seg", [".aws.", ".aws ", ".AWS. .", ".aws..."])
