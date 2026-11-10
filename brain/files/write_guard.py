@@ -58,6 +58,14 @@ def _fold(name: str) -> str:
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
 
 
+def _split_at_existing(p: Path) -> tuple[os.stat_result | None, tuple[str, ...]]:
+    """`p` as (identity of its nearest existing ancestor, the names below it that don't exist yet)."""
+    anchor, tail = p, ()
+    while stat_or_none(anchor) is None and anchor != anchor.parent:
+        anchor, tail = anchor.parent, (anchor.name, *tail)
+    return stat_or_none(anchor), tail
+
+
 def _is_within(child: Path, parent: Path) -> bool:
     """Deny-list test: True if child is parent or under it (#607).
 
@@ -73,10 +81,7 @@ def _is_within(child: Path, parent: Path) -> bool:
     c, p = _real(child), _real(parent)
     if c is None or p is None:
         return False
-    anchor, tail = p, ()
-    while stat_or_none(anchor) is None and anchor != anchor.parent:
-        anchor, tail = anchor.parent, (anchor.name, *tail)
-    st = stat_or_none(anchor)
+    st, tail = _split_at_existing(p)
     if st is None:
         return False
     for anc in (c, *c.parents):
@@ -100,17 +105,60 @@ def is_within_authorized(resolved: Path, folder: Path | None) -> bool:
     return c is not None and st is not None and under_any(c, [st])
 
 
-def _denied(resolved: Path, persona_dir: Path) -> bool:
+def _protected(persona_dir: Path) -> list[Path]:
     home = Path.home()
-    for rel in _HOME_DENY:
-        if _is_within(resolved, home / rel):
+    # her own substrate is in it too: never writable through this tool
+    return [*(home / rel for rel in _HOME_DENY), *(Path(ab) for ab in _ABS_DENY), persona_dir]
+
+
+def _denied(resolved: Path, persona_dir: Path) -> bool:
+    return any(_is_within(resolved, p) for p in _protected(persona_dir))
+
+
+_DIR_OPEN = (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0)
+_MAX_DEPTH = 4096
+
+
+def _fd_chain(dir_fd: int) -> list[os.stat_result]:
+    """The identities of an open directory and each of its ancestors, walked through
+    ``..`` from the descriptor, so no path is looked up again (#699)."""
+    chain, cur = [], os.dup(dir_fd)
+    try:
+        for _ in range(_MAX_DEPTH):
+            st = os.fstat(cur)
+            chain.append(st)
+            up = os.open("..", _DIR_OPEN, dir_fd=cur)
+            os.close(cur)
+            cur = up
+            if os.path.samestat(os.fstat(cur), st):  # ".." of the root is the root
+                return chain
+        raise OSError(f"directory chain deeper than {_MAX_DEPTH}")
+    finally:
+        os.close(cur)
+
+
+def dir_fd_denied(dir_fd: int, names: tuple[str, ...], persona_dir: Path) -> bool:
+    """POSIX. True if `names` below the open directory `dir_fd` is, or is inside, a
+    protected location, judged on the descriptor's real ancestry (#699).
+
+    Each protected location is split at its nearest existing ancestor as it is now,
+    after the chain is walked, so a folder swapped in between counts as existing.
+    One that exists must not be the directory or any ancestor of it; one that
+    doesn't yet must not be reached by creating `names` (folded) below its anchor.
+    """
+    chain = _fd_chain(dir_fd)
+    for p in _protected(persona_dir):
+        rp = _real(p)
+        st, tail = _split_at_existing(rp) if rp is not None else (None, ())
+        if st is None:
+            continue
+        if not tail:
+            if any(os.path.samestat(c, st) for c in chain):
+                return True
+        elif os.path.samestat(chain[0], st) and len(names) >= len(tail) and all(
+            _fold(a) == _fold(b) for a, b in zip(names, tail, strict=False)
+        ):
             return True
-    for ab in _ABS_DENY:
-        if _is_within(resolved, Path(ab)):
-            return True
-    # her own substrate — never writable through this tool
-    if _is_within(resolved, persona_dir):
-        return True
     return False
 
 
