@@ -242,12 +242,6 @@ def state_path(persona_dir: Path) -> Path:
     return paths.state_dir(persona_dir) / dev_constants.EMOTION_STATE_FILENAME
 
 
-def state_copy_paths(persona_dir: Path) -> list[Path]:
-    """The state file and its backups, newest first: the copies `read_state`'s walk looks at (they need not exist)."""
-    base = state_path(persona_dir)
-    return [base, *(base.with_name(f"{base.name}.bak{n}") for n in range(1, _BACKUPS + 1))]
-
-
 def queue_path(persona_dir: Path) -> Path:
     return paths.state_dir(persona_dir) / dev_constants.EMOTION_PENDING_FILENAME
 
@@ -1058,8 +1052,9 @@ def switch_over_state(loaded: LoadedState) -> bool | None:
     holds none, or there is no state file at all. None: the state exists but no copy can be read (`loaded.problem` is
     "unreadable"): that cannot say either way. Owner 2026-11-05: "If the system can't tell if its switched, assume its not."
     The engine reads None as not switched and never remembers it. The start-up does not skip on it (Planning B31 SW4, owner
-    S79): it decides from the database's x10 record (`nudge_scale_fix`), runs the first-mode rebuild, which keeps the damaged
-    copies aside as `<name>.corrupt-<stamp>`; the drain and the direct apply skip their pass and keep the queue until then.
+    S79): it decides from the database's x10 record (`nudge_scale_fix`) and runs the first-mode rebuild, whose state write
+    replaces the unreadable state like any other (owner S88; its normal backup rotation, nothing moved aside); the drain and the
+    direct apply skip their pass and keep the queue until then.
 
     Accepted edges (Planning B25 SW2, P4). (a) Every copy of the state file lost or unreadable, live and backups: the persona
     reads as not switched until the first rebuild runs again at the next start, and that run records a later switch-over time. The x10 fix's progress note in `memories.db` (`PRAGMA user_version`) stops it
