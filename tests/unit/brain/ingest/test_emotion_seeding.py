@@ -68,10 +68,9 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
     tmp_path,
 ):
     """Integration: close_session with a provider emitting emotions → committed
-    memories carry emotions → aggregate_state is non-empty."""
+    memories carry emotions, and the promoted rows keep them."""
     from unittest.mock import patch
 
-    from brain.emotion.aggregate import aggregate_state
     from brain.engines.consolidation import Decision, run_consolidation
     from brain.ingest.buffer import ingest_turn
     from brain.ingest.extract import ExtractionOutcome
@@ -131,10 +130,8 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
         "Expected at least one committed memory with non-empty emotions"
     )
 
-    # aggregate_state over committed memories returns a non-empty state.
-    active_mems = store.list_active()
-    state = aggregate_state(active_mems)
-    # loneliness is a baseline vocabulary name — it should appear in the aggregated state.
-    assert state.emotions.get("loneliness", 0.0) > 0.0, (
-        f"Expected loneliness > 0 in aggregate; got {state.emotions}"
+    # loneliness is a baseline vocabulary name: the promoted row still carries it.
+    promoted = store.list_active()
+    assert any(m.emotions.get("loneliness", 0.0) > 0.0 for m in promoted), (
+        f"Expected loneliness > 0 on a promoted row; got {[m.emotions for m in promoted]}"
     )

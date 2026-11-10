@@ -828,19 +828,15 @@ def _tunables_registry_restore() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _vocabulary_registry_restore() -> Iterator[None]:
-    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary) or trigger the
-    warn-once log of an unregistered emotion; neither may reach the next test, whatever worker runs it (#540). Restored IN
-    PLACE (clear + update), never rebound, like ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the
-    dict and set objects themselves."""
-    from brain.emotion import aggregate, vocabulary
+    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary); that may not reach
+    the next test, whatever worker runs it (#540). Restored IN PLACE (clear + update), never rebound, like
+    ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the dict object itself."""
+    from brain.emotion import vocabulary
 
     saved_registry = dict(vocabulary._REGISTRY)
-    saved_warned = set(aggregate._warned_unregistered)
     yield
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
-    aggregate._warned_unregistered.clear()
-    aggregate._warned_unregistered.update(saved_warned)
 
 
 @pytest.fixture(autouse=True)

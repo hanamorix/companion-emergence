@@ -2,7 +2,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from brain.emotion.aggregate import aggregate_state
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.memory.store import Memory
@@ -213,10 +212,9 @@ def test_select_seed_refractory_pushes_to_breadth():
 
 
 def test_congruence_matches_a_variant_spelled_candidate_against_the_aggregate_mood():
-    # The aggregate pools by canonical name, so its channel is `comfort_seeking`; a candidate
+    # A mood's channels are canonical names, so its channel is `comfort_seeking`; a candidate
     # stored under the hyphen spelling still has to score against that channel.
-    mood = aggregate_state([_mem("seed", emotions={"comfort_seeking": 7.0})])
-    assert mood.emotions == {"comfort_seeking": 7.0}
+    mood = EmotionalState(emotions={"comfort_seeking": 7.0})
 
     candidate = _mem("a", emotions={"comfort-seeking": 7.0})
 
