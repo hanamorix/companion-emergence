@@ -100,8 +100,8 @@ def test_propose_write_refuses_a_symlink_loop(env, requires_symlinks):
     assert "bad path" in out.get("error", ""), out
 
 
-@pytest.mark.parametrize("bad", ["\udc80", "\ud800"])
-def test_propose_write_refuses_a_path_with_a_lone_surrogate(env, bad):
+def test_propose_write_refuses_a_path_with_a_lone_surrogate(env):
+    bad = "\udc80"  # the OS takes it (surrogateescape); "\ud800" was already refused before #695
     # a JSON tool argument can carry one; it isn't valid text, and later steps encode the path as UTF-8
     out = propose_write(path=str(env["home"] / f"a{bad}.md"), content="hi", op="create", persona_dir=env["persona"])
     assert "bad path" in out.get("error", ""), out
@@ -115,6 +115,7 @@ def test_read_guard_answers_denied_for_a_path_that_is_not_a_path(env, bad):
     assert is_read_denied(env["home"] / bad, persona_dir=env["persona"]) is True
 
 
+@pytest.mark.no_base_failure(reason="pins one behaviour across Pythons: 3.12 already left a looping entry out (passes on the base there); 3.13 listed it as a file")
 def test_listing_a_folder_with_a_looping_symlink_still_works(env, requires_symlinks):
     # an entry nothing can open is left out, as Python 3.12 always did; 3.13 used to list it as a "file"
     from brain.tools.impls.list_directory import list_directory
