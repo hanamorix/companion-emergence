@@ -685,8 +685,8 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
 
         live_engine = engine.engine_for(persona_dir)
 
-        # Readers no longer test the switch. If the switch file cannot be inspected (a stat error), is_live() answers
-        # False and each reader shows the engine's current state, which can be partial; spec S6's assume-not-switched
+        # Readers no longer test the switch. If the emotion state file cannot be read, is_live() answers False
+        # and each reader shows the engine's current state, which can be partial; spec S6's assume-not-switched
         # fail-safe now governs the code outside these reader sites.
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and the body block shows baselines.
