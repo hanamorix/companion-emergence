@@ -7,6 +7,7 @@ at BOTH propose and commit (TOCTOU). Pure + exhaustively tested."""
 from __future__ import annotations
 
 import os
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,23 +41,38 @@ def _real(p: Path) -> Path | None:
         return None
 
 
+def _fold(name: str) -> str:
+    """Canonical caseless form: equal for any case or Unicode-normalisation variant."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
 def _is_within(child: Path, parent: Path) -> bool:
     """Deny-list test: True if child is parent or under it (#607).
 
-    By file identity when `parent` exists, so a case or Unicode-normalisation
-    variant on a case-insensitive volume still matches. Also by casefolded
-    spelling, because commit creates missing parents: ``~/.AWS/credentials`` with
-    no ``~/.aws`` yet has nothing to compare by identity but would create the
-    directory the AWS CLI then reads. On a case-sensitive volume that refuses a
-    differently-cased sibling too, which is the safe side for a deny list."""
+    `parent` may not exist yet (commit creates missing parents, so writing
+    ``~/.AWS/credentials`` with no ``~/.aws`` would create the directory the AWS
+    CLI then reads). So split `parent` at its nearest existing ancestor: that
+    anchor is matched against child's ancestors by file identity, which holds for
+    any case or Unicode-normalisation variant the volume accepts, and the missing
+    tail is matched by folded spelling. When `parent` exists the tail is empty and
+    this is a plain identity check. On a case-sensitive volume the folding also
+    refuses a differently-cased sibling of a missing directory, the safe side for
+    a deny list."""
     c, p = _real(child), _real(parent)
     if c is None or p is None:
         return False
-    st = stat_or_none(p)
-    if st is not None and under_any(c, [st]):
-        return True
-    cs, ps = os.path.normcase(str(c)).casefold(), os.path.normcase(str(p)).casefold()
-    return cs == ps or cs.startswith(ps.rstrip(os.sep) + os.sep)
+    anchor, tail = p, ()
+    while stat_or_none(anchor) is None and anchor != anchor.parent:
+        anchor, tail = anchor.parent, (anchor.name, *tail)
+    st = stat_or_none(anchor)
+    if st is None:
+        return False
+    for anc in (c, *c.parents):
+        s = stat_or_none(anc)
+        if s is not None and os.path.samestat(s, st):
+            rest = c.parts[len(anc.parts):len(anc.parts) + len(tail)]
+            return len(rest) == len(tail) and all(_fold(a) == _fold(b) for a, b in zip(rest, tail, strict=True))
+    return False
 
 
 def is_within_authorized(resolved: Path, folder: Path | None) -> bool:

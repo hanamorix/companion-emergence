@@ -13,6 +13,15 @@ import pytest
 
 from brain.files.write_guard import check_write_target, is_within_authorized
 
+# The base-code check runs on Linux (ext4: case- and normalisation-sensitive), where these skip.
+# On macOS APFS each one fails against main (#607); the macOS and Windows jobs run them on the head.
+_VOLUME = pytest.mark.no_base_failure(
+    reason="needs a case- or normalisation-insensitive volume, so it skips on the Linux base check; fails on main on macOS APFS (#607)"
+)
+_REGRESSION = pytest.mark.no_base_failure(
+    reason="regression guard: pins behaviour main already has (refusal in the real case, Documents allowed, no casefolding on a case-sensitive volume) against the #607 rewrite"
+)
+
 
 def _case_insensitive(d: Path) -> bool:
     probe = d / "CaseProbe607"
@@ -38,12 +47,14 @@ def ci(tmp_path):
         pytest.skip("needs a case-insensitive volume: the bypass only exists there")
 
 
+@_VOLUME
 @pytest.mark.parametrize("rel", [".SSH/authorized_keys", ".Ssh/x", ".ssh/../.SSH/config"])
 def test_case_variant_of_a_denied_home_dir_is_refused(home, ci, tmp_path, rel):
     r = check_write_target(str(home / rel), op="create", persona_dir=tmp_path / "persona")
     assert not r.ok and "denied" in r.error.lower()
 
 
+@_VOLUME
 def test_case_changed_persona_dir_is_refused(home, ci, tmp_path):
     persona = tmp_path / "persona"
     persona.mkdir()
@@ -51,6 +62,7 @@ def test_case_changed_persona_dir_is_refused(home, ci, tmp_path):
     assert not r.ok and "denied" in r.error.lower()
 
 
+@_VOLUME
 def test_persona_dir_passed_in_another_case_still_guards_the_real_one(home, ci, tmp_path):
     persona = tmp_path / "persona"
     persona.mkdir()
@@ -66,6 +78,7 @@ def test_case_variant_of_a_denied_dir_that_does_not_exist_yet_is_refused(home, t
     assert not r.ok and "denied" in r.error.lower()
 
 
+@_VOLUME
 def test_case_variant_of_a_denied_system_root_is_refused(home, tmp_path):
     if not Path("/Library").is_dir() or not Path("/library").exists():
         pytest.skip("needs macOS's /Library on a case-insensitive volume")
@@ -73,6 +86,7 @@ def test_case_variant_of_a_denied_system_root_is_refused(home, tmp_path):
     assert not r.ok and "denied" in r.error.lower()
 
 
+@_VOLUME
 def test_unicode_normalisation_variant_of_the_persona_dir_is_refused(home, tmp_path):
     nfc, nfd = unicodedata.normalize("NFC", "café"), unicodedata.normalize("NFD", "café")
     persona = tmp_path / nfc
@@ -83,6 +97,7 @@ def test_unicode_normalisation_variant_of_the_persona_dir_is_refused(home, tmp_p
     assert not r.ok and "denied" in r.error.lower()
 
 
+@_REGRESSION
 def test_real_case_is_still_refused_and_documents_still_allowed(home, tmp_path):
     persona = tmp_path / "persona"
     persona.mkdir()
@@ -92,12 +107,14 @@ def test_real_case_is_still_refused_and_documents_still_allowed(home, tmp_path):
     assert r.ok and r.resolved == (home / "Documents" / "note.md").resolve()
 
 
+@_VOLUME
 def test_authorized_folder_given_in_another_case_still_matches(ci, tmp_path):
     folder = tmp_path / "Notes"
     folder.mkdir()
     assert is_within_authorized((folder / "n.md").resolve(), tmp_path / "NOTES") is True
 
 
+@_REGRESSION
 def test_authorized_check_does_not_casefold_on_a_case_sensitive_volume(tmp_path):
     if _case_insensitive(tmp_path):
         pytest.skip("needs a case-sensitive volume, where Notes and notes are two folders")
@@ -108,3 +125,42 @@ def test_authorized_check_does_not_casefold_on_a_case_sensitive_volume(tmp_path)
 
 def test_authorized_folder_that_does_not_exist_authorizes_nothing(tmp_path):
     assert is_within_authorized(tmp_path / "gone" / "n.md", tmp_path / "gone") is False
+
+
+@_VOLUME
+def test_missing_denied_dir_under_a_normalisation_variant_of_home_is_refused(tmp_path, monkeypatch):
+    # Neither half alone covers this: ~/.aws doesn't exist (nothing to compare by identity) and the
+    # home is spelled in the other Unicode normalisation (the whole-path spelling differs too).
+    nfc, nfd = unicodedata.normalize("NFC", "café"), unicodedata.normalize("NFD", "café")
+    home = tmp_path / nfc / "home"
+    home.mkdir(parents=True)
+    if not (tmp_path / nfd).exists():
+        pytest.skip("needs a normalisation-insensitive volume (APFS)")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    for rel in (".aws/credentials", ".AWS/credentials"):
+        r = check_write_target(str(tmp_path / nfd / "home" / rel), op="create", persona_dir=tmp_path / "p")
+        assert not r.ok and "denied" in r.error.lower(), rel
+
+
+def test_a_deleted_notes_folder_gets_a_consent_card_not_an_auto_commit(tmp_path, monkeypatch):
+    # The allow-list matches by identity, so a notes folder the user deleted after enabling notes
+    # authorizes nothing: propose_write queues a card instead of silently recreating the folder.
+    import json
+    from datetime import UTC, datetime
+
+    from brain.files.pending import list_pending
+    from brain.tools.impls.propose_write import propose_write
+
+    h = tmp_path / "home"
+    (h / "Documents").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: h)
+    notes = h / "Documents" / "Canary Notes"  # enabled, then deleted: never created here
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    (persona / "persona_config.json").write_text(
+        json.dumps({"notes_enabled": True, "notes_folder": str(notes)}), encoding="utf-8"
+    )
+    out = propose_write(path=str(notes / "today.md"), content="a thought", op="create", persona_dir=persona)
+    assert out.get("status") != "written", out
+    assert not notes.exists()
+    assert len(list_pending(persona, now=datetime.now(UTC))) == 1
