@@ -74,10 +74,10 @@ def test_memory_create_new_importance_manual_override() -> None:
 
 
 def test_memory_defaults_active_and_unprotected() -> None:
-    """New memories are active and unprotected by default."""
+    """New memories are active by default; the removed `protected` flag is not an attribute any more."""
     m = Memory.create_new(content="x", memory_type="meta", domain="work")
     assert m.active is True
-    assert m.protected is False
+    assert not hasattr(m, "protected")
 
 
 def test_memory_to_dict_round_trips() -> None:
@@ -106,7 +106,7 @@ def test_memory_to_dict_round_trips() -> None:
 
 
 def test_memory_to_dict_round_trips_last_accessed_and_protected() -> None:
-    """Set last_accessed_at + protected=True and confirm they round-trip."""
+    """Set last_accessed_at and confirm it round-trips."""
     original = Memory.create_new(
         content="important memory",
         memory_type="conversation",
@@ -114,11 +114,10 @@ def test_memory_to_dict_round_trips_last_accessed_and_protected() -> None:
         emotions={"love": 9.0},
     )
     original.last_accessed_at = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
-    original.protected = True
 
     restored = Memory.from_dict(original.to_dict())
     assert restored.last_accessed_at == original.last_accessed_at
-    assert restored.protected is True
+    assert "protected" not in original.to_dict()
 
 
 @pytest.mark.parametrize("field", ["score", "importance"])
@@ -147,7 +146,6 @@ def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
         "created_at": "2024-01-01T12:00:00",  # no tz
         "last_accessed_at": "2024-01-02T08:00:00",  # no tz
         "active": True,
-        "protected": False,
     }
     m = Memory.from_dict(data)
     assert m.created_at.tzinfo is not None
@@ -212,7 +210,6 @@ def test_memory_from_dict_missing_metadata_defaults_empty() -> None:
         "created_at": datetime.now(UTC).isoformat(),
         "last_accessed_at": None,
         "active": True,
-        "protected": False,
         # no 'metadata' key
     }
     restored = Memory.from_dict(data)
@@ -247,7 +244,6 @@ def test_memory_from_dict_metadata_null_defaults_empty() -> None:
         "created_at": datetime.now(UTC).isoformat(),
         "last_accessed_at": None,
         "active": True,
-        "protected": False,
         "metadata": None,  # explicit null
     }
     restored = Memory.from_dict(data)
@@ -989,6 +985,38 @@ def test_store_update_rejects_unknown_field_still(store: MemoryStore) -> None:
     store.create(m)
     with pytest.raises(ValueError, match="Unknown update field"):
         store.update(m.id, nonsense_field="oops")
+
+
+def test_store_update_no_longer_accepts_protected(store: MemoryStore) -> None:
+    """`protected` left the accepted update fields with the Memory field; the column stays but nothing sets it."""
+    m = _mem("x")
+    store.create(m)
+    with pytest.raises(ValueError, match="Unknown update field"):
+        store.update(m.id, protected=True)
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that old data stays readable after the field is removed; the old code read it too, so it passes on base by design"
+)
+def test_memory_from_dict_ignores_an_old_protected_key() -> None:
+    """A queued candidate line (pending_candidates.jsonl) written before the field was removed still loads."""
+    data = {
+        "id": "legacy-protected",
+        "content": "legacy",
+        "memory_type": "meta",
+        "domain": "work",
+        "emotions": {},
+        "tags": [],
+        "importance": 0.0,
+        "score": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": None,
+        "active": True,
+        "protected": True,
+    }
+    restored = Memory.from_dict(data)
+    assert restored.content == "legacy"
+    assert restored.active is True
 
 
 def test_store_row_with_null_metadata_string_returns_empty_dict(store: MemoryStore) -> None:

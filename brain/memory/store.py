@@ -226,7 +226,6 @@ class Memory:
         last_accessed_at: tz-aware UTC datetime of most recent read, or None.
         active: F22 deactivation flag. Inactive memories are excluded from
             default queries but remain in the database (reversible).
-        protected: excluded from decay/consolidation.
         metadata: free-form dict for fields not modelled as first-class
             attributes — absorbs OG-only fields (source_date, supersedes,
             etc.) during migration without proliferating the dataclass.
@@ -244,7 +243,6 @@ class Memory:
     score: float = 0.0
     last_accessed_at: datetime | None = None
     active: bool = True
-    protected: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     state: str = "active"
     content_snapshot: str | None = None
@@ -311,7 +309,6 @@ class Memory:
             if self.last_accessed_at
             else None,
             "active": self.active,
-            "protected": self.protected,
             "metadata": dict(self.metadata),
         }
 
@@ -337,7 +334,6 @@ class Memory:
             score=float(data.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
-            protected=bool(data.get("protected", False)),
             metadata=dict(data.get("metadata") or {}),
         )
 
@@ -1188,9 +1184,9 @@ class MemoryStore:
             """
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
-                importance, score, created_at, last_accessed_at, active, protected,
+                importance, score, created_at, last_accessed_at, active,
                 metadata_json, peak_emotion_intensity
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
@@ -1204,7 +1200,6 @@ class MemoryStore:
                 memory.created_at.isoformat(),
                 memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
                 1 if memory.active else 0,
-                1 if memory.protected else 0,
                 metadata_json,
                 max(
                     [memory.peak_emotion_intensity]
@@ -2884,7 +2879,7 @@ class MemoryStore:
         """Update the given fields on an existing memory.
 
         Accepts: content, memory_type, domain, emotions (dict), tags (list),
-        importance, score, last_accessed_at, active, protected.
+        importance, score, last_accessed_at, active.
 
         `fold` is not a field. When true and `emotions` is among the fields, a row that had no emotions and gets some now
         is reported to the emotion engine (`on_emotions_assigned`), once the update, and the re-embed of a changed content,
@@ -2920,7 +2915,7 @@ class MemoryStore:
                     key,
                     value.isoformat() if value else None,
                 )
-            elif key in ("active", "protected"):
+            elif key == "active":
                 column_map[key] = (key, 1 if value else 0)
             elif key in (
                 "content",
@@ -3098,7 +3093,7 @@ class MemoryStore:
 
     _ENGINE_WINDOW_COLUMNS = (
         "id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
-        "last_accessed_at, active, protected, metadata_json, state, content_snapshot, recall_count, "
+        "last_accessed_at, active, metadata_json, state, content_snapshot, recall_count, "
         "peak_emotion_intensity"
     )
 
@@ -3917,7 +3912,6 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         score=float(row["score"]),
         last_accessed_at=last_accessed,
         active=bool(row["active"]),
-        protected=bool(row["protected"]),
         metadata=_safe_load_metadata(row["metadata_json"]),
         state=row["state"] if "state" in row_keys else "active",
         content_snapshot=row["content_snapshot"] if "content_snapshot" in row_keys else None,

@@ -650,8 +650,8 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("protected",),
-        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field, the column and the heartbeat check stay until phase C",
-        ref="#672 A2a cleanup",
+        why="no production code ever set the flag, so these paths stopped carrying it (#672); the Memory field, its insert and update went with the old decay pass (#586); only the database column stays",
+        ref="#672 A2a cleanup; #586 Engine 7",
         kind="code",
         scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
     ),
