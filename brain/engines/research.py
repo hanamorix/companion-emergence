@@ -210,9 +210,7 @@ class ResearchEngine:
             # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
             # pending or retrying, read() returns nothing and the research gate sees no high feeling.
             # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
-            emo_state = EmotionalState(
-                emotions={name: r.short for name, r in live_engine.read().items()}
-            )
+            emo_state = EmotionalState(emotions=engine.short_values(live_engine.read()))
 
         # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
         emotion_gate = any(live_engine.feels_high(name) for name in emo_state.emotions)

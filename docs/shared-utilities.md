@@ -182,6 +182,12 @@ Storage is UTC everywhere; local time is for display only.
 |---|---|---|
 | `format_emotion_summary` | brain/utils/emotion.py:8 | Top 5 emotions as `- name: X.X/10` lines for LLM prompt context. |
 
+### `brain/emotion/engine.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `short_values` | brain/emotion/engine.py:87 | The short average of each feeling in an engine `read()`, as a `{name: short}` dict: the map every reader of how she feels now works from. Use it, do not write the `{name: r.short ...}` comprehension again. |
+
 ### `brain/prompt_strings.py`
 
 | function | where (path:line) | what it is for |

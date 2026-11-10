@@ -690,7 +690,7 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         # fail-safe now governs the code outside these reader sites.
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and the body block shows baselines.
-        short = {name: r.short for name, r in live_engine.read().items()}
+        short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
         days = days_since_human(store, now=now, persona_dir=persona_dir)
         # Chat composer doesn't track session_hours yet — passes 0.0; words

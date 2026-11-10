@@ -340,7 +340,7 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
 
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and the panel shows no emotions.
-        scores = {name: r.short for name, r in engine.engine_for(persona_dir).read().items()}
+        scores = engine.short_values(engine.engine_for(persona_dir).read())
         if not scores:
             return {}
         # Sort desc, round to 1 decimal for UI display
@@ -385,7 +385,7 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
         try:
             # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
             # pending or retrying, read() returns nothing and the panel shows baselines.
-            short = {name: r.short for name, r in live_engine.read().items()}
+            short = engine.short_values(live_engine.read())
             days = days_since_human(store, now=now, persona_dir=persona_dir)
             # session_hours from the active conversation buffer's
             # earliest entry — 0 when no session is open.

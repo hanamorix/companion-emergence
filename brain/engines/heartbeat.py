@@ -1426,7 +1426,7 @@ class HeartbeatEngine:
             live_engine = emotion_engine.engine_for(persona_dir)
             # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
             # pending or retrying, read() returns nothing and the heartbeat entry is not written this tick.
-            short = {name: r.short for name, r in live_engine.read().items()}
+            short = emotion_engine.short_values(live_engine.read())
             if not short:
                 return
             dominant_emotion, intensity = self._peak_emotion(short)

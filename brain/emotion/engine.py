@@ -84,6 +84,15 @@ class Reading(NamedTuple):
     shift: int
 
 
+def short_values(readings: Mapping[str, Reading]) -> dict[str, float]:
+    """The short average of each present feeling, by name: the map every reader of "how she feels now" works from.
+
+    A new dict each call, in the readings' order. Callers write `engine.short_values(engine.engine_for(persona_dir).read())`
+    so a patch of `engine_for` still reaches them.
+    """
+    return {name: reading.short for name, reading in readings.items()}
+
+
 class EngineStatus(NamedTuple):
     caught_up: bool
     reset_at: datetime | None

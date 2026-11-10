@@ -31,7 +31,7 @@ def get_emotional_state(
     """
     # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
     # or retrying, read() returns nothing and this tool says no emotions are recorded.
-    scores: dict[str, float] = {name: r.short for name, r in engine.engine_for(persona_dir).read().items()}
+    scores: dict[str, float] = engine.short_values(engine.engine_for(persona_dir).read())
 
     if not scores:
         return {

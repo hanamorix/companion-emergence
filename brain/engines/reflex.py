@@ -330,7 +330,7 @@ class ReflexEngine:
         live_engine = engine.engine_for(self.log_path.parent)
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and no arc fires.
-        emotions = {name: r.short for name, r in live_engine.read().items()}
+        emotions = engine.short_values(live_engine.read())
         # log_path lives at the persona dir root, so its parent IS the
         # persona dir — same pattern used at line 450 below for prompt
         # composition. Passing it lets days_since_human see active

@@ -1967,7 +1967,7 @@ def _derive_intensity_drivers(
         try:
             # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
             # pending or retrying, read() returns nothing and body strain is computed from baseline energy.
-            short = {name: r.short for name, r in live_engine.read().items()}
+            short = engine.short_values(live_engine.read())
             _now = datetime.now(UTC)
             days = days_since_human(store, now=_now, persona_dir=persona_dir)
             words = count_words_in_session(
@@ -2457,7 +2457,7 @@ def _self_model_reflect(
     if _self_model_reset_seen(reads, prior_gap):
         _self_model_apply_reset(persona_dir, state, reads)
         return False
-    short_values = {name: r.short for name, r in reads.read.items()}
+    short_values = engine.short_values(reads.read)
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db")
         stack.callback(store.close)
@@ -3426,7 +3426,7 @@ def _run_initiate_review_tick(
         _now = datetime.now(UTC)
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and the gate sees baseline energy (not resting).
-        _short = {name: r.short for name, r in _live_engine.read().items()}
+        _short = engine.short_values(_live_engine.read())
         _days = days_since_human(_store, now=_now, persona_dir=persona_dir)
         _words = count_words_in_session(
             _store, persona_dir=persona_dir, session_hours=0.0, now=_now

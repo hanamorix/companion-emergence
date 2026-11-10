@@ -341,7 +341,7 @@ def _current_emotional_summary(persona_dir: Path) -> str:
 
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and the summary says neutral.
-        scores = {name: r.short for name, r in engine.engine_for(persona_dir).read().items()}
+        scores = engine.short_values(engine.engine_for(persona_dir).read())
     except Exception as exc:
         logger.warning("emotional state lookup failed: %s", exc)
         return "unknown"

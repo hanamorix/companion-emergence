@@ -44,7 +44,7 @@ def get_body_state(
     live_engine = engine.engine_for(persona_dir)
     # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
     # or retrying, read() returns nothing and the body emotions are absent.
-    short = {name: r.short for name, r in live_engine.read().items()}
+    short = engine.short_values(live_engine.read())
 
     days_since = days_since_human(store, now=now, persona_dir=persona_dir)
     words = count_words_in_session(
