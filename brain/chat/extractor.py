@@ -174,8 +174,8 @@ _SYSTEM_PROMPT = prompt_strings.register("chat.extractor.system_prompt")
 def _vocab_prompt_line() -> str:
     """Registered emotion names appended to the system prompt (soft assist).
 
-    Unregistered names are dropped at write time by `_filter_to_registered`;
-    this line just steers the LLM away from inventing channel names. Fail-soft:
+    The pass-2 emotion_delta is validated but no longer written anywhere; this
+    line just steers the LLM away from inventing channel names. Fail-soft:
     any registry error → empty string, the extraction call proceeds unassisted.
     """
     try:
