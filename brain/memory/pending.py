@@ -70,8 +70,9 @@ GATE_BYPASS_TYPES: frozenset[str] = frozenset({"journal_entry", "initiate_outbou
 SALIENCE_ELIGIBLE_TYPES: frozenset[str] = frozenset(
     {
         "monologue",
-        # monologue_emotion is in GATE_BYPASS_TYPES, so it skips the queue and this entry can only match a queue line
-        # written before the bypass, which cannot be ruled out. It goes when the gate goes (Phase 5).
+        # Nothing writes monologue_emotion any more (its writer and its GATE_BYPASS_TYPES entry are gone), so this entry
+        # can only match a queue line written before the bypass, which cannot be ruled out. It goes when the gate goes
+        # (Phase 5).
         "monologue_emotion",
         "monologue_soul_candidate",
     }

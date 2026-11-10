@@ -225,9 +225,10 @@ RERANK_MIN_REAL_CANDIDATES: int = 5
 # writes (monologue_emotion rows are no longer written, but existing ones stay
 # in the store and are classified here). In semantic recall they rank AFTER
 # genuine memories within each path and genuine candidates are taken first for
-# rerank slots (spec §4): a structural ordering, never a score multiplier. A fixed dev-level set of the
-# four types the spec names (monologue, monologue_trace, monologue_emotion,
-# monologue_soul_candidate); nothing reads or overrides it at run time. See
+# rerank slots (spec §4): a structural ordering, never a score multiplier. A
+# fixed dev-level set of the four types the spec names (monologue,
+# monologue_trace, monologue_emotion, monologue_soul_candidate); nothing reads
+# or overrides it at run time. See
 # `brain.memory.semantic_recall.is_monologue_family`.
 MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_trace", "monologue_emotion", "monologue_soul_candidate"}
