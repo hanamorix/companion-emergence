@@ -1418,30 +1418,18 @@ class HeartbeatEngine:
     ) -> None:
         """Write the heartbeat tick's own daemon_state entry.
 
-        dominant_emotion + intensity come from the aggregate emotional state
-        across all active conversation memories. Falls back to 'calm'/'3' when
-        no conversation memories exist. When the emotion engine is live they are
-        its highest short average, and an empty read writes nothing (the previous
-        heartbeat entry stays).
+        dominant_emotion + intensity are the emotion engine's highest short
+        average, and an empty read writes nothing (the previous heartbeat entry
+        stays).
         """
         try:
             live_engine = emotion_engine.engine_for(persona_dir)
-            if live_engine.is_live():
-                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-                # pending or retrying, read() returns nothing and the heartbeat entry is not written this tick.
-                short = {name: r.short for name, r in live_engine.read().items()}
-                if not short:
-                    return
-                dominant_emotion, intensity = self._peak_emotion(short)
-            else:
-                all_mems = self.store.list_active()
-                combined_emotions: dict[str, float] = {}
-                for m in all_mems:
-                    for name, val in m.emotions.items():
-                        combined_emotions[name] = combined_emotions.get(name, 0.0) + val
-                dominant_emotion, intensity = self._peak_emotion(
-                    combined_emotions, default=("calm", 3)
-                )
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the heartbeat entry is not written this tick.
+            short = {name: r.short for name, r in live_engine.read().items()}
+            if not short:
+                return
+            dominant_emotion, intensity = self._peak_emotion(short)
             theme = "heartbeat tick"
             summary = (
                 f"elapsed={elapsed_seconds / 3600:.1f}h, "
@@ -1486,38 +1474,21 @@ class HeartbeatEngine:
     def _compute_current_resonance(
         self, forced_resonance: float | None
     ) -> tuple[float, dict[str, float]]:
-        """Return (resonance, aggregate_emotion_vector) for the current tick.
+        """Return (resonance, emotion_vector) for the current tick.
 
-        Resonance is the peak intensity across all active memories' emotion
-        dicts — same scalar used elsewhere as "dominant emotion intensity".
-        When `forced_resonance` is given (test-only injection), the vector is
-        a single-key dict so the snapshot still carries structured data.
-
-        When the emotion engine is live the result is always (0.0, {}): the
-        detector has no engine input, so its emitter stays dormant (#569).
+        The result is always (0.0, {}) unless `forced_resonance` is given
+        (test-only injection; the vector is then a single-key dict so the
+        snapshot still carries structured data): the detector has no engine
+        input, so its emitter stays dormant (#569).
         """
         if forced_resonance is not None:
             return float(forced_resonance), {"forced": float(forced_resonance)}
 
-        live_engine = self.store.emotion_engine()
-        if live_engine is not None and live_engine.is_live():
-            # The spike detector's input has no engine counterpart. With a resonance of 0.0 the rolling-baseline
-            # window fills with zeros, so `_maybe_emit_emotion_spike` never reaches its `delta_sigma >= 0.5` bar and
-            # the emitter stays dormant until it is rebuilt (#569). The call, `_update_rolling_baseline`, the emitter
-            # and the `forced_resonance` plumbing stay in place.
-            return 0.0, {}
-
-        combined: dict[str, float] = {}
-        for mem in self.store.list_active():
-            for name, val in mem.emotions.items():
-                combined[name] = combined.get(name, 0.0) + float(val)
-        if not combined:
-            return 0.0, {}
-        # Peak intensity — clamped to [0, 10] to match the project's
-        # canonical 0..10 emotion scale (see _peak_emotion).
-        peak = max(combined.values())
-        peak = max(0.0, min(10.0, peak))
-        return peak, combined
+        # The spike detector's input has no engine counterpart. With a resonance of 0.0 the rolling-baseline
+        # window fills with zeros, so `_maybe_emit_emotion_spike` never reaches its `delta_sigma >= 0.5` bar and
+        # the emitter stays dormant until it is rebuilt (#569). The call, `_update_rolling_baseline`, the emitter
+        # and the `forced_resonance` plumbing stay in place.
+        return 0.0, {}
 
     def _update_rolling_baseline(self, current_resonance: float) -> tuple[float, float, float]:
         """Update the in-memory rolling-baseline window. Returns (mean, stdev, delta_sigma).

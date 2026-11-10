@@ -334,20 +334,14 @@ def _related_memory_snippets(
     return snippets
 
 
-def _current_emotional_summary(store: MemoryStore) -> str:
-    """One-line summary of current dominant emotion + intensity."""
+def _current_emotional_summary(persona_dir: Path) -> str:
+    """One-line summary of current dominant emotion + intensity (the emotion engine's short averages)."""
     try:
-        live_engine = store.emotion_engine()
-        if live_engine is not None and live_engine.is_live():
-            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-            # pending or retrying, read() returns nothing and the summary says neutral.
-            scores = {name: r.short for name, r in live_engine.read().items()}
-        else:
-            from brain.emotion.aggregate import aggregate_state
+        from brain.emotion import engine
 
-            recent = store.list_active(limit=50)
-            state = aggregate_state(recent)
-            scores = dict(state.emotions)
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the summary says neutral.
+        scores = {name: r.short for name, r in engine.engine_for(persona_dir).read().items()}
     except Exception as exc:
         logger.warning("emotional state lookup failed: %s", exc)
         return "unknown"
@@ -579,7 +573,7 @@ def _review_pending_candidates_locked(
         logger.info("soul review: no pending candidates")
         return report
 
-    emotional_summary = _current_emotional_summary(store)
+    emotional_summary = _current_emotional_summary(persona_dir)
     soul_size = soul_store.count()
 
     to_examine = pending_indices[:max_decisions]

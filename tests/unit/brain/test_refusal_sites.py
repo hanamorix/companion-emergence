@@ -833,9 +833,13 @@ def test_dream_refusal_writes_nothing(persona, kind):
 
 
 @pytest.mark.parametrize("kind", REFUSALS)
-def test_reflex_refusal_writes_nothing(persona, kind):
+def test_reflex_refusal_writes_nothing(persona, emotion_engine_stub, kind):
+    from brain.emotion.engine import Reading
     from brain.engines.reflex import ReflexEngine
 
+    # The engine reads love and calls it high, so the arc fires and reaches the provider.
+    emotion_engine_stub.readings = {"love": Reading(short=8.0, long=8.0, difference=0.0, shift=0)}
+    emotion_engine_stub.high = {"love"}
     arcs = persona / "reflex_arcs.json"
     arcs.write_text(json.dumps({"version": 1, "arcs": [{
         "name": "test_arc", "description": "d", "trigger": {"love": 5}, "days_since_human_min": 0,

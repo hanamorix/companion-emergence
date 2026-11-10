@@ -515,30 +515,16 @@ def test_parse_decision_unknown_love_type_on_accept_defers() -> None:
 # ── _current_emotional_summary regression ─────────────────────────────────────
 
 
-def test_current_emotional_summary_uses_emotions_attr_not_all_method() -> None:
-    """Regression: EmotionalState exposes ``emotions: dict[str, float]`` directly,
-    not a ``.all()`` method. The helper used to call ``state.all()`` which
-    raised AttributeError every invocation against a real store, swallowing
-    silently to return "unknown". This test ensures real emotion data flows
-    through the helper as a non-"unknown" summary string.
+def test_current_emotional_summary_uses_emotions_attr_not_all_method(tmp_path, emotion_engine_stub) -> None:
+    """Regression: the helper once raised AttributeError on every invocation, swallowed silently into "unknown".
+    This test ensures the engine's emotion data flows through the helper as a non-"unknown" summary string.
     """
-    from brain.memory.store import Memory
+    from brain.emotion.engine import Reading
     from brain.soul.review import _current_emotional_summary
 
-    store = MemoryStore(":memory:")
-    # "love" is a baseline emotion in brain.emotion.vocabulary — no persona
-    # loader needed for the regression check.
-    store.create(
-        Memory.create_new(
-            content="A genuinely meaningful moment.",
-            memory_type="experience",
-            domain="us",
-            emotions={"love": 9.0},
-            importance=8.0,
-        )
-    )
+    emotion_engine_stub.readings = {"love": Reading(short=9.0, long=0.0, difference=0.0, shift=0)}
 
-    summary = _current_emotional_summary(store)
+    summary = _current_emotional_summary(tmp_path)
     assert summary != "unknown", (
         "helper still raising AttributeError — likely regressed back to state.all()"
     )
@@ -1082,43 +1068,29 @@ def test_expired_not_forgetting_exempt(tmp_path: Path) -> None:
     assert rejected_mem_id not in under_review, "rejected memory_id must NOT be under-review"
 
 
-# ── B2 phase B: the review's emotional summary when the engine is live ────────
+# ── the review's emotional summary is the engine's short averages ─────────────
 
 
-def test_current_emotional_summary_live_is_the_top_three_short_averages(tmp_path, emotion_engine_stub) -> None:
+def test_current_emotional_summary_is_the_top_three_short_averages(tmp_path, emotion_engine_stub) -> None:
     from brain.emotion.engine import Reading
-    from brain.memory.store import Memory, MemoryStore
     from brain.soul.review import _current_emotional_summary
 
-    store = MemoryStore(tmp_path / "memories.db")
-    try:
-        store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"anger": 9.0}))
-        emotion_engine_stub.live = True
-        emotion_engine_stub.readings = {
-            "love": Reading(short=6.25, long=0.0, difference=0.0, shift=0),
-            "joy": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
-            "awe": Reading(short=3.0, long=0.0, difference=0.0, shift=0),
-            "calm": Reading(short=1.0, long=0.0, difference=0.0, shift=0),
-        }
-        assert _current_emotional_summary(store) == "love:6.2, awe:3.0, calm:1.0"
-        emotion_engine_stub.readings = {}
-        assert _current_emotional_summary(store) == "neutral"
-    finally:
-        store.close()
+    emotion_engine_stub.readings = {
+        "love": Reading(short=6.25, long=0.0, difference=0.0, shift=0),
+        "joy": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+        "awe": Reading(short=3.0, long=0.0, difference=0.0, shift=0),
+        "calm": Reading(short=1.0, long=0.0, difference=0.0, shift=0),
+    }
+    assert _current_emotional_summary(tmp_path) == "love:6.2, awe:3.0, calm:1.0"
+    emotion_engine_stub.readings = {}
+    assert _current_emotional_summary(tmp_path) == "neutral"
 
 
-def test_current_emotional_summary_live_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
-    from brain.memory.store import MemoryStore
+def test_current_emotional_summary_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
     from brain.soul.review import _current_emotional_summary
 
-    store = MemoryStore(tmp_path / "memories.db")
-    try:
-        emotion_engine_stub.live = True
+    def boom():
+        raise RuntimeError("engine fault")
 
-        def boom():
-            raise RuntimeError("engine fault")
-
-        emotion_engine_stub.read = boom
-        assert _current_emotional_summary(store) == "unknown"
-    finally:
-        store.close()
+    emotion_engine_stub.read = boom
+    assert _current_emotional_summary(tmp_path) == "unknown"

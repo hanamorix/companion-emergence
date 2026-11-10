@@ -142,9 +142,10 @@ def test_run_tick_days_since_human_triggers(tmp_path: Path):
         store.close()
 
 
-def test_run_tick_emotion_high_triggers(tmp_path: Path):
+def test_run_tick_emotion_high_triggers(tmp_path: Path, emotion_engine_stub):
     from brain.emotion.state import EmotionalState
 
+    emotion_engine_stub.high = {"curiosity"}  # the engine calls curiosity high: the gate holds no level of its own
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
     try:

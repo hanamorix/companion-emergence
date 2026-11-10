@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Literal
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion import engine
-from brain.emotion.aggregate import aggregate_state
 from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
 from brain.emotion.vocabulary import get as registered_emotion
 from brain.health.json_io import Recovery, read_json, read_json_result, write_json
@@ -72,7 +71,7 @@ class ReflexArc:
         trigger_raw = data["trigger"]
         if not isinstance(trigger_raw, dict) or not trigger_raw:
             raise ValueError(f"ReflexArc {data.get('name')!r}: trigger must be non-empty dict")
-        # Keys are canonical emotion names, the key space of aggregate_state's output. Two spellings of one
+        # Keys are canonical emotion names, the key space of the engine's read. Two spellings of one
         # emotion keep the higher threshold: every threshold must be met, so "above both" is "above the higher".
         # Only this in-memory arc is canonical; the file it was read from is not rewritten.
         trigger = pool_by_canonical_name({str(k): float(v) for k, v in trigger_raw.items()})
@@ -152,7 +151,7 @@ class ArcSkipped:
 
     arc_name: str
     # trigger_not_met | days_since_human_too_low | cooldown_active | single_fire_cap | no_arcs_defined
-    # | template_emotion_absent (engine live only: the prompt template names an emotion with no value)
+    # | template_emotion_absent (the prompt template names an emotion with no value)
     reason: str
 
 
@@ -329,13 +328,9 @@ class ReflexEngine:
 
         all_mems = self.store.list_active(limit=None)
         live_engine = engine.engine_for(self.log_path.parent)
-        live = live_engine.is_live()
-        if live:
-            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-            # pending or retrying, read() returns nothing and no arc fires.
-            emotions = {name: r.short for name, r in live_engine.read().items()}
-        else:
-            emotions = aggregate_state(all_mems).emotions
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and no arc fires.
+        emotions = {name: r.short for name, r in live_engine.read().items()}
         # log_path lives at the persona dir root, so its parent IS the
         # persona dir — same pattern used at line 450 below for prompt
         # composition. Passing it lets days_since_human see active
@@ -348,7 +343,7 @@ class ReflexEngine:
             days_since,
             log,
             now,
-            feels_high=live_engine.feels_high if live else None,
+            feels_high=live_engine.feels_high,
         )
 
         if not eligible:
@@ -387,7 +382,7 @@ class ReflexEngine:
                     evaluated_at=now,
                 )
 
-            fire = self._fire(winner, emotions, days_since, all_mems, now, live=live)
+            fire = self._fire(winner, emotions, days_since, all_mems, now)
             new_log = log.appended(fire)
             new_log.save(self.log_path)
 
@@ -407,9 +402,8 @@ class ReflexEngine:
         log: ReflexLog,
         now: datetime,
         *,
-        feels_high: Callable[[str], bool] | None = None,
+        feels_high: Callable[[str], bool],
     ) -> tuple[list[ReflexArc], list[ArcSkipped]]:
-        live = feels_high is not None
         eligible: list[ReflexArc] = []
         skipped: list[ArcSkipped] = []
 
@@ -417,16 +411,15 @@ class ReflexEngine:
             if not _trigger_met(arc, emotions, feels_high=feels_high):
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="trigger_not_met"))
                 continue
-            if live:
-                absent = _template_emotions_absent(arc, emotions)
-                if absent:
-                    logger.debug(
-                        "reflex arc %s does not fire: its template names emotions with no value: %s",
-                        arc.name,
-                        ", ".join(absent),
-                    )
-                    skipped.append(ArcSkipped(arc_name=arc.name, reason="template_emotion_absent"))
-                    continue
+            absent = _template_emotions_absent(arc, emotions)
+            if absent:
+                logger.debug(
+                    "reflex arc %s does not fire: its template names emotions with no value: %s",
+                    arc.name,
+                    ", ".join(absent),
+                )
+                skipped.append(ArcSkipped(arc_name=arc.name, reason="template_emotion_absent"))
+                continue
             if days_since_human < arc.days_since_human_min:
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="days_since_human_too_low"))
                 continue
@@ -449,12 +442,13 @@ class ReflexEngine:
     ) -> ReflexArc:
         """Highest aggregate threshold-excess wins; ties broken by longest-since-fire.
 
-        The same ordering on both paths: the sum of each trigger emotion's value minus the arc's own threshold. The
-        thresholds are used only to order eligible arcs; what makes an arc eligible on the live path is `engine.feels_high`.
+        The sum of each trigger emotion's value minus the arc's own threshold. The thresholds are used only to order
+        eligible arcs; what makes an arc eligible is `engine.feels_high`, and every trigger emotion of an eligible
+        arc is present in `emotions`.
         """
 
         def key(arc: ReflexArc) -> tuple[float, float]:
-            excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
+            excess = sum(emotions[e] - t for e, t in arc.trigger.items())
             last = log.last_fire_for_arc(arc.name)
             seconds_since = (now - last).total_seconds() if last is not None else float("inf")
             return (excess, seconds_since)
@@ -470,7 +464,6 @@ class ReflexEngine:
         now: datetime,
         *,
         dry_run: bool = False,
-        live: bool = False,
     ) -> ArcFire:
         """Render prompt → call LLM → write memory → return ArcFire."""
         context = _PromptContext(emotions)
@@ -482,10 +475,7 @@ class ReflexEngine:
         prompt = arc.prompt_template.format_map(context)
         raw = self.provider.generate(prompt, system=self.persona_system_prompt)
 
-        if live:
-            trigger_state = {e: emotions[e] for e in arc.trigger}
-        else:
-            trigger_state = {e: emotions.get(e, 0.0) for e in arc.trigger}
+        trigger_state = {e: emotions[e] for e in arc.trigger}
 
         # P3 retention rework, Change 1: reflex arc output is reflexive
         # self-behavior with moderate retention value, not the ~0.0 the
@@ -557,7 +547,7 @@ class _PromptContext(dict):
     """Format context for an arc's prompt template.
 
     A placeholder naming an emotion resolves by canonical name, so ``{comfort-seeking}`` reads the
-    ``comfort_seeking`` channel of the aggregate; any other missing placeholder renders "0".
+    ``comfort_seeking`` channel of the engine's read; any other missing placeholder renders "0".
     """
 
     def __init__(self, emotions: Mapping[str, float]) -> None:
@@ -574,28 +564,22 @@ def _trigger_met(
     arc: ReflexArc,
     emotions: Mapping[str, float],
     *,
-    feels_high: Callable[[str], bool] | None = None,
+    feels_high: Callable[[str], bool],
 ) -> bool:
-    """Whether every emotion the arc's trigger names is at its level.
-
-    Old path (`feels_high` None): each emotion at or above the arc's threshold for it. Live path: each emotion present in
-    `emotions` and high by `feels_high` (`engine.feels_high`); the arc's threshold numbers are not compared.
-    """
-    for name, threshold in arc.trigger.items():
-        if feels_high is not None:
-            # Accepted edge: a hand-edited arc with a threshold of 0 or below used to fire on a missing emotion because
-            # a missing value read as 0.0. On the live path a missing emotion fails the trigger, so such an arc waits
-            # until the emotion has a value and is high. The crystallizer refuses thresholds below 5.0, so only
-            # hand-edited arc files are affected.
-            if name not in emotions or not feels_high(name):
-                return False
-        elif emotions.get(name, 0.0) < threshold:
+    """Whether every emotion the arc's trigger names is present in `emotions` and high by `feels_high`
+    (`engine.feels_high`); the arc's threshold numbers are not compared."""
+    for name in arc.trigger:
+        # Accepted edge: a hand-edited arc with a threshold of 0 or below used to fire on a missing emotion because
+        # a missing value read as 0.0. A missing emotion fails the trigger, so such an arc waits
+        # until the emotion has a value and is high. The crystallizer refuses thresholds below 5.0, so only
+        # hand-edited arc files are affected.
+        if name not in emotions or not feels_high(name):
             return False
     return True
 
 
 def _template_emotions_absent(arc: ReflexArc, emotions: Mapping[str, float]) -> list[str]:
-    """The emotions the arc's prompt template names that have no value in `emotions` (engine live only).
+    """The emotions the arc's prompt template names that have no value in `emotions`.
 
     A placeholder names an emotion when its canonical name is in the vocabulary registry, the test `read()` applies.
     It has a value when the pooled emotions hold that canonical name, which is the lookup `_PromptContext` renders by,

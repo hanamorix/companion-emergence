@@ -674,8 +674,17 @@ def test_dream_gate_no_seed_reason_does_not_poison(live_engine: HeartbeatEngine)
     assert state_after.last_dream_at == dream_at_before
 
 
-def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path) -> None:
+def _engine_reads_high_love(stub) -> None:
+    """The emotion engine reads love at 8.0 and calls it high (what an arc triggered on love needs to fire)."""
+    from brain.emotion.engine import Reading
+
+    stub.readings = {"love": Reading(short=8.0, long=8.0, difference=0.0, shift=0)}
+    stub.high = {"love"}
+
+
+def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path, emotion_engine_stub) -> None:
     """Heartbeat fires reflex arc when enabled and trigger met."""
+    _engine_reads_high_love(emotion_engine_stub)
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
     from brain.memory.hebbian import HebbianMatrix
@@ -794,9 +803,10 @@ def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path) -> None:
 
 
 def test_heartbeat_isolates_reflex_llm_failure(
-    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
 ) -> None:
     """Reflex LLM failure is isolated from the tick — decay/state still run."""
+    _engine_reads_high_love(emotion_engine_stub)
     import logging
 
     from brain.bridge.provider import FakeProvider
@@ -962,8 +972,9 @@ def test_heartbeat_runs_research_when_enabled(tmp_path: Path) -> None:
         hm.close()
 
 
-def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path) -> None:
+def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path, emotion_engine_stub) -> None:
     """When both reflex and research eligible, reflex fires, research skipped."""
+    _engine_reads_high_love(emotion_engine_stub)
     import json
 
     from brain.bridge.provider import FakeProvider
@@ -1160,9 +1171,10 @@ def test_heartbeat_interest_bump_hook(tmp_path: Path) -> None:
 
 
 def test_heartbeat_isolates_research_failure(
-    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
 ) -> None:
     """Research LLM failure is isolated — tick completes."""
+    _engine_reads_high_love(emotion_engine_stub)
     import json
     import logging
 
@@ -2087,8 +2099,9 @@ def test_daemon_state_dream_entry_written_when_dream_fires(tmp_path: Path) -> No
         engine.hebbian.close()
 
 
-def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path) -> None:
+def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path, emotion_engine_stub) -> None:
     """When a reflex arc fires, daemon_state.json has last_reflex with trigger set."""
+    _engine_reads_high_love(emotion_engine_stub)
     from brain.engines.daemon_state import load_daemon_state
 
     arcs_path = tmp_path / "reflex_arcs.json"
