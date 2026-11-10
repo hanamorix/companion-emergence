@@ -41,7 +41,7 @@ Checks:
      MemoryStore, whose boot path self-heals/rebuilds FTS and would mask a
      genuinely broken file): count(memories_fts_docsize) == count(memories),
      and a MATCH query for a common term returns rows.
- 18. new_feelings_present (#654) (checks 18-20 run before the FTS and smoke-test checks, which stay last): rest_need, arousal, climax, touch_hunger and
+ 18. new_feelings_present (#654) (checks 18-21 run before the FTS and smoke-test checks, which stay last): rest_need, arousal, climax, touch_hunger and
      creative_hunger each have the planned distinct days and, in every 30-day
      window, the planned rows and value range (plan: augment_db.NEW_FEELINGS);
      each such row carries one emotion key, the conversation tag (three tags)
