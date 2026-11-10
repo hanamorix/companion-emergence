@@ -1325,7 +1325,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_low_energy(tmp_path: 
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", return_value=low_energy_body),
+        patch("brain.body.state.body_state_from_short", return_value=low_energy_body),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1362,7 +1362,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", return_value=active_energy_body),
+        patch("brain.body.state.body_state_from_short", return_value=active_energy_body),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1386,7 +1386,7 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", side_effect=RuntimeError("body read failed")),
+        patch("brain.body.state.body_state_from_short", side_effect=RuntimeError("body read failed")),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
