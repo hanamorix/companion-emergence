@@ -192,7 +192,8 @@ def test_main_prints_the_report_and_exits_zero(tmp_path, capsys):
     assert code == 0
     assert out.startswith("# Feels-high threshold measurement")
     assert "host: " in out
-    assert "| reader row | floor 0 | floor 0.5 |" in out  # one column per floor and no column for the old reader
+    assert "| reader row | floor 0 | floor 0.5 |" in out  # one column per floor ...
+    assert "| old" not in out  # ... and no column for the removed old reader
 
 
 @pytest.mark.no_base_failure(
