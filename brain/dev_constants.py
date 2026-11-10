@@ -479,10 +479,12 @@ SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
 FEELS_HIGH_RANGE_FRACTION: float = 0.5
 # A feeling whose short average is below this level (0 to 10 scale) is never high, whatever its range or its shift: a feeling
 # that sits near zero all month has a tiny range, and without a floor its top half would count as "high" (a vulnerability at
-# 0.02 started a self-check). Maintainer's decision, 2026-11-05. This is a DEFAULT, proposed from the reader measurement
-# (`scripts/measure_feels_high_thresholds.py`) and set by the owner on 2026-11-05; the follow-up that makes the floor
-# self-calibrating for a mature kindled is #661. Read at call time, inside `engine_utils.feels_high_from`.
-FEELS_HIGH_FLOOR: float = 0.1
+# 0.02 started a self-check). The maintainer set 1.0 on 2026-11-06 from `scripts/measure_feels_high_thresholds.py`, run on the
+# synthetic database and on a copy of one real persona: there, firings sit below 0.5 or at 1 and above, so any value from 0.5 to
+# 1 gives the same answer, and "high" under 1 in 10 would not be honest. 0.1 still let the research gate open on feelings from
+# 0.1 to 0.5, which the plateau rule does not count. The follow-up that makes the floor self-calibrating for a mature kindled
+# is #661. Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_FLOOR: float = 1.0
 # Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
 # `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
 # replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
