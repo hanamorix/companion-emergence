@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from brain.emotion import engine_files, engine_rebuild
+from brain.emotion.engine import ensure_engine_ready
 from brain.emotion.engine_utils import (
     Average,
     EmotionState,
@@ -354,10 +355,19 @@ def test_the_start_gate_at_the_first_rebuild_counts_from_the_oldest_memory_not_f
     days after the first start and 9.5 days after the second. Open, +1 for the old persona; gated, 0 for the other.
     """
     now = D(28) + timedelta(hours=3)
+    persona = _gate_case_persona(tmp_path, oldest_day)
+    _first_rebuild(persona, now)
+    _assert_gate_after_first_start(persona, now, oldest_day, expected)
+
+
+def _gate_case_persona(root: Path, oldest_day: int) -> Path:
+    """The persona of case (f): an oldest journal row on `oldest_day` and one conversation row on each of days 23 to 27."""
     rows = [row(D(oldest_day), memory_type="journal_entry", emotions={}, mid="oldest")]
     rows += [row(D(day), emotions={"joy": 5.0 + day % 3}, mid=f"recent-{day}") for day in range(23, 28)]
-    persona = make_persona(tmp_path / "persona", rows)
-    _first_rebuild(persona, now)
+    return make_persona(root / "persona", rows)
+
+
+def _assert_gate_after_first_start(persona: Path, now, oldest_day: int, expected: int) -> None:  # noqa: ANN001
     rebuilt = state_of(persona)
     assert rebuilt.persona_start_at == D(oldest_day)  # not D(23): the oldest memory, not the oldest entry in the window
     assert {entry.day for entry in rebuilt.emotions["joy"].snapshot} <= {_day(day) for day in range(23, 28)}
@@ -373,6 +383,176 @@ def test_the_start_gate_at_the_first_rebuild_counts_from_the_oldest_memory_not_f
     rebuilt.active_day = _day(28)
     save(persona, rebuilt)
     assert install(persona, now).read()["joy"].shift == expected
+
+
+@pytest.mark.parametrize(("oldest_day", "expected"), [(-62, 1), (18, 0)], ids=["oldest memory 90 days old", "oldest memory 10 days old"])
+def test_the_start_gate_after_a_real_first_start_counts_from_the_oldest_memory(tmp_path: Path, oldest_day: int, expected: int) -> None:
+    """(f) with the setup line the spec names: the persona is started through `ensure_engine_ready`, so the same case also
+    proves the start-up path runs the first rebuild on a persona that has a database and no state, and that this is what
+    leaves it switched over. The numbers are those of the case above."""
+    now = D(28) + timedelta(hours=3)
+    persona = _gate_case_persona(tmp_path, oldest_day)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    assert state_of(persona).switch_over_at == now
+    assert install(persona, now).is_live()
+    _assert_gate_after_first_start(persona, now, oldest_day, expected)
+
+
+# --- (g) the self-model after a reset ---------------------------------------------------------------------------------------
+#
+# The engine's rebuild or catch-up moves its `reset_at`; the self-model tick (`supervisor._run_self_model_tick`) sees that and
+# applies B2's spare rule; the engine itself never writes `self_model_state.json`. These cases use the real engine, started
+# through `ensure_engine_ready`, and the real tick (B2's `test_supervisor_self_model.py` covers the same entry rules with a
+# stub). The tick takes the engine path only for a persona that is switched over.
+
+
+def _self_model_persona(root: Path, rows: list) -> Path:
+    persona = make_persona(root / "persona", rows)
+    (persona / "active_conversations").mkdir()
+    (persona / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
+    return persona
+
+
+def _joy_rows() -> list:
+    return [row(D(day), emotions={"joy": 5.0 + day % 3}, mid=f"joy-{day}") for day in range(20, 28)]
+
+
+def _save_gap(persona: Path, *, status: str = "open", sustained_ticks: int = 5) -> bytes:
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    gap = Gap(
+        per_channel={"grief": 2.0},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        status=status,
+        sustained_ticks=sustained_ticks,
+        directions={"grief": 1},
+        reset_seen=None,
+    )
+    sm_state.save(persona, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+    return (persona / "self_model_state.json").read_bytes()
+
+
+def _tick(persona: Path):  # noqa: ANN202
+    from brain.bridge.provider import FakeProvider
+    from brain.bridge.supervisor import _run_self_model_tick
+
+    class _Bus:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def publish(self, event: dict) -> None:
+            self.events.append(event)
+
+    bus = _Bus()
+    return _run_self_model_tick(persona, provider=FakeProvider(), event_bus=bus), bus
+
+
+def _tick_on_the_engine_path(persona: Path):  # noqa: ANN202
+    """`_tick`, plus proof the engine branch decided it: the tick took the engine's three reads and they came back `None`."""
+    from unittest.mock import patch
+
+    from brain.bridge import supervisor
+
+    with patch.object(supervisor, "_self_model_engine_reads", wraps=supervisor._self_model_engine_reads) as reads:  # noqa: SLF001
+        result = _tick(persona)
+    assert reads.call_count == 1
+    return result
+
+
+def _cadence_is_unset(persona: Path) -> bool:
+    from brain.self_model import cadence
+
+    return cadence.load(persona).next_reflection_at is None
+
+
+def test_a_first_rebuild_resets_the_engine_and_the_tick_clears_the_open_gap_it_never_saw_the_reset_of(tmp_path: Path) -> None:
+    """(g), the reset case. A persona with eight joy rows and a saved open gap that recorded `reset_seen` None (made while the
+    engine had never reset). The first start rebuilds the engine, so its `reset_at` is the start's clock; the engine writes
+    nothing to `self_model_state.json` (the bytes are the ones saved). The next tick sees that `reset_at` differs from the gap's
+    and applies the spare rule: an open gap is cleared with no history entry, no resolution and no event. A second tick, with
+    the cadence made due again, is an ordinary one: the engine's `reset_at` is unchanged by it and the cadence saw no failure."""
+    from brain.self_model import cadence
+    from brain.self_model import state as sm_state
+
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, _joy_rows())
+    saved = _save_gap(persona)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    status = install(persona, now).status()
+    assert status.caught_up and status.reset_at == now
+    assert (persona / "self_model_state.json").read_bytes() == saved  # the engine never writes the self-model file
+    ran, bus = _tick(persona)
+    state, _ = sm_state.load_or_recover(persona)
+    assert ran is True
+    assert state.current_gap is None  # the spare rule: open and not answered, so cleared
+    assert state.gap_history == []  # cleared without a history entry
+    assert bus.events == []
+    cadence.save(persona, cadence.SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0))
+    ran_again, _bus = _tick(persona)
+    assert ran_again is True  # the tick ran (a skipped one returns False)
+    assert cadence.load(persona).next_reflection_at is not None  # and advanced the cadence
+    assert sm_state.load_or_recover(persona)[0].current_gap is None  # no new gap, nothing carried over
+    assert install(persona, now).status().reset_at == now
+    assert cadence.load(persona).consecutive_failures == 0
+
+
+def test_the_tick_keeps_a_gap_she_answered_through_a_reset_and_records_the_new_reset(tmp_path: Path) -> None:
+    """(g), the other half of the spare rule: an acknowledged gap with 3 or more sustained ticks is kept, with its `reset_seen`
+    brought up to the engine's `reset_at`; the engine did not touch the file."""
+    from brain.self_model import state as sm_state
+    from brain.utils.time import iso_utc
+
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, _joy_rows())
+    _save_gap(persona, status="acknowledged", sustained_ticks=4)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    ran, _bus = _tick(persona)
+    state, _ = sm_state.load_or_recover(persona)
+    assert ran is True
+    assert state.current_gap is not None
+    assert (state.current_gap.status, state.current_gap.sustained_ticks) == ("acknowledged", 4)
+    assert state.current_gap.reset_seen == iso_utc(now)
+
+
+def test_the_tick_does_nothing_when_the_live_engine_reads_nothing(tmp_path: Path) -> None:
+    """(g), the empty read: a switched-over persona with no memories has an engine that reads nothing. The tick returns False
+    and writes no self-model state, no audit file and no cadence."""
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, [])
+    install(persona, now)
+    ensure_engine_ready(persona)
+    assert install(persona, now).is_live()
+    ran, bus = _tick_on_the_engine_path(persona)
+    assert ran is False
+    assert not (persona / "self_model_state.json").exists()
+    assert not (persona / "self_model_audit.json").exists()
+    assert _cadence_is_unset(persona)
+    assert bus.events == []
+
+
+def test_the_tick_does_nothing_when_the_engine_is_not_caught_up(tmp_path: Path) -> None:
+    """(g), not caught up: the persona's only readable state is a backup copy (`status().caught_up` is False), so the tick
+    changes nothing: the saved gap's bytes, the cadence and the audit file are as they were."""
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, _joy_rows())
+    saved = _save_gap(persona)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    save_as_backup(persona, state_of(persona))
+    instance = install(persona, now)
+    assert instance.is_live()
+    assert not instance.status().caught_up
+    ran, bus = _tick_on_the_engine_path(persona)
+    assert ran is False
+    assert (persona / "self_model_state.json").read_bytes() == saved
+    assert not (persona / "self_model_audit.json").exists()
+    assert _cadence_is_unset(persona)
+    assert bus.events == []
 
 
 # --- (h) validity ------------------------------------------------------------------------------------------------------------
