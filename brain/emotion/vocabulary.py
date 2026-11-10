@@ -146,7 +146,7 @@ def canonical_name(name: str) -> str:
 def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
     """Key a name-to-value mapping by canonical name; spellings of one emotion keep the larger value.
 
-    The same max-per-emotion rule ``aggregate_state`` applies across memories. Names outside the
+    A max-per-emotion rule over spellings. Names outside the
     vocabulary are only normalised, so unrelated names stay separate keys. Returns a new dict.
     """
     pooled: dict[str, float] = {}

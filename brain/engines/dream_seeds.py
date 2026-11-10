@@ -27,7 +27,7 @@ W_REFRACTORY = 2.0
 def emotional_congruence(memory: Memory, mood: EmotionalState) -> float:
     """Sum over emotions shared by mood and memory of (mood_intensity * memory_value).
 
-    The mood's channels are canonical emotion names (``aggregate_state`` pools by canonical name),
+    The mood's channels are canonical emotion names (a mood is keyed by canonical name),
     so the memory's stored emotions are read by canonical name too; two spellings of one emotion in
     a memory count their larger value once.
     """

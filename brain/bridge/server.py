@@ -1411,7 +1411,7 @@ def build_app(
             logger.warning("FTS health check skipped: %s", _exc)
 
         # Load the persona emotion vocabulary before any chat request can arrive.
-        # Without this, aggregate_state silently drops all persona-extension
+        # Without this, every reader silently drops all persona-extension
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
         # fires for the first time). Uses a short-lived store — no persistent
         # handle held on app.state per HA hardening rule.

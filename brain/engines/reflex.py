@@ -72,7 +72,7 @@ class ReflexArc:
         trigger_raw = data["trigger"]
         if not isinstance(trigger_raw, dict) or not trigger_raw:
             raise ValueError(f"ReflexArc {data.get('name')!r}: trigger must be non-empty dict")
-        # Keys are canonical emotion names, the key space of aggregate_state's output. Two spellings of one
+        # Keys are canonical emotion names, the key space of a mood's channels. Two spellings of one
         # emotion keep the higher threshold: every threshold must be met, so "above both" is "above the higher".
         # Only this in-memory arc is canonical; the file it was read from is not rewritten.
         trigger = pool_by_canonical_name({str(k): float(v) for k, v in trigger_raw.items()})

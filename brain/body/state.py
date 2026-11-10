@@ -79,9 +79,8 @@ def compute_body_state(
 ) -> BodyState:
     """Pure projection — no I/O, no LLM call, no cache. Sub-millisecond.
 
-    `emotions` MUST be the post-aggregation, post-climax-reset state
-    (i.e. what aggregate_state() returns). compute_body_state does not
-    re-aggregate or re-reset.
+    `emotions` MUST be the already pooled, post-climax-reset state the old
+    emotion path hands it. compute_body_state does not re-pool or re-reset.
 
     This is the projection for the old emotion path: it fires on fixed levels (the only place that holds them).
     `body_state_from_short` is the one for the emotion engine.
