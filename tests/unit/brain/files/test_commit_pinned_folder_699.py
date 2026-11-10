@@ -146,3 +146,37 @@ def test_a_link_to_an_unprotected_folder_elsewhere_is_not_followed_either(env, m
     assert done["ok"] is False, done
     assert list(other.iterdir()) == []
     assert pending.get(env["persona"], rid)["status"] == "refused"
+
+
+@pytest.mark.parametrize("op", ["create", "append"])
+def test_a_folder_swapped_while_the_card_waits_does_not_redirect_the_write(env, op):
+    # the card names ~/Notes/x.md; the guard re-run resolved ~/Notes again and wrote wherever it now
+    # pointed, so a swap before approval sent the write to an unlisted place (~/.config/fish/config.fish)
+    other = env["home"] / "Other"
+    other.mkdir()
+    target = env["home"] / "Notes" / "x.md"
+    if op == "append":
+        target.write_text("mine\n", encoding="utf-8")
+        (other / "x.md").write_text("other\n", encoding="utf-8")
+    rid = propose_write(path=str(target), content="PLANTED", op=op, persona_dir=env["persona"])["id"]
+    _swap_folder_for_link(env["home"] / "Notes", other)()  # no hook: the card is still waiting
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    assert "PLANTED" not in "".join(p.read_text(encoding="utf-8") for p in other.iterdir())
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+
+
+def test_a_create_whose_folder_cannot_be_checked_after_the_open_is_refused_and_removed(env, monkeypatch):
+    from brain.files import commit as commit_mod
+
+    target = env["home"] / "Notes" / "x.md"
+    rid = propose_write(path=str(target), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+
+    def unreadable(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(commit_mod, "dir_fd_denied", unreadable)
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    assert not target.exists()
+    assert pending.get(env["persona"], rid)["status"] == "refused"

@@ -39,15 +39,17 @@ def _commit(env, rid):
         store.close()
 
 
-def test_a_handle_that_resolves_into_a_protected_folder_is_refused_and_the_file_removed(env, monkeypatch):
-    # Windows path, any OS: the open is redirected into ~/.ssh as a junction would, and the handle's
-    # real location (not the requested path) decides; the file it created there is removed again
+@pytest.mark.parametrize("into", [".ssh", "Other"])
+def test_a_handle_that_resolves_anywhere_but_the_approved_path_is_refused_and_the_file_removed(env, monkeypatch, into):
+    # Windows path, any OS: the open is redirected as a junction would (into a protected folder, or just
+    # somewhere else), and the handle's real location decides; the file it created there is removed again
     from brain.files import commit as commit_mod
 
-    target, landed = env["home"] / "Notes" / "rc", env["home"] / ".ssh" / "rc"
+    (env["home"] / into).mkdir(exist_ok=True)
+    target, landed = env["home"] / "Notes" / "rc", env["home"] / into / "rc"
     rid = propose_write(path=str(target), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
     real_open_final = commit_mod._open_final
-    monkeypatch.setattr(commit_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr("brain.files.write_guard._is_windows", lambda: True)
     monkeypatch.setattr(commit_mod, "_open_final", lambda name, op, dir_fd: real_open_final(str(landed), op, dir_fd))
     monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: str(landed))
     done = _commit(env, rid)

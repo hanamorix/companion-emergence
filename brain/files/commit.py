@@ -2,6 +2,7 @@
 Wires a file_write memory + feed event either way."""
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
@@ -9,13 +10,12 @@ import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.files import pending
+from brain.files import pending, write_guard
 from brain.files.audit import audit
 from brain.files.write_guard import (
     _DIR_OPEN,
     _MAX_RESULT_FILE_BYTES,
     _denied,
-    _is_windows,
     check_size,
     check_write_target,
     dir_fd_denied,
@@ -99,13 +99,15 @@ def _open_pinned(path: Path, op: str, persona_dir: Path) -> int:
             dfd = nfd
         fd = _open_final(path.name, op, dfd)
         try:
-            if dir_fd_denied(dfd, (path.name,), persona_dir):
-                if op == "create":
-                    os.unlink(path.name, dir_fd=dfd)
-                raise _TargetChangedError(f"refused: {path} moved into a protected location while it was opened")
-        except BaseException:
+            denied = dir_fd_denied(dfd, persona_dir)
+        except OSError:  # the folder became unreadable mid-commit: don't keep what can't be checked
+            denied = True
+        if denied:
             os.close(fd)
-            raise
+            if op == "create":
+                with contextlib.suppress(OSError):  # best effort; the refusal stands either way
+                    os.unlink(path.name, dir_fd=dfd)
+            raise _TargetChangedError(f"refused: {path} moved into a protected location while it was opened")
         return fd
     finally:
         os.close(dfd)
@@ -131,22 +133,22 @@ def _handle_path(fd: int) -> str | None:
 
 
 def _open_by_path(path: Path, op: str, persona_dir: Path) -> int:
-    """Windows (#699): no dir_fd or O_NOFOLLOW there, so open by path, then judge where
-    the opened handle really points (a junction swapped in is resolved by the handle)."""
+    """Windows (#699): no dir_fd or O_NOFOLLOW there, so open by path, then require the
+    opened handle's real location (a junction swapped in is resolved by the handle) to
+    be the approved path, and outside the protected locations. A create that fails it
+    is removed again. Missing folders are still made by path first (#703)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = _open_final(str(path), op, None)
     try:
         real = _handle_path(fd)
-        if real is None or _denied(Path(real), persona_dir):
-            os.close(fd)
-            fd = -1
-            if op == "create" and real is not None:
-                os.unlink(real)
-            raise _TargetChangedError(f"refused: {path} is in a protected location now")
-    except BaseException:
-        if fd != -1:
-            os.close(fd)
-        raise
+    except OSError:
+        real = None
+    if real is None or os.path.normcase(real) != os.path.normcase(str(path)) or _denied(Path(real), persona_dir):
+        os.close(fd)
+        if op == "create":
+            with contextlib.suppress(OSError):  # best effort; the refusal stands either way
+                os.unlink(real or str(path))
+        raise _TargetChangedError(f"refused: {path} leads to {real or 'an unreadable location'} now")
     return fd
 
 
@@ -162,7 +164,7 @@ def _open_target(path: Path, op: str, expect: os.stat_result | None, persona_dir
     regular file with exactly one link. Returns a text file (utf-8, newline
     translation as before) and whether an append needs a separating newline.
     """
-    fd = _open_by_path(path, op, persona_dir) if _is_windows() else _open_pinned(path, op, persona_dir)
+    fd = _open_by_path(path, op, persona_dir) if write_guard._is_windows() else _open_pinned(path, op, persona_dir)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
@@ -235,6 +237,10 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     op, content = rec["op"], rec["content"]
     # TOCTOU: re-run the guard on the resolved path RIGHT NOW.
     g = check_write_target(rec["resolved_path"], op=op, persona_dir=persona_dir)
+    if g.ok and g.resolved != Path(rec["resolved_path"]):
+        # the card's path resolves somewhere else now (a folder on it was swapped for a link while the card
+        # waited): write to the place the user approved or nowhere (#702)
+        g = type(g)(ok=False, error=f"refused: {rec['resolved_path']} now leads to {g.resolved}")
     # the file the guard judged (one link); the opened file must be that one. Not a second stat:
     # a link swapped in between would become the "expected" file (#694)
     expect = g.stat if op == "append" else None
