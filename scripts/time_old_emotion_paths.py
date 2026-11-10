@@ -200,8 +200,12 @@ def _time_trace(scratch: Path, store) -> list[str]:
     middle = statistics.median_low(len(m.content) for m in traces)
     text = next(m.content for m in traces if len(m.content) == middle)
     queue = scratch / "pending_candidates.jsonl"
+    # Since emotion rework B1 PR 6 the writer takes feed_digest and persona_dir; persona_dir=None is the switch-off path,
+    # the one timed here. Older commits take neither.
+    new_signature = "feed_digest" in inspect.signature(write_trace_memory).parameters
+    extra = {"feed_digest": text, "persona_dir": None} if new_signature else {}
     durations = _time_calls(
-        lambda: write_trace_memory(store, text),
+        lambda: write_trace_memory(store, text, **extra),
         1 + WARM_REPEATS,
         before_each=lambda: write_jsonl(queue, []),
     )
