@@ -183,12 +183,9 @@ def test_a_failed_first_read_stays_the_answer_so_a_bridge_keeps_its_own_record(
     assert state_file.read(tmp_path).shutdown_clean is True
 
 
-@pytest.mark.no_base_failure(
-    reason="the fix is in tests/conftest.py, which the check carries onto the old code too"
-)
 def test_a_test_that_fakes_the_platform_cannot_leave_later_tests_without_a_token():
-    """#662: this test fakes win32 and starts the app. As the first caller it cached the failed read, so every later test in
-    that worker saw no token. Runs in its own pytest so it really is the first caller, whatever ran in this one."""
+    """#662: this test fakes win32 and starts the app. When it faked the whole platform, as the first caller it cached a failed
+    read, so every later test in that worker saw no token. Runs in its own pytest so it really is the first caller."""
     root = Path(__file__).resolve().parents[3]
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     result = subprocess.run(

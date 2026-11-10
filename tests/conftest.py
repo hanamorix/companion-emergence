@@ -209,14 +209,6 @@ def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     assert_untouched(before, fingerprint(exposed))
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _own_token_read_on_the_real_platform():
-    """`own_token()` keeps its first answer for the life of the process, so read it before any test can fake the platform (#662)."""
-    from brain import process_identity
-
-    process_identity.own_token()
-
-
 @pytest.fixture(autouse=True)
 def _isolate_user_data_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """#488: no test may write into the real per-user data directory.
