@@ -2,8 +2,8 @@
 
 The app's left panels (Inner Weather, Body, Recent Interior, Soul,
 Connection) all consume real-time persona state. The data already
-exists across many subsystems — emotions in the memory store,
-body in compute_body_state, interior in daemon_state.json, soul in
+exists across many subsystems — emotions in the emotion engine,
+body projected from them by body_state_from_short, interior in daemon_state.json, soul in
 SoulStore, mode in BridgeState. This module composes them behind a
 single dict so the bridge can serve them at one endpoint.
 
@@ -54,11 +54,10 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     """Aggregate persona state for the NellFace panels.
 
     Returns a dict with keys:
-      - emotions: dict[str, float] — non-zero emotions sorted desc by intensity
-      - feels_high: list[str] | None — when the emotion engine is live, the names (from its read) that
-        `engine.feels_high` answers True for, sorted by name, computed here so the app holds no fixed level of its own;
-        None when the engine is not live (the app keeps its old levels) or cannot be asked
-      - body: dict | None — body state from compute_body_state
+      - emotions: dict[str, float] — the emotion engine's short averages, sorted desc by intensity
+      - feels_high: list[str] | None — the names (from the engine's read) that `engine.feels_high` answers True for,
+        sorted by name, computed here so the app holds no fixed level of its own; None when the engine cannot be asked
+      - body: dict | None — body state projected from the engine's short averages
       - interior: dict — last_dream / last_research / last_heartbeat themes
       - soul_highlight: dict | None — one crystallization (highest resonance,
         most recent on tie)
@@ -83,7 +82,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     return {
         "persona": persona_name,
         "emotions": _build_emotions(persona_dir),
-        # The feeling names the engine calls high (live path), for the app's expressions; None on the old path.
+        # The feeling names the engine calls high, for the app's expressions; None when the engine cannot be asked.
         "feels_high": _build_feels_high(persona_dir),
         "body": _build_body(persona_dir, now=now),
         "interior": _build_interior(persona_dir),
@@ -335,45 +334,13 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
 
 
 def _build_emotions(persona_dir: Path) -> dict[str, float]:
-    """Top non-zero emotions from recent emotion-carrying memories (when the emotion engine is live: its short
-    averages, present zeros included).
-
-    The previous query took the last 50 memories by ``created_at``
-    regardless of whether they actually carried an emotion vector.
-    On a steady-state brain the most recent 50 are almost all
-    heartbeats, observations, and facts — engine-internal records
-    with ``emotions_json = '{}'`` — so the aggregator returned 2-3
-    emotions even when 16+ were live in the underlying memory
-    store. Filtering to non-empty emotion rows fixes the surface
-    Inner Weather panel without aggregating over every active row
-    on each /state poll.
-    """
+    """The emotion engine's short averages, present zeros included, sorted by intensity, rounded for display."""
     try:
         from brain.emotion import engine
 
-        live_engine = engine.engine_for(persona_dir)
-        if live_engine.is_live():
-            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-            # pending or retrying, read() returns nothing and the panel shows no emotions.
-            scores = {name: r.short for name, r in live_engine.read().items()}
-        else:
-            from brain.emotion.aggregate import aggregate_state
-            from brain.memory.store import MemoryStore, _row_to_memory
-
-            store = MemoryStore(persona_dir / "memories.db")
-            try:
-                rows = store._conn.execute(  # noqa: SLF001
-                    "SELECT * FROM memories "
-                    "WHERE active = 1 "
-                    "AND emotions_json IS NOT NULL "
-                    "AND emotions_json != '{}' "
-                    "ORDER BY created_at DESC LIMIT 200"
-                ).fetchall()
-                memories = [_row_to_memory(row) for row in rows]
-                state = aggregate_state(memories)
-                scores = state.emotions
-            finally:
-                store.close()
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the panel shows no emotions.
+        scores = {name: r.short for name, r in engine.engine_for(persona_dir).read().items()}
         if not scores:
             return {}
         # Sort desc, round to 1 decimal for UI display
@@ -387,10 +354,10 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
 
 
 def _build_feels_high(persona_dir: Path) -> list[str] | None:
-    """The feeling names `engine.feels_high` answers True for, sorted, when the emotion engine is live (`[]` when none is
-    high or the read is empty); None when it is not live, and None (with a warning) when the engine cannot be asked.
+    """The feeling names `engine.feels_high` answers True for, sorted (`[]` when none is high or the read is empty);
+    None (with a warning) when the engine cannot be asked.
 
-    The app's expressions read this on the live path instead of comparing the panel's numbers to levels of their own. Each
+    The app's expressions read this instead of comparing the panel's numbers to levels of their own. Each
     name asks the engine's predicate, which reads the engine again (the accepted cost of the predicate's one-name signature,
     the same shape `_build_body` has).
     """
@@ -398,8 +365,6 @@ def _build_feels_high(persona_dir: Path) -> list[str] | None:
         from brain.emotion import engine
 
         live_engine = engine.engine_for(persona_dir)
-        if not live_engine.is_live():
-            return None
         return sorted(name for name in live_engine.read() if live_engine.feels_high(name))
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: feels_high aggregation failed", exc_info=True)
@@ -407,41 +372,20 @@ def _build_feels_high(persona_dir: Path) -> list[str] | None:
 
 
 def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
-    """Body block from compute_body_state (from the engine's short averages through body_state_from_short when the
-    emotion engine is live). None on failure."""
+    """Body block projected from the emotion engine's short averages (body_state_from_short). None on failure."""
     try:
-        from brain.body.state import body_state_from_short, compute_body_state
+        from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
         from brain.emotion import engine
-        from brain.memory.store import MemoryStore, _row_to_memory
+        from brain.memory.store import MemoryStore
         from brain.utils.memory import days_since_human
 
         live_engine = engine.engine_for(persona_dir)
-        is_live = live_engine.is_live()
         store = MemoryStore(persona_dir / "memories.db")
         try:
-            if is_live:
-                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-                # pending or retrying, read() returns nothing and the panel shows baselines.
-                short = {name: r.short for name, r in live_engine.read().items()}
-            else:
-                from brain.emotion.aggregate import aggregate_state
-
-                # Same fix as _build_emotions: filter to memories that
-                # actually carry an emotion vector. The naive last-50-by-date
-                # slice was almost all heartbeats / observations / facts
-                # (empty emotions_json), so body_emotions stayed at zero
-                # even when the underlying brain had strong signal.
-                rows = store._conn.execute(  # noqa: SLF001
-                    "SELECT * FROM memories "
-                    "WHERE active = 1 "
-                    "AND emotions_json IS NOT NULL "
-                    "AND emotions_json != '{}' "
-                    "ORDER BY created_at DESC LIMIT 200"
-                ).fetchall()
-                memories = [_row_to_memory(row) for row in rows]
-                state = aggregate_state(memories)
-                emotions = state.emotions
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the panel shows baselines.
+            short = {name: r.short for name, r in live_engine.read().items()}
             days = days_since_human(store, now=now, persona_dir=persona_dir)
             # session_hours from the active conversation buffer's
             # earliest entry — 0 when no session is open.
@@ -452,23 +396,14 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
                 session_hours=session_hours,
                 now=now,
             )
-            if is_live:
-                body = body_state_from_short(
-                    short,
-                    feels_high=live_engine.feels_high,
-                    session_hours=session_hours,
-                    words_written=words,
-                    days_since_contact=days,
-                    now=now,
-                )
-            else:
-                body = compute_body_state(
-                    emotions=emotions,
-                    session_hours=session_hours,
-                    words_written=words,
-                    days_since_contact=days,
-                    now=now,
-                )
+            body = body_state_from_short(
+                short,
+                feels_high=live_engine.feels_high,
+                session_hours=session_hours,
+                words_written=words,
+                days_since_contact=days,
+                now=now,
+            )
             return body.to_dict()
         finally:
             store.close()
