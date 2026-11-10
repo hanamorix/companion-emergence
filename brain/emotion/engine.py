@@ -541,6 +541,15 @@ class EmotionEngine:
             if loaded.source == "main":
                 self._catch_up_failed = False  # a readable main state ends a failure (a state repaired outside the engine)
             else:
+                if state.switch_over_at is None and self._switch_over_at is not None:
+                    # Edge (b) of `engine_files.switch_over_state`, narrowed (Planning B28 Q18): this process has SEEN the
+                    # persona switched over and the copy it fell back to predates the switch-over. Put the known value back
+                    # so the save below (through `save_state`) does not un-switch the persona for the next start.
+                    logger.warning(
+                        "emotion engine: the backup copy of the emotion state has no switch_over_at; the %s this process has seen is put back into it before it is saved",
+                        self._switch_over_at.isoformat(),
+                    )
+                    state.switch_over_at = self._switch_over_at
                 # Recovery first (sfa S40). Known risk (RD7): the walk skips a main file with an I/O fault that outlasts the
                 # shared read's own retries, and loads `.bak1`. That runs this recovery, which gives a close approximation of the
                 # state, not the state: a longer hold or a real disk error can replace a good main with a replayed one.

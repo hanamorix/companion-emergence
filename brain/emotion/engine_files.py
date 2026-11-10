@@ -349,6 +349,9 @@ def validate_state(data: object) -> None:
     if "saved_at" not in data:
         raise ValueError("saved_at is missing")
     _time(data["saved_at"], "saved_at")
+    # Accepted edge (Planning B28 SW3, P4, falls under the open owner question Q17): a malformed `switch_over_at` makes the
+    # WHOLE state unreadable here, exactly like a malformed `persona_start_at` (one validation rule for the state, P1), so
+    # the walk falls to a backup copy, and when no copy is readable the persona reads as unreadable (not switched, not cached).
     for key in ("reset_at", "last_update", "persona_start_at", "switch_over_at"):
         if data.get(key) is not None:
             _time(data[key], key)
@@ -1057,7 +1060,9 @@ def switch_over_state(loaded: LoadedState) -> bool | None:
     the first pass marked, but a small row of the three types written after the switch is unmarked and would be multiplied by
     10 on the re-run. (b) The live state is corrupted right after the first rebuild while `.bak1` is still the pre-switch
     state: the backup has no `switch_over_at`, so the persona reads as not switched until the first rebuild runs again (the
-    same as (a)).
+    same as (a)). Narrowed (Planning B28 Q18): a process that has already SEEN `switch_over_at` and loads a backup without it
+    puts the value it saw back before its drain saves (`EmotionEngine._run_apply`), so (b) still applies to a new process
+    that starts after the live state is corrupted.
     """
     if loaded.state is not None:
         return loaded.state.switch_over_at is not None

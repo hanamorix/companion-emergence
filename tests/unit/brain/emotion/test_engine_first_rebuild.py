@@ -1164,6 +1164,34 @@ def test_a_drain_that_recovers_from_a_backup_copy_keeps_the_switch_over_time_the
     assert loaded.source == "main" and loaded.state.switch_over_at == T[30]
 
 
+def test_a_drain_that_loads_a_backup_without_the_field_puts_back_the_value_this_process_has_seen(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Q18 (Planning B28 SW3): edge (b) must not un-switch a persona this process already saw switched over."""
+    persona = make_persona(tmp_path, [row(T[39], emotions={"joy": 5.0}, mid="a")])
+    make_live(persona, T[30])
+    instance = install(persona, NOW)
+    assert instance.is_live()  # the value is seen and cached
+    save_as_backup(persona, simple_state(saved_at=T[38]))  # the main file is ruined; the only readable copy has no field
+    caplog.set_level(logging.WARNING)
+    instance.note_active(NOW)
+    loaded = engine_files.read_state(persona)
+    assert loaded.source == "main" and loaded.state.switch_over_at == T[30]  # the known value, saved through save_state
+    warnings = [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "switch_over_at" in warnings[0]
+    assert install(persona, NOW).is_live()  # a new process reads the persona as switched over
+
+
+@pytest.mark.no_base_failure(reason="a retention pin: the old code already leaves a persona never seen switched over as loaded; this guards the Q18 restore from inventing a value")
+def test_a_drain_that_loads_a_backup_without_the_field_changes_nothing_for_a_persona_not_seen_switched(tmp_path: Path) -> None:
+    persona = make_persona(tmp_path, [row(T[39], emotions={"joy": 5.0}, mid="a")])
+    save_as_backup(persona, simple_state(saved_at=T[38]))
+    instance = install(persona, NOW)
+    assert not instance.is_live()
+    instance.note_active(NOW)
+    assert state_of(persona).switch_over_at is None  # nothing is invented for a persona never seen switched over
+
+
 def test_ensure_engine_ready_calls_ensure_ready_through_engine_for(tmp_path: Path, emotion_engine_stub) -> None:
     assert engine.engine_for(tmp_path) is emotion_engine_stub
     ensure_engine_ready(tmp_path)
