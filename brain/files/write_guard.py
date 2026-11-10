@@ -124,10 +124,12 @@ def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardRes
     if _is_windows() and any(":" in part for part in resolved.parts[1:]):
         # an NTFS stream (``.aws::$INDEX_ALLOCATION`` creates the directory) slips past both comparisons
         return GuardResult(ok=False, error=f"bad path: {resolved} names an NTFS stream")
-    if _denied(resolved, persona_dir):
-        return GuardResult(ok=False, error=f"denied: {resolved} is in a protected location")
+    # before the deny-list scan, which stats every ancestor per protected location: a 2600-part path
+    # took 3 s of CPU there. Either way it's refused.
     if (why := unusable(resolved)) is not None:
         return GuardResult(ok=False, error=f"bad path: {why}")
+    if _denied(resolved, persona_dir):
+        return GuardResult(ok=False, error=f"denied: {resolved} is in a protected location")
     if op == "create":
         if resolved.exists():
             return GuardResult(ok=False, error=f"path already exists (create won't overwrite): {resolved}")
