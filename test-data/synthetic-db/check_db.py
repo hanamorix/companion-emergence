@@ -53,6 +53,10 @@ Checks:
      conversation-tagged, on 4+ days, the largest 4.0+) and every other value in
      0.10-1.00; the spelling-variant keys keep their base counts and maxima.
  20. manifest_matches_database: manifest.json counts equal the database's.
+ 21. added_rows_peak_is_max_emotion: on the rows augment_db.py added (found by
+     the synthetic-aug-v1 marker), peak_emotion_intensity equals the largest of
+     the row's emotion values, the brain's own definition. Other rows' peaks were
+     sampled independently of their emotions by build_db.py and are not checked.
 """
 
 from __future__ import annotations
@@ -73,6 +77,7 @@ from augment_db import (
     NEAR_ZERO,
     NEAR_ZERO_RANGE,
     NEW_FEELINGS,
+    PROVIDER,
     SPIKY,
     SPIKY_LOW_RANGE,
     VARIANT_COUNTS,
@@ -974,6 +979,31 @@ def check_manifest_matches_database(conn: sqlite3.Connection, db_path: str) -> C
     )
 
 
+def check_added_rows_peak_is_max_emotion(conn: sqlite3.Connection) -> CheckResult:
+    """An added row's peak is the largest of its emotion values (brain/memory/store.py, Memory.create_new)."""
+    added = 0
+    bad = []
+    for row_id, emotions_json, metadata_json, peak in conn.execute(
+        "SELECT id, emotions_json, metadata_json, peak_emotion_intensity FROM memories "
+        "WHERE metadata_json LIKE ?",
+        ("%" + PROVIDER + "%",),
+    ):
+        if json.loads(metadata_json).get("provider") != PROVIDER:
+            continue
+        added += 1
+        expected = max((float(v) for v in json.loads(emotions_json).values()), default=0.0)
+        if abs(peak - expected) > VALUE_EPS:
+            bad.append("%s peak %r, max emotion %r" % (row_id, peak, expected))
+    if not added:
+        return CheckResult("added_rows_peak_is_max_emotion", False, "no added rows found (marker %s)" % PROVIDER)
+    detail = (
+        "%d of %d added rows differ, e.g. %s" % (len(bad), added, bad[0])
+        if bad
+        else "%d added rows, peak equals the largest emotion value" % added
+    )
+    return CheckResult("added_rows_peak_is_max_emotion", not bad, detail)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1003,6 +1033,7 @@ def run_all_checks(db_path: str):
             check_new_feelings_present(conn, db_path),
             check_emotion_profiles_hold(conn),
             check_manifest_matches_database(conn, db_path),
+            check_added_rows_peak_is_max_emotion(conn),
         ]
     finally:
         conn.close()

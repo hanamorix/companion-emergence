@@ -19,7 +19,10 @@ Two edits, both deterministic for a given seed (stdlib only, no network, nothing
    conversation-derived memory, because the emotion engine counts only such rows (and a few
    other kinds); rows without the conversation tag would be invisible to it. Each feeling is
    spread over the 109-day window so its stored value has a real range in every 30-day window
-   (NEW_FEELINGS holds the plan; check_db.py checks it).
+   (NEW_FEELINGS holds the plan; check_db.py checks it). An added row's
+   peak_emotion_intensity is its one emotion value, the brain's own definition (the largest
+   emotion value); importance, score and recall_count are copied from a donor row of the same
+   memory type.
 2. #664: the stored values of seven existing feelings are rescaled (row text and every other
    column untouched). NEAR_ZERO feelings are mapped monotonically into 0.02 to 0.30; SPIKY
    feelings keep their strongest conversation-tagged rows (about 6 percent of their rows) and
@@ -392,7 +395,7 @@ def new_rows(
                     "active",
                     None,
                     donor[2],
-                    donor[3],
+                    value,  # the brain's definition of peak: the largest emotion value
                 )
             )
     return out
@@ -573,7 +576,7 @@ def augment(args: argparse.Namespace) -> dict:
                     )
                 donors = {
                     t: conn.execute(
-                        "SELECT importance, score, recall_count, peak_emotion_intensity "
+                        "SELECT importance, score, recall_count "
                         "FROM memories WHERE memory_type = ? AND state = 'active' ORDER BY id",
                         (t,),
                     ).fetchall()
