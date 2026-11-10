@@ -470,7 +470,7 @@ def test_c7_cursor_guard_and_idempotence(tmp_path: Path) -> None:
 def test_c13_interior_not_starved(tmp_path: Path) -> None:
     marker = "MARKERC13 a persisting interior thought"
     store = MemoryStore(tmp_path / "memories.db")
-    write_trace_memory(store, marker)
+    write_trace_memory(store, marker, feed_digest="a digest", persona_dir=None)
     store.close()
 
     sid = "sess_c13"

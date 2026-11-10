@@ -81,7 +81,7 @@ def test_build_system_message_includes_interior_continuity(
 ) -> None:
     from brain.monologue.trace import write_trace_memory
 
-    write_trace_memory(store, "i was turning over what she said about leaving")
+    write_trace_memory(store, "i was turning over what she said about leaving", feed_digest="a digest", persona_dir=None)
     msg = build_system_message(
         persona_dir,
         voice_md="",
