@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _TESTS = Path(__file__).resolve().parents[1]
 _SELF = Path(__file__).resolve()
 
@@ -40,6 +42,7 @@ def _offenders() -> list[str]:
     return found
 
 
+@pytest.mark.no_base_failure(reason="test-suite machinery (#710): it checks the test files, which the base-code swap keeps at the head; on main's own test files it finds 41 global patches")
 def test_no_test_patches_the_global_sys_platform():
     offenders = _offenders()
     assert not offenders, (
@@ -48,6 +51,7 @@ def test_no_test_patches_the_global_sys_platform():
     )
 
 
+@pytest.mark.no_base_failure(reason="test-suite machinery (#710): checks the guard's own pattern, which no product code affects")
 def test_the_pattern_catches_each_form():
     for line in (
         'monkeypatch.setattr(sys, "platform", "win32")',
