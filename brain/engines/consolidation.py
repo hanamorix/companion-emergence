@@ -37,6 +37,8 @@ import numpy as np
 
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.emotion import engine
+from brain.emotion.engine_utils import resolve_emotions
 from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
@@ -76,6 +78,8 @@ _REAPPRAISER_USER_TEMPLATE = prompt_strings.register(
 )
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
+# Never rotate or truncate the archive: the forgetting exemption (brain/soul/candidates.py::merge_target_map) reads it
+# to protect merge targets (#430). Canary: test_supervisor.py::test_consolidation_archive_is_never_rotated.
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
 _QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
 
@@ -856,6 +860,10 @@ def _handle_reappraisals(
     ``names``; the write itself never removes a name the kindled added, and puts
     each removed name on the rejects list (S135).
 
+    Once the emotion engine is live, a re-appraised row also has its emotions rewritten at their faded values and its
+    ``created_at`` set to now (`_write_back_faded_emotions`): remembering a memory restarts its fading. The date it had before
+    the reset goes to the start of its text first, unless it is already there.
+
     Each item runs in its own try (#459): a failure is settled by `_settle_failed_item`, and True is returned when the pass
     must end (an environment failure or a deferred call); the unsettled items stay in the processing file.
     """
@@ -891,6 +899,7 @@ def _handle_reappraisals(
                 claim.settle(entry)
                 continue
             result.reappraised += 1
+            _write_back_faded_emotions(store, persona_dir, memory)
             _remove_not_names(persona_dir, memory, names, not_names)
             _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
             claim.settle(entry)
@@ -898,6 +907,34 @@ def _handle_reappraisals(
             if _settle_failed_item(store, pending, persona_dir, claim, entry, None, "reappraise", exc, result):
                 return True
     return False
+
+
+def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Memory) -> None:
+    """The temp-gate write-back, once the engine is live: the row's emotions become their faded values and its ``created_at``
+    becomes now, in one store write (`refresh_faded_emotions`, no hook), which also puts the date the row had before the reset at
+    the start of its text when it is not there yet. Every memory type and state, a row without emotions included (its
+    ``created_at`` is still reset). Runs after the importance update committed.
+
+    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
+    have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
+    BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
+    neither requeued nor settled as failed, so the outer per-item handler never sees it.
+    """
+    try:
+        live_engine = engine.engine_for(persona_dir)
+        if not live_engine.is_live():
+            return
+        fresh = store.get(memory.id, bump=False)  # a maintenance read, not an access
+        if fresh is None:
+            return  # hard-deleted since the importance update: nothing to write
+        row = replace(fresh, importance=memory.importance)
+        faded = {name: live_engine.faded_value(row, name) for name in row.emotions}
+        store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
+    except Exception:  # noqa: BLE001
+        # A lost write-back costs one refresh; the importance update has already committed.
+        logger.error(
+            "consolidation gate: temp-gate write-back failed for memory %s; row left as it was", memory.id, exc_info=True
+        )
 
 
 def _remove_not_names(persona_dir: Path, memory: Memory, names: object, not_names: object) -> None:
@@ -953,7 +990,8 @@ def _dispatch(
     _admit_extracted_names(persona_dir, decision.names, list_source="gate", label="gate judge")
 
     if verdict == "merge":
-        target = store.get(decision.target_id) if decision.target_id else None
+        # A merge verdict's read of its target is a maintenance read, not an access: bump=False, like every other internal read here.
+        target = store.get(decision.target_id, bump=False) if decision.target_id else None
         if target is None or target.state == "fading":
             # Target missing or mid-fade: defer — re-enqueue for the next tick
             # rather than lose the candidate or clobber a concurrent fade.
@@ -964,8 +1002,16 @@ def _dispatch(
         merged = decision.merged_content
         if not merged:
             merged = _fold(target.content, cand.content)
+        # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
+        live = engine.engine_for(persona_dir).is_live()
+        fields: dict = {"content": merged}
+        if live:
+            # Once the engine is live the merge combines both memories' emotions (see `_merge_emotions`), in the one update that
+            # writes the content. fold=False: the target's own update fires no hook (not even "assigned" when its emotions were
+            # empty); the incoming memory's mood move is sent below.
+            fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
         try:
-            store.update(target.id, content=merged)
+            store.update(target.id, **fields)
         except KeyError:
             # Target hard-deleted between the read and the write (a concurrent
             # forgetting LOSE). Defer the candidate; the archive record is
@@ -973,6 +1019,23 @@ def _dispatch(
             pending.enqueue(cand, source="gate-deferred")
             result.deferred += 1
             return
+        if live:
+            # The incoming emotions also move her mood, once, when the merge writes them: the existing commit event, for the
+            # incoming memory `cand`, which is never created as a row (so `create` never sends it). It follows the successful
+            # write, so a deferred merge (above) sends nothing and the tick that finally writes the merge sends it once. The
+            # event follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the
+            # climax reset like any commit. No try here: the engine's hooks never raise into their caller.
+            #
+            # The merge keeps this hook: design 3.1 ("The merge keeps the hook for the incoming memory's mood move") in
+            # docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md, decided by the maintainer on #629
+            # (issue #580). Two edges are accepted there, in design section 6:
+            # - If the update above commits and the item is retried before claim.settle (the process dies, or an error follows
+            #   the commit), the candidate is merged again: the emotions are averaged with it a second time (the content is
+            #   protected by `_fold`'s "contains it" rule, the averages are not), and the event is sent again and counts at the
+            #   repeat factor 1/2.
+            # - A rebuild or a catch-up counts the merged target row's current emotions once and does not restore this separate
+            #   mood move (the merged memory has no row and the merge writes no change-log line): a lost event, one merge's worth.
+            engine.engine_for(persona_dir).on_memory_committed(cand)
         result.merged += 1
         return
 
@@ -1013,6 +1076,19 @@ def _dispatch(
         result.continuations += 1
     else:
         result.promoted += 1
+
+
+def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, float]:
+    """The emotions of two memories that merge. Each memory goes through the engine's one name-resolution step first
+    (`resolve_emotions`: each name in its standard spelling, two spellings of one emotion one entry with their average, every
+    value held to 0-10, a value that is not a finite number dropped with a log line). Then an emotion on both memories is the
+    average of the two, and an emotion on one memory only is copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory counts
+    once in the average across the two. Returns a new dict, the target's names first.
+    """
+    merged = resolve_emotions(target_emotions)
+    for name, value in resolve_emotions(cand_emotions).items():
+        merged[name] = (merged[name] + value) / 2 if name in merged else value
+    return merged
 
 
 def _fold(existing: str, addition: str) -> str:

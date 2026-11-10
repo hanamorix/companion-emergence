@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.update import install, overlay
 
 
@@ -533,29 +534,146 @@ def test_missing_requirements_file_is_an_update_error(tmp_path):
 def test_staging_rename_rides_out_a_transient_permission_error(tmp_path, monkeypatch):
     """#302: Windows AV scanning freshly written .pyd files can briefly refuse the
     staging → target rename; a bounded retry keeps the in-app update reliable."""
-    import os
-
     finds = tmp_path / "finds"
     finds.mkdir()
     brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
     req = tmp_path / "requirements.txt"
     req.write_text("", encoding="utf-8")
     site = _fake_bundle(tmp_path, {})
-    real, calls = os.replace, []
-
-    def flaky_once(src, dst):
-        calls.append(dst)
-        if len(calls) == 1:
-            raise PermissionError("scanning")
-        real(src, dst)
-
-    monkeypatch.setattr(os, "replace", flaky_once)
-    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    renames = _stub_staging_rename(monkeypatch, failures=1)
     root = tmp_path / "brain-overlay"
     entry = install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
                                  root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert len(renames) == 2
     assert (root / entry["dir"] / "brain").is_dir()
     assert overlay.read_state(root)["active"] == entry
+
+
+def _stub_staging_rename(monkeypatch, failures: int) -> list[Path]:
+    """``os.replace`` raises PermissionError for the first ``failures`` renames of the staging folder, and only for those."""
+    import os
+    import time
+
+    real, staging_renames = os.replace, []
+
+    def replace(src, dst):
+        if Path(src).name.startswith(".staging-"):
+            staging_renames.append(Path(dst))
+            if len(staging_renames) <= failures:
+                raise PermissionError("scanning")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    return staging_renames
+
+
+def _stub_staging_rename_sleeps(monkeypatch, failures: int) -> tuple[list[Path], list[float]]:
+    """Like :func:`_stub_staging_rename`, and ``time.sleep`` records its argument, but only while a staging rename is being
+    retried (a refusal has been raised and the next try has not yet been made)."""
+    import time
+
+    renames = _stub_staging_rename(monkeypatch, failures)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s) if 1 <= len(renames) <= failures else None)
+    return renames, sleeps
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_staging_rename_has_its_own_budget_of_at_least_the_old_one(tmp_path, monkeypatch):
+    """The overlay's rename (the longest-held one, #302) keeps its own schedule through ``retry_transient``'s parameters: 6 tries,
+    waiting 0.11 s times the number of the try that failed, 1.65 s in all, which is at least the old 1.55 s."""
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    renames, sleeps = _stub_staging_rename_sleeps(monkeypatch, failures=5)
+    root = tmp_path / "brain-overlay"
+    entry = install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
+                                 root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert len(renames) == dev_constants.OVERLAY_RENAME_ATTEMPTS == 6
+    assert sleeps == [pytest.approx(0.11 * n) for n in range(1, 6)]
+    assert sum(sleeps) >= 1.55 and sum(sleeps) == pytest.approx(1.65)
+    assert (root / entry["dir"] / "brain").is_dir()
+    assert overlay.read_state(root)["active"] == entry
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_staging_rename_that_never_succeeds_fails_the_update_and_cleans_up(tmp_path, monkeypatch):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    renames = _stub_staging_rename(monkeypatch, failures=10_000)
+    root = tmp_path / "brain-overlay"
+    with pytest.raises(install.UpdateError, match="update failed"):
+        install.apply_update(wheel=brain_whl, requirements=req, commit="9" * 40, site_dir=site,
+                             root=root, pip_extra=["--no-index", "--find-links", str(finds)])
+    assert len(renames) == dev_constants.OVERLAY_RENAME_ATTEMPTS == 6
+    assert overlay.read_state(root)["active"] is None
+    assert not [p for p in root.iterdir() if p.name.startswith(".staging-")]
+
+
+def _stub_leftover_removal(monkeypatch, leftover: Path, failures: int) -> list[Path]:
+    """``shutil.rmtree`` of ``leftover`` raises PermissionError for the first ``failures`` calls; every other path (and
+    every call with keywords, such as the staging clean-up) goes through to the real one."""
+    import shutil
+
+    real, calls = shutil.rmtree, []
+
+    def rmtree(path, *args, **kwargs):
+        if Path(path) == leftover:
+            calls.append(Path(path))
+            if len(calls) <= failures:
+                raise PermissionError("scanning")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)
+    return calls
+
+
+def _apply_over_a_leftover(tmp_path):
+    finds = tmp_path / "finds"
+    finds.mkdir()
+    brain_whl = _wheel(finds, "companion-emergence", "9.9.9", BRAIN_OK)
+    req = tmp_path / "requirements.txt"
+    req.write_text("", encoding="utf-8")
+    site = _fake_bundle(tmp_path, {})
+    root = tmp_path / "brain-overlay"
+    leftover = root / f"{'c' * 12}-{'bundle-1'[:8]}"
+    leftover.mkdir(parents=True)
+    (leftover / "junk").write_text("garbage", encoding="utf-8")
+    return leftover, lambda: install.apply_update(
+        wheel=brain_whl, requirements=req, commit="c" * 40, site_dir=site, root=root,
+        pip_extra=["--no-index", "--find-links", str(finds)])
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_leftover_folder_removal_rides_out_a_transient_refusal(tmp_path, monkeypatch):
+    """#643 review: the leftover folder was removed with a bare ``shutil.rmtree``, so the first antivirus or indexer
+    refusal failed the update although the rename right after it is retried."""
+    leftover, apply = _apply_over_a_leftover(tmp_path)
+    calls = _stub_leftover_removal(monkeypatch, leftover, failures=2)
+    entry = apply()
+    assert len(calls) == 3
+    assert (tmp_path / "brain-overlay" / entry["dir"] / "brain").is_dir()
+    assert not (leftover / "junk").exists()
+
+
+@pytest.mark.usefixtures("fast_install")
+def test_leftover_folder_removal_that_never_succeeds_fails_the_update(tmp_path, monkeypatch):
+    leftover, apply = _apply_over_a_leftover(tmp_path)
+    calls = _stub_leftover_removal(monkeypatch, leftover, failures=10_000)
+    with pytest.raises(install.UpdateError, match="could not remove leftover overlay folder"):
+        apply()
+    assert len(calls) == dev_constants.FILE_RETRY_ATTEMPTS  # the retry schedule ran before the failure
+    assert overlay.read_state(tmp_path / "brain-overlay")["active"] is None
+    assert (leftover / "junk").read_text(encoding="utf-8") == "garbage"
 
 
 @pytest.mark.usefixtures("fast_install")

@@ -1101,3 +1101,213 @@ def test_run_tick_prompt_resolves_variant_spelled_placeholders(tmp_path: Path):
         assert captured[0] == "8.0|8.0|0|0"
     finally:
         store.close()
+
+
+# ── B2 phase B: arcs read the engine's short averages when it is live ─────────
+#
+# Each case seeds the file-backed store with values that CONTRADICT the stub's read, so an arc evaluated from the
+# store would give a different answer. What fires an arc is `engine.feels_high` (the stub's `high` set), never a number:
+# `high` defaults to every name in `readings`, and a case that wants "present but not high" passes `high=set()`.
+
+
+def _live_reflex(
+    tmp_path: Path,
+    stub,
+    readings: dict[str, float],
+    arcs: list[dict],
+    *,
+    stored: dict[str, float],
+    high: set[str] | None = None,
+):
+    from brain.emotion.engine import Reading
+
+    arcs_path = tmp_path / "arcs.json"
+    arcs_path.write_text(json.dumps({"version": 1, "arcs": arcs}), encoding="utf-8")
+    captured: list[str] = []
+
+    class CapturingProvider(FakeProvider):
+        def generate(self, prompt, *, system=None):
+            captured.append(prompt)
+            return "ok"
+
+    stub.live = True
+    stub.high = set(readings) if high is None else set(high)
+    stub.readings = {
+        n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()
+    }
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _seed_emotion_memory(store, stored)
+        runner = ReflexEngine(
+            store=store,
+            provider=CapturingProvider(),
+            persona_name="Nell",
+            persona_system_prompt="",
+            arcs_path=arcs_path,
+            log_path=tmp_path / "log.json",
+            default_arcs_path=DEFAULT_ARCS_PATH,
+        )
+        result = runner.run_tick(dry_run=False)
+    finally:
+        store.close()
+    return result, captured
+
+
+def _arc(name="live_arc", trigger=None, template="Love: {love}") -> dict:
+    return {
+        "name": name,
+        "description": "d",
+        "trigger": trigger if trigger is not None else {"love": 5},
+        "days_since_human_min": 0,
+        "cooldown_hours": 1.0,
+        "action": "a",
+        "output_memory_type": "reflex_journal",
+        "prompt_template": template,
+    }
+
+
+def test_live_an_absent_emotion_fails_the_trigger_and_ranks_nothing(tmp_path: Path, emotion_engine_stub):
+    result, captured = _live_reflex(
+        tmp_path, emotion_engine_stub, {"grief": 6.0}, [_arc()], stored={"love": 9.0}
+    )
+    assert result.arcs_fired == ()
+    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [("live_arc", "trigger_not_met")]
+    assert captured == []
+
+
+def test_live_the_arcs_own_threshold_number_is_not_compared(tmp_path: Path, emotion_engine_stub):
+    """A present value far above the arc's threshold does not fire it unless the engine calls the feeling high, and a
+    value far below the threshold fires it when the engine does."""
+    cases = {
+        "above_threshold_not_high": ({"love": 10.0}, set(), 0),
+        "below_threshold_high": ({"love": 0.5}, {"love"}, 1),
+        "zero_threshold_present_not_high": ({"love": 0.0}, set(), 0),
+        "zero_threshold_absent": ({"grief": 3.0}, {"love"}, 0),
+    }
+    for label, (readings, high, expected_fired) in cases.items():
+        run_dir = tmp_path / label
+        run_dir.mkdir()
+        threshold = 0 if label.startswith("zero") else 5
+        result, _ = _live_reflex(
+            run_dir,
+            emotion_engine_stub,
+            readings,
+            [_arc(trigger={"love": threshold})],
+            stored={"love": 9.0},
+            high=high,
+        )
+        assert len(result.arcs_fired) == expected_fired, label
+
+
+def test_live_every_emotion_a_trigger_names_must_be_high(tmp_path: Path, emotion_engine_stub):
+    arc = _arc(trigger={"love": 5, "grief": 5}, template="{love}|{grief}")
+    (tmp_path / "both").mkdir()
+    both, _ = _live_reflex(
+        tmp_path / "both",
+        emotion_engine_stub,
+        {"love": 0.5, "grief": 0.5},
+        [arc],
+        stored={},
+        high={"love", "grief"},
+    )
+    assert len(both.arcs_fired) == 1
+    (tmp_path / "one").mkdir()
+    one, _ = _live_reflex(
+        tmp_path / "one",
+        emotion_engine_stub,
+        {"love": 10.0, "grief": 10.0},
+        [arc],
+        stored={},
+        high={"love"},
+    )
+    assert one.arcs_fired == ()
+
+
+@pytest.mark.parametrize(
+    "arc_name", ["creative_pitch", "loneliness_journal", "self_check", "defiance_burst"]
+)
+def test_live_each_default_arc_fires_on_the_engine_saying_high_not_on_a_level(
+    tmp_path: Path, emotion_engine_stub, arc_name: str
+):
+    arcs = [
+        a
+        for a in json.loads(DEFAULT_ARCS_PATH.read_text(encoding="utf-8"))["arcs"]
+        if a["name"] == arc_name
+    ]
+    assert len(arcs) == 1
+    arcs[0]["days_since_human_min"] = 0  # the day-count gate is not what is under test
+    emotion = next(iter(arcs[0]["trigger"]))
+    (tmp_path / "low").mkdir()
+    fired, _ = _live_reflex(
+        tmp_path / "low", emotion_engine_stub, {emotion: 0.5}, arcs, stored={}, high={emotion}
+    )
+    assert [f.arc_name for f in fired.arcs_fired] == [arc_name]
+    (tmp_path / "top").mkdir()
+    quiet, _ = _live_reflex(
+        tmp_path / "top", emotion_engine_stub, {emotion: 10.0}, arcs, stored={}, high=set()
+    )
+    assert quiet.arcs_fired == ()
+
+
+def test_live_a_template_naming_an_emotion_with_no_value_does_not_fire(
+    tmp_path: Path, emotion_engine_stub
+):
+    result, captured = _live_reflex(
+        tmp_path,
+        emotion_engine_stub,
+        {"love": 7.0},
+        [_arc(template="Grief: {grief} Love: {love}")],
+        stored={"love": 7.0, "grief": 8.0},
+    )
+    assert result.arcs_fired == ()
+    assert [(s.arc_name, s.reason) for s in result.arcs_skipped] == [("live_arc", "template_emotion_absent")]
+    assert captured == []
+    assert not (tmp_path / "log.json").exists()
+
+
+def test_live_a_template_whose_placeholders_are_all_present_fires_and_a_present_zero_renders_as_0_0(
+    tmp_path: Path, emotion_engine_stub
+):
+    result, captured = _live_reflex(
+        tmp_path,
+        emotion_engine_stub,
+        {"love": 7.0, "grief": 0.0},
+        [_arc(template="Grief: {grief} Love: {love} Other: {no_such_field}")],
+        stored={"love": 1.0},
+    )
+    assert len(result.arcs_fired) == 1
+    assert captured == ["Grief: 0.0 Love: 7.0 Other: 0"]
+
+
+def test_live_a_variant_spelling_of_a_present_emotion_fires_and_renders_its_value(
+    tmp_path: Path, emotion_engine_stub
+):
+    result, captured = _live_reflex(
+        tmp_path,
+        emotion_engine_stub,
+        {"love": 7.0, "comfort_seeking": 4.0},
+        [_arc(template="{Love}|{comfort-seeking}")],
+        stored={"love": 1.0},
+    )
+    assert len(result.arcs_fired) == 1
+    assert captured == ["7.0|4.0"]
+
+
+def test_live_ranking_and_trigger_state_use_the_engine_values(tmp_path: Path, emotion_engine_stub):
+    arcs = [_arc(name="low", trigger={"love": 5}), _arc(name="high", trigger={"grief": 5})]
+    result, _ = _live_reflex(
+        tmp_path, emotion_engine_stub, {"love": 6.0, "grief": 9.0}, arcs, stored={"love": 10.0}
+    )
+    assert [f.arc_name for f in result.arcs_fired] == ["high"]
+    assert result.arcs_fired[0].trigger_state == {"grief": 9.0}
+
+
+def test_live_ranking_orders_by_value_minus_the_arcs_own_threshold(tmp_path: Path, emotion_engine_stub):
+    """Both arcs fire (the engine calls both feelings high). S52 and S53 change when an arc fires, not how eligible arcs are
+    ordered: the ranking stays the sum of value minus the arc's own threshold. `a` wins (6.0 - 5 = +1 against 8.0 - 9 = -1);
+    ranked by the short averages alone, `b` would win (8.0 against 6.0)."""
+    arcs = [_arc(name="a", trigger={"love": 5}), _arc(name="b", trigger={"grief": 9})]
+    result, _ = _live_reflex(
+        tmp_path, emotion_engine_stub, {"love": 6.0, "grief": 8.0}, arcs, stored={}
+    )
+    assert [f.arc_name for f in result.arcs_fired] == ["a"]

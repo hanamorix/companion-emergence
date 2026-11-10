@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from brain.grief import recall
+from brain.grief import policy, recall
 from brain.memory.store import MemoryStore
 
 
@@ -178,3 +179,92 @@ def test_handle_recall_touch_empty_graveyard_no_writes(tmp_path: Path) -> None:
     )
     rows = store._conn.execute("SELECT id FROM memories WHERE memory_type='grief_event'").fetchall()
     assert rows == []
+
+
+# The grief-touch race (#342): two turns recalling the same forgotten memory at once must write ONE breadcrumb.
+_RACE_B_HEAD_START_S = 2.0  # how long the second turn gets to run while the first is paused at its insert
+_RACE_JOIN_S = 10.0  # the most the test waits for the second turn to finish
+
+
+def _touch_count(db: Path, referent_id: str) -> int:
+    store = MemoryStore(db)
+    try:
+        rows = store._conn.execute("SELECT metadata_json FROM memories WHERE memory_type = 'grief_event'").fetchall()
+        return sum(1 for r in rows if json.loads(r["metadata_json"]).get("grief_referent_id") == referent_id)
+    finally:
+        store.close()
+
+
+def test_two_turns_touching_one_forgotten_memory_write_one_breadcrumb(tmp_path: Path) -> None:
+    db = tmp_path / "memories.db"
+    entry = _make_graveyard_entry(memory_id="mem-x")
+    opened = threading.Event()
+    go = threading.Event()
+    b_outcome: dict[str, object] = {}
+
+    def turn_b() -> None:
+        store_b = MemoryStore(db)  # opened in this thread, before the race starts: the connection is thread-bound
+        try:
+            opened.set()
+            go.wait(_RACE_JOIN_S)
+            recall.handle_recall_touch(
+                touched_ids=["mem-x"], graveyard_entries=[entry], persona_dir=tmp_path, store=store_b, lived_age_hours_now=24.0
+            )
+            b_outcome["finished"] = True
+        except BaseException as exc:
+            b_outcome["error"] = exc
+        finally:
+            store_b.close()
+
+    thread_b = threading.Thread(target=turn_b, name="grief-turn-b", daemon=True)
+    thread_b.start()
+    assert opened.wait(_RACE_JOIN_S), "the second turn never opened its store"
+    store_a = MemoryStore(db)
+    fired: list[str] = []
+
+    def trace(statement: str) -> None:
+        # The first turn is about to insert its breadcrumb: let the second turn run its whole touch now.
+        if statement.lstrip().startswith("INSERT INTO memories (") and not fired:
+            fired.append(statement)
+            go.set()
+            thread_b.join(_RACE_B_HEAD_START_S)
+
+    store_a._conn.set_trace_callback(trace)
+    a_finished = False
+    try:
+        recall.handle_recall_touch(
+            touched_ids=["mem-x"], graveyard_entries=[entry], persona_dir=tmp_path, store=store_a, lived_age_hours_now=24.0
+        )
+        a_finished = True
+    finally:
+        go.set()
+        thread_b.join(_RACE_JOIN_S)
+        store_a._conn.set_trace_callback(None)
+    assert not thread_b.is_alive(), "the second turn did not finish"
+    assert len(fired) == 1, "the interleaving did not happen: the first turn's insert was never seen"
+    assert a_finished and b_outcome == {"finished": True}
+    assert _touch_count(db, "mem-x") == 1  # the two turns raced and only one breadcrumb exists
+
+    # the debounce cases, in the same test: inside the window nothing is written; past it one is; another referent gets its own
+    try:
+        recall.handle_recall_touch(
+            touched_ids=["mem-x"], graveyard_entries=[entry], persona_dir=tmp_path, store=store_a, lived_age_hours_now=24.0
+        )
+        assert _touch_count(db, "mem-x") == 1
+        old = (datetime.now(UTC) - timedelta(hours=policy.DEBOUNCE_HOURS + 1)).isoformat()
+        store_a._conn.execute("UPDATE memories SET created_at = ? WHERE memory_type = 'grief_event'", (old,))
+        store_a._conn.commit()
+        recall.handle_recall_touch(
+            touched_ids=["mem-x"], graveyard_entries=[entry], persona_dir=tmp_path, store=store_a, lived_age_hours_now=24.0
+        )
+        assert _touch_count(db, "mem-x") == 2
+        recall.handle_recall_touch(
+            touched_ids=["mem-y"],
+            graveyard_entries=[_make_graveyard_entry(memory_id="mem-y")],
+            persona_dir=tmp_path,
+            store=store_a,
+            lived_age_hours_now=24.0,
+        )
+        assert _touch_count(db, "mem-y") == 1
+    finally:
+        store_a.close()

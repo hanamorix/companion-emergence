@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
@@ -83,6 +85,36 @@ def test_rotate_rolling_size_shifts_existing_archives(tmp_path: Path) -> None:
     assert (tmp_path / "log.jsonl.1.gz").exists()
     assert gzip.decompress((tmp_path / "log.jsonl.2.gz").read_bytes()) == b"old1\n"
     assert gzip.decompress((tmp_path / "log.jsonl.3.gz").read_bytes()) == b"old2\n"
+
+
+def test_rotate_rolling_size_shift_rides_out_a_transient_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#643 review: the shift of the archives was a raw ``os.replace``, so on Windows a reader holding ``.2.gz`` for a
+    moment aborted the rotation, while the publish of the new ``.1.gz`` would have waited."""
+    log = tmp_path / "log.jsonl"
+    (tmp_path / "log.jsonl.1.gz").write_bytes(gzip.compress(b"old1\n"))
+    (tmp_path / "log.jsonl.2.gz").write_bytes(gzip.compress(b"old2\n"))
+    _write_lines(log, 20, prefix="new")
+    real, shift_tries = os.replace, []
+
+    def replace(src, dst):
+        if Path(src).name == "log.jsonl.2.gz":  # the first move of the shift
+            shift_tries.append(Path(dst).name)
+            if len(shift_tries) <= 2:
+                raise PermissionError(13, "in use")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)
+
+    rotate_rolling_size(log, max_bytes=10_000, archive_keep=3)
+
+    assert shift_tries == ["log.jsonl.3.gz"] * 3
+    assert b"new" in gzip.decompress((tmp_path / "log.jsonl.1.gz").read_bytes())
+    assert gzip.decompress((tmp_path / "log.jsonl.2.gz").read_bytes()) == b"old1\n"
+    assert gzip.decompress((tmp_path / "log.jsonl.3.gz").read_bytes()) == b"old2\n"
+    assert log.read_bytes() == b""
 
 
 def test_rotate_rolling_size_evicts_oldest_when_keep_reached(tmp_path: Path) -> None:

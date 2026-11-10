@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
@@ -827,6 +829,37 @@ def test_add_memory_climax_below_threshold_writes_no_climax_journal(tmp_path: Pa
     assert len(journal_entries) == 0
 
 
+@pytest.mark.no_base_failure(reason="pins the climax journal at the shared threshold; the value (7.0) is unchanged")
+def test_add_memory_climax_journal_fires_at_the_threshold_and_not_below(tmp_path: Path) -> None:
+    from brain.body.events import CLIMAX_THRESHOLD
+    from brain.tools.impls.add_memory import add_memory
+
+    store = _make_store()
+    hebbian = _make_hebbian()
+    for content, climax in (("just under", CLIMAX_THRESHOLD - 0.01), ("right at it", CLIMAX_THRESHOLD)):
+        add_memory(
+            content=content,
+            memory_type="event",
+            domain="relationship",
+            emotions={"climax": climax, "arousal": 8, "desire": 8},  # enough weight for add_memory's own write gate
+            store=store,
+            hebbian=hebbian,
+            persona_dir=tmp_path,
+        )
+    journal_entries = store.list_by_type("journal_entry", active_only=True)
+    assert len(journal_entries) == 1
+    assert store.get(journal_entries[0].metadata["originating_memory_id"]).content == "right at it"
+
+
+def test_add_memory_uses_the_shared_climax_threshold() -> None:
+    """The climax journal compares with body.events.CLIMAX_THRESHOLD, so the threshold lives in one place."""
+    import brain.tools.impls.add_memory as module
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "7.0" not in source
+    assert ">= CLIMAX_THRESHOLD" in source
+
+
 def test_add_memory_no_climax_emotion_writes_no_climax_journal(tmp_path: Path) -> None:
     """No climax key in emotions → no journal."""
     from brain.tools.impls.add_memory import add_memory
@@ -883,3 +916,39 @@ def test_crystallize_soul_schema_does_not_reference_hana() -> None:
 
     desc = SCHEMAS["crystallize_soul"]["description"]
     assert "Hana" not in desc, f"crystallize_soul description hardcodes 'Hana': {desc!r}"
+
+
+# ── B2 phase B: the emotion tools read the engine's short averages when it is live ──
+
+
+def test_get_emotional_state_live_carries_present_zeros_ranked_last(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import Reading
+    from brain.tools.impls.get_emotional_state import get_emotional_state
+
+    store = _make_store()
+    _seed_memory(store, emotions={"anger": 9.0})  # the stored value must not appear
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "calm": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+        "love": Reading(short=6.0, long=0.0, difference=0.0, shift=0),
+        "joy": Reading(short=2.0, long=0.0, difference=0.0, shift=0),
+    }
+    result = get_emotional_state(store=store, hebbian=_make_hebbian(), persona_dir=tmp_path)
+    assert result["all"] == {"calm": 0.0, "love": 6.0, "joy": 2.0}
+    assert [e["emotion"] for e in result["top_5"]] == ["love", "joy", "calm"]
+    assert result["dominant"] == "love"
+
+
+def test_get_emotional_state_live_empty_read_says_no_active_emotions(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.tools.impls.get_emotional_state import get_emotional_state
+
+    store = _make_store()
+    _seed_memory(store, emotions={"anger": 9.0})
+    emotion_engine_stub.live = True
+    result = get_emotional_state(store=store, hebbian=_make_hebbian(), persona_dir=tmp_path)
+    assert result == {
+        "dominant": None,
+        "top_5": [],
+        "all": {},
+        "summary": "No active emotions recorded.",
+    }
