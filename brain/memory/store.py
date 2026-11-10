@@ -141,7 +141,7 @@ def _json_column(value: dict[str, Any]) -> str:
 
 
 def _metadata_or_none(raw: object) -> dict[str, Any] | None:
-    """The mapping a `metadata_json` value holds (the x10 fix's read-back check reads `emotions_json` through it too, the same shape), or None when it cannot be read as one.
+    """The mapping a `metadata_json` value holds, or None when it cannot be read as one.
 
     An empty value or JSON `null` (what a legacy writer stored) is the empty mapping. Text that is not JSON (or nested past the
     parser's limit, or an integer past its digit limit), or JSON that is not a mapping, is None. The ONE reader of the metadata
@@ -212,12 +212,11 @@ def scaled_small_emotions(emotions: object, *, factor: float, threshold: float, 
     return multiplied
 
 
-def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) -> tuple[str, float, float, dict[str, Any]] | None:
-    """The new `(emotions_json, score, peak, old_emotions)` of one row of the x10 fix (`MemoryStore.scale_up_small_nudge_rows`), or None to leave it.
+def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) -> tuple[str, float, float] | None:
+    """The new `(emotions_json, score, peak)` of one row of the x10 fix (`MemoryStore.scale_up_small_nudge_rows`), or None to leave it.
 
-    `old_emotions` is the row's feelings as stored, parsed here once, for the in-transaction value check. The feelings and the
-    peak are each held to 0.0 or more and multiplied (`scaled_small_emotions`, `_small_feeling_times`); the score is multiplied
-    as stored (it is a creation-time snapshot, not recomputed). A row with no feelings is multiplied like any other, in its peak
+    The feelings and the peak are each held to 0.0 or more and multiplied (`scaled_small_emotions`, `_small_feeling_times`);
+    the score is multiplied as stored (it is a creation-time snapshot, not recomputed). A row with no feelings is multiplied like any other, in its peak
     and score (Planning B27 Q15): its peak survives the decay of its feelings, so it can still be on the old scale.
 
     None WITH a warning naming the row's id (never its content) for a row that cannot be multiplied safely: `metadata_json` that
@@ -246,26 +245,7 @@ def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) ->
     if new_peak is None:
         logger.warning("x10 fix: row %s skipped, its peak is not a number below %s that times %s stays finite", memory_id, threshold, factor)
         return None
-    return _json_column(multiplied), new_score, new_peak, emotions
-
-
-def _x10_row_is_as_expected(old_emotions: dict[str, Any], old: sqlite3.Row, new: sqlite3.Row, factor: float) -> bool:
-    """True when a multiplied row reads back as ten times its held old values: every feeling, the peak (both held to 0.0 or more first), and the score as stored.
-
-    `new` holds only the three columns the fix wrote (`emotions_json`, `score`, `peak_emotion_intensity`): the check reads nothing
-    else of the row, so a damaged column the fix did not touch (tags, a timestamp) cannot fail it. The in-transaction value check of
-    the x10 fix (Planning B29 C2 item 1, P8a), hand-written on purpose: it shares no code with the multiply it checks (the hold
-    here is the rule "a negative becomes 0.0", not the engine's function). The same feelings, no more and no fewer, and a feeling
-    or the peak or the score that differs from its expected product by anything is a mismatch.
-    """
-    written = _metadata_or_none(new["emotions_json"])
-    if written is None or written.keys() != old_emotions.keys():
-        return False
-    for name, value in old_emotions.items():
-        if written[name] != (0.0 if value < 0 else value) * factor:
-            return False
-    peak = old["peak_emotion_intensity"]
-    return new["peak_emotion_intensity"] == (0.0 if peak < 0 else peak) * factor and new["score"] == old["score"] * factor
+    return _json_column(multiplied), new_score, new_peak
 
 
 def _small_feeling_times(value: object, factor: float, threshold: float) -> float | None:
@@ -3283,8 +3263,9 @@ class MemoryStore:
         """The progress note of the one-time x10 fix: `PRAGMA user_version` of this database (0 when the fix never ran).
 
         Nothing else uses `user_version` on `memories.db`. 0 = nothing done, `dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE`
-        = the rows are multiplied (set in the rows' own transaction), `NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED` = the
-        copies of the pending-queue files are written and checked (set by `PendingQueue.scale_up_small_making_candidates`).
+        = the rows are multiplied (set in the rows' own transaction), `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` = the
+        pending-queue step has started (set by `PendingQueue.scale_up_small_making_candidates` before it rewrites any file, so
+        it does not mean the files are done).
         Read and written only through this method and `set_x10_progress` (P7). It is a fresh read each time, not a cached one.
         """
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -3312,9 +3293,9 @@ class MemoryStore:
         `x10_progress`): inside the one write transaction (`BEGIN IMMEDIATE`, which also serialises two starters, the bridge and a
         CLI command) the number is read; if it is not 0 the rows were done by an earlier start and nothing is multiplied; if it is
         0 the rows are multiplied and the number is set to `NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE` in the same transaction, so a
-        crash leaves either both or neither. The transaction also holds the selection, the updates, a check that every update
-        changed exactly one row, and a check that every multiplied row reads back as ten times its held old values (P8a); a
-        mismatch or any error rolls everything back and raises. A row written by something else while the app is down
+        crash leaves either both or neither. The transaction also holds the selection and the updates; SQLite makes it
+        all-or-nothing, so no value or row-count check is repeated here (owner S84: what the database already recovers is not
+        done again); any error rolls everything back and raises. A row written by something else while the app is down
         between the steps of a start-up is missed (accepted edge, owner S77). The cut is not by date: a row written at the old
         scale before the switch-over exists is multiplied too. The count and every multiplied row's id are logged once, after
         the commit.
@@ -3335,26 +3316,16 @@ class MemoryStore:
                 f"WHERE memory_type IN ({marks}) AND peak_emotion_intensity < ?",
                 (*types, threshold),
             ).fetchall()
-            scaled: list[tuple[sqlite3.Row, str, float, float, dict[str, Any]]] = []
+            scaled: list[tuple[str, str, float, float]] = []
             for row in rows:
                 new_values = _scaled_small_feelings(row, factor, threshold)
                 if new_values is not None:
-                    emotions_json, score, peak, old_emotions = new_values
-                    scaled.append((row, emotions_json, score, peak, old_emotions))
-            changed = 0
-            for row, emotions_json, score, peak, _old_emotions in scaled:
-                changed += self._conn.execute(
+                    scaled.append((row["id"], *new_values))
+            for memory_id, emotions_json, score, peak in scaled:
+                self._conn.execute(
                     "UPDATE memories SET emotions_json = ?, score = ?, peak_emotion_intensity = ? WHERE id = ?",
-                    (emotions_json, score, peak, row["id"]),
-                ).rowcount
-            if changed != len(scaled):
-                raise RuntimeError(f"the x10 fix meant to change {len(scaled)} rows and changed {changed}; nothing was changed")
-            for row, _emotions_json, _score, _peak, old_emotions in scaled:
-                written = self._conn.execute(
-                    "SELECT emotions_json, score, peak_emotion_intensity FROM memories WHERE id = ?", (row["id"],)
-                ).fetchone()
-                if written is None or not _x10_row_is_as_expected(old_emotions, row, written, factor):
-                    raise RuntimeError(f"the x10 fix wrote row {row['id']} with values that are not ten times its old ones; nothing was changed")
+                    (emotions_json, score, peak, memory_id),
+                )
             self._conn.execute(f"PRAGMA user_version = {int(dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)}")  # noqa: S608 (an int)
             self._conn.commit()
         # The ids go in the log in full, in this one record, so the rows can be found by hand if the fix ever has to be undone
@@ -3363,7 +3334,7 @@ class MemoryStore:
             "MemoryStore.scale_up_small_nudge_rows: multiplied the feelings of %d rows by %s (ids: %s)",
             len(scaled),
             factor,
-            ", ".join(row["id"] for row, *_ in scaled),
+            ", ".join(memory_id for memory_id, *_ in scaled),
         )
         return len(scaled)
 

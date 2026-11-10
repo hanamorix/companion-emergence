@@ -691,8 +691,15 @@ REMOVED: tuple[Removed, ...] = (
     # --- the x10 fix carries no marker on any row or queued candidate; its progress is `PRAGMA user_version` (Engine 6 Q10c, C2) ---
     Removed(
         names=("NUDGE_SCALE_FIX_MARKER", "NUDGE_SCALE_FIX_MARKER_KEY"),
-        why="the single int the x10 fix once wrote to `PRAGMA user_version`, and the metadata key it marked each multiplied row and queued candidate with; the owner ruled out per-row and per-entry markers (S77), and the fix's progress is now the two named numbers NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE and NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED in `PRAGMA user_version`",
+        why="the single int the x10 fix once wrote to `PRAGMA user_version`, and the metadata key it marked each multiplied row and queued candidate with; the owner ruled out per-row and per-entry markers (S77), and the fix's progress is now the two named numbers NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE and NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED in `PRAGMA user_version`",
         ref="Engine 6 Q10c and C2 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- the x10 fix's queue step is simplified: no temporary copies, no check, no roll-forward (Engine 6 X10S, owner S84) ---
+    Removed(
+        names=("NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED", "_x10_copy_path", "_check_x10_copy", "_prepare_x10_copy", "_x10_row_is_as_expected"),
+        why="the x10 fix's temporary `.x10tmp` queue copies, their re-read check, the in-transaction value compare of the database half, and the constant that said the copies were checked; the owner ruled (S84) that what the shared atomic writer and the database's own transaction already make all-or-nothing is not done again, and 2 now means the queue step started",
+        ref="Engine 6 X10S (#584, draft PR #633)",
         kind="code",
     ),
     # --- an unreadable emotion state is decided from the x10 record, never skipped (Engine 6 SW4) ---------------------------

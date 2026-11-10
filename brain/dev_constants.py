@@ -137,7 +137,7 @@ EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 # peak of those rows by the factor, but only for a row whose stored peak and every stored feeling are below the threshold (a
 # row with any value of 1 or more is not multiplied; a negative value is held to 0.0 first). It also multiplies the `making`
 # candidates still waiting in the pending queue the same way. No row or candidate carries a marker: the fix's progress is one
-# number in `memories.db`'s `PRAGMA user_version` (rows done, then queue copies checked), so a start-up that fails part way
+# number in `memories.db`'s `PRAGMA user_version` (rows done, then queue step started), so a start-up that fails part way
 # and is run again never multiplies twice. The list comes from a survey of every
 # writer of feelings in `brain/`; `tests/unit/brain/emotion/test_nudge_scale_types.py` drives each known writer against it.
 # They are separate named constants on purpose: the factor is the scale change itself, not the engine's value cap
@@ -148,7 +148,7 @@ NUDGE_SCALE_FIX_MEMORY_TYPES: tuple[str, ...] = ("initiate_outbound", "kindled_p
 NUDGE_SCALE_FIX_FACTOR: float = 10.0
 NUDGE_SCALE_FIX_THRESHOLD: float = 1.0
 NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE: int = 1
-NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED: int = 2
+NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED: int = 2
 
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only

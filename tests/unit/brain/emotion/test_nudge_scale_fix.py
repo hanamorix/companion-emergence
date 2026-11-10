@@ -226,7 +226,7 @@ def test_a_row_whose_score_times_ten_is_not_finite_is_skipped_with_a_warning_and
     assert tuple(_read(persona, "big")) == before  # nothing of the row was written
     assert _feelings(persona, "fine") == pytest.approx({"pride": 3.0})
     assert any("big" in r.getMessage() and "skipped" in r.getMessage() for r in caplog.records)
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # the pass finished
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # the pass finished
 
 
 def test_a_row_with_a_score_that_is_not_a_number_is_skipped(tmp_path: Path) -> None:
@@ -290,7 +290,7 @@ def test_the_score_is_multiplied_as_stored_not_recomputed(tmp_path: Path) -> Non
     persona = _persona(tmp_path, _memory("snap", "making", {"pride": 0.2}, score=0.7))
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
     assert _read(persona, "snap")["score"] == pytest.approx(7.0)  # 0.7 x 10, not the 2.0 of the new feelings
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
 
 
 def test_a_decayed_row_with_no_feelings_still_has_its_peak_and_score_multiplied(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -313,47 +313,14 @@ def test_a_decayed_row_with_no_feelings_still_has_its_peak_and_score_multiplied(
 # --- the transaction: all or nothing, progress note included -----------------------------------
 
 
-def test_a_damaged_column_the_fix_does_not_touch_does_not_fail_the_value_check_or_stop_start_up(tmp_path: Path) -> None:
-    """The in-transaction check reads back only the three columns the fix wrote: a row with broken tags or timestamps is multiplied
-    like any other (a check that built the whole row from the database would raise here, and fail every later start-up)."""
+@pytest.mark.no_base_failure(reason="retained behaviour: a damaged column the fix does not touch never stopped the fix on the base either; this keeps it so now that no value check reads the row back")
+def test_a_damaged_column_the_fix_does_not_touch_does_not_stop_start_up(tmp_path: Path) -> None:
+    """A row with broken tags or timestamps is multiplied like any other: the fix reads and writes only its own three columns."""
     persona = _persona(tmp_path, _memory("odd", "making", {"pride": 0.2}), _memory("fine", "making", {"pride": 0.3}))
     _raw(persona, "UPDATE memories SET tags_json = ?, created_at = ?, last_accessed_at = ? WHERE id = ?", "not json", "yesterday", "garbage", "odd")
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 2
     assert _feelings(persona, "odd") == pytest.approx({"pride": 2.0})
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
-
-
-def test_a_row_count_mismatch_rolls_everything_back_progress_note_included(tmp_path: Path) -> None:
-    persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}), _memory("b", "making", {"pride": 0.3}))
-    # An update that touches no row (RAISE(IGNORE) skips it): the count the fix expects is not the count it got.
-    _raw(persona, "CREATE TRIGGER skip_b BEFORE UPDATE ON memories WHEN OLD.id = 'b' BEGIN SELECT RAISE(IGNORE); END")
-    with pytest.raises(RuntimeError, match="nothing was changed"):
-        nudge_scale_fix.scale_up_small_feelings(persona)
-    assert _unchanged(persona, "a", {"pride": 0.2}) and _unchanged(persona, "b", {"pride": 0.3})
-    assert _user_version(persona) == 0
-
-
-@pytest.mark.parametrize(
-    "wrong",
-    [
-        "UPDATE memories SET score = score + 1 WHERE id = NEW.id",
-        "UPDATE memories SET peak_emotion_intensity = peak_emotion_intensity + 1 WHERE id = NEW.id",
-        "UPDATE memories SET emotions_json = '{\"pride\": 99.0}' WHERE id = NEW.id",
-    ],
-    ids=["score", "peak", "feelings"],
-)
-def test_a_value_that_is_not_ten_times_the_old_one_rolls_everything_back_in_the_transaction(tmp_path: Path, wrong: str) -> None:
-    """Planning B29 C2 item 1 (P8a): the row count matches, so only the in-transaction value check can see this."""
-    persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}), _memory("b", "making", {"pride": 0.3}))
-    _raw(persona, f"CREATE TRIGGER wrong AFTER UPDATE ON memories WHEN NEW.id = 'b' BEGIN {wrong}; END")
-    with pytest.raises(RuntimeError, match="not ten times"):
-        nudge_scale_fix.scale_up_small_feelings(persona)
-    assert _unchanged(persona, "a", {"pride": 0.2}) and _unchanged(persona, "b", {"pride": 0.3})
-    assert _read(persona, "b")["score"] == pytest.approx(0.3)
-    assert _user_version(persona) == 0
-    _raw(persona, "DROP TRIGGER wrong")
-    assert nudge_scale_fix.scale_up_small_feelings(persona) == 2  # the failure left no transaction open and no note: the next run completes
-    assert _feelings(persona, "b") == pytest.approx({"pride": 3.0})
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
 
 
 def test_a_failure_part_way_through_the_updates_rolls_the_earlier_rows_back(tmp_path: Path) -> None:
@@ -430,7 +397,7 @@ def test_two_starters_at_once_multiply_each_row_exactly_once(tmp_path: Path) -> 
     for thread in threads:
         thread.join(60)
     assert not errors and sorted(c or 0 for c in counts) == [0, 8]
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # one starter set it, the other read it
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # one starter set it, the other read it
     assert all(_feelings(persona, f"r{n}") == pytest.approx({"pride": 2.0}) for n in range(8))  # once, not 20
 
 
@@ -451,7 +418,7 @@ def test_a_row_with_no_metadata_is_multiplied_like_any_other_and_its_metadata_is
 def test_a_row_whose_metadata_cannot_be_read_as_a_mapping_is_not_multiplied_and_is_logged_and_the_count_accounts_for_it(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, stored: str
 ) -> None:
-    """Planning B29 C2 item 3 (P4): detected with `_metadata_or_none`; the row-count check does not count it."""
+    """Planning B29 C2 item 3 (P4): detected with `_metadata_or_none`; the returned count does not include it."""
     persona = _persona(tmp_path, _memory("odd", "making", {"pride": 0.2}), _memory("fine", "making", {"pride": 0.3}))
     _raw(persona, "UPDATE memories SET metadata_json = ? WHERE id = ?", stored, "odd")
     caplog.set_level(logging.WARNING)
@@ -460,7 +427,7 @@ def test_a_row_whose_metadata_cannot_be_read_as_a_mapping_is_not_multiplied_and_
     assert _feelings(persona, "odd") == {"pride": 0.2}
     assert _feelings(persona, "fine") == pytest.approx({"pride": 3.0})
     assert any("odd" in r.getMessage() and "skipped" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # the skipped row does not hold the note back
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # the skipped row does not hold the note back
 
 
 def test_the_method_refuses_to_run_inside_an_open_transaction(tmp_path: Path) -> None:
@@ -493,7 +460,7 @@ def test_the_factor_threshold_and_types_come_from_dev_constants(tmp_path: Path, 
     assert _feelings(persona, "made") == pytest.approx({"pride": 0.6})  # the factor
     assert _feelings(persona, "talk") == pytest.approx({"joy": 0.6})  # the type list
     assert _feelings(persona, "mid") == pytest.approx({"pride": 4.5})  # the threshold: 1.5 is below 2.0
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
 
 
 def test_the_log_names_the_count_and_every_multiplied_id_so_the_rows_can_be_found_by_hand(
@@ -561,7 +528,7 @@ def test_it_runs_on_a_persona_with_a_state_that_holds_no_switch_over_time(tmp_pa
     engine_files.save_state(persona, EngineState(saved_at=NOW))
     assert engine_files.switch_over_state(engine_files.read_state(persona)) is False  # the rule the fix asks
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # no queue file: the queue step is done all the same
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # no queue file: the queue step is done all the same
 
 
 def test_it_runs_when_the_state_cannot_be_read_and_the_progress_note_decides(tmp_path: Path) -> None:
@@ -571,7 +538,7 @@ def test_it_runs_when_the_state_cannot_be_read_and_the_progress_note_decides(tmp
     engine_files.save_state(persona, EngineState(saved_at=NOW))
     ruin_the_state(persona)
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
-    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert _user_version(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 0  # the same start again: nothing is multiplied twice
 
 

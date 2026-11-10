@@ -924,9 +924,9 @@ class EmotionEngine:
         persona was switched; the decision comes from the database's own record of the x10 fix (Planning B31 SW4, owner S79):
         it goes on exactly like a missing one, nothing is written for it yet, nothing is cached.
         2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock: the rows of `memories.db`, then the `making`
-        candidates still waiting in the pending queue. Each step reads the progress number itself, so a finished step is skipped,
-        a checked queue copy is rolled forward or discarded, and an unstarted step runs. When the state is unreadable and
-        `memories.db` fails its integrity check too, this start is skipped with one warning and nothing is written.
+        candidates still waiting in the pending queue. Each step reads the progress number itself, so a finished or started step
+        is skipped and an unstarted step runs. When the state is unreadable and `memories.db` fails its integrity check too,
+        this start is skipped with one warning and nothing is written.
         3. The engine lock, taken once, the state read again under it (a second process that waited runs nothing), then
         `engine_rebuild.rebuild` in first mode with the lock held; its one verified state write records `switch_over_at` (now) and
         is the switch-over's last step. First mode, not recovery mode: a recovery copies `switch_over_at` from a loaded state, and

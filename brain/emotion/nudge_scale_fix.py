@@ -20,17 +20,20 @@ No row and no queue entry carries a marker (owner S77). A finished switch-over i
 (the guard above). A half-finished x10 fix is known from `memories.db`'s `PRAGMA user_version`, the fix's progress note (owner
 S78: "yes use the version number for a half finished repair"), read and written only through `MemoryStore.x10_progress` and
 `set_x10_progress`: 0 nothing done; 1 (`NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE`) the rows are multiplied, set in the rows' own
-transaction; 2 (`NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED`) the copies of both queue files are written and checked, set
-before any original is replaced. A start-up that fails after this fix is run again at the next start from where the number
-says: the rows are not multiplied twice, the queue copies are made again from the untouched originals, or, after a crash
-between setting 2 and the replace, finished from the checked copies (`PendingQueue.scale_up_small_making_candidates`).
+transaction; 2 (`NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED`) the queue step has started, set before any queue file is rewritten
+(so 2 does not mean the files are done). A start-up that fails after this fix is run again at the next start from where the
+number says: the rows are not multiplied twice, and a queue step that failed before setting 2 starts again from the untouched
+files (`PendingQueue.scale_up_small_making_candidates`). Nothing here repeats what the database's own transaction and the
+shared atomic writer already make all-or-nothing (owner S84).
 Dev personas made by the marker build that never left the branch (rows marked, number 0) would be multiplied again: they are
 test data to recreate.
 
 Accepted edges (the commit that adds this file names them):
 - Owner S77 (P4): a row or queue entry written by something else while the app is down between the steps of a start-up is
-  missed (a row written after the database step, an entry appended after the copies were made) or, for an entry appended
-  before a roll-forward, overwritten by the checked copy.
+  missed (a row written after the database step, an entry appended after the queue step read its files).
+- Owner S84 (P4): the number 2 is set before the queue files are rewritten, so a crash or a failed write after it leaves that
+  file's selected entries at the old, faint scale, never multiplied twice (the other order would multiply a rewritten file
+  again at the retry). A failed write is logged and start-up goes on; it is not retried.
 - E5 (owner 2026-10-21): a row whose strongest value is below 1 only because it faded there, not because it was written small,
   is multiplied once. One odd day for the kindled, then it sinks back.
 - E6: a feeling the old decay pass deleted at 0.01 stays deleted; multiplying the rest does not bring it back.
@@ -47,10 +50,10 @@ Accepted edges (the commit that adds this file names them):
   it; after that it does not.)
 - A candidate that an old-code process has already claimed into memory (the gate's batch, read before the fix and promoted after
   it) is promoted at its old size, the same window. An old-code process that finishes its batch while the queue half runs can
-  delete the processing file (`ClaimedBatch.close` takes no queue lock) after the fix has read it; the fix's replace then puts
+  delete the processing file (`ClaimedBatch.close` takes no queue lock) after the fix has read it; the fix's rewrite then puts
   the file back with entries that process already promoted, and the next claim offers them again. New code cannot be in that
   state: a process that runs a gate has already passed `ensure`, so the state holds `switch_over_at` and this fix does not run.
-- The queue half writes a file's copy only when something in it was multiplied, and writes every other line back as the shared
+- The queue half rewrites a file only when something in it was multiplied, and writes every other line back as the shared
   reader yielded it: the bytes of the line without its terminator (a blank line, a carriage return before the newline and a
   leading byte-order mark are not kept, and a torn last line gets its newline; the app writes none of them).
 - A peer row can hold a NEGATIVE value (a model delta keeps its sign). It passes "below 1" and is held to 0.0 and then
@@ -88,9 +91,9 @@ def scale_up_small_feelings(persona_dir: Path) -> int | None:
 
     The database store is opened with its default integrity check (this is a write, it runs once in a persona's life, and a
     damaged file must not be written into): a failing check raises `BrainIntegrityError` and nothing is written. Any other error
-    of the store method (the transaction rolled back, the progress number as it was) or of the queue method (a read or write
-    fault, a failed copy check, a failure to set the number: raised before any original is replaced) also goes out to the
-    caller, which stops the start-up.
+    of the store method (the transaction rolled back, the progress number as it was) or of the queue method (a read fault or a
+    failure to set the number: raised before any file is written) also goes out to the caller, which stops the start-up. A
+    failed write of a queue file is not one of them: the queue method logs it and goes on.
     """
     if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is True:
         return None  # switched; a state that cannot be read (None) goes on: the progress number below decides (Planning B31 SW4)
