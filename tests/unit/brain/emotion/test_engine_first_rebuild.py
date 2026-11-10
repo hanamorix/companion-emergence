@@ -325,6 +325,85 @@ def test_an_integrity_failure_raises_naming_the_check_and_writes_nothing(tmp_pat
     assert not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
 
 
+def _candidate(memory_id: str, emotions: dict[str, float]) -> Memory:
+    return row(T[36], memory_type="making", emotions=emotions, mid=memory_id)
+
+
+def test_the_queue_step_runs_after_the_database_transaction_and_before_the_lock_and_the_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q10c: a small `making` candidate waiting in the pending queue is multiplied once, marked, and promoted at its real size."""
+    from brain.memory import pending
+
+    persona = _standard_persona(tmp_path)
+    pending.PendingQueue(persona).enqueue(_candidate("waiting", {"pride": 0.3}), source="maker")
+    spy = LockSpy(monkeypatch)
+    order: list[str] = []
+    for owner, name, label in (
+        (MemoryStore, "scale_up_small_nudge_rows", "database"),
+        (pending.PendingQueue, "scale_up_small_making_candidates", "queue"),
+        (engine_rebuild, "rebuild", "rebuild"),
+    ):
+        real = getattr(owner, name)
+
+        def wrapped(*args: object, _real=real, _label=label, **kwargs: object):
+            order.append(_label + (":locked" if spy.within else ""))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapped)
+    _ensure(persona)
+    assert order == ["database", "queue", "rebuild:locked"]  # the lock came after the queue step, for the rebuild only
+    (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
+    assert entry["emotions"] == pytest.approx({"pride": 3.0}) and entry["metadata"][dev_constants.NUDGE_SCALE_FIX_MARKER_KEY] is True
+    ensure_engine_ready(persona)  # a second start, and a new process's start, multiply nothing
+    EmotionEngine(persona.resolve(), now=lambda: NOW).ensure_ready()
+    (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
+    assert entry["emotions"] == pytest.approx({"pride": 3.0})
+
+
+def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catching_what_was_written_in_between(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.memory import pending
+
+    persona = _standard_persona(tmp_path)
+    pending.PendingQueue(persona).enqueue(_candidate("waiting", {"pride": 0.3}), source="maker")
+    install(persona, NOW)
+    spy = LockSpy(monkeypatch)
+    real_write = pending.write_jsonl_bytes
+
+    def refuse(*args: object, **kwargs: object):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pending, "write_jsonl_bytes", refuse)
+    with pytest.raises(EngineStartupError) as failure:
+        ensure_engine_ready(persona)
+    assert failure.value.what == "the x10 fix of small feelings" and isinstance(failure.value.cause, OSError)
+    assert spy.calls == 0 and not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
+    assert _marked(persona, "made")  # the database half had finished
+    (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
+    assert entry["emotions"] == {"pride": 0.3}  # the queue is as it was
+    # between the failed start and the next, an old writer adds a small row and a candidate
+    store = MemoryStore(persona / "memories.db")
+    try:
+        store.create(_candidate("late-row", {"pride": 0.2}), fold=False)
+    finally:
+        store.close()
+    pending.PendingQueue(persona).enqueue(_candidate("late-candidate", {"pride": 0.2}), source="maker")
+    monkeypatch.setattr(pending, "write_jsonl_bytes", real_write)
+    ensure_engine_ready(persona)
+    assert engine_files.read_switch(persona) == NOW
+    store = MemoryStore(persona / "memories.db", integrity_check=False)
+    try:
+        assert store.get("made", bump=False).emotions == pytest.approx({"pride": 4.0})  # 0.4 x 10 once, not 40
+        assert store.get("late-row", bump=False).emotions == pytest.approx({"pride": 2.0})  # caught by the retry
+    finally:
+        store.close()
+    entries = {e["id"]: e for e in pending.read_jsonl(persona / "pending_candidates.jsonl")}
+    assert entries["waiting"]["emotions"] == pytest.approx({"pride": 3.0})
+    assert entries["late-candidate"]["emotions"] == pytest.approx({"pride": 2.0})
+
+
 def test_an_uninspectable_switch_skips_the_switch_over_with_one_warning_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -366,7 +445,7 @@ def test_a_switch_that_cannot_be_inspected_only_at_the_locked_recheck_runs_x10_b
     caplog.set_level(logging.WARNING)
     ensure_engine_ready(persona)
     assert pending == []
-    assert _marker_of(persona) == dev_constants.NUDGE_SCALE_FIX_MARKER  # x10 ran and set its marker
+    assert _marked(persona, "made")  # x10 ran and marked the row it multiplied
     assert not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
     assert len([r for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]) == 1
     ensure_engine_ready(persona)  # the fault is gone
@@ -375,10 +454,12 @@ def test_a_switch_that_cannot_be_inspected_only_at_the_locked_recheck_runs_x10_b
     assert _first_state_bytes(persona) == _first_state_bytes(clean)
 
 
-def _marker_of(persona: Path) -> int:
+def _marked(persona: Path, memory_id: str) -> bool:
+    """True when the row carries the x10 fix's marker in its metadata."""
     store = MemoryStore(persona / "memories.db", integrity_check=False)
     try:
-        return store._conn.execute("PRAGMA user_version").fetchone()[0]
+        found = store.get(memory_id, bump=False)
+        return found is not None and found.metadata.get(dev_constants.NUDGE_SCALE_FIX_MARKER_KEY) is True
     finally:
         store.close()
 

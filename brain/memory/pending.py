@@ -38,8 +38,24 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl_raw, read_jsonl, write_jsonl
-from brain.memory.store import Memory, MemoryStore
+from brain import dev_constants
+from brain.health.json_io import (
+    Recovery,
+    append_jsonl,
+    encode_jsonl,
+    iter_jsonl_raw,
+    read_jsonl,
+    write_jsonl,
+    write_jsonl_bytes,
+)
+from brain.memory.store import (
+    Memory,
+    MemoryStore,
+    has_feeling_at_or_above,
+    scaled_small_emotions,
+    times_if_finite,
+)
+from brain.utils import file_ops
 from brain.utils.file_lock import file_lock
 from brain.utils.finite import clamp_nonfinite
 
@@ -80,6 +96,44 @@ GATE_BYPASS_TYPES: frozenset[str] = frozenset(
 SALIENCE_ELIGIBLE_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_emotion", "monologue_soul_candidate"}
 )
+
+# The one type of the x10 fix (`dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES`) that waits in this queue: `initiate_outbound` is a
+# gate-bypass type and `kindled_peer` rows are written straight to the database, so only a `making` can be a candidate.
+_X10_QUEUED_TYPE = "making"
+
+
+def _scaled_candidate(entry: dict, factor: float, threshold: float, marker_key: str) -> dict | None:
+    """The queue entry `entry` with its feelings multiplied and the marker set (`scale_up_small_making_candidates`), or None to leave it.
+
+    None, without a log line, for an entry that is not selected: not a `making`, already marked, or a feeling at or above the
+    threshold (the largest value is not below it). None WITH a warning naming the entry's id (never content) for an entry that
+    cannot be multiplied safely: feelings that cannot be multiplied (`store.scaled_small_emotions`), a `score` that is present
+    and not a number or whose product is not finite, or `metadata` that is not a mapping. An absent or null `score` is not
+    multiplied (`Memory.from_dict` reads null as missing); absent emotions are the empty mapping, which is selected.
+    """
+    if entry.get("memory_type") != _X10_QUEUED_TYPE:
+        return None
+    where = f"pending candidate {entry.get('id')}"
+    metadata = entry.get("metadata") or {}  # as `Memory.from_dict` reads it
+    if not isinstance(metadata, dict):
+        logger.warning("x10 fix: %s skipped, its metadata is not a mapping, so it cannot be marked", where)
+        return None
+    if metadata.get(marker_key):
+        return None
+    emotions = entry.get("emotions", {})
+    if has_feeling_at_or_above(emotions, threshold):
+        return None  # the largest value is not below the threshold: an entry already on the 0-10 scale (no warning: most are)
+    multiplied = scaled_small_emotions(emotions, factor=factor, threshold=threshold, where=where)
+    if multiplied is None:
+        return None
+    scaled = {**entry, "emotions": multiplied, "metadata": {**metadata, marker_key: True}}
+    if entry.get("score") is not None:
+        new_score = times_if_finite(entry["score"], factor)
+        if new_score is None:
+            logger.warning("x10 fix: %s skipped, its score is not a number, or its score times %s is not a finite number", where, factor)
+            return None
+        scaled["score"] = new_score
+    return scaled
 
 
 class PendingQueue:
@@ -316,6 +370,68 @@ class PendingQueue:
             if queued or queue_damaged:
                 write_jsonl(self.path, [], fsync=False)  # empty the data file (the lock sidecar is separate)
         return ClaimedBatch(self, entries)
+
+    def scale_up_small_making_candidates(self) -> int:
+        """The x10 fix of small feelings for the candidates still waiting here: returns how many entries it multiplied.
+
+        The emotion engine's first start (`brain/emotion/nudge_scale_fix.py`, step (2b) after the database half) calls this once,
+        because a `making` candidate that waits in the queue is not a `memories.db` row yet and the fix of the rows cannot reach
+        it: the gate would promote it later at the old small size (owner, Planning B21 Q10c: "They're memories so they should get
+        treated as such"). Both files are reached, the queue and the claimed batch in the processing file, under the queue's own
+        lock (the one `enqueue` and `claim` take), each replaced atomically through the shared writer, so the queue keeps one
+        writer.
+
+        An entry is selected when its type is `making`, it is not marked, and the largest of its emotion values is below the
+        threshold (the peak is not carried in an entry, so it is computed here; an empty or absent emotions mapping counts as 0
+        and is selected). The whole entry's emotions are multiplied, negatives included, and its `score` if it carries one
+        (`store.scaled_small_emotions` and `store.times_if_finite`: the rule of the database half). The marker key goes in the
+        entry's `metadata` (a top-level key would be lost: `Memory.from_dict` ignores unknown keys), which the promoted row
+        carries, so a start-up that fails later and is run again multiplies no entry twice and still catches one queued between.
+        An entry that cannot be multiplied safely is skipped with a warning naming its id and left as it was; a line that cannot
+        be parsed, a line that is not an object, and every entry not selected are written back as the shared reader yielded them
+        (their bytes without the line terminator: a blank line, a carriage return before the newline and a leading byte-order
+        mark are not kept; the app writes none of them). A file in which nothing changed is not rewritten, and with neither file
+        present nothing is created, not even the lock sidecar. The count and the ids of each file's multiplied entries are logged
+        after that file's write. A read or write fault raises with the file as it was: the caller stops the start-up, and the next start
+        runs this again (the marker makes that safe).
+        """
+        if file_ops.stat_path(self.path) is None and file_ops.stat_path(self.processing_path) is None:
+            return 0
+        factor = dev_constants.NUDGE_SCALE_FIX_FACTOR
+        threshold = dev_constants.NUDGE_SCALE_FIX_THRESHOLD
+        marker_key = dev_constants.NUDGE_SCALE_FIX_MARKER_KEY
+        count = 0
+        with file_lock(self.path):
+            for path in (self.path, self.processing_path):
+                count += self._scale_up_file(path, factor, threshold, marker_key)
+        return count
+
+    def _scale_up_file(self, path: Path, factor: float, threshold: float, marker_key: str) -> int:
+        """Rewrite one queue-shaped file with its small `making` entries multiplied; how many it multiplied (the caller holds the lock).
+
+        The count and every multiplied entry's id are logged once, right after this file's write, so the entries can be found by
+        hand if the fix ever has to be undone, even when the other file's pass then fails.
+        """
+        if file_ops.stat_path(path) is None:
+            return 0
+        lines: list[bytes] = []
+        multiplied: list[str] = []
+        # RAISE: a file that cannot be read must stop the start-up, not be skipped and rewritten without its lines.
+        for text, entry in iter_jsonl_raw(path, recover=Recovery.RAISE, bad_lines=True):
+            scaled = None if entry is None else _scaled_candidate(entry, factor, threshold, marker_key)
+            if scaled is None:
+                lines.append(text.encode("utf-8", "surrogateescape") + b"\n")
+            else:
+                lines.append(encode_jsonl(scaled, nonfinite="null"))
+                multiplied.append(str(entry.get("id")))  # type: ignore[union-attr]
+        if multiplied:
+            # Not `write_jsonl`: it decodes its payload as UTF-8, and a line kept byte for byte may not be valid UTF-8.
+            write_jsonl_bytes(path, b"".join(lines))  # atomic and durable: a failure leaves the file as it was
+            logger.info(
+                "pending queue: multiplied the feelings of %d candidate(s) in %s by %s (ids: %s)",
+                len(multiplied), path.name, dev_constants.NUDGE_SCALE_FIX_FACTOR, ", ".join(multiplied),
+            )
+        return len(multiplied)
 
 
 class ClaimedBatch:

@@ -661,6 +661,13 @@ REMOVED: tuple[Removed, ...] = (
         why="three readers of the time of the user's last turn (active buffers, the newest conversation memory, a silence-days oracle); brain.ingest.buffer.last_user_turn_ts is the one",
         ref="Engine 6 G3 (#584, draft PR #633)",
     ),
+    # --- the x10 fix is marked per row and per queued candidate, not per database (Engine 6 Q10c) ----------------------------
+    Removed(
+        names=("NUDGE_SCALE_FIX_MARKER",),
+        why="the int the x10 fix wrote to the database's `PRAGMA user_version`, which skipped the whole second pass; the fix marks each multiplied row and queued candidate in its metadata (NUDGE_SCALE_FIX_MARKER_KEY)",
+        ref="Engine 6 Q10c (#584, draft PR #633)",
+        kind="code",
+    ),
 )
 
 

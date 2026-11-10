@@ -22,7 +22,9 @@ from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
 
 
-def _memory(memory_id: str, memory_type: str, emotions: dict[str, float], *, importance: float = 3.0) -> Memory:
+def _memory(
+    memory_id: str, memory_type: str, emotions: dict[str, float], *, importance: float = 3.0, metadata: dict | None = None
+) -> Memory:
     numbers = [float(v) for v in emotions.values()]
     return Memory(
         id=memory_id,
@@ -34,6 +36,7 @@ def _memory(memory_id: str, memory_type: str, emotions: dict[str, float], *, imp
         tags=[],
         importance=importance,
         score=sum(numbers),
+        metadata=dict(metadata or {}),
         peak_emotion_intensity=max(numbers, default=0.0),
     )
 
@@ -68,7 +71,21 @@ def _read(persona: Path, memory_id: str) -> sqlite3.Row:
         connection.close()
 
 
-def _marker(persona: Path) -> int:
+def _metadata_text(persona: Path, memory_id: str) -> str:
+    connection = sqlite3.connect(persona / "memories.db")
+    try:
+        return connection.execute("SELECT metadata_json FROM memories WHERE id = ?", (memory_id,)).fetchone()[0]
+    finally:
+        connection.close()
+
+
+def _marked(persona: Path, memory_id: str, key: str | None = None) -> bool:
+    """True when the row's metadata carries the fix's marker (the key is looked up late: a test fails on its own assertion first)."""
+    meta = json.loads(_metadata_text(persona, memory_id))
+    return isinstance(meta, dict) and meta.get(key or dev_constants.NUDGE_SCALE_FIX_MARKER_KEY) is True
+
+
+def _user_version(persona: Path) -> int:
     connection = sqlite3.connect(persona / "memories.db")
     try:
         return connection.execute("PRAGMA user_version").fetchone()[0]
@@ -110,7 +127,7 @@ def test_a_row_of_another_type_is_not_multiplied_however_small(tmp_path: Path) -
     persona = _persona(tmp_path, _memory("talk", "conversation", {"joy": 0.2}), _memory("dream", "dream", {"awe": 0.3}))
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 0
     assert _unchanged(persona, "talk", {"joy": 0.2}) and _unchanged(persona, "dream", {"awe": 0.3})
-    assert _marker(persona) == dev_constants.NUDGE_SCALE_FIX_MARKER  # it ran, and found nothing to do
+    assert not _marked(persona, "talk") and not _marked(persona, "dream")  # only a multiplied row is marked
 
 
 def test_a_row_already_on_the_ten_scale_is_not_multiplied(tmp_path: Path) -> None:
@@ -140,6 +157,7 @@ def test_a_row_whose_stored_peak_is_small_while_a_feeling_is_not_is_skipped_with
     ("bad_json", "label"),
     [
         ("not json at all", "unparseable"),
+        pytest.param("[" * 200000 + "]" * 200000, "nested past the parser's limit", id="deeply nested"),
         (json.dumps(["tenderness", 0.2]), "not a mapping"),
         (json.dumps({"tenderness": "0.2"}), "a text value"),
         (json.dumps({"tenderness": True}), "a boolean value"),
@@ -194,7 +212,7 @@ def test_a_damaged_row_is_skipped_and_not_counted_and_does_not_stop_the_others(
     assert _read(persona, "bad")["peak_emotion_intensity"] == 0.2  # not multiplied
     assert _feelings(persona, "good") == pytest.approx({"tenderness": 2.0})
     assert any("bad" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
-    assert _marker(persona) == dev_constants.NUDGE_SCALE_FIX_MARKER  # one damaged row does not stop the fix for good
+    assert _marked(persona, "good") and not _marked(persona, "bad")  # one damaged row does not stop the others; it is not marked
 
 
 @pytest.mark.parametrize(
@@ -271,7 +289,7 @@ def test_a_row_count_mismatch_rolls_everything_back_marker_included(tmp_path: Pa
     with pytest.raises(RuntimeError, match="nothing was changed"):
         nudge_scale_fix.scale_up_small_feelings(persona)
     assert _unchanged(persona, "a", {"pride": 0.2}) and _unchanged(persona, "b", {"pride": 0.3})
-    assert _marker(persona) == 0
+    assert not _marked(persona, "a") and not _marked(persona, "b")
 
 
 def test_a_failure_part_way_through_the_updates_rolls_the_earlier_rows_back(tmp_path: Path) -> None:
@@ -280,36 +298,85 @@ def test_a_failure_part_way_through_the_updates_rolls_the_earlier_rows_back(tmp_
     with pytest.raises(sqlite3.DatabaseError, match="refused"):
         nudge_scale_fix.scale_up_small_feelings(persona)
     assert _unchanged(persona, "a", {"pride": 0.2}) and _unchanged(persona, "b", {"pride": 0.3})
-    assert _marker(persona) == 0
+    assert not _marked(persona, "a") and not _marked(persona, "b")
     # the failure left no transaction open: with the cause gone the next run completes
     _raw(persona, "DROP TRIGGER fail_b")
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 2
 
 
-def test_the_marker_is_set_in_the_same_transaction_and_survives_a_reopen(tmp_path: Path) -> None:
-    persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
-    assert _marker(persona) == 0
-    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
-    assert _marker(persona) == dev_constants.NUDGE_SCALE_FIX_MARKER
-    store = MemoryStore(persona / "memories.db")  # a fresh open of the file sees it
+def test_each_multiplied_row_carries_the_marker_in_its_metadata_with_its_other_keys_and_it_survives_a_reopen(tmp_path: Path) -> None:
+    persona = _persona(
+        tmp_path,
+        _memory("a", "making", {"pride": 0.2}, metadata={"keep": "me", "n": 3}),
+        _memory("b", "kindled_peer", {"warmth": 0.4}),
+        _memory("big", "making", {"pride": 4.0}),
+        _memory("talk", "conversation", {"joy": 0.2}, metadata={"keep": "too"}),
+    )
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 2
+    assert json.loads(_metadata_text(persona, "a")) == {"keep": "me", "n": 3, dev_constants.NUDGE_SCALE_FIX_MARKER_KEY: True}
+    assert _marked(persona, "b")
+    assert not _marked(persona, "big") and not _marked(persona, "talk")  # a row the fix did not multiply is not marked
+    assert json.loads(_metadata_text(persona, "talk")) == {"keep": "too"}
+    store = MemoryStore(persona / "memories.db")  # a fresh open of the file sees it, through the store's own reader
     try:
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == dev_constants.NUDGE_SCALE_FIX_MARKER
+        assert store.get("a", bump=False).metadata[dev_constants.NUDGE_SCALE_FIX_MARKER_KEY] is True
     finally:
         store.close()
+    assert _user_version(persona) == 0  # the done-check is the row marker now: `PRAGMA user_version` is neither read nor written
 
 
-def test_a_second_run_multiplies_nothing(tmp_path: Path) -> None:
+def test_a_marked_row_is_not_selected_even_though_it_is_small(tmp_path: Path) -> None:
+    key = dev_constants.NUDGE_SCALE_FIX_MARKER_KEY  # the marker as a rewritten row carries it
+    persona = _persona(
+        tmp_path,
+        _memory("done", "making", {"pride": 0.3}, metadata={key: True, "keep": 1}),
+        _memory("todo", "making", {"pride": 0.3}),
+    )
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    assert _feelings(persona, "done") == {"pride": 0.3} and _feelings(persona, "todo") == pytest.approx({"pride": 3.0})
+
+
+def test_a_second_run_multiplies_nothing_already_multiplied_and_catches_a_row_written_in_between(tmp_path: Path) -> None:
+    """The retry case: a start-up that fails after this fix is run again. A row written between the two runs (a writer on old code)
+    is caught by the second, and the first row is not multiplied twice. (Before Q10c a `PRAGMA user_version` skipped the whole second pass.)"""
     persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
-    # a row written small afterwards (an old writer) is not multiplied: the marker says the fix has run
     store = MemoryStore(persona / "memories.db")
     try:
         store.create(_memory("late", "making", {"pride": 0.2}), fold=False)
     finally:
         store.close()
-    assert nudge_scale_fix.scale_up_small_feelings(persona) == 0
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1  # only the late row
     assert _feelings(persona, "a") == pytest.approx({"pride": 2.0})  # not 20
-    assert _feelings(persona, "late") == {"pride": 0.2}
+    assert _feelings(persona, "late") == pytest.approx({"pride": 2.0})
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 0  # nothing left
+    assert _feelings(persona, "a") == pytest.approx({"pride": 2.0}) and _feelings(persona, "late") == pytest.approx({"pride": 2.0})
+
+
+@pytest.mark.parametrize("stored", ["", "null", "{}"], ids=["empty text", "json null", "empty mapping"])
+def test_a_row_with_no_metadata_is_marked_like_any_other(tmp_path: Path, stored: str) -> None:
+    persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
+    _raw(persona, "UPDATE memories SET metadata_json = ? WHERE id = ?", stored, "a")
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    assert json.loads(_metadata_text(persona, "a")) == {dev_constants.NUDGE_SCALE_FIX_MARKER_KEY: True}
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["not json {", "[1, 2]", '"text"', "7", "[" * 200000 + "]" * 200000],
+    ids=["unparseable", "a list", "a string", "a number", "nested past the parser's limit"],
+)
+def test_a_row_whose_metadata_cannot_be_read_as_a_mapping_is_skipped_with_a_warning_and_nothing_is_lost(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, stored: str
+) -> None:
+    persona = _persona(tmp_path, _memory("odd", "making", {"pride": 0.2}), _memory("fine", "making", {"pride": 0.3}))
+    _raw(persona, "UPDATE memories SET metadata_json = ? WHERE id = ?", stored, "odd")
+    caplog.set_level(logging.WARNING)
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    assert _metadata_text(persona, "odd") == stored  # kept as it was: marking it would overwrite what is there
+    assert _feelings(persona, "odd") == {"pride": 0.2}
+    assert _feelings(persona, "fine") == pytest.approx({"pride": 3.0}) and _marked(persona, "fine")
+    assert any("odd" in r.getMessage() and "skipped" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
 
 def test_the_method_refuses_to_run_inside_an_open_transaction(tmp_path: Path) -> None:
@@ -338,12 +405,12 @@ def test_the_factor_threshold_types_and_marker_come_from_dev_constants(tmp_path:
     monkeypatch.setattr(dev_constants, "NUDGE_SCALE_FIX_FACTOR", 3.0)
     monkeypatch.setattr(dev_constants, "NUDGE_SCALE_FIX_MEMORY_TYPES", ("making", "conversation"))
     monkeypatch.setattr(dev_constants, "NUDGE_SCALE_FIX_THRESHOLD", 2.0)
-    monkeypatch.setattr(dev_constants, "NUDGE_SCALE_FIX_MARKER", 7)
+    monkeypatch.setattr(dev_constants, "NUDGE_SCALE_FIX_MARKER_KEY", "a_test_key")
     assert nudge_scale_fix.scale_up_small_feelings(persona) == 3
     assert _feelings(persona, "made") == pytest.approx({"pride": 0.6})  # the factor
     assert _feelings(persona, "talk") == pytest.approx({"joy": 0.6})  # the type list
     assert _feelings(persona, "mid") == pytest.approx({"pride": 4.5})  # the threshold: 1.5 is below 2.0
-    assert _marker(persona) == 7  # the marker
+    assert _marked(persona, "made", "a_test_key")  # the marker key
 
 
 def test_the_log_names_the_count_and_every_multiplied_id_so_the_rows_can_be_found_by_hand(
@@ -377,10 +444,10 @@ class _FailingOn:
         self._real.commit()
 
 
-@pytest.mark.parametrize("fault", [{"statement": "PRAGMA user_version ="}, {"commit": True}], ids=["marker write fails", "commit fails"])
-def test_the_updates_and_the_marker_are_one_transaction_a_failure_of_either_leaves_neither(tmp_path: Path, fault: dict) -> None:
-    """If the marker were written after the commit, a crash between them would leave multiplied rows and no marker, and the next
-    start would multiply again. The marker write is the last statement before the commit: failing it, or the commit, rolls the rows back."""
+@pytest.mark.parametrize("fault", [{"statement": "UPDATE memories SET"}, {"commit": True}], ids=["update fails", "commit fails"])
+def test_the_values_and_the_marker_are_one_write_a_failure_of_the_update_or_the_commit_leaves_neither(tmp_path: Path, fault: dict) -> None:
+    """The marker is in the same UPDATE as the multiplied values, so a crash cannot leave a multiplied row with no marker (the next
+    start would multiply it again): failing the update, or the commit, leaves the row as it was and unmarked."""
     persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
     store = MemoryStore(persona / "memories.db")
     try:
@@ -391,7 +458,7 @@ def test_the_updates_and_the_marker_are_one_transaction_a_failure_of_either_leav
         store._conn = store._conn._real
         store.close()
     assert _unchanged(persona, "a", {"pride": 0.2})
-    assert _marker(persona) == 0
+    assert not _marked(persona, "a")
 
 
 # --- when the fix runs ----------------------------------------------------------------------
@@ -402,7 +469,7 @@ def test_it_is_skipped_on_a_persona_whose_switch_exists(tmp_path: Path) -> None:
     assert engine_files.write_switch(persona, NOW)
     assert nudge_scale_fix.scale_up_small_feelings(persona) is None
     assert _unchanged(persona, "a", {"pride": 0.2})
-    assert _marker(persona) == 0
+    assert not _marked(persona, "a")
 
 
 def test_it_is_skipped_when_the_switch_cannot_be_inspected_and_the_store_is_never_opened(
@@ -415,7 +482,7 @@ def test_it_is_skipped_when_the_switch_cannot_be_inspected_and_the_store_is_neve
     refuse_the_switch_stat(monkeypatch)
     assert nudge_scale_fix.scale_up_small_feelings(persona) is None
     assert opened == []
-    assert _unchanged(persona, "a", {"pride": 0.2}) and _marker(persona) == 0
+    assert _unchanged(persona, "a", {"pride": 0.2}) and not _marked(persona, "a")
 
 
 def test_it_does_nothing_and_creates_nothing_when_there_is_no_database(tmp_path: Path) -> None:

@@ -27,7 +27,7 @@ rebuilds.
 
 The switch-over and the live engine (Engine 6, #584):
 - `ensure_ready()` (the module function `ensure_engine_ready(persona_dir)` calls it): at a persona's first start it runs the
-  one-time x10 fix of small feelings (`nudge_scale_fix`), then rebuilds the state from the last 30 days under the engine lock
+  one-time x10 fix of small feelings (`nudge_scale_fix`: database rows and queued `making` candidates), then rebuilds the state from the last 30 days under the engine lock
   (`engine_rebuild.rebuild`, which writes `state/emotion_switch.json` last). A switch that cannot be inspected skips all of it
   for this start with one warning (owner 2026-11-05: assume not switched); any other failure raises `EngineStartupError`.
 - `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
@@ -914,14 +914,15 @@ class EmotionEngine:
         1. The switch is asked through `_switch_seen` (cached when seen): seen, return at once (no transaction, no lock).
         Not inspectable (None, owner 2026-11-05): skip the whole switch-over for this start with one warning and return; no x10
         fix, no lock, no rebuild, no write, nothing cached, and the next start asks again.
-        2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock.
+        2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock: the rows of `memories.db`, then the `making`
+        candidates still waiting in the pending queue.
         3. The engine lock, taken once, the switch asked again under it (a second process that waited runs nothing), then
         `engine_rebuild.rebuild` in first mode with the lock held, which writes the switch last. The clock is read once inside
         the hold.
 
         Any other failure (the x10 error or its integrity check, a lock that did not come, a failed rebuild check or write) is
         logged and raised as `EngineStartupError(what, cause)`; a failure stops start-up and the next start runs it again (every
-        step is idempotent: the marker, the empty-state rebuild, the write-once switch).
+        step is idempotent: the per-row and per-candidate marker, the empty-state rebuild, the write-once switch).
         """
         seen = self._switch_seen()
         if seen is True:

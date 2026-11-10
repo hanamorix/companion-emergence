@@ -136,16 +136,18 @@ EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 # model's deltas scaled so a peer's total stays within `KINDLED_LINK_PEER_EMOTION_WINDOW_CAP`). At the engine's first start
 # the one-time fix (`brain/emotion/nudge_scale_fix.py`) multiplies the feelings, the score and the
 # peak of those rows by the factor, but only for a row whose stored peak and every stored feeling are below the threshold (a
-# row with any value of 1 or more is not multiplied), and records that it ran by setting the database's `PRAGMA user_version`
-# to the marker. The list comes from a survey of every writer of feelings in `brain/`;
-# `tests/unit/brain/emotion/test_nudge_scale_types.py` drives each known writer against it.
+# row with any value of 1 or more is not multiplied). It records each row it multiplied by setting the marker key in the row's
+# `metadata` (and the same key in the `metadata` of a `making` candidate still waiting in the pending queue, which it
+# multiplies the same way), and only unmarked rows and candidates are selected, so a start-up that fails after the fix and is
+# run again never multiplies one twice and still catches what was written in between. The list comes from a survey of every
+# writer of feelings in `brain/`; `tests/unit/brain/emotion/test_nudge_scale_types.py` drives each known writer against it.
 # They are separate named constants on purpose: the factor is the scale change itself, not the engine's value cap
-# (`EMOTION_VALUE_CAP`); "below 1" is the owner's rule for what counts as a small row; the marker is a format version of
-# the one-time fix. None is a tunable. They go with `nudge_scale_fix.py` when #388 removes it.
+# (`EMOTION_VALUE_CAP`); "below 1" is the owner's rule for what counts as a small row; the marker key names a stored format
+# of the one-time fix. None is a tunable. They go with `nudge_scale_fix.py` when #388 removes it.
 NUDGE_SCALE_FIX_MEMORY_TYPES: tuple[str, ...] = ("initiate_outbound", "kindled_peer", "making")
 NUDGE_SCALE_FIX_FACTOR: float = 10.0
 NUDGE_SCALE_FIX_THRESHOLD: float = 1.0
-NUDGE_SCALE_FIX_MARKER: int = 1
+NUDGE_SCALE_FIX_MARKER_KEY: str = "nudge_scale_fixed"
 
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
