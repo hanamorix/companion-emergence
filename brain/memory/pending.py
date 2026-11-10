@@ -78,7 +78,13 @@ GATE_BYPASS_TYPES: frozenset[str] = frozenset(
 # still exempt, same as before. Owner directive (Roy, 2026-08-11) — a single
 # flat floor would nuke legitimate flat content.
 SALIENCE_ELIGIBLE_TYPES: frozenset[str] = frozenset(
-    {"monologue", "monologue_emotion", "monologue_soul_candidate"}
+    {
+        "monologue",
+        # monologue_emotion is in GATE_BYPASS_TYPES, so it skips the queue and this entry can only match a queue line
+        # written before the bypass, which cannot be ruled out. It goes when the gate goes (Phase 5).
+        "monologue_emotion",
+        "monologue_soul_candidate",
+    }
 )
 
 

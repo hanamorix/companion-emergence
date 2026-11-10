@@ -192,8 +192,12 @@ def test_main_prints_the_report_and_exits_zero(tmp_path, capsys):
     assert code == 0
     assert out.startswith("# Feels-high threshold measurement")
     assert "host: " in out
+    assert "| reader row | floor 0 | floor 0.5 |" in out  # one column per floor and no column for the old reader
 
 
+@pytest.mark.no_base_failure(
+    reason="pins the one-line abort of the source step; that step moved into this script unchanged, so the old script gave the same line"
+)
 def test_a_path_that_is_not_a_file_aborts_with_the_one_line_message(tmp_path, capsys):
     code = mod.main([str(tmp_path / "absent.db")])
 
