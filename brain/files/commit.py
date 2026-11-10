@@ -2,6 +2,7 @@
 Wires a file_write memory + feed event either way."""
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import stat
@@ -10,10 +11,57 @@ from pathlib import Path
 
 from brain.files import pending
 from brain.files.audit import audit
+from brain.files.path_identity import stat_or_none as _stat_or_none
 from brain.files.write_guard import _MAX_RESULT_FILE_BYTES, check_size, check_write_target
 from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
+
+
+class _TargetChangedError(OSError):
+    """The file commit opened is not the one the guard checked (#694)."""
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # POSIX; Windows has no symlink-following open to refuse
+_BINARY = getattr(os, "O_BINARY", 0)  # Windows: a raw fd is CRT text mode otherwise, translating "\n" a second time
+
+
+def _open_target(path: Path, op: str, expect: os.stat_result | None):
+    """Open the approved target and check the OPENED file, not the path (#694).
+
+    The guard checks a path, then this opens it again, so anything swapped in
+    between (a hard link to ~/.ssh/authorized_keys, a symlink) would be written
+    to. The last component is opened without following a symlink; a create uses
+    O_EXCL, so it can only make a new file; an append must reopen the same file
+    the guard saw. Either way the opened file must be a regular file with exactly
+    one link. Returns a text file (utf-8, newline translation as before) and
+    whether an append needs a separating newline.
+    """
+    try:
+        if op == "create":
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o666)
+        else:
+            fd = os.open(path, os.O_RDWR | os.O_APPEND | _NOFOLLOW | _BINARY)
+    except FileExistsError as exc:  # something appeared at a create target after it was checked
+        raise _TargetChangedError(f"refused: {path} appeared after it was checked") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # the last component became a symlink after it was checked
+            raise _TargetChangedError(f"refused: {path} became a symlink after it was checked") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise _TargetChangedError(f"refused: {path} changed after it was checked (not a single-link file)")
+        if expect is not None and not os.path.samestat(st, expect):
+            raise _TargetChangedError(f"refused: {path} was replaced after it was checked")
+        needs_separator = False
+        if op == "append" and st.st_size > 0:  # #100: don't run the new block into the last line
+            os.lseek(fd, -1, os.SEEK_END)
+            needs_separator = os.read(fd, 1) != b"\n"
+        return os.fdopen(fd, "a" if op == "append" else "w", encoding="utf-8"), needs_separator
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _wire_memory(store, *, path: str, outcome: str) -> None:
@@ -72,6 +120,10 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     op, content = rec["op"], rec["content"]
     # TOCTOU: re-run the guard on the resolved path RIGHT NOW.
     g = check_write_target(rec["resolved_path"], op=op, persona_dir=persona_dir)
+    # the identity the guard just approved; the opened file must still be it (#694)
+    expect = _stat_or_none(g.resolved) if g.ok and op == "append" else None
+    if g.ok and op == "append" and expect is None:
+        g = type(g)(ok=False, error=f"append target vanished after it was checked: {g.resolved}")
     if not g.ok or not check_size(content, op=op, resolved=g.resolved).ok:
         err = g.error or "size check failed"
         pending.mark(persona_dir, rid, status="refused")
@@ -100,19 +152,18 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
 
     try:
         g.resolved.parent.mkdir(parents=True, exist_ok=True)
-        mode = "w" if op == "create" else "a"
         # #100: an append must not run together with the block before it.
         # write_guard already requires the target to exist for append, so the
         # only run-together case is a non-empty file with no trailing newline.
-        needs_separator = False
-        if mode == "a" and g.resolved.exists() and g.resolved.stat().st_size > 0:
-            with g.resolved.open("rb") as probe:
-                probe.seek(-1, os.SEEK_END)
-                needs_separator = probe.read(1) != b"\n"
-        with g.resolved.open(mode, encoding="utf-8") as f:
+        f, needs_separator = _open_target(g.resolved, op, expect)
+        with f:
             if needs_separator:
                 f.write("\n")
             f.write(content)
+    except _TargetChangedError as exc:
+        pending.mark(persona_dir, rid, status="refused")
+        audit(persona_dir, event="commit_refused", id=rid, op=op, path=str(g.resolved), error=str(exc))
+        return {"ok": False, "error": str(exc)}
     except OSError as exc:
         pending.mark(persona_dir, rid, status="error")
         audit(persona_dir, event="error", id=rid, op=op, path=str(g.resolved), error=str(exc))
