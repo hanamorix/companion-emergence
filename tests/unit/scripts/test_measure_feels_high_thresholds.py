@@ -175,6 +175,16 @@ def test_the_script_runs_end_to_end_on_the_engine_rule_alone(tmp_path):
     assert "| reader row | floor 0 | floor 0.1 | floor 1 |" in text
     assert "| old " not in text and "old fixed" not in text
     assert "### R and the proposal" in text
+    # Every section of the report is still printed (a silent loss of one would otherwise pass).
+    for section in (
+        "By part, per floor",
+        "Near-zero firings after day 30",
+        "Present feelings whose highest short average",
+        "body_strain mean:",
+        "maker discharges:",
+        "host: ",
+    ):
+        assert section in text, section
     # The rule fires on this history: the love temperature row has floor-0 firings after day 30.
     after_30 = text.split("Firing counts, after day 30")[1].split("Firing counts, all ticks")[0]
     love_row = next(line for line in after_30.splitlines() if line.startswith("| temperature: love |"))

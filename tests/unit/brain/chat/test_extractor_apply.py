@@ -127,9 +127,8 @@ def test_empty_output_writes_nothing(persona_dir: Path):
 def test_emotion_delta_applies_memory_with_emotion(persona_dir: Path):
     """Emotion delta writes a memory carrying the emotion channels to MemoryStore.
 
-    The emotion system derives state from memory aggregation — the monologue
-    write acts as a tiny influence event. We verify a memory was committed
-    with the emotion vector and that no exception was raised.
+    The monologue write is a tiny emotion-carrying row. We verify a memory was
+    committed with the emotion vector and that no exception was raised.
     """
     from brain.memory.store import MemoryStore
 

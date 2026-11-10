@@ -21,9 +21,9 @@ Actions:
 
 The emotion write mirrors ``brain/chat/extractor.py::_apply_emotion_delta`` — a
 tiny emotion-carrying Memory committed through MemoryStore, importance from
-magnitude. There is no separate persisted emotion file; felt state is derived
-from memory aggregation, so this is the correct (non-bypassing) way to influence
-it.
+magnitude. The old max-pool read of such rows (``aggregate_state``) is removed
+and the engine's fold does not count them, so the row feeds no felt state; the
+writer is due to be replaced by one that folds the shift into the engine.
 """
 from __future__ import annotations
 
