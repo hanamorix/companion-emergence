@@ -16,8 +16,9 @@ import pytest
 
 from brain import dev_constants
 from brain.emotion import engine_files, nudge_scale_fix
+from brain.emotion.engine_utils import EngineState
 from brain.memory.store import Memory, MemoryStore
-from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
+from tests.unit.brain.emotion._engine_support import make_live, ruin_the_state
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
 
@@ -464,22 +465,32 @@ def test_the_values_and_the_marker_are_one_write_a_failure_of_the_update_or_the_
 # --- when the fix runs ----------------------------------------------------------------------
 
 
-def test_it_is_skipped_on_a_persona_whose_switch_exists(tmp_path: Path) -> None:
+def test_it_is_skipped_on_a_persona_whose_state_holds_the_switch_over_time(tmp_path: Path) -> None:
     persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
-    assert engine_files.write_switch(persona, NOW)
+    make_live(persona, NOW)
     assert nudge_scale_fix.scale_up_small_feelings(persona) is None
     assert _unchanged(persona, "a", {"pride": 0.2})
     assert not _marked(persona, "a")
 
 
-def test_it_is_skipped_when_the_switch_cannot_be_inspected_and_the_store_is_never_opened(
+def test_it_runs_on_a_persona_with_a_state_that_holds_no_switch_over_time(tmp_path: Path) -> None:
+    """A shadow state (what the engine wrote before the switch-over) is not a switch-over."""
+    persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
+    engine_files.save_state(persona, EngineState(saved_at=NOW))
+    assert engine_files.switch_over_state(engine_files.read_state(persona)) is False  # the rule the fix asks
+    assert nudge_scale_fix.scale_up_small_feelings(persona) == 1
+    assert _marked(persona, "a")
+
+
+def test_it_is_skipped_when_the_state_cannot_be_read_and_the_store_is_never_opened(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     persona = _persona(tmp_path, _memory("a", "making", {"pride": 0.2}))
+    engine_files.save_state(persona, EngineState(saved_at=NOW))
+    ruin_the_state(persona)  # cannot tell whether the persona was switched over: nothing irreversible runs
     opened: list[object] = []
     real = nudge_scale_fix.MemoryStore
     monkeypatch.setattr(nudge_scale_fix, "MemoryStore", lambda *a, **k: opened.append(a) or real(*a, **k))
-    refuse_the_switch_stat(monkeypatch)
     assert nudge_scale_fix.scale_up_small_feelings(persona) is None
     assert opened == []
     assert _unchanged(persona, "a", {"pride": 0.2}) and not _marked(persona, "a")

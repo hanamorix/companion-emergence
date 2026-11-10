@@ -27,12 +27,10 @@ from tests.unit.brain.emotion._engine_support import (
     queue,
     queue_events,
     queue_text_lines,
-    refuse_the_switch_stat,
     ruin_the_state,
     save,
     showing,
     simple_state,
-    skipped_warnings,
     state_of,
     tree,
 )
@@ -138,7 +136,7 @@ def test_the_early_out_does_not_fire_with_a_missing_or_unreadable_state_and_neve
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    engine.note_active(D[3])  # an unreadable state on a persona whose switch is missing: starts empty and writes
+    engine.note_active(D[3])  # an unreadable state on a persona not seen switched over: starts empty and writes
     assert len(spy.within) == 3
 
 
@@ -357,47 +355,23 @@ def test_an_unreadable_state_on_a_persona_that_is_not_live_is_replaced_by_an_emp
     assert saves == []
 
 
-def test_with_the_switch_unknown_a_drain_over_an_unreadable_state_skips_the_pass_and_keeps_everything(
-    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_drain_over_an_unreadable_state_of_a_persona_this_instance_saw_switched_over_flags_it_and_keeps_everything(
+    persona: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Owner 2026-11-05: an unknown switch is "not switched". A not-switched persona would start from an empty state, which
-    replaces the stored one, so with the switch unknown the pass is skipped: nothing is written, the queue is kept."""
-    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    """A switched persona's state is never replaced by an empty one: the pass is marked failed, nothing is written, the queue is
+    kept, and the recovery job repairs it. (An instance that never saw the switch-over cannot tell, and starts empty: the test
+    above, accepted edge (a) of Planning B25 SW2.)"""
+    save(persona, simple_state(saved_at=D[3], day=_day(3), switch_over_at=D[1]))
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
+    engine = install(persona, D[5])
+    assert engine.is_live()
     ruin_the_state(persona)
-    queue(persona, showing("m1", D[4], {"joy": 6.0}))
-    engine = install(persona, D[5])
     before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
         engine.note_active(D[5])
-    assert len(skipped_warnings(caplog)) == 1
-    assert engine_errors(caplog) == []  # not a failure of a switched persona
-    assert engine._catch_up_failed is False  # no failure flag is set either
-    engine.note_active(D[5])  # the next pass skips again, and still changes nothing
-    assert tree(persona / "state") == before  # the stored state, its copies and the queue lines are exactly as they were
+    assert len(engine_errors(caplog)) == 1 and engine._catch_up_failed is True
+    assert tree(persona / "state") == before  # the stored copies and the queue lines are exactly as they were
     assert len(queue_events(persona)) == 1
-    monkeypatch.undo()  # the fault clears: the switch is known missing, so the retry starts empty and consumes the queue
-    engine.note_active(D[5])
-    assert queue_events(persona) == []
-    assert state_of(persona).emotions["joy"].short.avg == 6.0
-
-
-def test_with_the_switch_unknown_a_drain_over_a_missing_state_skips_the_pass_and_keeps_the_queue(
-    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    queue(persona, showing("m1", D[4], {"joy": 6.0}))
-    engine = install(persona, D[5])
-    before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
-    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
-        engine.note_active(D[5])
-    assert len(skipped_warnings(caplog)) == 1
-    assert engine_errors(caplog) == []
-    assert not engine_files.state_path(persona).exists()
-    assert tree(persona / "state") == before and len(queue_events(persona)) == 1
-    monkeypatch.undo()
-    engine.note_active(D[5])
-    assert queue_events(persona) == [] and state_of(persona).emotions["joy"].short.avg == 6.0
 
 
 # --- the stamp (V1, B17) and the time given -------------------------------------------------------------------

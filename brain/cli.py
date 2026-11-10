@@ -1007,8 +1007,8 @@ def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
 
     Called by the six commands that touch the engine, right after their own vocabulary load. A real run calls
     `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and a failure raises `EngineStartupError`
-    out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona whose
-    switch is not seen (not switched yet, or its switch file cannot be read: the fail-safe answer is "not switched") it prints a
+    out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
     plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
     on a switched persona it goes on as today.
     """
@@ -1017,9 +1017,9 @@ def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
         return None
     if emotion_engine.engine_for(persona_dir).is_live():
         return None
-    if engine_files.switch_state(persona_dir) is None:
+    if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is None:
         message = (
-            f"This persona's emotion switch file ({engine_files.switch_path(persona_dir)}) cannot be read, so its emotion engine "
+            f"This persona's emotion state file ({engine_files.state_path(persona_dir)}) cannot be read, so its emotion engine "
             "counts as not switched, and a dry run writes nothing. Nothing was run. Check that the file and its folder are "
             "readable, then try again."
         )

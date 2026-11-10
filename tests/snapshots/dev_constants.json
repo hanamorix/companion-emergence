@@ -28,7 +28,6 @@
   "EMOTION_STATE_FILENAME": "'emotion_state.json'",
   "EMOTION_SUMMARY_COUNT": "3",
   "EMOTION_SUMMARY_MODE": "'long'",
-  "EMOTION_SWITCH_FILENAME": "'emotion_switch.json'",
   "EMOTION_VALUE_CAP": "10.0",
   "FADE_IMPORTANCE_GAIN": "2.0",
   "FADE_THRESHOLD": "0.25",

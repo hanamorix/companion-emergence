@@ -127,7 +127,6 @@ EMOTION_LOCK_WAIT_S: float = 5.0
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
 EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
-EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 
 # --- the one-time x10 fix of small feelings (emotion rework, Engine 6, #584) ------------------------------------------

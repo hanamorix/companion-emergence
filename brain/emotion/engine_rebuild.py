@@ -3,7 +3,7 @@
 `replay` folds what happened in a window of time into a state: the rows of `memories.db` created or opened in it, the day each
 row was written on, and the change-log lines. `catch_up` is the recovery-first step (design 2.8, "Recovery first", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`): a state that had to be loaded
 from a backup copy is replayed forward from that copy's `saved_at` to now. `rebuild` builds a whole state from the last 30 days
-of rows and the change log: at a persona's first start (the switch-over, which writes the switch file last) and as the recovery
+of rows and the change log: at a persona's first start (the switch-over, which records `switch_over_at` in its one state write) and as the recovery
 of a live persona whose state cannot be used. Both read the window through `_read_window`.
 
 All three are called with the engine's lock already held by the caller (the drain, a direct apply or a batch, the first start, the
@@ -280,6 +280,7 @@ def rebuild(
     *,
     faded_emotions_of: Callable[[Memory], Mapping[str, float]],
     modifier_of: Callable[[Memory], float],
+    switch_over_at: datetime | None = None,
 ) -> None:
     """Build the engine's state from the last 30 days of `memories.db` and the change log, and write it (Engine 6, #584).
 
@@ -288,6 +289,14 @@ def rebuild(
     window and creates nothing) or "recovery" (a live persona whose state cannot be used: the faded values `faded_emotions_of`
     gives, faded to this rebuild's clock as `catch_up` does; a missing `memories.db` raises `CatchUpError`, because an empty
     rebuild would rotate a readable backup out). `modifier_of` is the trust-aware weight, as for `catch_up`.
+
+    The switch-over time. First mode records it as the rebuild's own `now`, in the one verified state write (there is no
+    switch file). A recovery rebuild copies it from the old state it loads (main, or a backup copy: the walk accepts either),
+    so a recovered persona stays switched over; when no readable copy holds one it uses `switch_over_at`, the value the
+    caller's engine already saw, and when it has neither it refuses (`RebuildCheckError`, nothing written): a recovered
+    state without the field would read as not switched. Accepted edge (Planning B25 SW2): a backup copy older than the first
+    rebuild holds no `switch_over_at` (see `engine_files.switch_over_state`, edge (b)); a recovery that loaded only such a copy
+    takes `switch_over_at` from the caller.
 
     The window is `now - EMOTION_LONG_HALF_LIFE_D days` up to now; a row dated after `now` is folded at `now` (the window has
     no creation upper bound). The state is built from empty by `replay` (no stop) and the days close at `now`. Past days are
@@ -298,10 +307,9 @@ def rebuild(
 
     The order is fixed. (1) The check (`_check_rebuilt`). (2) The queue step: `empty_queue`, then the new state's `queue_line` is 0;
     if the emptying fails, `queue_line` is the queue's end line, so no line is folded on top of the rebuild. (3) ONE
-    `save_state(..., verify=True)` with `saved_at` and `reset_at` both `now`; a False result is a failed check. (4) First mode
-    only: `state/emotion_switch.json` is written LAST; a False return means a switch already exists and counts as done. A failed
-    check or write raises (`RebuildCheckError`, or the writer's own error) and the old state stays. Nothing is written before
-    step 2, so a failed check leaves the queue intact.
+    `save_state(..., verify=True)` with `saved_at` and `reset_at` both `now` and `switch_over_at` set as above; a False result
+    is a failed check. That write is the last step of the switch-over. A failed check or write raises (`RebuildCheckError`, or
+    the writer's own error) and the old state stays. Nothing is written before step 2, so a failed check leaves the queue intact.
     """
     if mode not in ("first", "recovery"):
         raise ValueError(f"mode must be 'first' or 'recovery', found {mode!r}")
@@ -324,12 +332,19 @@ def rebuild(
     changes = engine_files.read_changes(persona_dir, after)
 
     previous_start: datetime | None = None
+    carried_switch: datetime | None = None
     if mode == "recovery":
         # E1.4a (accepted): with no readable old state (the state and all three backups unreadable), `persona_start_at` has only
         # the oldest row to go on, and the write-back moves a row's creation time forward, so the gate can only stay shut
         # longer, by at most 30 days. No source exists that the write-back cannot move; there is no later fix.
         previous = engine_files.read_state(persona_dir).state
         previous_start = None if previous is None else previous.persona_start_at
+        carried_switch = previous.switch_over_at if previous is not None and previous.switch_over_at is not None else switch_over_at
+        if carried_switch is None:
+            raise RebuildCheckError(
+                "no readable copy of the state holds the switch-over time and the caller has none to carry: "
+                "a recovered state without it would read as not switched"
+            )
 
     if mode == "first":
         emotions_of = _stored_emotions
@@ -377,6 +392,7 @@ def rebuild(
     starts = [t for t in (window.oldest, state.persona_start_at, previous_start) if t is not None]
     state.persona_start_at = min(starts, default=None)
     state.saved_at = state.reset_at = now
+    state.switch_over_at = now if mode == "first" else carried_switch
     _check_rebuilt(state)
 
     # E7.18 (accepted): a change still queued at a rebuild with no change-log line (a failed append, or phase B, which writes no
@@ -388,8 +404,6 @@ def rebuild(
         state.queue_line = engine_files.read_queue(persona_dir, from_line=0).end_line
     if not engine_files.save_state(persona_dir, state, verify=True):
         raise RebuildCheckError("the rebuilt state did not verify after it was written (the previous copy is put back when there is one)")
-    if mode == "first":
-        engine_files.write_switch(persona_dir, now)  # False: a switch already exists, which is as good as written
 
 
 def _stored_emotions(memory: Memory) -> Mapping[str, float]:

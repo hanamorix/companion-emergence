@@ -3,7 +3,7 @@
 The bridge lifespan calls it between the vocabulary load and the engine's start-up drain, and a failure stops start-up before the
 supervisor thread is spawned. Six `nell` commands (chat in-process, heartbeat, dream, reflex, research, soul review) call it
 through one helper right after their own vocabulary load; five of them take `--dry-run`, which writes nothing and so cannot do the
-switch-over: on a persona whose switch is not seen (not switched, or a switch file that cannot be read) it refuses with a plain
+switch-over: on a persona that is not live (not switched, or an emotion state that cannot be read) it refuses with a plain
 message and runs nothing. Personas here are tmp directories with synthetic rows; nothing touches a real persona.
 
 Two shapes of test: with the shared recording stub (`emotion_engine_stub`) for ORDER ("ensure" between "vocabulary" and the first
@@ -31,9 +31,10 @@ from tests.unit.brain.emotion._engine_support import (
     LockSpy,
     local_day,
     local_noon,
+    make_live,
     make_persona,
-    refuse_the_switch_stat,
     row,
+    ruin_the_state,
 )
 
 T35 = local_noon(local_day(35))
@@ -121,7 +122,7 @@ def test_a_first_start_through_each_command_leaves_the_switch_before_the_first_w
     order: list[str] = []
     switched_at_work: list[bool] = []
     _record_vocabulary_and_stop_at_the_first_work(
-        monkeypatch, order, at_work=lambda: switched_at_work.append(engine_files.switch_exists(cli_persona))
+        monkeypatch, order, at_work=lambda: switched_at_work.append(engine.engine_for(cli_persona).is_live())
     )
     spy = LockSpy(monkeypatch)
     with pytest.raises(_StopError):
@@ -155,11 +156,11 @@ def test_a_dry_run_refuses_with_a_plain_message_and_runs_nothing_while_the_perso
 
 
 @pytest.mark.parametrize(("name", "argv"), FIVE_DRY_RUN_COMMANDS, ids=[name for name, _ in FIVE_DRY_RUN_COMMANDS])
-def test_a_dry_run_on_a_persona_whose_switch_file_cannot_be_inspected_refuses_the_same_way(
+def test_a_dry_run_on_a_persona_whose_state_cannot_be_read_refuses_the_same_way(
     name: str, argv: list[str], cli_persona: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert engine_files.write_switch(cli_persona, T35)  # switched, but the stat of the switch file is refused: not "seen"
-    refuse_the_switch_stat(monkeypatch)
+    make_live(cli_persona, T35)  # switched over, but no copy of the state can be read: cannot tell, so not switched
+    ruin_the_state(cli_persona)
     order: list[str] = []
     _record_vocabulary_and_stop_at_the_first_work(monkeypatch, order)
     files_before = _files_under(cli_persona)
@@ -167,7 +168,7 @@ def test_a_dry_run_on_a_persona_whose_switch_file_cannot_be_inspected_refuses_th
     assert order == ["vocabulary"]
     assert _files_under(cli_persona) == files_before
     message = capsys.readouterr().err
-    assert "cannot be read" in message and engine_files.switch_path(cli_persona).name in message  # the cause is named, not "run it first"
+    assert "cannot be read" in message and engine_files.state_path(cli_persona).name in message  # the cause is named, not "run it first"
     assert "without --dry-run" not in message
 
 
@@ -243,7 +244,7 @@ def test_a_first_start_of_the_bridge_switches_the_persona_over_before_the_superv
     switched_when_spawned: list[bool] = []
 
     def fake_run_supervised(stop_event, **_kw):  # noqa: ANN001
-        switched_when_spawned.append(engine_files.switch_exists(persona_dir))
+        switched_when_spawned.append(engine.engine_for(persona_dir).is_live())
         stop_event.wait()
 
     monkeypatch.setattr(supervisor_mod, "run_supervised", fake_run_supervised)
@@ -253,17 +254,20 @@ def test_a_first_start_of_the_bridge_switches_the_persona_over_before_the_superv
     assert engine_files.read_state(persona_dir).state is not None
 
 
-def test_a_bridge_whose_switch_file_cannot_be_inspected_starts_and_skips_the_switch_over(
+def test_a_bridge_whose_state_cannot_be_read_starts_and_skips_the_switch_over(
     persona_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     make_persona(persona_dir, [row(T35, emotions={"joy": 6.0}, mid="seed")])
-    assert engine_files.write_switch(persona_dir, T35 - timedelta(days=1))
-    refuse_the_switch_stat(monkeypatch)
+    make_live(persona_dir, T35 - timedelta(days=1))
+    ruin_the_state(persona_dir)
     spawned = _supervisor_spawns(monkeypatch)
     with caplog.at_level(logging.WARNING, logger="brain.emotion.engine"):
         with TestClient(build_app(persona_dir=persona_dir, client_origin="tests", background_threads=True)):
             assert engine.engine_for(persona_dir).is_live() is False
-    assert spawned == ["supervisor"]  # an unknown switch is not a failure: the bridge comes up
+    assert spawned == ["supervisor"]  # an unreadable state is not a failure: the bridge comes up
     skip_lines = [r.getMessage() for r in caplog.records if "skips the switch-over" in r.getMessage()]
-    assert skip_lines and "cannot be inspected" in skip_lines[0]
-    assert not engine_files.state_path(persona_dir).exists()  # nothing was rebuilt or written
+    assert skip_lines and "cannot be read" in skip_lines[0]
+    # `ensure` rebuilt nothing and recorded no switch-over (no x10 either); the start-up drain that follows it starts the
+    # unreadable state over from an empty one (accepted edge (a), Planning B25 SW2), so the next start runs the switch-over again
+    after = engine_files.read_state(persona_dir).state
+    assert after is not None and after.switch_over_at is None and after.emotions == {}

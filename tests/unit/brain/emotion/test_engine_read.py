@@ -20,6 +20,8 @@ from tests.unit.brain.emotion._engine_support import (
     install,
     local_day,
     local_noon,
+    lose_the_state,
+    make_live,
     make_persona,
     save,
     save_as_backup,
@@ -99,8 +101,10 @@ def test_read_is_empty_while_the_state_is_missing_unreadable_or_flagged_and_take
 
 def test_read_is_empty_while_a_catch_up_failed(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _no_refresh(monkeypatch)
-    engine_files.write_switch(persona, D[1])
+    make_live(persona, D[1])
     eng = install(persona, D[8])
+    assert eng.is_live()  # the running engine has seen the switch-over; the state is gone afterwards
+    lose_the_state(persona)
     eng.note_active(D[8])  # a live persona with no state: flagged
     save(persona, _two_emotion_state())
     assert eng.read() == {}

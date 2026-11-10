@@ -34,9 +34,10 @@ from tests.unit.brain.emotion._engine_support import (
     install,
     local_day,
     local_noon,
+    lose_the_state,
+    make_live,
     make_persona,
     queue,
-    refuse_the_switch_stat,
     row,
     ruin_the_state,
     save,
@@ -52,9 +53,9 @@ NOW = T[40] + timedelta(hours=3)  # local 3 PM of day 40: the clock of every cas
 LOGGER = "brain.emotion.engine"
 
 
-def simple_state(*, saved_at: datetime, joy: float = 4.0) -> EngineState:
+def simple_state(*, saved_at: datetime, joy: float = 4.0, switch_over_at: datetime | None = None) -> EngineState:
     """The shared small state, with its open day set (a state with `last_update` and no `active_day` is not one the reader accepts)."""
-    return _support_simple_state(saved_at=saved_at, joy=joy, day=day_of(saved_at))
+    return _support_simple_state(saved_at=saved_at, joy=joy, day=day_of(saved_at), switch_over_at=switch_over_at)
 
 
 def _standard_rows() -> list[Memory]:
@@ -77,8 +78,9 @@ def _ensure(persona: Path, now: datetime = NOW) -> EmotionEngine:
     return instance
 
 
-def _first_state_bytes(persona: Path) -> tuple[bytes, bytes]:
-    return engine_files.state_path(persona).read_bytes(), engine_files.switch_path(persona).read_bytes()
+def _first_state_bytes(persona: Path) -> bytes:
+    """The state file a first start leaves: it holds the switch-over time, so two clean first runs are byte for byte equal."""
+    return engine_files.state_path(persona).read_bytes()
 
 
 def _stored(memory: Memory):
@@ -89,8 +91,15 @@ def _unit_modifier(_: Memory) -> float:
     return 1.0
 
 
-def _rebuild(persona: Path, mode: str, now: datetime = NOW, *, faded=None, modifier=None) -> None:
-    engine_rebuild.rebuild(persona, mode, now, faded_emotions_of=faded or _stored, modifier_of=modifier or _unit_modifier)
+def _rebuild(persona: Path, mode: str, now: datetime = NOW, *, faded=None, modifier=None, switch_over_at: datetime | None = None) -> None:
+    engine_rebuild.rebuild(
+        persona,
+        mode,
+        now,
+        faded_emotions_of=faded or _stored,
+        modifier_of=modifier or _unit_modifier,
+        switch_over_at=switch_over_at,
+    )
 
 
 def _x10():
@@ -120,13 +129,13 @@ class _Spy:
 # ================================================================================================
 
 
-def test_a_first_start_runs_x10_takes_the_lock_once_empties_the_queue_writes_one_verified_state_then_the_switch(
+def test_a_first_start_runs_x10_takes_the_lock_once_empties_the_queue_and_writes_one_verified_state_that_records_the_switch_over(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     persona = _standard_persona(tmp_path)
     spy = LockSpy(monkeypatch)
     order: list[object] = []
-    for module, name in ((_x10(), "scale_up_small_feelings"), (engine_files, "empty_queue"), (engine_files, "save_state"), (engine_files, "write_switch")):
+    for module, name in ((_x10(), "scale_up_small_feelings"), (engine_files, "empty_queue"), (engine_files, "save_state")):
         real = getattr(module, name)
 
         def wrapped(*args: object, _real=real, _name=name, **kwargs: object):
@@ -135,13 +144,14 @@ def test_a_first_start_runs_x10_takes_the_lock_once_empties_the_queue_writes_one
 
         monkeypatch.setattr(module, name, wrapped)
     _ensure(persona)
-    assert order == [("scale_up_small_feelings", None), ("empty_queue", None), ("save_state", True), ("write_switch", None)]
+    # the verified state write is the last step: it carries the switch-over time, and no other write follows it
+    assert order == [("scale_up_small_feelings", None), ("empty_queue", None), ("save_state", True)]
     assert spy.within == [(engine_files.state_path(persona), dev_constants.EMOTION_LOCK_WAIT_S)]  # the lock, once, with the wait
     # x10 ran before the rebuild read the rows: the small making row was multiplied, and the rebuild folded its 4.0
     assert state_of(persona).emotions["pride"].short.avg == pytest.approx(4.0)
     assert engine_files.queue_path(persona).read_text(encoding="utf-8") == ""  # emptied, not deleted
     assert state_of(persona).queue_line == 0
-    assert engine_files.read_switch(persona) == NOW  # the switch holds the rebuild's own clock
+    assert state_of(persona).switch_over_at == NOW  # the rebuild's own clock, in the same write as saved_at and reset_at
     assert state_of(persona).saved_at == state_of(persona).reset_at == NOW
 
 
@@ -158,14 +168,22 @@ def test_a_second_start_returns_with_no_store_open_and_no_lock(tmp_path: Path, m
     assert instance.is_live()
 
 
-def test_a_fresh_persona_with_no_database_gets_an_empty_state_and_the_switch_and_no_database_is_created(tmp_path: Path) -> None:
+def test_a_fresh_persona_with_no_database_gets_an_empty_state_that_records_the_switch_over_and_no_database_is_created(tmp_path: Path) -> None:
     persona = tmp_path / "fresh"
     persona.mkdir()
     _ensure(persona)
     state = state_of(persona)
     assert state.emotions == {} and state.persona_start_at is None and state.saved_at == NOW
-    assert engine_files.read_switch(persona) == NOW
+    assert state.switch_over_at == NOW
     assert not (persona / "memories.db").exists()
+
+
+def test_a_first_start_writes_no_switch_file(tmp_path: Path) -> None:
+    """There is no switch file: the folder of a switched persona holds the state, its backups, the queue and the lock sidecar."""
+    persona = _standard_persona(tmp_path)
+    _ensure(persona)
+    assert state_of(persona).switch_over_at == NOW  # the switch-over happened, and its only record is the state's field
+    assert not [path.name for path in persona.rglob("*") if "switch" in path.name]  # nowhere under the persona, at any depth
 
 
 def test_the_first_start_replaces_a_shadow_state_with_the_rebuilt_one(tmp_path: Path) -> None:
@@ -176,28 +194,21 @@ def test_the_first_start_replaces_a_shadow_state_with_the_rebuilt_one(tmp_path: 
     assert state_of(persona).saved_at == NOW
 
 
-def test_a_switch_written_by_another_process_while_this_one_waited_for_the_lock_makes_this_one_rebuild_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_switch_over_recorded_by_another_process_while_this_one_waited_for_the_lock_makes_this_one_rebuild_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _standard_persona(tmp_path)
     real = _x10().scale_up_small_feelings
 
     def another_process_finishes_first(path: Path):
         result = real(path)
-        engine_files.write_switch(path, T[39])
+        make_live(path, T[39])
         return result
 
     monkeypatch.setattr(_x10(), "scale_up_small_feelings", another_process_finishes_first)
     opened = _Spy(monkeypatch)
     _ensure(persona)
     assert "rebuild" not in opened.opened  # no rebuild: its window read never happened (the x10 fix, which ran first, did open the store)
-    assert not engine_files.state_path(persona).exists()
-    assert engine_files.read_switch(persona) == T[39]
-
-
-def test_a_switch_that_already_exists_is_left_as_it_is_when_the_rebuild_writes_its_last_step(tmp_path: Path) -> None:
-    persona = _standard_persona(tmp_path)
-    engine_files.write_switch(persona, T[39])
-    _rebuild(persona, "first")  # no error: a False from `write_switch` counts as done
-    assert engine_files.read_switch(persona) == T[39]
+    after = state_of(persona)
+    assert after.switch_over_at == T[39] and after.emotions == {}  # the other process's state, not a rebuilt one
 
 
 # ================================================================================================
@@ -205,20 +216,21 @@ def test_a_switch_that_already_exists_is_left_as_it_is_when_the_rebuild_writes_i
 # ================================================================================================
 
 
-def test_a_check_failure_raises_naming_the_step_leaves_the_queue_and_the_old_state_and_writes_no_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_check_failure_raises_naming_the_step_leaves_the_queue_and_the_old_state_and_records_no_switch_over(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _standard_persona(tmp_path)
     save(persona, simple_state(saved_at=T[39]))
     queue_before = engine_files.queue_path(persona).read_bytes()
     state_before = engine_files.state_path(persona).read_bytes()
     install(persona, NOW)
     with monkeypatch.context() as patch:
-        patch.setattr(engine_files, "validate_state", lambda data: (_ for _ in ()).throw(ValueError("forced")))
+        # not `validate_state`: the reader uses it too, and `ensure` reads the shadow state first
+        patch.setattr(engine_files, "state_to_json", lambda state: (_ for _ in ()).throw(ValueError("forced")))
         with pytest.raises(EngineStartupError) as failure:
             ensure_engine_ready(persona)
     assert failure.value.what == "the first rebuild" and isinstance(failure.value.cause, engine_rebuild.RebuildCheckError)
     assert engine_files.queue_path(persona).read_bytes() == queue_before  # the check comes before the queue step
     assert engine_files.state_path(persona).read_bytes() == state_before
-    assert not engine_files.switch_path(persona).exists()
+    assert state_of(persona).switch_over_at is None
     # with the fault gone the next start completes, equal to a clean first run
     ensure_engine_ready(persona)
     clean = _standard_persona(tmp_path / "clean")
@@ -251,7 +263,7 @@ def test_a_state_write_failure_after_the_emptying_leaves_the_old_state_and_an_em
     assert failure.value.what == "the first rebuild" and isinstance(failure.value.cause, OSError)
     assert engine_files.state_path(persona).read_bytes() == state_before
     assert engine_files.queue_path(persona).read_text(encoding="utf-8") == ""
-    assert not engine_files.switch_path(persona).exists()
+    assert state_of(persona).switch_over_at is None
     ensure_engine_ready(persona)
     clean = _standard_persona(tmp_path / "clean")
     save(clean, simple_state(saved_at=T[39]))
@@ -268,21 +280,7 @@ def test_a_state_write_that_does_not_verify_is_a_failed_check_and_writes_no_swit
         with pytest.raises(EngineStartupError) as failure:
             ensure_engine_ready(persona)
     assert isinstance(failure.value.cause, engine_rebuild.RebuildCheckError)
-    assert not engine_files.switch_path(persona).exists()
-
-
-def test_a_switch_write_failure_leaves_the_saved_state_and_the_next_start_completes_equal_to_a_clean_first_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    persona = _standard_persona(tmp_path / "a")
-    install(persona, NOW)
-    with monkeypatch.context() as patch:
-        patch.setattr(engine_files, "write_switch", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
-        with pytest.raises(EngineStartupError):
-            ensure_engine_ready(persona)
-    assert engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
-    ensure_engine_ready(persona)
-    clean = _standard_persona(tmp_path / "b")
-    _ensure(clean)
-    assert _first_state_bytes(persona) == _first_state_bytes(clean)
+    assert engine_files.read_state(persona).state is None  # nothing was written, so the persona is not switched over
 
 
 def test_a_lock_that_does_not_come_raises_naming_the_lock_and_writes_nothing_after_the_x10_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -294,10 +292,10 @@ def test_a_lock_that_does_not_come_raises_naming_the_lock_and_writes_nothing_aft
     with engine_files.state_lock(persona), pytest.raises(EngineStartupError) as failure:
         ensure_engine_ready(persona)
     assert failure.value.what == "the engine lock"
-    assert not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
+    assert not engine_files.state_path(persona).exists()
     monkeypatch.undo()
     ensure_engine_ready(persona)  # the x10 marker is set, the rebuild runs: idempotent
-    assert engine_files.read_switch(persona) == NOW
+    assert state_of(persona).switch_over_at == NOW
 
 
 def test_an_x10_error_raises_naming_the_fix_takes_no_lock_and_writes_no_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -308,7 +306,7 @@ def test_an_x10_error_raises_naming_the_fix_takes_no_lock_and_writes_no_switch(t
     with pytest.raises(EngineStartupError) as failure:
         ensure_engine_ready(persona)
     assert failure.value.what == "the x10 fix of small feelings" and isinstance(failure.value.cause, RuntimeError)
-    assert spy.calls == 0 and not engine_files.switch_path(persona).exists()
+    assert spy.calls == 0 and not engine_files.state_path(persona).exists()
 
 
 def test_an_integrity_failure_raises_naming_the_check_and_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -322,7 +320,7 @@ def test_an_integrity_failure_raises_naming_the_check_and_writes_nothing(tmp_pat
     with pytest.raises(EngineStartupError) as failure:
         ensure_engine_ready(persona)
     assert failure.value.what == "the memories.db integrity check" and isinstance(failure.value.cause, BrainIntegrityError)
-    assert not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
+    assert not engine_files.state_path(persona).exists()
 
 
 def _candidate(memory_id: str, emotions: dict[str, float]) -> Memory:
@@ -379,7 +377,7 @@ def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catc
     with pytest.raises(EngineStartupError) as failure:
         ensure_engine_ready(persona)
     assert failure.value.what == "the x10 fix of small feelings" and isinstance(failure.value.cause, OSError)
-    assert spy.calls == 0 and not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
+    assert spy.calls == 0 and not engine_files.state_path(persona).exists()
     assert _marked(persona, "made")  # the database half had finished
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
     assert entry["emotions"] == {"pride": 0.3}  # the queue is as it was
@@ -392,7 +390,7 @@ def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catc
     pending.PendingQueue(persona).enqueue(_candidate("late-candidate", {"pride": 0.2}), source="maker")
     monkeypatch.setattr(pending, "write_jsonl_bytes", real_write)
     ensure_engine_ready(persona)
-    assert engine_files.read_switch(persona) == NOW
+    assert state_of(persona).switch_over_at == NOW
     store = MemoryStore(persona / "memories.db", integrity_check=False)
     try:
         assert store.get("made", bump=False).emotions == pytest.approx({"pride": 4.0})  # 0.4 x 10 once, not 40
@@ -404,25 +402,26 @@ def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catc
     assert entries["late-candidate"]["emotions"] == pytest.approx({"pride": 2.0})
 
 
-def test_an_uninspectable_switch_skips_the_switch_over_with_one_warning_and_writes_nothing(
+def test_a_state_that_exists_but_cannot_be_read_skips_the_switch_over_with_one_warning_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """R-D1 (owner 2026-11-05): "If the system can't tell if its switched, assume its not." Nothing irreversible runs on an unknown."""
+    """Owner 2026-11-05: "If the system can't tell if its switched, assume its not." Nothing irreversible runs on an unknown."""
     persona = _standard_persona(tmp_path)
+    save(persona, simple_state(saved_at=T[39]))
+    ruin_the_state(persona)  # the state file is there and no copy of it can be read
     instance = install(persona, NOW)
     before = tree(persona)
     spy = LockSpy(monkeypatch)
     opened = _Spy(monkeypatch)
     caplog.set_level(logging.WARNING)
-    with monkeypatch.context() as patch:
-        refuse_the_switch_stat(patch)
-        ensure_engine_ready(persona)  # returns normally
-        warnings = [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]
-        assert len(warnings) == 1 and str(engine_files.switch_path(persona)) in warnings[0] and "cannot be inspected" in warnings[0]
-        assert spy.calls == 0 and opened.opened == []  # no x10, no lock, no rebuild
-        assert instance.is_live() is False and instance.needs_recovery() is False
-    assert tree(persona) == before  # no state, no queue change, no marker, no switch
-    # nothing about the unknown is cached: the next call in the same process, with the fault gone, completes
+    ensure_engine_ready(persona)  # returns normally
+    warnings = [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and str(engine_files.state_path(persona)) in warnings[0] and "cannot be read" in warnings[0]
+    assert spy.calls == 0 and opened.opened == []  # no x10, no lock, no rebuild
+    assert instance.is_live() is False and instance.needs_recovery() is False
+    assert tree(persona) == before  # no state, no queue change, no marker
+    # nothing about the unknown is cached: the next call in the same process, with the state gone or fixed, completes
+    lose_the_state(persona)
     ensure_engine_ready(persona)
     clean = _standard_persona(tmp_path / "clean")
     _ensure(clean)
@@ -430,28 +429,53 @@ def test_an_uninspectable_switch_skips_the_switch_over_with_one_warning_and_writ
     assert instance.is_live()
 
 
-def test_a_switch_that_cannot_be_inspected_only_at_the_locked_recheck_runs_x10_but_no_rebuild_and_raises_nothing(
+def test_a_state_that_cannot_be_read_only_at_the_locked_recheck_runs_x10_but_no_rebuild_and_raises_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     persona = _standard_persona(tmp_path)
     install(persona, NOW)
-    real = engine_files.switch_state
-    pending = [False, False, None]  # the fast path, the x10 fix's own guard, the re-check under the lock
+    missing = engine_files.LoadedState(None, None, None, "missing")
+    unreadable = engine_files.LoadedState(None, None, None, "unreadable")
+    real = engine_files.read_state
+    answers = [missing, missing, unreadable]  # the fast path, the x10 fix's own guard, the re-check under the lock
 
     def scripted(path: Path):
-        return pending.pop(0) if pending else real(path)
+        return answers.pop(0) if answers else real(path)
 
-    monkeypatch.setattr(engine_files, "switch_state", scripted)
+    monkeypatch.setattr(engine_files, "read_state", scripted)
     caplog.set_level(logging.WARNING)
     ensure_engine_ready(persona)
-    assert pending == []
+    assert answers == []
     assert _marked(persona, "made")  # x10 ran and marked the row it multiplied
-    assert not engine_files.state_path(persona).exists() and not engine_files.switch_path(persona).exists()
+    assert not engine_files.state_path(persona).exists()
     assert len([r for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]) == 1
     ensure_engine_ready(persona)  # the fault is gone
     clean = _standard_persona(tmp_path / "clean")
     _ensure(clean)
     assert _first_state_bytes(persona) == _first_state_bytes(clean)
+
+
+def test_a_missing_state_means_not_switched_and_the_switch_over_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    assert not engine_files.state_path(persona).exists()
+    opened = _Spy(monkeypatch)
+    instance = _ensure(persona)
+    assert opened.opened == ["x10", "rebuild"]
+    assert instance.is_live() and state_of(persona).switch_over_at == NOW
+
+
+def test_a_state_that_already_holds_the_switch_over_time_returns_at_once_with_no_store_open_and_no_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona = _standard_persona(tmp_path)
+    make_live(persona, T[39])  # another process switched the persona over earlier
+    before = tree(persona)
+    spy = LockSpy(monkeypatch)
+    opened = _Spy(monkeypatch)
+    instance = install(persona, NOW)
+    ensure_engine_ready(persona)
+    assert spy.calls == 0 and opened.opened == [] and tree(persona) == before
+    assert instance.is_live() and state_of(persona).switch_over_at == T[39]  # the time never moves
 
 
 def _marked(persona: Path, memory_id: str) -> bool:
@@ -521,6 +545,7 @@ def test_the_persona_start_is_the_earliest_of_the_oldest_row_the_replay_and_the_
     _rebuild(persona, "first")
     assert state_of(persona).persona_start_at == ancient  # the query finds a row outside the window
     older = simple_state(saved_at=T[39])
+    older.switch_over_at = T[30]
     older.persona_start_at = NOW - timedelta(days=200)
     save(persona, older)
     _rebuild(persona, "recovery")
@@ -593,7 +618,7 @@ def test_a_first_rebuild_with_no_database_creates_nothing_but_a_recovery_rebuild
     persona = tmp_path / "no-db"
     persona.mkdir()
     _rebuild(persona, "first")
-    assert not (persona / "memories.db").exists() and engine_files.read_switch(persona) == NOW
+    assert not (persona / "memories.db").exists() and state_of(persona).switch_over_at == NOW
     other = tmp_path / "other"
     other.mkdir()
     save_as_backup(other, simple_state(saved_at=T[39]))
@@ -813,7 +838,7 @@ class _Clock:
 
 def _live_engine(persona: Path, switch_at: datetime, now: datetime) -> tuple[EmotionEngine, _Clock]:
     clock = _Clock(now)
-    assert engine_files.write_switch(persona, switch_at)
+    make_live(persona, switch_at)
     return EmotionEngine(persona, now=clock), clock
 
 
@@ -827,7 +852,7 @@ def test_faded_value_is_the_stored_value_before_the_switch_and_faded_after_it_on
     memory = _memory(T[20], {"joy": 8.0})
     clock.now = T[50]
     assert instance.faded_value(memory, "joy") == 8.0  # not switched: the stored value, whatever the age
-    engine_files.write_switch(tmp_path, T[44])
+    make_live(tmp_path, T[44])
     # now it is live. Age counts from the switch (day 44 is later than the creation, day 20): 6 days. joy half-life 3 days,
     # importance 0 (stretch 1): 8 x 0.5^(6/3) = 2.0
     assert instance.faded_value(memory, "joy") == pytest.approx(2.0)
@@ -871,26 +896,25 @@ def test_faded_value_needs_no_store_so_it_serves_a_row_that_hard_delete_removed(
     assert instance.faded_value(memory, "joy") == pytest.approx(4.0)
 
 
-def test_an_unreadable_switch_gives_the_stored_value_and_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    instance, _ = _live_engine(tmp_path, T[0], T[3])
+def test_an_unreadable_state_gives_the_stored_value_and_is_not_cached(tmp_path: Path) -> None:
+    _live_engine(tmp_path, T[0], T[3])  # the persona is switched over, its state holds the time
     memory = _memory(T[0], {"joy": 8.0})
     fresh = EmotionEngine(tmp_path, now=lambda: T[3])  # a new instance has seen nothing
-    with monkeypatch.context() as patch:
-        refuse_the_switch_stat(patch)
-        assert fresh.faded_value(memory, "joy") == 8.0 and fresh.is_live() is False
-    assert fresh.faded_value(memory, "joy") == pytest.approx(4.0)  # the stat works again: nothing about the failure was kept
+    ruin_the_state(tmp_path)
+    assert fresh.faded_value(memory, "joy") == 8.0 and fresh.is_live() is False  # cannot tell: not switched, the stored value
+    make_live(tmp_path, T[0])  # the state is readable again (the ruined copy goes to .bak1)
+    assert fresh.faded_value(memory, "joy") == pytest.approx(4.0)  # nothing about the failure was kept
 
 
-def test_a_present_switch_file_with_corrupt_content_gives_the_stored_value_and_that_failed_read_is_not_cached(tmp_path: Path) -> None:
-    switch = engine_files.switch_path(tmp_path)
-    switch.parent.mkdir(parents=True)
-    switch.write_bytes(b"\x00 not json")
+def test_a_state_whose_switch_over_time_is_not_a_time_is_unreadable_and_gives_the_stored_value(tmp_path: Path) -> None:
+    state = engine_files.state_path(tmp_path)
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({**engine_files.state_to_json(simple_state(saved_at=T[1])), "switch_over_at": "never"}), encoding="utf-8")
     instance = EmotionEngine(tmp_path, now=lambda: T[3])
     memory = _memory(T[0], {"joy": 8.0})
-    assert instance.is_live() is True  # the file is SEEN
-    assert instance.faded_value(memory, "joy") == 8.0  # but its time cannot be read
-    switch.unlink()
-    assert engine_files.write_switch(tmp_path, T[0])
+    assert instance.is_live() is False  # the validator refuses the whole state, so it cannot be read
+    assert instance.faded_value(memory, "joy") == 8.0
+    make_live(tmp_path, T[0])
     assert instance.faded_value(memory, "joy") == pytest.approx(4.0)  # read again, now readable
 
 
@@ -912,12 +936,20 @@ def test_fold_change_writes_one_change_log_line_when_live_and_none_before_the_sw
 
 
 def _live_persona(tmp_path: Path, rows=()) -> tuple[Path, EmotionEngine]:
+    """A switched-over persona and the running engine that has seen it (an instance keeps the `switch_over_at` it saw).
+
+    The state file is gone afterwards: the running instance holds the only record, so a test starts from "live with a missing
+    state" and saves whatever state it needs.
+    """
     persona = make_persona(tmp_path, list(rows))
-    assert engine_files.write_switch(persona, NOW - timedelta(days=6))
-    return persona, install(persona, NOW)
+    make_live(persona, NOW - timedelta(days=6))
+    instance = install(persona, NOW)
+    assert instance.is_live()
+    lose_the_state(persona)
+    return persona, instance
 
 
-def test_needs_recovery_truth_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_needs_recovery_truth_table(tmp_path: Path) -> None:
     # not switched: nothing to recover, even with no state
     not_live = make_persona(tmp_path / "a")
     assert install(not_live, NOW).needs_recovery() is False
@@ -939,11 +971,14 @@ def test_needs_recovery_truth_table(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     save(third, simple_state(saved_at=T[39]))
     third_engine._catch_up_failed = True
     assert third_engine.needs_recovery() is True
-    # an unknown switch: no recovery on an unknown
-    fourth, fourth_engine = _live_persona(tmp_path / "e")
-    with monkeypatch.context() as patch:
-        refuse_the_switch_stat(patch)
-        assert EmotionEngine(fourth, now=lambda: NOW).needs_recovery() is False
+    # an instance that never saw the switch-over meets an unreadable state: cannot tell, so not switched and no recovery
+    fourth, _ = _live_persona(tmp_path / "e")
+    make_live(fourth, NOW - timedelta(days=6))
+    ruin_the_state(fourth)
+    assert EmotionEngine(fourth, now=lambda: NOW).needs_recovery() is False
+    # and one that meets a missing state (accepted edge (a)): the first rebuild runs again at its next start, not a recovery
+    fifth, _ = _live_persona(tmp_path / "f")
+    assert EmotionEngine(fifth, now=lambda: NOW).needs_recovery() is False
 
 
 def test_a_recovery_rebuild_folds_the_faded_values_empties_the_queue_keeps_the_switch_and_clears_the_failed_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -956,7 +991,8 @@ def test_a_recovery_rebuild_folds_the_faded_values_empties_the_queue_keeps_the_s
     assert spy.within == [(engine_files.state_path(persona), dev_constants.EMOTION_LOCK_WAIT_S)]  # the lock, once, with the wait
     assert state_of(persona).emotions["joy"].short.avg == pytest.approx(2.0)
     assert engine_files.queue_path(persona).read_text(encoding="utf-8") == "" and state_of(persona).queue_line == 0
-    assert engine_files.read_switch(persona) == NOW - timedelta(days=6)  # a recovery never writes the switch
+    # a recovery never sets a new switch-over time: the state it wrote holds the one the engine saw (no readable copy had it)
+    assert state_of(persona).switch_over_at == NOW - timedelta(days=6)
     assert instance._catch_up_failed is False and instance.needs_recovery() is False
 
 
@@ -1003,9 +1039,9 @@ def test_a_failed_recovery_rebuild_raises_and_keeps_the_failed_flag(tmp_path: Pa
 def test_a_recovery_rebuild_with_no_database_raises_and_leaves_a_readable_backup(tmp_path: Path) -> None:
     persona = tmp_path / "persona"
     persona.mkdir()
-    assert engine_files.write_switch(persona, T[30])
-    save_as_backup(persona, simple_state(saved_at=T[39]))
+    save_as_backup(persona, simple_state(saved_at=T[39], switch_over_at=T[30]))  # the only readable copy, and it holds the switch-over time
     instance = install(persona, NOW)
+    assert instance.is_live()
     with pytest.raises(EngineStartupError) as failure:
         instance.recovery_rebuild()
     assert isinstance(failure.value.cause, CatchUpError)
@@ -1018,6 +1054,8 @@ def test_the_recovery_job_rebuilds_a_ruined_state_and_reports_success(tmp_path: 
     assert instance.needs_recovery() is True
     assert engine.recovery_job_run(persona) is True
     assert state_of(persona).saved_at == NOW and instance.needs_recovery() is False
+    assert state_of(persona).switch_over_at == NOW - timedelta(days=6)  # the persona stays switched over, with its own time
+    assert EmotionEngine(persona.resolve(), now=lambda: NOW).is_live()  # a new process reads it off the rebuilt state
 
 
 def test_the_recovery_job_on_a_healthy_or_a_not_switched_persona_does_nothing_and_reports_success(tmp_path: Path) -> None:
@@ -1059,6 +1097,71 @@ def test_a_failing_recovery_job_is_logged_even_when_the_drain_already_logged_the
             assert engine.recovery_job_run(persona) is False
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.name == LOGGER]
     assert len(messages) == 2 and "recovery rebuild failed" in messages[1]  # why the rebuild failed is not hidden by the drain's line
+
+
+# ================================================================================================
+# SW2: the switch-over time is a field of the state (there is no switch file)
+# ================================================================================================
+
+
+def test_a_shadow_drain_and_a_direct_apply_never_set_the_switch_over_time(tmp_path: Path) -> None:
+    persona = make_persona(tmp_path, [row(T[35], emotions={"joy": 5.0}, mid="a")])
+    instance = install(persona, NOW)
+    queue(persona, showing("a", T[39]))
+    instance.note_active(NOW)  # a shadow drain: it folds the showing and writes the state
+    assert state_of(persona).emotions and state_of(persona).switch_over_at is None  # it wrote, and set nothing
+    instance.on_memory_committed(row(T[40], emotions={"joy": 3.0}, mid="b"))  # a direct apply
+    assert state_of(persona).switch_over_at is None
+    assert instance.is_live() is False
+
+
+def test_every_save_of_a_switched_persona_keeps_the_switch_over_time(tmp_path: Path) -> None:
+    persona = _standard_persona(tmp_path)
+    instance = _ensure(persona)
+    assert state_of(persona).switch_over_at == NOW
+    queue(persona, showing("old", NOW + timedelta(hours=1)))
+    instance.note_active(NOW + timedelta(hours=2))  # a drain that folds a showing
+    assert state_of(persona).switch_over_at == NOW
+    instance.note_active(NOW + timedelta(days=3))  # a drain that closes days
+    assert state_of(persona).switch_over_at == NOW
+    instance.on_memory_committed(row(T[40], emotions={"joy": 3.0}, mid="c"))  # a direct apply
+    assert state_of(persona).switch_over_at == NOW
+
+
+@pytest.mark.parametrize("copy", ["main", "backup"])
+def test_a_recovery_rebuild_copies_the_switch_over_time_from_the_state_it_loaded(tmp_path: Path, copy: str) -> None:
+    persona = make_persona(tmp_path, [row(T[35], emotions={"joy": 5.0}, mid="a")])
+    old = simple_state(saved_at=T[39], switch_over_at=T[10])
+    if copy == "main":
+        save(persona, old)
+    else:
+        save_as_backup(persona, old)
+    _rebuild(persona, "recovery", switch_over_at=T[12])  # the engine's own value is the fallback only
+    assert state_of(persona).switch_over_at == T[10]
+
+
+def test_a_recovery_rebuild_with_no_readable_copy_takes_the_time_the_engine_saw_and_with_none_at_all_refuses(tmp_path: Path) -> None:
+    rows = [row(T[35], emotions={"joy": 5.0}, mid="a")]
+    persona = make_persona(tmp_path / "engine-saw-it", rows)
+    _rebuild(persona, "recovery", switch_over_at=T[12])
+    assert state_of(persona).switch_over_at == T[12]
+    other = make_persona(tmp_path / "nothing-to-carry", rows)
+    save(other, simple_state(saved_at=T[39]))  # readable, but it holds no switch-over time
+    queue(other, showing("a", T[40]))
+    before = tree(other)
+    with pytest.raises(engine_rebuild.RebuildCheckError, match="switch-over time"):
+        _rebuild(other, "recovery")
+    assert tree(other) == before  # nothing written, the queue kept: a state without the field would read as not switched
+
+
+def test_a_drain_that_recovers_from_a_backup_copy_keeps_the_switch_over_time_the_copy_holds(tmp_path: Path) -> None:
+    persona = make_persona(tmp_path, [row(T[39], emotions={"joy": 5.0}, mid="a")])
+    save_as_backup(persona, simple_state(saved_at=T[38], switch_over_at=T[30]))
+    instance = install(persona, NOW)  # a new process: it learns the switch-over from the backup copy
+    assert instance.is_live()
+    instance.note_active(NOW)
+    loaded = engine_files.read_state(persona)
+    assert loaded.source == "main" and loaded.state.switch_over_at == T[30]
 
 
 def test_ensure_engine_ready_calls_ensure_ready_through_engine_for(tmp_path: Path, emotion_engine_stub) -> None:

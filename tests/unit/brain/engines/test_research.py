@@ -1071,11 +1071,11 @@ _FELT_REPLY = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8
 
 
 def _go_live(persona_dir: Path, store: MemoryStore) -> None:
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
-    from brain.emotion import engine_files
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over in its state."""
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _fire_with(tmp_path: Path, store: MemoryStore, reply: str):

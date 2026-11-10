@@ -668,6 +668,25 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 Q10c (#584, draft PR #633)",
         kind="code",
     ),
+    # --- "switched over" is read off the state, not off a switch file (Engine 6 SW2) ----------------------------------------
+    Removed(
+        names=(
+            "emotion_switch.json",
+            "EMOTION_SWITCH_FILENAME",
+            "switch_path",
+            "write_switch",
+            "read_switch",
+            "switch_exists",
+            "switch_state",
+            "_switch_seen",
+            "_switch_over_time",
+            "_skip_for_unknown_switch",
+            "_skip_start_for_unknown_switch",
+        ),
+        why="the switch file `state/emotion_switch.json` and the code that wrote, stat-ed and read it; the persona's one switch-over time is the `switch_over_at` field of the emotion state (`engine_files.switch_over_state` reads 'switched' off a loaded state)",
+        ref="Engine 6 SW2 (#584, draft PR #633; Planning B25, owner S73)",
+        kind="code",
+    ),
 )
 
 

@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from brain import dev_constants
-from brain.emotion import engine_files, nudge_scale_fix
+from brain.emotion import nudge_scale_fix
 from brain.health.json_io import read_jsonl
 from brain.memory import pending
 from brain.memory.pending import PendingQueue
@@ -405,22 +405,22 @@ def test_a_read_fault_raises_and_changes_nothing(tmp_path: Path) -> None:
     assert (tmp_path / QUEUE).is_dir()
 
 
-def test_the_first_start_runs_the_queue_half_even_with_no_database_and_only_when_the_switch_is_known_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_the_first_start_runs_the_queue_half_even_with_no_database_and_only_when_the_persona_is_known_not_switched(
+    tmp_path: Path,
 ) -> None:
+    from tests.unit.brain.emotion._engine_support import lose_the_state, make_live, ruin_the_state
+
     _enqueue(tmp_path, _memory("a", {"joy": 0.05}))
-    assert engine_files.write_switch(tmp_path, NOW)
+    make_live(tmp_path, NOW)
     assert nudge_scale_fix.scale_up_small_feelings(tmp_path) is None  # switched: the fix does not run again
     assert _entries(tmp_path)["a"]["emotions"] == {"joy": 0.05}
-    from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
-
     other = tmp_path / "other"
     other.mkdir()
     _enqueue(other, _memory("b", {"joy": 0.05}))
-    with monkeypatch.context() as patch:
-        refuse_the_switch_stat(patch)
-        assert nudge_scale_fix.scale_up_small_feelings(other) is None  # an unknown counts as not switched: nothing irreversible runs
+    make_live(other, NOW)
+    ruin_the_state(other)  # cannot tell whether it was switched over: nothing irreversible runs
+    assert nudge_scale_fix.scale_up_small_feelings(other) is None
     assert _entries(other)["b"]["emotions"] == {"joy": 0.05}
-    engine_files.switch_path(tmp_path).unlink()
+    lose_the_state(tmp_path)  # no state at all: not switched
     nudge_scale_fix.scale_up_small_feelings(tmp_path)  # not switched, no database
     assert _entries(tmp_path)["a"]["emotions"] == pytest.approx({"joy": 0.5})
