@@ -41,6 +41,18 @@ Checks:
      MemoryStore, whose boot path self-heals/rebuilds FTS and would mask a
      genuinely broken file): count(memories_fts_docsize) == count(memories),
      and a MATCH query for a common term returns rows.
+ 18. new_feelings_present (#654): rest_need, arousal, climax, touch_hunger and
+     creative_hunger each have the planned distinct days and, in every 30-day
+     window, the planned rows and value range (plan: augment_db.NEW_FEELINGS);
+     each such row carries one emotion key, the conversation tag (three tags)
+     and a last_accessed_at not before created_at; peace and body_grief occur
+     as no emotion key; emotion_vocabulary.json beside the database registers
+     creative_hunger through the app's own loader, equal to its canonical entry.
+ 19. emotion_profiles_hold (#664): near-zero feelings stay in 0.02-0.30 with a
+     30-day range under 0.5; low-with-spikes feelings have 3-12% spike rows (all
+     conversation-tagged, on 4+ days, the largest 4.0+) and every other value in
+     0.10-1.00; the spelling-variant keys keep their base counts and maxima.
+ 20. manifest_matches_database: manifest.json counts equal the database's.
 """
 
 from __future__ import annotations
@@ -56,6 +68,19 @@ import subprocess
 import sys
 import tempfile
 
+from augment_db import (
+    ABSENT_EMOTIONS,
+    NEAR_ZERO,
+    NEAR_ZERO_RANGE,
+    NEW_FEELINGS,
+    SPIKY,
+    SPIKY_LOW_RANGE,
+    VARIANT_COUNTS,
+    WINDOW_DAYS,
+    day_of,
+    db_summary,
+    window_problems,
+)
 from build_db import (
     BRAIN_TYPES,
     MONOLOGUE_TYPES,
@@ -785,6 +810,176 @@ def check_brain_open_smoke_test(db_path: str) -> CheckResult:
 
 
 # ---------------------------------------------------------------------------
+# emotion checks (#654 new feelings, #664 profiles) and the manifest
+# ---------------------------------------------------------------------------
+
+NEAR_ZERO_MAX_RANGE = 0.5  # a near-zero feeling's 30-day range stays below this
+SPIKE_LEVEL = 1.0  # a low-with-spikes value above this is a spike
+SPIKE_SHARE_RANGE = (0.03, 0.12)  # augment_db rescales so about 6% of rows are spikes
+SPIKE_MIN_DAYS = 4
+SPIKE_MIN_PEAK = 4.0
+VARIANT_MIN_PEAK = 7.0  # the spelling-variant keys must keep their strong rows (a low-profile rescale would remove them)
+VALUE_EPS = 1e-9
+
+
+def _scan_emotions(conn: sqlite3.Connection) -> dict:
+    """{feeling: [(id, day, value, tags, created_at, last_accessed_at, number_of_keys_on_the_row)]}."""
+    scan: dict = {}
+    for row_id, emotions_json, tags_json, created, accessed in conn.execute(
+        "SELECT id, emotions_json, tags_json, created_at, last_accessed_at FROM memories WHERE emotions_json != '{}'"
+    ):
+        emotions = json.loads(emotions_json)
+        tags = json.loads(tags_json)
+        for name, value in emotions.items():
+            scan.setdefault(name, []).append((row_id, day_of(created), value, tags, created, accessed, len(emotions)))
+    return scan
+
+
+def _vocabulary_problems(db_path: str) -> list:
+    """The shipped emotion_vocabulary.json must register creative_hunger through the app's loader, as its canonical entry."""
+    vocab = os.path.join(os.path.dirname(os.path.abspath(db_path)), "emotion_vocabulary.json")
+    if not os.path.isfile(vocab):
+        return ["emotion_vocabulary.json missing beside the database"]
+    if not os.path.isfile(VENV_PYTHON):
+        return ["venv python not found at %s" % VENV_PYTHON]
+    tmpdir = tempfile.mkdtemp(prefix="check_db_vocab_")
+    try:
+        scratch = os.path.join(tmpdir, "emotion_vocabulary.json")
+        shutil.copy2(vocab, scratch)
+        script = (
+            "import json\n"
+            "from pathlib import Path\n"
+            "from brain.emotion import vocabulary\n"
+            "from brain.emotion._canonical_personal_emotions import _CANONICAL\n"
+            "from brain.emotion.persona_loader import load_persona_vocabulary\n"
+            "registered = load_persona_vocabulary(Path(%r))\n"
+            "got = vocabulary.get('creative_hunger')\n"
+            "print(json.dumps([registered, got == _CANONICAL['creative_hunger'], got.decay_half_life_days, got.category]))\n"
+            % scratch
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = BRAIN_REPO + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.run(
+            [VENV_PYTHON, "-c", script], cwd=BRAIN_REPO, env=env, capture_output=True, text=True, timeout=60
+        )
+        if proc.returncode != 0:
+            return ["vocabulary load failed: %r" % proc.stderr[-300:]]
+        registered, canonical, half_life, category = json.loads(proc.stdout.strip().splitlines()[-1])
+        if registered != 1 or not canonical or half_life != 5.0 or category != "persona_extension":
+            return [
+                "creative_hunger via load_persona_vocabulary: registered=%s equals_canonical=%s half_life=%s category=%s"
+                % (registered, canonical, half_life, category)
+            ]
+        return []
+    except Exception as exc:
+        return ["vocabulary check raised %r" % exc]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def check_new_feelings_present(conn: sqlite3.Connection, db_path: str) -> CheckResult:
+    scan = _scan_emotions(conn)
+    problems = []
+    for name, plan in NEW_FEELINGS.items():
+        rows = scan.get(name, [])
+        if not rows:
+            problems.append("%s: no rows" % name)
+            continue
+        problems += window_problems(name, [(r[1], r[2]) for r in rows], plan)
+        bad = [
+            r[0] for r in rows
+            if r[6] != 1 or "conversation" not in r[3] or len(r[3]) != 3 or r[5] is None or r[5] < r[4]
+        ]
+        if bad:
+            problems.append(
+                "%s: %d rows not (single emotion key, conversation tag, 3 tags, last_accessed_at >= created_at), e.g. %s"
+                % (name, len(bad), bad[0])
+            )
+    for key in ABSENT_EMOTIONS:
+        if key in scan:
+            problems.append("%s occurs as an emotion key in %d rows" % (key, len(scan[key])))
+    problems += _vocabulary_problems(db_path)
+    detail = "; ".join(problems) if problems else (
+        "rows/days: %s; every 30-day window meets the plan; creative_hunger registers at 5.0 days via the app loader"
+        % ", ".join("%s %d/%d" % (n, len(scan[n]), len({r[1] for r in scan[n]})) for n in NEW_FEELINGS)
+    )
+    return CheckResult("new_feelings_present", not problems, detail)
+
+
+def check_emotion_profiles_hold(conn: sqlite3.Connection) -> CheckResult:
+    scan = _scan_emotions(conn)
+    problems = []
+    lo, hi = NEAR_ZERO_RANGE
+    for name in NEAR_ZERO:
+        rows = scan.get(name, [])
+        if not rows:
+            problems.append("%s: no rows" % name)
+            continue
+        outside = sum(1 for r in rows if not (lo - VALUE_EPS <= r[2] <= hi + VALUE_EPS))
+        if outside:
+            problems.append("%s: %d of %d values outside [%.2f, %.2f], max %.2f" % (name, outside, len(rows), lo, hi, max(r[2] for r in rows)))
+            continue
+        for start in range(1, SPAN_DAYS - WINDOW_DAYS + 2):
+            values = [r[2] for r in rows if start <= r[1] < start + WINDOW_DAYS]
+            if values and max(values) - min(values) >= NEAR_ZERO_MAX_RANGE:
+                problems.append("%s: days %d-%d range %.2f" % (name, start, start + WINDOW_DAYS - 1, max(values) - min(values)))
+                break
+    low_lo, _low_hi = SPIKY_LOW_RANGE
+    for name in SPIKY:
+        rows = scan.get(name, [])
+        if not rows:
+            problems.append("%s: no rows" % name)
+            continue
+        spikes = [r for r in rows if r[2] > SPIKE_LEVEL + VALUE_EPS]
+        share = len(spikes) / len(rows)
+        if not (SPIKE_SHARE_RANGE[0] <= share <= SPIKE_SHARE_RANGE[1]):
+            problems.append("%s: spike share %.3f outside %s" % (name, share, SPIKE_SHARE_RANGE))
+        if len({r[1] for r in spikes}) < SPIKE_MIN_DAYS:
+            problems.append("%s: spikes on %d days, need %d" % (name, len({r[1] for r in spikes}), SPIKE_MIN_DAYS))
+        if any("conversation" not in r[3] for r in spikes):
+            problems.append("%s: a spike row is not conversation-tagged (the engine would not read it)" % name)
+        if not spikes or max(r[2] for r in spikes) < SPIKE_MIN_PEAK:
+            problems.append("%s: largest spike %.1f, need %.1f" % (name, max((r[2] for r in spikes), default=0.0), SPIKE_MIN_PEAK))
+        if any(r[2] < low_lo - VALUE_EPS for r in rows):
+            problems.append("%s: a value below %.2f" % (name, low_lo))
+    for key, count in VARIANT_COUNTS.items():
+        rows = scan.get(key, [])
+        if len(rows) != count or max((r[2] for r in rows), default=0.0) < VARIANT_MIN_PEAK:
+            problems.append(
+                "%s: %d rows (base %d), max %.1f (need %.1f)"
+                % (key, len(rows), count, max((r[2] for r in rows), default=0.0), VARIANT_MIN_PEAK)
+            )
+    detail = "; ".join(problems) if problems else (
+        "near-zero %s within [%.2f, %.2f]; low-with-spikes %s; spelling-variant keys unchanged"
+        % (",".join(NEAR_ZERO), lo, hi, ",".join(SPIKY))
+    )
+    return CheckResult("emotion_profiles_hold", not problems, detail)
+
+
+def check_manifest_matches_database(conn: sqlite3.Connection, db_path: str) -> CheckResult:
+    path = os.path.join(os.path.dirname(os.path.abspath(db_path)), "manifest.json")
+    if not os.path.isfile(path):
+        return CheckResult("manifest_matches_database", False, "no manifest.json beside the database")
+    with open(path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    summary = db_summary(conn)
+    problems = []
+    for key in ("total_rows", "per_memory_type_counts", "per_window_counts", "active_count", "fading_count", "inactive_count", "day_span"):
+        if manifest.get(key) != summary[key]:
+            problems.append("%s: manifest %r, database %r" % (key, manifest.get(key), summary[key]))
+    stats = manifest.get("per_day_stats", {})
+    for key in ("min", "max"):
+        if stats.get(key) != summary["per_day_stats"][key]:
+            problems.append("per_day_stats.%s: manifest %r, database %r" % (key, stats.get(key), summary["per_day_stats"][key]))
+    if abs(stats.get("mean", -1.0) - summary["per_day_stats"]["mean"]) > 1e-6:
+        problems.append("per_day_stats.mean differs")
+    return CheckResult(
+        "manifest_matches_database", not problems,
+        "; ".join(problems) if problems else "manifest counts equal the database (total=%d)" % summary["total_rows"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -810,6 +1005,9 @@ def run_all_checks(db_path: str):
             check_peak_emotion_intensity(conn),
             check_recall_count(conn),
             check_id_column(conn),
+            check_new_feelings_present(conn, db_path),
+            check_emotion_profiles_hold(conn),
+            check_manifest_matches_database(conn, db_path),
         ]
     finally:
         conn.close()
