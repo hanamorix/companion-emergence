@@ -154,7 +154,7 @@ The self-model block says which feelings have shifted and which way they are mov
 
 **Where it is computed.** The shift is worked out when `read()` needs it, by one pure function over the snapshots (two passes over at most 30 days per feeling), and cached with the state, so it is recomputed at most once per state write. It therefore changes only when the snapshot does: at a day close, a rebuild or a catch-up. Readers never compute it.
 
-**What it was sized against.** On the synthetic database (109 active days, 76 feelings, four ticks a day, 296 ticks after a 35-day warm-up) the rule flags 2.8% of present feelings, 1.84 on average and at most 5; at least one feeling is flagged on 82.4% of ticks and none on 17.6%; and it allows at most 3.30 articulation calls per active day, before the articulation threshold filters some. Other forms were sized and set aside: the per-feeling "usual gap" test (about a third of feelings open on every tick), a percentile gate (needs a chosen percentile), a strict run end on the first day against (too many false ends), and a majority run end.
+**What it was sized against.** On the synthetic database as it was before #654 and #664 (109 active days, 76 feelings, four ticks a day, 296 ticks after a 35-day warm-up) the rule flags 2.8% of present feelings, 1.84 on average and at most 5; at least one feeling is flagged on 82.4% of ticks and none on 17.6%; and it allows at most 3.30 articulation calls per active day, before the articulation threshold filters some. Other forms were sized and set aside: the per-feeling "usual gap" test (about a third of feelings open on every tick), a percentile gate (needs a chosen percentile), a strict run end on the first day against (too many false ends), and a majority run end.
 
 ### 2.7 Reading the engine
 
@@ -287,7 +287,7 @@ A chat change or self-correction is stored today as a memory row with its sign l
 
 A failed check or an error leaves the old state, writes no switch, and logs what failed. A first rebuild's failure stops start-up (2.12); a recovery rebuild logs once per active day and retries at each quiet moment. A crash before the state write leaves the old state and the same rebuild reruns. A rebuilt state is a fresh 30-day history, not the live one: it folds each memory once where live folded every showing, and its snapshot holds only the replayed days, so flags after a rebuild may differ from those before it.
 
-The prototype on the synthetic database (19,413 rows, 684 counted rows in the window, 45 emotions) took about 1.2 s cold and 0.08 to 0.13 s warm on a low-end laptop VM. The real cost is measured in the switch-over PR (3.3).
+The prototype on the synthetic database as it was before #654 and #664 (19,413 rows, 684 counted rows in the window, 45 emotions) took about 1.2 s cold and 0.08 to 0.13 s warm on a low-end laptop VM. The real cost is measured in the switch-over PR (3.3).
 
 **`persona_start_at` in normal running.** No query runs: every committed row of any type min-folds it (the hook's start-only event covers uncounted types), and a new persona with no rows has null, which keeps the gate shut. A catch-up keeps the loaded state's value and folds into it.
 
