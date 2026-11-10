@@ -338,8 +338,8 @@ class ReflexEngine:
             emotions = aggregate_state(all_mems).emotions
         # log_path lives at the persona dir root, so its parent IS the
         # persona dir — same pattern used at line 450 below for prompt
-        # composition. Passing it lets days_since_human see active
-        # session JSONL buffers (the freshest user-contact signal).
+        # composition. days_since_human reads the user's last turn from the
+        # conversation files under it (active buffers, then the archive).
         days_since = days_since_human(self.store, now, persona_dir=self.log_path.parent)
 
         eligible, skipped = self._evaluate(

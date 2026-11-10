@@ -734,19 +734,13 @@ def test_b13_status_reports_counts_and_enqueued_matches_the_queue(kestrel) -> No
 
 
 def _b15_history(persona) -> list[dict]:
-    """Archived only, so the time since the user spoke is read from memories; every reply is stamped after its user row,
+    """Archived only, so the time since the user spoke is read from the archive; every reply is stamped after its user row,
     the last one by minutes."""
     rows = _rows("sess_b15", datetime.now(UTC) - timedelta(days=5), 9, gap_s=60, lag_s=20)
     last_user = lenient_utc(rows[-2]["ts"])
     rows[-1]["ts"] = (last_user + timedelta(minutes=4)).isoformat(timespec="seconds")
     _archive(persona, "sess_b15", rows)
     return rows
-
-
-def _silence_read_at(store, now) -> datetime:
-    from brain.utils.memory import days_since_human
-
-    return now - timedelta(days=days_since_human(store, now))
 
 
 def test_b15_each_memory_is_dated_at_its_chunks_last_user_turn(kestrel) -> None:
@@ -774,8 +768,7 @@ def test_b15_each_memory_is_dated_at_its_chunks_last_user_turn(kestrel) -> None:
     for mid, expect in created.items():
         assert store.get(mid).created_at == expect
     newest_user = lenient_utc(rows[-2]["ts"])
-    now = datetime.now(UTC)
-    assert _silence_read_at(store, now) <= newest_user + timedelta(seconds=1)
+    assert max(created.values()) <= newest_user  # no memory is dated past the real newest user turn
 
 
 def test_b15_the_silence_clock_is_unchanged_when_a_newer_memory_exists(kestrel) -> None:
@@ -788,11 +781,12 @@ def test_b15_the_silence_clock_is_unchanged_when_a_newer_memory_exists(kestrel) 
     run_consolidation(store, persona_dir=persona, classifier=_PROMOTE_ALL)
     assert store.get(recent) is not None
     now = datetime.now(UTC)
-    before = days_since_human(store, now)
+    before = days_since_human(store, now, persona_dir=persona)
+    assert before == pytest.approx(5.0, abs=0.1)  # the archived history's newest user turn, not the 2-day-old memory
     _arm(persona, "all")
     _run_all(persona, store, hebbian, _Stub())
     run_consolidation(store, persona_dir=persona, classifier=_PROMOTE_ALL)
-    assert days_since_human(store, now) == before
+    assert days_since_human(store, now, persona_dir=persona) == before
 
 
 def test_b15_a_chunk_with_no_user_row(kestrel) -> None:

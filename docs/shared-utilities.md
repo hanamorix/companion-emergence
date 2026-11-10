@@ -264,6 +264,12 @@ Live in utils but read the MemoryStore.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `days_since_human` | brain/utils/memory.py:15 | Days since the user last spoke (999.0 if never), from active session buffers first, then closed-session memories. |
-| `is_conversation_derived` | brain/utils/memory.py:70 | True if a memory came from a conversation buffer (conversation tag or `source_summary` starting `conversation:`), plus the legacy type. |
-| `list_conversation_memories` | brain/utils/memory.py:87 | List chat-derived memories, newest first, using the conversation-derived contract. |
+| `days_since_human` | brain/utils/memory.py:14 | Days since the user last spoke (999.0 if never). Reads no memory: it is the days since `brain.ingest.buffer.last_user_turn_ts` (the time of the last user turn in the active conversation files, then the archive when no active file holds one; None if none). The user-presence silence uses the same function. |
+| `is_conversation_derived` | brain/utils/memory.py:41 | True if a memory came from a conversation buffer (conversation tag or `source_summary` starting `conversation:`), plus the legacy type. |
+| `list_conversation_memories` | brain/utils/memory.py:58 | List chat-derived memories, newest first, using the conversation-derived contract. |
+
+### `brain/ingest/buffer.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `last_user_turn_ts` | brain/ingest/buffer.py:558 | The time (aware, UTC) of the user's last turn, from the conversation files only: every active file read whole, and the archive (newest session file first, bounded by file modification times) only when no active file holds a user turn; None if none. Creates no folder. The one source for `days_since_human` and the user-presence silence. |

@@ -655,6 +655,12 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
     ),
+    # --- the user's last turn is read in one place (Engine 6 G3) ----------------------------------------------------------
+    Removed(
+        names=("_latest_user_turn_in_buffers", "_latest_conversation_memory_ts", "_compute_silence_days"),
+        why="three readers of the time of the user's last turn (active buffers, the newest conversation memory, a silence-days oracle); brain.ingest.buffer.last_user_turn_ts is the one",
+        ref="Engine 6 G3 (#584, draft PR #633)",
+    ),
 )
 
 

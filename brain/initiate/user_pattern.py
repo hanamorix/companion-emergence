@@ -7,9 +7,11 @@ check_send_allowed to adjust gate thresholds in real time.
 jsonl and/or initiate_audit.jsonl from scratch on EVERY call. As of this
 redesign, only ignore_streak still reads initiate_audit.jsonl on every call
 — and only a small bounded tail window of it, never the whole file (see
-``_compute_ignore_streak_bounded``). silence_days and likely_active are
-derived from a small persisted sidecar (``brain.initiate.presence_state``)
-that's rebuilt from a full scan at most once/24h; response_lag_p50 is
+``_compute_ignore_streak_bounded``). likely_active is derived from a small
+persisted sidecar (``brain.initiate.presence_state``) that's rebuilt from a
+full scan at most once/24h; silence_days is read from the conversation
+files on every call through ``brain.ingest.buffer.last_user_turn_ts``
+(engine rework S6: one source with ``days_since_human``); response_lag_p50 is
 folded incrementally at the point a reply is recorded
 (``brain.initiate.audit.update_audit_state``'s reply-lag hook). The
 original from-scratch ``_compute_*`` helpers below are KEPT as reference/
@@ -42,8 +44,9 @@ _SEND_DECISIONS = frozenset({"send_notify", "send_quiet"})
 _STREAK_STATES = frozenset({"unanswered", "dismissed"})
 _RESET_STATES = frozenset({"replied_explicit", "acknowledged_unclear"})
 
-# Daily recompute cadence (silence-days last-seen bootstrap, likely-active
-# histogram rebuild, and the one-time reply-lag bootstrap) — reuses the
+# Daily recompute cadence (likely-active histogram rebuild, the one-time
+# reply-lag bootstrap, and the last-seen merge that silence_days no longer
+# reads, see compute_user_presence) — reuses the
 # generic persisted_cadence.py mechanism (#225).
 _PRESENCE_DAILY_CADENCE_FILENAME = "presence_daily_cadence.json"
 _PRESENCE_DAILY_INTERVAL_S = 86400.0
@@ -74,54 +77,6 @@ class UserPresence:
     ignore_streak: int            # consecutive unanswered/dismissed proactive sends
     likely_active: bool           # within inferred active window; True when unknown
     response_lag_p50: float | None  # median response lag in seconds; None = cold start
-
-
-# ---------------------------------------------------------------------------
-# silence-days — reference implementation (kept, unchanged; not used by
-# compute_user_presence anymore, which derives silence_days from
-# presence_state.last_seen_ts instead — see _daily_scan_conversations /
-# _run_daily_presence_recompute below for the incremental replacement).
-# ---------------------------------------------------------------------------
-
-
-def _compute_silence_days(persona_dir: Path, *, _now: datetime | None = None) -> float:
-    """Return days since the most recent inbound (non-companion) chat turn.
-
-    Returns 0.0 when no buffer files exist or no inbound turns are found —
-    uncertainty stays permissive.
-    """
-    conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
-    if not conversations_dir.exists():
-        return 0.0
-
-    now = _now or datetime.now(UTC)
-    companion_name = persona_dir.name.lower()
-    latest_ts: datetime | None = None
-
-    for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
-            speaker = str(row.get("speaker", "")).lower()
-            if speaker == companion_name:
-                continue
-            # A compaction `summary` row is not a real user turn — its
-            # compaction-time ts must not corrupt the "last user message" signal.
-            if speaker == "summary":
-                continue
-            ts_str = row.get("ts")
-            if not ts_str:
-                continue
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                if latest_ts is None or ts > latest_ts:
-                    latest_ts = ts
-            except (ValueError, TypeError):
-                continue
-
-    if latest_ts is None:
-        return 0.0
-    return max(0.0, (now - latest_ts).total_seconds() / 86400.0)
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +360,8 @@ def _daily_scan_conversations(
     """One pass over active_conversations/*.jsonl for the daily recompute:
     builds the likely-active hour histogram (30-day lookback) AND finds the
     max inbound-turn ts across ALL history (no lookback cutoff) in the same
-    loop, so silence-days' bootstrap doesn't need a second full scan.
+    loop, for the persisted last-seen timestamp (which silence_days no
+    longer reads: it comes from ``last_user_turn_ts``).
 
     Returns (hour_counts, active_threshold, latest_ts_iso) — any of which
     may be None (no conversations dir, or no qualifying rows).
@@ -453,9 +409,9 @@ def _daily_scan_conversations(
 
 
 def _run_daily_presence_recompute(persona_dir: Path, *, _now: datetime | None = None) -> None:
-    """Run the once-daily bounded recompute: silence-days last-seen
-    discovery, likely-active histogram rebuild, and (once ever) the
-    reply-lag bootstrap.
+    """Run the once-daily bounded recompute: last-seen discovery (no
+    longer read by silence_days), likely-active histogram rebuild, and
+    (once ever) the reply-lag bootstrap.
 
     Scan phase runs UNLOCKED (matches today's un-locked full-scan reads —
     read_jsonl already tolerates a concurrent writer via
@@ -580,14 +536,18 @@ def _note_failure(what: str) -> None:
 
 
 def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) -> UserPresence:
-    """Compute current UserPresence from persisted presence state + audit log.
+    """Compute current UserPresence from persisted presence state, the conversation files + audit log.
 
     All four signals default to permissive values on failure — uncertainty
-    never tightens gates. The heavy full-history scans (silence-days
-    last-seen discovery, the likely-active histogram, the one-time
-    reply-lag bootstrap) run at most once/24h via the daily recompute
-    below; the normal per-call path is a cheap small-file read plus
-    arithmetic. ignore_streak is the one exception: it always uses its own
+    never tightens gates. The heavy full-history scans (the likely-active
+    histogram, the one-time reply-lag bootstrap) run at most once/24h via
+    the daily recompute below; the normal per-call path is a cheap
+    small-file read plus arithmetic. silence_days is the exception beside
+    ignore_streak: it is read on every call from the conversation files
+    through ``brain.ingest.buffer.last_user_turn_ts``, the same function
+    ``days_since_human`` uses (the active files hold about the newest
+    forty raw turns each; the archive is read only when none holds a user
+    turn); no user turn means 0.0 days. ignore_streak always uses its own
     bounded (never full-file) tail read (`_compute_ignore_streak_bounded`),
     independent of the daily cadence and of PresenceState entirely.
     """
@@ -612,13 +572,14 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
         state = None
 
     try:
-        if state is None or state.last_seen_ts is None:
+        # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+        from brain.ingest.buffer import last_user_turn_ts
+
+        last_user_turn = last_user_turn_ts(persona_dir)
+        if last_user_turn is None:
             silence_days = 0.0
         else:
-            last_seen = datetime.fromisoformat(state.last_seen_ts)
-            if last_seen.tzinfo is None:
-                last_seen = last_seen.replace(tzinfo=UTC)
-            silence_days = max(0.0, (now - last_seen).total_seconds() / 86400.0)
+            silence_days = max(0.0, (now - last_user_turn).total_seconds() / 86400.0)
     except Exception:
         _note_failure("silence_days derivation")
         silence_days = 0.0
