@@ -160,3 +160,37 @@ def test_a_link_planted_at_a_create_target_after_the_commit_guard_is_not_overwri
     assert done["ok"] is False, done
     assert env["keys"].read_text(encoding="utf-8") == "ssh-ed25519 AAAA original\n"
     assert pending.get(env["persona"], rid)["status"] == "refused"
+
+
+def test_a_link_swapped_in_and_back_out_around_the_guard_is_not_written(env, monkeypatch):
+    # race found by a real 300-round run: the link is swapped in just after the guard's own check (so a
+    # second stat records it as the expected file), and the plain file renamed back over it before the
+    # opened file is checked (so authorized_keys is down to one link). The guard's own view must be used.
+    from brain.files import commit as commit_mod
+
+    target = env["home"] / "Notes" / "log.md"
+    target.write_text("start\n", encoding="utf-8")
+    rid = propose_write(path=str(target), content="ssh-ed25519 AAAA planted", op="append", persona_dir=env["persona"])["id"]
+    plain = target.with_name("log.plain")
+    real_guard, real_fstat, swapped_back = commit_mod.check_write_target, commit_mod.os.fstat, []
+
+    def guard_then_swap_in(*a, **k):
+        g = real_guard(*a, **k)
+        target.rename(plain)
+        _link(env["keys"], target)
+        return g
+
+    keys_ino = env["keys"].stat().st_ino
+
+    def swap_back_then_fstat(fd):
+        if not swapped_back and real_fstat(fd).st_ino == keys_ino:  # commit is checking what it opened
+            swapped_back.append(1)
+            plain.rename(target)
+        return real_fstat(fd)
+
+    monkeypatch.setattr(commit_mod, "check_write_target", guard_then_swap_in)
+    monkeypatch.setattr(commit_mod.os, "fstat", swap_back_then_fstat)
+    done = _commit(env, rid)
+    assert swapped_back, "the race window was not reached"
+    assert done["ok"] is False, done
+    assert env["keys"].read_text(encoding="utf-8") == "ssh-ed25519 AAAA original\n"
