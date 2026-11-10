@@ -4,6 +4,16 @@ thread -> zero "database is locked" (2-plan §4.3/§4.2's whole point: the
 30s busy timeout removes the O16 starvation pattern even
 under real, item-level, multi-minute background activity).
 
+What this proves now (Engine 6, #633): a heartbeat tick no longer rewrites
+every memory's emotions (the emotion engine fades a value when it is read, so
+the old per-memory decay pass, the tick's one bulk writer of memories.db, is
+gone), so the writer that contends with the chat-path thread on that file for
+long stretches is the gated jobs' items, above all the forgetting job's page
+writes. The heartbeat still runs in the window: the test requires a full tick
+with no reflex or growth error, which proves the supervisor loop's heartbeat
+path keeps working beside those jobs, but it is no longer a source of sustained
+memories.db write contention.
+
 Stage-6 red-team MAJOR, addressed: C15(a)/(b) (job-granularity ordering and
 heartbeat/job mutual exclusion) were proven at INC-9; this file proves
 C15(c) specifically — the ITEM-level interleaving this increment (INC-10)
@@ -98,8 +108,8 @@ def _build_synthetic_bob20k(db_path: Path, n: int = 20_000) -> None:
 _STRESS_DURATION_S = 60.0
 _STRESS_ROWS = 20_000
 # The bridge's own shutdown budget: server.py joins the supervisor thread with
-# `join(timeout=180.0)`. A stop that arrives while a heartbeat is running waits
-# for it (a heartbeat over 20k rows takes many seconds), so the old 30 s was
+# `join(timeout=180.0)`. A stop that arrives while a heartbeat or a gated pass is running waits
+# for it (a forgetting pass over 20k rows takes many seconds), so the old 30 s was
 # not a safe bound on a slow host; the production budget is.
 _SHUTDOWN_JOIN_TIMEOUT_S = 180.0
 # Felt-time age written into the persona before the loop starts. At cold start

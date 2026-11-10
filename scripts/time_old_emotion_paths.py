@@ -8,9 +8,9 @@ Usage:
 
 The path is optional and defaults to test-data/synthetic-db/memories.db under the repository root. The file is
 copied into a fresh temporary directory (the copy is the persona directory) and three paths are timed on the copy:
-get_emotional_state, one write_trace_memory, and the heartbeat's decay pass (HeartbeatEngine._apply_emotion_decay).
-Each of the first two is one cold first call plus nine warm repeats; the decay pass is ten consecutive passes, the
-first being the cold run, with the rows each pass changed. Warm timings are reported as minimum, median and maximum
+get_emotional_state, one write_trace_memory, and, on a commit that still has it, the heartbeat's decay pass
+(HeartbeatEngine._apply_emotion_decay). Each of the first two is one cold first call plus nine warm repeats; the decay
+pass is ten consecutive passes, the first being the cold run, with the rows each pass changed. Warm timings are reported as minimum, median and maximum
 in milliseconds. Nothing is asserted: there is no threshold and no pass or fail.
 
 It refuses a path under the brain's home directory, aborts when the source has a non-empty -wal file, copies only
@@ -22,6 +22,11 @@ app's own probe, which reads /proc/cpuinfo on Linux and answers "no" when that r
 "unknown" on other systems. The CPU model is the first `model name` field of /proc/cpuinfo, read by the script
 itself on Linux (the read starts no process); it prints "unknown" on other systems and when the field is missing or
 unreadable. The architecture is printed beside it.
+
+After the vocabulary load and before the first timing the script starts the copy once through `ensure_engine_ready` (not
+timed) and confirms the engine is live, so that the timed calls read the live engine; that is the script's one first
+rebuild, and it is skipped with a printed reason on a commit that has no `ensure_engine_ready`. On a commit without the
+heartbeat's decay pass (`HeartbeatEngine._apply_emotion_decay`, removed by Engine 6) the decay timing is skipped.
 
 A timing whose function is absent on the checked-out commit is skipped with a printed reason. On a failure it
 prints one line, `time_old_emotion_paths: FAILED at <step>: <detail>`, to stderr, prints no timings and exits 1.
@@ -138,6 +143,25 @@ def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
         return registered, len(vocabulary.list_all())
 
     return _guarded("vocabulary", load)
+
+
+def _step_start(scratch: Path) -> list[str]:
+    """Start the copy the way the app's start-up does, through `ensure_engine_ready`, and confirm the engine is live.
+
+    Run once, after the vocabulary load and before any timing, the order the CLI handlers use (the load, then `ensure`), so the
+    first rebuild sees the same registered names. It is not timed (its cost is the first-rebuild check's). It is the script's
+    one rebuild: the timed calls after it read a live engine, which is what `get_emotional_state` takes its live branch on. A
+    commit with no `ensure_engine_ready` is skipped with a printed reason; a copy that is not live afterwards ends the run.
+    """
+    from brain.emotion import engine
+
+    ensure = getattr(engine, "ensure_engine_ready", None)
+    if ensure is None:
+        return ["start: skipped, ensure_engine_ready is not on this commit"]
+    ensure(scratch)
+    if not engine.engine_for(scratch).is_live():
+        raise StepError("start", "the copy is not live after ensure_engine_ready, so the timings would not read the live engine")
+    return ["start: the copy was started through ensure_engine_ready (not timed; one first rebuild) and the engine is live"]
 
 
 def _ms(seconds: float) -> str:
@@ -306,7 +330,6 @@ def _host_line() -> str:
 
 
 def run(arg: str | None) -> list[str]:
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
     from brain.paths import get_home
 
     source, commit, code = _step_source(arg)
@@ -325,11 +348,10 @@ def run(arg: str | None) -> list[str]:
             f"code: {code}",
             f"database: sha256 {digest}",
             f"emotion names registered by the first vocabulary load: {registered}; registry size: {registry_size}",
-            "  (a name with no stored half-life gets the placeholder half-life in brain.health.reconstruct, "
-            f"{PLACEHOLDER_DECAY_DAYS} days, which sets how many rows the decay pass rewrites)",
             f"active rows: {active}",
             "",
         ]
+        out += _guarded("start", lambda: _step_start(scratch)) + [""]
         out += _guarded("state", lambda: _time_state(scratch, store)) + [""]
         out += _guarded("trace", lambda: _time_trace(scratch, store)) + [""]
         out += _guarded("decay", lambda: _time_decay(scratch, store))

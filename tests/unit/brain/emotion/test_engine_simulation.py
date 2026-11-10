@@ -19,29 +19,35 @@ Days are numbered from 0; `D(n)` is local noon of day n. A long run is finished 
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
-from brain.emotion import engine_files
+from brain.emotion import engine_files, engine_rebuild
 from brain.emotion.engine_utils import (
     Average,
     EmotionState,
     EngineState,
+    Event,
     RunRecord,
     SnapshotDay,
     close_days,
 )
+from brain.memory.store import MemoryStore
 from tests.unit.brain.emotion._engine_support import (
     DAY0,
+    change,
     install,
     local_day,
     local_noon,
     make_persona,
     queue,
+    row,
     save,
+    save_as_backup,
     showing,
     state_of,
 )
@@ -293,9 +299,6 @@ def test_a_persona_whose_first_rows_are_uncounted_opens_its_gate_thirty_days_aft
     event sets `persona_start_at` to the oldest of them (day 0 noon). The snapshot of (d) with its last day 29 ends at the start
     of day 30, 29.5 days after that noon: gated, 0. With its last day 30 it ends 30.5 days after it: open, +1.
     """
-    from brain.memory.store import MemoryStore
-    from tests.unit.brain.emotion._engine_support import row
-
     persona = make_persona(tmp_path / "persona")
     install(persona, D(400))
     store = MemoryStore(persona / "memories.db")
@@ -319,6 +322,57 @@ def test_a_persona_whose_first_rows_are_uncounted_opens_its_gate_thirty_days_aft
         )
         save(persona, grafted)
         assert install(persona, D(400)).read()["joy"].shift == expected
+
+
+def _first_rebuild(persona: Path, now) -> None:  # noqa: ANN001
+    """Run the first rebuild on `persona` at `now` the way the engine's start-up does, through `engine_rebuild.rebuild`.
+
+    The two callbacks are the ones `catch_up` takes: first mode folds the stored values and does not call the fade, and the
+    weight of every row here is 1, so neither callback changes a number.
+    """
+    engine_rebuild.rebuild(
+        persona,
+        "first",
+        now,
+        faded_emotions_of=lambda memory: dict(memory.emotions),
+        modifier_of=lambda memory: 1.0,
+    )
+
+
+@pytest.mark.parametrize(("oldest_day", "expected"), [(-62, 1), (18, 0)], ids=["oldest memory 90 days old", "oldest memory 10 days old"])
+def test_the_start_gate_at_the_first_rebuild_counts_from_the_oldest_memory_not_from_the_oldest_entry(
+    tmp_path: Path, oldest_day: int, expected: int
+) -> None:
+    """(f), the rebuild half of the G8 case. A persona that already has a database is rebuilt at noon of day 28 + 3 h. Its rows
+    in the 30-day window are on its last 5 days only (days 23 to 27, one conversation row each), so the engine's own oldest entry
+    is day 23 and the persona would read as new. Its oldest row of all is a journal entry (it counts for nothing) dated either 90
+    or 10 days before day 28.
+
+    The rebuild takes `persona_start_at` from that oldest row (a plain query, outside the window): day -62 noon and day 18 noon.
+    The gate then compares the end of the last snapshot day with it. The snapshot of (d) is put on the rebuilt state (the
+    rebuild itself builds only days 23 to 27, too few for any run) with its last day 27: its end is the start of day 28, 89.5
+    days after the first start and 9.5 days after the second. Open, +1 for the old persona; gated, 0 for the other.
+    """
+    now = D(28) + timedelta(hours=3)
+    rows = [row(D(oldest_day), memory_type="journal_entry", emotions={}, mid="oldest")]
+    rows += [row(D(day), emotions={"joy": 5.0 + day % 3}, mid=f"recent-{day}") for day in range(23, 28)]
+    persona = make_persona(tmp_path / "persona", rows)
+    _first_rebuild(persona, now)
+    rebuilt = state_of(persona)
+    assert rebuilt.persona_start_at == D(oldest_day)  # not D(23): the oldest memory, not the oldest entry in the window
+    assert {entry.day for entry in rebuilt.emotions["joy"].snapshot} <= {_day(day) for day in range(23, 28)}
+    climb = [6.0, 7.0, 8.0, 9.0, 9.5, 10.0]
+    rebuilt.emotions = {
+        "joy": EmotionState(
+            short=Average(10.0, 2.0),
+            long=Average(3.2, 20.0),
+            last_entry_day=_day(27),
+            snapshot=_long_run_bar_snapshot(short_days=climb),
+        )
+    }
+    rebuilt.active_day = _day(28)
+    save(persona, rebuilt)
+    assert install(persona, now).read()["joy"].shift == expected
 
 
 # --- (h) validity ------------------------------------------------------------------------------------------------------------
@@ -617,3 +671,98 @@ def test_an_off_day_then_a_reversal_in_one_close_starts_the_new_run_on_the_rever
     state = _close_state(snapshot, 4.9, active=2)
     close_days(state, D(3))
     assert _written_record(state, 2) == RunRecord(_day(2), -1, _day(2))
+
+
+# --- (i) catch-up ---------------------------------------------------------------------------------------------------------
+
+
+_RUN_DAYS = 40
+_COPY_DAY = 20
+
+
+def _joy_on(day: int) -> float:
+    return 2.0 + (day * 3) % 7  # 2 to 8, a different number most days
+
+
+def _grief_change_on(day: int) -> float:
+    return 1.0 + (day * 2) % 5  # 1 to 5
+
+
+def _fold_view(state: EngineState) -> dict:
+    """Everything the fold decides, in plain numbers (no save or reset times, which differ by design)."""
+    return {
+        name: {
+            "short": (emotion.short.avg, emotion.short.weight),
+            "long": (emotion.long.avg, emotion.long.weight),
+            "last_entry_day": emotion.last_entry_day,
+            "snapshot": [(d.day, d.short, d.long, d.felt, d.run) for d in emotion.snapshot],
+        }
+        for name, emotion in sorted(state.emotions.items())
+    } | {"_": {"active_day": state.active_day, "last_update": state.last_update, "start": state.persona_start_at, "repeats": state.repeats}}
+
+
+def _assert_same_fold(got: dict, want: dict) -> None:
+    assert got.keys() == want.keys()
+    for name in want:
+        if name == "_":
+            assert got[name] == want[name]
+            continue
+        for key in ("short", "long"):
+            assert got[name][key] == pytest.approx(want[name][key], abs=1e-9), (name, key)
+        assert got[name]["last_entry_day"] == want[name]["last_entry_day"], name
+        assert len(got[name]["snapshot"]) == len(want[name]["snapshot"]), name
+        for mine, theirs in zip(got[name]["snapshot"], want[name]["snapshot"], strict=True):
+            assert mine[0] == theirs[0] and mine[3:] == theirs[3:], (name, mine, theirs)
+            assert mine[1:3] == pytest.approx(theirs[1:3], abs=1e-9), (name, mine, theirs)
+
+
+@pytest.mark.no_base_failure(
+    reason="Check 25 (i) is a whole-run equality pin of `catch_up`, which Engine 4 built and main already has; it is listed under "
+    "S6 only because the change log it replays is written only live. It passes on the base by design; the check below that it "
+    "can fail (a missing change line) was run by hand."
+)
+def test_a_state_copy_from_day_twenty_caught_up_from_the_database_and_the_change_log_equals_the_uninterrupted_run(tmp_path: Path) -> None:
+    """(i) A 40-day run, one committed row and one chat change on every day (a new memory id each, so no repeat factor; no
+    showing, no climax, no access-only fold), drained at the end of each day, is the uninterrupted run. The state it held
+    after day 20 is copied: it becomes the ONLY readable state (a backup copy) of a second persona with the same database, the
+    change lines of days 21 to 38 in its change log, and only the last turn's change (day 39) in its queue.
+
+    The history is built so that equality holds by construction (E5.19: the catch-up inherits the rebuild's limits): every row
+    after day 20 is in the database, every change but the last is in the log, the replay window's upper bound is the oldest
+    queued line (exclusive), so the last change folds once through the drain and no line twice. One drain then gives the
+    uninterrupted run's averages, weights and snapshot days to 1e-9, each queued event once.
+
+    The change lines are written with `engine_files.append_change`, the writer a live engine uses for its own change log; the
+    uninterrupted run is not live here, so it writes none, and the second persona's log is what a live run would have left.
+    """
+    rows = [row(D(day), emotions={"joy": _joy_on(day)}, mid=f"day-{day}") for day in range(_RUN_DAYS)]
+    uninterrupted = make_persona(tmp_path / "uninterrupted")
+    store = MemoryStore(uninterrupted / "memories.db")
+    copied: EngineState | None = None
+    try:
+        for day in range(_RUN_DAYS):
+            live = install(uninterrupted, D(day) + timedelta(hours=1))
+            store.create(rows[day])
+            live.fold_change({"grief": _grief_change_on(day)}, D(day) + timedelta(hours=2), "pass2")
+            live.note_active(D(day) + timedelta(hours=3))
+            if day == _COPY_DAY:
+                copied = copy.deepcopy(state_of(uninterrupted))
+    finally:
+        store.close()
+    assert copied is not None
+    last = D(_RUN_DAYS - 1) + timedelta(hours=3)
+    want = _fold_view(state_of(uninterrupted))
+    assert len(want["joy"]["snapshot"]) == 30 and want["grief"]["snapshot"]  # a real 30-day snapshot, not an empty comparison
+
+    crashed = make_persona(tmp_path / "crashed", rows)
+    save_as_backup(crashed, copied)
+    for day in range(_COPY_DAY + 1, _RUN_DAYS - 1):
+        assert engine_files.append_change(
+            crashed, Event(kind="change", at=D(day) + timedelta(hours=2), emotions={"grief": _grief_change_on(day)}, source="pass2")
+        )
+    queue(crashed, change(D(_RUN_DAYS - 1) + timedelta(hours=2), {"grief": _grief_change_on(_RUN_DAYS - 1)}))
+    recovered = install(crashed, last)
+    recovered.note_active(last)
+    assert recovered.status().caught_up
+    _assert_same_fold(_fold_view(state_of(crashed)), want)
+    assert engine_files.read_queue(crashed, from_line=0).events == []  # the one queued line was folded once and the file emptied
