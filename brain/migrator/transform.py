@@ -156,7 +156,6 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
         score=score,
         last_accessed_at=last_accessed_at,
         active=bool(og.get("active", True)),
-        protected=False,
         metadata=metadata,
     )
     return mem, None

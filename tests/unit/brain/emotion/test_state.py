@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 
-from brain.emotion.state import EmotionalState, ResidueEntry
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+from brain.emotion.state import EmotionalState
 
 
 def test_empty_state_has_no_dominant() -> None:
@@ -18,7 +12,6 @@ def test_empty_state_has_no_dominant() -> None:
     state = EmotionalState()
     assert state.emotions == {}
     assert state.dominant is None
-    assert state.residue == []
 
 
 def test_set_intensity_updates_dominant() -> None:
@@ -73,35 +66,6 @@ def test_dominant_ties_broken_by_insertion_order() -> None:
     assert state.dominant == "love"
 
 
-def test_add_residue_appends_entry() -> None:
-    """add_residue appends to the residue queue."""
-    state = EmotionalState()
-    entry = ResidueEntry(
-        timestamp=_utcnow(),
-        source="dream",
-        emotions={"grief": 4.0, "tenderness": 6.0},
-    )
-    state.add_residue(entry)
-    assert len(state.residue) == 1
-    assert state.residue[0] == entry
-
-
-def test_add_residue_bounded_by_max_entries() -> None:
-    """Residue queue is bounded — oldest entries evict when capacity is hit."""
-    state = EmotionalState(residue_max=3)
-    for i in range(5):
-        state.add_residue(
-            ResidueEntry(
-                timestamp=_utcnow(),
-                source=f"source-{i}",
-                emotions={"love": float(i)},
-            )
-        )
-    assert len(state.residue) == 3
-    assert state.residue[0].source == "source-2"
-    assert state.residue[-1].source == "source-4"
-
-
 def test_copy_returns_independent_state() -> None:
     """copy() returns a new EmotionalState — mutations don't affect the original."""
     original = EmotionalState()
@@ -117,21 +81,21 @@ def test_copy_returns_independent_state() -> None:
 
 def test_to_dict_round_trips() -> None:
     """to_dict() → from_dict() reproduces the state."""
-    original = EmotionalState(residue_max=10)
+    original = EmotionalState()
     original.set("tenderness", 8.0)
     original.set("desire", 5.0)
-    original.add_residue(
-        ResidueEntry(
-            timestamp=_utcnow(),
-            source="heartbeat",
-            emotions={"anger": 3.0},
-        )
-    )
 
     data = original.to_dict()
     restored = EmotionalState.from_dict(data)
 
     assert restored.emotions == original.emotions
     assert restored.dominant == original.dominant
-    assert len(restored.residue) == len(original.residue)
-    assert restored.residue[0].source == "heartbeat"
+
+
+def test_from_dict_ignores_legacy_residue_key() -> None:
+    """An old dict's residue keys are ignored on read and never written back."""
+    state = EmotionalState.from_dict(
+        {"emotions": {"joy": 3.0}, "residue": [{"x": 1}], "residue_max": 16}
+    )
+    assert state.emotions == {"joy": 3.0}
+    assert "residue" not in state.to_dict()
