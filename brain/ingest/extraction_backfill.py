@@ -408,13 +408,7 @@ def _all_rows(persona_dir: Path, sid: str) -> Iterator[dict]:
 
 
 def _newest_user_ts(persona_dir: Path) -> datetime | None:
-    """The latest ``ts`` of any ``user`` row in any session, active file and archived files alike, read in full (a full scan).
-
-    It is not ``buffer.last_user_turn_ts``, the one reader of "the user's last turn" for the engine's clocks. That function
-    answers from the active files and reads the archive only when no active file holds a user turn, and it stops as soon as
-    the answer cannot be older. This one always looks at every session, so the two answers differ when an older session's
-    active file still holds a user turn while a newer session survives only in the archive. The back-date below wants the
-    newest user turn anywhere, which is why it keeps its own scan."""
+    """A duplicate reader of the newest user turn (see ``buffer.last_user_turn_ts``); left as it is."""
     newest = None
     for sid in _session_ids(persona_dir):
         for row in _all_rows(persona_dir, sid):

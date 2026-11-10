@@ -909,13 +909,13 @@ class EmotionEngine:
 
         Accepted edges (Planning B25 SW2): see `engine_files.switch_over_state` (every copy of the state lost or unreadable, or
         the live state corrupted while `.bak1` is still the pre-switch state: the persona reads as not switched and this runs
-        again at the next start, recording a later switch-over time, and small rows of the three x10 types written after the
-        switch are unmarked and are multiplied by 10 on that re-run).
+        again at the next start, recording a later switch-over time; the x10 fix does not multiply anything on that re-run, because
+        its progress note in `memories.db` (`PRAGMA user_version`) says it is done).
 
         Any other failure (the x10 error or its integrity check, a lock that did not come, a failed rebuild check or write) is
         logged and raised as `EngineStartupError(what, cause)`; a failure stops start-up and the next start runs it again (every
-        step is idempotent: the per-row and per-candidate marker, the empty-state rebuild, the `switch_over_at` that only the
-        one verified write records).
+        step is idempotent: the x10 fix's progress note in `memories.db`, the empty-state rebuild, the `switch_over_at` that only
+        the one verified write records).
         """
         loaded = self._state_cache.get()
         if self._switched(loaded):

@@ -1056,9 +1056,8 @@ def switch_over_state(loaded: LoadedState) -> bool | None:
 
     Accepted edges (Planning B25 SW2, P4). (a) Every copy of the state file lost or unreadable, live and backups: the drain
     falls back to an empty state, the persona reads as not switched until the first rebuild runs again at the next start, and
-    that run records a later switch-over time. The per-row and per-entry markers of the x10 fix stop a second multiply of what
-    the first pass marked, but a small row of the three types written after the switch is unmarked and would be multiplied by
-    10 on the re-run. (b) The live state is corrupted right after the first rebuild while `.bak1` is still the pre-switch
+    that run records a later switch-over time. The x10 fix's progress note in `memories.db` (`PRAGMA user_version`) stops it
+    multiplying anything again on the re-run. (b) The live state is corrupted right after the first rebuild while `.bak1` is still the pre-switch
     state: the backup has no `switch_over_at`, so the persona reads as not switched until the first rebuild runs again (the
     same as (a)). Narrowed (Planning B28 Q18): a process that has already SEEN `switch_over_at` and loads a backup without it
     puts the value it saw back before its drain saves (`EmotionEngine._run_apply`), so (b) still applies to a new process

@@ -294,7 +294,7 @@ def test_a_lock_that_does_not_come_raises_naming_the_lock_and_writes_nothing_aft
     assert failure.value.what == "the engine lock"
     assert not engine_files.state_path(persona).exists()
     monkeypatch.undo()
-    ensure_engine_ready(persona)  # the x10 marker is set, the rebuild runs: idempotent
+    ensure_engine_ready(persona)  # the x10 progress note is already 2, the rebuild runs: idempotent
     assert state_of(persona).switch_over_at == NOW
 
 
@@ -330,7 +330,7 @@ def _candidate(memory_id: str, emotions: dict[str, float]) -> Memory:
 def test_the_queue_step_runs_after_the_database_transaction_and_before_the_lock_and_the_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Q10c: a small `making` candidate waiting in the pending queue is multiplied once, marked, and promoted at its real size."""
+    """Q10c: a small `making` candidate waiting in the pending queue is multiplied once, with no marker, and promoted at its real size."""
     from brain.memory import pending
 
     persona = _standard_persona(tmp_path)
@@ -352,14 +352,15 @@ def test_the_queue_step_runs_after_the_database_transaction_and_before_the_lock_
     _ensure(persona)
     assert order == ["database", "queue", "rebuild:locked"]  # the lock came after the queue step, for the rebuild only
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
-    assert entry["emotions"] == pytest.approx({"pride": 3.0}) and entry["metadata"][dev_constants.NUDGE_SCALE_FIX_MARKER_KEY] is True
+    assert entry["emotions"] == pytest.approx({"pride": 3.0}) and not entry.get("metadata")  # no marker in it
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
     ensure_engine_ready(persona)  # a second start, and a new process's start, multiply nothing
     EmotionEngine(persona.resolve(), now=lambda: NOW).ensure_ready()
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
     assert entry["emotions"] == pytest.approx({"pride": 3.0})
 
 
-def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catching_what_was_written_in_between(
+def test_a_failed_queue_copy_stops_start_up_and_the_next_start_completes_without_a_second_multiply_of_the_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from brain.memory import pending
@@ -378,10 +379,11 @@ def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catc
         ensure_engine_ready(persona)
     assert failure.value.what == "the x10 fix of small feelings" and isinstance(failure.value.cause, OSError)
     assert spy.calls == 0 and not engine_files.state_path(persona).exists()
-    assert _marked(persona, "made")  # the database half had finished
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE  # the database half had finished, the queue had not
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
     assert entry["emotions"] == {"pride": 0.3}  # the queue is as it was
-    # between the failed start and the next, an old writer adds a small row and a candidate
+    # between the failed start and the next, an old writer adds a small row and a candidate (owner S77: the row is missed, the
+    # candidate is caught, because the queue copies are made again from the originals)
     store = MemoryStore(persona / "memories.db")
     try:
         store.create(_candidate("late-row", {"pride": 0.2}), fold=False)
@@ -394,7 +396,7 @@ def test_a_failed_queue_rewrite_stops_start_up_and_the_next_start_completes_catc
     store = MemoryStore(persona / "memories.db", integrity_check=False)
     try:
         assert store.get("made", bump=False).emotions == pytest.approx({"pride": 4.0})  # 0.4 x 10 once, not 40
-        assert store.get("late-row", bump=False).emotions == pytest.approx({"pride": 2.0})  # caught by the retry
+        assert store.get("late-row", bump=False).emotions == pytest.approx({"pride": 0.2})  # accepted edge (S77): the rows were done
     finally:
         store.close()
     entries = {e["id"]: e for e in pending.read_jsonl(persona / "pending_candidates.jsonl")}
@@ -419,7 +421,7 @@ def test_a_state_that_exists_but_cannot_be_read_skips_the_switch_over_with_one_w
     assert len(warnings) == 1 and str(engine_files.state_path(persona)) in warnings[0] and "cannot be read" in warnings[0]
     assert spy.calls == 0 and opened.opened == []  # no x10, no lock, no rebuild
     assert instance.is_live() is False and instance.needs_recovery() is False
-    assert tree(persona) == before  # no state, no queue change, no marker
+    assert tree(persona) == before  # no state, no queue change, no progress note
     # nothing about the unknown is cached: the next call in the same process, with the state gone or fixed, completes
     lose_the_state(persona)
     ensure_engine_ready(persona)
@@ -446,7 +448,7 @@ def test_a_state_that_cannot_be_read_only_at_the_locked_recheck_runs_x10_but_no_
     caplog.set_level(logging.WARNING)
     ensure_engine_ready(persona)
     assert answers == []
-    assert _marked(persona, "made")  # x10 ran and marked the row it multiplied
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # x10 ran to its end (this persona has no queue file: nothing to copy)
     assert not engine_files.state_path(persona).exists()
     assert len([r for r in caplog.records if r.name == LOGGER and r.levelno == logging.WARNING]) == 1
     ensure_engine_ready(persona)  # the fault is gone
@@ -478,12 +480,11 @@ def test_a_state_that_already_holds_the_switch_over_time_returns_at_once_with_no
     assert instance.is_live() and state_of(persona).switch_over_at == T[39]  # the time never moves
 
 
-def _marked(persona: Path, memory_id: str) -> bool:
-    """True when the row carries the x10 fix's marker in its metadata."""
+def _progress(persona: Path) -> int:
+    """The x10 fix's progress note (`memories.db`'s `PRAGMA user_version`), read through the store's own method."""
     store = MemoryStore(persona / "memories.db", integrity_check=False)
     try:
-        found = store.get(memory_id, bump=False)
-        return found is not None and found.metadata.get(dev_constants.NUDGE_SCALE_FIX_MARKER_KEY) is True
+        return store.x10_progress()
     finally:
         store.close()
 

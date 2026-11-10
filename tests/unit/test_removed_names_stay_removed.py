@@ -661,11 +661,11 @@ REMOVED: tuple[Removed, ...] = (
         why="three readers of the time of the user's last turn (active buffers, the newest conversation memory, a silence-days oracle); brain.ingest.buffer.last_user_turn_ts is the one",
         ref="Engine 6 G3 (#584, draft PR #633)",
     ),
-    # --- the x10 fix is marked per row and per queued candidate, not per database (Engine 6 Q10c) ----------------------------
+    # --- the x10 fix carries no marker on any row or queued candidate; its progress is `PRAGMA user_version` (Engine 6 Q10c, C2) ---
     Removed(
-        names=("NUDGE_SCALE_FIX_MARKER",),
-        why="the int the x10 fix wrote to the database's `PRAGMA user_version`, which skipped the whole second pass; the fix marks each multiplied row and queued candidate in its metadata (NUDGE_SCALE_FIX_MARKER_KEY)",
-        ref="Engine 6 Q10c (#584, draft PR #633)",
+        names=("NUDGE_SCALE_FIX_MARKER", "NUDGE_SCALE_FIX_MARKER_KEY"),
+        why="the single int the x10 fix once wrote to `PRAGMA user_version`, and the metadata key it marked each multiplied row and queued candidate with; the owner ruled out per-row and per-entry markers (S77), and the fix's progress is now the two named numbers NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE and NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED in `PRAGMA user_version`",
+        ref="Engine 6 Q10c and C2 (#584, draft PR #633)",
         kind="code",
     ),
     # --- "switched over" is read off the state, not off a switch file (Engine 6 SW2) ----------------------------------------
