@@ -222,10 +222,9 @@ RERANK_MIN_REAL_CANDIDATES: int = 5
 
 # --- monologue family (name-recall fix R3, S13/S16) -------------------------
 # The memory types the kindled's own generated inner-monologue machinery
-# writes (monologue_emotion rows are no longer written, but existing ones stay
-# in the store and are classified here). In semantic recall they rank AFTER
-# genuine memories within each path and genuine candidates are taken first for
-# rerank slots (spec §4): a structural ordering, never a score multiplier. A fixed dev-level set of the
+# writes. In semantic recall they rank AFTER genuine memories within each path
+# and genuine candidates are taken first for rerank slots (spec §4): a
+# structural ordering, never a score multiplier. A fixed dev-level set of the
 # four types the spec names (monologue, monologue_trace, monologue_emotion,
 # monologue_soul_candidate); nothing reads or overrides it at run time. See
 # `brain.memory.semantic_recall.is_monologue_family`.
