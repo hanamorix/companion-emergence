@@ -12,7 +12,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from brain.files.path_identity import stat_or_none, under_any
+from brain.files.path_identity import stat_or_none, under_any, unusable
 
 _MAX_WRITE_BYTES = 1 * 1024 * 1024          # 1 MB per proposal
 _MAX_RESULT_FILE_BYTES = 25 * 1024 * 1024   # 25 MB resulting-file ceiling (append)
@@ -122,6 +122,8 @@ def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardRes
         return GuardResult(ok=False, error=f"bad path: {resolved} names an NTFS stream")
     if _denied(resolved, persona_dir):
         return GuardResult(ok=False, error=f"denied: {resolved} is in a protected location")
+    if (why := unusable(resolved)) is not None:
+        return GuardResult(ok=False, error=f"bad path: {why}")
     if op == "create":
         if resolved.exists():
             return GuardResult(ok=False, error=f"path already exists (create won't overwrite): {resolved}")
@@ -138,7 +140,11 @@ def check_size(content: str, *, op: str, resolved: Path) -> GuardResult:
     nbytes = len(content.encode("utf-8"))
     if nbytes > _MAX_WRITE_BYTES:
         return GuardResult(ok=False, error=f"too large ({nbytes} > {_MAX_WRITE_BYTES} cap)")
-    if op == "append" and resolved.exists():
-        if resolved.stat().st_size + nbytes > _MAX_RESULT_FILE_BYTES:
+    if op == "append":
+        try:
+            size = resolved.stat().st_size if resolved.exists() else 0
+        except OSError as exc:  # #695: the path stopped being usable since check_write_target
+            return GuardResult(ok=False, error=f"bad path: {exc.strerror or type(exc).__name__}")
+        if size + nbytes > _MAX_RESULT_FILE_BYTES:
             return GuardResult(ok=False, error="append would exceed the file-size ceiling")
     return GuardResult(ok=True, resolved=resolved)

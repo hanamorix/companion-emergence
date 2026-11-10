@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.files.path_identity import unusable
 from brain.files.read_guard import PROTECTED, is_read_denied
 from brain.health.json_io import append_jsonl
 from brain.images import media_type_to_ext, save_image_bytes, sniff_media_type
@@ -204,6 +205,9 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     except Exception as exc:  # noqa: BLE001
         _audit(persona_dir, tool="read_file", path=raw, resolved="", bytes_=0, ok=False, error=str(exc))
         return {"error": f"bad path: {exc}"}
+    if (why := unusable(p)) is not None:  # #695: too long, no permission, a loop: refuse before anything stats it
+        _audit(persona_dir, tool="read_file", path=raw, resolved="", bytes_=0, ok=False, error=why)
+        return {"error": f"bad path: {why}"}
 
     if is_read_denied(p, persona_dir=persona_dir):
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=False, error=PROTECTED)

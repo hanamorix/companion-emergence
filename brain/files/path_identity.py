@@ -23,6 +23,19 @@ def stat_or_none(p: Path) -> os.stat_result | None:
         return None
 
 
+def unusable(p: Path) -> str | None:
+    """Why the OS can't use `p` as a path (too long, permission denied, a loop), or
+    None if it can: it exists, or simply doesn't yet. Guards check this right after
+    resolving, so a later ``exists()`` or ``is_dir()`` can't raise mid-check (#695)."""
+    try:
+        os.stat(p)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
+    return None
+
+
 def under_any(resolved: Path, targets: Iterable[os.stat_result]) -> bool:
     """True if `resolved`, or any existing ancestor of it, is one of `targets`.
 
