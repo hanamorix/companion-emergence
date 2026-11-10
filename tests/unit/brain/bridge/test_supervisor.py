@@ -903,6 +903,17 @@ def test_run_log_rotation_tick_rotates_oversize_heartbeat(tmp_path: Path) -> Non
     assert "log_rotation" in types
 
 
+def test_run_log_rotation_tick_rotates_oversize_extractor_errors(tmp_path: Path) -> None:
+    """#559: extractor_errors.jsonl is append-only with no reader (only the extractor and monologue capture write it),
+    so it is bounded like the other error logs."""
+    persona_dir = _persona_dir(tmp_path)
+    _write_oversize_log(persona_dir, "extractor_errors.jsonl", size_bytes=200_000)
+
+    _run_log_rotation_tick(persona_dir, _CapturingBus(), rolling_size_bytes=10_000)
+
+    assert (persona_dir / "extractor_errors.jsonl.1.gz").exists()
+
+
 def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
     tmp_path: Path,
 ) -> None:
@@ -1503,7 +1514,10 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
     persona_dir = _persona_dir(tmp_path)
     emotion_engine_stub.live = True
 
+    asked: list[str] = []
+
     def boom():
+        asked.append("read")
         raise RuntimeError("engine fault")
 
     emotion_engine_stub.read = boom
@@ -1517,6 +1531,7 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+    assert asked, "the live rest gate must ask the engine for its read"
     assert captured["is_rest_state"] is False
 
 

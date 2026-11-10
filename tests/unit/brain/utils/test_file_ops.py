@@ -115,7 +115,7 @@ def test_windows_only_runs_the_full_schedule_on_windows(sleeps: list[float], mon
     assert fn.calls == 3 and sleeps == _linear(2)
 
 
-# --- read_bytes, read_bytes_stat, stat_key ---------------------------------------------------------------------------
+# --- read_bytes_stat, stat_key ---------------------------------------------------------------------------
 
 
 def test_read_bytes_stat_gives_the_bytes_and_the_stat_key(tmp_path: Path) -> None:
@@ -125,7 +125,7 @@ def test_read_bytes_stat_gives_the_bytes_and_the_stat_key(tmp_path: Path) -> Non
     st = os.stat(path)
     assert data == b"hello"
     assert key == (st.st_ino, st.st_mtime_ns, st.st_size) == file_ops.stat_key(st)
-    assert file_ops.read_bytes(path) == b"hello" and file_ops.read_bytes(str(path)) == b"hello"
+    assert file_ops.read_bytes_stat(str(path)) == (b"hello", key)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a file that is open cannot be replaced on Windows")
@@ -148,9 +148,9 @@ def test_read_bytes_stat_takes_the_key_from_the_open_handle(tmp_path: Path, monk
     assert file_ops.stat_key(os.stat(path)) != old_key
 
 
-def test_read_bytes_of_a_missing_file_raises_at_once(tmp_path: Path, sleeps: list[float]) -> None:
+def test_read_bytes_stat_of_a_missing_file_raises_at_once(tmp_path: Path, sleeps: list[float]) -> None:
     with pytest.raises(FileNotFoundError):
-        file_ops.read_bytes(tmp_path / "missing")
+        file_ops.read_bytes_stat(tmp_path / "missing")
     assert sleeps == []
 
 
@@ -179,6 +179,44 @@ def test_a_read_makes_one_attempt_off_windows(tmp_path: Path, sleeps: list[float
     _deny_open(monkeypatch, tries)
     with pytest.raises(PermissionError):
         file_ops.read_bytes_stat(tmp_path / "a")
+    assert len(tries) == 1 and sleeps == []
+
+
+# --- open_read -------------------------------------------------------------------------------------------------------
+
+
+def test_open_read_gives_a_binary_handle_that_streams_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "a"
+    path.write_bytes(b"one\ntwo\n")
+    with file_ops.open_read(path) as fh:
+        assert fh.readline() == b"one\n" and fh.read() == b"two\n"
+
+
+def test_open_read_of_a_missing_file_or_a_folder_raises_at_once(tmp_path: Path, sleeps: list[float]) -> None:
+    with pytest.raises(FileNotFoundError):
+        file_ops.open_read(tmp_path / "missing")
+    with pytest.raises(OSError):
+        file_ops.open_read(tmp_path)  # IsADirectoryError on Linux and macOS, PermissionError on Windows
+    assert sleeps == [] or file_ops._IS_WINDOWS
+
+
+def test_open_read_retries_a_sharing_violation_on_windows_with_the_read_schedule(
+    tmp_path: Path, sleeps: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", True)
+    tries: list[int] = []
+    _deny_open(monkeypatch, tries)
+    with pytest.raises(PermissionError):
+        file_ops.open_read(tmp_path / "a")
+    assert len(tries) == dev_constants.FILE_READ_ATTEMPTS == 3 and sleeps == _linear(2)
+
+
+def test_open_read_makes_one_attempt_off_windows(tmp_path: Path, sleeps: list[float], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", False)
+    tries: list[int] = []
+    _deny_open(monkeypatch, tries)
+    with pytest.raises(PermissionError):
+        file_ops.open_read(tmp_path / "a")
     assert len(tries) == 1 and sleeps == []
 
 
@@ -273,9 +311,39 @@ def test_delete_file_never_removes_a_folder(tmp_path: Path, sleeps: list[float])
     folder = tmp_path / "d"
     folder.mkdir()
     (folder / "x").write_bytes(b"1")
-    with pytest.raises(OSError):  # IsADirectoryError on Linux; PermissionError (retried) on macOS and Windows
+    with pytest.raises(IsADirectoryError):
         file_ops.delete_file(folder)
     assert (folder / "x").read_bytes() == b"1"
+
+
+def test_delete_file_refuses_a_folder_at_once_on_every_system(tmp_path: Path, sleeps: list[float], monkeypatch: pytest.MonkeyPatch) -> None:
+    """macOS and Windows raise PermissionError (not IsADirectoryError) when a folder is unlinked. That must not be retried
+    (8 tries and about 1.4 s, then a permission error): the folder is refused before any unlink is tried."""
+    folder = tmp_path / "d"
+    folder.mkdir()
+    (folder / "x").write_bytes(b"1")
+    attempts: list[object] = []
+
+    def unlink_as_on_macos_and_windows(path, *args, **kwargs):
+        attempts.append(path)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "unlink", unlink_as_on_macos_and_windows)
+    with pytest.raises(IsADirectoryError):
+        file_ops.delete_file(folder)
+    assert attempts == [] and sleeps == []
+    assert (folder / "x").read_bytes() == b"1"
+
+
+@pytest.mark.no_base_failure(reason="pins the existing rule that unlink removes a symbolic link to a folder (the link only); the new folder check must not change it")
+def test_delete_file_removes_a_symlink_to_a_folder_and_keeps_the_folder(tmp_path: Path, requires_symlinks: None, sleeps: list[float]) -> None:
+    folder = tmp_path / "d"
+    folder.mkdir()
+    (folder / "x").write_bytes(b"1")
+    link = tmp_path / "link"
+    link.symlink_to(folder, target_is_directory=True)
+    file_ops.delete_file(link)
+    assert not link.is_symlink() and (folder / "x").read_bytes() == b"1" and sleeps == []
 
 
 # --- delete_tree ---------------------------------------------------------------------------------------------------

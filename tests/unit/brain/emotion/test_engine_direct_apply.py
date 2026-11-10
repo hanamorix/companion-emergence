@@ -25,6 +25,7 @@ from tests.unit.brain.emotion._engine_support import (
     NOW,
     LockSpy,
     commit_event,
+    engine_errors,
     install,
     local_day,
     local_noon,
@@ -32,11 +33,14 @@ from tests.unit.brain.emotion._engine_support import (
     queue,
     queue_events,
     queue_text_lines,
+    refuse_the_switch_stat,
     row,
+    ruin_the_state,
     save,
     save_as_backup,
     showing,
     simple_state,
+    skipped_warnings,
     state_of,
     tree,
 )
@@ -345,6 +349,76 @@ def test_a_failed_recovery_on_a_persona_that_is_not_live_continues_from_an_empty
     state = state_of(persona)
     assert state.emotions["joy"].short.avg == 6.0 and state.emotions["joy"].short.weight == 1.0  # from empty, not the backup's 4
     assert engine_files.read_state(persona).source == "main" and queue_events(persona) == []
+
+
+def test_a_failed_recovery_with_the_switch_unknown_skips_the_pass_and_keeps_the_state_and_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fallback to an empty state after a failed catch-up (fallback_empty) replaces the stored state, so it runs only when
+    the switch is known missing; an unknown switch ("assume it is not switched", owner 2026-11-05) skips the pass instead."""
+    persona, eng = _backup_world(tmp_path)
+    _failing_catch_up(monkeypatch)
+    queue(persona, showing("s", D[7], {"joy": 6.0}))
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+        eng.note_active(D[8])
+    assert len(skipped_warnings(caplog)) == 1
+    assert engine_errors(caplog) == []
+    assert eng._catch_up_failed is False
+    assert tree(persona / "state") == before  # the backup state is still the only copy, and the queue line is kept
+    assert len(queue_events(persona)) == 1
+    monkeypatch.undo()  # the fault clears: known missing, so the retry falls back to an empty state as before
+    _failing_catch_up(monkeypatch)
+    eng.note_active(D[8])
+    assert state_of(persona).emotions["joy"].short.weight == 1.0 and queue_events(persona) == []
+
+
+def test_a_direct_apply_with_the_switch_unknown_and_an_unreadable_state_keeps_the_memory_and_the_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    persona = make_persona(tmp_path / "persona")
+    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    ruin_the_state(persona)
+    eng = install(persona, D[8])
+    store = MemoryStore(persona / "memories.db")
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+            memory = row(D[7], emotions={"joy": 6.0})
+            store.create(memory)
+        assert store.get(memory.id, bump=False) is not None
+    finally:
+        store.close()
+    assert tree(persona / "state") == before
+    assert len(skipped_warnings(caplog)) == 1
+    assert engine_errors(caplog) == []
+    assert eng._catch_up_failed is False
+
+
+def test_a_batch_with_the_switch_unknown_and_an_unreadable_state_keeps_the_memories_and_the_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    persona = make_persona(tmp_path / "persona")
+    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    ruin_the_state(persona)
+    eng = install(persona, D[8])
+    store = MemoryStore(persona / "memories.db")
+    before = tree(persona / "state")
+    refuse_the_switch_stat(monkeypatch)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
+            with eng.batch():
+                first, second = row(D[6], emotions={"joy": 6.0}), row(D[7], emotions={"joy": 5.0})
+                store.create(first)
+                store.create(second)
+        assert store.get(first.id, bump=False) is not None and store.get(second.id, bump=False) is not None
+    finally:
+        store.close()
+    assert tree(persona / "state") == before
+    assert len(skipped_warnings(caplog)) == 1  # one apply at the end of the block, so one skipped pass
+    assert engine_errors(caplog) == []
 
 
 def test_an_unreadable_state_on_a_live_persona_is_never_overwritten_and_the_direct_apply_logs_and_flags(

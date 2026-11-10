@@ -14,10 +14,12 @@ import ast
 import contextlib
 import copy
 import dataclasses
+import io
 import json
 import logging
 import math
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -227,7 +229,7 @@ _WRONG = [None, "x", [], {}, True, 10**400, -1, float("nan"), float("inf"), 0, 2
 
 
 def test_every_event_the_check_accepts_folds_and_saves(tmp_path: Path) -> None:
-    """The check and the fold agree: nothing that passes can fail every drain for ever (E6.10), not even at the save."""
+    """The check and the fold agree: nothing that passes can fail every drain for ever (design doc section 2.13), not even at the save."""
     accepted = refused = 0
     for kind in ("commit", "assigned", "showing", "change", "start"):
         base = _raw(kind)
@@ -566,7 +568,7 @@ def test_blank_lines_count_in_the_line_numbers(tmp_path: Path, caplog: pytest.Lo
 def test_a_line_of_zero_bytes_is_dropped_like_a_torn_line_and_the_next_line_is_read(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """B04.2: an unclean machine stop can leave a zeroed record; it is dropped with its own line, the rest is read."""
+    """design doc section 6: an unclean machine stop can leave a zeroed record; it is dropped with its own line, the rest is read."""
     first, second = _raw("commit", memory_id="a"), _raw("assigned", memory_id="c")
     path = _put_queue_file(tmp_path, _jline(first) + b"\x00" * 64 + b"\n" + _jline(second))
     before = _tree(tmp_path)
@@ -656,7 +658,7 @@ def test_an_event_that_cannot_be_encoded_is_logged_once_and_the_queue_is_untouch
 def test_the_append_asks_append_jsonl_for_a_held_lock_and_logging_with_no_fsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B04.2: no fsync per append; the caller holds the lock, so the append takes none of its own."""
+    """design doc section 2.9: no fsync per append; the caller holds the lock, so the append takes none of its own."""
     seen: dict[str, object] = {}
     result: list[int | None] = [10]
 
@@ -752,7 +754,7 @@ def test_a_huge_position_reads_the_whole_queue_from_line_zero(tmp_path: Path) ->
 def test_a_negative_position_is_read_as_zero_and_logged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """P12b: a position outside its range is held to the range. `tmp_path` is unique, so the throttle cannot hide the line."""
+    """design doc section 2.9: a position outside its range is held to the range. `tmp_path` is unique, so the throttle cannot hide the line."""
     events = _queue_of(tmp_path, 3)
     starts: list[int] = []
     real = engine_files.read_jsonl_from
@@ -829,10 +831,6 @@ def test_emptying_a_queue_path_that_is_a_folder_returns_false_and_keeps_the_fold
     assert queue.is_dir() and (queue / "inner").read_bytes() == b"keep"
 
 
-def test_clear_queue_no_longer_exists() -> None:
-    assert not hasattr(engine_files, "clear_queue")
-
-
 def test_the_position_rule_in_one_sequence(tmp_path: Path) -> None:
     """Append 3, read to the end, empty, append 2: the stored position 3 is past the end of the new queue, so it is read from line 0."""
     first = _queue_of(tmp_path, 3)
@@ -846,7 +844,7 @@ def test_the_position_rule_in_one_sequence(tmp_path: Path) -> None:
     assert (again.events, again.end_line) == (later, 2)
 
 
-# --- every file operation goes through its accessor (P18, S1, S37) -------------------------------
+# --- every file operation goes through its accessor (design doc section 2.9) -------------------------------
 
 _RAW_FILE_ATTRS = frozenset(
     "open unlink iterdir stat lstat exists is_file is_dir mkdir rmdir read_text write_text read_bytes write_bytes "
@@ -1279,6 +1277,67 @@ def test_the_reader_skips_a_torn_line_a_bad_line_and_a_line_that_is_not_a_change
     assert len(_errors(caplog)) == 2  # the invalid event and the commit line
 
 
+def _kind_line(kind: object, at: datetime) -> str:
+    return json.dumps({"kind": kind, "at": at.isoformat(), "emotions": {"joy": 9.0}})
+
+
+@pytest.mark.parametrize("kind", [[], {}, [1], [[]], {"a": 1}], ids=["list", "dict", "list-of-one", "nested", "dict-of-one"])
+def test_the_reader_skips_a_line_whose_kind_cannot_be_looked_up_and_reads_the_rest(
+    kind: object, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unhashable `kind` (valid JSON) used to raise TypeError out of the membership test and abort the whole read."""
+    since = _local_noon(date(2026, 6, 10))
+    path = _write_day(
+        tmp_path,
+        "2026-06-10",
+        _line(since, joy=1.0),
+        _kind_line(kind, since),
+        _line(since + timedelta(minutes=1), joy=2.0),
+    )
+    before = path.read_bytes()
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len(_errors(caplog)) == 1 and "unknown kind" in _errors(caplog)[0]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.no_base_failure(reason="a number, a bool, null or an unknown text kind is hashable, so it already reaches event_from_json's own kind check and is dropped at base; this pins that the whole set of non-text kinds is dropped one line at a time")
+@pytest.mark.parametrize("kind", [5, 1.5, True, None, "x", "Change"], ids=["int", "float", "bool", "null", "text", "case"])
+def test_the_reader_skips_a_line_whose_kind_is_not_a_known_text_and_reads_the_rest(
+    kind: object, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(
+        tmp_path,
+        "2026-06-10",
+        _line(since, joy=1.0),
+        _kind_line(kind, since),
+        _line(since + timedelta(minutes=1), joy=2.0),
+    )
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len(_errors(caplog)) == 1
+
+
+@pytest.mark.no_base_failure(reason="read_queue already checks the kind as text first (event_from_json); this pins that the queue and the change log answer the same lines the same way")
+@pytest.mark.parametrize("kind", [[], {}, 5, None, "x"], ids=["list", "dict", "int", "null", "text"])
+def test_the_queue_skips_a_line_whose_kind_is_not_a_known_text_and_reads_the_rest(
+    kind: object, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = engine_files.queue_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join([json.dumps(_raw("commit")), _kind_line(kind, NOW), json.dumps(_raw("commit", memory_id="m2"))]) + "\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        got = engine_files.read_queue(tmp_path, from_line=0)
+    assert [e.memory_id for e in got.events] == ["m1", "m2"] and got.end_line == 3
+    assert len(_errors(caplog)) == 1
+
+
 @pytest.mark.no_base_failure(reason="guards the new hold line against firing in the change-log reader: a commit line there is dropped as not a change with one error line and no 'held' warning; the old code has no hold line to misfire")
 def test_a_commit_line_in_the_change_log_is_dropped_as_not_a_change_without_a_hold_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1300,6 +1359,119 @@ def test_the_reader_treats_an_unlistable_folder_as_missing_with_a_line(
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         assert engine_files.read_changes(tmp_path, NOW) == []
     assert len(_errors(caplog)) == 1
+
+
+def _reader_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The WARNING lines of the shared JSONL readers (`brain.health.*`): which of them logs is the reader's own business."""
+    return [r.getMessage() for r in caplog.records if r.name.startswith("brain.health.") and r.levelno == logging.WARNING]
+
+
+def _unloadable_digits() -> str:
+    return '{"x": ' + "1" * (sys.get_int_max_str_digits() + 1) + "}"  # the parser refuses it: ValueError
+
+
+def _unloadable_nesting() -> str:
+    return '{"x": ' + "[" * 200_000 + "]" * 200_000 + "}"  # past the parser's recursion limit: RecursionError
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(
+            _unloadable_digits,
+            marks=pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off"),
+        ),
+        _unloadable_nesting,
+    ],
+    ids=["digits", "nesting"],
+)
+def test_the_reader_skips_a_line_the_json_parser_cannot_load_with_a_warning_naming_file_and_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, bad
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    unloadable = bad()
+    with pytest.raises((ValueError, RecursionError)) as parser_error:  # the apparatus: this line really is one the parser refuses
+        json.loads(unloadable)
+    assert not isinstance(parser_error.value, json.JSONDecodeError)
+    path = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), unloadable, _line(since + timedelta(minutes=1), joy=2.0))
+    before = path.read_bytes()
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert path.read_bytes() == before  # the reader repairs nothing
+    named = [m for m in _reader_warnings(caplog) if str(path) in m and "line 2" in m]
+    assert len(named) == 1
+
+
+@pytest.mark.no_base_failure(reason="pins what the switch to the raw reader must keep: iter_jsonl warned about a malformed line the same way, naming the file and the line")
+def test_a_malformed_change_line_is_skipped_with_a_warning_naming_file_and_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    path = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), "{not json", _line(since, joy=2.0))
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 2.0]
+    assert len([m for m in _reader_warnings(caplog) if str(path) in m and "line 2" in m]) == 1
+
+
+@pytest.mark.no_base_failure(reason="pins the I/O tolerance design doc section 2.10 requires, which iter_jsonl had too: a day file that cannot be opened adds nothing, with a warning naming it, and the other days are still read")
+def test_an_unopenable_day_file_adds_nothing_and_the_other_days_are_still_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0))
+    broken = _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=8.0))
+    _write_day(tmp_path, "2026-06-12", _line(since + timedelta(days=2), joy=3.0))
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if Path(path).name == broken.name:
+            raise PermissionError(13, "denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", fake_open, raising=False)
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
+    assert any(broken.name in m and "(io:" in m for m in _reader_warnings(caplog))
+
+
+@pytest.mark.no_base_failure(reason="pins the I/O tolerance design doc section 2.10 requires, which iter_jsonl had too: a read fault in the middle of a day file ends that file's lines, keeps what was read, warns naming the file, and the next day is still read")
+def test_a_read_fault_mid_file_ends_that_file_keeps_what_was_read_and_reads_the_next_day(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    since = _local_noon(date(2026, 6, 10))
+    faulty = _write_day(tmp_path, "2026-06-10", _line(since, joy=1.0), _line(since + timedelta(minutes=1), joy=9.0))
+    _write_day(tmp_path, "2026-06-11", _line(since + timedelta(days=1), joy=3.0))
+    first_line = (_line(since, joy=1.0) + "\n").encode("utf-8")  # ends in a newline, so the line is whole before the fault
+
+    class _FaultAfterOneLine(io.RawIOBase):
+        def __init__(self) -> None:
+            self._served = False
+
+        def readable(self) -> bool:
+            return True
+
+        def readinto(self, buffer) -> int:
+            if self._served:
+                raise OSError(5, "input/output error")
+            self._served = True
+            buffer[: len(first_line)] = first_line
+            return len(first_line)
+
+    real_open = open
+
+    def fake_open(path, mode="r", *args, **kwargs):
+        if Path(path).name == faulty.name:
+            return io.BufferedReader(_FaultAfterOneLine())
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", fake_open, raising=False)
+    with caplog.at_level(logging.WARNING):
+        got = engine_files.read_changes(tmp_path, since)
+    assert [e.emotions["joy"] for e in got] == [1.0, 3.0]
+    assert any(faulty.name in m and "(io:" in m for m in _reader_warnings(caplog))
 
 
 def test_a_change_written_then_read_round_trips(tmp_path: Path) -> None:

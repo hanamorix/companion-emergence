@@ -285,16 +285,22 @@ RAM_FIT_SAFETY_FACTOR: float = 1.0 / (1.0 - RAM_FIT_LARGEST_UNDERESTIMATE)  # 1.
 # --- transient file-access retry (#643) --------------------------------------
 # Windows refuses to replace, delete or open a file another handle holds for a moment (WinError 32: a just-flushed writer,
 # an antivirus scan or indexer on a freshly written file, a reader that is not yet closed). `brain.utils.file_ops
-# .retry_transient` is the one retry for it, and replace, delete and the whole-file read go through it. A failed try is
+# .retry_transient` is the one retry for it, and replace, delete, the whole-file read and the open of a file that is streamed go through it. A failed try is
 # repeated up to FILE_RETRY_ATTEMPTS tries in all, sleeping FILE_RETRY_SLEEP_S * n after the n-th failed try (0.05, 0.10 ...
 # 0.35 s, about 1.4 s in all) before the error is let through, so a real permission problem still fails loudly. A read holds
 # the file for microseconds, so it rides out a rename in progress with fewer tries, and only on Windows: on Linux and macOS a
 # PermissionError is a real one and one attempt is made. These are the values that the copies of the loop in atomic_write and
-# json_io used, moved here unchanged. The update overlay's rename used 6 doubling tries (about 1.55 s) and now follows the
-# replace schedule.
+# json_io used, moved here unchanged. The update overlay's rename has its own schedule (below), not this one.
 FILE_RETRY_ATTEMPTS: int = 8
 FILE_RETRY_SLEEP_S: float = 0.05
 FILE_READ_ATTEMPTS: int = 3
+# The update overlay's rename of the staged folder (brain/update/install.py, #302): the longest-held rename, since Windows
+# refuses a folder rename while any file inside is open and an antivirus scan of a freshly unpacked overlay holds many. It used
+# 6 doubling tries (0.05, 0.1, 0.2, 0.4, 0.8 s: 1.55 s in all). `retry_transient` waits sleep_s * n after the n-th failed try
+# (linear, not doubling), so 6 tries at 0.05 s would give 0.75 s; 0.11 s is the smallest round step whose total,
+# 0.11 * (1 + 2 + 3 + 4 + 5) = 1.65 s, is at or above the old 1.55 s. The old budget is kept, not shortened (D2).
+OVERLAY_RENAME_ATTEMPTS: int = 6
+OVERLAY_RENAME_SLEEP_S: float = 0.11
 
 # --- settings-file lock wait (#529) ------------------------------------------
 # How long a writer of $KINDLED_HOME/tunables.toml (the install-wide settings file: the picker, `nell model`, the
@@ -451,9 +457,15 @@ SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
 
 # A feeling counts as high (`engine.feels_high`, the one predicate the readers that used to fire on a fixed level call) when
 # its short average today is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, taken over that feeling's
-# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high regardless). Owner-set,
-# 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
+# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high whatever its range), and either
+# way only at or above the floor in the next constant. Owner-set, 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
 FEELS_HIGH_RANGE_FRACTION: float = 0.5
+# A feeling whose short average is below this level (0 to 10 scale) is never high, whatever its range or its shift: a feeling
+# that sits near zero all month has a tiny range, and without a floor its top half would count as "high" (a vulnerability at
+# 0.02 started a self-check). Maintainer's decision, 2026-11-05. This is a DEFAULT, proposed from the reader measurement
+# (`scripts/measure_feels_high_thresholds.py`) and set by the owner on 2026-11-05; the follow-up that makes the floor
+# self-calibrating for a mature kindled is #661. Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_FLOOR: float = 0.1
 # Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
 # `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
 # replaced the feeling levels, not this count). Read at call time in `brain.body.state`.

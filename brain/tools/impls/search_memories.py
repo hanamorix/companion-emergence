@@ -56,7 +56,7 @@ def _reinforce_corecall(hebbian, memories: list) -> None:
         logger.debug("co-recall reinforcement failed", exc_info=True)
 
 
-def _snippet_result(memory, persona_dir: Path) -> dict:
+def _snippet_result(memory, persona_dir: Path | None) -> dict:
     """Slim a Memory to a SNIPPET result: truncated body + id + snippet marker.
 
     Full bodies are surfaced only via ``read_full_memory(id)`` — the model pulls

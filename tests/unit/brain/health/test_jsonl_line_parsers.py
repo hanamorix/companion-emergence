@@ -201,8 +201,13 @@ def _run(reader_name: str, tmp_path: Path, content: bytes, *, strict: bool) -> t
     return rows, None, path
 
 
-def _assert_the_unloadable_line_error(exc: BaseException | None, cause: type[Exception], line: int, path: Path) -> None:
-    """Exactly ``UnloadableJsonlLineError``: not a bare parser exception, not ``JsonlLineError`` or ``JsonFileError`` (``ValueError``s too)."""
+def _assert_the_unloadable_line_error(
+    exc: BaseException | None, cause: type[Exception], line: int | None, path: Path, window_line: int | None = None
+) -> None:
+    """Exactly ``UnloadableJsonlLineError``: not a bare parser exception, not ``JsonlLineError`` or ``JsonFileError`` (``ValueError``s too).
+
+    ``line`` is the file line, or None for the plain tail reader, which parses a window of the last lines: then ``reason`` says
+    ``window_line``, the position in that window, and the message does not claim a line."""
     assert exc is not None, "the read went on past the line"
     assert type(exc).__name__ == "UnloadableJsonlLineError", f"got {type(exc).__name__}: {exc}"
     assert type(exc) is jsonl_reader.UnloadableJsonlLineError
@@ -211,6 +216,12 @@ def _assert_the_unloadable_line_error(exc: BaseException | None, cause: type[Exc
     assert exc.code == "jsonl_unloadable_line"
     assert exc.line == line
     assert exc.path == path
+    if window_line is not None:
+        assert line is None
+        assert f"line {window_line} of the window of the last lines read, not a file line" in exc.reason
+        assert "None" not in str(exc) and str(exc).startswith(f"{path}: ") and exc.reason in str(exc)
+    else:
+        assert "window" not in exc.reason
     assert type(exc.__cause__) is cause  # the parser's own exception stays reachable
 
 
@@ -234,6 +245,15 @@ def test_the_error_survives_copy_and_pickle(clone) -> None:
     )
 
 
+@pytest.mark.parametrize("clone", [copy.copy, lambda e: pickle.loads(pickle.dumps(e))], ids=["copy", "pickle"])
+def test_the_error_without_a_line_survives_copy_and_pickle_and_its_message_claims_no_line(clone) -> None:
+    original = jsonl_reader.UnloadableJsonlLineError(None, "malformed JSON (x) (line 2 of the window)", Path("a") / "b.jsonl")
+    again = clone(original)
+    assert type(again) is type(original) and again.line is None
+    assert (again.reason, again.path, again.code, str(again)) == (original.reason, original.path, original.code, str(original))
+    assert str(original) == f"{Path('a') / 'b.jsonl'}: malformed JSON (x) (line 2 of the window)"
+
+
 @pytest.mark.parametrize("layout", _LAYOUTS)
 @pytest.mark.parametrize(("build", "cause"), _UNLOADABLE)
 @pytest.mark.parametrize("reader_name", _ABORTING_READERS)
@@ -243,8 +263,10 @@ def test_a_line_the_json_parser_cannot_load_stops_the_read_with_a_named_error(
     content, file_line, window_line = _layout(layout, build())
     with caplog.at_level(logging.WARNING):
         rows, exc, path = _run(reader_name, tmp_path, content, strict=False)
-    line = window_line if reader_name == "read_jsonl_tail" else file_line  # the plain tail parses a window of the file
-    _assert_the_unloadable_line_error(exc, cause, line, path)
+    if reader_name == "read_jsonl_tail":  # the plain tail parses a window of the file: no file line, the window position is in the reason
+        _assert_the_unloadable_line_error(exc, cause, None, path, window_line)
+    else:
+        _assert_the_unloadable_line_error(exc, cause, file_line, path)
     assert rows == ([] if reader_name in _RETURNS_A_LIST else [{"a": 1}])
     assert _messages(caplog) == []
 
@@ -257,7 +279,10 @@ def test_strict_mode_gives_the_same_named_error_for_such_a_line(
 ) -> None:
     content, file_line, window_line = _layout(layout, build())
     rows, exc, path = _run(reader_name, tmp_path, content, strict=True)
-    _assert_the_unloadable_line_error(exc, cause, window_line if reader_name == "read_jsonl_tail" else file_line, path)
+    if reader_name == "read_jsonl_tail":
+        _assert_the_unloadable_line_error(exc, cause, None, path, window_line)
+    else:
+        _assert_the_unloadable_line_error(exc, cause, file_line, path)
     assert rows == ([] if reader_name in _RETURNS_A_LIST else [{"a": 1}])
 
 

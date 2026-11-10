@@ -55,6 +55,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
 
     Returns a dict with keys:
       - emotions: dict[str, float] — non-zero emotions sorted desc by intensity
+      - feels_high: list[str] | None — when the emotion engine is live, the names (from its read) that
+        `engine.feels_high` answers True for, sorted by name, computed here so the app holds no fixed level of its own;
+        None when the engine is not live (the app keeps its old levels) or cannot be asked
       - body: dict | None — body state from compute_body_state
       - interior: dict — last_dream / last_research / last_heartbeat themes
       - soul_highlight: dict | None — one crystallization (highest resonance,
@@ -80,6 +83,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     return {
         "persona": persona_name,
         "emotions": _build_emotions(persona_dir),
+        # The feeling names the engine calls high (live path), for the app's expressions; None on the old path.
+        "feels_high": _build_feels_high(persona_dir),
         "body": _build_body(persona_dir, now=now),
         "interior": _build_interior(persona_dir),
         "soul_highlight": _build_soul_highlight(persona_dir),
@@ -379,6 +384,26 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: emotions aggregation failed", exc_info=True)
         return {}
+
+
+def _build_feels_high(persona_dir: Path) -> list[str] | None:
+    """The feeling names `engine.feels_high` answers True for, sorted, when the emotion engine is live (`[]` when none is
+    high or the read is empty); None when it is not live, and None (with a warning) when the engine cannot be asked.
+
+    The app's expressions read this on the live path instead of comparing the panel's numbers to levels of their own. Each
+    name asks the engine's predicate, which reads the engine again (the accepted cost of the predicate's one-name signature,
+    the same shape `_build_body` has).
+    """
+    try:
+        from brain.emotion import engine
+
+        live_engine = engine.engine_for(persona_dir)
+        if not live_engine.is_live():
+            return None
+        return sorted(name for name in live_engine.read() if live_engine.feels_high(name))
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: feels_high aggregation failed", exc_info=True)
+        return None
 
 
 def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:

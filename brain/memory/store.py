@@ -142,7 +142,7 @@ def _emotions_column(emotions: dict[str, float]) -> str:
 # PLACEHOLDER WORDING. The date the temp gate's write-back puts at the start of a recalled memory's text (spec section 7
 # item 12, sfa S31(c)) is persona-facing: its exact form is the owner's byte-exact call at the end of the build, and this
 # constant is working text until then. `{date}` stands for the day as YYYY-MM-DD and must appear exactly once. The test for "the
-# text already starts with a date" is built from this same constant, so re-wording it changes the add and the skip together.
+# text already starts with a date" is built from this same constant, so re-wording it changes the add, the skip and `carry_date_prefix` together.
 DATE_PREFIX_FORMAT_PLACEHOLDER = "{date}: "
 
 
@@ -167,6 +167,28 @@ def _with_date_prefix(text: str, created_at: datetime) -> str:
     if _date_prefix_pattern(fmt).match(text):
         return text
     return fmt.replace("{date}", day_of(created_at)) + text
+
+
+def carry_date_prefix(old_text: str, new_text: str) -> str:
+    """`new_text` with the date `old_text` starts with put at its start, when `old_text` has one and `new_text` does not.
+
+    Every rewrite of a row's text goes through this (`MemoryStore.update`, `MemoryStore.fade`): a write-back put the day the memory
+    was made at the start of the text and moved ``created_at``, so a rewrite that drops that date would make the next write-back
+    stamp the reset day as the day it was made. A blank rewrite and an old text with no date are returned unchanged. A rewrite's leading whitespace is
+    dropped (the write-back's "already dated" test does not skip whitespace, so a date behind whitespace would be stamped over
+    by the next write-back): a rewrite that starts with a date of its own keeps it, and otherwise the old date goes in front.
+    The form is the same `DATE_PREFIX_FORMAT_PLACEHOLDER` the write-back uses, read when this is called.
+    """
+    pattern = _date_prefix_pattern(DATE_PREFIX_FORMAT_PLACEHOLDER)
+    if not new_text.strip():
+        return new_text
+    text = new_text.lstrip()
+    if pattern.match(text):
+        return text
+    old = pattern.match(old_text)
+    if old is None:
+        return new_text
+    return old.group(0) + text
 
 
 def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
@@ -2875,6 +2897,8 @@ class MemoryStore:
         before = self.get(memory_id, bump=False)
         if before is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
+        if "content" in fields:
+            fields["content"] = carry_date_prefix(before.content, fields["content"])
 
         column_map: dict[str, tuple[str, Any]] = {}
         extra_clauses: list[str] = []
@@ -3012,7 +3036,8 @@ class MemoryStore:
 
         The date: so a displayed memory keeps the day it was made once ``created_at`` moves, the row's text gets the local
         calendar day of its ``created_at`` BEFORE this reset at its start (`DATE_PREFIX_FORMAT_PLACEHOLDER`), unless it already
-        starts with a date in that form, so a second write-back adds nothing. A fading row's original text (``content_snapshot``,
+        starts with a date in that form, so a second write-back adds nothing (`update` and `fade` keep that date when they rewrite
+        the text: `carry_date_prefix`). A fading row's original text (``content_snapshot``,
         which `unfade` restores) is judged and dated the same way, so the day survives an unfade. The row's own text is read
         here, in the same write transaction (`BEGIN IMMEDIATE`) as the UPDATE, so a text change that landed since the caller
         loaded the row is kept and the old date is the one the row really held. When the text changed, the same UPDATE clears
@@ -3036,8 +3061,7 @@ class MemoryStore:
             content = _with_date_prefix(row["content"], before)
             snapshot = row["content_snapshot"]
             # A fading row's snapshot (the original text `unfade` restores) is dated with the same origin day, so an unfade after
-            # this write-back keeps the day the memory was made. Accepted edge: a summary made by `fade` after an earlier write-back
-            # has no prefix, so a later write-back dates that summary with the last reset day while the snapshot keeps the origin day.
+            # this write-back keeps the day the memory was made.
             new_snapshot = None if snapshot is None else _with_date_prefix(snapshot, before)
             assignments = ["emotions_json = ?", "created_at = ?"]
             values: list[Any] = [_emotions_column(emotions), created_at.isoformat()]
@@ -3153,9 +3177,10 @@ class MemoryStore:
 
     def fade(self, memory_id: str, *, summary: str) -> None:
         """Fade a memory: snapshot content into content_snapshot, replace
-        content with summary, set state='fading'. Raises KeyError if unknown.
+        content with summary (keeping the made-on date: `carry_date_prefix`),
+        set state='fading'. Raises KeyError if unknown.
         """
-        row = self._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        row = self._conn.execute("SELECT state, content FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if row is None:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
         if row["state"] == "fading":
@@ -3164,6 +3189,7 @@ class MemoryStore:
                 memory_id,
             )
             return
+        summary = carry_date_prefix(row["content"], summary)
         # F1 #259 increment-2 red-team fix: embedding/embedding_model_id are
         # NULLed IN THE SAME UPDATE/commit as the content change, so the
         # durable intermediate state after a crash right here is {summary

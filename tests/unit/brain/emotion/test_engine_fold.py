@@ -177,7 +177,7 @@ def _state_signature(state: eu.EngineState) -> tuple:
         )
         for name, e in state.emotions.items()
     }
-    return rows, state.last_update, state.oldest_entry_at
+    return rows, state.last_update
 
 
 def test_the_same_entries_in_any_order_give_the_same_state() -> None:
@@ -194,13 +194,11 @@ def test_the_same_entries_in_any_order_give_the_same_state() -> None:
             eu.fold_entry(state, name, value, w, at)
         results.append(state)
     first = results[0]
-    expected_rows, expected_last, expected_oldest = _state_signature(first)
+    expected_rows, expected_last = _state_signature(first)
     assert first.last_update == _at(4)
-    assert expected_oldest == _at(0)
     for other in results[1:]:
-        rows, last, oldest = _state_signature(other)
+        rows, last = _state_signature(other)
         assert last == expected_last
-        assert oldest == expected_oldest
         assert set(rows) == set(expected_rows)
         for name, row in rows.items():
             assert row == expected_rows[name]
@@ -268,7 +266,6 @@ def test_an_entry_dated_in_the_future_is_dated_now() -> None:
     now = _at(3)
     eu.fold_event(state, _event("commit", now + timedelta(days=2), {"joy": 5.0}), now)
     assert state.last_update == now
-    assert state.oldest_entry_at == now
     assert state.emotions["joy"].last_entry_day == eu.day_of(now)
 
 
@@ -707,25 +704,43 @@ def test_persona_start_is_the_earliest_commit_and_a_start_event_folds_nothing_el
     only = eu.EngineState()
     eu.fold_event(only, eu.Event(kind="start", at=_at(0)), _at(9))
     assert only.persona_start_at == _at(0)
-    assert only.emotions == {} and only.last_update is None and only.oldest_entry_at is None and only.repeats == {}
+    assert only.emotions == {} and only.last_update is None and only.repeats == {}
     eu.fold_event(only, eu.Event(kind="start", at=_at(4)), _at(9))
     assert only.persona_start_at == _at(0)
 
 
-def test_oldest_entry_and_last_entry_day_follow_the_entries_never_a_zero() -> None:
+@pytest.mark.no_base_failure(reason="the old oldest-entry test with its oldest_entry_at assertions removed and a new name; the last-entry-day assertions that remain hold on the base code too")
+def test_last_entry_day_follows_the_entries_never_a_zero() -> None:
     state = eu.EngineState()
     _fold(state, _event("showing", _at(2), {"joy": 5.0}, "a"))
     _fold(state, _event("change", _at(1), {"joy": 1.0}, "s"))
-    assert state.oldest_entry_at == _at(1)
     assert state.emotions["joy"].last_entry_day == eu.day_of(_at(2))  # the later of the two days
     _fold(state, _event("assigned", _at(0), {"grief": 3.0}, "b"))
-    assert state.oldest_entry_at == _at(0)
     assert state.emotions["grief"].last_entry_day == eu.day_of(_at(0))
     state2 = eu.EngineState()
     eu.fold_entry(state2, "joy", 5.0, 1.0, _at(5))
     eu.fold_entry(state2, "joy", 0.0, 1.0, _at(1), zero=True)
-    assert state2.oldest_entry_at == _at(5)
     assert state2.emotions["joy"].last_entry_day == eu.day_of(_at(5))
+
+
+def test_a_first_fold_never_leaves_an_average_above_the_value_cap() -> None:
+    """A weight of 0.22876222127045265 at the value 10 folds to 10.000000000000002 by the delta form without the hold."""
+    state = eu.EngineState()
+    eu.fold_entry(state, "joy", 10.0, 0.22876222127045265, _at(0))
+    assert state.emotions["joy"].short.avg <= dev_constants.EMOTION_VALUE_CAP
+    assert state.emotions["joy"].long.avg <= dev_constants.EMOTION_VALUE_CAP
+    assert state.emotions["joy"].short.avg == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("kind", ["commit", "start"])
+def test_a_first_row_dated_in_the_future_starts_the_persona_at_now_and_an_earlier_row_still_lowers_it(kind: str) -> None:
+    """The start gate counts from `persona_start_at`; a future date there would keep it shut until an earlier row arrived."""
+    now = _at(3)
+    state = eu.EngineState()
+    eu.fold_event(state, _event(kind, now + timedelta(days=5), {"joy": 5.0} if kind == "commit" else {}, "a"), now)
+    assert state.persona_start_at == now
+    eu.fold_event(state, _event(kind, _at(1), {"joy": 5.0} if kind == "commit" else {}, "b"), now)
+    assert state.persona_start_at == _at(1)
 
 
 def test_an_unknown_event_kind_raises() -> None:

@@ -634,3 +634,71 @@ def test_build_body_live_energy_and_temperature_follow_the_engines_predicate_not
     assert _body_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
     low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
     assert _body_numbers(tmp_path, emotion_engine_stub, low, set(low)) == (energy - 1, temperature + 1)
+
+
+# ── the feeling names the frontend's expressions read instead of their own levels (HR1 item 4) ───
+
+
+def test_build_feels_high_live_lists_exactly_the_read_names_the_engine_calls_high(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {
+        "love": _stub_reading(0.5),
+        "desire": _stub_reading(0.4),
+        "arousal": _stub_reading(9.9),
+        "awe": _stub_reading(3.0),
+    }
+    # `grief` is high for the stub but the read does not return it: it must not appear. `arousal` is read at 9.9 but the
+    # engine does not call it high: it must not appear either (no level is compared here).
+    emotion_engine_stub.high = {"love", "desire", "grief"}
+    assert _build_feels_high(tmp_path) == ["desire", "love"]
+
+
+def test_build_feels_high_live_with_nothing_high_or_an_empty_read_is_an_empty_list(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"love": _stub_reading(9.0)}
+    assert _build_feels_high(tmp_path) == []
+    emotion_engine_stub.readings = {}
+    emotion_engine_stub.high = {"love"}
+    assert _build_feels_high(tmp_path) == []
+
+
+def test_build_feels_high_not_live_is_none_so_the_old_levels_stay_in_force(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+
+    emotion_engine_stub.live = False
+    emotion_engine_stub.readings = {"love": _stub_reading(9.0)}
+    emotion_engine_stub.high = {"love"}
+    assert _build_feels_high(tmp_path) is None
+
+
+def test_build_feels_high_never_raises_and_is_none_when_the_engine_cannot_be_asked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from brain.bridge.persona_state import _build_feels_high
+    from brain.emotion import engine
+
+    def boom(persona_dir: Path):
+        raise RuntimeError("no engine")
+
+    monkeypatch.setattr(engine, "engine_for", boom)
+    assert _build_feels_high(tmp_path) is None
+
+
+def test_build_persona_state_carries_the_feels_high_key(tmp_path: Path, emotion_engine_stub) -> None:
+    emotion_engine_stub.live = True
+    emotion_engine_stub.readings = {"love": _stub_reading(0.5), "awe": _stub_reading(3.0)}
+    emotion_engine_stub.high = {"love"}
+    state = build_persona_state(tmp_path)
+    assert state["feels_high"] == ["love"]
+    emotion_engine_stub.live = False
+    assert build_persona_state(tmp_path)["feels_high"] is None

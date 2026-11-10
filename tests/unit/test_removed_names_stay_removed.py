@@ -54,8 +54,8 @@ _FLOOR_REF = "0c4e7b23 fold pre-flip revision F2a fixes into #274"
 _ST_REF = "108bb6c5 fix(recall): per-message rerank width, always-merged keyword search, known-names list (#321)"
 _TIER_REF = "44af2447 Choose each job's model with one line in the user tunables file"
 _IDLE_REF = "1f69f189 feat(ram-spike-fix): one shared chat-idle lull + is_chat_idle gate for every background caller (INC-6)"
-_DEVCONST_REF = "#531 shared-settings guard, the constants move into brain/dev_constants.py (draft PR #553)"
-_GUARD_REF = "#531 shared-settings guard (draft PR #553)"
+_DEVCONST_REF = "7af1da3f #531 shared-settings guard, the constants move into brain/dev_constants.py (#553)"
+_GUARD_REF = "7af1da3f #531 shared-settings guard (#553)"
 _FILE_OPS_REF = "#643 shared file accessors (draft PR #644): the four private retry loops became brain/utils/file_ops.py"
 _JSON_REF = "b826f01b refactor(brain): one shared JSON reader/writer for every JSON file read and write (#439)"
 
@@ -580,6 +580,18 @@ REMOVED: tuple[Removed, ...] = (
         why="the grief touch's recent-touch check and its insert are one store call, MemoryStore.create_grief_touch_unless_recent (the race, #342); a lookup kept alone would let a caller check and write in two steps again",
         ref="#627 emotion rework Engine 3 (issue #578; the grief-touch race #342)",
         kind="code",
+    ),
+    Removed(
+        names=("read_bytes",),
+        why="file_ops.read_bytes had no production caller once read_jsonl_from streamed through open_read; the whole-file accessor is file_ops.read_bytes_stat (pathlib's Path.read_bytes is a different, attribute-call use elsewhere)",
+        ref=_FILE_OPS_REF,
+        kind="code",
+        scope=("brain/utils/file_ops.py",),
+    ),
+    Removed(
+        names=("oldest_entry_at",),
+        why="the emotion state's oldest-entry time (and the engine's `oldest_entry_at()` stub) had no reader; dropped before any live persona's state file was written with it, so no migration is needed",
+        ref="the maintainer's decision on PR #626 (Engine 2), 2026-11-05",
     ),
     # --- every full open is an access (#582) ----------------------------------------------------------------------------
     Removed(
