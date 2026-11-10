@@ -115,8 +115,12 @@ def _denied(resolved: Path, persona_dir: Path) -> bool:
 def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardResult:
     try:
         resolved = Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.12 (#695)
         return GuardResult(ok=False, error=f"bad path: {exc}")
+    try:  # a lone surrogate (from a JSON argument) isn't text; the OS may take it, the audit and card ids can't (#695)
+        str(resolved).encode("utf-8")
+    except UnicodeEncodeError:
+        return GuardResult(ok=False, error="bad path: not valid text (lone surrogate)")
     if _is_windows() and any(":" in part for part in resolved.parts[1:]):
         # an NTFS stream (``.aws::$INDEX_ALLOCATION`` creates the directory) slips past both comparisons
         return GuardResult(ok=False, error=f"bad path: {resolved} names an NTFS stream")

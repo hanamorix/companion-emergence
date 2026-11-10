@@ -24,15 +24,18 @@ def stat_or_none(p: Path) -> os.stat_result | None:
 
 
 def unusable(p: Path) -> str | None:
-    """Why the OS can't use `p` as a path (too long, permission denied, a loop), or
-    None if it can: it exists, or simply doesn't yet. Guards check this right after
-    resolving, so a later ``exists()`` or ``is_dir()`` can't raise mid-check (#695)."""
+    """Why the OS can't use `p` as a path (too long, permission denied, a loop, a NUL
+    byte, a lone surrogate), or None if it can: it exists, or simply doesn't yet.
+    Guards check this right after resolving, so a later ``exists()`` or ``is_dir()``
+    can't raise mid-check (#695)."""
     try:
         os.stat(p)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as exc:
         return exc.strerror or type(exc).__name__
+    except ValueError:  # NUL byte, or a surrogate the filesystem encoding can't take (UnicodeEncodeError)
+        return "not a valid path"
     return None
 
 

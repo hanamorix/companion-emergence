@@ -89,3 +89,40 @@ def test_approving_a_card_whose_path_is_too_long_refuses_it(env):
         store.close()
     assert out == {"ok": False, "error": out["error"]} and "bad path" in out["error"], out
     assert pending.get(env["persona"], rid)["status"] == "refused"
+
+
+def test_propose_write_refuses_a_symlink_loop(env, requires_symlinks):
+    # Python 3.12's Path.resolve() raises RuntimeError on a loop (3.13 returns a path); neither may escape
+    a, b = env["home"] / "loopA", env["home"] / "loopB"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    out = propose_write(path=str(a / "x.md"), content="hi", op="create", persona_dir=env["persona"])
+    assert "bad path" in out.get("error", ""), out
+
+
+@pytest.mark.parametrize("bad", ["\udc80", "\ud800"])
+def test_propose_write_refuses_a_path_with_a_lone_surrogate(env, bad):
+    # a JSON tool argument can carry one; it isn't valid text, and later steps encode the path as UTF-8
+    out = propose_write(path=str(env["home"] / f"a{bad}.md"), content="hi", op="create", persona_dir=env["persona"])
+    assert "bad path" in out.get("error", ""), out
+
+
+@pytest.mark.parametrize("bad", ["a\x00b", "a\ud800b"])
+def test_read_guard_answers_denied_for_a_path_that_is_not_a_path(env, bad):
+    # NUL or a lone surrogate: the read tools' resolve() refuses these first, but the guard itself must answer
+    from brain.files.read_guard import is_read_denied
+
+    assert is_read_denied(env["home"] / bad, persona_dir=env["persona"]) is True
+
+
+def test_listing_a_folder_with_a_looping_symlink_still_works(env, requires_symlinks):
+    # an entry nothing can open is left out, as Python 3.12 always did; 3.13 used to list it as a "file"
+    from brain.tools.impls.list_directory import list_directory
+
+    d = env["home"] / "Docs"
+    d.mkdir()
+    (d / "note.md").write_text("x", encoding="utf-8")
+    (d / "loopA").symlink_to(d / "loopB")
+    (d / "loopB").symlink_to(d / "loopA")
+    out = list_directory(path=str(d), persona_dir=env["persona"])
+    assert [e["name"] for e in out["entries"]] == ["note.md"], out
