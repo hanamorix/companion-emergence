@@ -130,6 +130,23 @@ EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
 EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 
+# --- the one-time x10 fix of small feelings (emotion rework, Engine 6, #584) ------------------------------------------
+# Three memory types hold feelings stored below 1, not on the 0-10 scale: reach-outs and notes (`initiate_outbound`, small
+# constants such as 0.15 and 0.12), makings (`making`, small constants such as 0.12) and peer memories (`kindled_peer`, a
+# model's deltas scaled so a peer's total stays within `KINDLED_LINK_PEER_EMOTION_WINDOW_CAP`). At the engine's first start
+# the one-time fix (`brain/emotion/nudge_scale_fix.py`) multiplies the feelings, the score and the
+# peak of those rows by the factor, but only for a row whose stored peak and every stored feeling are below the threshold (a
+# row with any value of 1 or more is not multiplied), and records that it ran by setting the database's `PRAGMA user_version`
+# to the marker. The list comes from a survey of every writer of feelings in `brain/`;
+# `tests/unit/brain/emotion/test_nudge_scale_types.py` drives each known writer against it.
+# They are separate named constants on purpose: the factor is the scale change itself, not the engine's value cap
+# (`EMOTION_VALUE_CAP`); "below 1" is the owner's rule for what counts as a small row; the marker is a format version of
+# the one-time fix. None is a tunable. They go with `nudge_scale_fix.py` when #388 removes it.
+NUDGE_SCALE_FIX_MEMORY_TYPES: tuple[str, ...] = ("initiate_outbound", "kindled_peer", "making")
+NUDGE_SCALE_FIX_FACTOR: float = 10.0
+NUDGE_SCALE_FIX_THRESHOLD: float = 1.0
+NUDGE_SCALE_FIX_MARKER: int = 1
+
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
 # to all 4 sqlite stores per orchestrator directive 2026-09-28) ------------
