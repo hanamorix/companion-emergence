@@ -104,6 +104,11 @@ def test_self_model_tick_runs_end_to_end_and_persists_state(tmp_path: Path) -> N
     assert not sm_cadence.is_due(advanced, now=datetime.now(UTC))
 
 
+@pytest.mark.no_base_failure(
+    reason=(
+        "renamed from test_self_model_tick_fail_isolated_on_derived_error (compute_derived is deleted); with the engine stub the base's live branch isolates a raising gap_from_read the same way, so it passes there by design"
+    )
+)
 def test_self_model_tick_fail_isolated_on_gap_error(tmp_path: Path) -> None:
     """If building the gap raises, the tick logs and does NOT propagate —
     the supervisor survives (Organ DoD fail-isolation). The cadence still

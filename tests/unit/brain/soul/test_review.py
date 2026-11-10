@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from brain.bridge.provider import LLMProvider
 from brain.memory.store import MemoryStore
 from brain.soul.review import parse_decision, review_pending_candidates
@@ -1086,6 +1088,11 @@ def test_current_emotional_summary_is_the_top_three_short_averages(tmp_path, emo
     assert _current_emotional_summary(tmp_path) == "neutral"
 
 
+@pytest.mark.no_base_failure(
+    reason=(
+        "renamed from the _live_ variant; on the base the helper takes a store, so a directory argument also ends in 'unknown' through the same fail-soft except"
+    )
+)
 def test_current_emotional_summary_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
     from brain.soul.review import _current_emotional_summary
 

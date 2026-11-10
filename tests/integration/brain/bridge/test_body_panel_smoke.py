@@ -134,6 +134,11 @@ def test_multi_bar_arousal_desire_touch_hunger(persona_dir, capsys):
     assert "touch hunger 5.0" in ui  # underscore → space in Bar component
 
 
+@pytest.mark.no_base_failure(
+    reason=(
+        'renamed from test_transition_quiet_to_stirring_to_quiet, which also deactivated every row (a step that pinned the removed store window); the two steps it keeps pass on the base by design'
+    )
+)
 def test_transition_quiet_to_stirring(persona_dir, capsys):
     """Walk the transition: empty -> seed desire. (The engine's averages are not the store's active rows, so
     deactivating the rows does not quiet the panel: that third step belonged to the old store window.)"""
