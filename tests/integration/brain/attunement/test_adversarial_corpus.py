@@ -10,20 +10,25 @@ ungrounded patterns. Asserts:
 
 If this test fails, the merge is blocked. The build is a hard gate.
 
-Marked @pytest.mark.integration so the default pytest run skips it.
-Tests 1 and 3 also require the claude CLI. Run with:
-  uv run pytest -m integration
-to opt in. CI workflow may include this gate explicitly.
+Tests 1 and 3 make up to 22 real claude calls, which spend subscription usage, so a plain `pytest`
+leaves them out (#680). Run them on purpose with:
+  uv run pytest -m requires_claude_cli tests/integration/brain/attunement/test_adversarial_corpus.py
+They fail if the model never answered, because a failed call declines quietly, and test 1 also fails
+if fewer rounds answered than a pattern needs to become known (ATTUNEMENT_MATURITY_KNOWN_MIN). Test 2
+and the checks on those failures need no CLI and run by default.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
-from brain.attunement.detector import run_detector
+from brain import dev_constants
+from brain.attunement.detector import _decline_output, run_detector
 from brain.attunement.store import (
     BufferTurn,
     merge_into_learned,
@@ -38,6 +43,54 @@ def _load_corpus() -> tuple[list[BufferTurn], list[dict]]:
     return buffer, payload["known_false_patterns"]
 
 
+def _run_detector_rounds(
+    persona_dir: Path, buffer: list[BufferTurn], *, rounds: int, min_answered: int = 1
+) -> None:
+    """Merge what the detector proposes, `rounds` times. Fails if fewer than `min_answered` rounds were answered."""
+    answered = 0
+    for i in range(rounds):
+        output = run_detector(buffer_slice=buffer, reply_text=f"reply attempt {i}")
+        read = output.current_read
+        if read.tone_label != "unknown" or read.tone_justification or output.pattern_candidates:
+            answered += 1
+        merge_into_learned(
+            persona_dir,
+            output.pattern_candidates,
+            buffer,
+            now_iso=f"2026-05-31T12:{i:02d}:00Z",
+        )
+    assert answered, f"the model never answered in {rounds} rounds, so this proves nothing"
+    assert answered >= min_answered, (
+        f"only {answered} of {rounds} rounds answered, fewer than the {min_answered} this check needs"
+    )
+
+
+@pytest.mark.no_base_failure(reason="the helper it guards is in this test file, which the base check keeps at the PR's version")
+def test_rounds_fail_when_the_model_never_answered(tmp_path: Path, monkeypatch) -> None:
+    """A failed call declines quietly, so without this a dead CLI would pass as "no pattern formed"."""
+    declined = _decline_output(source_turn_id="")
+    monkeypatch.setattr(sys.modules[__name__], "run_detector", lambda **kwargs: declined)
+    with pytest.raises(AssertionError, match="never answered"):
+        _run_detector_rounds(tmp_path, [BufferTurn(id="t1", content="hello")], rounds=2)
+
+
+@pytest.mark.no_base_failure(reason="the corpus test it guards is in this test file, which the base check keeps at the PR's version")
+def test_corpus_fails_when_too_few_rounds_answered_to_reach_known(tmp_path: Path, monkeypatch) -> None:
+    """A pattern needs ATTUNEMENT_MATURITY_KNOWN_MIN confirmations to become known, so fewer answers prove nothing."""
+    declined = _decline_output(source_turn_id="")
+    answered = dataclasses.replace(
+        declined, current_read=dataclasses.replace(declined.current_read, tone_label="warm")
+    )
+    calls = iter(range(100))
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "run_detector",
+        lambda **kwargs: answered if next(calls) < dev_constants.ATTUNEMENT_MATURITY_KNOWN_MIN - 1 else declined,
+    )
+    with pytest.raises(AssertionError, match="fewer than"):
+        test_adversarial_corpus_does_not_crystallise_any_pattern(tmp_path, True)
+
+
 @pytest.fixture(scope="session")
 def claude_cli_available() -> bool:
     return shutil.which("claude") is not None
@@ -45,21 +98,18 @@ def claude_cli_available() -> bool:
 
 @pytest.mark.integration
 @pytest.mark.requires_claude_cli
+@pytest.mark.timeout(1500)  # 12 calls at up to 60 s each, plus the merges
 def test_adversarial_corpus_does_not_crystallise_any_pattern(
     tmp_path: Path, claude_cli_available: bool
 ) -> None:
     if not claude_cli_available:
         pytest.skip("claude CLI not available")
     buffer, _ = _load_corpus()
-    # Run detector 12 times to give the corpus chances to confirm anything
-    for i in range(12):
-        output = run_detector(buffer_slice=buffer, reply_text=f"reply attempt {i}")
-        merge_into_learned(
-            tmp_path,
-            output.pattern_candidates,
-            buffer,
-            now_iso=f"2026-05-31T12:{i:02d}:00Z",
-        )
+    # Run detector 12 times to give the corpus chances to confirm anything. A pattern becomes known only after
+    # ATTUNEMENT_MATURITY_KNOWN_MIN confirmations, so fewer answered rounds than that can't test the gate.
+    _run_detector_rounds(
+        tmp_path, buffer, rounds=12, min_answered=dev_constants.ATTUNEMENT_MATURITY_KNOWN_MIN
+    )
 
     patterns = read_learned_patterns(tmp_path)
     # No pattern should reach 'known' maturity from this adversarial corpus
@@ -120,6 +170,7 @@ def test_validate_grounded_gate_is_wired_into_merge_path(
 
 @pytest.mark.integration
 @pytest.mark.requires_claude_cli
+@pytest.mark.timeout(1500)  # 10 calls at up to 60 s each, plus the merges
 def test_known_false_patterns_do_not_appear(
     tmp_path: Path, claude_cli_available: bool
 ) -> None:
@@ -129,11 +180,7 @@ def test_known_false_patterns_do_not_appear(
     if not claude_cli_available:
         pytest.skip("claude CLI not available")
     buffer, known_false = _load_corpus()
-    for i in range(10):
-        output = run_detector(buffer_slice=buffer, reply_text=f"reply attempt {i}")
-        merge_into_learned(
-            tmp_path, output.pattern_candidates, buffer, now_iso=f"2026-05-31T12:{i:02d}:00Z"
-        )
+    _run_detector_rounds(tmp_path, buffer, rounds=10)
 
     patterns = read_learned_patterns(tmp_path)
     pattern_keys = {(p.category, p.canonical_key) for p in patterns}
