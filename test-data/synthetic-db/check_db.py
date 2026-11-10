@@ -41,7 +41,7 @@ Checks:
      MemoryStore, whose boot path self-heals/rebuilds FTS and would mask a
      genuinely broken file): count(memories_fts_docsize) == count(memories),
      and a MATCH query for a common term returns rows.
- 18. new_feelings_present (#654): rest_need, arousal, climax, touch_hunger and
+ 18. new_feelings_present (#654) (checks 18-20 run before the FTS and smoke-test checks, which stay last): rest_need, arousal, climax, touch_hunger and
      creative_hunger each have the planned distinct days and, in every 30-day
      window, the planned rows and value range (plan: augment_db.NEW_FEELINGS);
      each such row carries one emotion key, the conversation tag (three tags)
@@ -79,6 +79,7 @@ from augment_db import (
     WINDOW_DAYS,
     day_of,
     db_summary,
+    window_of,
     window_problems,
 )
 from build_db import (
@@ -258,16 +259,13 @@ def check_type_budgets(conn: sqlite3.Connection) -> CheckResult:
 
 
 def check_window_and_day_coverage(conn: sqlite3.Connection) -> CheckResult:
-    # window is not a stored column; reconstruct from created_at date offset
-    # from the known start date used by build_db.py.
+    # window is not a stored column; reconstruct from the created_at day number
+    # (augment_db.day_of / window_of, the one copy of that mapping).
     rows = conn.execute("SELECT created_at FROM memories WHERE created_at IS NOT NULL").fetchall()
     days_present = set()
     for (created_at,) in rows:
         try:
-            date_part = created_at[:10]
-            from datetime import date
-            y, m, d = (int(x) for x in date_part.split("-"))
-            day_num = (date(y, m, d) - date(2026, 5, 17)).days + 1
+            day_num = day_of(created_at)
         except Exception:
             continue
         if 1 <= day_num <= SPAN_DAYS:
@@ -275,12 +273,7 @@ def check_window_and_day_coverage(conn: sqlite3.Connection) -> CheckResult:
 
     missing_days = [d for d in range(1, SPAN_DAYS + 1) if d not in days_present]
 
-    def day_to_window(day_num):
-        if day_num >= 106:
-            return NUM_WINDOWS
-        return ((day_num - 1) // 7) + 1
-
-    windows_present = {day_to_window(d) for d in days_present}
+    windows_present = {window_of(d) for d in days_present}
     missing_windows = [w for w in range(1, NUM_WINDOWS + 1) if w not in windows_present]
 
     problems = []
@@ -813,7 +806,9 @@ def check_brain_open_smoke_test(db_path: str) -> CheckResult:
 # emotion checks (#654 new feelings, #664 profiles) and the manifest
 # ---------------------------------------------------------------------------
 
-NEAR_ZERO_MAX_RANGE = 0.5  # a near-zero feeling's 30-day range stays below this
+# A near-zero feeling's 30-day range stays below this (the brief's wording). It follows from the
+# 0.02-0.30 value band checked first; it is kept so the property is stated, not only implied.
+NEAR_ZERO_MAX_RANGE = 0.5
 SPIKE_LEVEL = 1.0  # a low-with-spikes value above this is a spike
 SPIKE_SHARE_RANGE = (0.03, 0.12)  # augment_db rescales so about 6% of rows are spikes
 SPIKE_MIN_DAYS = 4

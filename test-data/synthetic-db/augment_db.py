@@ -210,7 +210,10 @@ def window_problems(name: str, pairs: list[tuple[int, float]], plan: FeelingPlan
 
 
 def db_summary(conn: sqlite3.Connection) -> dict:
-    """The counts manifest.json holds, worked out from the database (check 20 shares it)."""
+    """The counts manifest.json holds, worked out from the database (check 20 shares it).
+
+    build_db.build() computes the same counts inline while it writes, so they cannot be imported.
+    """
     types = dict(conn.execute("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type"))
     windows: dict[int, int] = {}
     day_counts: dict[int, int] = {}
@@ -334,9 +337,8 @@ def new_rows(
         phase = rng.uniform(0.0, 2.0 * math.pi)
         days = []
         waves = []
-        for i in range(
-            n
-        ):  # one stratum of the 109 days per row, one jittered day in each: distinct, evenly spread
+        # one stratum of the 109 days per row, one jittered day in each: distinct, evenly spread
+        for i in range(n):
             lo = int(i * SPAN_DAYS / n) + 1
             hi = max(lo, int((i + 1) * SPAN_DAYS / n))
             day = rng.randint(lo, hi)
@@ -496,6 +498,19 @@ def _has_marker(path: str) -> bool:
         conn.close()
 
 
+def _load_manifest(path: str) -> dict:
+    """This database's manifest.json (build or augmented); anything else is refused, not merged."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except ValueError as exc:
+        raise AugmentError("%s is not valid JSON: %s" % (path, exc)) from exc
+    ok = isinstance(data, dict) and "total_rows" in data and "per_memory_type_counts" in data
+    if not ok or not ("parts_dir" in data or "augmentation" in data):
+        raise AugmentError("%s is not this database's manifest.json" % path)
+    return data
+
+
 def _remove(path: str | None) -> None:
     if path and os.path.exists(path):
         os.remove(path)
@@ -525,12 +540,15 @@ def augment(args: argparse.Namespace) -> dict:
                 "--force only replaces the base or an augmented database, not %s" % dst
             )
     out_dir = os.path.dirname(dst)
+    if not os.path.isdir(out_dir):
+        raise AugmentError("output directory does not exist: %s" % out_dir)
     manifest_in = args.manifest_in or os.path.join(os.path.dirname(src), "manifest.json")
     manifest_out = os.path.join(out_dir, "manifest.json")
-    manifest: dict = {}
-    if os.path.isfile(manifest_in):
-        with open(manifest_in, encoding="utf-8") as fh:
-            manifest = json.load(fh)
+    manifest = _load_manifest(manifest_in) if os.path.isfile(manifest_in) else {}
+    if os.path.isfile(manifest_out):
+        _load_manifest(
+            manifest_out
+        )  # refuse to replace a file that is not this database's manifest
 
     tmp_db = tmp_manifest = None
     try:
@@ -594,10 +612,10 @@ def augment(args: argparse.Namespace) -> dict:
         fd, tmp_manifest = tempfile.mkstemp(dir=out_dir, prefix=".augment-", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
+            fh.write("\n")
         os.chmod(tmp_manifest, 0o644)
-        os.replace(
-            tmp_db, dst
-        )  # the database first, then its manifest; check 20 catches a crash between the two
+        # the database first, then its manifest; check 20 catches a crash between the two
+        os.replace(tmp_db, dst)
         tmp_db = None
         os.replace(tmp_manifest, manifest_out)
         tmp_manifest = None
@@ -615,7 +633,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--manifest-in",
-        help="manifest.json to update (default: beside --input); written beside --output",
+        help="manifest.json to update (default: beside --input); written as manifest.json "
+        "beside --output, so give --output a directory of its own",
     )
     parser.add_argument(
         "--force",
@@ -630,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = augment(args)
-    except AugmentError as exc:
+    except (AugmentError, OSError, sqlite3.Error, ValueError) as exc:
         print("augment_db: FAILED: %s" % exc, file=sys.stderr)
         return 1
     print("augment_db: OK seed=%d %s" % (args.seed, json.dumps(result, sort_keys=True)))
