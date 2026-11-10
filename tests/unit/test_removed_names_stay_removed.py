@@ -655,6 +655,18 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
     ),
+    Removed(
+        names=("brain/emotion/aggregate.py",),
+        why="the old max-pool of recent memory rows into a mood; the emotion engine is the one source of a felt state",
+        ref="#586 Engine 7",
+        kind="file",
+    ),
+    Removed(
+        names=("_warned_unregistered",),
+        why="the warn-once set of the deleted aggregate; the engine keeps its own warned-name sets on the engine instance",
+        ref="#586 Engine 7",
+        kind="code",
+    ),
 )
 
 
