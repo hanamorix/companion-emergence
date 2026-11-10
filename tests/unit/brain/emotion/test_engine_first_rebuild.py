@@ -353,14 +353,37 @@ def test_the_queue_step_runs_after_the_database_transaction_and_before_the_lock_
     assert order == ["database", "queue", "rebuild:locked"]  # the lock came after the queue step, for the rebuild only
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
     assert entry["emotions"] == pytest.approx({"pride": 3.0}) and not entry.get("metadata")  # no marker in it
-    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
     ensure_engine_ready(persona)  # a second start, and a new process's start, multiply nothing
     EmotionEngine(persona.resolve(), now=lambda: NOW).ensure_ready()
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
     assert entry["emotions"] == pytest.approx({"pride": 3.0})
 
 
-def test_a_failed_queue_copy_stops_start_up_and_the_next_start_completes_without_a_second_multiply_of_the_rows(
+def test_a_failed_queue_write_is_logged_and_start_up_goes_on_with_the_entry_at_the_old_scale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Owner S84 (X10S step 6): the number is set before the rewrite, so a failed write does not stop start-up and is not retried."""
+    from brain.memory import pending
+
+    persona = _standard_persona(tmp_path)
+    pending.PendingQueue(persona).enqueue(_candidate("waiting", {"pride": 0.3}), source="maker")
+    install(persona, NOW)
+
+    def refuse(*args: object, **kwargs: object):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pending, "write_jsonl_bytes", refuse)
+    caplog.set_level(logging.WARNING, logger="brain.memory.pending")
+    ensure_engine_ready(persona)  # does not raise
+    assert state_of(persona).switch_over_at == NOW
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
+    assert entry["emotions"] == {"pride": 0.3}  # at the old, faint scale, and never multiplied later
+    assert any("old scale" in r.getMessage() and "waiting" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_record_of_the_queue_step_stops_start_up_and_the_next_start_completes_without_a_second_multiply_of_the_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from brain.memory import pending
@@ -369,28 +392,29 @@ def test_a_failed_queue_copy_stops_start_up_and_the_next_start_completes_without
     pending.PendingQueue(persona).enqueue(_candidate("waiting", {"pride": 0.3}), source="maker")
     install(persona, NOW)
     spy = LockSpy(monkeypatch)
-    real_write = pending.write_jsonl_bytes
+    real_set = MemoryStore.set_x10_progress
 
-    def refuse(*args: object, **kwargs: object):
+    def refuse(self: MemoryStore, number: int) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr(pending, "write_jsonl_bytes", refuse)
+    monkeypatch.setattr(MemoryStore, "set_x10_progress", refuse)
     with pytest.raises(EngineStartupError) as failure:
         ensure_engine_ready(persona)
     assert failure.value.what == "the x10 fix of small feelings" and isinstance(failure.value.cause, OSError)
     assert spy.calls == 0 and not engine_files.state_path(persona).exists()
     assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE  # the database half had finished, the queue had not
     (entry,) = pending.read_jsonl(persona / "pending_candidates.jsonl")
-    assert entry["emotions"] == {"pride": 0.3}  # the queue is as it was
+    assert entry["emotions"] == {"pride": 0.3}  # nothing was written to the queue
+    assert not list(persona.glob("*.x10tmp"))  # and no temporary copy was made (the fix writes none)
     # between the failed start and the next, an old writer adds a small row and a candidate (owner S77: the row is missed, the
-    # candidate is caught, because the queue copies are made again from the originals)
+    # candidate is caught, because the queue step runs again from the untouched files)
     store = MemoryStore(persona / "memories.db")
     try:
         store.create(_candidate("late-row", {"pride": 0.2}), fold=False)
     finally:
         store.close()
     pending.PendingQueue(persona).enqueue(_candidate("late-candidate", {"pride": 0.2}), source="maker")
-    monkeypatch.setattr(pending, "write_jsonl_bytes", real_write)
+    monkeypatch.setattr(MemoryStore, "set_x10_progress", real_set)
     ensure_engine_ready(persona)
     assert state_of(persona).switch_over_at == NOW
     store = MemoryStore(persona / "memories.db", integrity_check=False)
@@ -436,7 +460,7 @@ def test_a_state_that_cannot_be_read_only_at_the_locked_recheck_still_gets_the_f
     monkeypatch.setattr(engine_files, "read_state", scripted)
     ensure_engine_ready(persona)
     assert answers == []
-    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert _progress(persona) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
     assert state_of(persona).switch_over_at == NOW  # an unreadable state at the re-check is not a skip
 
 

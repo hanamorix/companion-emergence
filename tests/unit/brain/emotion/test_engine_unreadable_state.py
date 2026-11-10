@@ -36,7 +36,7 @@ from tests.unit.brain.emotion._engine_support import (
 
 T35 = local_noon(local_day(35))
 STAMP = NOW.strftime("%Y-%m-%dT%H-%M-%S.%fZ")
-DONE = dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+DONE = dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # 2: the queue step started (the x10 fix's last number)
 ROWS_DONE = dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
 QUEUE = "pending_candidates.jsonl"
 
@@ -104,14 +104,10 @@ def _progress_world(persona: Path, how: str) -> None:
         finally:
             store.close()
         return
-    if how == "1+copy":
-        _progress_world(persona, "1")
-        (persona / (QUEUE + ".x10tmp")).write_bytes(b"left by a failed start\n")  # a copy a failure before 2 left
-        return
-    nudge_scale_fix.scale_up_small_feelings(persona)  # runs to 2 (the roll-forward case has its own test)
+    nudge_scale_fix.scale_up_small_feelings(persona)  # runs to 2 (a crash after setting 2 has its own test)
 
 
-@pytest.mark.parametrize("how", ["0", "1", "1+copy", "2"])
+@pytest.mark.parametrize("how", ["0", "1", "2"])
 def test_an_unreadable_state_at_every_x10_progress_ends_with_a_fresh_state_and_nothing_multiplied_twice(tmp_path: Path, how: str) -> None:
     persona = _persona(tmp_path)
     _progress_world(persona, how)
@@ -123,28 +119,29 @@ def test_an_unreadable_state_at_every_x10_progress_ends_with_a_fresh_state_and_n
     assert _pride(persona, "made") == pytest.approx(4.0)  # 0.4 x 10 once, whatever the number said
     assert _queue_pride(persona) == pytest.approx(3.0)
     assert _progress(persona) == DONE
-    assert not list(persona.glob("*.x10tmp"))
     assert _asides(persona) == {f"{name}.corrupt-{STAMP}": data for name, data in damaged.items()}
     ensure_engine_ready(persona)  # a second start multiplies nothing
     assert _pride(persona, "made") == pytest.approx(4.0) and _queue_pride(persona) == pytest.approx(3.0)
 
 
-def test_a_crash_after_the_number_was_set_to_2_with_a_checked_copy_left_rolls_forward_over_an_unreadable_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_failed_queue_write_after_the_number_was_set_to_2_leaves_the_entry_at_the_old_scale_and_is_never_multiplied_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner S84 accepted edge (X10S): 2 means "queue step started", so the entries of a file whose write failed are not retried."""
     persona = _persona(tmp_path)
 
     def refuse(*args: object, **kwargs: object) -> None:
-        raise OSError("crash before the replace")
+        raise OSError("crash before the write")
 
-    monkeypatch.setattr(pending.file_ops, "replace_file", refuse)
-    with pytest.raises(OSError):
-        nudge_scale_fix.scale_up_small_feelings(persona)  # progress is 2, the checked copy is left, the original unmultiplied
+    monkeypatch.setattr(pending, "write_jsonl_bytes", refuse)
+    nudge_scale_fix.scale_up_small_feelings(persona)  # the failed write is logged and the step goes on: progress is 2, the entry unmultiplied
     monkeypatch.undo()
-    assert _progress(persona) == DONE and (persona / (QUEUE + ".x10tmp")).exists() and _queue_pride(persona) == pytest.approx(0.3)
+    assert _progress(persona) == DONE and _queue_pride(persona) == pytest.approx(0.3)
     _damage(persona)
     install(persona, NOW)
     ensure_engine_ready(persona)
-    assert _queue_pride(persona) == pytest.approx(3.0) and _pride(persona, "made") == pytest.approx(4.0)
-    assert not list(persona.glob("*.x10tmp")) and state_of(persona).switch_over_at == NOW
+    assert _queue_pride(persona) == pytest.approx(0.3) and _pride(persona, "made") == pytest.approx(4.0)  # still at the old scale
+    assert state_of(persona).switch_over_at == NOW
 
 
 def test_the_damaged_copies_are_renamed_aside_not_deleted_and_a_name_already_taken_is_not_overwritten(tmp_path: Path) -> None:

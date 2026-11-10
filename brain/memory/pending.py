@@ -137,52 +137,6 @@ def _scaled_candidate(entry: dict, factor: float, threshold: float) -> dict | No
     return scaled
 
 
-def _x10_copy_path(path: Path) -> Path:
-    """The fixed temporary sibling the x10 fix writes a file's new copy to (`<file>.x10tmp`), so a later start finds it."""
-    return path.with_name(path.name + ".x10tmp")
-
-
-def _check_x10_copy(copy: Path, read: list[tuple[str, dict | None, bool]], factor: float) -> None:
-    """Check the written copy of a queue file against what was read (the x10 fix, Planning B29 C2 item 3, P8a); raise `RuntimeError` on any difference.
-
-    The copy is read back through `iter_jsonl_raw`, the reader that read the original, so lines are counted the same way on both
-    sides (a leading byte-order mark and a carriage-return line ending are handled by that one reader). The same number of lines;
-    every unselected line has the same text; every multiplied entry has the same keys and the same fields apart from its feelings
-    and score, its feelings are exactly `factor` times its held old values (a negative one becomes 0.0: the rule here is
-    "negative is 0.0", written by hand, it shares no code with the multiply) and its score, when it had one, is exactly `factor`
-    times the old score. The value compares are hand-written: there is no shared one. The caller keeps the original on a failure.
-    """
-    written = list(iter_jsonl_raw(copy, recover=Recovery.RAISE, bad_lines=True))
-    if len(written) != len(read):
-        raise RuntimeError(f"the x10 copy {copy.name} has {len(written)} lines where the original has {len(read)}; nothing was replaced")
-    for number, ((text, entry, was_multiplied), (new_text, new_entry)) in enumerate(zip(read, written, strict=True), start=1):
-        if not was_multiplied:
-            # The reader drops a byte-order mark at the start of a stream, so a first line that itself begins with one (a double
-            # mark, or blank lines before a mark) reads back one mark shorter; a byte-order mark is not content.
-            expected = text[1:] if number == 1 and text.startswith("﻿") else text
-            if new_text != expected:
-                raise RuntimeError(f"the x10 copy {copy.name} changed line {number}, which it must keep as it was; nothing was replaced")
-            continue
-        assert entry is not None  # a multiplied line was an object
-        if not isinstance(new_entry, dict):
-            raise RuntimeError(f"the x10 copy {copy.name} line {number} is not an entry; nothing was replaced")
-        old_feelings = entry.get("emotions", {})
-        new_feelings = new_entry.get("emotions")
-        if not isinstance(new_feelings, dict) or new_feelings.keys() != old_feelings.keys():
-            raise RuntimeError(f"the x10 copy {copy.name} line {number} has other feelings than the original; nothing was replaced")
-        for name, value in old_feelings.items():
-            if new_feelings[name] != (0.0 if value < 0 else value) * factor:
-                raise RuntimeError(f"the x10 copy {copy.name} line {number} has a feeling that is not ten times the held old one; nothing was replaced")
-        old_score = entry.get("score")
-        if old_score is not None and new_entry.get("score") != old_score * factor:
-            raise RuntimeError(f"the x10 copy {copy.name} line {number} has a score that is not ten times the old one; nothing was replaced")
-        others = [k for k in {*entry, *new_entry} if k not in ("emotions", "score")]
-        if any(entry.get(k) != new_entry.get(k) or (k in entry) != (k in new_entry) for k in others) or (
-            old_score is None and entry.get("score") != new_entry.get("score")
-        ):
-            raise RuntimeError(f"the x10 copy {copy.name} line {number} differs from the original in a field it must keep; nothing was replaced")
-
-
 class PendingQueue:
     """Append-only JSONL queue of pending candidates for one persona."""
 
@@ -419,7 +373,7 @@ class PendingQueue:
         return ClaimedBatch(self, entries)
 
     def scale_up_small_making_candidates(self, store: MemoryStore) -> int:
-        """The x10 fix of small feelings for the candidates still waiting here: returns how many entries it multiplied in the copies it prepared.
+        """The x10 fix of small feelings for the candidates still waiting here: returns how many entries it multiplied in the files it rewrote.
 
         The emotion engine's first start (`brain/emotion/nudge_scale_fix.py`, after the database half) calls this, because a
         `making` candidate that waits in the queue is not a `memories.db` row yet and the fix of the rows cannot reach it: the
@@ -438,59 +392,72 @@ class PendingQueue:
         bytes without the line terminator: a blank line, a carriage return before the newline and a leading byte-order mark are
         not kept; the app writes none of them).
 
-        Order, all under the queue's lock, from the number `store.x10_progress()` (re-read here): below
-        `NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED`, any `<file>.x10tmp` left by a failed or crashed earlier start is deleted
-        and the copies are made again from the untouched originals; each file with something to multiply gets its new copy
-        written to `<file>.x10tmp` and CHECKED (the copy is re-read through `iter_jsonl_raw`, the same line count, every
-        unselected line the same text, every selected entry's feelings and score exactly ten times its held old values, every
-        other field unchanged); only when every copy has passed is the number set to that value; then each original is replaced by its
-        copy (`file_ops.replace_file`). With the number already set and a copy still there (a crash after setting it) the
-        replacing is finished from the checked copies. A failed check, or a failure to set the number, raises before any
-        original is replaced (a start-up failure), so a retry never multiplies twice. A file with nothing to multiply gets no
-        copy and is not rewritten; with neither file nor copy present nothing is created, not even the lock sidecar.
+        The steps, in this order (owner S84, Planning B32 X10S: what the shared atomic writer and the database already make
+        all-or-nothing is not repeated here):
+        1. Neither queue file exists: the number is set to `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` and the step stops, taking no
+           lock (it would create its sidecar). The queue step is done all the same, so a later re-run (SW2 edges (a), (b))
+           multiplies nothing.
+        2. The queue's `file_lock` is taken.
+        3. `store.x10_progress()` is read INSIDE the lock; when it already says started, the lock is released and the step stops,
+           so a bridge and a command that start together cannot both multiply.
+        4. Both files are read with `iter_jsonl_raw` and each file's new content is built in memory. A read fault raises: a
+           start-up failure with nothing changed, retried at the next start.
+        5. The number is set to started (`MemoryStore.set_x10_progress`). A failure raises with nothing written.
+        6. Each file with at least one selected entry is rewritten once with `write_jsonl_bytes` (the shared writer's atomic
+           replace; a line that could not be parsed is kept byte for byte). A file that is missing, empty or has nothing selected
+           is not created or rewritten. A failed write is logged (P9b) and start-up goes on.
+        7. The lock is released.
+
+        The number is set before any file is rewritten, so 2 means "queue step started", not "queue done". Accepted edges (P4):
+        a crash or a failed write after the number is set leaves that file's selected entries at the old, faint scale, never
+        multiplied twice (the alternative order, rewrite first and record after, would multiply a rewritten file again at the
+        retry); and, as for the database half (owner S77), an entry or row written by something else while the app is down
+        between the steps of a start-up is missed.
 
         The lock (`file_lock`) waits without a timeout, so a stuck holder delays start-up: existing behaviour of every queue
-        writer, unchanged here. Accepted edge (owner S77; P4): an entry appended while the app is down between the steps of a start-up
-        is missed, and one appended before a roll-forward is overwritten by the checked copy.
+        writer, unchanged here.
         """
         factor = dev_constants.NUDGE_SCALE_FIX_FACTOR
         threshold = dev_constants.NUDGE_SCALE_FIX_THRESHOLD
-        checked = dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+        started = dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
         files = (self.path, self.processing_path)
-        copies = tuple(_x10_copy_path(path) for path in files)
-        if all(file_ops.stat_path(p) is None for p in (*files, *copies)):
-            # No queue file and no copy: nothing to multiply, and no lock to take (it would create its sidecar). The queue step is
-            # done all the same, so the number reaches 2 and a later re-run (SW2 edges (a), (b)) multiplies nothing.
-            if store.x10_progress() < checked:
-                store.set_x10_progress(checked)
+        if all(file_ops.stat_path(p) is None for p in files):
+            if store.x10_progress() < started:
+                store.set_x10_progress(started)
             return 0
         count = 0
         with file_lock(self.path):
-            if store.x10_progress() < checked:
-                for copy in copies:
-                    if file_ops.stat_path(copy) is not None:
-                        file_ops.delete_file(copy)  # before the number is set: a failed or crashed earlier start; start again from the originals
-                prepared: dict[Path, list[str]] = {}
-                for path, copy in zip(files, copies, strict=True):
-                    prepared[path] = self._prepare_x10_copy(path, copy, factor, threshold)
-                store.set_x10_progress(checked)  # raises before any original is replaced
-                count = sum(len(ids) for ids in prepared.values())
-            for path, copy in zip(files, copies, strict=True):
-                if file_ops.stat_path(copy) is not None:
-                    file_ops.replace_file(copy, path)  # atomic-write: ok -- renames a finished, checked copy over its original (the copy itself was written by `write_jsonl_bytes`), not a write
-                    logger.info("pending queue: replaced %s with its checked x10 copy", path.name)
+            if store.x10_progress() >= started:
+                return 0  # another starter did the queue step while this one waited for the lock
+            prepared = [(path, *self._scaled_x10_content(path, factor, threshold)) for path in files]
+            store.set_x10_progress(started)  # raises before any file is written
+            for path, data, ids in prepared:
+                if not ids:
+                    continue
+                try:
+                    write_jsonl_bytes(path, data)  # atomic and durable: the file is the old one or the new one
+                except OSError as exc:  # the writer's one failure (its other error, a missing final newline, cannot happen: every line ends with one)
+                    logger.warning(
+                        "x10 fix: could not rewrite %s (%s: %s); its %d selected candidate(s) stay at the old scale and will not be retried (ids: %s)",
+                        path.name, type(exc).__name__, exc, len(ids), ", ".join(ids),
+                    )
+                    continue
+                count += len(ids)
+                logger.info(
+                    "pending queue: rewrote %s with the feelings of %d candidate(s) multiplied by %s (ids: %s)",
+                    path.name, len(ids), factor, ", ".join(ids),
+                )
         return count
 
-    def _prepare_x10_copy(self, path: Path, copy: Path, factor: float, threshold: float) -> list[str]:
-        """Write and check the copy of one queue-shaped file with its small `making` entries multiplied; the ids it multiplied (the caller holds the lock).
+    def _scaled_x10_content(self, path: Path, factor: float, threshold: float) -> tuple[bytes, list[str]]:
+        """The new content of one queue-shaped file with its small `making` entries multiplied, and the ids it multiplied (the caller holds the lock).
 
-        Nothing is written (and no copy exists) when the file is missing or nothing in it is selected. A copy that fails its check
-        raises `RuntimeError` and the original is untouched. The count and every multiplied entry's id are logged once, with the
-        copy's name, so the entries can be found by hand if the fix ever has to be undone.
+        Built in memory, nothing is written here. No ids (and empty content) when the file is missing, empty, or nothing in it is
+        selected: the caller does not create or rewrite such a file. A read fault raises. The ids are logged by the caller once,
+        so the entries can be found by hand if the fix ever has to be undone.
         """
         if file_ops.stat_path(path) is None:
-            return []
-        read: list[tuple[str, dict | None, bool]] = []  # (the line as read, its entry, whether it was multiplied)
+            return b"", []
         lines: list[bytes] = []
         multiplied: list[str] = []
         # RAISE: a file that cannot be read must stop the start-up, not be skipped and rewritten without its lines.
@@ -504,22 +471,16 @@ class PendingQueue:
                     encoded = encode_jsonl(scaled, nonfinite="raise")
                 except (ValueError, TypeError) as exc:
                     logger.warning("x10 fix: pending candidate %s skipped, it cannot be written back unchanged (%s)", entry.get("id"), exc)  # type: ignore[union-attr]
-            read.append((text, entry, encoded is not None))
             if encoded is None:
                 lines.append(text.encode("utf-8", "surrogateescape") + b"\n")
             else:
                 lines.append(encoded)
                 multiplied.append(str(entry.get("id")))  # type: ignore[union-attr]
         if not multiplied:
-            return []
-        # Not `write_jsonl`: it decodes its payload as UTF-8, and a line kept byte for byte may not be valid UTF-8.
-        write_jsonl_bytes(copy, b"".join(lines))  # atomic and durable
-        _check_x10_copy(copy, read, factor)
-        logger.info(
-            "pending queue: prepared %s with the feelings of %d candidate(s) multiplied by %s (ids: %s)",
-            copy.name, len(multiplied), factor, ", ".join(multiplied),
-        )
-        return multiplied
+            return b"", []
+        # The caller writes with `write_jsonl_bytes`, not `write_jsonl`: that one decodes its payload as UTF-8, and a line kept
+        # byte for byte may not be valid UTF-8.
+        return b"".join(lines), multiplied
 
 
 class ClaimedBatch:

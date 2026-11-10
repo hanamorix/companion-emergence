@@ -5,9 +5,14 @@ persona's engine first starts is not a `memories.db` row yet, so the database ha
 gate would promote it later at the old small size. Owner (Planning B21, Q10c): "They're memories so they should get treated as such".
 
 C2 (Planning B29 items 1, 3, 4; B27 Q15): negatives are held to 0.0 and then multiplied; an entry with no feelings has its score
-multiplied; no entry carries a marker; each file's new copy is written to `<file>.x10tmp` and checked before any replace; the fix's
-progress is `PRAGMA user_version` of `memories.db` (0 -> 1 with the rows, -> 2 under the queue lock between the checked copies and
-the replace), read and written only through `MemoryStore` methods.
+multiplied; no entry carries a marker; the fix's progress is `PRAGMA user_version` of `memories.db` (0 -> 1 with the rows, -> 2 under
+the queue lock before any queue file is rewritten, so 2 means "queue step started"), read and written only through `MemoryStore`
+methods.
+
+X10S (owner S84, Planning B32): the queue step is the seven steps in order: no queue file sets 2 without a lock; the lock; the number
+read inside it; both files read into memory (a read fault raises, nothing written); the number set; each file with a selected entry
+rewritten once with the shared atomic writer (a failed write is logged and start-up goes on); release. There are no temporary
+`.x10tmp` copies, no check of a copy and no roll-forward; `_copies` below asserts none is ever left.
 
 The queue is driven through `nudge_scale_fix.scale_up_small_feelings` (the one entry the first start calls) wherever the behaviour is
 the point, and through the method itself for counts and failure paths. Entries are written the way the product writes them (`enqueue`)
@@ -202,7 +207,7 @@ def test_a_second_run_multiplies_nothing_already_multiplied_and_leaves_the_files
     nudge_scale_fix.scale_up_small_feelings(tmp_path)
     assert _entries(tmp_path)["small"]["emotions"] == pytest.approx({"joy": 0.5})  # not 5.0
     assert QueuedBytes.of(tmp_path) == first and _copies(tmp_path) == []
-    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
 
 
 def test_an_entry_queued_after_the_fix_is_not_multiplied_the_accepted_edge_of_the_progress_note(tmp_path: Path) -> None:
@@ -257,7 +262,7 @@ def test_a_file_with_nothing_to_multiply_is_not_rewritten_at_all_whatever_it_hol
     monkeypatch.setattr(pending, "write_jsonl_bytes", lambda path, data, **kw: writes.append(path) or real_write(path, data, **kw))
     assert _scale(tmp_path) == 0
     assert (tmp_path / QUEUE).read_bytes() == content and writes == [] and _copies(tmp_path) == []
-    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # done: nothing to copy
+    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # the step ran: nothing selected, nothing rewritten
 
 
 def test_an_entry_with_no_score_is_multiplied_in_its_feelings_and_gets_no_score(tmp_path: Path) -> None:
@@ -296,12 +301,18 @@ def test_the_method_returns_how_many_entries_it_multiplied_across_both_files_and
     assert _scale(tmp_path) == 0
 
 
-def test_a_persona_with_no_queue_files_creates_nothing_and_a_missing_processing_file_is_fine(tmp_path: Path) -> None:
+def test_a_persona_with_no_queue_files_creates_nothing_and_a_missing_processing_file_is_fine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _database(tmp_path)
     before = sorted(p.name for p in tmp_path.iterdir())
+    real_lock = pending.file_lock
+    locks: list[Path] = []
+    monkeypatch.setattr(pending, "file_lock", lambda path, *a, **kw: locks.append(Path(path)) or real_lock(path, *a, **kw))
     assert _scale(tmp_path) == 0
+    assert locks == []  # X10S step (1): no queue file sets the number and stops, taking no lock
     assert sorted(p.name for p in tmp_path.iterdir()) == before  # not even a lock sidecar
-    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # the queue step is done: a later re-run multiplies nothing
+    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # the queue step is recorded: a later re-run multiplies nothing
     with_queue = tmp_path / "with-queue"
     with_queue.mkdir()
     _enqueue(with_queue, _memory("a", {"joy": 0.05}))
@@ -312,7 +323,13 @@ def test_a_persona_with_no_queue_files_creates_nothing_and_a_missing_processing_
     _database(other)
     _write_lines(other / PROCESSING, _raw_line("only-claimed", {"joy": 0.05}))
     assert _scale(other) == 1  # the processing file alone is reached too
-    assert not (other / QUEUE).exists()
+    assert not (other / QUEUE).exists()  # a missing file is not created
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _database(empty)
+    (empty / QUEUE).write_bytes(b"")
+    assert _scale(empty) == 0
+    assert (empty / QUEUE).read_bytes() == b"" and not (empty / PROCESSING).exists()  # an empty file is not rewritten, a missing one not created
 
 
 # --- a line that cannot be used ---------------------------------------------------------------------
@@ -370,19 +387,20 @@ def test_a_damaged_entry_is_left_byte_identical_and_logged_and_does_not_stop_the
     assert "content of" not in warned  # an id is named, never content
 
 
-# --- the copy, the check, the lock, a failure ------------------------------------------------------------
+# --- the order, the lock, a failure ----------------------------------------------------------------------
 
 
-def test_the_work_runs_under_the_queues_own_lock_the_copies_are_written_then_each_original_is_replaced_by_its_copy(
+def test_the_steps_run_in_the_order_lock_then_record_2_then_each_file_rewritten_once_then_unlock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """X10S: (2) lock, (5) set 2, (6) one `write_jsonl_bytes` per file with a selected entry, (7) release; the record comes before any rewrite."""
     queue = PendingQueue(tmp_path)
     _enqueue(tmp_path, _memory("a", {"joy": 0.05}))
     queue.claim()
     _enqueue(tmp_path, _memory("b", {"joy": 0.05}))
     held: list[Path] = []
-    events: list[tuple[str, Path | None]] = []
-    real_lock, real_write, real_replace = pending.file_lock, pending.write_jsonl_bytes, pending.file_ops.replace_file
+    events: list[tuple[str, Path | int | None]] = []
+    real_lock, real_write, real_set = pending.file_lock, pending.write_jsonl_bytes, MemoryStore.set_x10_progress
 
     @contextlib.contextmanager
     def lock_spy(path: Path, *args: object, **kwargs: object):
@@ -398,25 +416,52 @@ def test_the_work_runs_under_the_queues_own_lock_the_copies_are_written_then_eac
         events.append(("write", Path(path)))
         return real_write(path, records, **kwargs)
 
-    def replace_spy(src: Path, dst: Path):
-        assert held == [queue.path]
-        events.append(("replace", Path(dst)))
-        assert Path(src).name == Path(dst).name + COPY_SUFFIX  # the fixed sibling name, so recovery finds it
-        return real_replace(src, dst)
+    def set_spy(self: MemoryStore, number: int) -> None:
+        assert held == [queue.path]  # recorded with the queue's lock held
+        events.append(("set", number))
+        real_set(self, number)
 
     monkeypatch.setattr(pending, "file_lock", lock_spy)
     monkeypatch.setattr(pending, "write_jsonl_bytes", write_spy)
-    monkeypatch.setattr(pending.file_ops, "replace_file", replace_spy)
+    monkeypatch.setattr(MemoryStore, "set_x10_progress", set_spy)
     assert _scale(tmp_path) == 2
-    copy_of = lambda path: path.with_name(path.name + COPY_SUFFIX)  # noqa: E731
     assert events == [
         ("lock", queue.path),
-        ("write", copy_of(queue.path)),
-        ("write", copy_of(queue.processing_path)),
-        ("replace", queue.path),
-        ("replace", queue.processing_path),
+        ("set", dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED),
+        ("write", queue.path),
+        ("write", queue.processing_path),
         ("unlock", queue.path),
     ]
+
+
+@pytest.mark.no_base_failure(
+    reason="retained behaviour: the base also read the number inside the lock and skipped; this pins X10S step (3) (the second starter does nothing)"
+)
+def test_a_second_starter_that_waited_for_the_lock_sees_2_inside_it_and_does_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """X10S step (3): a bridge and a command starting together cannot both multiply: the number is read inside the lock."""
+    queue = PendingQueue(tmp_path)
+    _enqueue(tmp_path, _memory("a", {"joy": 0.05}))
+    before = QueuedBytes.of(tmp_path)
+    real_lock = pending.file_lock
+
+    @contextlib.contextmanager
+    def lock_after_the_other_starter_finished(path: Path, *args: object, **kwargs: object):
+        with real_lock(path, *args, **kwargs) as acquired:
+            _set_progress(tmp_path, dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED)  # the starter that held the lock first has recorded 2
+            yield acquired
+
+    monkeypatch.setattr(pending, "file_lock", lock_after_the_other_starter_finished)
+    writes: list[Path] = []
+    real_write = pending.write_jsonl_bytes
+    monkeypatch.setattr(pending, "write_jsonl_bytes", lambda path, data, **kw: writes.append(path) or real_write(path, data, **kw))
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        # this starter read 0 before it waited: it must read again inside the lock
+        assert store.x10_progress() == 0
+        assert queue.scale_up_small_making_candidates(store) == 0
+    finally:
+        store.close()
+    assert QueuedBytes.of(tmp_path) == before and writes == []
 
 
 def test_an_entry_enqueued_by_another_thread_while_the_pass_runs_is_not_lost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -442,7 +487,7 @@ def test_an_entry_enqueued_by_another_thread_while_the_pass_runs_is_not_lost(tmp
     assert entries["a"]["emotions"] == pytest.approx({"joy": 0.5}) and entries["late"]["emotions"] == {"joy": 0.05}  # missed: the accepted edge (S77)
 
 
-def test_every_progress_step_is_in_its_place_0_then_1_with_the_rows_then_2_after_both_checked_copies_and_before_the_replace(
+def test_every_progress_step_is_in_its_place_0_then_1_with_the_rows_then_2_after_both_files_are_read_and_before_any_is_rewritten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tests.unit.brain.emotion.test_nudge_scale_fix import _memory as _row
@@ -457,19 +502,24 @@ def test_every_progress_step_is_in_its_place_0_then_1_with_the_rows_then_2_after
     finally:
         store.close()
     assert _progress(tmp_path) == 0
-    seen: list[tuple[int, list[str], bool]] = []
+    seen: list[tuple[int, bool]] = []
     real_set = MemoryStore.set_x10_progress
 
     def spy(self: MemoryStore, number: int) -> None:
-        # at the moment the number is set to 2: both copies exist and have passed, and no original is replaced yet
-        unchanged = _entries(tmp_path)["p"]["emotions"] == {"joy": 0.06} and _entries(tmp_path, PROCESSING)["q"]["emotions"] == {"joy": 0.05}
-        seen.append((number, _copies(tmp_path), unchanged))
+        # at the moment the number is set to 2: no file has been rewritten yet (the record comes before the rewrite), and no
+        # temporary copy exists (the fix writes none)
+        unchanged = (
+            _entries(tmp_path)["p"]["emotions"] == {"joy": 0.06}
+            and _entries(tmp_path, PROCESSING)["q"]["emotions"] == {"joy": 0.05}
+            and not list(tmp_path.glob("*.x10tmp"))
+        )
+        seen.append((number, unchanged))
         real_set(self, number)
 
     monkeypatch.setattr(MemoryStore, "set_x10_progress", spy)
     assert nudge_scale_fix.scale_up_small_feelings(tmp_path) == 1
-    assert seen == [(2, [QUEUE + COPY_SUFFIX, PROCESSING + COPY_SUFFIX], True)]
-    assert _progress(tmp_path) == 2 and _copies(tmp_path) == []
+    assert seen == [(2, True)]
+    assert _progress(tmp_path) == 2 and not list(tmp_path.glob("*.x10tmp"))
     assert _entries(tmp_path)["p"]["emotions"] == pytest.approx({"joy": 0.6})
     assert _entries(tmp_path, PROCESSING)["q"]["emotions"] == pytest.approx({"joy": 0.5})
 
@@ -495,62 +545,10 @@ def test_the_rows_set_the_number_to_1_in_their_own_transaction_before_the_queue_
     assert seen == [dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE]
 
 
-def test_a_crash_after_the_number_is_2_with_a_checked_copy_still_there_rolls_forward_without_a_second_multiply(
+def test_a_failure_to_set_the_number_raises_with_nothing_written_and_the_next_start_runs_the_queue_step_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    queue = PendingQueue(tmp_path)
-    _enqueue(tmp_path, _memory("q", {"joy": 0.05}))
-    queue.claim()
-    _enqueue(tmp_path, _memory("p", {"joy": 0.06}))
-    original = QueuedBytes.of(tmp_path)
-    real_replace = pending.file_ops.replace_file
-    calls: list[Path] = []
-
-    def die_on_the_first_replace(src: Path, dst: Path) -> None:
-        calls.append(Path(dst))
-        raise OSError("power cut")
-
-    monkeypatch.setattr(pending.file_ops, "replace_file", die_on_the_first_replace)
-    with pytest.raises(OSError, match="power cut"):
-        _scale(tmp_path)
-    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
-    assert QueuedBytes.of(tmp_path) == original and _copies(tmp_path) == [QUEUE + COPY_SUFFIX, PROCESSING + COPY_SUFFIX]
-    monkeypatch.setattr(pending.file_ops, "replace_file", real_replace)
-    assert _scale(tmp_path) == 0  # the roll-forward multiplies nothing itself: it finishes the replacing from the checked copies
-    assert _copies(tmp_path) == []
-    assert _entries(tmp_path)["p"]["emotions"] == pytest.approx({"joy": 0.6})
-    assert _entries(tmp_path, PROCESSING)["q"]["emotions"] == pytest.approx({"joy": 0.5})  # once, not 5.0
-    assert _scale(tmp_path) == 0 and _entries(tmp_path)["p"]["emotions"] == pytest.approx({"joy": 0.6})
-
-
-def test_a_crash_between_the_two_replaces_finishes_the_second_from_its_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    queue = PendingQueue(tmp_path)
-    _enqueue(tmp_path, _memory("q", {"joy": 0.05}))
-    queue.claim()
-    _enqueue(tmp_path, _memory("p", {"joy": 0.06}))
-    real_replace = pending.file_ops.replace_file
-    calls: list[Path] = []
-
-    def die_on_the_second(src: Path, dst: Path) -> None:
-        calls.append(Path(dst))
-        if len(calls) == 2:
-            raise OSError("power cut")
-        real_replace(src, dst)
-
-    monkeypatch.setattr(pending.file_ops, "replace_file", die_on_the_second)
-    with pytest.raises(OSError, match="power cut"):
-        _scale(tmp_path)
-    assert _copies(tmp_path) == [PROCESSING + COPY_SUFFIX]
-    monkeypatch.setattr(pending.file_ops, "replace_file", real_replace)
-    _scale(tmp_path)
-    assert _copies(tmp_path) == []
-    assert _entries(tmp_path)["p"]["emotions"] == pytest.approx({"joy": 0.6})  # the first file was replaced once and stays
-    assert _entries(tmp_path, PROCESSING)["q"]["emotions"] == pytest.approx({"joy": 0.5})
-
-
-def test_a_failure_before_the_number_is_2_with_a_copy_left_deletes_it_and_starts_the_queue_step_again_from_the_originals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+    """X10S step (5): the number is set before any file is written, so a failure to set it leaves every file as it was."""
     from tests.unit.brain.emotion.test_nudge_scale_fix import _memory as _row
 
     _enqueue(tmp_path, _memory("p", {"joy": 0.06}))
@@ -569,52 +567,18 @@ def test_a_failure_before_the_number_is_2_with_a_copy_left_deletes_it_and_starts
     with pytest.raises(OSError, match="disk full"):
         nudge_scale_fix.scale_up_small_feelings(tmp_path)
     assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE  # the rows were done, the queue step was not
-    assert QueuedBytes.of(tmp_path) == original  # no original was replaced
-    assert _copies(tmp_path) == [QUEUE + COPY_SUFFIX]
-    (tmp_path / (QUEUE + COPY_SUFFIX)).write_bytes(b"garbage left by a crash\n")  # a copy that cannot be trusted
+    assert QueuedBytes.of(tmp_path) == original  # nothing was written
+    assert not list(tmp_path.glob("*.x10tmp"))  # and no temporary copy was made
     monkeypatch.setattr(MemoryStore, "set_x10_progress", real_set)
     assert nudge_scale_fix.scale_up_small_feelings(tmp_path) == 0  # the rows are done
-    assert _copies(tmp_path) == [] and _progress(tmp_path) == 2
-    assert _entries(tmp_path)["p"]["emotions"] == pytest.approx({"joy": 0.6})  # from the originals, once, not from the leftover
+    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    assert _entries(tmp_path)["p"]["emotions"] == pytest.approx({"joy": 0.6})  # from the originals, once
 
 
-@pytest.mark.parametrize(
-    "corrupt",
-    [
-        pytest.param(lambda data, original: data.rsplit(b"\n", 2)[0] + b"\n", id="a line dropped"),
-        pytest.param(lambda data, original: data + b'{"id": "extra"}\n', id="a line added"),
-        pytest.param(lambda data, original: data.replace(b"content of big", b"content of BIG"), id="an unselected line altered"),
-        pytest.param(lambda data, original: original, id="nothing multiplied"),
-        pytest.param(lambda data, original: data.replace(b"0.5", b"0.6"), id="a feeling that is not ten times"),
-        pytest.param(lambda data, original: data.replace(b'"score": 5.0', b'"score": 4.0'), id="a score that is not ten times"),
-        pytest.param(lambda data, original: data.replace(b'"importance": 5.0', b'"importance": 6.0'), id="another field changed"),
-    ],
+@pytest.mark.no_base_failure(
+    reason="retained behaviour, renamed because the copy check its old name described is gone: the base also read a BOM and CRLF file through the shared reader and multiplied every entry"
 )
-def test_a_copy_that_fails_its_check_raises_before_any_original_is_replaced_and_the_number_is_not_2(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corrupt
-) -> None:
-    _database(tmp_path)
-    _write_lines(
-        tmp_path / QUEUE,
-        _raw_line("one", {"joy": 0.05}, score=0.5),
-        b"bad line {",
-        _raw_line("big", {"joy": 6.0}),
-        _raw_line("last", {"calm": 0.05}),
-    )
-    original = (tmp_path / QUEUE).read_bytes()
-    real_write = pending.write_jsonl_bytes
-    monkeypatch.setattr(pending, "write_jsonl_bytes", lambda path, data, **kw: real_write(path, corrupt(data, original), **kw))
-    with pytest.raises(RuntimeError, match="nothing was replaced"):
-        _scale(tmp_path)
-    assert (tmp_path / QUEUE).read_bytes() == original  # the original is kept
-    assert _progress(tmp_path) != dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
-    monkeypatch.setattr(pending, "write_jsonl_bytes", real_write)
-    assert _scale(tmp_path) == 2  # with the fault gone the next start completes, once
-    assert _entries(tmp_path)["one"]["emotions"] == pytest.approx({"joy": 0.5})
-    assert _copies(tmp_path) == []
-
-
-def test_a_bom_and_crlf_file_is_counted_the_same_way_on_both_sides_so_the_check_passes_and_every_entry_is_multiplied(tmp_path: Path) -> None:
+def test_a_bom_and_crlf_file_is_read_by_the_shared_reader_and_every_entry_is_multiplied(tmp_path: Path) -> None:
     _database(tmp_path)
     (tmp_path / QUEUE).write_bytes(
         b"\xef\xbb\xbf" + _raw_line("one", {"joy": 0.05}) + b"\r\n" + _raw_line("big", {"joy": 6.0}) + b"\r\n" + b"\r\n" + _raw_line("two", {"joy": 0.06}) + b"\r\n"
@@ -627,45 +591,34 @@ def test_a_bom_and_crlf_file_is_counted_the_same_way_on_both_sides_so_the_check_
     assert entries["one"]["emotions"] == pytest.approx({"joy": 0.5}) and entries["two"]["emotions"] == pytest.approx({"joy": 0.6})
 
 
-def test_a_first_line_that_starts_with_a_second_byte_order_mark_does_not_fail_the_check(tmp_path: Path) -> None:
-    """The reader drops one leading mark of a stream; a line that itself begins with another reads back one mark shorter (a mark is not content)."""
-    _database(tmp_path)
-    (tmp_path / QUEUE).write_bytes(b"\xef\xbb\xbf\xef\xbb\xbfnot json {\n" + _raw_line("one", {"joy": 0.05}) + b"\n")
-    assert _scale(tmp_path) == 1
-    assert _entries(tmp_path)["one"]["emotions"] == pytest.approx({"joy": 0.5})
-    assert _lines(tmp_path / QUEUE)[0] == b"not json {"[:0] + "﻿not json {".encode()  # one mark is left, the junk is kept
-
-
-def test_a_failed_write_of_the_second_copy_raises_and_changes_no_original_and_the_next_start_completes_once(
+def test_a_failed_write_after_the_number_is_2_is_logged_the_other_file_is_rewritten_start_up_goes_on_and_the_entries_are_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Owner S84, X10S step (6): a failed write is logged, start-up continues, that file's entries stay at the old scale and are not retried."""
     queue = PendingQueue(tmp_path)
     _enqueue(tmp_path, _memory("claimed", {"joy": 0.05}))
     queue.claim()
-    _enqueue(tmp_path, _memory("queued", {"joy": 0.05}))
-    before = QueuedBytes.of(tmp_path)
-    caplog.set_level(logging.INFO, logger="brain.memory.pending")
+    _enqueue(tmp_path, _memory("queued", {"joy": 0.06}))
+    caplog.set_level(logging.WARNING, logger="brain.memory.pending")
     real_write = pending.write_jsonl_bytes
-    calls: list[Path] = []
 
-    def fail_on_the_second_file(path: Path, records: object, **kwargs: object):
-        calls.append(Path(path))
-        if len(calls) == 2:
+    def fail_on_the_queue_file(path: Path, records: object, **kwargs: object):
+        if Path(path) == queue.path:
             raise OSError("disk full")
         return real_write(path, records, **kwargs)
 
-    monkeypatch.setattr(pending, "write_jsonl_bytes", fail_on_the_second_file)
-    with pytest.raises(OSError, match="disk full"):
-        _scale(tmp_path)
-    assert QueuedBytes.of(tmp_path) == before  # neither original was replaced
-    assert _progress(tmp_path) != dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
+    monkeypatch.setattr(pending, "write_jsonl_bytes", fail_on_the_queue_file)
+    assert _scale(tmp_path) == 1  # start-up goes on: only the file that was rewritten is counted
+    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    assert _entries(tmp_path, PROCESSING)["claimed"]["emotions"] == pytest.approx({"joy": 0.5})  # the other file was rewritten
+    assert _entries(tmp_path)["queued"]["emotions"] == {"joy": 0.06}  # the failed file stays at the old scale
+    assert not list(tmp_path.glob("*.x10tmp"))
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(QUEUE in line and "old scale" in line and "not be retried" in line and "queued" in line for line in warned)
     monkeypatch.undo()
-    assert _scale(tmp_path) == 2  # both entries, from the originals
+    assert _scale(tmp_path) == 0  # not retried, and never multiplied twice
+    assert _entries(tmp_path)["queued"]["emotions"] == {"joy": 0.06}
     assert _entries(tmp_path, PROCESSING)["claimed"]["emotions"] == pytest.approx({"joy": 0.5})
-    assert _entries(tmp_path)["queued"]["emotions"] == pytest.approx({"joy": 0.5})  # not 5.0
-    assert _copies(tmp_path) == []
-    logged = [r.getMessage() for r in caplog.records if "multiplied by" in r.getMessage()]
-    assert any("queued" in line for line in logged)  # the ids are in the log, so the entries can be found by hand
 
 
 def test_a_read_fault_raises_and_changes_nothing(tmp_path: Path) -> None:
@@ -674,6 +627,23 @@ def test_a_read_fault_raises_and_changes_nothing(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         _scale(tmp_path)
     assert (tmp_path / QUEUE).is_dir()
+
+
+def test_a_read_fault_in_the_second_file_raises_with_nothing_written_and_the_number_not_set_and_the_next_start_completes_once(
+    tmp_path: Path,
+) -> None:
+    """X10S step (4): both files are read before the number is set or any file is written, so a fault in the second leaves the first alone."""
+    _enqueue(tmp_path, _memory("queued", {"joy": 0.05}))
+    (tmp_path / PROCESSING).mkdir()  # the processing file cannot be read
+    before = (tmp_path / QUEUE).read_bytes()
+    with pytest.raises(OSError):
+        _scale(tmp_path)
+    assert (tmp_path / QUEUE).read_bytes() == before
+    assert _progress(tmp_path) != dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    assert not list(tmp_path.glob("*.x10tmp"))
+    (tmp_path / PROCESSING).rmdir()
+    assert _scale(tmp_path) == 1  # with the fault gone, the next start runs the step once
+    assert _entries(tmp_path)["queued"]["emotions"] == pytest.approx({"joy": 0.5})
 
 
 def test_the_first_start_runs_the_queue_half_only_when_the_persona_is_known_not_switched_and_has_a_database(tmp_path: Path) -> None:
@@ -693,5 +663,5 @@ def test_the_first_start_runs_the_queue_half_only_when_the_persona_is_known_not_
     lose_the_state(tmp_path)  # no state at all: not switched
     nudge_scale_fix.scale_up_small_feelings(tmp_path)
     assert _entries(tmp_path)["a"]["emotions"] == pytest.approx({"joy": 0.5})
-    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED
-    assert _progress(other) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED  # the one that could not be told ran too
+    assert _progress(tmp_path) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    assert _progress(other) == dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED  # the one that could not be told ran too
