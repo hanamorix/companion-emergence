@@ -678,12 +678,16 @@ def test_articulate_refusal_raises_and_leaves_the_budget(persona, kind):
 
 
 @pytest.mark.parametrize("kind", REFUSALS)
-def test_self_model_tick_refusal_leaves_state_and_cadence(persona, monkeypatch, kind):
+def test_self_model_tick_refusal_leaves_state_and_cadence(persona, monkeypatch, emotion_engine_stub, kind):
     import brain.bridge.supervisor as sup
+    from brain.emotion.engine import Reading
     from brain.self_model.gap import Gap
 
-    monkeypatch.setattr(sup, "compute_gap", lambda *_a, **_k: Gap(per_channel={"joy": 1.0}, magnitude=1.0,
-                                                                  unnamed_pressure=0.0))
+    # The engine reads one shifted channel, and the gap built from it is above the articulation threshold, so the
+    # tick reaches `sm_articulate`.
+    emotion_engine_stub.readings = {"joy": Reading(short=6.0, long=5.0, difference=1.0, shift=1)}
+    monkeypatch.setattr(sup, "gap_from_read", lambda *_a, **_k: Gap(per_channel={"joy": 1.0}, magnitude=1.0,
+                                                                    unnamed_pressure=0.0))
     prov = Refusing(kind, persona)
     with pytest.raises(_refused_type(kind)):
         sup._run_self_model_tick(persona, provider=prov, event_bus=object())

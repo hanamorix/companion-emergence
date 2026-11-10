@@ -2,7 +2,7 @@
 
 The block is hedged ("you've been moving like X, but your felt read says Y").
 It renders ONLY when state.current_gap is open/acknowledged AND has a note or
-non-trivial per_channel; otherwise None so the prompt carries no bloat.
+a channel the engine reads as shifted; otherwise None so the prompt carries no bloat.
 """
 from __future__ import annotations
 
@@ -69,15 +69,7 @@ def test_open_gap_with_nothing_to_say_returns_none():
     assert render_block(state) is None
 
 
-def test_open_gap_with_only_subfloor_channels_returns_none():
-    # deltas below the surfacing floor are noise — omit the block
-    state = SelfModelState(
-        current_gap=_open_gap(per_channel={"grief": 0.1}, magnitude=0.1, note=None)
-    )
-    assert render_block(state) is None
-
-
-# ── B2 phase B: the live render (the engine's shifted channels, position and direction) ──
+# ── the engine's shifted channels, position and direction ──
 
 
 def _live_block(per_channel, directions, **kw) -> str | None:
@@ -88,7 +80,7 @@ def _live_block(per_channel, directions, **kw) -> str | None:
         directions=directions,
         **kw,
     )
-    return render_block(SelfModelState(current_gap=gap), live=True)
+    return render_block(SelfModelState(current_gap=gap))
 
 
 def test_live_four_position_direction_pairs_render_four_distinct_fragments():
@@ -119,14 +111,13 @@ def test_live_zero_difference_with_no_direction_has_nothing_to_say():
     assert _live_block({"joy": 0.0}, {}) is None
 
 
-def test_live_has_no_floor_and_cuts_to_the_largest_three_by_absolute_difference(monkeypatch):
+def test_there_is_no_floor_and_cuts_to_the_largest_three_by_absolute_difference(monkeypatch):
     per_channel = {"a": 0.1, "b": -3.0, "c": 2.0, "d": 2.0, "e": 0.9}
     directions = dict.fromkeys(per_channel, 1)
     block = _live_block(per_channel, directions)
     assert block is not None
     named = {n for n in per_channel if any(ln.startswith(n + " ") for ln in block.replace("; ", "\n").splitlines())}
-    # b (3.0), then c and d tie at 2.0 and break by name; a (0.1, under the old 0.5 floor) is a live channel too
-    # but loses the cut.
+    # b (3.0), then c and d tie at 2.0 and break by name; a (0.1) is a channel too but loses the cut.
     assert named == {"b", "c", "d"}
     from brain import dev_constants
 
@@ -134,8 +125,3 @@ def test_live_has_no_floor_and_cuts_to_the_largest_three_by_absolute_difference(
     block = _live_block(per_channel, directions)
     named = {n for n in per_channel if any(ln.startswith(n + " ") for ln in block.replace("; ", "\n").splitlines())}
     assert named == set(per_channel)
-
-
-def test_not_live_still_applies_the_floor_and_the_sign_render():
-    gap = Gap(per_channel={"joy": 0.2}, magnitude=0.2, unnamed_pressure=0.0, directions={"joy": 1})
-    assert render_block(SelfModelState(current_gap=gap)) is None

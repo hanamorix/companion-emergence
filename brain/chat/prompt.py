@@ -2114,24 +2114,20 @@ def _build_attunement_block(persona_dir: Path) -> str:
 def _build_self_model_block(persona_dir: Path, *, tool_prefix: str = "") -> str | None:
     """Return the self-model gap block, or None when there's nothing to surface.
 
-    Renders only when an open gap exists between her declared (max-pool) and
-    derived (trend/body) emotional reads (self-model design §3, R-F1); when the
-    emotion engine is live the gap is its shifted channels, rendered with their
-    position and direction. Hedged
+    Renders only when an open gap exists (self-model design §3, R-F1): the gap
+    is the emotion engine's shifted channels, rendered with their position and
+    direction. Hedged
     framing — she's invited to notice, never commanded to revise.
 
     Failure-safe: a missing/corrupt state file or any read error yields None so
     a cold install never breaks chat composition.
     """
     try:
-        from brain.emotion import engine
         from brain.self_model.ambient import render_block
         from brain.self_model.state import load_or_recover
 
         state, _recovered = load_or_recover(persona_dir)
-        return render_block(
-            state, tool_prefix=tool_prefix, live=engine.engine_for(persona_dir).is_live()
-        )
+        return render_block(state, tool_prefix=tool_prefix)
     except Exception:  # noqa: BLE001
         return None
 

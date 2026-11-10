@@ -1721,20 +1721,18 @@ def test_journal_block_in_memory_store_prints_the_stored_values(emotion_engine_s
     assert "joy 9" in block
 
 
-def test_self_model_block_is_live_when_the_engine_is_live(tmp_path, emotion_engine_stub):
+def test_self_model_block_renders_the_engines_shifted_channels_with_no_floor(tmp_path):
     from brain.chat.prompt import _build_self_model_block
     from brain.self_model.gap import Gap
     from brain.self_model.state import SelfModelState, save
 
     gap = Gap(
-        per_channel={"joy": 0.2},  # under the old 0.5 floor: the old render would omit the block
+        per_channel={"joy": 0.2},  # small, but the engine read it as shifted: there is no floor
         magnitude=0.2,
         unnamed_pressure=0.0,
         directions={"joy": 1},
     )
     save(tmp_path, SelfModelState(current_gap=gap))
-    assert _build_self_model_block(tmp_path) is None
-    emotion_engine_stub.live = True
     block = _build_self_model_block(tmp_path)
     assert block is not None and "joy" in block
 
