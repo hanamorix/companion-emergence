@@ -13,11 +13,13 @@ If this test fails, the merge is blocked. The build is a hard gate.
 Tests 1 and 3 make up to 22 real claude calls, which spend subscription usage, so a plain `pytest`
 leaves them out (#680). Run them on purpose with:
   uv run pytest -m requires_claude_cli tests/integration/brain/attunement/test_adversarial_corpus.py
-They fail if the model never answered, because a failed call declines quietly. Test 2 and the check
-on that failure need no CLI and run by default.
+They fail if the model never answered, because a failed call declines quietly, and test 1 also fails
+if fewer rounds answered than a pattern needs to become known (ATTUNEMENT_MATURITY_KNOWN_MIN). Test 2
+and the checks on those failures need no CLI and run by default.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 import sys
@@ -25,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.attunement.detector import _decline_output, run_detector
 from brain.attunement.store import (
     BufferTurn,
@@ -40,8 +43,10 @@ def _load_corpus() -> tuple[list[BufferTurn], list[dict]]:
     return buffer, payload["known_false_patterns"]
 
 
-def _run_detector_rounds(persona_dir: Path, buffer: list[BufferTurn], *, rounds: int) -> None:
-    """Merge what the detector proposes, `rounds` times. Fails if the model never answered."""
+def _run_detector_rounds(
+    persona_dir: Path, buffer: list[BufferTurn], *, rounds: int, min_answered: int = 1
+) -> None:
+    """Merge what the detector proposes, `rounds` times. Fails if fewer than `min_answered` rounds were answered."""
     answered = 0
     for i in range(rounds):
         output = run_detector(buffer_slice=buffer, reply_text=f"reply attempt {i}")
@@ -55,6 +60,9 @@ def _run_detector_rounds(persona_dir: Path, buffer: list[BufferTurn], *, rounds:
             now_iso=f"2026-05-31T12:{i:02d}:00Z",
         )
     assert answered, f"the model never answered in {rounds} rounds, so this proves nothing"
+    assert answered >= min_answered, (
+        f"only {answered} of {rounds} rounds answered, fewer than the {min_answered} this check needs"
+    )
 
 
 @pytest.mark.no_base_failure(reason="the helper it guards is in this test file, which the base check keeps at the PR's version")
@@ -64,6 +72,23 @@ def test_rounds_fail_when_the_model_never_answered(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(sys.modules[__name__], "run_detector", lambda **kwargs: declined)
     with pytest.raises(AssertionError, match="never answered"):
         _run_detector_rounds(tmp_path, [BufferTurn(id="t1", content="hello")], rounds=2)
+
+
+@pytest.mark.no_base_failure(reason="the corpus test it guards is in this test file, which the base check keeps at the PR's version")
+def test_corpus_fails_when_too_few_rounds_answered_to_reach_known(tmp_path: Path, monkeypatch) -> None:
+    """A pattern needs ATTUNEMENT_MATURITY_KNOWN_MIN confirmations to become known, so fewer answers prove nothing."""
+    declined = _decline_output(source_turn_id="")
+    answered = dataclasses.replace(
+        declined, current_read=dataclasses.replace(declined.current_read, tone_label="warm")
+    )
+    calls = iter(range(100))
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "run_detector",
+        lambda **kwargs: answered if next(calls) < dev_constants.ATTUNEMENT_MATURITY_KNOWN_MIN - 1 else declined,
+    )
+    with pytest.raises(AssertionError, match="fewer than"):
+        test_adversarial_corpus_does_not_crystallise_any_pattern(tmp_path, True)
 
 
 @pytest.fixture(scope="session")
@@ -80,8 +105,11 @@ def test_adversarial_corpus_does_not_crystallise_any_pattern(
     if not claude_cli_available:
         pytest.skip("claude CLI not available")
     buffer, _ = _load_corpus()
-    # Run detector 12 times to give the corpus chances to confirm anything
-    _run_detector_rounds(tmp_path, buffer, rounds=12)
+    # Run detector 12 times to give the corpus chances to confirm anything. A pattern becomes known only after
+    # ATTUNEMENT_MATURITY_KNOWN_MIN confirmations, so fewer answered rounds than that can't test the gate.
+    _run_detector_rounds(
+        tmp_path, buffer, rounds=12, min_answered=dev_constants.ATTUNEMENT_MATURITY_KNOWN_MIN
+    )
 
     patterns = read_learned_patterns(tmp_path)
     # No pattern should reach 'known' maturity from this adversarial corpus
