@@ -316,12 +316,38 @@ def test_assistant_error_scan_survives_hostile_lines():
     assert provider_mod._assistant_error_code("") is None
     assert provider_mod._assistant_error_code("9" * 5000) is None
     assert provider_mod._assistant_error_code("[" * 100000) is None
-    # a line under the cap that really makes json.loads recurse too deep, before and after the real frame
-    deep = "[" * 65000
-    with pytest.raises(RecursionError):
-        json.loads(deep)  # guard: this interpreter really raises here, so the case below exercises the arm
+
+
+_DEEP_LINE = "[" * 65000  # under _ASSISTANT_SCAN_MAX_LINE, so the scan does parse it
+
+
+@pytest.mark.no_base_failure(reason="moved out of the hostile-lines test so it can skip by interpreter (#678)")
+def test_assistant_error_scan_survives_a_line_that_really_recurses():
+    """Whether this depth recurses depends on the interpreter: 3.12 and 3.13 raise, 3.14 and 3.15 don't."""
+    try:
+        json.loads(_DEEP_LINE)
+    except RecursionError:
+        pass
+    except ValueError:
+        pytest.skip("this interpreter's JSON parser doesn't recurse at this depth")
     real = _ndjson(_reword(F302))
-    assert provider_mod._assistant_error_code(deep + "\n" + real + deep) == "model_not_found"
+    stdout = _DEEP_LINE + "\n" + real + _DEEP_LINE
+    assert provider_mod._assistant_error_code(stdout) == "model_not_found"
+
+
+@pytest.mark.no_base_failure(reason="covers the recursion arm on every interpreter, including 3.14+ (#678)")
+def test_assistant_error_scan_survives_a_recursion_error_from_the_parser(monkeypatch):
+    real_loads = json.loads
+
+    def loads(text, *args, **kwargs):
+        if text == _DEEP_LINE:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(provider_mod.json, "loads", loads)
+    real = _ndjson(_reword(F302))
+    stdout = _DEEP_LINE + "\n" + real + _DEEP_LINE
+    assert provider_mod._assistant_error_code(stdout) == "model_not_found"
 
 
 def test_failure_detail_with_benign_hostile_lines_is_still_a_detected_rejection():

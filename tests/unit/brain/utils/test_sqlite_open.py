@@ -12,12 +12,12 @@ from brain import dev_constants
 from brain.health.anomaly import BrainIntegrityError
 from brain.utils import sqlite_open
 from brain.utils.sqlite_open import (
-    DEFAULT_PROFILE,
-    STRICT_WAL_PROFILE,
     OpenProfile,
     check_integrity,
     close_on_error,
+    default_profile,
     open_store_connection,
+    strict_wal_profile,
 )
 from tests.unit.brain.utils.test_sqlite_open_equivalence import (
     CLOSE,
@@ -73,10 +73,10 @@ def test_a_profile_has_no_default_timeout_of_its_own() -> None:
 
 def test_the_profile_is_two_fields_frozen_and_sourced_from_the_constant() -> None:
     assert [f.name for f in dataclasses.fields(OpenProfile)] == ["busy_timeout_s", "wal_fallback"]
-    assert DEFAULT_PROFILE == OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, True)
-    assert STRICT_WAL_PROFILE == OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, False)
+    assert default_profile() == OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, True)
+    assert strict_wal_profile() == OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, False)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        DEFAULT_PROFILE.wal_fallback = False  # type: ignore[misc]
+        default_profile().wal_fallback = False  # type: ignore[misc]
 
 
 def test_a_profile_timeout_reaches_connect_and_the_pragma(tmp_path, monkeypatch) -> None:
@@ -109,7 +109,7 @@ def test_only_operational_error_is_swallowed_on_the_wal_pragma(tmp_path, monkeyp
     rec.fail_on("PRAGMA journal_mode = WAL", exc)
     with pytest.raises(sqlite3.DatabaseError) as raised:
         open_store_connection(
-            tmp_path / "a.db", caller="TestStore", integrity_check=False, profile=DEFAULT_PROFILE
+            tmp_path / "a.db", caller="TestStore", integrity_check=False, profile=default_profile()
         )
     assert raised.value is exc
     assert CLOSE in rec.conns[0].trace
@@ -140,7 +140,7 @@ def test_wal_failure_propagates_and_closes_under_the_strict_profile(tmp_path, mo
             tmp_path / "a.db",
             caller="TestStore",
             integrity_check=False,
-            profile=STRICT_WAL_PROFILE,
+            profile=strict_wal_profile(),
         )
     assert raised.value is exc
     assert CLOSE in rec.conns[0].trace
@@ -228,3 +228,11 @@ def test_the_in_memory_database_opens_with_the_default_profile() -> None:
 
 def test_close_on_error_is_exported() -> None:
     assert sqlite_open.close_on_error is close_on_error
+
+
+def test_the_default_profile_reads_the_busy_timeout_at_open_time(tmp_path, monkeypatch) -> None:
+    """#528 / #602: the dev constant is read when a store opens, not frozen at import."""
+    monkeypatch.setattr(dev_constants, "SQLITE_STORE_BUSY_TIMEOUT_S", 12.0)
+    conn = open_store_connection(tmp_path / "a.db", caller="TestStore", integrity_check=False)
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 12000
+    conn.close()

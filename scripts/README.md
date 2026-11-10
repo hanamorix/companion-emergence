@@ -34,6 +34,26 @@ Cost: tens of seconds, network for `uv build`. No live persona. No
 LLM calls. Adds the wheel + sdist to `dist/` (cleaned up on next
 build).
 
+### `time_old_emotion_paths.py` — tier 1
+
+Copies a synthetic `memories.db` into a fresh temporary persona directory and times three emotion code paths on the copy: one full `HeartbeatEngine._apply_emotion_decay` pass, one `write_trace_memory`, and one `get_emotional_state`. Each timing is one labelled cold first run plus nine warm repeats (minimum, median, maximum), printed with the host (CPU model, architecture, AVX2, cores, RAM; the CPU model is the `model name` field of `/proc/cpuinfo` on Linux and `unknown` on any other system or when the field is missing or unreadable), the database's sha256 and the commit. Refuses a path under the brain's home directory and removes its copy when it ends; a timing whose function is absent on the commit is skipped with a printed reason. The path is optional and defaults to `test-data/synthetic-db/memories.db`.
+
+```bash
+bash scripts/time_old_emotion_paths.sh [path to memories.db]
+```
+
+Cost: about 32 seconds with the 19,406-row synthetic database on a 4-core VM with AVX2 hidden from the guest (a Ryzen 5 5500 host with the VM's AVX2 masked); a slower machine takes longer. No LLM, no live persona, no network.
+
+### `measure_feels_high_thresholds.py` — tier 1
+
+Copies a synthetic `memories.db` (the path is required: the database is not in the repository) into a fresh temporary directory, feeds its history through the emotion engine's own pure fold functions from an empty state, and counts, per reader condition (body energy and temperature, the research gate, the reflex arcs, and the two frontend expressions), how often it fires under the old fixed levels against `engine_utils.feels_high_from`, at each floor of `--floors` (default `0,0.1,0.25,0.5,1.0,2.0`; 0 is the rule without a floor). Two runs (every day active, and a fixed set of days off). It prints firing counts after day 30 and over all ticks, the shift part and the range part alone, the near-zero firings, the survival floor of each floor-0 firing in buckets, how many feelings ever reach each floor, and R(F), the firings the floor removes from the reflex and temperature rows, with the plateau rule's proposal. It checks its own invariants (counts never rise with the floor and the like) and exits 1 when one fails. Refuses a path under the brain's home directory, aborts on a non-empty `-wal` file, removes its copy when it ends, calls no model, no network.
+
+```bash
+bash scripts/measure_feels_high_thresholds.sh <path to memories.db> [--floors 0,0.1,0.25,0.5,1.0,2.0]
+```
+
+Cost: about 20 seconds with the 19,406-row synthetic database on a 4-core Ryzen 5 5500 host with AVX2 (7 seconds of it the measurement, the rest start-up and the database copy); a slower machine takes longer. No LLM, no live persona, no network.
+
 ### `stress_test_image.py` — tier 2
 
 Builds a temp persona in `tempfile.mkdtemp`, starts an in-process

@@ -17,7 +17,6 @@ from brain.chat.prompt import _build_recall_block, _extract_recall_tokens, _lega
 from brain.felt_time.state import FeltTimeState
 from brain.felt_time.state import persist as persist_felt_time
 from brain.forgetting import graveyard as gv
-from brain.grief import policy
 from brain.memory import known_names as kn
 from brain.memory.store import Memory, MemoryStore
 
@@ -42,6 +41,12 @@ def _world(tmp_path: Path, entries: list[dict], *, store_texts=("a quiet filler 
     for t in store_texts:
         store.create(Memory.create_new(content=t, memory_type="conversation", domain="us"))
     return store
+
+
+def _grief_touches(store: MemoryStore, referent_id: str) -> int:
+    """How many grief_event rows name `referent_id` as their referent."""
+    rows = store._conn.execute("SELECT metadata_json FROM memories WHERE memory_type = 'grief_event'").fetchall()
+    return sum(1 for row in rows if json.loads(row["metadata_json"]).get("grief_referent_id") == referent_id)
 
 
 def _render(store, tmp_path, message, *, spy_touch=True):
@@ -220,9 +225,9 @@ def test_only_shown_forgotten_memories_write_grief(tmp_path):
     store = _world(tmp_path, entries)
     _render(store, tmp_path, "harbour", spy_touch=False)
     for i in range(4, 12):
-        assert store.exists_recent_grief_touch(f"m{i:02d}", hours=policy.DEBOUNCE_HOURS), i
+        assert _grief_touches(store, f"m{i:02d}") == 1, i
     for i in range(0, 4):
-        assert not store.exists_recent_grief_touch(f"m{i:02d}", hours=policy.DEBOUNCE_HOURS), i
+        assert _grief_touches(store, f"m{i:02d}") == 0, i
     # precondition (the old behaviour): touching a below-cut entry DOES write a breadcrumb here
     from brain.felt_time.state import load_or_recover
     from brain.grief import handle_recall_touch
@@ -232,7 +237,7 @@ def test_only_shown_forgotten_memories_write_grief(tmp_path):
         touched_ids=["m00"], graveyard_entries=gv.read_all(tmp_path), persona_dir=tmp_path, store=store,
         lived_age_hours_now=felt.lived_age_hours,
     )
-    assert store.exists_recent_grief_touch("m00", hours=policy.DEBOUNCE_HOURS)
+    assert _grief_touches(store, "m00") == 1
 
 
 # G16 once, never when nothing shown

@@ -20,6 +20,7 @@ import pytest
 
 import brain.utils.atomic_write as heal
 from brain.health.json_io import Recovery, read_json_result
+from brain.utils import file_ops
 from brain.utils.atomic_write import save_with_backup_text
 
 # The polling-reader tests need the reader to have really read while saves were in flight. On a busy host the reader thread
@@ -396,7 +397,7 @@ def test_transient_permission_error_at_every_replace_is_retried(
         1 for e in _record_one_save(monkeypatch, tmp_path, "dry") if e[:2] == ("before", "replace")
     )
     assert total >= 3
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     real_replace = os.replace
     for n in range(1, total + 1):
         d = tmp_path / f"r{n}"
@@ -416,7 +417,7 @@ def test_transient_permission_error_at_every_replace_is_retried(
         monkeypatch.setattr(os, "replace", flaky)
         save_with_backup_text(p, _payload(6))
         monkeypatch.undo()
-        monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
         assert calls.get("fired"), f"replace #{n} was never reached"
         assert _version(p) == 6 and _version(d / "x.json.bak1") == 5, f"replace #{n}"
 
@@ -429,7 +430,7 @@ def test_transient_permission_error_inside_backup_copy_is_retried(
     does not trip over it (no FileExistsError)."""
     p = tmp_path / "x.json"
     _seed(p)
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     fired = {"n": 0}
     real_open, real_copystat = os.open, shutil.copystat
 
@@ -468,7 +469,7 @@ def test_persistent_failure_of_final_replace_leaves_old_live_and_intact_chain(
     bak1 holds the old live content and bak2 the previous bak1 (never a missing live file)."""
     p = tmp_path / "x.json"
     _seed(p)
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     real_replace = os.replace
 
     def deny_final(src, dst):
@@ -492,7 +493,7 @@ def _function(name: str) -> ast.FunctionDef:
 
 
 def test_save_helper_has_no_bare_replace_or_side_door_rename() -> None:
-    """C5d / C13: every replace in save_with_backup_text goes through _replace_with_retry, and the
+    """C5d / C13: every replace in save_with_backup_text goes through replace_file, and the
     live file is never moved by another rename API."""
     forbidden = {"os.replace", "os.rename", "shutil.move", "os.renames"}
     attr_forbidden = {"rename", "replace"}
@@ -666,7 +667,7 @@ def test_unreadable_live_file_fails_loud_and_changes_nothing(tmp_path: Path, mon
     _seed(p)
     names = ["x.json", "x.json.bak1", "x.json.bak2", "x.json.bak3"]
     before = {n: (tmp_path / n).read_bytes() for n in names}
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     p.chmod(0)
     try:
         with pytest.raises(PermissionError):

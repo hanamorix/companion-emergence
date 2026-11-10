@@ -287,12 +287,14 @@ def _source_memory_snippet(store: MemoryStore, candidate: dict) -> str | None:
     """Return up to 400 chars of the memory that generated this candidate.
 
     Fail-soft: missing memory_id, missing memory, or store error all return None.
+
+    Reads without counting as an access (`bump=False`): the excerpt goes into the review prompt, but a background re-check of a memory is not an access.
     """
     mid = str(candidate.get("memory_id") or "").strip()
     if not mid:
         return None
     try:
-        mem = store.get(mid)
+        mem = store.get(mid, bump=False)
     except Exception as exc:
         logger.debug("_source_memory_snippet: store.get(%r) raised: %s", mid, exc)
         return None
@@ -313,9 +315,13 @@ def _related_memory_snippets(
 
     Best-effort — if search fails, returns empty list. The decision still
     happens, it just has less context.
+
+    Reads without counting as an access (`bump=False`): the excerpt goes into the review prompt, but a background re-check of a memory is not an access.
     """
     try:
-        memories = store.search_text(candidate_text[:200], active_only=True, limit=limit)
+        memories = store.search_text(
+            candidate_text[:200], active_only=True, limit=limit, bump=False
+        )
     except Exception as exc:
         logger.warning("related memory lookup failed: %s", exc)
         return []
@@ -331,11 +337,17 @@ def _related_memory_snippets(
 def _current_emotional_summary(store: MemoryStore) -> str:
     """One-line summary of current dominant emotion + intensity."""
     try:
-        from brain.emotion.aggregate import aggregate_state
+        live_engine = store.emotion_engine()
+        if live_engine is not None and live_engine.is_live():
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the summary says neutral.
+            scores = {name: r.short for name, r in live_engine.read().items()}
+        else:
+            from brain.emotion.aggregate import aggregate_state
 
-        recent = store.list_active(limit=50)
-        state = aggregate_state(recent)
-        scores = dict(state.emotions)
+            recent = store.list_active(limit=50)
+            state = aggregate_state(recent)
+            scores = dict(state.emotions)
     except Exception as exc:
         logger.warning("emotional state lookup failed: %s", exc)
         return "unknown"

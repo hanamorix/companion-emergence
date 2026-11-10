@@ -125,6 +125,10 @@ export interface InteriorEntry {
 export interface PersonaState {
   persona: string;
   emotions: Record<string, number>;
+  /** The feeling names the emotion engine calls high, from `engine.feels_high` (computed server-side). An array only
+   *  when the engine is live (possibly empty); null or absent on the old path and on older bridge builds, where the
+   *  expressions keep their own levels. */
+  feels_high?: string[] | null;
   body: BodyState | null;
   interior: {
     dream: InteriorEntry | null;

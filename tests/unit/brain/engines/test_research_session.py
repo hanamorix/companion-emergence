@@ -5,7 +5,40 @@ import time
 
 import pytest
 
-from brain.engines.research_session import parse_session_output
+from brain.engines.research_session import extract_felt_lines, parse_session_output
+
+_FELT_BODY = "NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose"
+
+
+@pytest.mark.parametrize(
+    ("tail", "emotions", "rating"),
+    [
+        ('EMOTIONS: {"joy": 7}\nENGAGEMENT: 7', {"joy": 7.0}, 7.0),
+        ('ENGAGEMENT: 7/10\n\nEMOTIONS: {"joy": 7}\n', {"joy": 7.0}, 7.0),
+        ('**EMOTIONS:** {"joy": 7}\n__ENGAGEMENT__: 7', {"joy": 7.0}, 7.0),
+        ('**EMOTIONS**: {"joy": 12, "awe": -1, "fear": 0, "zorble": 3, "love": NaN}', {"joy": 10.0}, None),
+        ("ENGAGEMENT: -2", None, None),
+        ("ENGAGEMENT: 40", None, 10.0),
+        ("ENGAGEMENT: lots", None, None),
+        ('EMOTIONS: ["joy"]', None, None),
+        ('EMOTIONS: {"joy": {"a": 1}}', {}, None),
+        ("EMOTIONS: {broken", None, None),
+        ("", None, None),
+    ],
+)
+def test_extract_felt_lines(tail, emotions, rating):
+    rest, got_emotions, got_rating = extract_felt_lines(_FELT_BODY + "\n\n" + tail)
+    assert parse_session_output(rest).verdict == "close"
+    assert (got_emotions, got_rating) == (emotions, rating)
+
+
+def test_a_felt_line_inside_the_notes_is_not_taken():
+    raw = "NOTES:\nEngagement: 7 was the score\n\nMEMORY:\nm\n\nVERDICT:\ncontinue"
+    assert extract_felt_lines(raw) == (raw, None, None)
+
+
+def test_a_reply_of_only_felt_lines_leaves_empty_text():
+    assert extract_felt_lines('EMOTIONS: {"joy": 7}\nENGAGEMENT: 7') == ("", {"joy": 7.0}, 7.0)
 
 
 def _reply(notes="facts here", memory="I dug in today.", verdict="continue"):
