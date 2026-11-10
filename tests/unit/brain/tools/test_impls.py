@@ -886,7 +886,7 @@ def test_crystallize_soul_schema_does_not_reference_hana() -> None:
     assert "Hana" not in desc, f"crystallize_soul description hardcodes 'Hana': {desc!r}"
 
 
-# ── B2 phase B: the emotion tools read the engine's short averages when it is live ──
+# ── the emotion tools read the engine's short averages ──
 
 
 def test_get_emotional_state_carries_present_zeros_ranked_last(tmp_path: Path, emotion_engine_stub) -> None:

@@ -2542,7 +2542,7 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
         hm.close()
 
 
-# ── B2 phase B: the heartbeat's emotion readers when the engine is live ───────
+# ── the heartbeat's emotion readers (the engine's short averages) ─────────────
 
 
 def _live_reading(short: float):
@@ -2561,7 +2561,6 @@ def test_live_status_summary_writes_the_short_peak_and_no_calm_default(tmp_path:
             heartbeat.store.create(
                 Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": value})
             )
-        emotion_engine_stub.live = True
         emotion_engine_stub.readings = {"joy": _live_reading(5.6), "love": _live_reading(2.0)}
         heartbeat._write_daemon_state_for_heartbeat(
             persona_dir, elapsed_seconds=900.0, memories_decayed=0, edges_pruned=0, dream_id=None
@@ -2588,7 +2587,6 @@ def test_live_status_summary_with_an_empty_read_writes_nothing_and_keeps_the_pre
             theme="heartbeat tick",
             summary="Previous heartbeat",
         )
-        emotion_engine_stub.live = True
         heartbeat._write_daemon_state_for_heartbeat(
             persona_dir, elapsed_seconds=900.0, memories_decayed=0, edges_pruned=0, dream_id=None
         )
@@ -2608,7 +2606,6 @@ def test_live_spike_resonance_is_zero_and_the_forced_resonance_path_is_unchanged
         heartbeat.store.create(
             Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 9.0})
         )
-        emotion_engine_stub.live = True
         assert heartbeat._compute_current_resonance(None) == (0.0, {})
         assert heartbeat._compute_current_resonance(6.5) == (6.5, {"forced": 6.5})
     finally:

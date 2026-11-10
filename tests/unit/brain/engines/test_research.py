@@ -163,6 +163,31 @@ def test_run_tick_emotion_high_triggers(tmp_path: Path, emotion_engine_stub):
         store.close()
 
 
+def test_run_tick_emotion_override_above_the_old_level_does_not_open_the_gate_unless_the_engine_says_high(
+    tmp_path: Path, emotion_engine_stub
+):
+    """The gate holds no level of its own: a high-looking override with no feeling the engine calls high stays closed."""
+    from brain.emotion.state import EmotionalState
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        es = EmotionalState()
+        es.set("curiosity", 9.0)
+        emotion_engine_stub.high = set()
+        result = engine.run_tick(
+            trigger="emotion_high",
+            dry_run=False,
+            days_since_human_override=0.0,
+            emotion_state_override=es,
+        )
+        assert result.fired is None
+        assert result.reason == "not_due"
+    finally:
+        store.close()
+
+
 def test_run_tick_pull_threshold_filters(tmp_path: Path):
     _write_interests(
         tmp_path / "interests.json", [_interest_dict(pull_score=5.0)]
@@ -1005,7 +1030,7 @@ def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
     assert _session_rows(tmp_path) == []
 
 
-# ── B2 phase B: the research gate asks the engine whether a feeling is high when it is live ──
+# ── the research gate asks the engine whether a feeling is high ──
 
 
 def _live_gate_reason(

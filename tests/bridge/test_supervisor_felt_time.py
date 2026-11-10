@@ -440,7 +440,6 @@ def _live_drivers(tmp_path: Path, stub, readings: dict[str, float], *, high: set
     from brain.bridge.supervisor import _derive_intensity_drivers
     from brain.emotion.engine import Reading
 
-    stub.live = True
     stub.high = set(high or ())
     stub.readings = {n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()}
     return _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
@@ -498,7 +497,6 @@ def test_live_body_strain_follows_the_engines_predicate_not_the_store_or_a_level
 def test_live_drivers_survive_a_read_that_raises(tmp_path: Path, emotion_engine_stub) -> None:
     """The felt-time drivers keep their fail-soft except: a raising read leaves body strain and emotional
     intensity at their 0.0 defaults and the other two drivers still come back."""
-    emotion_engine_stub.live = True
 
     def boom():
         raise RuntimeError("engine fault")

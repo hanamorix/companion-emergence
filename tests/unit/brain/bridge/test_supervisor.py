@@ -1446,7 +1446,7 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
 def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and_closes_its_store(
     tmp_path: Path, emotion_engine_stub, monkeypatch
 ) -> None:
-    """B2 phase B: with the engine live the gate's body is built from the engine's short averages (not the store's
+    """The gate's body is built from the engine's short averages (not the store's
     rows), reports rest when the energy is low, and closes the store it opened."""
     from datetime import UTC, datetime
     from unittest.mock import MagicMock, patch
@@ -1461,7 +1461,6 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
     seeded = MemoryStore(persona_dir / "memories.db")
     seeded.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"joy": 9.0}))
     seeded.close()
-    emotion_engine_stub.live = True
     emotion_engine_stub.readings = {"rest_need": Reading(short=8.5, long=0.0, difference=0.0, shift=0)}
 
     seen: dict[str, object] = {"emotions": None, "closed": 0}
@@ -1512,7 +1511,6 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
 
     persona_dir = _persona_dir(tmp_path)
-    emotion_engine_stub.live = True
 
     asked: list[str] = []
 
@@ -1543,7 +1541,6 @@ def test_live_rest_gate_asks_the_engines_predicate_for_body_energy(tmp_path: Pat
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
 
     persona_dir = _persona_dir(tmp_path)
-    emotion_engine_stub.live = True
     seen: list[object] = []
     real = body_state.body_state_from_short
 

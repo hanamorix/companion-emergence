@@ -855,7 +855,7 @@ wire_note_back_message_segments = [
 ]
 
 [self_model.ambient]
-# The live self-model block's fragment for one channel (ambient.render_block with live=True), filled with
+# The live self-model block's fragment for one channel (ambient.render_block), filled with
 # str.format(name=...). One key per (position, direction) pair: position is where the channel sits against its usual
 # level (above or below), direction is which way it is moving (rising or fading). The *_only forms are used when the
 # gap carries no direction for the channel; the level_* forms when the difference is exactly 0.

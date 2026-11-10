@@ -14,10 +14,10 @@ pooling memory rows would give the stored numbers and fail):
 For each reader the map it derives and uses is captured at the point where it hands it on (the argument the body
 projection receives, what a panel or tool returns, the ``emotions`` the reflex engine evaluates, the state the research
 engine builds, what the heartbeat summary takes its peak from). A cell then checks, in order, that exactly one capture
-was made (1), that the stub is set up to show the case (2: every feeling has distinct short, long and difference values,
-and the stub's last fold is a nonzero interval before the instant the reader is called), and only then asserts the one
-thing under test (3): the captured map equals the stub's short averages. Checks 1 and 2 use ``pytest.fail`` so no
-expected failure could hide them; check 3 is the only ``AssertionError``.
+was made (1, after the call), that the stub is set up to show the case (2, before the call: every number of its table is
+different from every other, and its last fold is a nonzero interval before the instant the reader is called), and only
+then asserts the one thing under test (3): the captured map equals the stub's short averages. Checks 1 and 2 use
+``pytest.fail`` so no expected failure could hide them; check 3 is the only ``AssertionError``.
 """
 
 from __future__ import annotations
@@ -60,8 +60,9 @@ _TOOL_BODY_STATE = importlib.import_module("brain.tools.impls.get_body_state")
 
 # ── what the engine reads (the stub's table) ─────────────────────────────────
 
-# name -> (short, long, difference). Every feeling has three different numbers, and no two feelings share a short value,
-# so a reader that took the long average or the difference, or mixed up two feelings, gives a different map. All are
+# name -> (short, long, difference). Every number of the table is different from every other (the stub does not
+# need `difference` to equal short minus long), so a reader that took the long average or the difference, or mixed up
+# two feelings, gives a different map. All are
 # exact at one decimal (the panels round to one decimal) and none equals a number the stores below hold.
 _STUB_TABLES: dict[str, dict[str, tuple[float, float, float]]] = {
     "D1": {"nostalgia": (2.5, 6.5, -4.0), "joy": (7.5, 3.5, 4.5), "relief": (5.5, 1.5, 3.0)},
@@ -349,26 +350,31 @@ CELLS = _cells()
 
 def _check_the_stub_shows_the_case(stub, called_at: datetime, surface: str, dataset: str) -> None:
     """Check 2: the stub's numbers are told apart, and its last fold is a nonzero interval before the call."""
-    readings = stub.readings
-    for name, reading in readings.items():
+    numbers: list[float] = []
+    for name, reading in stub.readings.items():
         if len({reading.short, reading.long, reading.difference}) != 3:
             pytest.fail(f"{surface}-{dataset}: {name} does not have distinct short, long and difference values")
-    shorts = [reading.short for reading in readings.values()]
-    if len(set(shorts)) != len(shorts):
-        pytest.fail(f"{surface}-{dataset}: two feelings share a short value, so a mix-up would go unseen")
+        numbers += [reading.short, reading.long, reading.difference]
+    if len(set(numbers)) != len(numbers):
+        pytest.fail(
+            f"{surface}-{dataset}: two numbers of the stub's table are equal, so a reader that took the wrong "
+            "field or mixed up two feelings could go unseen"
+        )
     if not stub.last_fold_at < called_at:
         pytest.fail(f"{surface}-{dataset}: the stub's last fold is not an interval before the call")
 
 
 @pytest.mark.no_base_failure(
     reason=(
-        "same-answer test, re-pointed at the engine read with its ids unchanged from the safety net (#581), so the base "
-        "check does not judge these ids; each cell is shown able to fail by running it against the base source, where "
-        "the readers still take their old branches (recorded in the run's harness notes)"
+        "same-answer test, re-pointed at the engine read; its 24 ids are the safety net's (#581) and are unchanged, so "
+        "the base check does not judge them. Each cell is shown able to fail by running the file against the base "
+        "source, where the readers still take their old branches (recorded in the run's harness notes)"
     )
 )
 @pytest.mark.parametrize(("surface", "dataset"), CELLS)
-def test_surface_matches_the_engine_read(surface, dataset, tmp_path, monkeypatch, emotion_engine_stub):
+def test_surface_matches_the_store_pool(surface, dataset, tmp_path, monkeypatch, emotion_engine_stub):
+    # (The id keeps the safety net's name (#581) so the 24 cells stay the same ids; what they compare against is now
+    # the engine's short averages.)
     install, call, expected_from = _SURFACES[surface]
     table = _STUB_TABLES[dataset]
     emotion_engine_stub.readings = {
