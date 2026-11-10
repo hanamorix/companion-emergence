@@ -650,7 +650,7 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("protected",),
-        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field, the column and the heartbeat check stay until phase C",
+        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field and the column stay until phase C (the heartbeat check went with the old decay pass, Engine 6 G4)",
         ref="#672 A2a cleanup",
         kind="code",
         scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
@@ -685,6 +685,31 @@ REMOVED: tuple[Removed, ...] = (
         ),
         why="the switch file `state/emotion_switch.json` and the code that wrote, stat-ed and read it; the persona's one switch-over time is the `switch_over_at` field of the emotion state (`engine_files.switch_over_state` reads 'switched' off a loaded state)",
         ref="Engine 6 SW2 (#584, draft PR #633; Planning B25, owner S73)",
+        kind="code",
+    ),
+    # --- the heartbeat no longer decays each memory's stored emotions (Engine 6 G4) -----------------------------------------
+    Removed(
+        names=("brain/emotion/decay.py",),
+        why="per-memory emotion decay: the engine fades a stored value when it is read (engine_utils.fade), so nothing rewrites memories.db emotions on a timer",
+        ref="Engine 6 G4 (#584, draft PR #633)",
+        kind="file",
+    ),
+    Removed(
+        names=(
+            "apply_decay",
+            "_apply_emotion_decay",
+            "_resume_decay_only",
+            "DecayCursor",
+            "decay_cursor",
+            "_parse_decay_cursor",
+            "HEARTBEAT_DECAY_BATCH_BUDGET_S",
+            "_DECAY_PAGE_SIZE",
+            "memories_decayed",
+            "update_emotions_batch",
+            "list_active_since",
+        ),
+        why="the heartbeat's batched per-memory emotion decay pass with its resume cursor, its batch time budget, its page size, its count (`memories_decayed`) and the two store methods only it used; the engine fades on read, so nothing decays a stored emotion on a timer",
+        ref="Engine 6 G4 (#584, draft PR #633)",
         kind="code",
     ),
 )

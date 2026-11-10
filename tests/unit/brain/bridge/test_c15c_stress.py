@@ -1,7 +1,7 @@
 """ram-spike-fix INC-10 — C15(c): heartbeat passes and gated-job items
 driven for >= 60s on F-bob20k with concurrent chat-path writes from another
 thread -> zero "database is locked" (2-plan §4.3/§4.2's whole point: the
-30s busy timeout + batched decay removes the O16 starvation pattern even
+30s busy timeout removes the O16 starvation pattern even
 under real, item-level, multi-minute background activity).
 
 Stage-6 red-team MAJOR, addressed: C15(a)/(b) (job-granularity ordering and
@@ -29,7 +29,7 @@ running. It now also asserts, for the supervisor thread: it raised nothing, was
 alive at the end of the window, and is not alive after `stop_event` plus a
 bounded join (no help from the test: the supervisor itself must stop a gated
 pass at its next item); and that the loop did real work in the window: a
-heartbeat that decayed memories with no reflex/growth error, forgetting wrote
+heartbeat that completed a full tick with no reflex/growth error, forgetting wrote
 rows, a `supervisor_tick` (only "the loop iterates"), and no exception swallowed
 by the loop's own loggers. The writer thread is held to the same standard (no
 error, alive, joined, at least one successful `bump_recall`). The persona is
@@ -76,8 +76,7 @@ _FIXTURE_ENV = os.environ.get("KINDLED_F_BOB20K")
 
 def _build_synthetic_bob20k(db_path: Path, n: int = 20_000) -> None:
     """20k memories spread over a year with nonzero emotions, so the
-    heartbeat's batched decay and the forgetting pass both have real work
-    on every row, as they did on F-bob20k. (`n` is only lowered by the
+    forgetting pass has real work on every row, as it did on F-bob20k. (`n` is only lowered by the
     stand-in tests, which need a database but not its size.)"""
     from brain.memory.store import Memory, MemoryStore
 
@@ -260,6 +259,7 @@ class _StressResult:
     non_active_rows: int | None = None
     forgetting_cursor: dict = dataclasses.field(default_factory=dict)
     forgetting_state_file: bool = False
+    heartbeat_full_ticks: int = 0
     oracle_error: str | None = None
     loop_join_s: float = 0.0
     subprocess_calls: list[str] = dataclasses.field(default_factory=list)
@@ -282,6 +282,12 @@ def _read_window_end_oracle(persona_dir: Path, result: _StressResult) -> None:
             con.close()
         result.forgetting_cursor = job_progress.load_progress(persona_dir, "forgetting")
         result.forgetting_state_file = (persona_dir / "forgetting_state.json").exists()
+        # A heartbeat that did its work (not the first-ever tick, which only initializes) appends a row with
+        # `initialized` false to the heartbeat log.
+        log = persona_dir / "heartbeats.log.jsonl"
+        if log.exists():
+            rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            result.heartbeat_full_ticks = sum(1 for row in rows if row.get("initialized") is False)
     except Exception as exc:  # noqa: BLE001
         result.oracle_error = repr(exc)
 
@@ -393,8 +399,9 @@ def _assert_stress_result(result: _StressResult) -> None:
     )
     heartbeats = bus.of_type("heartbeat_tick")
     assert heartbeats, "no heartbeat_tick event: no heartbeat completed in the window"
-    assert any((hb.get("memories_decayed") or 0) > 0 for hb in heartbeats), (
-        "no heartbeat_tick decayed any memory: the heartbeat's write path did not run"
+    assert result.heartbeat_full_ticks > 0, (
+        "no heartbeat completed a full tick (heartbeats.log.jsonl holds no row with initialized false): "
+        "the heartbeat's work did not run"
     )
     failed = [hb for hb in heartbeats if hb.get("reflex_error") or hb.get("growth_error")]
     assert not failed, (
@@ -535,7 +542,7 @@ def test_c15c_heartbeat_and_gated_items_60s_with_concurrent_writes_no_lock_error
     print(
         f"[c15c-stress] supervisor_tick={len(bus.of_type('supervisor_tick'))} "
         f"heartbeat_tick={len(heartbeats)} "
-        f"decayed={[hb.get('memories_decayed') for hb in heartbeats]} "
+        f"full_heartbeat_ticks={result.heartbeat_full_ticks} "
         f"non_active_rows={result.non_active_rows} "
         f"cursor={bool(result.forgetting_cursor)} state_file={result.forgetting_state_file} "
         f"bumps={result.bumps} loop_join_s={result.loop_join_s:.2f}"
@@ -600,7 +607,8 @@ def _stand_in(
     noop: bool = False,
     ignores_stop: bool = False,
     tick: bool = True,
-    heartbeats: tuple[dict, ...] = ({"memories_decayed": 1},),
+    heartbeats: tuple[dict, ...] = ({},),
+    real_tick: bool = True,
     cursor: bool = True,
     state_file: bool = False,
     fade_row: bool = True,
@@ -635,6 +643,9 @@ def _stand_in(
             bus.publish({"type": "supervisor_tick"})
         for hb in heartbeats:
             bus.publish({"type": "heartbeat_tick", "reflex_error": None, "growth_error": None, **hb})
+        if real_tick:
+            with (persona_dir / "heartbeats.log.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps({"initialized": False}) + "\n")
         if cursor:
             job_progress.save_progress(persona_dir, "forgetting", {"last_id": "stand-in"})
         if state_file:
@@ -717,13 +728,17 @@ def test_stand_in_clean_finish_shape_passes(tmp_path: Path) -> None:
          "ready", "supervisor_tick"),
         ("ticks_only", {"heartbeats": (), "cursor": False, "fade_row": False},
          "ready", "heartbeat_tick"),
-        ("heartbeat_decays_nothing", {"heartbeats": ({"memories_decayed": 0},)},
-         "ready", "decayed any memory"),
-        ("heartbeat_reports_reflex_error", {"heartbeats": ({"memories_decayed": 1,
-                                                            "reflex_error": "boom"},)},
+        pytest.param(
+            "heartbeat_completes_no_full_tick", {"real_tick": False}, "ready", "full tick",
+            marks=pytest.mark.no_base_failure(
+                reason="opt-in stress file (skipped unless KINDLED_RUN_STRESS=1, so the base check cannot run it); "
+                "this case is the old heartbeat_decays_nothing case moved to the new liveness proof, and it was run "
+                "by hand with the variable set"
+            ),
+        ),
+        ("heartbeat_reports_reflex_error", {"heartbeats": ({"reflex_error": "boom"},)},
          "ready", "reflex_error"),
-        ("heartbeat_reports_growth_error", {"heartbeats": ({"memories_decayed": 1,
-                                                            "growth_error": "boom"},)},
+        ("heartbeat_reports_growth_error", {"heartbeats": ({"growth_error": "boom"},)},
          "ready", "growth_error"),
         ("all_exempt_shape", {"cursor": False, "fade_row": False},
          "ready", "forgetting wrote no row"),

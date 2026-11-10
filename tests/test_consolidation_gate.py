@@ -385,13 +385,8 @@ def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
     `run_consolidation` and `HeartbeatEngine._try_fire_reflex` to record
     the order they're actually invoked in at runtime, across
     `HeartbeatEngine.run_tick`'s real dispatch (first-ever-tick init,
-    then a fresh tick). ram-spike-fix INC-7 split run_tick's old
-    monolithic body into `_run_tick_body` (fresh tick) / `_resume_decay_only`
-    (resumes an interrupted decay pass and stops, per spec §5) — a source
-    grep on `run_tick` itself no longer finds either call. The resumed
-    path runs neither consolidation nor reflex at all (nothing else that
-    tick), so it can't violate this ordering; only the fresh-tick path is
-    exercised here.
+    then a fresh tick). The tick's work lives in `_run_tick_body`, so a
+    source grep on `run_tick` itself finds neither call.
     """
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatEngine
@@ -400,7 +395,7 @@ def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
 
     # Keep dream/reflex/research/growth from constructing a real CLI
     # provider against a bare tmp_path persona (same guard
-    # test_heartbeat_decay_batching.py uses).
+    # test_heartbeat.py uses).
     monkeypatch.setattr(
         "brain.engines.heartbeat.build_tier_provider", lambda *a, **k: FakeProvider()
     )

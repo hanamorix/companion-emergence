@@ -127,7 +127,8 @@ def test_nell_heartbeat_compact_output_suppresses_not_due(
     assert "interests bumped: 0" not in out
     # But the basic heartbeat lines should still be there
     assert "Heartbeat tick complete" in out
-    assert "decayed:" in out
+    assert "pruned" in out
+    assert "decayed" not in out
 
 
 def test_nell_heartbeat_verbose_shows_all_gated_reasons(
@@ -201,7 +202,6 @@ def test_compact_cli_self_treated_emits_bandage_line(
         return HeartbeatResult(
             trigger=trigger,
             elapsed_seconds=3600.0,
-            memories_decayed=0,
             edges_pruned=0,
             dream_id=None,
             dream_gated_reason="not_due",
@@ -235,7 +235,6 @@ def test_compact_cli_alarm_emits_banner_above_engine_status(
         return HeartbeatResult(
             trigger=trigger,
             elapsed_seconds=3600.0,
-            memories_decayed=0,
             edges_pruned=0,
             dream_id=None,
             dream_gated_reason="not_due",

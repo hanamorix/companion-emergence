@@ -346,7 +346,7 @@ class Memory:
         last_accessed_at: tz-aware UTC datetime of most recent read, or None.
         active: F22 deactivation flag. Inactive memories are excluded from
             default queries but remain in the database (reversible).
-        protected: excluded from decay/consolidation.
+        protected: reserved. It is stored and loaded, but no code acts on it now that the heartbeat's decay pass is gone.
         metadata: free-form dict for fields not modelled as first-class
             attributes — absorbs OG-only fields (source_date, supersedes,
             etc.) during migration without proliferating the dataclass.
@@ -3107,41 +3107,6 @@ class MemoryStore:
         if fold and "emotions" in fields:
             self._notify_assigned(before, fields["emotions"])
 
-    def update_emotions_batch(self, rows: Sequence[tuple[str, dict[str, float]]]) -> None:
-        """Write a batch of emotions-only updates in ONE transaction (C10(b),
-        S17/S45): the heartbeat's batched decay pass, not the per-row
-        ``update(emotions=...)`` path (which commits per call).
-
-        Same column semantics as ``update(emotions=...)``: ``emotions_json``
-        replaced, ``peak_emotion_intensity`` raised via ``MAX(...)`` — never
-        lowered by decay (store.py:2197-2203). No embedding/content column is
-        touched (that branch of ``update`` only fires when ``content`` is
-        among the updated fields, which is never true here) — nothing new is
-        added to the row (I2/I8), and ``PRAGMA table_info(memories)`` is
-        unaffected (no schema change).
-
-        Every ``execute`` below runs before the single trailing ``commit()``,
-        so the whole batch is exactly one transaction (sqlite3's default
-        deferred-transaction behavior: an implicit BEGIN on the first write,
-        held open until this commit) — never one transaction per row. Callers
-        are responsible for pre-filtering to rows whose emotions actually
-        changed (S18); this method does not re-check and will happily rewrite
-        an unchanged row if asked to.
-
-        No-op (no transaction opened, no commit) when ``rows`` is empty.
-        """
-        if not rows:
-            return
-        with self._rolls_back_on_error():
-            for memory_id, emotions in rows:
-                new_max = max((float(v) for v in emotions.values()), default=0.0)
-                self._conn.execute(
-                    "UPDATE memories SET emotions_json = ?, "
-                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-                    (_json_column(emotions), new_max, memory_id),
-                )
-            self._conn.commit()
-
     def refresh_faded_emotions(
         self, memory_id: str, emotions: dict[str, float], created_at: datetime
     ) -> None:
@@ -3823,52 +3788,6 @@ class MemoryStore:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
-        return [_row_to_memory(row) for row in rows]
-
-    def list_active_since(
-        self, cursor: tuple[str, str] | None, *, limit: int
-    ) -> list[Memory]:
-        """Return up to `limit` active memories strictly after `cursor`,
-        ordered ASCENDING by (created_at, id) (oldest-of-the-remainder
-        first).
-
-        `cursor` is `(created_at_iso, id)` of the last row already
-        processed, or `None` to start from the beginning of history. Uses a
-        composite keyset comparison — `created_at > ts OR (created_at = ts
-        AND id > id)` — rather than filtering on `created_at` alone, so that
-        multiple rows sharing an IDENTICAL `created_at` (common after a bulk
-        migrator import — see `brain/migrator/emergence_kit.py` — since
-        `brain/migrator/transform.py` derives `created_at` from the source
-        export's own timestamp string) are still individually reachable: a
-        strict `created_at > ts` filter would make every row but the last
-        one at a shared timestamp permanently invisible to a caller that
-        pins its cursor at that timestamp (the embedding backfill's cursor
-        used to; it now walks rowid, see `list_unembedded_since`). `id` is a
-        UUID4 string (TEXT PRIMARY KEY); the comparison is a plain
-        lexicographic tiebreak, not creation order — it only needs to be a
-        stable TOTAL order so no row at a shared timestamp is skipped or
-        revisited, not a meaningful one. A bounded, cursor-paged sibling of
-        `list_active()` for a caller that walks the WHOLE corpus a little at
-        a time across many calls rather than loading it all at once — same
-        `active = 1` filter as `list_active()`. See `list_unembedded_since`
-        below for the embedding backfill's own backlog query (F1 #259
-        increment 3), which walks insertion order instead.
-        """
-        if cursor is None:
-            sql = (
-                "SELECT * FROM memories WHERE active = 1 "
-                "ORDER BY created_at ASC, id ASC LIMIT ?"
-            )
-            params: list[Any] = [limit]
-        else:
-            cursor_ts, cursor_id = cursor
-            sql = (
-                "SELECT * FROM memories WHERE active = 1 AND "
-                "(created_at > ? OR (created_at = ? AND id > ?)) "
-                "ORDER BY created_at ASC, id ASC LIMIT ?"
-            )
-            params = [cursor_ts, cursor_ts, cursor_id, limit]
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 

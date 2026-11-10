@@ -186,17 +186,6 @@ SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S: float = 0.1
 # weekly tick applies it.
 JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
 
-# --- heartbeat decay batch time budget (S24, S45, S47) ---------------------
-# Caps how long a single heartbeat decay batch (one `memories.db` write
-# transaction, `HeartbeatEngine._apply_emotion_decay`) may run before it
-# commits and the heartbeat saves its resume cursor, so a decay pass over a
-# large corpus never holds the write lock for longer than about this many
-# seconds at a stretch (S48/S58's busy-timeout sizing assumes this bound).
-# Checked after each row, not each batch (S45). ~2,500 rows/batch at the
-# measured 0.4 ms/row in-txn rate (2-plan.md §5.2, F-bob20k). A batch may
-# also end earlier if the rows run out.
-HEARTBEAT_DECAY_BATCH_BUDGET_S: float = 1.0
-
 # --- pass-2 `--no-bridge` exit-drain time budget (S80) ---------------------
 # Caps how long `nell chat --no-bridge`'s exit-drain (pass2_queue.py's
 # `drain_all_locked`, called with no `should_pause` — there is no later lull

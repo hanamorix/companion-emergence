@@ -2032,13 +2032,15 @@ def test_the_hooks_run_after_the_commit_and_after_the_reembed(
 # --- C5b: methods that stay silent ---------------------------------------------------------------
 
 
-def test_update_emotions_batch_and_set_active_clear_snapshot_fire_no_hook(
+@pytest.mark.no_base_failure(
+    reason="the retained half of a test whose other half (update_emotions_batch) was removed with the old decay pass; set_active_clear_snapshot was already silent on base"
+)
+def test_set_active_clear_snapshot_fires_no_hook(
     tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     probe = _Probe(monkeypatch)
     probe.wrap(engine_module, "engine_for")
     mem = _row_without_emotions(hook_store)
-    hook_store.update_emotions_batch([(mem.id, {"joy": 3.0})])
     hook_store.set_active_clear_snapshot(mem.id)
     assert not engine_files.queue_path(tmp_path).exists() and probe.n("engine_for") == 0
     other = _row_without_emotions(hook_store)

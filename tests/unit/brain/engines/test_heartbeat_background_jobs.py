@@ -2,9 +2,7 @@
 `background_jobs` for the duration of a real tick (spec §6, S15/S23/S38;
 criterion C11(a)).
 
-Kept in its own file (not test_heartbeat_decay_batching.py) so this
-increment's build doesn't touch a file another concurrent builder in this
-worktree may have in-flight changes to.
+Kept in its own file, apart from test_heartbeat.py.
 """
 
 from __future__ import annotations
@@ -70,25 +68,25 @@ def test_heartbeat_is_published_during_a_real_tick_and_cleared_after(
         store.create(m)
         engine = _engine(tmp_path, store, hebbian)
 
-        # First-ever tick just initializes state and defers work (no decay
-        # call) — not the case under test, run it out of the way first.
+        # First-ever tick just initializes state and defers work (no Hebbian
+        # decay call) — not the case under test, run it out of the way first.
         assert background_jobs.snapshot() == []
         engine.run_tick(trigger="background")
         assert background_jobs.snapshot() == [], "first-ever (deferred) tick must not publish"
 
         seen_during: list[list[str]] = []
-        real_apply = HeartbeatEngine._apply_emotion_decay
+        real_apply = HeartbeatEngine._apply_hebbian_decay_and_gc
 
         def _spy(self, *args, **kwargs):
             seen_during.append(background_jobs.snapshot())
             return real_apply(self, *args, **kwargs)
 
-        monkeypatch.setattr(HeartbeatEngine, "_apply_emotion_decay", _spy)
+        monkeypatch.setattr(HeartbeatEngine, "_apply_hebbian_decay_and_gc", _spy)
 
         result = engine.run_tick(trigger="background")
 
         assert result.initialized is False, "this must be the real (non-deferred) tick"
-        assert seen_during == [["heartbeat"]], "must be published for the decay call itself"
+        assert seen_during == [["heartbeat"]], "must be published for the tick's first work call"
         assert background_jobs.snapshot() == [], "must clear once run_tick returns"
     finally:
         store.close()
@@ -100,7 +98,7 @@ def test_heartbeat_locked_out_by_another_pass_is_not_published(
 ) -> None:
     """C30's cross-process guard: a pass that loses the lock returns
     immediately (skipped_reason="heartbeat_locked") without ever reaching
-    the decay call — must never appear in the registry."""
+    any work — must never appear in the registry."""
     from brain.utils.file_lock import file_lock
 
     db = tmp_path / "memories.db"

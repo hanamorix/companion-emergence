@@ -5,13 +5,13 @@ run_folded() is a synchronous loop running two cadences:
   * every ``tick_interval_s`` (default: the ``embedding_backfill.tick_interval_seconds``
     setting, 60s): close stale sessions
   * every ``heartbeat_interval_s`` (default 900s = 15min): fire a
-    heartbeat tick — memory decay, dream gate, reflex, growth, research
+    heartbeat tick — Hebbian decay, dream gate, reflex, growth, research
 
 The heartbeat cadence keeps the autonomous brain alive while the user
 is away. Without it, dreams / reflex / growth / research only fire when
-the user manually runs ``nell heartbeat``, and memory decay never runs
+the user manually runs ``nell heartbeat``, and the Hebbian decay never runs
 in the background. The heartbeat engine has its own internal cadence
-gates (e.g. memory decay every N hours, dreams every M hours) so
+gates (e.g. dreams every M hours) so
 calling ``run_tick`` every 15 min is mostly cheap — only the
 gate-passes do real work.
 
@@ -2128,7 +2128,6 @@ def _run_heartbeat_tick(
         {
             "type": "heartbeat_tick",
             "trigger": "background",
-            "memories_decayed": result.memories_decayed,
             "edges_pruned": result.edges_pruned,
             "dream_id": result.dream_id,
             "reflex_fired": list(result.reflex_fired),

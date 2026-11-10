@@ -1093,7 +1093,6 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     elif args.dry_run:
         print("Heartbeat dry-run — no writes.")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
-        print(f"  would decay: {result.memories_decayed} memories")
         print(f"  would prune: {result.edges_pruned} edges")
         # `or "gated"` defends against any future engine refactor that could
         # leave dream_gated_reason=None — prevents literal "dream: None" output.
@@ -1113,7 +1112,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
         print(f"Heartbeat tick complete ({args.trigger}).")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
-        print(f"  decayed: {result.memories_decayed} memories, pruned {result.edges_pruned} edges")
+        print(f"  pruned {result.edges_pruned} edges")
 
         # Dream: show fires + interesting gates. Suppress "not_due" by default.
         if result.dream_id:
