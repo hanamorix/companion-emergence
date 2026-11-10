@@ -2,8 +2,8 @@
 
 Everything here works on in-memory state and takes the time as an argument: no files, no lock, no clock, no memory
 store. The engine module (Engine 0 and later) orchestrates; this file is what its numbers come from. The JSON form
-of `EngineState`, the queue, the drain and the rebuild belong to the later slices. Callers pass names already resolved
-(`resolve_emotions`): the fold functions do not canonicalise.
+of `EngineState` and the queue are in `engine_files.py`; the drain and the direct apply are in `engine.py`, the replay in
+`engine_rebuild.py`. Callers pass names already resolved (`resolve_emotions`): the fold functions do not canonicalise.
 
 What lives here:
 
@@ -16,6 +16,8 @@ What lives here:
   day, the day's snapshot, and the skip over whole days the app was off.
 * `apply_climax_reset`, `fade`, `counted_kind`, `source_modifier`, `resolve_emotions`.
 * `run_tracker` and `shift_for`: which feelings have shifted, and which way, worked out from the snapshot.
+* `feels_high_from`: the one rule for "this feeling is high" (never below an absolute floor; above it, the shift reads
+  stronger, or the short average is in the upper half of its own 30-day range) that `engine.feels_high` answers by.
 
 All constants are read as `dev_constants.NAME` at call time. Times are aware datetimes (UTC); a "day" is the machine's
 local calendar day (`day_of`), written `YYYY-MM-DD`.
@@ -26,7 +28,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, NamedTuple, get_args
 
@@ -34,6 +36,7 @@ from brain import dev_constants
 from brain.emotion.vocabulary import canonical_name
 from brain.initiate.schemas import StateName
 from brain.memory import memory_utils
+from brain.utils.log_throttle import warn_throttled
 from brain.utils.memory import is_conversation_derived
 from brain.utils.time import to_local
 
@@ -112,19 +115,21 @@ class EmotionState:
 class EngineState:
     """Everything the engine keeps about one persona's emotions, in memory.
 
-    `last_update` is the time up to which the weights have been aged; `active_day` is the open day; `oldest_entry_at` is the
-    time of the oldest entry folded (never set by a quiet-day zero); `persona_start_at` is the creation time of the persona's
-    oldest memory, which the shift's start gate counts from (null: no memory yet, the gate is closed).
+    `last_update` is the time up to which the weights have been aged; `active_day` is the open day; `persona_start_at` is the
+    creation time of the persona's oldest memory (a future time is held to now when it is folded), which the shift's start gate
+    counts from (null: no memory yet, the gate is closed). `queue_line` is the
+    number of lines of the queue file the engine has already folded: the next drain reads the lines after it. It is saved
+    with the state so that the fold and the position reach the disk in one write.
     """
 
     saved_at: datetime | None = None
     reset_at: datetime | None = None
     last_update: datetime | None = None
     active_day: str | None = None
-    oldest_entry_at: datetime | None = None
     persona_start_at: datetime | None = None
     repeats: dict[str, RepeatEntry] = field(default_factory=dict)
     emotions: dict[str, EmotionState] = field(default_factory=dict)
+    queue_line: int = 0
 
 
 @dataclass(frozen=True)
@@ -134,8 +139,9 @@ class Event:
     kind "commit": a counted memory was committed (`at` is its creation time, `emotions` its faded values, `climax` its
     stored climax). "assigned": an existing counted memory got its feelings later (`at` is the row's creation time, as for a
     commit, not the time of the assignment). "showing": a counted memory was shown in full. "change": signed amounts to add to
-    the stored averages (`source` names the caller). "start": the start-only event, queued for a committed row of a type that
-    does not count; it carries only `at`, the row's creation time, and keeps the persona's start date.
+    the stored averages (`source` names the caller). "start": the start-only event for a committed row of a type that
+    does not count (a memory's own date event, applied directly like a commit, never queued); it carries only `at`, the row's
+    creation time, and keeps the persona's start date.
 
     `modifier` is the source modifier of a commit, an assigned or a showing event. A change has no modifier (its weight is
     always 1) and a start event folds nothing, so neither reads the field.
@@ -148,6 +154,63 @@ class Event:
     modifier: float = 1.0
     climax: float = 0.0
     source: str | None = None
+
+
+def copy_state(state: EngineState) -> EngineState:
+    """A copy of `state` that shares nothing mutable with it: the checkpoint an apply step restores after a fold that raised.
+
+    The scalar fields are copied by `dataclasses.replace` (so a field added later is carried without a change here); the
+    averages, the repeat entries and each emotion's snapshot list are copied one level down. A `SnapshotDay` is an immutable
+    tuple, so the list is a shallow copy. Cheaper than `copy.deepcopy`, which an import of thousands of events would pay for
+    on every event.
+    """
+    return replace(
+        state,
+        repeats={memory_id: RepeatEntry(entry.first_at, entry.count) for memory_id, entry in state.repeats.items()},
+        emotions={
+            name: EmotionState(
+                Average(emotion.short.avg, emotion.short.weight),
+                Average(emotion.long.avg, emotion.long.weight),
+                emotion.last_entry_day,
+                list(emotion.snapshot),
+            )
+            for name, emotion in state.emotions.items()
+        },
+    )
+
+
+def restore_state(state: EngineState, checkpoint: EngineState) -> None:
+    """Put the fields of `checkpoint` (a `copy_state` result) back into `state`, in place, so every holder of `state` sees it."""
+    for item in fields(EngineState):
+        setattr(state, item.name, getattr(checkpoint, item.name))
+
+
+# What a fold step may raise for an event's own content: an ordinary skip, logged as a line. Anything else is a bug and is
+# logged with its traceback (throttled), but the event is still skipped and the others still fold.
+_SKIPPABLE = (ValueError, OverflowError, OSError, TypeError)
+
+
+def fold_guarded(state: EngineState, step: Callable[[], None], what: str, *, key: str) -> bool:
+    """Run one fold `step` on `state`; if it raises, put the state back exactly as it was, log, and return False.
+
+    `_fold` changes the averages before its last `day_of`, so a step that raises can leave a half-folded event; the apply step
+    would then save it. The state is therefore checkpointed (`copy_state`) before the step and restored on ANY exception. An
+    error of the event's own content (`_SKIPPABLE`) is an ordinary warning line; any other is logged with its traceback, once
+    per throttle interval for the same `key` (the caller puts the persona and the step in it), so a persistent bug does not
+    flood the log. `BaseException`s that are not `Exception` (an interrupt) are not caught.
+    """
+    checkpoint = copy_state(state)
+    try:
+        step()
+    except _SKIPPABLE as exc:
+        restore_state(state, checkpoint)
+        logger.warning("emotion engine: %s skipped (%s: %s)", what, type(exc).__name__, exc)
+        return False
+    except Exception as exc:
+        restore_state(state, checkpoint)
+        warn_throttled(logger, f"{key}:{type(exc).__name__}", "emotion engine: %s skipped, an unexpected %s", what, type(exc).__name__)
+        return False
+    return True
 
 
 # --- days ----------------------------------------------------------------------------------------------------------
@@ -188,12 +251,12 @@ def _fold_average(average: Average, value: float, w: float) -> None:
 
     The delta form of the weighted mean: an average fed the value it already holds does not move at all, so a steady feeling
     makes an exactly zero daily move and the shift rule needs no tolerance. A weight of 0 (an entry too old to count) folds
-    nothing.
+    nothing. The result is held to 0-10: the arithmetic can land one rounding step past the cap.
     """
     if w <= 0.0:
         return
     weight = average.weight + w
-    average.avg += (value - average.avg) * w / weight
+    average.avg = _hold(average.avg + (value - average.avg) * w / weight)
     average.weight = weight
 
 
@@ -238,12 +301,10 @@ def _fold(
             return  # so old that nothing of it survives: no ghost emotion
         state.emotions[emotion] = emotion_state
     if zero:
-        return  # a quiet-day zero sets neither the last-entry day nor the oldest entry
+        return  # a quiet-day zero does not set the last-entry day
     day = day_of(at)
     if emotion_state.last_entry_day is None or day > emotion_state.last_entry_day:
         emotion_state.last_entry_day = day
-    if state.oldest_entry_at is None or at < state.oldest_entry_at:
-        state.oldest_entry_at = at
 
 
 def fold_entry(
@@ -259,8 +320,8 @@ def fold_entry(
 
     An entry at or after `last_update` ages all weights to its time and becomes the new `last_update`; an earlier one is
     pre-aged and ages nothing else. An entry that is not a quiet-day zero (even one whose value is 0) sets the emotion's last-entry
-    day (the later of the old and the entry's day) and the state's oldest entry (the earlier). `zero=True` is a quiet-day zero: it goes only to an emotion that
-    already has an average and sets neither. The caller holds a future `at` to now (`fold_event` does).
+    day (the later of the old and the entry's day). `zero=True` is a quiet-day zero: it goes only to an emotion that
+    already has an average and does not set the last-entry day. The caller holds a future `at` to now (`fold_event` does).
     """
     if not math.isfinite(value):
         raise ValueError(f"cannot fold a non-finite value for {emotion!r}: {value!r}")
@@ -303,7 +364,7 @@ def _repeat_factor(state: EngineState, event: Event, at: datetime, now: datetime
 def fold_event(state: EngineState, event: Event, now: datetime) -> None:
     """Apply one event to the state.
 
-    A future event time and a future `last_update` are held to `now` first. A commit, an assignment and a showing fold each
+    A future event time and a future `last_update` are held to `now` first (the persona's start date is dated at the held time too). A commit, an assignment and a showing fold each
     of the event's emotions at weight `modifier x repeat factor`; a commit then keeps the persona's start date and, when its
     stored climax is 7 or more, applies the climax reset after its own emotions are in. An event with no emotions folds
     nothing and writes or advances no repeat record; a commit or an assignment of a memory that is already a window old keeps
@@ -329,10 +390,10 @@ def fold_event(state: EngineState, event: Event, now: datetime) -> None:
         state.last_update = now
     at = min(event.at, now)
     if event.kind == "start":
-        _fold_persona_start(state, event.at)
+        _fold_persona_start(state, at)
         return
     if event.kind == "commit":
-        _fold_persona_start(state, event.at)
+        _fold_persona_start(state, at)
     if not event.emotions:
         return
     if event.kind == "change":
@@ -653,6 +714,28 @@ def shift_for(snapshot_days: Mapping[str, Sequence[SnapshotDay]], persona_start_
     return {name: _shift_of(days, persona_start_at) for name, days in snapshot_days.items()}
 
 
+def feels_high_from(short: float, shift: int, snapshot: Sequence[SnapshotDay]) -> bool:
+    """Whether a feeling is high: the one rule `engine.feels_high` (S52, S53) answers by. Change the rule here.
+
+    Never high when `short`, its short average today, is below `FEELS_HIGH_FLOOR`: the floor comes first and holds for both
+    parts below. At or above it, high when its shift reads stronger (`shift > 0`, a rising run; a falling run is not
+    "stronger"), or when `short` is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, where `lowest` and
+    `highest` are the lowest and highest short average among the feeling's days in `snapshot` (the 30-day snapshot). With
+    fewer than two snapshot days, or a flat range (`highest == lowest`), only the shift part applies. Pure: nothing is stored.
+    """
+    if short < dev_constants.FEELS_HIGH_FLOOR:
+        return False
+    if shift > 0:
+        return True
+    if len(snapshot) < 2:
+        return False
+    lowest = min(day.short for day in snapshot)
+    highest = max(day.short for day in snapshot)
+    if highest == lowest:
+        return False
+    return short >= lowest + dev_constants.FEELS_HIGH_RANGE_FRACTION * (highest - lowest)
+
+
 # --- the day close ---------------------------------------------------------------------------------------------------
 
 
@@ -666,13 +749,13 @@ def close_days(state: EngineState, t: datetime) -> None:
     snapshot day, and snapshot days 30 or more calendar days before D are dropped; then `last_update` moves past the whole
     calendar days the app was off (weights do not age across them) and `active_day` becomes `day_of(t)`.
 
-    Accepted edges (A3 E5.8, E5.13):
+    Accepted edges (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 6):
 
     * A system clock set forward and then corrected: this function closes the open day and sets `active_day` to the far-future
       day, and then day closes stop until real time reaches that day, so the shift stays frozen at its last value and, with
       no day closing, the change-log files the drain would delete pile up. The deletion half belongs to the drain (it
       anchors on the active day as it stood before its closes). The open design call, telling a corrected clock from a long
-      absence, needs a chosen number or a new rule; it is tracked in an issue filed when this slice merges.
+      absence, needs a chosen number or a new rule; it is tracked in #660.
     * An entry dated in a day that has already closed cannot undo the zero already folded for it: that day holds both the zero
       and the entry.
     """

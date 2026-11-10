@@ -555,10 +555,23 @@ def test_store_list_active_since_excludes_inactive(store: MemoryStore) -> None:
     assert [m.id for m in results] == [active.id]
 
 
+def _ids(rows) -> list[str]:
+    """Memory ids of `list_unembedded_since` rows (shape-tolerant: a bare Memory or a row that carries one)."""
+    return [getattr(row, "memory", row).id for row in rows]
+
+
+def _contents(rows) -> list[str]:
+    return [getattr(row, "memory", row).content for row in rows]
+
+
+def _rowid(store: MemoryStore, memory_id: str) -> int:
+    return store._conn.execute("SELECT rowid FROM memories WHERE id = ?", (memory_id,)).fetchone()[0]
+
+
 # ---------------------------------------------------------------------------
 # list_unembedded_since — the embedding backfill's own backlog query (F1
-# #259 increment 3). Same keyset-cursor shape as list_active_since above,
-# scoped to `embedding IS NULL`.
+# #259 increment 3). Walks rows by SQLite rowid (insertion order; sfa S31(b)),
+# scoped to the backlog predicate (`embedding IS NULL` or a stale model).
 # ---------------------------------------------------------------------------
 
 
@@ -586,7 +599,7 @@ def test_store_list_unembedded_since_excludes_already_embedded_rows(
         None, limit=10, current_model_id="some-model", min_chars=0
     )
 
-    assert [m.id for m in results] == [unembedded.id]
+    assert _ids(results) == [unembedded.id]
 
 
 def test_store_list_unembedded_since_includes_stale_model_rows(
@@ -619,7 +632,7 @@ def test_store_list_unembedded_since_includes_stale_model_rows(
     )
 
     # The stale-model row IS in the backlog; the current-model row is not.
-    assert [m.id for m in results] == [stale.id]
+    assert _ids(results) == [stale.id]
 
 
 def test_store_list_unembedded_since_excludes_short_rows(
@@ -639,7 +652,7 @@ def test_store_list_unembedded_since_excludes_short_rows(
         None, limit=10, current_model_id="some-model", min_chars=20
     )
 
-    assert [m.id for m in results] == [long_enough.id]
+    assert _ids(results) == [long_enough.id]
 
 
 def test_store_list_unembedded_since_none_cursor_returns_from_beginning(
@@ -657,13 +670,13 @@ def test_store_list_unembedded_since_none_cursor_returns_from_beginning(
         None, limit=10, current_model_id="some-model", min_chars=0
     )
 
-    assert [m.id for m in results] == [older.id, newer.id]
+    assert _ids(results) == [older.id, newer.id]
 
 
 def test_store_list_unembedded_since_excludes_at_or_before_cursor(
     store: MemoryStore,
 ) -> None:
-    """Only rows strictly AFTER the (created_at, id) cursor are returned."""
+    """Only rows strictly AFTER the rowid cursor are returned."""
     a = _mem("a")
     a.created_at = datetime(2020, 1, 1, tzinfo=UTC)
     b = _mem("b")
@@ -675,33 +688,62 @@ def test_store_list_unembedded_since_excludes_at_or_before_cursor(
     store.create(c)
 
     results = store.list_unembedded_since(
-        (b.created_at.isoformat(), b.id), limit=10, current_model_id="some-model", min_chars=0
+        _rowid(store, b.id), limit=10, current_model_id="some-model", min_chars=0
     )
 
-    assert [m.id for m in results] == [c.id]
+    assert _ids(results) == [c.id]
 
 
-def test_store_list_unembedded_since_tie_inclusive_on_shared_created_at(
+def test_store_list_unembedded_since_tie_on_shared_created_at_is_walked_by_rowid(
     store: MemoryStore,
 ) -> None:
-    """A cursor pinned at (ts, id) of one row must still return ANOTHER row
-    sharing that EXACT created_at, provided its id sorts after the cursor's
-    — same tied-timestamp regression coverage as list_active_since."""
+    """Two rows with ONE created_at (a bulk import's shape) are told apart by their rowid: a cursor between them returns
+    only the later-inserted one, whatever their ids sort like."""
     shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
     first = _mem("first")
     first.created_at = shared_ts
     second = _mem("second")
     second.created_at = shared_ts
-    first.id = "aaaa0000-0000-0000-0000-000000000000"
-    second.id = "bbbb0000-0000-0000-0000-000000000000"
+    first.id = "bbbb0000-0000-0000-0000-000000000000"  # sorts AFTER the second's id: the walk is not by id
+    second.id = "aaaa0000-0000-0000-0000-000000000000"
     store.create(first)
     store.create(second)
 
     results = store.list_unembedded_since(
-        (shared_ts.isoformat(), first.id), limit=10, current_model_id="some-model", min_chars=0
+        _rowid(store, first.id), limit=10, current_model_id="some-model", min_chars=0
     )
 
-    assert [m.id for m in results] == [second.id]
+    assert _ids(results) == [second.id]
+
+
+def test_store_list_unembedded_since_walks_insertion_order_not_created_at(store: MemoryStore) -> None:
+    """The backfill's cursor walks rows in the order they were inserted: a row refreshed to a later (or earlier) created_at
+    keeps its place in the walk (sfa S31(b))."""
+    inserted_first = _mem("inserted first")
+    inserted_first.created_at = datetime(2030, 1, 3, tzinfo=UTC)  # the LATEST created_at
+    inserted_second = _mem("inserted second")
+    inserted_second.created_at = datetime(2030, 1, 1, tzinfo=UTC)
+    inserted_third = _mem("inserted third")
+    inserted_third.created_at = datetime(2030, 1, 2, tzinfo=UTC)
+    for memory in (inserted_first, inserted_second, inserted_third):
+        store.create(memory)
+
+    rows = store.list_unembedded_since(None, limit=10, current_model_id="some-model", min_chars=0)
+
+    assert _ids(rows) == [inserted_first.id, inserted_second.id, inserted_third.id]
+    after_first = store.list_unembedded_since(
+        _rowid(store, inserted_first.id), limit=10, current_model_id="some-model", min_chars=0
+    )
+    assert _ids(after_first) == [inserted_second.id, inserted_third.id]
+
+
+def test_store_list_unembedded_since_rows_carry_the_sqlite_rowid(store: MemoryStore) -> None:
+    for text in ("one", "two", "three"):
+        store.create(_mem(text))
+    rows = store.list_unembedded_since(None, limit=10, current_model_id="some-model", min_chars=0)
+    assert [row.rowid for row in rows] == [_rowid(store, row.memory.id) for row in rows]
+    assert [row.rowid for row in rows] == sorted(row.rowid for row in rows)
+    assert all(type(row.rowid) is int for row in rows)
 
 
 def test_store_list_unembedded_since_respects_limit(store: MemoryStore) -> None:
@@ -716,7 +758,7 @@ def test_store_list_unembedded_since_respects_limit(store: MemoryStore) -> None:
     )
 
     assert len(results) == 2
-    assert [m.content for m in results] == ["item-0", "item-1"]
+    assert _contents(results) == ["item-0", "item-1"]
 
 
 def test_store_list_unembedded_since_excludes_inactive(store: MemoryStore) -> None:
@@ -732,7 +774,7 @@ def test_store_list_unembedded_since_excludes_inactive(store: MemoryStore) -> No
         None, limit=10, current_model_id="some-model", min_chars=0
     )
 
-    assert [m.id for m in results] == [active.id]
+    assert _ids(results) == [active.id]
 
 
 def test_store_list_unembedded_since_row_reappears_after_going_null_again(
@@ -768,7 +810,7 @@ def test_store_list_unembedded_since_row_reappears_after_going_null_again(
     results = store.list_unembedded_since(
         None, limit=10, current_model_id="some-model", min_chars=0
     )
-    assert [row.id for row in results] == [m.id]
+    assert _ids(results) == [m.id]
 
 
 # ---------------------------------------------------------------------------
@@ -811,12 +853,9 @@ def test_count_unembedded_matches_list_unembedded_since_predicate(
     # NOT `embedded_current` (matches), `too_short` (< min_chars), or
     # `inactive` (deactivated).
     assert count == 2
-    matching_ids = {
-        m.id
-        for m in store.list_unembedded_since(
-            None, limit=10, current_model_id="current-model", min_chars=20
-        )
-    }
+    matching_ids = set(
+        _ids(store.list_unembedded_since(None, limit=10, current_model_id="current-model", min_chars=20))
+    )
     assert matching_ids == {unembedded.id, embedded_stale.id}
 
 
@@ -861,12 +900,12 @@ def test_count_unembedded_ignores_any_persisted_backfill_cursor(
     # would no longer see it — count_unembedded is unaffected by any such
     # cursor because it never takes one.
     paged = store.list_unembedded_since(
-        (older.created_at.isoformat(), older.id),
+        _rowid(store, older.id),
         limit=10,
         current_model_id="some-model",
         min_chars=0,
     )
-    assert [row.id for row in paged] == [newer.id]
+    assert _ids(paged) == [newer.id]
 
     assert store.count_unembedded(current_model_id="some-model", min_chars=0) == 2
 

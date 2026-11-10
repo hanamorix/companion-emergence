@@ -45,7 +45,7 @@ def _age_memory(store, mem_id, days):
 @pytest.mark.xfail(reason=_TRACE_LIFECYCLE_DEFERRED, strict=True)
 def test_unrevisited_trace_fades_then_is_lost(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
-    mem_id = write_trace_memory(store, "an idle unremarkable drift")
+    mem_id = write_trace_memory(store, "an idle unremarkable drift", feed_digest="a digest", persona_dir=None)
     store.update(mem_id, emotions={})  # strip emotion seed → low salience
     _age_memory(store, mem_id, days=40)
     store.close()
@@ -68,7 +68,7 @@ def test_unrevisited_trace_fades_then_is_lost(tmp_path):
 @pytest.mark.xfail(reason=_TRACE_LIFECYCLE_DEFERRED, strict=True)
 def test_recalled_trace_stays(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
-    mem_id = write_trace_memory(store, "a thought she keeps returning to")
+    mem_id = write_trace_memory(store, "a thought she keeps returning to", feed_digest="a digest", persona_dir=None)
     _age_memory(store, mem_id, days=40)
     # Simulate repeated recall — bumps recall_count well above the salience floor.
     for _ in range(12):

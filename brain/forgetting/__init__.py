@@ -204,6 +204,9 @@ def run_pass(
                     break
             memories = memories[resume_idx:]
 
+        # One engine for the whole pass (None for an in-memory store: stored values).
+        emotion_engine = store.emotion_engine()
+
         for memory in memories:
             memory_id = memory.id
             if policy.is_exempt(
@@ -230,6 +233,7 @@ def run_pass(
                 hebbian=hebbian,
                 felt_time_state=felt_state,
                 soul_linked_ids=soul_linked,
+                emotion_engine=emotion_engine,
             )
             prev_low = counters.get(memory_id, 0)
             # Update consecutive_low_passes for this pass.
@@ -259,6 +263,7 @@ def run_pass(
                     hebbian=hebbian,
                     felt_time_state=felt_state,
                     soul_linked_ids=soul_linked,
+                    emotion_engine=emotion_engine,
                 )
                 neighbors_at_drop = hebbian.neighbors(memory_id)
                 # Graveyard write BEFORE hard_delete (spec §4 order), now also

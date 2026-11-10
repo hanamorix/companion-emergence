@@ -112,6 +112,28 @@ def test_run_tags_emotion_less_memories(tmp_path):
     assert updated.emotions == {"loneliness": 7.0}
 
 
+def test_backfilled_emotions_reach_the_engine_hook(tmp_path, emotion_engine_stub):
+    """A backfilled row is reported to the emotion engine once, with the emotions the tagger gave it.
+
+    The backfill writes through `MemoryStore.update`, whose hook is what tells the engine; a write that passed
+    `fold=False` would leave these rows out of the engine silently.
+    """
+    from brain.ingest.emotion_backfill import run_emotion_backfill
+
+    store = _make_store(tmp_path)
+    m = _create_memory(store, has_emotions=False)
+    store.close()
+    emotion_engine_stub.recorded_calls.clear()  # the create above reported the row as committed
+
+    run_emotion_backfill(tmp_path, tagger_fn=_stub_tagger, cap=50, delay_s=0)
+
+    assert len(emotion_engine_stub.recorded_calls) == 1
+    name, reported = emotion_engine_stub.recorded_calls[0]
+    assert name == "on_emotions_assigned"
+    assert reported.id == m.id
+    assert reported.emotions == {"loneliness": 7.0}
+
+
 def test_run_does_not_retag_emotion_bearing_memories(tmp_path):
     """Memories that already have emotions must not be overwritten."""
     from brain.ingest.emotion_backfill import run_emotion_backfill
@@ -612,3 +634,11 @@ def test_run_that_loses_the_slot_after_tagging_some_is_not_marked_complete(tmp_p
     saved = emotion_backfill._load_state(tmp_path)
     assert saved is not None and saved.status != "complete"
     assert should_run_emotion_backfill(tmp_path)
+
+
+def test_normalize_drops_nan_and_inf_and_holds_to_ten():
+    """Emotion rework B1 PR 6: a tagger reply of NaN or inf is not a feeling; 12 is held to 10, 3 is kept."""
+    from brain.ingest.emotion_backfill import _normalize
+
+    raw = {"joy": float("nan"), "grief": float("inf"), "calm": "-inf", "love": 12, "awe": 3}
+    assert _normalize(raw, frozenset()) == {"love": 10.0, "awe": 3.0}

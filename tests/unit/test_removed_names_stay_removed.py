@@ -576,11 +576,47 @@ REMOVED: tuple[Removed, ...] = (
         scope=("brain/update/overlay.py",),
     ),
     Removed(
+        names=("exists_recent_grief_touch",),
+        why="the grief touch's recent-touch check and its insert are one store call, MemoryStore.create_grief_touch_unless_recent (the race, #342); a lookup kept alone would let a caller check and write in two steps again",
+        ref="#627 emotion rework Engine 3 (issue #578; the grief-touch race #342)",
+        kind="code",
+    ),
+    Removed(
         names=("read_bytes",),
         why="file_ops.read_bytes had no production caller once read_jsonl_from streamed through open_read; the whole-file accessor is file_ops.read_bytes_stat (pathlib's Path.read_bytes is a different, attribute-call use elsewhere)",
         ref=_FILE_OPS_REF,
         kind="code",
         scope=("brain/utils/file_ops.py",),
+    ),
+    Removed(
+        names=("oldest_entry_at",),
+        why="the emotion state's oldest-entry time (and the engine's `oldest_entry_at()` stub) had no reader; dropped before any live persona's state file was written with it, so no migration is needed",
+        ref="the maintainer's decision on PR #626 (Engine 2), 2026-11-05",
+    ),
+    # --- every full open is an access (#582) ----------------------------------------------------------------------------
+    Removed(
+        names=("deliberate",),
+        why="open_memory has no deliberate parameter: every full open sets last_accessed_at and reports to the emotion engine, so no caller says whether the open was deliberate",
+        ref="#582 (draft PR #631): the access fixes",
+        kind="code",
+        scope=(
+            "brain/memory/recall_open.py",
+            "brain/tools/impls/read_full_memory.py",
+            "brain/chat/prompt.py",
+        ),
+    ),
+    # --- the readers move onto the engine (#583, Readers 1) ---------------------------------------------------------------
+    Removed(
+        names=("_compute_unnamed_pressure",),
+        why="renamed compute_unnamed_pressure: the supervisor's live self-model tick imports it, so it is public",
+        ref="#583 (draft PR #632): Readers 1",
+        kind="code",
+    ),
+    Removed(
+        names=("_emotion_engine",),
+        why="renamed MemoryStore.emotion_engine: the readers that hold a store use it, so it is public",
+        ref="#583 (draft PR #632): Readers 1",
+        kind="code",
     ),
 )
 

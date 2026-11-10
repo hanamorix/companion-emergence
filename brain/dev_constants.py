@@ -126,7 +126,7 @@ EMOTION_LOCK_WAIT_S: float = 5.0
 # The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
-EMOTION_PENDING_FILENAME: str = "emotion_pending.json"
+EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
 EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 
@@ -444,3 +444,29 @@ KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
 # per poll PER PEER. Excess is left un-acked on the relay and surfaced as a
 # degraded state; bounds local decrypt/provider work against a flooding peer.
 KINDLED_LINK_INBOUND_FLOOD_CAP = 20
+
+# --- emotion readers (B2 phase B) ----------------------------------------------
+# The prompt's mood summary (`brain.chat.prompt._build_emotion_summary`) lists this many feelings by long average,
+# highest first; None lists them all. Read at use time, inside the function.
+EMOTION_SUMMARY_COUNT: int | None = 3
+# How each listed feeling is written: "long" (name:L), "long_short" (name:L/S) or "long_difference" (name:L(D), D signed).
+EMOTION_SUMMARY_MODE: str = "long"
+# The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
+# by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
+SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
+
+# A feeling counts as high (`engine.feels_high`, the one predicate the readers that used to fire on a fixed level call) when
+# its short average today is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, taken over that feeling's
+# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high whatever its range), and either
+# way only at or above the floor in the next constant. Owner-set, 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_RANGE_FRACTION: float = 0.5
+# A feeling whose short average is below this level (0 to 10 scale) is never high, whatever its range or its shift: a feeling
+# that sits near zero all month has a tiny range, and without a floor its top half would count as "high" (a vulnerability at
+# 0.02 started a self-check). Maintainer's decision, 2026-11-05. This is a DEFAULT, proposed from the reader measurement
+# (`scripts/measure_feels_high_thresholds.py`) and set by the owner on 2026-11-05; the follow-up that makes the floor
+# self-calibrating for a mature kindled is #661. Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_FLOOR: float = 0.1
+# Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
+# `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
+# replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
+BODY_ENERGY_HIGH_COUNT: int = 6

@@ -1002,3 +1002,153 @@ def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
     _engine, result, memory = _fire_with_reply(tmp_path, reply)
     assert result.fired is not None and memory is not None
     assert _session_rows(tmp_path) == []
+
+
+# ── B2 phase B: the research gate asks the engine whether a feeling is high when it is live ──
+
+
+def _live_gate_reason(
+    tmp_path: Path,
+    stub,
+    readings: dict[str, float],
+    *,
+    stored: dict[str, float],
+    high: set[str] | None = None,
+) -> str | None:
+    from brain.emotion.engine import Reading
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    stub.live = True
+    stub.high = set(high or ())
+    stub.readings = {
+        n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()
+    }
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        if stored:
+            store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored))
+        runner = _build_engine(tmp_path, store)
+        result = runner.run_tick(
+            trigger="manual", dry_run=True, days_since_human_override=0.0, emotion_state_override=None
+        )
+    finally:
+        store.close()
+    return result.reason
+
+
+def test_live_gate_opens_on_a_feeling_the_engine_calls_high_whatever_its_value_and_the_store(
+    tmp_path: Path, emotion_engine_stub
+):
+    reason = _live_gate_reason(tmp_path, emotion_engine_stub, {"awe": 0.5}, stored={}, high={"awe"})
+    assert reason != "not_due"
+
+
+def test_live_gate_stays_closed_while_the_engine_calls_nothing_high_at_any_value(
+    tmp_path: Path, emotion_engine_stub
+):
+    reason = _live_gate_reason(
+        tmp_path, emotion_engine_stub, {"awe": 10.0, "grief": 9.0}, stored={"awe": 9.5}
+    )
+    assert reason == "not_due"
+
+
+def test_live_gate_only_asks_about_feelings_the_read_returned(tmp_path: Path, emotion_engine_stub):
+    # stored grief at 9.5 would open the gate through the old peak test; the live gate must ignore the store
+    reason = _live_gate_reason(
+        tmp_path, emotion_engine_stub, {"awe": 10.0}, stored={"grief": 9.5}, high={"grief"}
+    )
+    assert reason == "not_due"
+
+
+def test_live_gate_with_an_empty_read_is_closed(tmp_path: Path, emotion_engine_stub):
+    reason = _live_gate_reason(tmp_path, emotion_engine_stub, {}, stored={"awe": 9.5}, high={"awe"})
+    assert reason == "not_due"
+
+
+# ---- B1 PR 4: a live fire carries its own feelings and rating ----
+
+_FELT_REPLY = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8}\nENGAGEMENT: 6/10'
+
+
+def _go_live(persona_dir: Path, store: MemoryStore) -> None:
+    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    from brain.emotion import engine_files
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+
+
+def _fire_with(tmp_path: Path, store: MemoryStore, reply: str):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    provider = ScriptedProvider(['{"choice": "i1", "why": "it connects"}', reply])
+    result = _build_engine(tmp_path, store, provider=provider).run_tick(days_since_human_override=5.0)
+    memory = PendingQueue(tmp_path).read_recent("research", limit=1)[0]  # research is a gated type
+    return result, memory
+
+
+def test_live_fire_stores_feelings_and_rating(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        result, memory = _fire_with(tmp_path, store, _FELT_REPLY)
+    finally:
+        store.close()
+    assert result.fired is not None
+    assert memory.emotions == {"awe": 8.0}
+    assert memory.metadata["engagement_rating"] == 6.0
+    interests = json.loads((tmp_path / "interests.json").read_text(encoding="utf-8"))["interests"]
+    assert interests[0]["status"] == "dormant"  # the verdict still reads "close" with the felt lines after it
+
+
+def test_live_fire_with_only_the_three_markers_keeps_the_memory_and_logs(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        result, memory = _fire_with(tmp_path, store, "NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\ncontinue")
+    finally:
+        store.close()
+    assert result.fired is not None and memory.content == "m"
+    assert memory.emotions == {}
+    assert "engagement_rating" not in memory.metadata
+    rows = (tmp_path / "parse_failures.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(row)["site"] for row in rows] == ["research_felt"]
+
+
+def test_live_system_prompt_asks_for_the_felt_lines_and_off_does_not(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = _build_engine(tmp_path, store)
+        live = engine._render_system_prompt(live=True)
+        off = engine._render_system_prompt()
+    finally:
+        store.close()
+    assert 'EMOTIONS: {"<emotion name>": <0-10>}' in live and "ENGAGEMENT: <0-10>" in live
+    assert "—" not in live.replace(off, "")  # new prompt text has no em-dashes
+    assert "ENGAGEMENT" not in off
+
+
+def test_live_fire_sends_both_prompts_asking_for_the_felt_lines(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        provider = ScriptedProvider(['{"choice": "i1", "why": "it connects"}', _FELT_REPLY])
+        _build_engine(tmp_path, store, provider=provider).run_tick(days_since_human_override=5.0)
+    finally:
+        store.close()
+    prompt, system = provider.calls[1]
+    assert "ENGAGEMENT: <0-10>" in system
+    assert prompt.rstrip().endswith("Write NOTES / MEMORY / VERDICT, then EMOTIONS and ENGAGEMENT, now.")
+
+
+@pytest.mark.no_base_failure(reason="pins today's path with the switch off, which this PR must not change")
+def test_off_fire_is_unchanged_and_leaves_felt_lines_to_the_old_parser(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        result, memory = _fire_with(tmp_path, store, _FELT_REPLY)
+    finally:
+        store.close()
+    assert result.fired is not None
+    assert memory.emotions == {}
+    assert "engagement_rating" not in memory.metadata
+    assert not (tmp_path / "parse_failures.jsonl").exists()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from brain.emotion import engine
 from brain.emotion.aggregate import aggregate_state
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -18,8 +19,9 @@ def get_emotional_state(
 ) -> dict:
     """Return Nell's current emotional state.
 
-    Aggregates across all active memories using max-pool per emotion
-    (same strategy as reflex engine). Returns dominant emotion, top-5
+    The numbers are the emotion engine's short averages when the engine is live;
+    otherwise the max-pool per emotion across all active memories (same strategy
+    as reflex engine). Returns dominant emotion, top-5
     ranked list, full score map, and a human-readable summary string.
 
     Returns
@@ -30,11 +32,17 @@ def get_emotional_state(
         all       — {emotion: score, ...}
         summary   — human-readable multi-line string
     """
-    active_memories = store.list_active()
+    live_engine = engine.engine_for(persona_dir)
+    if live_engine.is_live():
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
+        # or retrying, read() returns nothing and this tool says no emotions are recorded.
+        scores: dict[str, float] = {name: r.short for name, r in live_engine.read().items()}
+    else:
+        active_memories = store.list_active()
 
-    emotional_state = aggregate_state(active_memories)
+        emotional_state = aggregate_state(active_memories)
 
-    scores: dict[str, float] = dict(emotional_state.emotions)
+        scores = dict(emotional_state.emotions)
 
     if not scores:
         return {

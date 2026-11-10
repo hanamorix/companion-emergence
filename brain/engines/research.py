@@ -18,7 +18,7 @@ from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provi
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
 from brain.engines.research_notes import append_session_notes, read_notes_tail
-from brain.engines.research_session import parse_session_output
+from brain.engines.research_session import extract_felt_lines, parse_session_output
 from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import Memory, MemoryStore
@@ -50,6 +50,9 @@ _TOPIC_OVERLAP_PROMPT_SEGMENTS = prompt_strings.register_segments(
 )
 _RENDER_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
     "engines.research.render_system_prompt_segments"
+)
+_RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE = prompt_strings.register_segments(
+    "engines.research.render_system_prompt_segments_live"
 )
 
 
@@ -195,17 +198,39 @@ class ResearchEngine:
             else days_since_human(self.store, now, persona_dir=self.interests_path.parent)
         )
         emo_state = emotion_state_override
+        high_engine = None  # the live engine, when its reading drives the emotion half of the gate
+        from brain.emotion import engine
+
+        live_engine = engine.engine_for(self.interests_path.parent)
+        # Read once, so the gate, the prompt and the stored feelings of this fire all agree.
+        live = live_engine.is_live()
         if emo_state is None:
-            from brain.emotion.aggregate import aggregate_state
+            if live:
+                high_engine = live_engine
+                from brain.emotion.state import EmotionalState
 
-            all_mems = self.store.list_active(limit=None)
-            emo_state = aggregate_state(all_mems)
+                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+                # pending or retrying, read() returns nothing and the research gate sees no high feeling.
+                # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
+                emo_state = EmotionalState(
+                    emotions={name: r.short for name, r in live_engine.read().items()}
+                )
+            else:
+                from brain.emotion.aggregate import aggregate_state
 
-        emo_peak = max(emo_state.emotions.values(), default=0.0)
+                all_mems = self.store.list_active(limit=None)
+                emo_state = aggregate_state(all_mems)
+
+        if high_engine is not None:
+            # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
+            emotion_gate = any(high_engine.feels_high(name) for name in emo_state.emotions)
+        else:
+            # Old path, and a caller-supplied `emotion_state_override` (test-only: no caller in brain/).
+            emotion_gate = max(emo_state.emotions.values(), default=0.0) >= 7.0  # research_emotion_threshold default
 
         gate_ok = (
             days_since >= 1.5  # research_days_since_human_min default
-            or emo_peak >= 7.0  # research_emotion_threshold default
+            or emotion_gate
         )
         if not gate_ok:
             return ResearchResult(
@@ -289,10 +314,29 @@ class ResearchEngine:
             web_used = len(web_results) > 0
 
             prompt = self._render_prompt(
-                winner, why, notes_tail, memory_context, web_results, emo_state
+                winner, why, notes_tail, memory_context, web_results, emo_state, live=live
             )
-            raw = self.provider.generate(prompt, system=self._render_system_prompt())
-            session = parse_session_output(raw)
+            raw = self.provider.generate(prompt, system=self._render_system_prompt(live=live))
+            felt: dict[str, float] | None = None
+            rating: float | None = None
+            reply = raw
+            if live:
+                reply, felt, rating = extract_felt_lines(raw)
+                if felt is None or rating is None:
+                    # A missing or broken felt line never fails the fire: the memory is still written.
+                    record_parse_failure(
+                        self.interests_path.parent,
+                        site="research_felt",
+                        raw=raw,
+                        error="no readable "
+                        + " or ".join(
+                            name
+                            for name, value in (("EMOTIONS", felt), ("ENGAGEMENT", rating))
+                            if value is None
+                        )
+                        + " line at the end of the reply",
+                    )
+            session = parse_session_output(reply)
 
             # A reply with notes but no memory or no verdict is a layout the parser did not read (the prompt asks for
             # all three every time): the memory, the close and the spawned topics of the fire are lost without a trace
@@ -339,6 +383,8 @@ class ResearchEngine:
                         trigger=trigger,
                         provider_name=self.provider.name(),
                         searcher_name=self.searcher.name() if web_used else None,
+                        emotions=felt or {},
+                        engagement_rating=rating,
                     )
                     from brain.memory.pending import route_write
 
@@ -557,8 +603,8 @@ class ResearchEngine:
             or "(no prior memories on this topic)"
         )
 
-    def _render_system_prompt(self) -> str:
-        seg = _RENDER_SYSTEM_PROMPT_SEGMENTS
+    def _render_system_prompt(self, *, live: bool = False) -> str:
+        seg = _RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE if live else _RENDER_SYSTEM_PROMPT_SEGMENTS
         return seg[0] + self.persona_name + seg[1] + self.persona_name + seg[2]
 
     def _render_prompt(
@@ -569,6 +615,8 @@ class ResearchEngine:
         memory_context: str,
         web_results: list,
         emo_state,
+        *,
+        live: bool = False,
     ) -> str:
         emo_summary = format_emotion_summary(emo_state.emotions) or "(neutral)"
         web_section = ""
@@ -578,6 +626,12 @@ class ResearchEngine:
             )
             web_section = f"\nFresh findings from the web today:\n{excerpts}\n"
         why_line = f"Why today: {why}\n" if why else ""
+        # The last line has to agree with the system prompt, or the two instructions contradict each other.
+        last_line = (
+            "Write NOTES / MEMORY / VERDICT, then EMOTIONS and ENGAGEMENT, now."
+            if live
+            else "Write NOTES / MEMORY / VERDICT now."
+        )
         return (
             f"Topic: {interest.topic}\n"
             f"{why_line}"
@@ -586,7 +640,7 @@ class ResearchEngine:
             f"Your notes so far:\n{notes_tail or '(first session on this topic)'}\n\n"
             f"What your own memories say:\n{memory_context}\n"
             f"{web_section}\n"
-            "Write NOTES / MEMORY / VERDICT now."
+            f"{last_line}"
         )
 
 
@@ -605,33 +659,38 @@ def build_research_memory(
     trigger: str,
     provider_name: str | None,
     searcher_name: str | None,
+    emotions: dict[str, float] | None = None,
+    engagement_rating: float | None = None,
 ) -> Memory:
     """Factory helper — Memory.create_new with research-specific metadata shape.
 
     Shared by the live fire and by the recovery of fires whose reply was not split (brain/engines/research_recovery.py),
     so both build the same fields.
     """
+    metadata = {
+        "schema_version": RESEARCH_SCHEMA_VERSION,
+        "interest_id": interest_id,
+        "interest_topic": interest_topic,
+        "scope": scope,
+        "web_used": web_used,
+        "web_result_count": web_result_count,
+        "web_urls": web_urls,
+        "triggered_by": trigger,
+        "provider": provider_name,
+        "searcher": searcher_name,
+    }
+    if engagement_rating is not None:
+        metadata["engagement_rating"] = engagement_rating
     return Memory.create_new(
         content=content,
         memory_type="research",
         domain="us",
-        emotions={},
+        emotions=dict(emotions or {}),
         # P3 retention rework, Change 1: research is durable knowledge the
         # companion deliberately sought, not the ~0.0 the emotions={} default
         # would otherwise produce.
         importance=5.0,
-        metadata={
-            "schema_version": RESEARCH_SCHEMA_VERSION,
-            "interest_id": interest_id,
-            "interest_topic": interest_topic,
-            "scope": scope,
-            "web_used": web_used,
-            "web_result_count": web_result_count,
-            "web_urls": web_urls,
-            "triggered_by": trigger,
-            "provider": provider_name,
-            "searcher": searcher_name,
-        },
+        metadata=metadata,
     )
 
 
