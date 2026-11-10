@@ -110,30 +110,6 @@ def test_body_block_renders_with_no_emotions(store, soul_store, daemon_state, pe
     assert "energy: 8" in msg
 
 
-def test_body_block_climax_reset_visible(store, soul_store, daemon_state, persona_dir):
-    """Inviolate property #1 — climax memory at 8 must produce post-reset
-    arousal in render (not 8). After reset: arousal=1.6 (clamped per body block to 1.6 → '1.6'),
-    comfort_seeking and rest_need both 2.0."""
-    _seed_emotion_memory(store, {"climax": 8.0, "arousal": 8.0, "desire": 8.0})
-    msg = build_system_message(
-        persona_dir,
-        voice_md="",
-        daemon_state=daemon_state,
-        soul_store=soul_store,
-        store=store,
-    )
-    body_section = msg[msg.find("── body ──") : msg.find("── recent journal")]
-    # comfort_seeking and rest_need should both be present at 2.0 post-reset
-    assert "comfort_seeking 2" in body_section
-    assert "rest_need 2" in body_section
-    # Original arousal 8 should NOT appear in body emotions row
-    if "body emotions:" in body_section:
-        body_emotions_line = [
-            line for line in body_section.split("\n") if line.startswith("body emotions:")
-        ][0]
-        assert "arousal 8" not in body_emotions_line
-
-
 def test_body_block_degrades_gracefully_on_compute_failure(
     store,
     soul_store,
@@ -153,7 +129,7 @@ def test_body_block_degrades_gracefully_on_compute_failure(
         raise RuntimeError("simulated body computation failure")
 
     monkeypatch.setattr(
-        "brain.body.state.compute_body_state",
+        "brain.body.state.body_state_from_short",
         boom,
         raising=True,
     )
