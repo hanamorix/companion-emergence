@@ -16,6 +16,8 @@ did before extended markers existed.
 """
 from __future__ import annotations
 
+import json
+import math
 import re
 from bisect import bisect_left
 from dataclasses import dataclass
@@ -32,6 +34,13 @@ _EXT_UPPER = re.compile(
 )
 _ORDER = ("NOTES", "MEMORY", "VERDICT")
 _SPAWN_CAP = 2
+# A felt line (emotion rework B1): a name, optionally in bold or underscores, with the colon inside or outside them.
+_FELT_LINE = re.compile(
+    r"^(?:\*\*|__)?(?P<name>EMOTIONS|ENGAGEMENT)(?:\*\*|__)?:(?:\*\*|__)?[ \t]*(?P<value>.*)$",
+    re.IGNORECASE | re.ASCII,
+)
+_LEADING_NUMBER = re.compile(r"[+-]?\d+(?:\.\d+)?")
+_FELT_MAX = 10.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,65 @@ def _find_markers(raw: str) -> list[tuple[str, int, int]]:
         markers.append((name, start, body_start))
     markers.sort(key=lambda marker: marker[1])
     return markers
+
+
+def extract_felt_lines(raw: str) -> tuple[str, dict[str, float] | None, float | None]:
+    """Split the EMOTIONS and ENGAGEMENT lines off the end of a research reply: ``(rest, emotions, rating)``.
+
+    Only one-line markers at the very end count: the walk goes back from the last line, skips blank lines, and stops at
+    the first line that isn't a felt marker, so a marker word inside the notes is never taken. The nearest line of each
+    name wins. ``rest`` is the text before the earliest felt line, or ``raw`` unchanged when there is none.
+
+    ``None`` means missing or broken. For emotions, ``{}`` means a valid object whose values were all dropped: only
+    registered names with finite values above 0 are kept, held to 10. The rating is the number at the start of the
+    value (``7/10`` gives 7), held to 10; a negative is treated as missing.
+    """
+    lines = raw.splitlines(keepends=True)
+    values: dict[str, str] = {}
+    earliest = len(lines)
+    for index in range(len(lines) - 1, -1, -1):
+        text = lines[index].strip()
+        if not text:
+            continue
+        match = _FELT_LINE.match(text)
+        if not match:
+            break
+        values.setdefault(match.group("name").upper(), match.group("value").strip())
+        earliest = index
+    if earliest == len(lines):
+        return raw, None, None
+    rest = "".join(lines[:earliest])
+    emotions = _felt_emotions(values["EMOTIONS"]) if "EMOTIONS" in values else None
+    rating = _felt_rating(values["ENGAGEMENT"]) if "ENGAGEMENT" in values else None
+    return rest, emotions, rating
+
+
+def _felt_emotions(value: str) -> dict[str, float] | None:
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    kept = {}
+    for name, number in parsed.items():
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            continue
+        if math.isfinite(number) and number > 0:
+            kept[str(name)] = min(float(number), _FELT_MAX)
+    from brain.chat.extractor import _filter_to_registered
+
+    return _filter_to_registered(kept)
+
+
+def _felt_rating(value: str) -> float | None:
+    match = _LEADING_NUMBER.match(value)
+    if not match:
+        return None
+    number = float(match.group())
+    if not math.isfinite(number) or number < 0:
+        return None
+    return min(number, _FELT_MAX)
 
 
 def parse_session_output(raw: str) -> SessionOutput:
