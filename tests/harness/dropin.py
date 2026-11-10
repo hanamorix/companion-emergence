@@ -360,7 +360,7 @@ def _build_venv(dest: Path, deps: str) -> Path:
 
     if deps == "auto":
         if uv:
-            _run([uv, "venv", str(venv_dir)])
+            _run([uv, "venv", "--python", sys.executable, str(venv_dir)])
             venv_py = _venv_python(venv_dir)
             _run([uv, "pip", "install", "--python", str(venv_py), "-e", str(dest)])
         else:
@@ -369,7 +369,7 @@ def _build_venv(dest: Path, deps: str) -> Path:
             _run([str(venv_py), "-m", "pip", "install", "-e", str(dest)])
     else:  # "none" — bare venv, offline
         if uv:
-            _run([uv, "venv", str(venv_dir)])
+            _run([uv, "venv", "--python", sys.executable, str(venv_dir)])
         else:
             _run([sys.executable, "-m", "venv", "--without-pip", str(venv_dir)])
         venv_py = _venv_python(venv_dir)

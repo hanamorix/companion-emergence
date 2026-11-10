@@ -2,8 +2,9 @@
 
 Surfaces recent monologue_trace memories into the chat system prompt so her own
 prior interior colours later turns. Because fade() rewrites content→summary,
-rendering `m.content` shows the verbatim while active and the tombstone summary
-once fading.
+rendering `m.content` shows the trace as stored while active (the verbatim
+thought with the switch off, its feed digest once the emotion engine is live)
+and the tombstone summary once fading.
 """
 from __future__ import annotations
 

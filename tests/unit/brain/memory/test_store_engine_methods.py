@@ -437,14 +437,14 @@ def test_a_fade_a_write_back_and_an_unfade_keep_the_origin_date(store):
     assert restored["content_snapshot"] is None
 
 
-def test_a_snapshot_that_already_starts_with_a_date_is_left_alone_and_the_summary_is_judged_on_its_own(store):
+def test_a_snapshot_that_already_starts_with_a_date_is_left_alone_and_the_summary_takes_that_date(store):
     dated = _prefix("1999-12-31")
     memory_id = _make(store, {"joy": 8.0}, content=dated + "Bob likes tea with honey")
-    store.fade(memory_id, summary="Bob likes tea")  # a summary with no date, a snapshot that has one
+    store.fade(memory_id, summary="Bob likes tea")  # the fade carries the date to the summary (#666)
     store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
     raw = _raw(store, memory_id)
     assert raw["content_snapshot"] == dated + "Bob likes tea with honey"
-    assert raw["content"] == _prefix("2031-03-04") + "Bob likes tea"
+    assert raw["content"] == dated + "Bob likes tea"
 
 
 def test_a_summary_that_already_starts_with_a_date_is_left_alone_and_the_snapshot_gets_the_prefix(store):
@@ -608,3 +608,110 @@ def test_carry_date_prefix_follows_a_reworded_placeholder(monkeypatch):
     assert store_module.carry_date_prefix("[2026-01-10] we walked", "[2026-02-02] we swam") == "[2026-02-02] we swam"
     # A prefix in the old working form is not a prefix under the new one.
     assert store_module.carry_date_prefix("2026-01-10: we walked", "we swam") == "we swam"
+
+
+# --- every rewrite of a row's text keeps the made-on date (#666) -----------------------------------------------------
+#
+# The first write-back dates the text and moves `created_at`, so the text is the only record left of the day the memory was
+# made. A rewrite that drops the date loses that day: the next write-back dates the text with the moved `created_at`.
+
+_MADE_ON = "2031-03-04"
+_SECOND_WRITE_BACK = _WRITTEN_AT + timedelta(days=30)
+_HOLDS_ON_BASE = "pins behaviour the fix must not change; it already holds on the base"
+
+
+def _written_back(store, content="Bob likes tea with honey"):
+    memory_id = _make(store, {"joy": 8.0}, content=content)
+    store.refresh_faded_emotions(memory_id, {"joy": 6.0}, _WRITTEN_AT)
+    return memory_id
+
+
+def test_an_update_of_the_text_keeps_the_made_on_date_through_the_next_write_back(store):
+    memory_id = _written_back(store)
+    store.update(memory_id, content="Bob drinks coffee now")
+    assert _raw(store, memory_id)["content"] == _prefix(_MADE_ON) + "Bob drinks coffee now"
+    store.refresh_faded_emotions(memory_id, {"joy": 5.0}, _SECOND_WRITE_BACK)
+    assert _raw(store, memory_id)["content"] == _prefix(_MADE_ON) + "Bob drinks coffee now"
+
+
+def test_an_update_of_the_text_embeds_the_dated_text_it_stored(store):
+    memory_id = _written_back(store)
+    recorder = _Recorder()
+    store._reembed_or_clear = recorder
+    store.update(memory_id, content="Bob drinks coffee now")
+    assert recorder.calls == [(memory_id, _prefix(_MADE_ON) + "Bob drinks coffee now")]
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_an_update_with_a_date_of_its_own_keeps_that_date(store):
+    memory_id = _written_back(store)
+    store.update(memory_id, content=_prefix("1999-12-31") + "Bob drinks coffee now")
+    assert _raw(store, memory_id)["content"] == _prefix("1999-12-31") + "Bob drinks coffee now"
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_an_update_of_a_row_with_no_date_adds_none(store):
+    memory_id = _make(store, {"joy": 8.0})
+    store.update(memory_id, content="Bob drinks coffee now")
+    assert _raw(store, memory_id)["content"] == "Bob drinks coffee now"
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_an_update_with_blank_text_is_stored_as_sent(store):
+    memory_id = _written_back(store)
+    store.update(memory_id, content="   ")
+    assert _raw(store, memory_id)["content"] == "   "
+
+
+def test_a_fade_after_a_write_back_keeps_the_made_on_date_through_the_next_write_back_and_an_unfade(store):
+    memory_id = _written_back(store)
+    store.fade(memory_id, summary="Bob likes tea")
+    assert _raw(store, memory_id)["content"] == _prefix(_MADE_ON) + "Bob likes tea"
+    store.refresh_faded_emotions(memory_id, {"joy": 5.0}, _SECOND_WRITE_BACK)
+    raw = _raw(store, memory_id)
+    assert raw["content"] == _prefix(_MADE_ON) + "Bob likes tea"
+    assert raw["content_snapshot"] == _prefix(_MADE_ON) + "Bob likes tea with honey"
+    store.unfade(memory_id)
+    assert _raw(store, memory_id)["content"] == _prefix(_MADE_ON) + "Bob likes tea with honey"
+
+
+def test_a_fade_embeds_the_dated_summary_it_stored(store):
+    memory_id = _written_back(store)
+    recorder = _Recorder()
+    store._reembed_or_clear = recorder
+    store.fade(memory_id, summary="Bob likes tea")
+    assert recorder.calls == [(memory_id, _prefix(_MADE_ON) + "Bob likes tea")]
+
+
+def test_a_recovery_unfade_of_a_faded_row_keeps_the_made_on_date(store, tmp_path):
+    """Recovery unfades only faded rows, so the text it replaces is the summary: this path needs the fade to keep the date too."""
+    from brain.recovery.engine import RestorePlan, _apply_memory_restores
+
+    memory_id = _written_back(store)
+    store.fade(memory_id, summary="Bob likes tea")
+    counts = _apply_memory_restores(tmp_path, RestorePlan(unfade={memory_id: "Bob likes tea with honey"}))
+    assert counts["unfaded"] == 1
+    assert _raw(store, memory_id)["content"] == _prefix(_MADE_ON) + "Bob likes tea with honey"
+    store.refresh_faded_emotions(memory_id, {"joy": 5.0}, _SECOND_WRITE_BACK)
+    raw = _raw(store, memory_id)
+    assert raw["content"] == _prefix(_MADE_ON) + "Bob likes tea with honey"
+    assert raw["state"] == "active"
+
+
+def test_an_initiate_state_change_keeps_the_made_on_date(store):
+    from brain.initiate.memory import (
+        _find_memory_id_for_audit,
+        render_memory_for_state,
+        update_initiate_memory_for_state,
+        write_initiate_memory,
+    )
+
+    reach = {"audit_id": "ia_666", "subject": "tea", "message": "Bob, did you try the honey?", "ts": "2031-03-04T12:00:00+00:00"}
+    write_initiate_memory(store, state="pending", **reach)
+    memory_id = _find_memory_id_for_audit(store, "ia_666")
+    made_on = engine_utils.day_of(store.get(memory_id, bump=False).created_at)
+    store.refresh_faded_emotions(memory_id, {}, _WRITTEN_AT)
+    update_initiate_memory_for_state(store, new_state="read", **reach)
+    store.refresh_faded_emotions(memory_id, {}, _SECOND_WRITE_BACK)
+    expected = render_memory_for_state(subject="tea", message="Bob, did you try the honey?", state="read", user_name="my user", pronouns=None)
+    assert _raw(store, memory_id)["content"] == _prefix(made_on) + expected
