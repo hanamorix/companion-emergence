@@ -618,6 +618,33 @@ REMOVED: tuple[Removed, ...] = (
         ref="#583 (draft PR #632): Readers 1",
         kind="code",
     ),
+    # --- the old reader paths go now that the engine is live (#585, Readers 2) ---------------------------------------------
+    Removed(
+        names=(
+            "compute_gap",
+            "compute_derived",
+            "compute_baseline",
+            "DerivedRead",
+            "_channel_ema",
+            "_CHANNEL_FLOOR",
+            "_GAP_NOISE_FLOOR",
+            "_SHORT_HALF_LIFE_HOURS",
+            "_LONG_HALF_LIFE_HOURS",
+        ),
+        why=(
+            "the self-model's own windows, half-lives, noise floors and gap computation: the gap is the engine's shifted "
+            "channels (gap_from_read), so nothing derives a short and a long read from memory rows any more"
+        ),
+        ref="#585 (draft PR #634): Readers 2",
+        kind="code",
+    ),
+    Removed(
+        names=("_RECENT_EMOTION_WINDOW",),
+        why="the maker's 200-row window over emotion-bearing memories: it reads the engine's short averages",
+        ref="#585 (draft PR #634): Readers 2",
+        kind="code",
+        scope=("brain/maker",),
+    ),
 )
 
 

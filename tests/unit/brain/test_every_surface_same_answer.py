@@ -1,21 +1,23 @@
-"""Every reader of how the kindled feels should give the answer the store gives.
+"""Every reader of how the kindled feels gives the answer the emotion engine gives.
 
-About a dozen readers each pool memory rows for the emotion strengths their own way (different windows, one
-that sums where the rest take a maximum). This file puts each reader beside the one answer the store gives,
-``aggregate_state`` over every active row, on two stores:
+About a dozen readers each turn the engine's read into the numbers they use (the body block, the persona panels, the
+tools, the rest gate, the self-model tick, the maker, the soul review, the reflex and research engines, the felt-time
+drivers, the heartbeat summary). This file puts each reader beside the one answer the engine gives: the short averages of
+its ``read()``, here the ones an ``emotion_engine_stub`` holds.
 
-* D1: an emotive memory (``nostalgia``) older than the newest 200 emotion-bearing rows, then 30 emotionless rows.
+Two file-backed stores stand behind the readers, with emotions that CONTRADICT the stub (so a reader that went back to
+pooling memory rows would give the stored numbers and fail):
+
+* D1: an emotive memory (``nostalgia``), another (``joy``, ``relief``), then 30 emotionless rows.
 * D2: only two emotive memories, buried under more than 50 newer emotionless rows.
 
-For each reader the map it pools is captured by wrapping ``aggregate_state`` at the module that calls it (the
-heartbeat summary, which sums by hand, is captured at ``HeartbeatEngine._peak_emotion``). A cell then checks, in
-order, that the wrapper fired once (1), that the dataset shows the disagreement it exists to show (2), that the
-reader still reads exactly the window it is known to read (3), and only then asserts the one thing under test (4):
-the captured map equals the full-store pool. Checks 1 to 3 use ``pytest.fail`` so a strict expected failure can
-never hide them; check 4 is the only ``AssertionError``.
-
-Twelve cells are strict expected failures today because those readers disagree with the store. Nothing marks a
-persona live: the marks stay through the reader switch-over, which points the same cells at the engine.
+For each reader the map it derives and uses is captured at the point where it hands it on (the argument the body
+projection receives, what a panel or tool returns, the ``emotions`` the reflex engine evaluates, the state the research
+engine builds, what the heartbeat summary takes its peak from). A cell then checks, in order, that exactly one capture
+was made (1), that the stub is set up to show the case (2: every feeling has distinct short, long and difference values,
+and the stub's last fold is a nonzero interval before the instant the reader is called), and only then asserts the one
+thing under test (3): the captured map equals the stub's short averages. Checks 1 and 2 use ``pytest.fail`` so no
+expected failure could hide them; check 3 is the only ``AssertionError``.
 """
 
 from __future__ import annotations
@@ -29,10 +31,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from brain.body import state as body_state_module
 from brain.bridge import persona_state, supervisor
 from brain.bridge.provider import FakeProvider
 from brain.chat import prompt
-from brain.emotion import aggregate
+from brain.emotion import state as emotion_state_module
+from brain.emotion.engine import Reading
 from brain.engines import reflex as reflex_module
 from brain.engines import research as research_module
 from brain.engines.heartbeat import HeartbeatEngine
@@ -46,14 +50,31 @@ from brain.tools.impls.get_body_state import get_body_state
 from brain.tools.impls.get_emotional_state import get_emotional_state
 
 # Bound at import, before any wrapper is installed.
-_REAL = aggregate.aggregate_state
+_REAL_BODY_STATE = body_state_module.body_state_from_short
 _REAL_PEAK = HeartbeatEngine._peak_emotion
+_REAL_EVALUATE = reflex_module.ReflexEngine._evaluate
+_REAL_EMOTIONAL_STATE = emotion_state_module.EmotionalState
 
-_TOOL_EMOTIONAL_STATE = importlib.import_module("brain.tools.impls.get_emotional_state")
 _TOOL_BODY_STATE = importlib.import_module("brain.tools.impls.get_body_state")
 
 
-# ── datasets ─────────────────────────────────────────────────────────────────
+# ── what the engine reads (the stub's table) ─────────────────────────────────
+
+# name -> (short, long, difference). Every feeling has three different numbers, and no two feelings share a short value,
+# so a reader that took the long average or the difference, or mixed up two feelings, gives a different map. All are
+# exact at one decimal (the panels round to one decimal) and none equals a number the stores below hold.
+_STUB_TABLES: dict[str, dict[str, tuple[float, float, float]]] = {
+    "D1": {"nostalgia": (2.5, 6.5, -4.0), "joy": (7.5, 3.5, 4.5), "relief": (5.5, 1.5, 3.0)},
+    "D2": {"nostalgia": (4.5, 8.5, 2.0), "joy": (6.5, 0.5, -3.0)},
+}
+
+
+def _short_averages(table: dict[str, tuple[float, float, float]]) -> dict[str, float]:
+    """The reference: the short average of each feeling, from the test's own table."""
+    return {name: short for name, (short, _long, _difference) in table.items()}
+
+
+# ── datasets (the stores behind the readers) ─────────────────────────────────
 
 
 def _row(i: int, base: datetime, memory_type: str, emotions: dict[str, float]) -> Memory:
@@ -63,29 +84,26 @@ def _row(i: int, base: datetime, memory_type: str, emotions: dict[str, float]) -
     return dataclasses.replace(mem, created_at=base + timedelta(minutes=i))
 
 
-def _fill(persona_dir: Path, rows: list[tuple[str, dict[str, float]]]) -> tuple[MemoryStore, list[Memory]]:
+def _fill(persona_dir: Path, rows: list[tuple[str, dict[str, float]]]) -> MemoryStore:
     """A file-backed store holding ``rows`` oldest first, one minute apart, starting eight hours ago."""
     base = datetime.now(UTC) - timedelta(hours=8)
     store = MemoryStore(persona_dir / "memories.db")
-    mems = [_row(i, base, memory_type, emotions) for i, (memory_type, emotions) in enumerate(rows)]
-    for mem in mems:
-        store.create(mem)
-    return store, mems
+    for i, (memory_type, emotions) in enumerate(rows):
+        store.create(_row(i, base, memory_type, emotions))
+    return store
 
 
-def _d1(persona_dir: Path) -> tuple[MemoryStore, list[Memory]]:
-    """231 rows: the oldest emotive row is rank 201 among emotion-bearing rows, so a 200-row window misses it."""
+def _d1(persona_dir: Path) -> MemoryStore:
     rows: list[tuple[str, dict[str, float]]] = [
         ("episodic", {"nostalgia": 6.0}),
         ("episodic", {"joy": 2.0, "relief": 4.0}),
     ]
-    rows += [("episodic", {"joy": 2.0})] * 199
     rows += [("heartbeat", {})] * 30
     return _fill(persona_dir, rows)
 
 
-def _d2(persona_dir: Path) -> tuple[MemoryStore, list[Memory]]:
-    """62 rows: two emotive rows, then 60 emotionless ones, so the newest 50 rows hold no emotion at all."""
+def _d2(persona_dir: Path) -> MemoryStore:
+    """Two emotive rows, then 60 emotionless ones, so the newest 50 rows hold no emotion at all."""
     rows: list[tuple[str, dict[str, float]]] = [
         ("episodic", {"nostalgia": 6.0, "joy": 5.0}),
         ("episodic", {"joy": 3.0}),
@@ -94,30 +112,7 @@ def _d2(persona_dir: Path) -> tuple[MemoryStore, list[Memory]]:
     return _fill(persona_dir, rows)
 
 
-_DATASETS: dict[str, Callable[[Path], tuple[MemoryStore, list[Memory]]]] = {"D1": _d1, "D2": _d2}
-
-
-def _pool(rows: list[Memory]) -> dict[str, float]:
-    return dict(_REAL(rows).emotions)
-
-
-def _newest_first(mems: list[Memory]) -> list[Memory]:
-    return list(reversed(mems))
-
-
-def _window_pool(window: str, mems: list[Memory]) -> dict[str, float]:
-    """The map a reader with this window should pool, computed from the rows the builder made."""
-    newest = _newest_first(mems)
-    if window == "emotive200":
-        return _pool([m for m in newest if m.emotions][:200])
-    if window == "all50":
-        return _pool(newest[:50])
-    if window == "all":
-        return _pool(mems)
-    if window == "sum":
-        names = {name for m in mems for name in m.emotions}
-        return {name: sum(m.emotions.get(name, 0.0) for m in mems) for name in names}
-    raise ValueError(f"unknown window {window!r}")
+_DATASETS: dict[str, Callable[[Path], MemoryStore]] = {"D1": _d1, "D2": _d2}
 
 
 # ── surfaces ─────────────────────────────────────────────────────────────────
@@ -130,8 +125,32 @@ class _Bus:
         pass
 
 
+def _capture_body_state(monkeypatch, captures: list, module: object) -> None:
+    """Record the short map each call of `body_state_from_short` receives (the argument is what the site derived)."""
+
+    def wrapper(short, **kwargs):
+        captures.append(dict(short))
+        return _REAL_BODY_STATE(short, **kwargs)
+
+    monkeypatch.setattr(module, "body_state_from_short", wrapper)
+
+
+def _install_body_state(monkeypatch, captures: list) -> None:
+    # The readers that import the projection at call time find the patched attribute of the module.
+    _capture_body_state(monkeypatch, captures, body_state_module)
+
+
+def _install_body_state_in_tool(monkeypatch, captures: list) -> None:
+    # `get_body_state` binds the projection at import, so the tool module's own name is patched.
+    _capture_body_state(monkeypatch, captures, _TOOL_BODY_STATE)
+
+
+def _install_nothing(monkeypatch, captures: list) -> None:
+    pass
+
+
 def _persona_emotions(c: SimpleNamespace) -> None:
-    persona_state._build_emotions(c.persona_dir)
+    c.captures.append(persona_state._build_emotions(c.persona_dir))
 
 
 def _persona_body(c: SimpleNamespace) -> None:
@@ -145,7 +164,7 @@ def _prompt_body(c: SimpleNamespace) -> None:
 def _get_emotional_state(c: SimpleNamespace) -> None:
     hebbian = HebbianMatrix(":memory:")
     try:
-        get_emotional_state(store=c.store, hebbian=hebbian, persona_dir=c.persona_dir)
+        c.captures.append(get_emotional_state(store=c.store, hebbian=hebbian, persona_dir=c.persona_dir)["all"])
     finally:
         hebbian.close()
 
@@ -163,7 +182,10 @@ def _drivers(c: SimpleNamespace) -> None:
 
 
 def _selfmodel(c: SimpleNamespace) -> None:
-    supervisor._self_model_reflect(c.persona_dir, provider=FakeProvider(), event_bus=_Bus(), now=c.now)
+    from brain.bridge import cli_throttle
+
+    cli_throttle.reset()  # a fresh persona's tick is due; the throttle must not hold a chat spell from another test
+    supervisor._run_self_model_tick(c.persona_dir, provider=FakeProvider(), event_bus=_Bus())
 
 
 def _rest(c: SimpleNamespace) -> None:
@@ -171,11 +193,19 @@ def _rest(c: SimpleNamespace) -> None:
 
 
 def _maker(c: SimpleNamespace) -> None:
-    maker_sources.current_emotional_intensity(c.store)
+    c.captures.append({"peak": maker_sources.current_emotional_intensity(c.store)})
 
 
 def _review(c: SimpleNamespace) -> None:
-    soul_review._current_emotional_summary(c.store)
+    c.captures.append(soul_review._current_emotional_summary(c.persona_dir))
+
+
+def _install_reflex(monkeypatch, captures: list) -> None:
+    def wrapper(self, arcs, emotions, *args, **kwargs):
+        captures.append(dict(emotions))
+        return _REAL_EVALUATE(self, arcs, emotions, *args, **kwargs)
+
+    monkeypatch.setattr(reflex_module.ReflexEngine, "_evaluate", wrapper)
 
 
 def _reflex(c: SimpleNamespace) -> None:
@@ -201,6 +231,15 @@ def _reflex(c: SimpleNamespace) -> None:
         default_arcs_path=Path(reflex_module.__file__).parent / "default_reflex_arcs.json",
     )
     engine.run_tick(dry_run=True)
+
+
+def _install_research(monkeypatch, captures: list) -> None:
+    class Recording(_REAL_EMOTIONAL_STATE):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captures.append(dict(self.emotions))
+
+    monkeypatch.setattr(emotion_state_module, "EmotionalState", Recording)
 
 
 def _research(c: SimpleNamespace) -> None:
@@ -232,6 +271,14 @@ def _research(c: SimpleNamespace) -> None:
     engine.run_tick(dry_run=True, days_since_human_override=0.0)
 
 
+def _install_peak(monkeypatch, captures: list) -> None:
+    def wrapper(emotions, *, default=("curiosity", 5)):
+        captures.append(dict(emotions))
+        return _REAL_PEAK(emotions, default=default)
+
+    monkeypatch.setattr(HeartbeatEngine, "_peak_emotion", staticmethod(wrapper))
+
+
 def _heartbeat(c: SimpleNamespace) -> None:
     interests_path = c.persona_dir / "interests.json"
     write_json(interests_path, {"version": 1, "interests": []})
@@ -257,49 +304,33 @@ def _heartbeat(c: SimpleNamespace) -> None:
         hebbian.close()
 
 
-# surface id -> (module that calls aggregate_state, the call, the window the site is known to read)
-_SURFACES: dict[str, tuple[object, Callable[[SimpleNamespace], None], str]] = {
-    "persona_emotions": (aggregate, _persona_emotions, "emotive200"),
-    "persona_body": (aggregate, _persona_body, "emotive200"),
-    "prompt_body": (aggregate, _prompt_body, "emotive200"),
-    "get_emotional_state": (_TOOL_EMOTIONAL_STATE, _get_emotional_state, "all"),
-    "get_body_state": (_TOOL_BODY_STATE, _get_body_state, "emotive200"),
-    "drivers": (aggregate, _drivers, "emotive200"),
-    "selfmodel": (aggregate, _selfmodel, "emotive200"),
-    "rest": (aggregate, _rest, "emotive200"),
-    "maker": (maker_sources, _maker, "emotive200"),
-    "review": (aggregate, _review, "all50"),
-    "reflex": (reflex_module, _reflex, "all"),
-    "research": (aggregate, _research, "all"),
-    "heartbeat": (HeartbeatEngine, _heartbeat, "sum"),
+def _top_three_summary(reference: dict[str, float]) -> dict[str, str]:
+    """The string the soul review builds from a map: its top three by value, `name:value` to one decimal."""
+    top = sorted(reference.items(), key=lambda item: -item[1])[:3]
+    return {"summary": ", ".join(f"{name}:{round(value, 1)}" for name, value in top)}
+
+
+def _as_is(reference: dict[str, float]) -> dict[str, float]:
+    return reference
+
+
+# surface id -> (install the capture, the call, what the capture must equal given the reference)
+_SURFACES: dict[str, tuple[Callable, Callable, Callable]] = {
+    "persona_emotions": (_install_nothing, _persona_emotions, _as_is),
+    "persona_body": (_install_body_state, _persona_body, _as_is),
+    "prompt_body": (_install_body_state, _prompt_body, _as_is),
+    "get_emotional_state": (_install_nothing, _get_emotional_state, _as_is),
+    "get_body_state": (_install_body_state_in_tool, _get_body_state, _as_is),
+    "drivers": (_install_body_state, _drivers, _as_is),
+    "selfmodel": (_install_body_state, _selfmodel, _as_is),
+    "rest": (_install_body_state, _rest, _as_is),
+    "maker": (_install_nothing, _maker, lambda ref: {"peak": max(ref.values())}),
+    "review": (_install_nothing, _review, _top_three_summary),
+    "reflex": (_install_reflex, _reflex, _as_is),
+    "research": (_install_research, _research, _as_is),
+    "heartbeat": (_install_peak, _heartbeat, _as_is),
 }
 
-# ── cells and their marks ────────────────────────────────────────────────────
-
-_WINDOW_200 = "reads the newest 200 emotion-bearing rows and misses the oldest emotive row (`nostalgia`)"
-_EXPECTED_FAILURES: dict[tuple[str, str], str] = {
-    ("persona_emotions", "D1"): _WINDOW_200,
-    ("persona_body", "D1"): _WINDOW_200,
-    ("prompt_body", "D1"): _WINDOW_200,
-    ("get_body_state", "D1"): _WINDOW_200,
-    ("drivers", "D1"): _WINDOW_200,
-    ("selfmodel", "D1"): _WINDOW_200,
-    ("rest", "D1"): _WINDOW_200,
-    ("maker", "D1"): _WINDOW_200,
-    (
-        "review",
-        "D1",
-    ): "reads the newest 50 rows with no emotion filter; 30 emotionless rows take part of that window",
-    (
-        "heartbeat",
-        "D1",
-    ): "sums each emotion over every memory where the other surfaces take the maximum (joy 400.0 against 2.0)",
-    ("review", "D2"): "the newest 50 rows are all emotionless, so it sees nothing",
-    (
-        "heartbeat",
-        "D2",
-    ): "sums each emotion over every memory where the other surfaces take the maximum (joy 8.0 against 5.0)",
-}
 _NO_D2 = {"prompt_body", "get_body_state"}
 
 
@@ -309,53 +340,50 @@ def _cells() -> list:
         for dataset in _DATASETS:
             if dataset == "D2" and surface in _NO_D2:
                 continue
-            reason = _EXPECTED_FAILURES.get((surface, dataset))
-            marks = (
-                [pytest.mark.xfail(strict=True, raises=AssertionError, reason=reason)] if reason else []
-            )
-            cells.append(pytest.param(surface, dataset, id=f"{surface}-{dataset}", marks=marks))
+            cells.append(pytest.param(surface, dataset, id=f"{surface}-{dataset}"))
     return cells
 
 
 CELLS = _cells()
 
 
-def _wrapper(captures: list):
-    def wrapper(memories):
-        rows = list(memories)
-        result = _REAL(rows)
-        captures.append(([m.id for m in rows], dict(result.emotions)))
-        return result
-
-    return wrapper
-
-
-def _peak_wrapper(captures: list):
-    def wrapper(emotions, *, default=("curiosity", 5)):
-        captures.append((None, dict(emotions)))
-        return _REAL_PEAK(emotions, default=default)
-
-    return wrapper
+def _check_the_stub_shows_the_case(stub, called_at: datetime, surface: str, dataset: str) -> None:
+    """Check 2: the stub's numbers are told apart, and its last fold is a nonzero interval before the call."""
+    readings = stub.readings
+    for name, reading in readings.items():
+        if len({reading.short, reading.long, reading.difference}) != 3:
+            pytest.fail(f"{surface}-{dataset}: {name} does not have distinct short, long and difference values")
+    shorts = [reading.short for reading in readings.values()]
+    if len(set(shorts)) != len(shorts):
+        pytest.fail(f"{surface}-{dataset}: two feelings share a short value, so a mix-up would go unseen")
+    if not stub.last_fold_at < called_at:
+        pytest.fail(f"{surface}-{dataset}: the stub's last fold is not an interval before the call")
 
 
 @pytest.mark.no_base_failure(
     reason=(
-        "same-answer test: its cells pass, or fail as strict expected failures, on the old code by design; "
-        "it pins the old readers until phase C re-points it"
+        "same-answer test, re-pointed at the engine read with its ids unchanged from the safety net (#581), so the base "
+        "check does not judge these ids; each cell is shown able to fail by running it against the base source, where "
+        "the readers still take their old branches (recorded in the run's harness notes)"
     )
 )
 @pytest.mark.parametrize(("surface", "dataset"), CELLS)
-def test_surface_matches_the_store_pool(surface, dataset, tmp_path, monkeypatch):
-    module, call, window = _SURFACES[surface]
+def test_surface_matches_the_engine_read(surface, dataset, tmp_path, monkeypatch, emotion_engine_stub):
+    install, call, expected_from = _SURFACES[surface]
+    table = _STUB_TABLES[dataset]
+    emotion_engine_stub.readings = {
+        name: Reading(short=short, long=long, difference=difference, shift=0)
+        for name, (short, long, difference) in table.items()
+    }
+    emotion_engine_stub.high = set(table)
     captures: list = []
-    if surface == "heartbeat":
-        monkeypatch.setattr(HeartbeatEngine, "_peak_emotion", staticmethod(_peak_wrapper(captures)))
-    else:
-        monkeypatch.setattr(module, "aggregate_state", _wrapper(captures))
+    install(monkeypatch, captures)
 
-    store, mems = _DATASETS[dataset](tmp_path)
+    store = _DATASETS[dataset](tmp_path)
     try:
-        context = SimpleNamespace(store=store, persona_dir=tmp_path, now=datetime.now(UTC))
+        called_at = datetime.now(UTC)
+        _check_the_stub_shows_the_case(emotion_engine_stub, called_at, surface, dataset)
+        context = SimpleNamespace(store=store, persona_dir=tmp_path, now=called_at, captures=captures)
         try:
             call(context)
         except AssertionError as exc:
@@ -363,34 +391,13 @@ def test_surface_matches_the_store_pool(surface, dataset, tmp_path, monkeypatch)
     finally:
         store.close()
 
-    full = _pool(mems)
-
-    # (1) the wrapper fired once, on rows (or keys) of this dataset
+    # (1) exactly one capture
     if len(captures) != 1:
         pytest.fail(f"{surface}-{dataset}: expected exactly one capture, got {len(captures)}")
-    ids, captured = captures[0]
-    if ids is not None and not set(ids) <= {m.id for m in mems}:
-        pytest.fail(f"{surface}-{dataset}: captured rows that are not in the dataset")
-    if ids is None and not set(captured) <= {name for m in mems for name in m.emotions}:
-        pytest.fail(f"{surface}-{dataset}: the heartbeat summary used emotion names the dataset does not hold")
 
-    # (2) the dataset shows the disagreement it exists to show
-    if dataset == "D1":
-        seen_by_a_window = _window_pool("emotive200", mems)
-        which = "newest-200 emotion-bearing pool"
-    else:
-        seen_by_a_window = _pool(_newest_first(mems)[:50])
-        which = "newest-50 pool"
-    if full == seen_by_a_window:
-        pytest.fail(f"{dataset}: the full pool equals the {which}, so the dataset no longer shows the case")
-
-    # (3) the reader still reads exactly the window it is known to read
-    expected_for_site = _window_pool(window, mems)
-    if captured != expected_for_site:
-        pytest.fail(
-            f"{surface}-{dataset}: captured {captured} but the {window} window pools {expected_for_site}; "
-            "the site no longer reads the window it is known to read"
-        )
-
-    # (4) the one assertion under test
-    assert captured == full
+    # (3) the one assertion under test
+    reference = _short_averages(table)
+    captured = captures[0]
+    if surface == "review":
+        captured = {"summary": captured}
+    assert captured == expected_from(reference)

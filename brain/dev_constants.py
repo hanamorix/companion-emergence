@@ -451,7 +451,7 @@ KINDLED_LINK_INBOUND_FLOOD_CAP = 20
 EMOTION_SUMMARY_COUNT: int | None = 3
 # How each listed feeling is written: "long" (name:L), "long_short" (name:L/S) or "long_difference" (name:L(D), D signed).
 EMOTION_SUMMARY_MODE: str = "long"
-# The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
+# The self-model block (`brain.self_model.ambient.render_block`) names this many channels, the largest
 # by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
 SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
 
