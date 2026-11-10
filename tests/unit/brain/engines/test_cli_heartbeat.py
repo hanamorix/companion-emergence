@@ -68,7 +68,9 @@ def test_nell_heartbeat_second_tick_does_work(nell_persona: Path) -> None:
 def test_nell_heartbeat_dry_run_no_writes(nell_persona: Path) -> None:
     """--dry-run doesn't create state file or log entry."""
     from brain.cli import main
+    from brain.emotion.engine import ensure_engine_ready
 
+    ensure_engine_ready(nell_persona)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     rc = main(
         ["heartbeat", "--persona", "nell", "--trigger", "manual", "--provider", "fake", "--dry-run"]
     )

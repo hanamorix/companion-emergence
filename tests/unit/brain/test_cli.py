@@ -137,6 +137,9 @@ def test_dream_handler_friendly_message_when_no_seed(
     PersonaConfig(provider="fake", searcher="noop", mcp_audit_log_level="metadata").save(
         persona_dir / "persona_config.json"
     )
+    from brain.emotion.engine import ensure_engine_ready
+
+    ensure_engine_ready(persona_dir)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
 
     result = cli.main(["dream", "--persona", "freshie", "--provider", "fake", "--dry-run"])
 

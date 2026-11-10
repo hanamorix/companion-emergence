@@ -1421,6 +1421,12 @@ def build_app(
         finally:
             _vocab_store.close()
 
+        # The emotion engine's switch-over (Engine 6, spec 3.1 S6): a persona's first start does its x10 fix and first rebuild
+        # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so
+        # start-up stops before the supervisor thread is spawned (a switch that cannot be inspected is not a failure: `ensure`
+        # skips the switch-over for this start and logs why).
+        emotion_engine.ensure_engine_ready(persona_dir)
+
         # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
         # own failures and never raises.
         emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))

@@ -19,6 +19,7 @@ from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
+from brain.emotion import engine_files
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
@@ -942,6 +943,9 @@ def _dream_handler(args: argparse.Namespace) -> int:
         from brain.soul.store import SoulStore
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
         try:
@@ -998,6 +1002,37 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
     emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
 
 
+def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
+    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6): None to go on, or an exit code to return.
+
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run calls
+    `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and a failure raises `EngineStartupError`
+    out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona whose
+    switch is not seen (not switched yet, or its switch file cannot be read: the fail-safe answer is "not switched") it prints a
+    plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
+    on a switched persona it goes on as today.
+    """
+    if not dry_run:
+        emotion_engine.ensure_engine_ready(persona_dir)
+        return None
+    if emotion_engine.engine_for(persona_dir).is_live():
+        return None
+    if engine_files.switch_state(persona_dir) is None:
+        message = (
+            f"This persona's emotion switch file ({engine_files.switch_path(persona_dir)}) cannot be read, so its emotion engine "
+            "counts as not switched, and a dry run writes nothing. Nothing was run. Check that the file and its folder are "
+            "readable, then try again."
+        )
+    else:
+        message = (
+            "This persona's emotion engine is not switched on yet, and a dry run writes nothing, so it cannot switch it on. "
+            "Nothing was run. The switch-over happens at the persona's first start: the bridge, or any of these commands "
+            "without --dry-run."
+        )
+    print(message, file=sys.stderr)
+    return 2
+
+
 def _heartbeat_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell heartbeat` to the HeartbeatEngine."""
     persona_dir = get_persona_dir(args.persona)
@@ -1015,6 +1050,9 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)
@@ -1139,6 +1177,9 @@ def _reflex_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
         engine = ReflexEngine(
             store=store,
@@ -1195,6 +1236,9 @@ def _research_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
         searcher = get_searcher(searcher_name)
         engine = ResearchEngine(
@@ -1828,6 +1872,9 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
 
         from brain.soul.review import review_pending_candidates
@@ -2172,6 +2219,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        _engine_ready_or_refuse(persona_dir, False)  # `nell chat` has no dry run, so this never refuses
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)

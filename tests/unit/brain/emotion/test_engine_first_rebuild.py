@@ -931,6 +931,55 @@ def test_a_recovery_rebuild_with_no_database_raises_and_leaves_a_readable_backup
     assert engine_files.read_state(persona).state is not None
 
 
+def test_the_recovery_job_rebuilds_a_ruined_state_and_reports_success(tmp_path: Path) -> None:
+    persona, instance = _live_persona(tmp_path, [row(T[35], emotions={"joy": 5.0}, mid="a")])
+    ruin_the_state(persona)
+    assert instance.needs_recovery() is True
+    assert engine.recovery_job_run(persona) is True
+    assert state_of(persona).saved_at == NOW and instance.needs_recovery() is False
+
+
+def test_the_recovery_job_on_a_healthy_or_a_not_switched_persona_does_nothing_and_reports_success(tmp_path: Path) -> None:
+    healthy, _ = _live_persona(tmp_path / "healthy", [row(T[35], emotions={"joy": 5.0}, mid="a")])
+    save(healthy, simple_state(saved_at=T[39]))
+    not_switched = make_persona(tmp_path / "not_switched", [row(T[35], emotions={"joy": 5.0}, mid="b")])
+    install(not_switched, NOW)
+    before = {"healthy": tree(healthy), "not_switched": tree(not_switched)}
+    assert engine.recovery_job_run(healthy) is True and engine.recovery_job_run(not_switched) is True
+    assert {"healthy": tree(healthy), "not_switched": tree(not_switched)} == before
+
+
+def test_a_failing_recovery_job_reports_failure_logs_once_per_active_day_keeps_the_retry_and_recovers_when_the_fault_goes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    persona, instance = _live_persona(tmp_path, [row(T[35], emotions={"joy": 5.0}, mid="a")])
+    ruin_the_state(persona)
+    with monkeypatch.context() as patch, caplog.at_level(logging.INFO, logger=LOGGER):
+        patch.setattr(engine_files, "save_state", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
+        assert engine.recovery_job_run(persona) is False
+        assert engine.recovery_job_run(persona) is False  # the next quiet pass, the same active day
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == LOGGER]
+    assert len(errors) == 1  # once per active day, not once per pass, and not the start-up wording
+    assert "start-up stops" not in errors[0].getMessage() and errors[0].exc_info is not None
+    assert instance.needs_recovery() is True  # the failed flag is set: the next pass tries again
+    assert engine.recovery_job_run(persona) is True  # the fault is gone
+    assert state_of(persona).saved_at == NOW and instance.needs_recovery() is False
+
+
+def test_a_failing_recovery_job_is_logged_even_when_the_drain_already_logged_the_missing_state_that_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    persona, instance = _live_persona(tmp_path, [row(T[35], emotions={"joy": 5.0}, mid="a")])
+    ruin_the_state(persona)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        instance.note_active(NOW)  # the bridge's start-up drain says the state is missing
+        with monkeypatch.context() as patch:
+            patch.setattr(engine_files, "save_state", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
+            assert engine.recovery_job_run(persona) is False
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.name == LOGGER]
+    assert len(messages) == 2 and "recovery rebuild failed" in messages[1]  # why the rebuild failed is not hidden by the drain's line
+
+
 def test_ensure_engine_ready_calls_ensure_ready_through_engine_for(tmp_path: Path, emotion_engine_stub) -> None:
     assert engine.engine_for(tmp_path) is emotion_engine_stub
     ensure_engine_ready(tmp_path)

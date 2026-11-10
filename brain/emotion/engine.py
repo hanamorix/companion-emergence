@@ -167,7 +167,7 @@ class EmotionEngine:
         self._switch_over_at: datetime | None = None  # the switch-over time as read from the file, kept once it was read; a failed read is never kept
         # Per-instance state of the apply step, all of it in memory (a second process has its own):
         self._catch_up_failed = False  # set by a failed recovery or an unreadable live state; cleared by a state load or write
-        self._failure_logged_day: str | None = None  # the local day the failure was last logged for (once per active day)
+        self._failure_logged_days: dict[str, str | None] = {}  # failure kind -> the local day it was last logged for (once per active day, per kind)
         self._last_queue_key: object = _UNSET  # the queue file's stat key as this instance's last clean drain left it
         self._warned_names: set[str] = set()  # unregistered emotion names `read()` already named, once per name
         self._refresh_logged: set[str] = set()  # distinct refresh failures `read()` already logged
@@ -427,19 +427,21 @@ class EmotionEngine:
 
     # --- the one apply step (the drain and the direct apply) -----------------------------------------
 
-    def _mark_failed(self, why: str, now: datetime, *, exc: BaseException | None = None) -> None:
+    def _mark_failed(self, why: str, now: datetime, *, exc: BaseException | None = None, kind: str = "apply") -> None:
         """A live persona's state cannot be used: set the catch-up-failed flag (it empties `read()`), log once per active day.
 
         Nothing is written, the queue and its position are kept, and a memory stays saved. The retry is the next call: a failed
-        live catch-up reruns on every tick with the lock held (the cost named in design 2.8, "Recovery first").
+        live catch-up reruns on every tick with the lock held (the cost named in design 2.8, "Recovery first"). The once-a-day
+        throttle is per `kind`: the apply step's report ("the state is missing") and the recovery job's report (why the rebuild
+        failed) are different lines, and one must not hide the other.
         """
         self._catch_up_failed = True
         try:
             day = day_of(now)
         except (OverflowError, OSError, ValueError):
             day = None
-        if day is None or self._failure_logged_day != day:
-            self._failure_logged_day = day
+        if day is None or self._failure_logged_days.get(kind) != day:
+            self._failure_logged_days[kind] = day
             logger.error(
                 "emotion engine: %s; nothing is applied until a state write succeeds, the queue and its position are kept",
                 why,
@@ -979,7 +981,12 @@ class EmotionEngine:
                     modifier_of=modifier_of,
                 )
         except Exception as exc:  # noqa: BLE001 - every failure is named and raised as the start-up error
-            self._start_failed(f"the {mode} rebuild" if held else "the engine lock", exc)
+            what = f"the {mode} rebuild" if held else "the engine lock"
+            if mode == "recovery":
+                # Not a start-up: the recovery job (`recovery_job_run`) logs the failure once per active day, so a rebuild that
+                # keeps failing does not write an error line, with a traceback, on every quiet pass.
+                raise EngineStartupError(what, exc) from exc
+            self._start_failed(what, exc)
 
     def needs_recovery(self) -> bool:
         """True when a live persona's state cannot be used: missing or unreadable (through the cache), or the catch-up-failed flag is set.
@@ -1038,3 +1045,21 @@ def ensure_engine_ready(persona_dir: Path) -> None:
     Raises `EngineStartupError(what, cause)` when the switch-over fails; a failure stops start-up.
     """
     engine_for(persona_dir).ensure_ready()
+
+
+def recovery_job_run(persona_dir: Path) -> bool:
+    """The body of the supervisor's `emotion_recovery_rebuild` job: `engine_for(persona_dir).recovery_rebuild()`, never raising.
+
+    True when the rebuild finished or was no longer needed (another process repaired the state first). False when it failed:
+    the failure is logged once per active day through `_mark_failed` (with its traceback; its own throttle key, so the drain's
+    line about the same state does not hide it), which also keeps the failed flag set, so `needs_recovery()` stays True and
+    the next quiet pass tries again, with the lock held for a rebuild's length (the cost named in design 3.0). The job maps True to `JobOutcome.COMPLETED` and False to `JobOutcome.SKIPPED`; this returns a
+    Boolean because `JobOutcome` lives in `brain.bridge`, which imports the provider stack.
+    """
+    instance = engine_for(persona_dir)
+    try:
+        instance.recovery_rebuild()
+    except Exception as exc:  # noqa: BLE001 - a background job never raises into the supervisor; the failure is logged below and the job retries
+        instance._mark_failed("the recovery rebuild failed", instance._now(), exc=exc, kind="recovery")
+        return False
+    return True
