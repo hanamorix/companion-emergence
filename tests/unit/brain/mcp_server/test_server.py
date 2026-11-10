@@ -112,6 +112,41 @@ def test_run_server_loads_the_persona_vocabulary_before_serving_tools(tmp_path: 
     assert seen == {"registered": True}
 
 
+@pytest.mark.no_base_failure(reason="base never reads the vocabulary; bites when the MCP load heals (quarantines and resets) a corrupt file")
+def test_run_server_leaves_a_corrupt_vocabulary_file_untouched(tmp_path: Path) -> None:
+    """The MCP load reads only. A heal here would quarantine the file and reset it to empty with no memory-based
+    rebuild, losing her vocabulary while the bridge runs; the bridge's own load (which has the store) repairs it."""
+    from brain.mcp_server import run_server
+
+    persona = _seed_persona(tmp_path)
+    (persona / "emotion_vocabulary.json").write_bytes(b"{not json")
+    before = {p.name: p.read_bytes() for p in persona.iterdir() if p.is_file()}
+
+    class _FakeStdio:
+        async def __aenter__(self):
+            return (MagicMock(), MagicMock())
+
+        async def __aexit__(self, *_):
+            return None
+
+    async def _fake_run(self, *_args, **_kwargs):
+        return None
+
+    with (
+        patch("brain.mcp_server.register_tools"),
+        patch("brain.mcp_server.stdio_server", lambda: _FakeStdio()),
+        patch("mcp.server.Server.run", _fake_run),
+    ):
+        run_server(persona)
+    after = {
+        p.name: p.read_bytes()
+        for p in persona.iterdir()
+        if p.is_file() and not p.name.startswith(("memories.db", "hebbian.db"))
+    }
+    before = {k: v for k, v in before.items() if not k.startswith(("memories.db", "hebbian.db"))}
+    assert after == before
+
+
 @pytest.mark.no_base_failure(reason="base never loads the vocabulary; bites when the load's failure stops being caught")
 def test_run_server_still_serves_tools_when_the_vocabulary_load_fails(tmp_path: Path) -> None:
     from brain.mcp_server import run_server

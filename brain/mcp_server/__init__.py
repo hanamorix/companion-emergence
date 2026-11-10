@@ -66,12 +66,13 @@ def _load_vocabulary(persona_dir: Path) -> None:
     """Register the persona's own emotion names in this process before any tool runs (#689).
 
     The brain tools (record_monologue, add_memory, the emotion reads) run in this per-turn process, and the registry is
-    per process; without this every name outside the baseline is unknown here. No `store`, so no heal scan writes on a
-    turn's path; the bridge's start-up and the heartbeat still heal. Fail-soft: the tools must still serve.
+    per process; without this every name outside the baseline is unknown here. Read-only: nothing is written on a
+    turn's path, and a corrupt file is left as it is (logged, baseline names only) for the bridge's start-up load to
+    repair, since that load has the store and rebuilds from memories. Fail-soft: the tools must still serve.
     """
     try:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
     except Exception:  # noqa: BLE001
         logger.warning("mcp server: could not load the persona vocabulary; tools see only the baseline names", exc_info=True)
