@@ -14,7 +14,7 @@ This directory is not part of the Python package or the sdist (the sdist ships o
 
 ## How the current database was made
 
-`augment_db.py` reads the original database and writes the current one. It is seeded (default seed 20261110), stdlib only and deterministic: the same seed gives the same rows, and the same file bytes under the same SQLite library version (the file header records it; sha256 of the shipped `memories.db`: `c8e5e55edeebb90fa62d8e7d29f659484cac5ebf3e886fc19e14390f1f015ee5`). To reproduce it, recover the original (sha256 `f0a4def9fb77bd009e75ce2571914a4c964204cf246a799fba8ae6542f4c69da`) outside the repository and run:
+`augment_db.py` reads the original database and writes the current one. It is seeded (default seed 20261110), stdlib only and deterministic: the same seed gives the same rows, and the same file bytes under the same SQLite library version (the file header records it; sha256 of the shipped `memories.db`: `e00bc8b854e06942aae5abebe9512da396ae5716eb68a430e62234df283665fb`). To reproduce it, recover the original (sha256 `f0a4def9fb77bd009e75ce2571914a4c964204cf246a799fba8ae6542f4c69da`) outside the repository and run:
 
 ```
 git show d8eedb76:test-data/synthetic-db/memories.db > /path/outside/repo/base.db
