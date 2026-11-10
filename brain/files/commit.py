@@ -11,7 +11,6 @@ from pathlib import Path
 
 from brain.files import pending
 from brain.files.audit import audit
-from brain.files.path_identity import stat_or_none as _stat_or_none
 from brain.files.write_guard import _MAX_RESULT_FILE_BYTES, check_size, check_write_target
 from brain.utils.time import lenient_utc
 
@@ -120,10 +119,9 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     op, content = rec["op"], rec["content"]
     # TOCTOU: re-run the guard on the resolved path RIGHT NOW.
     g = check_write_target(rec["resolved_path"], op=op, persona_dir=persona_dir)
-    # the identity the guard just approved; the opened file must still be it (#694)
-    expect = _stat_or_none(g.resolved) if g.ok and op == "append" else None
-    if g.ok and op == "append" and expect is None:
-        g = type(g)(ok=False, error=f"append target vanished after it was checked: {g.resolved}")
+    # the file the guard judged (one link); the opened file must be that one. Not a second stat:
+    # a link swapped in between would become the "expected" file (#694)
+    expect = g.stat if op == "append" else None
     if not g.ok or not check_size(content, op=op, resolved=g.resolved).ok:
         err = g.error or "size check failed"
         pending.mark(persona_dir, rid, status="refused")
