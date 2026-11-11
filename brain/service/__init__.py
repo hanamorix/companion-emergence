@@ -34,6 +34,12 @@ class UnsupportedPlatformError(RuntimeError):
     """
 
 
+def current_platform() -> str:
+    """The platform the service commands target. Also the seam for tests: patching ``sys.platform`` globally reaches the
+    stdlib and process-wide caches (#662, #710), so tests patch this instead."""
+    return sys.platform
+
+
 def current_backend() -> ModuleType:
     """Return the OS-appropriate service backend module.
 
@@ -41,20 +47,21 @@ def current_backend() -> ModuleType:
     ``brain.service.systemd`` (Linux user services), or
     ``brain.service.windows_service`` (Windows Task Scheduler).
     """
-    if sys.platform == "darwin":
+    platform = current_platform()
+    if platform == "darwin":
         from brain.service import launchd
 
         return launchd
-    if sys.platform == "linux":
+    if platform == "linux":
         from brain.service import systemd
 
         return systemd
-    if sys.platform.startswith("win"):
+    if platform.startswith("win"):
         from brain.service import windows_service
 
         return windows_service
     raise UnsupportedPlatformError(
-        f"No service backend for sys.platform={sys.platform!r}. "
+        f"No service backend for sys.platform={platform!r}. "
         "See docs/superpowers/plans/2026-05-08-launchd-supervisor-agent.md "
         "for the supported targets."
     )
