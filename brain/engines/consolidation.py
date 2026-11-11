@@ -38,6 +38,7 @@ import numpy as np
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.emotion import engine
+from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
@@ -917,7 +918,8 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
     The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
     have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
     BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
-    neither requeued nor settled as failed, so the outer per-item handler never sees it.
+    neither requeued nor settled as failed, so the outer per-item handler never sees it. A row whose stored emotion the read leaves
+    out is skipped the same way (logged, left as it was), because the write replaces the row's whole map.
     """
     try:
         live_engine = engine.engine_for(persona_dir)
@@ -927,10 +929,17 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
         if fresh is None:
             return  # hard-deleted since the importance update: nothing to write
         row = replace(fresh, importance=memory.importance)
-        # The engine's one read: faded, held to 0-10, canonical names. A name whose stored value is not a finite number (or whose fade
-        # failed, with a warning from the read) is left out of the written map, where it used to be written as 0.0: accepted edge, a
-        # value no writer produces (decisions.md, runner 6).
+        # The engine's one read: faded, held to 0-10, canonical names. `refresh_faded_emotions` replaces the row's whole map, so a
+        # stored name the read leaves out (a value that is not a finite number, or a fade that failed, with a warning from the
+        # read) would be deleted: that row is skipped and its stored values stay, as when a fade failed before. Two spellings of
+        # one name that the read pools into one are not missing. A skipped row keeps its unfaded values with the importance
+        # committed above, so they fade later under that new importance from the row's old `created_at`.
         faded = dict(live_engine.memory_feelings(row).feelings)
+        if any(canonical_name(name) not in faded for name in store.stored_emotion_names(row)):
+            logger.warning(
+                "consolidation gate: temp-gate write-back skipped for memory %s; the read left a stored emotion out", memory.id
+            )
+            return
         store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
     except Exception:  # noqa: BLE001
         # A lost write-back costs one refresh; the importance update has already committed.

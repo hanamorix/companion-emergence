@@ -177,6 +177,51 @@ def test_the_consolidation_write_back_writes_the_read_feelings(tmp_path: Path, e
         store.close()
 
 
+def test_stored_emotion_names_returns_text_names_only():
+    memory = _stored(emotions={"Joy": 1.0, "joy": 2.0, 3: 4.0})  # type: ignore[dict-item]
+    assert MemoryStore.stored_emotion_names(memory) == ["Joy", "joy"]
+    assert MemoryStore.stored_emotion_names(_stored(emotions={})) == []
+
+
+def test_the_write_back_skips_a_row_when_the_read_leaves_a_stored_name_out(tmp_path: Path, emotion_engine_stub, monkeypatch):
+    from types import SimpleNamespace
+
+    from brain.engines import consolidation
+
+    emotion_engine_stub.live = True
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        row = _stored(id="w", emotions={"joy": 9.0, "trust": 5.0}, importance=3.0)
+        store.create(row, fold=False)
+        # the read drops "trust" (a value that is not a finite number is dropped by the real read)
+        monkeypatch.setattr(emotion_engine_stub, "memory_feelings", lambda m: SimpleNamespace(feelings={"joy": 2.0}))
+        before = store.get("w", bump=False)
+        consolidation._write_back_faded_emotions(store, tmp_path, row)
+        after = store.get("w", bump=False)
+        assert after._stored_emotions == {"joy": 9.0, "trust": 5.0}  # stored values stay
+        assert after.created_at == before.created_at  # and the row is not touched at all
+    finally:
+        store.close()
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that the new skip guard does not fire on a pooled two-spelling row; the unguarded write-back already writes it"
+)
+def test_the_write_back_writes_a_row_whose_two_spellings_the_read_pools_into_one(tmp_path: Path, emotion_engine_stub):
+    from brain.engines import consolidation
+
+    emotion_engine_stub.live = True
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        row = _stored(id="w", emotions={"Joy": 4.0, "joy": 6.0}, importance=3.0)
+        store.create(row, fold=False)
+        assert len(store.get("w", bump=False)._stored_emotions) == 2  # both spellings are stored
+        consolidation._write_back_faded_emotions(store, tmp_path, row)
+        assert store.get("w", bump=False)._stored_emotions == {"joy": 5.0}  # pooled as their average, written back
+    finally:
+        store.close()
+
+
 def test_the_pure_read_is_what_every_engineless_reader_gets():
     memory = _stored(emotions={"joy": 4.0, "Joy": 2.0}, score=6.0, peak_emotion_intensity=4.0)
     read = memory_feelings(memory, None, None, None)

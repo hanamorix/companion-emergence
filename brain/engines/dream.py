@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from brain.bridge.provider import LLMProvider
+from brain.emotion import engine as emotion_engine
 from brain.emotion.aggregate import aggregate_state
 from brain.emotion.engine_utils import memory_feelings
 from brain.engines import dream_seeds
@@ -83,6 +84,13 @@ class DreamEngine:
                 "DreamEngine requires persona_system_prompt — construct "
                 "explicitly, don't rely on a default."
             )
+
+    def _feelings_of(self, memory: Memory) -> dict[str, float]:
+        """The one read of a memory's feelings: the persona's engine when this DreamEngine has a persona directory (faded values
+        once the persona has switched over), the pure read with no engine otherwise (tests). Held to 0-10, canonical names."""
+        if self.persona_dir is not None:
+            return dict(emotion_engine.engine_for(self.persona_dir).memory_feelings(memory).feelings)
+        return dict(memory_feelings(memory, None, None, None).feelings)
 
     def run_cycle(
         self,
@@ -184,6 +192,7 @@ class DreamEngine:
             w_identity=self.w_identity,
             w_grief=self.w_grief,
             w_refractory=self.w_refractory,
+            read=self._feelings_of,
         )
 
     def _recent_seed_ids(self, window: int) -> list[str]:
@@ -250,9 +259,9 @@ class DreamEngine:
         # show love=80 across 8 activated memories. Downstream consumers that
         # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
         # ingest, not here.
-        aggregated_emotions: dict[str, float] = dict(memory_feelings(seed, None, None, None).feelings)
+        aggregated_emotions: dict[str, float] = self._feelings_of(seed)
         for mem, _ in neighbours:
-            for k, v in memory_feelings(mem, None, None, None).feelings.items():
+            for k, v in self._feelings_of(mem).items():
                 aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
 
         dream = Memory.create_new(
@@ -340,7 +349,7 @@ class DreamEngine:
                 source="dream",
                 source_id=dream_memory.id,
                 emotional_snapshot=EmotionalSnapshot(
-                    vector=dict(memory_feelings(dream_memory, None, None, None).feelings),
+                    vector=self._feelings_of(dream_memory),
                     rolling_baseline_mean=0.0,
                     rolling_baseline_stdev=0.0,
                     current_resonance=0.0,

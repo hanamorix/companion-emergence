@@ -3915,6 +3915,15 @@ class MemoryStore:
         """
         return bool(memory._stored_emotions)
 
+    @staticmethod
+    def stored_emotion_names(memory: Memory) -> list[str]:
+        """The names the memory has stored emotions under, text names only (a name that is not text cannot be named canonically).
+
+        The temp-gate write-back's guard input: it compares these names, in canonical form, with the names the one read returns.
+        Names only, never values: the values go through `memory_feelings`.
+        """
+        return [name for name in memory._stored_emotions if isinstance(name, str)]
+
     def list_unembedded_since(
         self,
         cursor: int | None,

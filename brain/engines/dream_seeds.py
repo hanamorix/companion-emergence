@@ -1,19 +1,32 @@
 """Pure seed-selection logic for the dream cycle.
 
 No I/O and no engine dependencies — every function takes plain Memory /
-EmotionalState / Crystallization objects so it is unit-testable in isolation.
+EmotionalState / Crystallization objects (and, optionally, the caller's read of a memory's
+feelings as a function) so it is unit-testable in isolation.
 See docs/superpowers/specs/2026-05-26-multi-signal-dream-seeds-design.md.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Mapping
 from datetime import datetime
 
 from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.state import EmotionalState
 from brain.memory.store import Memory
 from brain.soul.crystallization import Crystallization
+
+# The one read of a memory's feelings, handed in by the caller (the DreamEngine passes the engine's read when it has a persona
+# directory). None means the pure read with no engine, so this module stays free of any engine or I/O.
+FeelingsRead = Callable[[Memory], Mapping[str, float]]
+
+
+def _feelings(memory: Memory, read: FeelingsRead | None) -> Mapping[str, float]:
+    """The memory's feelings through `read`, or through the pure read (stored values held to 0-10) when there is none."""
+    if read is not None:
+        return read(memory)
+    return memory_feelings(memory, None, None, None).feelings
 
 # Calibration defaults (overridable by callers / DreamEngine fields).
 MOOD_FLOOR = 0.5
@@ -24,15 +37,15 @@ W_GRIEF = 1.0
 W_REFRACTORY = 2.0
 
 
-def emotional_congruence(memory: Memory, mood: EmotionalState) -> float:
+def emotional_congruence(memory: Memory, mood: EmotionalState, read: FeelingsRead | None = None) -> float:
     """Sum over emotions shared by mood and memory of (mood_intensity * memory_value).
 
     The mood's channels are canonical emotion names (a mood is keyed by canonical name),
     so the memory's feelings are read by canonical name too: the one read of a memory's feelings
-    (`memory_feelings`, no engine here, so its stored values held to 0-10) gives canonical names, and two
-    spellings of one emotion in a memory count once, as their average.
+    (`read`, the engine's read when the caller has one, else the pure read with its stored values held to 0-10) gives
+    canonical names, and two spellings of one emotion in a memory count once, as their average.
     """
-    memory_values = memory_feelings(memory, None, None, None).feelings
+    memory_values = _feelings(memory, read)
     total = 0.0
     for name, intensity in mood.emotions.items():
         mv = memory_values.get(name, 0.0)
@@ -92,12 +105,12 @@ def identity_congruence(
     return best
 
 
-def grief_pull(memory: Memory) -> float:
+def grief_pull(memory: Memory, read: FeelingsRead | None = None) -> float:
     """Normalized bonus for actual grief breadcrumbs so loss gets reached
     within a grief-congruent pool. Fires only for grief_event memories."""
     if memory.memory_type != "grief_event":
         return 0.0
-    return memory_feelings(memory, None, None, None).feelings.get("memory_grief", 0.0) / 10.0
+    return _feelings(memory, read).get("memory_grief", 0.0) / 10.0
 
 
 def refractory_penalty(memory_id: str, recent_seed_ids: list[str]) -> float:
@@ -115,13 +128,14 @@ def composite_score(
     w_identity: float = W_IDENTITY,
     w_grief: float = W_GRIEF,
     w_refractory: float = W_REFRACTORY,
+    read: FeelingsRead | None = None,
 ) -> float:
     """Rank score inside the mood-gated pool. Emotional congruence is NOT a
     term here — it already acted as the gate. importance is normalized 0..1."""
     return (
         memory.importance / 10.0
         + w_identity * identity_congruence(memory, crystallizations)
-        + w_grief * grief_pull(memory)
+        + w_grief * grief_pull(memory, read)
         - w_refractory * refractory_penalty(memory.id, recent_seed_ids)
     )
 
@@ -137,12 +151,14 @@ def select_seed(
     w_identity: float = W_IDENTITY,
     w_grief: float = W_GRIEF,
     w_refractory: float = W_REFRACTORY,
+    read: FeelingsRead | None = None,
 ) -> Memory:
     """Mood-gated multi-signal seed selection. `candidates` must be non-empty
-    (the engine raises NoSeedAvailable before calling)."""
+    (the engine raises NoSeedAvailable before calling). `read` is the one read of a
+    memory's feelings (see `FeelingsRead`); None means the pure read."""
     pool = candidates
     if mood_is_active(mood, floor=mood_floor):
-        congruent = [m for m in candidates if emotional_congruence(m, mood) > 0.0]
+        congruent = [m for m in candidates if emotional_congruence(m, mood, read) > 0.0]
         if len(congruent) >= min_congruent:
             pool = congruent
 
@@ -150,7 +166,7 @@ def select_seed(
         score = composite_score(
             m, mood, crystallizations,
             recent_seed_ids=recent_seed_ids,
-            w_identity=w_identity, w_grief=w_grief, w_refractory=w_refractory,
+            w_identity=w_identity, w_grief=w_grief, w_refractory=w_refractory, read=read,
         )
         return (score, m.created_at, m.id)
 
