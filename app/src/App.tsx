@@ -570,8 +570,10 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           in its own column. */}
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
         <div style={{ transform: "translateY(50px)" }}>
+          {/* Nothing coming in (the poll is failing) means no state: the avatar shows neutral, not the last
+              good snapshot. */}
           <NellAvatar
-            state={state}
+            state={stateError ? null : state}
             persona={persona}
             isSpeaking={isSpeaking}
             soulFlashing={soulFlashing}

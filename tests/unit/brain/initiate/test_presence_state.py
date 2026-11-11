@@ -82,7 +82,7 @@ def test_save_presence_state_is_atomic_no_tmp_file_left(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# record_inbound_turn (silence-days event hook)
+# record_inbound_turn (last-seen event hook; nothing reads last_seen_ts for silence-days any more)
 # ---------------------------------------------------------------------------
 
 

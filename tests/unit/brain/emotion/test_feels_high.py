@@ -108,6 +108,13 @@ def test_the_default_floor_is_a_positive_number():
     assert dev_constants.FEELS_HIGH_FLOOR > 0.0
 
 
+def test_with_the_default_floor_a_feeling_under_one_is_never_high():
+    # The value in use, no patch: the top of its own range or a rising run does not make 0.5 or 0.99 high.
+    assert feels_high_from(0.5, 0, _days(0.0, 0.2, 0.5)) is False
+    assert feels_high_from(0.99, +1, []) is False
+    assert feels_high_from(1.0, +1, []) is True
+
+
 def test_below_the_floor_is_never_high_even_at_the_top_of_its_range(floor_one):
     # 0.9 is the highest of its own range (the range part alone would say high) and 0.02 is Hana's near-zero case.
     assert feels_high_from(0.9, 0, _days(*FLOOR_DAYS)) is False

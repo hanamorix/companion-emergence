@@ -25,22 +25,21 @@ from tests.unit.brain.emotion._engine_support import (
     NOW,
     LockSpy,
     commit_event,
-    engine_errors,
     install,
     local_day,
     local_noon,
+    lose_the_state,
+    make_live,
     make_persona,
     queue,
     queue_events,
     queue_text_lines,
-    refuse_the_switch_stat,
     row,
     ruin_the_state,
     save,
     save_as_backup,
     showing,
     simple_state,
-    skipped_warnings,
     state_of,
     tree,
 )
@@ -60,10 +59,13 @@ def world(tmp_path: Path) -> Iterator[tuple[Path, MemoryStore]]:
     store.close()
 
 
-def _backup_world(tmp_path: Path, rows=(), *, saved_at=None, start=True):
-    """A persona whose ONLY usable state is a backup saved at day 3 (one joy entry, average 4, weight 1), engine clock at day 8."""
+def _backup_world(tmp_path: Path, rows=(), *, saved_at=None, start=True, live=False):
+    """A persona whose ONLY usable state is a backup saved at day 3 (one joy entry, average 4, weight 1), engine clock at day 8.
+
+    With `live` the backup holds a switch-over time (day 1): the persona was switched over, and the copy says so.
+    """
     persona = make_persona(tmp_path / "persona", list(rows))
-    state = simple_state(saved_at=saved_at or D[3], joy=4.0, day=_day(3))
+    state = simple_state(saved_at=saved_at or D[3], joy=4.0, day=_day(3), switch_over_at=D[1] if live else None)
     if not start:
         state.persona_start_at = None
     save_as_backup(persona, state)
@@ -304,10 +306,6 @@ def test_a_queued_showing_for_a_skip_listed_row_still_folds_once_and_a_queued_co
 # --- failures of recovery and of the load (A5, A5b, A6, A7, A8c) ----------------------------------------------
 
 
-def _live(persona: Path) -> None:
-    assert engine_files.write_switch(persona, D[1])
-
-
 def _failing_catch_up(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*args: object, **kwargs: object) -> object:
         raise RuntimeError("the replay failed")
@@ -318,8 +316,7 @@ def _failing_catch_up(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_failed_recovery_on_a_live_persona_applies_nothing_keeps_the_queue_flags_it_and_logs_once_per_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    persona, eng = _backup_world(tmp_path)
-    _live(persona)
+    persona, eng = _backup_world(tmp_path, live=True)
     queue(persona, showing("s", D[7]))
     _failing_catch_up(monkeypatch)
     store = MemoryStore(persona / "memories.db")
@@ -339,99 +336,53 @@ def test_a_failed_recovery_on_a_live_persona_applies_nothing_keeps_the_queue_fla
     assert len([r for r in caplog.records if "catch-up of the backup state failed" in r.getMessage()]) == 1  # once per active day
 
 
-def test_a_failed_recovery_on_a_persona_that_is_not_live_continues_from_an_empty_state_and_writes(
+def test_a_failed_recovery_on_a_persona_that_is_not_live_skips_the_pass_keeps_the_queue_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    persona, eng = _backup_world(tmp_path)
-    _failing_catch_up(monkeypatch)
-    queue(persona, showing("s", D[7], {"joy": 6.0}))
-    eng.note_active(D[8])
-    state = state_of(persona)
-    assert state.emotions["joy"].short.avg == 6.0 and state.emotions["joy"].short.weight == 1.0  # from empty, not the backup's 4
-    assert engine_files.read_state(persona).source == "main" and queue_events(persona) == []
-
-
-def test_a_failed_recovery_with_the_switch_unknown_skips_the_pass_and_keeps_the_state_and_the_queue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The fallback to an empty state after a failed catch-up (fallback_empty) replaces the stored state, so it runs only when
-    the switch is known missing; an unknown switch ("assume it is not switched", owner 2026-11-05) skips the pass instead."""
+    """Planning B31 SW4: the failed-catch-up site follows the unreadable-state rule: no start from an empty state."""
     persona, eng = _backup_world(tmp_path)
     _failing_catch_up(monkeypatch)
     queue(persona, showing("s", D[7], {"joy": 6.0}))
     before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
-    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
-        eng.note_active(D[8])
-    assert len(skipped_warnings(caplog)) == 1
-    assert engine_errors(caplog) == []
-    assert eng._catch_up_failed is False
-    assert tree(persona / "state") == before  # the backup state is still the only copy, and the queue line is kept
-    assert len(queue_events(persona)) == 1
-    monkeypatch.undo()  # the fault clears: known missing, so the retry falls back to an empty state as before
-    _failing_catch_up(monkeypatch)
     eng.note_active(D[8])
-    assert state_of(persona).emotions["joy"].short.weight == 1.0 and queue_events(persona) == []
+    assert tree(persona / "state") == before  # no new main file, the queue line and its position kept
+    assert engine_files.read_state(persona).source == "bak1" and len(queue_events(persona)) == 1
 
 
-def test_a_direct_apply_with_the_switch_unknown_and_an_unreadable_state_keeps_the_memory_and_the_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_direct_apply_on_an_unreadable_state_of_a_persona_this_instance_has_not_seen_switched_skips_and_writes_nothing(
+    tmp_path: Path,
 ) -> None:
+    """Planning B31 SW4 (supersedes B25 edge (a)): with every copy of the state unreadable nothing can say whether the persona
+    was switched over, so it reads as not switched, and the apply is skipped: the unreadable copies are left for the first
+    rebuild at the next start, which decides from the database's x10 record. The memory is saved all the same."""
     persona = make_persona(tmp_path / "persona")
-    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    save(persona, simple_state(saved_at=D[3], day=_day(3), switch_over_at=D[1]))
     ruin_the_state(persona)
-    eng = install(persona, D[8])
-    store = MemoryStore(persona / "memories.db")
+    eng = install(persona, D[8])  # a new instance: it never saw the switch-over
     before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
+    store = MemoryStore(persona / "memories.db")
     try:
-        with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
-            memory = row(D[7], emotions={"joy": 6.0})
-            store.create(memory)
+        memory = row(D[7], emotions={"joy": 6.0})
+        store.create(memory)
         assert store.get(memory.id, bump=False) is not None
     finally:
         store.close()
     assert tree(persona / "state") == before
-    assert len(skipped_warnings(caplog)) == 1
-    assert engine_errors(caplog) == []
-    assert eng._catch_up_failed is False
-
-
-def test_a_batch_with_the_switch_unknown_and_an_unreadable_state_keeps_the_memories_and_the_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    persona = make_persona(tmp_path / "persona")
-    save(persona, simple_state(saved_at=D[3], day=_day(3)))
-    ruin_the_state(persona)
-    eng = install(persona, D[8])
-    store = MemoryStore(persona / "memories.db")
-    before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
-    try:
-        with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
-            with eng.batch():
-                first, second = row(D[6], emotions={"joy": 6.0}), row(D[7], emotions={"joy": 5.0})
-                store.create(first)
-                store.create(second)
-        assert store.get(first.id, bump=False) is not None and store.get(second.id, bump=False) is not None
-    finally:
-        store.close()
-    assert tree(persona / "state") == before
-    assert len(skipped_warnings(caplog)) == 1  # one apply at the end of the block, so one skipped pass
-    assert engine_errors(caplog) == []
+    assert engine_files.read_state(persona).problem == "unreadable"
+    assert eng.is_live() is False
 
 
 def test_an_unreadable_state_on_a_live_persona_is_never_overwritten_and_the_direct_apply_logs_and_flags(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     persona = make_persona(tmp_path / "persona")
-    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    save(persona, simple_state(saved_at=D[3], day=_day(3), switch_over_at=D[1]))
+    eng = install(persona, D[8])
+    assert eng.is_live()  # a running engine has seen the switch-over; the state is damaged afterwards
     for suffix in ("", ".bak1", ".bak2", ".bak3"):
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    _live(persona)
-    eng = install(persona, D[8])
     store = MemoryStore(persona / "memories.db")
     before = tree(persona / "state")
     try:
@@ -448,8 +399,10 @@ def test_an_unreadable_state_on_a_live_persona_is_never_overwritten_and_the_dire
 
 def test_a_live_persona_with_no_state_is_flagged_and_nothing_is_written(world, caplog: pytest.LogCaptureFixture) -> None:
     persona, store = world
-    _live(persona)
+    make_live(persona, D[1])
     eng = install(persona, NOW)
+    assert eng.is_live()  # the running engine has seen the switch-over; the state is gone afterwards
+    lose_the_state(persona)
     store.create(row(NOW - timedelta(hours=1)))
     assert not engine_files.state_path(persona).exists()
     assert eng.status().caught_up is False  # observed through status(), not through read()
@@ -466,13 +419,13 @@ def test_read_on_a_corrupted_state_recovers_nothing_writes_nothing_and_returns_t
 
 def test_a_state_repaired_outside_the_engine_clears_the_failure_at_the_next_load_and_a_write_does_too(tmp_path: Path) -> None:
     persona = make_persona(tmp_path / "persona")
-    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    save(persona, simple_state(saved_at=D[3], day=_day(3), switch_over_at=D[1]))
+    eng = install(persona, D[8])
+    assert eng.is_live()  # the running engine has seen the switch-over; the state is damaged afterwards
     for suffix in ("", ".bak1", ".bak2", ".bak3"):
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    _live(persona)
-    eng = install(persona, D[8])
     eng.note_active(D[8])
     assert eng.status().caught_up is False and eng.read() == {}
     save(persona, simple_state(saved_at=D[7], joy=5.0, day=_day(7)))  # repaired by someone else

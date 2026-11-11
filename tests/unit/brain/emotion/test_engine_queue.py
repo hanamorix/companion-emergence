@@ -2032,13 +2032,15 @@ def test_the_hooks_run_after_the_commit_and_after_the_reembed(
 # --- C5b: methods that stay silent ---------------------------------------------------------------
 
 
-def test_update_emotions_batch_and_set_active_clear_snapshot_fire_no_hook(
+@pytest.mark.no_base_failure(
+    reason="the retained half of a test whose other half (update_emotions_batch) was removed with the old decay pass; set_active_clear_snapshot was already silent on base"
+)
+def test_set_active_clear_snapshot_fires_no_hook(
     tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     probe = _Probe(monkeypatch)
     probe.wrap(engine_module, "engine_for")
     mem = _row_without_emotions(hook_store)
-    hook_store.update_emotions_batch([(mem.id, {"joy": 3.0})])
     hook_store.set_active_clear_snapshot(mem.id)
     assert not engine_files.queue_path(tmp_path).exists() and probe.n("engine_for") == 0
     other = _row_without_emotions(hook_store)
@@ -2216,7 +2218,7 @@ def test_a_showing_carries_the_faded_value_at_the_given_or_the_entry_time(
     assert len(_events(tmp_path)) == 2
 
 
-def test_fold_change_queues_one_change_event_and_writes_no_change_log(
+def test_fold_change_queues_one_change_event_and_a_live_engine_writes_one_change_log_line_for_each(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(EngineCls, "is_live", lambda self: True)
@@ -2226,19 +2228,14 @@ def test_fold_change_queues_one_change_event_and_writes_no_change_log(
     first, second = _events(tmp_path)
     assert (first.kind, first.at, first.source, dict(first.emotions)) == ("change", NOW, "pass2", {"joy": -2.0, "grief": 1.0})
     assert second.at == NOW - timedelta(hours=2) and second.source == "chat"
-    assert not engine_files.changes_dir(tmp_path).exists()  # the change-log line is the switch-over's step
+
+    def logged() -> int:
+        return sum(len(path.read_text(encoding="utf-8").splitlines()) for path in engine_files.changes_dir(tmp_path).glob("*.jsonl"))
+
+    assert logged() == 2  # the change-log line is written with the queue line once the persona is live
     engine.fold_change({}, None, "x")
     engine.fold_change({"joy": math.nan}, None, "x")
-    assert len(_events(tmp_path)) == 2
-
-
-# --- C10 --------------------------------------------------------------------------------------
-
-
-def test_peer_trust_is_zero_and_does_no_io(tmp_path: Path) -> None:
-    assert engine_files.peer_trust(tmp_path, "anyone") == 0.0
-    assert engine_files.peer_trust(tmp_path / "no" / "such", "") == 0.0
-    assert list(tmp_path.iterdir()) == []
+    assert len(_events(tmp_path)) == 2 and logged() == 2
 
 
 # --- C12(c): the store reaches the stub through the module attribute ----------------------------
