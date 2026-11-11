@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain import dev_constants
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.new_sources import (
     GateThresholds,
@@ -62,7 +63,7 @@ class MemoryActivationBaseline:
         # the bridge's MemoryStore writer; WAL removes the reader/writer lock.
         if ":memory:" not in str(self._db_path):
             self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA busy_timeout = 5000")
+            self._conn.execute(f"PRAGMA busy_timeout = {int(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S * 1000)}")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_activation_baseline (
@@ -306,7 +307,10 @@ def run_resonance_tick(
             if row is None or row.update_count < thresholds.recall_resonance_bootstrap_min_count:
                 continue
 
-            memory = store.get(memory_id) if store is not None else None
+            # bump=False: this read exists only to get last_accessed_at for the staleness gate below. It shows her
+            # nothing, so it is not an access; a default get would add 1.0 to recall_count and set last_accessed_at
+            # to now for each of up to 50 memories on every tick, about every 15 minutes.
+            memory = store.get(memory_id, bump=False) if store is not None else None
             if memory is None:
                 continue
 

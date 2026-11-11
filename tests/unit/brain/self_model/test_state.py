@@ -146,3 +146,80 @@ def test_a_corrupt_state_file_warns_once_not_every_turn(tmp_path, monkeypatch, c
         for _ in range(3):
             load_or_recover(tmp_path)
     assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+
+
+# ── B2 phase B: Gap.directions and Gap.reset_seen survive the file ────────────
+
+
+def test_directions_and_reset_seen_survive_save_and_load(tmp_path):
+    from brain.self_model.gap import Gap
+
+    gap = Gap(
+        per_channel={"joy": 1.5, "calm": -0.5},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        directions={"joy": 1, "calm": -1},
+        reset_seen="2026-11-04T10:00:00+00:00",
+    )
+    save(tmp_path, SelfModelState(current_gap=gap, gap_history=[gap]))
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered
+    assert loaded.current_gap.directions == {"joy": 1, "calm": -1}
+    assert loaded.current_gap.reset_seen == "2026-11-04T10:00:00+00:00"
+    assert loaded.gap_history[0].directions == {"joy": 1, "calm": -1}
+
+
+def test_a_stored_none_reset_seen_reads_back_as_none_not_unset(tmp_path):
+    from brain.self_model.gap import UNSET, Gap
+
+    gap = Gap(per_channel={}, magnitude=0.0, unnamed_pressure=0.0, reset_seen=None)
+    save(tmp_path, SelfModelState(current_gap=gap))
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.current_gap.reset_seen is None
+    assert loaded.current_gap.reset_seen is not UNSET
+
+
+def test_a_gap_that_never_stored_reset_seen_reads_back_as_unset_and_stays_without_the_key(tmp_path):
+    import json
+
+    from brain.self_model.gap import UNSET, Gap
+
+    gap = Gap(per_channel={"joy": 1.0}, magnitude=1.0, unnamed_pressure=0.0)
+    assert gap.reset_seen is UNSET
+    save(tmp_path, SelfModelState(current_gap=gap))
+    raw = json.loads((tmp_path / "self_model_state.json").read_text(encoding="utf-8"))
+    assert "reset_seen" not in raw["current_gap"]
+    assert raw["current_gap"]["directions"] == {}
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.current_gap.reset_seen is UNSET
+
+
+def test_a_pre_field_gap_history_item_still_loads(tmp_path):
+    import json
+
+    from brain.self_model.gap import UNSET
+
+    old_item = {
+        "per_channel": {"calm": 2.0},
+        "magnitude": 2.0,
+        "unnamed_pressure": 0.0,
+        "status": "resolved",
+    }
+    (tmp_path / "self_model_state.json").write_text(
+        json.dumps({"current_gap": None, "gap_history": [old_item]}), encoding="utf-8"
+    )
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered
+    assert loaded.gap_history[0].directions == {}
+    assert loaded.gap_history[0].reset_seen is UNSET
+
+
+def test_a_malformed_directions_value_loads_as_empty(tmp_path):
+    import json
+
+    item = {"per_channel": {"joy": 1.0}, "magnitude": 1.0, "unnamed_pressure": 0.0, "directions": "up"}
+    (tmp_path / "self_model_state.json").write_text(
+        json.dumps({"current_gap": item, "gap_history": []}), encoding="utf-8"
+    )
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.current_gap.directions == {}

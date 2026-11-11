@@ -217,7 +217,7 @@ def test_an_unreadable_file_raises_and_is_not_modified(t, tmp_path, monkeypatch)
     def boom(*args, **kwargs):
         raise PermissionError("denied")
 
-    monkeypatch.setattr("brain.utils.toml_io._read_bytes", boom)
+    monkeypatch.setattr("brain.utils.toml_io.read_bytes_stat", boom)
     with pytest.raises(t.TunablesWriteError):
         t.set_values({"a": 2})
     monkeypatch.undo()
@@ -239,9 +239,9 @@ def test_the_write_is_fsynced_before_the_replace(t, tmp_path, monkeypatch) -> No
     t.register("a", 1)
     write_text(tmp_path, '"a" = 1\n')
     order: list[str] = []
-    real_fsync, real_replace = os.fsync, atomic_write._replace_with_retry
+    real_fsync, real_replace = os.fsync, atomic_write.replace_file
     monkeypatch.setattr(toml_io.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
-    monkeypatch.setattr(atomic_write, "_replace_with_retry", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
+    monkeypatch.setattr(atomic_write, "replace_file", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
     t.set_values({"a": 2})
     assert order[:2] == ["fsync", "replace"]  # the data is on disk before the replace; the folder fsync comes after
 
@@ -357,7 +357,7 @@ def test_an_io_failure_is_not_cached_and_the_previous_values_stay_in_force(t, tm
     path.write_text('"a" = 22\n', encoding="utf-8")  # a change the reader must pick up
     from brain.utils import toml_io
 
-    real = toml_io._read_bytes
+    real = toml_io.read_bytes_stat
     calls = {"n": 0}
 
     def flaky(p):
@@ -366,7 +366,7 @@ def test_an_io_failure_is_not_cached_and_the_previous_values_stay_in_force(t, tm
             raise PermissionError("busy")
         return real(p)
 
-    monkeypatch.setattr(toml_io, "_read_bytes", flaky)
+    monkeypatch.setattr(toml_io, "read_bytes_stat", flaky)
     assert t.get_tunable("a", 0) == 1  # the failed read did not wipe the values
     assert t.get_tunable("a", 0) == 22  # and was not cached: the next call re-read the file
 

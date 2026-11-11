@@ -7,8 +7,12 @@ at BOTH propose and commit (TOCTOU). Pure + exhaustively tested."""
 from __future__ import annotations
 
 import os
+import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+from brain.files.path_identity import stat_or_none, under_any
 
 _MAX_WRITE_BYTES = 1 * 1024 * 1024          # 1 MB per proposal
 _MAX_RESULT_FILE_BYTES = 25 * 1024 * 1024   # 25 MB resulting-file ceiling (append)
@@ -31,24 +35,67 @@ class GuardResult:
     error: str | None = None
 
 
-def _is_within(child: Path, parent: Path) -> bool:
-    """True if child == parent or is under it, comparing casefolded real paths
-    (macOS is case-insensitive — block ~/.SSH too)."""
+def _real(p: Path) -> Path | None:
     try:
-        c = os.path.normcase(os.path.realpath(child))
-        p = os.path.normcase(os.path.realpath(parent))
-    except OSError:
+        return Path(os.path.realpath(p))
+    except (OSError, ValueError):
+        return None
+
+
+def _is_windows() -> bool:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib (#662)."""
+    return sys.platform == "win32"
+
+
+def _fold(name: str) -> str:
+    """Canonical caseless form: equal for any case or Unicode-normalisation variant,
+    and on Windows for the trailing dots and spaces Win32 drops from a segment
+    (``.aws.`` creates ``.aws``)."""
+    if _is_windows():
+        name = name.rstrip(". ")
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """Deny-list test: True if child is parent or under it (#607).
+
+    `parent` may not exist yet (commit creates missing parents, so writing
+    ``~/.AWS/credentials`` with no ``~/.aws`` would create the directory the AWS
+    CLI then reads). So split `parent` at its nearest existing ancestor: that
+    anchor is matched against child's ancestors by file identity, which holds for
+    any case or Unicode-normalisation variant the volume accepts, and the missing
+    tail is matched by folded spelling. When `parent` exists the tail is empty and
+    this is a plain identity check. On a case-sensitive volume the folding also
+    refuses a differently-cased sibling of a missing directory, the safe side for
+    a deny list."""
+    c, p = _real(child), _real(parent)
+    if c is None or p is None:
         return False
-    return c == p or c.startswith(p + os.sep)
+    anchor, tail = p, ()
+    while stat_or_none(anchor) is None and anchor != anchor.parent:
+        anchor, tail = anchor.parent, (anchor.name, *tail)
+    st = stat_or_none(anchor)
+    if st is None:
+        return False
+    for anc in (c, *c.parents):
+        s = stat_or_none(anc)
+        if s is not None and os.path.samestat(s, st):
+            rest = c.parts[len(anc.parts):len(anc.parts) + len(tail)]
+            return len(rest) == len(tail) and all(_fold(a) == _fold(b) for a, b in zip(rest, tail, strict=True))
+    return False
 
 
 def is_within_authorized(resolved: Path, folder: Path | None) -> bool:
-    """True only if `resolved`'s real path is inside `folder`. Escape-proof
-    (realpath collapses .. and symlinks). None folder → always False (notes
-    disabled = nothing authorized)."""
+    """True only if `resolved`'s real path is inside `folder`, by file identity
+    (#607), so the folder may be given in any case the volume accepts. Escape-proof
+    (realpath collapses .. and symlinks before the ancestors are compared). No
+    spelling fallback: this is an allow-list, and a folder that does not exist
+    authorizes nothing. None folder → always False (notes disabled = nothing
+    authorized)."""
     if folder is None:
         return False
-    return _is_within(resolved, folder)
+    c, st = _real(resolved), stat_or_none(folder)
+    return c is not None and st is not None and under_any(c, [st])
 
 
 def _denied(resolved: Path, persona_dir: Path) -> bool:
@@ -70,6 +117,9 @@ def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardRes
         resolved = Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
     except (OSError, ValueError) as exc:
         return GuardResult(ok=False, error=f"bad path: {exc}")
+    if _is_windows() and any(":" in part for part in resolved.parts[1:]):
+        # an NTFS stream (``.aws::$INDEX_ALLOCATION`` creates the directory) slips past both comparisons
+        return GuardResult(ok=False, error=f"bad path: {resolved} names an NTFS stream")
     if _denied(resolved, persona_dir):
         return GuardResult(ok=False, error=f"denied: {resolved} is in a protected location")
     if op == "create":

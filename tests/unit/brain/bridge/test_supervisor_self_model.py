@@ -2,8 +2,9 @@
 
 Task 7 (Organ DoD): the producer (self-model reflection) fires through the
 supervisor's own persisted-cadence block — NOT a monotonic timer. The tick
-composes the whole organ end-to-end: short (compute_derived) vs long
-(compute_baseline) → gap → state persistence → cadence advance, fail-isolated.
+composes the whole organ end-to-end: the emotion engine's shifted channels
+(an `emotion_engine_stub` here) → gap → state persistence → cadence advance,
+fail-isolated.
 """
 
 from __future__ import annotations
@@ -12,8 +13,14 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.bridge.provider import FakeProvider
-from brain.bridge.supervisor import _run_self_model_tick
+from brain.bridge.supervisor import (
+    _run_self_model_tick,
+    _self_model_engine_reads,
+    _self_model_reflect,
+)
 
 
 class _CapturingBus:
@@ -34,47 +41,36 @@ def _persona_dir(tmp_path: Path) -> Path:
     return p
 
 
-def _seed_divergent_memories(persona_dir: Path, now: datetime | None = None) -> None:
-    """A genuine, sustained short-vs-long (recent-vs-baseline) cross on two channels.
+def _reading(short=0.0, long=0.0, difference=0.0, shift=0):
+    from brain.emotion.engine import Reading
 
-    Placed RELATIVE to ``now`` (the tick's reference instant) so "recent" is recent
-    for that tick:
-      - joy:   OLD low events (2.0) + RECENT high events (9.0) → the SHORT read runs
-               above the LONG baseline → a GOLDEN cross (delta > +0.5).
-      - grief: OLD high events (9.0) + RECENT low events (2.0) → the SHORT read runs
-               below baseline → a DEATH cross (delta < -0.5).
-    Each channel is MULTI-event (a single event would give short == long under the
-    normalized mean, hence no gap). The deltas are ~±1.8, robustly above the 0.5
-    noise floor, so {joy, grief} is a stable per_channel key set across ticks — as
-    ``now`` advances over a fixed memory set every event ages by the same amount, a
-    uniform time-shift the normalized mean is invariant to, so the cross persists and
-    sustained_ticks accumulates. Two divergent channels so a reconcile on joy leaves
+    return Reading(short=short, long=long, difference=difference, shift=shift)
+
+
+def _divergent_readings() -> dict:
+    """The engine's read for a genuine, sustained recent-vs-baseline divergence on two channels.
+
+    joy runs above its baseline (difference +1.8, shift rising), grief below (difference -1.8, shift fading), so
+    {joy, grief} is a stable per_channel key set across ticks. Two divergent channels so a reconcile on joy leaves
     the gap non-empty (grief remains).
     """
-    from brain.memory.store import Memory, MemoryStore
+    return {
+        "joy": _reading(short=9.0, long=7.2, difference=1.8, shift=1),
+        "grief": _reading(short=2.0, long=3.8, difference=-1.8, shift=-1),
+    }
 
-    now = now or datetime.now(UTC)
-    store = MemoryStore(persona_dir / "memories.db")
-    try:
-        for name, old_val, new_val in (("joy", 2.0, 9.0), ("grief", 9.0, 2.0)):
-            for days in (40, 45, 50):  # OLD events
-                m = Memory.create_new(
-                    content=f"an old {name} memory",
-                    memory_type="episodic", domain="self",
-                    emotions={name: old_val}, importance=7.0,
-                )
-                object.__setattr__(m, "created_at", now - timedelta(days=days))
-                store.create(m)
-            for hours in (1, 3, 6):  # RECENT events
-                m = Memory.create_new(
-                    content=f"a recent {name} memory",
-                    memory_type="episodic", domain="self",
-                    emotions={name: new_val}, importance=7.0,
-                )
-                object.__setattr__(m, "created_at", now - timedelta(hours=hours))
-                store.create(m)
-    finally:
-        store.close()
+
+@pytest.fixture(autouse=True)
+def _engine_reads_a_divergence(emotion_engine_stub):
+    emotion_engine_stub.readings = _divergent_readings()
+    return emotion_engine_stub
+
+
+def _reflect(persona_dir: Path, *, provider, event_bus, now: datetime) -> bool:
+    """`_self_model_reflect` with the engine reads the tick would have taken for this persona."""
+    reads = _self_model_engine_reads(persona_dir)
+    assert reads is not None, "the stub's read must be non-empty and caught up"
+    return _self_model_reflect(persona_dir, provider=provider, event_bus=event_bus, now=now, reads=reads)
 
 
 def test_self_model_tick_runs_end_to_end_and_persists_state(tmp_path: Path) -> None:
@@ -85,7 +81,6 @@ def test_self_model_tick_runs_end_to_end_and_persists_state(tmp_path: Path) -> N
     from brain.self_model import state as sm_state
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     # Fresh cadence (next_reflection_at=None) → due now.
@@ -108,8 +103,8 @@ def test_self_model_tick_runs_end_to_end_and_persists_state(tmp_path: Path) -> N
     assert not sm_cadence.is_due(advanced, now=datetime.now(UTC))
 
 
-def test_self_model_tick_fail_isolated_on_derived_error(tmp_path: Path) -> None:
-    """If compute_derived raises, the tick logs and does NOT propagate —
+def test_self_model_tick_fail_isolated_on_gap_error(tmp_path: Path) -> None:
+    """If building the gap raises, the tick logs and does NOT propagate —
     the supervisor survives (Organ DoD fail-isolation). The cadence still
     advances (with a backoff) so the tick doesn't busy-loop on the error.
     """
@@ -118,12 +113,11 @@ def test_self_model_tick_fail_isolated_on_derived_error(tmp_path: Path) -> None:
     from brain.self_model import cadence as sm_cadence
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     with patch(
-        "brain.bridge.supervisor.compute_derived",
-        side_effect=RuntimeError("derived blew up"),
+        "brain.bridge.supervisor.gap_from_read",
+        side_effect=RuntimeError("gap blew up"),
     ):
         # Must NOT raise — fail-isolation.
         _run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=bus)
@@ -139,7 +133,6 @@ def test_self_model_tick_increments_gaps_surfaced_when_gap_active(tmp_path: Path
     from brain.self_model.resolve import load_audit
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     _run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=bus)
@@ -156,7 +149,6 @@ def test_self_model_tick_not_due_returns_early(tmp_path: Path) -> None:
     from brain.self_model import cadence as sm_cadence
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     # Force the cadence far into the future → not due.
@@ -179,7 +171,6 @@ def test_self_model_tick_fail_isolated_on_articulate_error(tmp_path: Path) -> No
     from brain.self_model import cadence as sm_cadence
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     with patch(
@@ -224,7 +215,6 @@ def test_preflight_peek_denial_is_zero_side_effect(tmp_path: Path) -> None:
     from brain.self_model.resolve import load_audit
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     cli_throttle.mark_interactive_active()  # chat "just happened" — denies the peek
@@ -276,7 +266,6 @@ def test_rare_race_throttle_deferred_still_persists_state_but_defers_cadence(
     from brain.self_model import cadence as sm_cadence
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir)
     bus = _CapturingBus()
 
     with patch(
@@ -301,14 +290,12 @@ def test_carry_forward_same_channels_open_status_note_present(tmp_path: Path) ->
     present → the note IS carried forward onto the new gap."""
     from unittest.mock import patch
 
-    from brain.bridge.supervisor import _self_model_reflect
     from brain.self_model import state as sm_state
     from brain.self_model.gap import Gap
 
     provider = FakeProvider()
     base = datetime(2026, 6, 1, tzinfo=UTC)
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir, now=base)
 
     prior_gap = Gap(
         per_channel={"joy": 1.8, "grief": -1.8},
@@ -319,6 +306,7 @@ def test_carry_forward_same_channels_open_status_note_present(tmp_path: Path) ->
         first_seen_ts=base.isoformat(),
         last_seen_ts=base.isoformat(),
         sustained_ticks=1,
+        reset_seen=None,
     )
     sm_state.save(
         persona_dir,
@@ -326,7 +314,7 @@ def test_carry_forward_same_channels_open_status_note_present(tmp_path: Path) ->
     )
 
     with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
-        _self_model_reflect(
+        _reflect(
             persona_dir,
             provider=provider,
             event_bus=_CapturingBus(),
@@ -349,14 +337,12 @@ def test_carry_forward_blocked_on_different_channels(tmp_path: Path) -> None:
     gap, must NOT have its stale, off-channel note carried forward."""
     from unittest.mock import patch
 
-    from brain.bridge.supervisor import _self_model_reflect
     from brain.self_model import state as sm_state
     from brain.self_model.gap import Gap
 
     provider = FakeProvider()
     base = datetime(2026, 6, 1, tzinfo=UTC)
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir, now=base)  # new tick will be {joy, grief}
 
     prior_gap = Gap(
         per_channel={"focus": 1.2},  # disjoint from {joy, grief}
@@ -367,6 +353,7 @@ def test_carry_forward_blocked_on_different_channels(tmp_path: Path) -> None:
         first_seen_ts=base.isoformat(),
         last_seen_ts=base.isoformat(),
         sustained_ticks=1,
+        reset_seen=None,
     )
     sm_state.save(
         persona_dir,
@@ -374,7 +361,7 @@ def test_carry_forward_blocked_on_different_channels(tmp_path: Path) -> None:
     )
 
     with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
-        _self_model_reflect(
+        _reflect(
             persona_dir,
             provider=provider,
             event_bus=_CapturingBus(),
@@ -395,17 +382,15 @@ def test_carry_forward_blocked_when_no_prior_note(tmp_path: Path) -> None:
     stays None (nothing to carry forward)."""
     from unittest.mock import patch
 
-    from brain.bridge.supervisor import _self_model_reflect
     from brain.self_model import state as sm_state
 
     provider = FakeProvider()
     base = datetime(2026, 6, 1, tzinfo=UTC)
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir, now=base)
     # No prior state file written — this is a fresh persona's first tick.
 
     with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
-        _self_model_reflect(
+        _reflect(
             persona_dir, provider=provider, event_bus=_CapturingBus(), now=base
         )
 
@@ -425,14 +410,12 @@ def test_carry_forward_requires_prior_status_open_not_just_same_channels(
     wording named only the channel-set half of the predicate it reuses)."""
     from unittest.mock import patch
 
-    from brain.bridge.supervisor import _self_model_reflect
     from brain.self_model import state as sm_state
     from brain.self_model.gap import Gap
 
     provider = FakeProvider()
     base = datetime(2026, 6, 1, tzinfo=UTC)
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir, now=base)
 
     # Hand-construct a prior state: an "acknowledged" (NOT open) gap on the
     # exact channel set the seeded memories will produce ({joy, grief}), with
@@ -446,6 +429,7 @@ def test_carry_forward_requires_prior_status_open_not_just_same_channels(
         first_seen_ts=base.isoformat(),
         last_seen_ts=base.isoformat(),
         sustained_ticks=1,
+        reset_seen=None,
     )
     sm_state.save(
         persona_dir,
@@ -453,7 +437,7 @@ def test_carry_forward_requires_prior_status_open_not_just_same_channels(
     )
 
     with patch("brain.bridge.supervisor.sm_articulate", return_value=None):
-        _self_model_reflect(
+        _reflect(
             persona_dir,
             provider=provider,
             event_bus=_CapturingBus(),
@@ -483,24 +467,8 @@ def _capture_feed_events():
     return captured, lambda: ev.set_publisher(None)
 
 
-def _clear_emotion_memories(persona_dir: Path) -> None:
-    """Deactivate every emotion-bearing memory so declared/derived re-match.
-
-    After this the self-model gap collapses to magnitude 0 (natural
-    reconvergence — no reconcile tool call).
-    """
-    from brain.memory.store import MemoryStore
-
-    store = MemoryStore(persona_dir / "memories.db")
-    try:
-        store._conn.execute("UPDATE memories SET active = 0")  # noqa: SLF001
-        store._conn.commit()
-    finally:
-        store.close()
-
-
 def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
-    tmp_path: Path,
+    tmp_path: Path, emotion_engine_stub
 ) -> None:
     """Organ DoD (C1): a gap that genuinely sustains across REAL reflection ticks
     and then resolves emits a soul candidate + a feed event — on BOTH paths.
@@ -510,7 +478,6 @@ def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
     """
     from datetime import timedelta
 
-    from brain.bridge.supervisor import _self_model_reflect
     from brain.ingest.soul_queue import list_soul_candidates
     from brain.self_model import state as sm_state
     from brain.self_model.reconcile import reconcile_self_read
@@ -520,13 +487,12 @@ def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
     base = datetime(2026, 6, 1, tzinfo=UTC)
 
     def _tick(persona_dir: Path, now: datetime) -> None:
-        _self_model_reflect(
+        _reflect(
             persona_dir, provider=provider, event_bus=_CapturingBus(), now=now
         )
 
     # ── PATH A — reconcile ───────────────────────────────────────────────────
     pa = _persona_dir(tmp_path)
-    _seed_divergent_memories(pa, now=base)
 
     # Sustain the gap over enough real ticks to cross _SUSTAINED_TICKS.
     for i in range(_SUSTAINED_TICKS + 1):
@@ -558,7 +524,6 @@ def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
     pb_root = tmp_path / "b"
     pb_root.mkdir()
     pb = _persona_dir(pb_root)
-    _seed_divergent_memories(pb, now=base)
 
     for i in range(_SUSTAINED_TICKS + 1):
         _tick(pb, base + timedelta(hours=6 * i))
@@ -566,8 +531,8 @@ def test_sustained_gap_resolved_through_live_tick_emits_soul_candidate(
     sustained_b = sm_state.load_or_recover(pb)[0].current_gap
     assert sustained_b is not None and sustained_b.sustained_ticks >= _SUSTAINED_TICKS
 
-    # Memories re-match (declared == derived → magnitude collapses to 0). No tool.
-    _clear_emotion_memories(pb)
+    # The engine reads no channel as shifted any more (magnitude collapses to 0). No tool.
+    emotion_engine_stub.readings = {name: _reading(short=5.0, long=5.0) for name in ('joy', 'grief')}
 
     events_b, teardown_b = _capture_feed_events()
     try:
@@ -592,7 +557,6 @@ def test_reconcile_cooldown_suppresses_channel_on_next_live_tick(tmp_path: Path)
     """
     from datetime import timedelta
 
-    from brain.bridge.supervisor import _self_model_reflect
     from brain.self_model import state as sm_state
     from brain.self_model.reconcile import is_channel_in_cooldown, reconcile_self_read
 
@@ -600,10 +564,9 @@ def test_reconcile_cooldown_suppresses_channel_on_next_live_tick(tmp_path: Path)
     base = datetime(2026, 6, 1, tzinfo=UTC)
 
     persona_dir = _persona_dir(tmp_path)
-    _seed_divergent_memories(persona_dir, now=base)
 
     # Tick once → a gap surfaces on joy (and grief).
-    _self_model_reflect(
+    _reflect(
         persona_dir, provider=provider, event_bus=_CapturingBus(), now=base
     )
     gap = sm_state.load_or_recover(persona_dir)[0].current_gap
@@ -616,7 +579,7 @@ def test_reconcile_cooldown_suppresses_channel_on_next_live_tick(tmp_path: Path)
 
     # Next live tick, still inside the cooldown window: joy must be suppressed
     # from the surfaced gap, and the cooldown carried forward.
-    _self_model_reflect(
+    _reflect(
         persona_dir, provider=provider, event_bus=_CapturingBus(), now=base + timedelta(hours=6)
     )
     new_gap = sm_state.load_or_recover(persona_dir)[0].current_gap
@@ -625,3 +588,288 @@ def test_reconcile_cooldown_suppresses_channel_on_next_live_tick(tmp_path: Path)
     assert is_channel_in_cooldown(new_gap, "joy", now=base + timedelta(hours=6)) is True, (
         "non-expired cooldown must survive the recompute / status flip"
     )
+
+
+# ── the tick (engine reads, reset test, spare rule, cooldown pruning) ──
+#
+# The tick takes status(), read(), status() and builds the gap from the engine's shifted channels.
+
+
+def _live_tick(persona_dir, stub, *, readings, statuses=None, order=None):
+    """Run the tick with the engine live. `statuses` are the answers of the two `status()` calls, in order."""
+    from brain.emotion.engine import EngineStatus
+
+    stub.readings = readings
+    answers = list(statuses or [EngineStatus(True, None), EngineStatus(True, None)])
+    real_read = stub.read
+
+    def status():
+        if order is not None:
+            order.append("status")
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    def read():
+        if order is not None:
+            order.append("read")
+        return real_read()
+
+    stub.status = status
+    stub.read = read
+    bus = _CapturingBus()
+    return _run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=bus), bus
+
+
+def _saved_gap(persona_dir, **kw):
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    base = {"per_channel": {"grief": 2.0}, "magnitude": 2.0, "unnamed_pressure": 0.0, "status": "open",
+            "sustained_ticks": 1, "directions": {"grief": 1}}
+    base.update(kw)
+    gap = Gap(**base)
+    sm_state.save(persona_dir, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+    return gap
+
+
+def _history_marker(persona_dir):
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    state, _ = sm_state.load_or_recover(persona_dir)
+    state.gap_history.append(Gap(per_channel={"calm": 1.0}, magnitude=1.0, unnamed_pressure=0.0, status="resolved"))
+    sm_state.save(persona_dir, state)
+
+
+def test_live_tick_with_an_empty_read_touches_nothing(tmp_path, emotion_engine_stub) -> None:
+    from brain.self_model import cadence as sm_cadence
+
+    persona_dir = _persona_dir(tmp_path)
+    result, bus = _live_tick(persona_dir, emotion_engine_stub, readings={})
+    assert result is False
+    assert not (persona_dir / "self_model_state.json").exists()
+    assert sm_cadence.load(persona_dir).next_reflection_at is None
+    assert not (persona_dir / "self_model_audit.json").exists()
+    assert bus.events == []
+
+
+def test_live_tick_that_is_not_caught_up_touches_nothing(tmp_path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import EngineStatus
+    from brain.self_model import cadence as sm_cadence
+
+    persona_dir = _persona_dir(tmp_path)
+    for statuses in (
+        [EngineStatus(False, None), EngineStatus(True, None)],
+        [EngineStatus(True, None), EngineStatus(False, None)],
+    ):
+        result, _ = _live_tick(
+            persona_dir,
+            emotion_engine_stub,
+            readings={"joy": _reading(short=5.0, difference=2.0, shift=1)},
+            statuses=statuses,
+        )
+        assert result is False
+        assert not (persona_dir / "self_model_state.json").exists()
+        assert sm_cadence.load(persona_dir).next_reflection_at is None
+
+
+def test_live_tick_takes_status_then_read_then_status(tmp_path, emotion_engine_stub) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    order: list[str] = []
+    _live_tick(
+        persona_dir,
+        emotion_engine_stub,
+        readings={"joy": _reading(short=5.0, difference=2.0, shift=1)},
+        order=order,
+    )
+    assert order == ["status", "read", "status"]
+
+
+def test_live_tick_builds_the_gap_from_the_engines_shifted_channels(tmp_path, emotion_engine_stub) -> None:
+    from brain.self_model import cadence as sm_cadence
+    from brain.self_model import state as sm_state
+
+    persona_dir = _persona_dir(tmp_path)
+    result, bus = _live_tick(
+        persona_dir,
+        emotion_engine_stub,
+        readings={
+            "awe": _reading(short=6.0, long=3.0, difference=-1.5, shift=-1),
+            "calm": _reading(short=2.0, long=2.0, difference=0.0, shift=0),  # not shifted: no channel
+        },
+    )
+    assert result is True  # the tick ran and advanced the cadence
+    state, _ = sm_state.load_or_recover(persona_dir)
+    gap = state.current_gap
+    assert gap is not None
+    assert gap.per_channel == {"awe": -1.5}
+    assert gap.directions == {"awe": -1}
+    assert gap.magnitude == 1.5
+    assert gap.reset_seen is None  # the engine had never reset: a stored None, not UNSET
+    assert sm_cadence.load(persona_dir).next_reflection_at is not None
+    assert bus.events and bus.events[0]["gap_active"] is True
+
+
+def test_live_tick_records_the_reset_it_saw(tmp_path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import EngineStatus
+    from brain.self_model import state as sm_state
+
+    persona_dir = _persona_dir(tmp_path)
+    reset_at = datetime(2026, 11, 4, 8, 0, tzinfo=UTC)
+    statuses = [EngineStatus(True, reset_at), EngineStatus(True, reset_at)]
+    _live_tick(
+        persona_dir,
+        emotion_engine_stub,
+        readings={"awe": _reading(short=6.0, difference=2.0, shift=1)},
+        statuses=statuses,
+    )
+    state, _ = sm_state.load_or_recover(persona_dir)
+    from brain.utils.time import iso_utc
+
+    assert state.current_gap.reset_seen == iso_utc(reset_at)
+    # The same engine answer next time is an ordinary tick: the gap carries on (sustained ticks 2).
+    from brain.self_model import cadence as sm_cadence
+
+    sm_cadence.save(persona_dir, sm_cadence.SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0))
+    _live_tick(
+        persona_dir,
+        emotion_engine_stub,
+        readings={"awe": _reading(short=6.0, difference=2.0, shift=1)},
+        statuses=[EngineStatus(True, reset_at), EngineStatus(True, reset_at)],
+    )
+    state, _ = sm_state.load_or_recover(persona_dir)
+    assert state.current_gap.sustained_ticks == 2
+
+
+def test_reset_during_the_reads_clears_an_open_gap_without_a_resolution_or_history_entry(
+    tmp_path, emotion_engine_stub
+) -> None:
+    from brain.emotion.engine import EngineStatus
+    from brain.self_model import state as sm_state
+
+    persona_dir = _persona_dir(tmp_path)
+    _saved_gap(persona_dir, status="open", sustained_ticks=5, reset_seen=None)
+    _history_marker(persona_dir)
+    before_history = [g.per_channel for g in sm_state.load_or_recover(persona_dir)[0].gap_history]
+    from unittest.mock import patch
+
+    with patch("brain.bridge.supervisor.check_and_emit_resolution") as resolution:
+        result, bus = _live_tick(
+            persona_dir,
+            emotion_engine_stub,
+            readings={"awe": _reading(short=6.0, difference=2.0, shift=1)},
+            statuses=[EngineStatus(True, None), EngineStatus(True, datetime(2026, 11, 4, 9, 0, tzinfo=UTC))],
+        )
+    resolution.assert_not_called()  # the clear is not a resolution: no soul candidate, no feed event
+    state, _ = sm_state.load_or_recover(persona_dir)
+    assert result is True  # the tick finished; the reflection did nothing but the spare rule
+    assert state.current_gap is None
+    assert [g.per_channel for g in state.gap_history] == before_history  # the cleared gap is not appended
+    assert bus.events == []  # no tick event, no new gap, no articulation
+    assert not (persona_dir / "self_model_audit.json").exists()
+
+
+def test_spare_rule_keeps_an_answered_gap_with_three_sustained_ticks_and_clears_the_others(
+    tmp_path, emotion_engine_stub
+) -> None:
+    from brain.emotion.engine import EngineStatus
+    from brain.self_model import cadence as sm_cadence
+    from brain.self_model import state as sm_state
+    from brain.utils.time import iso_utc
+
+    new_reset = datetime(2026, 11, 4, 9, 0, tzinfo=UTC)
+    cases = [
+        ("acknowledged", 3, True),
+        ("dismissed", 7, True),
+        ("acknowledged", 2, False),
+        ("dismissed", 0, False),
+        ("open", 9, False),
+    ]
+    for index, (status, ticks, kept) in enumerate(cases):
+        (tmp_path / f"case{index}").mkdir()
+        persona_dir = _persona_dir(tmp_path / f"case{index}")
+        _saved_gap(persona_dir, status=status, sustained_ticks=ticks, reset_seen=None)
+        _history_marker(persona_dir)
+        sm_cadence.save(persona_dir, sm_cadence.SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0))
+        _live_tick(
+            persona_dir,
+            emotion_engine_stub,
+            readings={"awe": _reading(short=6.0, difference=2.0, shift=1)},
+            statuses=[EngineStatus(True, new_reset), EngineStatus(True, new_reset)],
+        )
+        state, _ = sm_state.load_or_recover(persona_dir)
+        label = f"{status}/{ticks}"
+        assert (state.current_gap is not None) is kept, label
+        assert len(state.gap_history) == 1, label  # the history marker only
+        if kept:
+            assert state.current_gap.status == status, label
+            assert state.current_gap.sustained_ticks == ticks, label
+            assert state.current_gap.per_channel == {"grief": 2.0}, label
+            assert state.current_gap.reset_seen == iso_utc(new_reset), label
+
+
+def test_a_saved_gap_that_never_stored_a_reset_runs_the_spare_rule_once_then_ticks_normally(
+    tmp_path, emotion_engine_stub
+) -> None:
+    from brain.self_model import cadence as sm_cadence
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import UNSET
+
+    persona_dir = _persona_dir(tmp_path)
+    saved = _saved_gap(persona_dir, status="acknowledged", sustained_ticks=4)
+    assert saved.reset_seen is UNSET
+    readings = {"awe": _reading(short=6.0, difference=2.0, shift=1)}
+    _live_tick(persona_dir, emotion_engine_stub, readings=readings)
+    state, _ = sm_state.load_or_recover(persona_dir)
+    assert state.current_gap.per_channel == {"grief": 2.0}  # kept, not replaced by a new gap
+    assert state.current_gap.reset_seen is None  # now stored
+    sm_cadence.save(persona_dir, sm_cadence.SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0))
+    _live_tick(persona_dir, emotion_engine_stub, readings=readings)
+    state, _ = sm_state.load_or_recover(persona_dir)
+    assert state.current_gap.per_channel == {"awe": 2.0}  # an ordinary tick followed
+
+
+def test_cooldown_filter_prunes_directions_with_per_channel(tmp_path, emotion_engine_stub) -> None:
+    from brain.self_model import state as sm_state
+
+    persona_dir = _persona_dir(tmp_path)
+    future = (datetime.now(UTC) + timedelta(hours=6)).isoformat()
+    _saved_gap(
+        persona_dir,
+        status="acknowledged",
+        channel_cooldowns={"awe": future},
+        reset_seen=None,
+    )
+    _live_tick(
+        persona_dir,
+        emotion_engine_stub,
+        readings={
+            "awe": _reading(short=6.0, difference=2.0, shift=1),
+            "calm": _reading(short=1.0, difference=-1.0, shift=-1),
+        },
+    )
+    state, _ = sm_state.load_or_recover(persona_dir)
+    assert state.current_gap.per_channel == {"calm": -1.0}
+    assert state.current_gap.directions == {"calm": -1}
+
+
+def test_live_tick_asks_the_engines_predicate_for_body_energy(tmp_path, emotion_engine_stub) -> None:
+    import brain.body.state as body_state
+
+    persona_dir = _persona_dir(tmp_path)
+    seen: list[object] = []
+    real = body_state.body_state_from_short
+
+    def recording(short, *, feels_high, **kwargs):
+        seen.append(feels_high)
+        return real(short, feels_high=feels_high, **kwargs)
+
+    body_state.body_state_from_short = recording
+    try:
+        _live_tick(
+            persona_dir,
+            emotion_engine_stub,
+            readings={"joy": _reading(short=5.0, difference=2.0, shift=1)},
+        )
+    finally:
+        body_state.body_state_from_short = real
+    assert seen == [emotion_engine_stub.feels_high]

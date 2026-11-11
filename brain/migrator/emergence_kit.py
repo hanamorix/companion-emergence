@@ -257,7 +257,7 @@ def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem)
+            store.create(mem, fold=False)
             migrated_count += 1
     finally:
         store.close()

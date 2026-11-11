@@ -11,7 +11,7 @@ import tempfile
 import threading
 import traceback
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -431,6 +431,129 @@ def _reset_pass2_queue() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_emotion_engine_registry() -> Iterator[None]:
+    """Clear the emotion engine registry (`engine_for`) before and after each test.
+
+    Engines are one per resolved persona directory, and a store write now reaches the engine for its directory, so a
+    leaked instance (and its state cache) must not outlive its test. It acts only when `brain.emotion.engine` is already
+    imported, and imports nothing from `brain.emotion` itself: the new-tests-must-fail job runs this conftest against
+    product code that has no engine module, and an import here would fail every test there (`CANARY FAILED`).
+    """
+
+    def clear() -> None:
+        module = sys.modules.get("brain.emotion.engine")
+        if module is not None:
+            with module._engines_lock:
+                module._engines.clear()
+
+    clear()
+    yield
+    clear()
+
+
+class EmotionEngineStub:
+    """A settable stand-in for the emotion engine, for tests of the callers (see the `emotion_engine_stub` fixture).
+
+    Every public call of the engine exists. `recorded_calls` holds one entry per hook call, per `note_active` call and per
+    `ensure_ready` / `recovery_rebuild` call, `(name, *arguments in the call's own order)`, for example
+    `("on_memory_shown", memory, at)`, `("note_active", now)` or `("ensure_ready",)`; the real engine keeps no such list. The rest is
+    settable: `readings` (what `read()` returns), `live`, `recovery_needed` (what `needs_recovery()` answers), `high` (the names `feels_high` answers True for, whatever
+    `readings` holds, so a reader's test says which feelings are high independently of the numbers it feeds), `faded`
+    (`(memory_id, emotion) -> value`, else the stored value), `engine_status` and `last_fold_at` (a fixed
+    instant well before any test's "now", so a site that compares its own time with it sees a nonzero interval).
+    """
+
+    def __init__(self) -> None:
+        from datetime import UTC, datetime
+
+        from brain.emotion.engine import EngineStatus
+
+        self.recorded_calls: list[tuple[Any, ...]] = []
+        self.readings: dict[str, Any] = {}
+        self.live = False
+        self.high: set[str] = set()
+        self.faded: dict[tuple[str, str], float] = {}
+        self.engine_status = EngineStatus(True, None)
+        self.recovery_needed = False
+        self.last_fold_at = datetime(2000, 1, 1, tzinfo=UTC)
+
+    def on_memory_committed(self, memory: Any) -> None:
+        self.recorded_calls.append(("on_memory_committed", memory))
+
+    def on_emotions_assigned(self, memory: Any) -> None:
+        self.recorded_calls.append(("on_emotions_assigned", memory))
+
+    def fold_change(self, emotions: Any, at: Any, source: str) -> None:
+        self.recorded_calls.append(("fold_change", emotions, at, source))
+
+    def on_memory_shown(self, memory: Any, at: Any) -> None:
+        self.recorded_calls.append(("on_memory_shown", memory, at))
+
+    def note_active(self, now: Any) -> None:
+        self.recorded_calls.append(("note_active", now))
+
+    def batch(self) -> AbstractContextManager[None]:
+        """A context manager that does nothing (the real engine's `batch()` collects events; a caller's test needs only the call to work)."""
+        return nullcontext()
+
+    def read(self) -> dict[str, Any]:
+        return dict(self.readings)
+
+    def is_live(self) -> bool:
+        return self.live
+
+    def feels_high(self, name: str) -> bool:
+        return name in self.high
+
+    def faded_value(self, memory: Any, emotion: str) -> float:
+        """The settable faded value (else the stored one), held to 0-10 as the real `faded_value` holds its result."""
+        from brain.emotion.engine_utils import resolve_emotions
+        from brain.emotion.vocabulary import canonical_name
+
+        value = self.faded.get((memory.id, emotion), memory._stored_emotions[emotion])
+        return resolve_emotions({emotion: value}).get(canonical_name(emotion), 0.0)
+
+    def memory_feelings(self, memory: Any) -> Any:
+        """The real pure read over the memory with each emotion's value replaced by what this stub's `faded_value` answers."""
+        from dataclasses import replace
+
+        from brain.emotion.engine_utils import memory_feelings
+
+        shown = replace(
+            memory,
+            _stored_emotions={name: self.faded_value(memory, name) for name in memory._stored_emotions},
+        )
+        return memory_feelings(shown, None, None, None)
+
+    def status(self) -> Any:
+        return self.engine_status
+
+    def ensure_ready(self) -> None:
+        """What `engine.ensure_engine_ready(<directory>)` reaches through the patched `engine_for`: recorded, and nothing happens."""
+        self.recorded_calls.append(("ensure_ready",))
+
+    def needs_recovery(self) -> bool:
+        return self.recovery_needed
+
+    def recovery_rebuild(self) -> None:
+        self.recorded_calls.append(("recovery_rebuild",))
+
+
+@pytest.fixture
+def emotion_engine_stub(monkeypatch: pytest.MonkeyPatch) -> EmotionEngineStub:
+    """Make `engine.engine_for(<any directory>)` return one settable `EmotionEngineStub`.
+
+    Callers use the receiver form `engine.engine_for(persona_dir).<call>`, so patching the module attribute reaches every
+    call site. The module is imported here, in the body, so a test that does not ask for the stub never needs it.
+    """
+    from brain.emotion import engine
+
+    stub = EmotionEngineStub()
+    monkeypatch.setattr(engine, "engine_for", lambda persona_dir: stub)
+    return stub
+
+
+@pytest.fixture(autouse=True)
 def _fake_embedding_provider_by_default(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -734,19 +857,15 @@ def _tunables_registry_restore() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _vocabulary_registry_restore() -> Iterator[None]:
-    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary) or trigger the
-    warn-once log of an unregistered emotion; neither may reach the next test, whatever worker runs it (#540). Restored IN
-    PLACE (clear + update), never rebound, like ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the
-    dict and set objects themselves."""
-    from brain.emotion import aggregate, vocabulary
+    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary); that may not reach
+    the next test, whatever worker runs it (#540). Restored IN PLACE (clear + update), never rebound, like
+    ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the dict object itself."""
+    from brain.emotion import vocabulary
 
     saved_registry = dict(vocabulary._REGISTRY)
-    saved_warned = set(aggregate._warned_unregistered)
     yield
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
-    aggregate._warned_unregistered.clear()
-    aggregate._warned_unregistered.update(saved_warned)
 
 
 @pytest.fixture(autouse=True)

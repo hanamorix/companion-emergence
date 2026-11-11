@@ -325,6 +325,57 @@ def test_run_resonance_tick_emits_on_spike(tmp_path):
     assert candidates[0].source_id == "mem_y"
 
 
+def test_run_resonance_tick_reads_the_memory_without_ticking_it(tmp_path):
+    """The tick reads a memory only for its last-accessed time; reading it must not count as an access."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.initiate.emit import read_candidates
+    from brain.initiate.resonance import MemoryActivationBaseline, run_resonance_tick
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    persona = tmp_path / "p"
+    persona.mkdir()
+    now = datetime(2026, 5, 13, 10, 0, 0, tzinfo=UTC)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    h.strengthen("mem_y", "n1", delta=0.1)
+    h.close()
+
+    store = MemoryStore(persona / "memories.db")
+    store.create(
+        Memory(
+            id="mem_y",
+            content="y",
+            memory_type="conversation",
+            domain="us",
+            created_at=now - timedelta(days=30),
+        )
+    )
+    store.close()
+
+    with MemoryActivationBaseline(persona / "memory_activation_baseline.db") as b:
+        for _ in range(12):
+            b.update("mem_y", 0.1, alpha=0.08)
+
+    h = HebbianMatrix(persona / "hebbian.db")
+    for i in range(20):
+        h.strengthen("mem_y", f"new_n{i}", delta=0.4)
+    h.close()
+
+    run_resonance_tick(persona, now=now)
+
+    # The memory passed every gate and was emitted, so the tick's staleness-gate read ran
+    # (a read that never happened would pass the next assertions for nothing).
+    assert len(read_candidates(persona)) == 1
+    store = MemoryStore(persona / "memories.db")
+    row = store.get("mem_y", bump=False)
+    store.close()
+    assert row is not None
+    assert row.recall_count == 0.0
+    assert row.last_accessed_at is None
+
+
 def test_a_quiet_memory_does_not_write_a_gate_rejection_row(tmp_path):
     """The z-gate's null result is not an event, so it must not be logged.
 
@@ -438,3 +489,12 @@ def test_baseline_db_uses_wal_and_busy_timeout(tmp_path: Path):
         assert mode.lower() == "wal", f"expected WAL, got {mode!r}"
         timeout = b._conn.execute("PRAGMA busy_timeout").fetchone()[0]
         assert timeout == 5000, f"expected busy_timeout 5000, got {timeout}"
+
+
+def test_baseline_busy_timeout_reads_the_dev_constant(tmp_path: Path, monkeypatch) -> None:
+    """#602: the busy timeout comes from the dev constant, not a hand-written 5000."""
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "SQLITE_STORE_BUSY_TIMEOUT_S", 12.0)
+    with MemoryActivationBaseline(tmp_path / "baseline.db") as b:
+        assert b._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 12000

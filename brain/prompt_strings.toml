@@ -470,18 +470,19 @@ try_fire_dream_system_prompt_segments = [
 ]
 # _emit_heartbeat_memory's local system segments, in order, reassembled
 # around 1 var: self.persona_name -- seg[0] + persona_name + seg[1].
+# WORKING TEXT: the second segment was edited when the old decay pass went (Engine 6 G4); final wording is the owner's.
 emit_heartbeat_system_segments = [
   '''You are ''',
-  '''. You just finished a background heartbeat cycle — decay applied, memory graph tended. Reflect in first person, one short sentence, starting with 'HEARTBEAT: '.''',
+  '''. You just finished a background heartbeat cycle and the memory graph was tended. Reflect in first person, one short sentence, starting with 'HEARTBEAT: '.''',
 ]
 # _emit_heartbeat_memory's local user segments, in order, reassembled
-# around 4 vars: f"{elapsed_seconds / 3600:.1f}", memories_decayed,
-# edges_pruned, ("yes" if dream_id else "no") -- seg[0] + elapsed_h + seg[1]
-# + memories_decayed + seg[2] + edges_pruned + seg[3] + dream_fired.
+# around 3 vars: f"{elapsed_seconds / 3600:.1f}", edges_pruned,
+# ("yes" if dream_id else "no") -- seg[0] + elapsed_h + seg[1]
+# + edges_pruned + seg[2] + dream_fired.
+# WORKING TEXT: the memories_decayed segment was dropped (Engine 6 G4); final wording is the owner's.
 emit_heartbeat_user_segments = [
   '''elapsed=''',
-  '''h, memories_decayed=''',
-  ''', edges_pruned=''',
+  '''h, edges_pruned=''',
   ''', dream_fired=''',
 ]
 
@@ -549,6 +550,27 @@ MEMORY:
 VERDICT:
 <one line: continue | close | spawn: <new topic>; <new topic>>
 ('close' = this thread feels finished. 'spawn' = a tangent worth its own thread — keep this one going.)''',
+]
+# Emotion rework B1: the same prompt once the engine is live, asking for two felt lines at the end.
+# Same vars as above. Working text; the rating line is ThinkerOfThoughts' to edit (their design, item 11).
+render_system_prompt_segments_live = [
+  '''You are ''',
+  ''', spending quiet time on a research thread of your own. Write plain prose under exactly three markers, then two last lines, nothing else:
+
+NOTES:
+<what you found: facts with sources, reactions, opinions, lists if lists fit the subject. Free format. Continue from your prior notes; don't repeat what's already written there.>
+
+MEMORY:
+<2-4 sentences, first person as ''',
+  ''': how this session felt, what surprised you.>
+
+VERDICT:
+<one line: continue | close | spawn: <new topic>; <new topic>>
+('close' = this thread feels finished. 'spawn' = a tangent worth its own thread, and this one keeps going.)
+
+Then, each on its own last line:
+EMOTIONS: {"<emotion name>": <0-10>}
+ENGAGEMENT: <0-10>''',
 ]
 
 [grief.breadcrumb]
@@ -833,7 +855,29 @@ wire_note_back_message_segments = [
   ''' a note in ''',
 ]
 
+[self_model.ambient]
+# The live self-model block's fragment for one channel (ambient.render_block), filled with
+# str.format(name=...). One key per (position, direction) pair: position is where the channel sits against its usual
+# level (above or below), direction is which way it is moving (rising or fading). The *_only forms are used when the
+# gap carries no direction for the channel; the level_* forms when the difference is exactly 0.
+# PLACEHOLDER wording (spec section 7, item 3): working text only, the final text is the owner's, byte-exact, at the
+# end of the build.
+above_rising = '''{name} is above where it usually sits and rising'''
+above_fading = '''{name} is above where it usually sits and fading'''
+below_rising = '''{name} is below where it usually sits and rising'''
+below_fading = '''{name} is below where it usually sits and fading'''
+above_only = '''{name} is above where it usually sits'''
+below_only = '''{name} is below where it usually sits'''
+level_rising = '''{name} is rising'''
+level_fading = '''{name} is fading'''
+
 [self_model.articulate]
+# The label written after a channel's delta in articulate()'s deltas text when the gap carries the channel's direction
+# (rising or fading). No label for a channel without a direction, so a gap with no directions gives today's text.
+# PLACEHOLDER wording (spec section 7, item 4): working text only. The final wording, and the segment and system text
+# that tells the model how to read these labels, are the owner's, at the end of the build.
+direction_rising = ''' (rising)'''
+direction_fading = ''' (fading)'''
 # articulate()'s local prompt segments, in order, reassembled around 2
 # vars: deltas_text, f"{gap.unnamed_pressure:.2f}" -- seg[0] + deltas_text
 # + seg[1] + formatted_pressure + seg[2].

@@ -5,13 +5,13 @@ run_folded() is a synchronous loop running two cadences:
   * every ``tick_interval_s`` (default: the ``embedding_backfill.tick_interval_seconds``
     setting, 60s): close stale sessions
   * every ``heartbeat_interval_s`` (default 900s = 15min): fire a
-    heartbeat tick — memory decay, dream gate, reflex, growth, research
+    heartbeat tick — Hebbian decay, dream gate, reflex, growth, research
 
 The heartbeat cadence keeps the autonomous brain alive while the user
 is away. Without it, dreams / reflex / growth / research only fire when
-the user manually runs ``nell heartbeat``, and memory decay never runs
+the user manually runs ``nell heartbeat``, and the Hebbian decay never runs
 in the background. The heartbeat engine has its own internal cadence
-gates (e.g. memory decay every N hours, dreams every M hours) so
+gates (e.g. dreams every M hours) so
 calling ``run_tick`` every 15 min is mostly cheap — only the
 gate-passes do real work.
 
@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
@@ -78,6 +78,7 @@ from brain.chat.session import (
     prune_empty_sessions,
     remove_session,
 )
+from brain.emotion import engine as emotion_engine
 from brain.engines import interest_sweep, research_recovery
 from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
@@ -133,11 +134,12 @@ from brain.narrative_memory import run_pass as narrative_memory_run_pass
 from brain.persona_config import PersonaConfig
 from brain.self_model import cadence as self_model_cadence
 from brain.self_model import reconcile as sm_reconcile
+from brain.self_model import resolve as sm_resolve
 from brain.self_model import state as self_model_state
 from brain.self_model.articulate import articulate as sm_articulate
 from brain.self_model.articulate import log_self_model_deferred
-from brain.self_model.derived import compute_baseline, compute_derived
-from brain.self_model.gap import compute_gap
+from brain.self_model.derived import compute_unnamed_pressure
+from brain.self_model.gap import UNSET, gap_from_read
 from brain.self_model.resolve import (
     check_and_emit_resolution,
     increment_gaps_surfaced,
@@ -259,7 +261,7 @@ def run_folded(
     compaction_interval_s: float | None = 86400.0,
     calibration_interval_s: float | None = 86400.0,
     interest_sweep_interval_s: float | None = interest_sweep.SWEEP_INTERVAL_HOURS * 3600.0,
-    judge_selftune_interval_s: float | None = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0,
+    judge_selftune_interval_s: float | None | Literal["dev_constant"] = "dev_constant",
     clustering_interval_s: float | None = 6 * 3600.0,
     vocab_repair_interval_s: float | None = 6 * 3600.0,
     pending_reconcile_interval_s: float | None = 900.0,
@@ -321,8 +323,8 @@ def run_folded(
     self-tune cadence (F2c inc2, spec Section 2) — wired structurally
     identically to ``interest_sweep_interval_s`` immediately above (own
     persisted ``judge_selftune_cadence.json``, own fault-isolated tick, NO
-    startup catch-up). Default matches
-    ``dev_constants.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly).
+    startup catch-up). The default, ``"dev_constant"``, reads
+    ``dev_constants.JUDGE_TUNE_INTERVAL_HOURS`` (168h/weekly) when run_folded starts.
     This increment (inc2) is a SCAFFOLD ONLY: the cadence, the >handful
     gate, runtime RAM tier-detection and the cgroup-aware OOM-safety
     downgrade are built and wired; the actual tuning (knob-refit / LoRA /
@@ -334,6 +336,9 @@ def run_folded(
     # explicit value, ``0.0`` included, wins.
     if tick_interval_s is None:
         tick_interval_s = _backfill_tick_interval_seconds()
+    # The judge self-tune default is read here, not frozen at definition (#602); None stays "disabled".
+    if judge_selftune_interval_s == "dev_constant":
+        judge_selftune_interval_s = dev_constants.JUDGE_TUNE_INTERVAL_HOURS * 3600.0
     logger.info(
         "supervisor folded persona=%s tick=%.2fs heartbeat=%s soul_review=%s finalize=%s",
         persona_dir.name,
@@ -881,6 +886,13 @@ def run_folded(
                 except Exception:
                     logger.exception("supervisor kindled-link tick raised")
 
+            # The emotion engine's drain and day close (spec 3.1 S4): the end of the pass, after the kindled block and before the
+            # wait, and never while a chat reply is being generated (the reply path drains after it is sent). `note_active` catches
+            # and logs its own failures and never raises. Accepted edge (E5.16, section 6): a day that ends closes at the next
+            # drain, so the rollover can lag until the next supervisor pass or the next reply.
+            if not cli_throttle.reply_in_flight():
+                emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+
             # Wait for the next tick or for stop_event, whichever comes first.
             stop_event.wait(timeout=tick_interval_s)
         except Exception as exc:
@@ -965,7 +977,7 @@ def _build_gated_jobs(
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
-    test/dev disable knob) is left out. Pass 2, session snapshot/prune,
+    test/dev disable knob) is left out. The emotion recovery rebuild (#584), pass 2, session snapshot/prune,
     emotion backfill, research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
     the extraction backfill takes one chunk per pass). Deploy recalibration is due
@@ -1007,6 +1019,20 @@ def _build_gated_jobs(
             yield own
         finally:
             own.close()
+
+    # 0. emotion recovery rebuild (Engine 6, #584): a live persona whose engine state is missing or unreadable is rebuilt from its
+    # rows before any other job reads the engine. No interval: due while `needs_recovery()` holds; a failed rebuild is
+    # logged once per active day by `recovery_job_run` and retried at the next idle pass (SKIPPED, no cadence to advance).
+    def _emotion_recovery_run() -> JobOutcome:
+        return JobOutcome.COMPLETED if emotion_engine.recovery_job_run(persona_dir) else JobOutcome.SKIPPED
+
+    jobs.append(
+        GatedJob(
+            "emotion_recovery_rebuild",
+            run=_emotion_recovery_run,
+            has_work=lambda: emotion_engine.engine_for(persona_dir).needs_recovery(),
+        )
+    )
 
     # 1. pass 2 — S53: every idle pass while the saved queue is non-empty.
     def _pass2_run() -> JobOutcome:
@@ -1861,37 +1887,19 @@ def _run_felt_time_tick(
     return drivers
 
 
-def _derive_intensity_drivers(
-    persona_dir: Path,
-    chat_turns_in_tick: int,
-    wall_clock_s_in_tick: float,
-) -> IntensityDrivers:
-    """Build IntensityDrivers from body + emotion state.
+def _dormant_emotional_intensity(persona_dir: Path) -> float:
+    """The old felt-time emotional intensity: dormant until #386, called by nothing.
 
-    Each driver clipped to [0, 1]; missing inputs collapse to 0.0
-    so lived-age advances at baseline rate rather than crashing.
-
-    Body strain is derived from exhaustion + energy via a full
-    compute_body_state pass (opens its own MemoryStore per-call,
-    thread-local, same pattern as _run_heartbeat_tick).
-
-    Emotional intensity — computed as the max positive sigma-deviation
-    across emotion channels (capped at 1.0), using aggregate_state over
-    the 200 most recent active memories. Falls back to 0.0 on any error.
-
-    Chat activity uses a fixed 6 turns/h baseline for the supervisor
-    tick window. Phase 9.2 follow-up will tighten to a rolling baseline
-    once weather_shift per-channel baselines are proven stable.
+    The max positive sigma-deviation across emotion channels (capped at 1.0) over the 200 most recent active
+    emotion-bearing memories, each channel's baseline from `weather_shift.update_baseline`. Kept for the felt-time
+    rework (#386) to decide what replaces it; `_derive_intensity_drivers` leaves emotional_intensity at 0.0.
+    Falls back to 0.0 on any error.
     """
-    # Best-effort body strain + emotional intensity from exhaustion / energy.
-    body_strain = 0.0
-    emotional_intensity = 0.0
     try:
-        from brain.body.state import compute_body_state
-        from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
+        from collections import defaultdict
+
+        from brain.felt_time.weather_shift import update_baseline as _update_baseline_emo
         from brain.memory.store import MemoryStore, _row_to_memory
-        from brain.utils.memory import days_since_human
 
         store = MemoryStore(persona_dir / "memories.db")
         try:
@@ -1903,55 +1911,93 @@ def _derive_intensity_drivers(
                 "ORDER BY created_at DESC LIMIT 200"
             ).fetchall()
             memories = [_row_to_memory(row) for row in rows]
-            emotion_state = aggregate_state(memories)
-            _now = datetime.now(UTC)
-            days = days_since_human(store, now=_now, persona_dir=persona_dir)
-            words = count_words_in_session(
-                store, persona_dir=persona_dir, session_hours=0.0, now=_now
-            )
-            body = compute_body_state(
-                emotions=emotion_state.emotions,
-                session_hours=0.0,
-                words_written=words,
-                days_since_contact=days,
-                now=_now,
-            )
-            # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
-            # Normalize each to [0, 1] then take the max (strain = worst axis).
-            raw_exhaustion = float(body.exhaustion) / 9.0
-            raw_energy_lack = 1.0 - float(body.energy) / 10.0
-            body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
-            # emotional_intensity: max positive sigma-deviation from per-channel baseline.
-            # Channels with < 10 samples skipped (cold-start guard). 3σ ceiling clips to 1.0.
-            from collections import defaultdict
-
-            from brain.felt_time.weather_shift import update_baseline as _update_baseline_emo
-            _channel_samples: dict[str, list] = defaultdict(list)
-            for _mem in memories:
-                if _mem.created_at is None:
-                    continue
-                for _ch, _val in _mem.emotions.items():
-                    try:
-                        _fval = float(_val)
-                    except (TypeError, ValueError):
-                        continue
-                    if _fval > 0.0:
-                        _channel_samples[_ch].append((_mem.created_at, _fval))
-            _positive_devs: list[float] = []
-            for _ch, _ch_samps in _channel_samples.items():
-                if len(_ch_samps) < 10:
-                    continue
-                _bl = _update_baseline_emo(None, _ch_samps)
-                if _bl.sigma <= 0.0:
-                    continue
-                _current_val = max(v for _, v in _ch_samps)  # max-pool mirrors aggregate_state behaviour
-                _dev = (_current_val - _bl.mean) / max(_bl.sigma, 0.1)
-                if _dev > 0.0:
-                    _positive_devs.append(_dev)
-            if _positive_devs:
-                emotional_intensity = min(1.0, max(_positive_devs) / 3.0)
         finally:
             store.close()
+        # Max positive sigma-deviation from per-channel baseline.
+        # Channels with < 10 samples skipped (cold-start guard). 3σ ceiling clips to 1.0.
+        _channel_samples: dict[str, list] = defaultdict(list)
+        _engine = emotion_engine.engine_for(persona_dir)
+        for _mem in memories:
+            if _mem.created_at is None:
+                continue
+            for _ch, _val in _engine.memory_feelings(_mem).feelings.items():
+                try:
+                    _fval = float(_val)
+                except (TypeError, ValueError):
+                    continue
+                if _fval > 0.0:
+                    _channel_samples[_ch].append((_mem.created_at, _fval))
+        _positive_devs: list[float] = []
+        for _ch, _ch_samps in _channel_samples.items():
+            if len(_ch_samps) < 10:
+                continue
+            _bl = _update_baseline_emo(None, _ch_samps)
+            if _bl.sigma <= 0.0:
+                continue
+            _current_val = max(v for _, v in _ch_samps)  # the highest sample, as the old max-pool read it
+            _dev = (_current_val - _bl.mean) / max(_bl.sigma, 0.1)
+            if _dev > 0.0:
+                _positive_devs.append(_dev)
+        if _positive_devs:
+            return min(1.0, max(_positive_devs) / 3.0)
+    except Exception:
+        logger.debug("supervisor felt-time: dormant emotional intensity read failed; using 0.0", exc_info=True)
+    return 0.0
+
+
+def _derive_intensity_drivers(
+    persona_dir: Path,
+    chat_turns_in_tick: int,
+    wall_clock_s_in_tick: float,
+) -> IntensityDrivers:
+    """Build IntensityDrivers from body + emotion state.
+
+    Each driver clipped to [0, 1]; missing inputs collapse to 0.0
+    so lived-age advances at baseline rate rather than crashing.
+
+    Body strain is derived from exhaustion + energy via the body state built
+    from the emotion engine's short averages.
+
+    Emotional intensity is not computed: it stays 0.0 (flagged for the
+    felt-time rework, #386; the old measure is kept, uncalled, in
+    `_dormant_emotional_intensity`).
+
+    Chat activity uses a fixed 6 turns/h baseline for the supervisor
+    tick window. Phase 9.2 follow-up will tighten to a rolling baseline
+    once weather_shift per-channel baselines are proven stable.
+    """
+    # Best-effort body strain from exhaustion / energy.
+    body_strain = 0.0
+    emotional_intensity = 0.0
+    try:
+        from brain.body.state import body_state_from_short
+        from brain.body.words import count_words_in_session
+        from brain.emotion import engine
+        from brain.utils.memory import days_since_human
+
+        live_engine = engine.engine_for(persona_dir)
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and body strain is computed from baseline energy.
+        short = engine.short_values(live_engine.read())
+        _now = datetime.now(UTC)
+        days = days_since_human(now=_now, persona_dir=persona_dir)
+        words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=_now)
+        body = body_state_from_short(
+            short,
+            feels_high=live_engine.feels_high,
+            session_hours=0.0,
+            words_written=words,
+            days_since_contact=days,
+            now=_now,
+        )
+        # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
+        # Normalize each to [0, 1] then take the max (strain = worst axis).
+        raw_exhaustion = float(body.exhaustion) / 9.0
+        raw_energy_lack = 1.0 - float(body.energy) / 10.0
+        body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
+        # emotional_intensity is never computed here and stays at its initial 0.0. The old measure (a sigma
+        # deviation over the 200-row max-pool, `_dormant_emotional_intensity`) has no engine counterpart; it is
+        # unplugged until the felt-time rework decides what replaces it (#386).
     except Exception:
         logger.debug("supervisor felt-time: body strain read failed; using 0.0", exc_info=True)
 
@@ -2076,7 +2122,6 @@ def _run_heartbeat_tick(
         {
             "type": "heartbeat_tick",
             "trigger": "background",
-            "memories_decayed": result.memories_decayed,
             "edges_pruned": result.edges_pruned,
             "dream_id": result.dream_id,
             "reflex_fired": list(result.reflex_fired),
@@ -2226,10 +2271,9 @@ def _run_self_model_tick(
          attempt has zero side effects (no gap computation, no budget
          consumption, no sustained_ticks/gaps_surfaced change, no
          self_model_state.json or cadence write).
-      1. Read the recent active emotion-bearing memories.
-      2. short = compute_derived(memories, body)       (recent normalized mean, short half-life)
-      3. long  = compute_baseline(memories)            (baseline normalized mean, long half-life)
-      4. gap   = compute_gap(short, long)              (bidirectional short − long, noise-floored)
+      1-4. Read the emotion engine: status, read and status again. An empty read, or a state that is not
+         caught up, ends the tick untouched. After a rebuild or catch-up the spare rule runs and the tick
+         ends. Otherwise the gap is built with `gap_from_read` from the engine's shifted channels.
       5. Track sustained_ticks vs the prior current_gap; bump the
          gaps_surfaced audit counter while a gap is active.
       6. If gap.magnitude >= threshold → articulate a note via Haiku. The real
@@ -2280,8 +2324,14 @@ def _run_self_model_tick(
 
     outcome = "clean"
     try:
+        # Take the three engine reads (status, read, status) in this thread first. Nothing readable, or a state
+        # that is not caught up, means this tick does nothing: no saved gap, no cadence advance, no audit counter.
+        # The call sits inside the try so that a raise takes the tick's own failure outcome (the cadence backs off).
+        reads = _self_model_engine_reads(persona_dir)
+        if reads is None:
+            return False
         deferred = _self_model_reflect(
-            persona_dir, provider=provider, event_bus=event_bus, now=now
+            persona_dir, provider=provider, event_bus=event_bus, now=now, reads=reads
         )
         if deferred:
             outcome = "deferred"
@@ -2298,14 +2348,96 @@ def _run_self_model_tick(
     return True
 
 
+@dataclass(frozen=True)
+class _SelfModelEngineReads:
+    """What the self-model tick took from the emotion engine: the read, and the engine's `reset_at` before and after it."""
+
+    read: dict[str, Any]
+    before: datetime | None
+    after: datetime | None
+
+
+def _self_model_engine_reads(persona_dir: Path) -> _SelfModelEngineReads | None:
+    """The engine's `status()`, `read()` and `status()` again, in that order, in this thread.
+
+    None when the read is empty or either status says the engine is not caught up: the tick then does nothing.
+    A `reset_at` that differs between the two statuses means a rebuild or catch-up happened during the read.
+    """
+    from brain.emotion import engine
+
+    live_engine = engine.engine_for(persona_dir)
+    first = live_engine.status()
+    read = live_engine.read()
+    second = live_engine.status()
+    if not read or not first.caught_up or not second.caught_up:
+        return None
+    return _SelfModelEngineReads(read=read, before=first.reset_at, after=second.reset_at)
+
+
+def _self_model_reset_seen(reads: _SelfModelEngineReads, prior_gap: Any) -> bool:
+    """True when the engine was rebuilt or caught up since the saved gap was written.
+
+    That is: `reset_at` moved during this tick's reads, or the saved gap never recorded the `reset_at` it was
+    made against (`UNSET`), or the one it recorded differs from the current one (a stored None equals None).
+    """
+    from brain.utils.time import lenient_utc
+
+    if reads.before != reads.after:
+        return True
+    if prior_gap is None:
+        return False
+    if prior_gap.reset_seen is UNSET:
+        return True
+    return lenient_utc(prior_gap.reset_seen) != reads.after
+
+
+def _self_model_apply_reset(
+    persona_dir: Path, state: self_model_state.SelfModelState, reads: _SelfModelEngineReads
+) -> None:
+    """The spare rule, after a rebuild or catch-up. The tick then ends: nothing else is done.
+
+    After a rebuild or a catch-up the saved flags are only approximate. No gap: nothing to do. A gap she has
+    acknowledged or dismissed that held for the sustained number of ticks is kept (its `reset_seen` brought up to
+    date). Any other gap is cleared without the resolution path and without a history entry.
+    """
+    from brain.utils.time import iso_utc
+
+    prior_gap = state.current_gap
+    if prior_gap is None:
+        return
+    # The two private constants of the resolution path are read, not copied: which statuses mean "she has answered
+    # this gap" and how many sustained ticks make a gap worth keeping, so the rule and the resolution path cannot drift.
+    if (
+        prior_gap.status in sm_resolve._RESOLVED_STATUSES  # noqa: SLF001
+        and prior_gap.sustained_ticks >= sm_resolve._SUSTAINED_TICKS  # noqa: SLF001
+    ):
+        prior_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
+        self_model_state.save(
+            persona_dir,
+            self_model_state.SelfModelState(current_gap=prior_gap, gap_history=state.gap_history),
+        )
+        return
+    # Accepted edge: clearing a gap here drops its reconcile cooldowns, so a channel she has just reconciled can
+    # come back on the next ordinary tick. After a rebuild or a catch-up the saved flags are only approximate, so a
+    # gap that is neither acknowledged nor dismissed with 3 or more sustained ticks is cleared without the
+    # resolution path. A follow-up issue records the deferral.
+    self_model_state.save(
+        persona_dir,
+        self_model_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
+    )
+
+
 def _self_model_reflect(
     persona_dir: Path,
     *,
     provider: LLMProvider,
     event_bus: EventBus | object,
     now: datetime,
+    reads: _SelfModelEngineReads,
 ) -> bool:
     """The reflection body — separated so cadence advance always runs.
+
+    ``reads`` is the emotion engine's reads for this tick (see `_self_model_engine_reads`).
 
     See _run_self_model_tick for the step-by-step contract. This function
     does steps 1-8; the caller owns the cadence gates (steps 0/0a) and
@@ -2318,53 +2450,36 @@ def _self_model_reflect(
     unrelated to the throttle). The caller uses this to pick the cadence
     outcome ("deferred" vs "clean").
     """
-    from brain.body.state import compute_body_state
+    from brain.body.state import body_state_from_short
     from brain.body.words import count_words_in_session
-    from brain.emotion.aggregate import aggregate_state
-    from brain.memory.store import MemoryStore, _row_to_memory
+    from brain.emotion import engine
     from brain.utils.memory import days_since_human
+    from brain.utils.time import iso_utc
 
-    # ── 1-3: read memories, body + short/long reads ─────────────────────────
-    # Same query as _build_intensity_drivers: the 200 most recent active
-    # emotion-bearing memories. aggregate_state (max-pool peak) still feeds the
-    # body-state computation; the gap uses short/long normalized-mean reads.
-    with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
-        stack.callback(store.close)
-
-        rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        memories = [_row_to_memory(row) for row in rows]
-
-        declared = aggregate_state(memories)
-        days = days_since_human(store, now=now, persona_dir=persona_dir)
-        words = count_words_in_session(
-            store, persona_dir=persona_dir, session_hours=0.0, now=now
-        )
-        body = compute_body_state(
-            emotions=declared.emotions,
-            session_hours=0.0,
-            words_written=words,
-            days_since_contact=days,
-            now=now,
-        )
-
-    short = compute_derived(
-        memories, body_energy=body.energy, body_exhaustion=body.exhaustion, now=now
-    )
-    long = compute_baseline(memories, now=now)
-    new_gap = compute_gap(short, long)
-
-    # ── 4: load prior state, track sustained ticks ──────────────────────────
+    # ── a rebuild or catch-up since the last tick runs the spare rule and ends the tick ──
     state, _recovered = self_model_state.load_or_recover(persona_dir)
     prior_gap = state.current_gap
+    if _self_model_reset_seen(reads, prior_gap):
+        _self_model_apply_reset(persona_dir, state, reads)
+        return False
+    short_values = engine.short_values(reads.read)
+    days = days_since_human(now=now, persona_dir=persona_dir)
+    words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=now)
+    body = body_state_from_short(
+        short_values,
+        feels_high=engine.engine_for(persona_dir).feels_high,
+        session_hours=0.0,
+        words_written=words,
+        days_since_contact=days,
+        now=now,
+    )
+    unnamed = compute_unnamed_pressure(
+        short_values, body_energy=body.energy, body_exhaustion=body.exhaustion
+    )
+    new_gap = gap_from_read(reads.read, unnamed_pressure=unnamed)
+    new_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
 
-    # ── 4a: R-B2 anti-oscillation — honour the reconcile cooldown (live) ─────
+    # ── 4a: R-B2 anti-oscillation — honour the reconcile cooldown ─────
     # Drop any channel the prior gap put in cooldown (REGARDLESS of prior
     # status — the reconcile tool leaves prior acknowledged/dismissed) and
     # recompute magnitude, so a freshly-reconciled channel doesn't re-surface
@@ -2379,6 +2494,7 @@ def _self_model_reflect(
                     continue
                 kept_channels[ch] = delta
             new_gap.per_channel = kept_channels
+            new_gap.directions = {ch: d for ch, d in new_gap.directions.items() if ch in kept_channels}
             new_gap.magnitude = sum(abs(v) for v in kept_channels.values())
             # Keep only cooldowns that have not yet expired.
             for ch, expiry in prior_gap.channel_cooldowns.items():
@@ -2603,7 +2719,7 @@ def _run_narrative_memory_pass(
     # set would pull soul-linked memories in, so skip. Read before any store is opened so a skip
     # does no work; the next maintenance run tries again.
     try:
-        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir, caller="narrative")
     except SoulExemptionsUnavailableError as exc:
         logger.warning("narrative-memory pass: %s; skipping this pass", exc)
         return
@@ -3298,29 +3414,21 @@ def _run_initiate_review_tick(
     # Fail-open: a body-read error must never permanently silence her.
     is_rest_state = False
     try:
-        from brain.body.state import compute_body_state
+        from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
-        from brain.memory.store import MemoryStore, _row_to_memory
+        from brain.emotion import engine
         from brain.utils.memory import days_since_human
 
-        _store = MemoryStore(persona_dir / "memories.db")
+        _live_engine = engine.engine_for(persona_dir)
         _now = datetime.now(UTC)
-        _rows = _store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        _memories = [_row_to_memory(row) for row in _rows]
-        _emotion_state = aggregate_state(_memories)
-        _days = days_since_human(_store, now=_now, persona_dir=persona_dir)
-        _words = count_words_in_session(
-            _store, persona_dir=persona_dir, session_hours=0.0, now=_now
-        )
-        _body = compute_body_state(
-            emotions=_emotion_state.emotions,
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the gate sees baseline energy (not resting).
+        _short = engine.short_values(_live_engine.read())
+        _days = days_since_human(now=_now, persona_dir=persona_dir)
+        _words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=_now)
+        _body = body_state_from_short(
+            _short,
+            feels_high=_live_engine.feels_high,
             session_hours=0.0,
             words_written=_words,
             days_since_contact=_days,
@@ -3453,6 +3561,7 @@ _ROLLING_LOG_POLICIES: tuple[tuple[str, int], ...] = (
     ("attunement_errors.jsonl", 5),
     ("gate_rejections.jsonl", 3),
     ("self_model_articulate_errors.jsonl", 5),
+    ("extractor_errors.jsonl", 5),  # written by the extractor and monologue capture; nothing reads it (#559)
 )
 # This table is deliberately hand-maintained, NOT derived from the jsonl files
 # present on disk. Several persona jsonl files are stores or queues, not logs —

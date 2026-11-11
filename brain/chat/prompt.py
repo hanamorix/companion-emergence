@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from brain import prompt_strings
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
 from brain.chat.tool_inventory import build_tool_inventory
+from brain.emotion.engine_utils import memory_feelings
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.health.json_io import read_jsonl
@@ -50,6 +53,9 @@ from brain.memory.store import MemoryStore, split_by_raw_query_floor
 from brain.soul.store import SoulStore
 from brain.tools.naming import fill_tool_prefix, prefix_tool_names
 from brain.utils.time import format_local, to_local
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import Reading
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +153,7 @@ def build_system_message(
     brain_lines: list[str] = ["── brain context ──"]
 
     # 3a. Emotion state
-    emotion_summary = _build_emotion_summary(store)
+    emotion_summary = _build_emotion_summary(persona_dir)
     if emotion_summary:
         brain_lines.append(f"current emotions: {emotion_summary}")
 
@@ -218,7 +224,7 @@ def build_system_message(
             parts.append(reply_block)
 
     # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
-    body_block = _build_body_block(store, persona_dir)
+    body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -441,7 +447,7 @@ def build_volatile_context(
 
     # 4. Brain context block
     brain_lines: list[str] = ["── brain context ──"]
-    emotion_summary = _build_emotion_summary(store)
+    emotion_summary = _build_emotion_summary(persona_dir)
     if emotion_summary:
         brain_lines.append(f"current emotions: {emotion_summary}")
     residue_ctx = get_residue_context(daemon_state)
@@ -479,7 +485,7 @@ def build_volatile_context(
             parts.append(reply_block)
 
     # 5. Body block.
-    body_block = _build_body_block(store, persona_dir)
+    body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -653,67 +659,52 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
+def _build_body_block(persona_dir: Path) -> str:
     """Render the body block: computed energy/temperature/exhaustion +
     six body emotions inline.
 
-    Per spec §4 + §7.3 — fail-soft. Any exception during compute_body_state,
-    aggregate_state, or count_words_in_session → block omitted, chat
+    Per spec §4 + §7.3 — fail-soft. Any exception during body_state_from_short,
+    the engine read, or count_words_in_session → block omitted, chat
     continues. Token cost ~80 (raw metadata, no LLM summarization).
 
+    The body is projected from the emotion engine's short averages (the recent feeling); the mood summary below
+    shows the long averages. The two differ on purpose.
+
     Inviolate properties enforced here:
-    - #4 compute_body_state does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
-      the input reads below are this function's, not compute_body_state's
-    - #5 no self-perpetuation (we read from store, never write)
-    - #8 no cache (compute_body_state is recomputed every call)
+    - #4 the body projection does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
+      the input reads below are this function's, not the projection's
+    - #5 no self-perpetuation (this block reads only, never writes)
+    - #8 no cache (the body state is recomputed every call)
     """
     try:
         from datetime import UTC, datetime
 
-        from brain.body.state import compute_body_state
+        from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
-        from brain.memory.store import _row_to_memory
+        from brain.emotion import engine
         from brain.utils.memory import days_since_human
 
-        # #90: filter to memories that actually carry an emotion vector. This is
-        # the SAME fix already applied to _build_emotion_summary below and to
-        # _build_emotions / _build_body in brain/bridge/persona_state.py — this
-        # site and get_body_state were missed when it went in.
-        #
-        # Measured on the real persona 2026-08-08: 48 of the 50 most recent
-        # memories were `heartbeat` rows with empty emotions_json, so this
-        # aggregated to {} — the injected body block carried no emotion at all —
-        # while love:10.0 and belonging:10.0 sat just outside the window.
-        # heartbeat writes ~50-75 emotionless memories a day and is 49% of the
-        # store, so the unfiltered window fills within a day of quiet.
-        #
-        # Filtering cannot change the aggregation: an emotionless memory is a
-        # no-op in aggregate_state's max-pool. It only stops the window being
-        # spent on rows that cannot contribute. LIMIT matches the sibling's 200
-        # so the two emotion surfaces in one prompt cannot disagree.
-        rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        memories = [_row_to_memory(row) for row in rows]
-        state = aggregate_state(memories)
+        live_engine = engine.engine_for(persona_dir)
+
+        # Readers no longer test the switch. If the emotion state file cannot be read, is_live() answers False
+        # and each reader shows the engine's current state, which can be partial; spec S6's assume-not-switched
+        # fail-safe now governs the code outside these reader sites.
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the body block shows baselines.
+        short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
-        days = days_since_human(store, now=now, persona_dir=persona_dir)
+        days = days_since_human(now=now, persona_dir=persona_dir)
         # Chat composer doesn't track session_hours yet — passes 0.0; words
         # falls back to 1-hour window. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
         words = count_words_in_session(
-            store,
             persona_dir=persona_dir,
             session_hours=0.0,
             now=now,
         )
-        body = compute_body_state(
-            emotions=state.emotions,
+        body = body_state_from_short(
+            short,
+            feels_high=live_engine.feels_high,
             session_hours=0.0,
             words_written=words,
             days_since_contact=days,
@@ -742,37 +733,39 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_emotion_summary(store: MemoryStore) -> str:
-    """Return top-3 emotion summary string from recent emotion-bearing memories.
+# How the mood summary writes one feeling, by `dev_constants.EMOTION_SUMMARY_MODE`: the long average, the long and
+# short averages, or the long average with its signed difference from the short one.
+# PLACEHOLDER wording (spec section 7, item 1): working text only, the final form is the owner's, at the end of the build.
+_EMOTION_SUMMARY_FORMATS: dict[str, Callable[[str, Reading], str]] = {
+    "long": lambda name, r: f"{name}:{r.long:.1f}",
+    "long_short": lambda name, r: f"{name}:{r.long:.1f}/{r.short:.1f}",
+    "long_difference": lambda name, r: f"{name}:{r.long:.1f}({r.difference:+.1f})",
+}
+
+
+def _build_emotion_summary(persona_dir: Path) -> str:
+    """Return the mood summary string: the top `dev_constants.EMOTION_SUMMARY_COUNT` feelings by the emotion
+    engine's long average (highest first, ties by name), written per `dev_constants.EMOTION_SUMMARY_MODE`.
 
     Example: "love:8.5, tenderness:6.2, awe:5.0"
 
-    Filters to memories that actually carry an emotion vector. The naive
-    last-50-by-date slice was almost all heartbeats / observations / facts
-    (empty emotions_json) on a steady-state brain, so the aggregator
-    returned an empty top-3 even when emotion-bearing memories existed
-    just outside the window. Same fix as _build_emotions / _build_body in
-    brain/bridge/persona_state.py (see comments at lines 209-217, 260-264).
+    "" when the engine reads nothing.
     """
     try:
-        from brain.emotion.aggregate import aggregate_state
-        from brain.memory.store import _row_to_memory
+        from brain import dev_constants
+        from brain.emotion import engine
 
-        rows = store._conn.execute(  # noqa: SLF001 — internal same-tier access
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT 200"
-        ).fetchall()
-        memories = [_row_to_memory(row) for row in rows]
-        state = aggregate_state(memories)
-        scores = state.emotions  # {name: float} — non-zero only
-        if not scores:
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the summary is left out.
+        readings = engine.engine_for(persona_dir).read()
+        if not readings:
             return ""
-        # Sort descending by intensity, take top 3.
-        top3 = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        return ", ".join(f"{name}:{value:.1f}" for name, value in top3)
+        ranked = sorted(readings.items(), key=lambda item: (-item[1].long, item[0]))
+        count = dev_constants.EMOTION_SUMMARY_COUNT
+        if count is not None:
+            ranked = ranked[:count]
+        write = _EMOTION_SUMMARY_FORMATS[dev_constants.EMOTION_SUMMARY_MODE]
+        return ", ".join(write(name, reading) for name, reading in ranked)
     except Exception:  # noqa: BLE001
         return ""
 
@@ -1052,9 +1045,9 @@ def _bump_active_entries(
     """Apply the recall-counter ticks for the rendered "active:" entries.
 
     Render-loop rule (#231 consolidation): the bump follows the ACTUAL render.
-    A row rendered FULL goes through the one `open_memory` door (+1.0,
-    deliberate=False, per-id enqueue via ``pending_ids`` when persona_dir is
-    set). A row rendered as a snippet takes the shared rank-weighted
+    A row rendered FULL goes through the one `open_memory` door (+1.0 and
+    last_accessed_at, one engine report, per-id enqueue via ``pending_ids`` when
+    persona_dir is set). A row rendered as a snippet takes the shared rank-weighted
     fractional bump (`_snippet_bump_amount`: 0.8 top -> 0.1 bottom over the
     snippet rows in rendered order; a lone snippet -> 0.8) and its id joins
     ``snippet_ids`` for the caller's one batched enqueue. When
@@ -1069,7 +1062,6 @@ def _bump_active_entries(
                 mem,
                 store=store,
                 persona_dir=persona_dir,
-                deliberate=False,
                 seen=seen,
                 pending_ids=pending_ids,
             )
@@ -1224,15 +1216,15 @@ def _build_recall_block(
             prefix += "]"
             lines.append(f'- {prefix} {mem.id}: "{_peer_attributed(mem, snippet)}"')
 
-        # Reconciliation E (#231): the legacy/no-persona_dir path now routes its
-        # FULL renders through the one door too — recall_count bumps (+1.0,
-        # deliberate=False so last_accessed_at is untouched) and the enqueue
-        # auto-skips because persona_dir is None. Full iff the row rendered
+        # Reconciliation E (#231): the legacy/no-persona_dir path routes its
+        # FULL renders through the one door too: recall_count bumps (+1.0) and
+        # last_accessed_at is set, and the enqueue and the engine report
+        # auto-skip because persona_dir is None. Full iff the row rendered
         # untruncated: in full_ids, or every row when snippet mode is off.
         # Snippet rows stay bump-free here (unchanged).
         for mem in top:
             if mem.id in full_ids or not SNIPPET_MODE_ENABLED:
-                open_memory(mem, store=store, persona_dir=None, deliberate=False, seen=None)
+                open_memory(mem, store=store, persona_dir=None, seen=None)
 
         return "\n".join(lines)
 
@@ -1597,8 +1589,8 @@ def _build_recall_block(
 
         # --- Passive recall bumps + reappraisal enqueues (#231 consolidation) ---
         # The render-loop rule replaces the old scattered per-tier gating: a row
-        # rendered in FULL goes through the one door (`open_memory`: +1.0,
-        # deliberate=False, per-id enqueue when persona_dir is set), a genuine
+        # rendered in FULL goes through the one door (`open_memory`: +1.0 and
+        # last_accessed_at, one engine report, per-id enqueue when persona_dir is set), a genuine
         # snippet takes the rank-weighted fractional bump and is folded into one
         # batched enqueue. `seen` (created before the active tier is rendered and
         # threaded through it and the fading tier) dedups every id across every
@@ -1630,7 +1622,6 @@ def _build_recall_block(
                     mem,
                     store=store,
                     persona_dir=persona_dir,
-                    deliberate=False,
                     seen=seen,
                     pending_ids=full_open_ids,
                 )
@@ -1908,6 +1899,7 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
     )
 
     cutoff = datetime.now(UTC) - timedelta(days=window_days)
+    live_engine = store.emotion_engine()
 
     try:
         entries = [m for m in store.list_by_type("journal_entry") if m.created_at >= cutoff]
@@ -1932,12 +1924,12 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
         source = (m.metadata or {}).get("source", "unknown")
         arc_name = (m.metadata or {}).get("reflex_arc_name")
         source_str = f"reflex_arc({arc_name})" if arc_name else source
-        # Top-2 emotions by intensity
-        emotions = sorted(
-            (m.emotions or {}).items(),
-            key=lambda kv: kv[1],
-            reverse=True,
-        )[:2]
+        # Top-2 emotions by intensity, through the one read of a memory's feelings (faded once the persona has switched over,
+        # held to 0-10; an in-memory store has no engine, so the pure read returns its stored values held).
+        feelings = (
+            memory_feelings(m, None, None, None) if live_engine is None else live_engine.memory_feelings(m)
+        ).feelings
+        emotions = sorted(feelings.items(), key=lambda kv: kv[1], reverse=True)[:2]
         if emotions:
             emotions_str = ", ".join(f"{n} {v:.0f}" for n, v in emotions)
         else:
@@ -2055,8 +2047,9 @@ def _build_attunement_block(persona_dir: Path) -> str:
 def _build_self_model_block(persona_dir: Path, *, tool_prefix: str = "") -> str | None:
     """Return the self-model gap block, or None when there's nothing to surface.
 
-    Renders only when an open gap exists between her declared (max-pool) and
-    derived (trend/body) emotional reads (self-model design §3, R-F1). Hedged
+    Renders only when an open gap exists (self-model design §3, R-F1): the gap
+    is the emotion engine's shifted channels, rendered with their position and
+    direction. Hedged
     framing — she's invited to notice, never commanded to revise.
 
     Failure-safe: a missing/corrupt state file or any read error yields None so

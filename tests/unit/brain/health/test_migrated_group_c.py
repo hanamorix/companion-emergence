@@ -113,10 +113,6 @@ RAISERS = {
         "initiate_audit.jsonl",
         lambda pd: __import__("brain.initiate.user_pattern", fromlist=["x"])._read_valid_reply_lags(pd),
     ),
-    "initiate.user_pattern._compute_silence_days": (
-        "active_conversations/s1.jsonl",
-        lambda pd: __import__("brain.initiate.user_pattern", fromlist=["x"])._compute_silence_days(pd),
-    ),
     "initiate.user_pattern._build_hour_histogram": (
         "active_conversations/s1.jsonl",
         lambda pd: __import__("brain.initiate.user_pattern", fromlist=["x"])._build_hour_histogram(pd),
@@ -232,8 +228,8 @@ def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path, caplog
     from brain.chat.prompt import _count_soul_candidates
     from brain.health.parse_failures import count_recent
     from brain.health.soul_candidate_repair import should_run_soul_candidate_repair
+    from brain.ingest.buffer import last_user_turn_ts
     from brain.kindled_link.views import relay_health
-    from brain.utils.memory import _latest_user_turn_in_buffers
 
     pd = tmp_path / "persona"
     _dir_at(pd / "initiate_audit.jsonl")
@@ -249,7 +245,7 @@ def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path, caplog
     assert _count_soul_candidates(pd) == 0
     assert should_run_soul_candidate_repair(pd) is False
     assert relay_health(pd) == {"relay_ok": None, "last_poll_ts": None, "last_push_ts": None, "degraded_peers": []}
-    assert _latest_user_turn_in_buffers(pd) is None
+    assert last_user_turn_ts(pd) is None
     assert count_recent(pd) == {}
 
 
@@ -270,7 +266,7 @@ def test_group_c_feed_monologue_and_count_words_survive_bad_lines(tmp_path: Path
         f'{{"speaker": "assistant", "ts": "{NOW.isoformat()}", "text": "one two three"}}\n'.encode()
         + b"garbage\n"
     )
-    assert count_words_in_session(None, persona_dir=pd, session_hours=24, now=NOW + timedelta(hours=1)) == 3
+    assert count_words_in_session(persona_dir=pd, session_hours=24, now=NOW + timedelta(hours=1)) == 3
 
 
 # ---------------------------------------------------------------------------------------------
@@ -475,7 +471,7 @@ def test_group_c_narrative_state_event_log_roundtrip_and_replay(tmp_path: Path) 
 
 
 def test_group_c_utils_memory_latest_user_turn(tmp_path: Path) -> None:
-    from brain.utils.memory import _latest_user_turn_in_buffers
+    from brain.ingest.buffer import last_user_turn_ts
 
     d = tmp_path / "active_conversations"
     d.mkdir()
@@ -483,7 +479,7 @@ def test_group_c_utils_memory_latest_user_turn(tmp_path: Path) -> None:
         b'{"speaker": "user", "ts": "2026-01-01T00:00:00+00:00"}\nbad\n{"speaker": "assistant", "ts": "2026-02-01T00:00:00+00:00"}\n'
     )
     (d / "b.jsonl").write_bytes(b'{"speaker": "user", "ts": "2026-01-05T00:00:00"}\n')
-    assert _latest_user_turn_in_buffers(tmp_path) == datetime(2026, 1, 5, tzinfo=UTC)
+    assert last_user_turn_ts(tmp_path) == datetime(2026, 1, 5, tzinfo=UTC)
 
 
 def test_group_c_attunement_store_rejection_and_pattern_append(tmp_path: Path) -> None:

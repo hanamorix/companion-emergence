@@ -55,7 +55,7 @@ def _build_restore_plan(persona_dir: Path, *, source_dir: Path | None) -> Restor
             except (ValueError, AttributeError, TypeError):
                 plan.skipped_no_timestamp += 1
                 continue
-            plan.missing_summaries[mid] = Memory(
+            plan.missing_summaries[mid] = Memory.from_stored_row(
                 id=mid,
                 content=entry.get("summary") or "",
                 memory_type=entry.get("memory_type") or "conversation",
@@ -125,11 +125,11 @@ def _apply_memory_restores(persona_dir: Path, plan: RestorePlan) -> dict[str, in
         now = datetime.now(UTC)
         for mem in plan.missing.values():
             mem.last_accessed_at = now
-            store.create(mem)
+            store.create(mem, fold=False)
             counts["restored_full"] += 1
         for mem in plan.missing_summaries.values():
             mem.last_accessed_at = now
-            store.create(mem)
+            store.create(mem, fold=False)
             counts["restored_summary"] += 1
         for mid, original in plan.unfade.items():
             store.update(mid, content=original)

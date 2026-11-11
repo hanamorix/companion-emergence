@@ -241,3 +241,77 @@ def test_lived_rate_falls_back_to_one_when_first_tick_missing():
     state = FeltTimeState(lived_age_hours=500.0, last_tick_ts=now.isoformat(), first_tick_ts=None)
     lived = _lived_hours_since(now - timedelta(hours=10), state)
     assert abs(lived - 10.0) < 0.01  # rate 1.0
+
+
+# ── B2 phase B: the emotion input fades through the engine ───────────────────
+
+
+def test_emotion_input_uses_the_faded_value_and_peak_input_is_not_faded(tmp_path, emotion_engine_stub):
+    from brain.forgetting.salience import _emotion_input, _peak_input
+
+    m = _make_memory(emotions={"joy": 8.0, "love": 4.0}, created_iso=datetime.now(UTC).isoformat())
+    emotion_engine_stub.faded = {(m.id, "joy"): 2.0, (m.id, "love"): 5.0}
+    assert _emotion_input(m, emotion_engine_stub) == 0.5  # the faded 5.0 wins, over the stored 8.0
+    assert _emotion_input(m, None) == 0.8  # no engine: the stored values
+    object.__setattr__(m, "_stored_peak", 9.0)
+    state = FeltTimeState(lived_age_hours=100.0)
+    before = _peak_input(m, state)
+    assert before > 0.0
+    # The peak input reads the monotone peak field and never the engine: changing the faded values moves nothing.
+    emotion_engine_stub.faded = {(m.id, "joy"): 0.0, (m.id, "love"): 0.0}
+    assert _peak_input(m, state) == before
+
+
+def test_emotion_input_keeps_its_empty_emotions_guard_with_an_engine(emotion_engine_stub):
+    from brain.forgetting.salience import _emotion_input
+
+    assert _emotion_input(_make_memory(emotions={}), emotion_engine_stub) == 0.0
+
+
+def test_score_resolves_the_engine_from_a_file_store_and_an_explicit_engine_wins(tmp_path, emotion_engine_stub):
+    store = MemoryStore(tmp_path / "memories.db")
+    hebbian = HebbianMatrix(":memory:")
+    state = FeltTimeState(lived_age_hours=100.0)
+    try:
+        m = _make_memory(emotions={"joy": 10.0})
+        store.create(m)
+        emotion_engine_stub.faded = {(m.id, "joy"): 0.0}
+        kwargs = {"store": store, "hebbian": hebbian, "felt_time_state": state, "soul_linked_ids": set()}
+        faded = score(m, **kwargs)
+        stored = score(m, emotion_engine=_StoredEngine(), **kwargs)
+        assert faded < stored
+    finally:
+        store.close()
+        hebbian.close()
+
+
+class _StoredEngine:
+    """An engine whose feelings are the stored ones (an explicit engine passed to `score`)."""
+
+    def memory_feelings(self, memory):
+        from brain.emotion.engine_utils import memory_feelings
+
+        return memory_feelings(memory, None, None, None)
+
+
+def test_compute_inputs_fades_the_emotion_input_through_the_engine(tmp_path, emotion_engine_stub):
+    """`salience_inputs_at_drop.emotion` is the faded value, taken once at the write."""
+    from brain.forgetting.salience import compute_inputs
+
+    store = MemoryStore(tmp_path / "memories.db")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        m = _make_memory(emotions={"joy": 10.0})
+        store.create(m)
+        emotion_engine_stub.faded = {(m.id, "joy"): 4.0}
+        inputs = compute_inputs(
+            m,
+            store=store,
+            hebbian=hebbian,
+            felt_time_state=FeltTimeState(lived_age_hours=100.0),
+            soul_linked_ids=set(),
+        )
+        assert inputs.emotion == 0.4
+    finally:
+        store.close()
+        hebbian.close()

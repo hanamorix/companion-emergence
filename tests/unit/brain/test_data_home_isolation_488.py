@@ -22,8 +22,8 @@ from tests.conftest import REAL_PLATFORM_DIRS, REAL_XDG_CACHE_HOME
 
 
 def _snapshot(root: Path) -> dict[str, tuple[int, int] | None]:
-    """mtime and size of every file under `root`, plus a key per persona directory (so a new empty one shows). SQLite sidecars inside a
-    persona are skipped: whoever opens its database creates them, so they say nothing about who wrote it (#600)."""
+    """mtime and size of every file under `root`, plus a key per persona directory (so a new empty one shows). SQLite sidecars count:
+    a live supervisor's are dropped with the rest of its persona by `_outside`, and anyone else's mean a test opened that database."""
     if not root.exists():
         return {}
     snap: dict[str, tuple[int, int] | None] = {}
@@ -32,8 +32,6 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int] | None]:
         in_persona = rel.parts[0] == "personas" and len(rel.parts) >= 2
         if in_persona and len(rel.parts) == 2 and p.is_dir():
             snap[f"personas/{rel.parts[1]}/"] = None
-            continue
-        if in_persona and p.name.endswith(("-wal", "-shm", "-journal")):
             continue
         try:
             st = p.stat()
@@ -46,21 +44,29 @@ def _snapshot(root: Path) -> dict[str, tuple[int, int] | None]:
 
 def _live_personas(root: Path) -> set[str]:
     """Personas whose own supervisor is running now (the installed app on a dev machine, #600): their files are theirs to write.
-    bridge.json is parsed here, not through state_file.read, whose heal of a corrupt file would itself write into the real home."""
+    bridge.json is parsed here, not through state_file.read, whose heal of a corrupt file would itself write into the real home.
+    A record without a pid_token is proven against `get_home()`, which the autouse fixture moved, so it is pointed at `root` here."""
     live = set()
-    for d in (root / "personas").glob("*"):
-        try:
-            state = from_known_fields(BridgeState, json.loads((d / STATE_FILENAME).read_text(encoding="utf-8")))
-        except (OSError, ValueError, TypeError):
-            continue
-        if bridge_liveness(state, d) == ALIVE:
-            live.add(d.name)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("KINDLED_HOME", str(root))
+        for d in (root / "personas").glob("*"):
+            try:
+                state = from_known_fields(BridgeState, json.loads((d / STATE_FILENAME).read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                continue
+            if bridge_liveness(state, d) == ALIVE:
+                live.add(d.name)
     return live
 
 
 def _outside(snap: dict[str, tuple[int, int] | None], personas: set[str]) -> dict[str, tuple[int, int] | None]:
-    """`snap` without the files of `personas`; their directory keys stay, so removing one still shows."""
-    return {k: v for k, v in snap.items() if k.endswith("/") or not (k.startswith("personas/") and k.split("/")[1] in personas)}
+    """`snap` without the files of `personas`, and without `claude-config/` (their `claude` calls write it) while any is live; the
+    persona directory keys stay, so removing one still shows."""
+
+    def theirs(k: str) -> bool:
+        return (k.startswith("personas/") and k.split("/")[1] in personas) or (bool(personas) and k.startswith("claude-config/"))
+
+    return {k: v for k, v in snap.items() if k.endswith("/") or not theirs(k)}
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -151,6 +157,50 @@ def test_a_live_supervisor_writing_its_own_persona_is_not_a_leak(tmp_path):
     assert _changed(real, before, live_before)
 
 
+@pytest.mark.no_base_failure(reason="#600 test infrastructure: it checks this file's own snapshot helpers, not brain code")
+def test_a_live_supervisors_claude_config_writes_are_not_a_leak(tmp_path):
+    """A live supervisor's `claude` calls write `<home>/claude-config/` (CLAUDE_CONFIG_DIR, shared by every persona), which is
+    outside its persona directory. With no supervisor live, nothing may write there."""
+    real = tmp_path / "home"
+    live = real / "personas" / "live"
+    live.mkdir(parents=True)
+    (real / "claude-config").mkdir()
+    (real / "claude-config" / ".claude.json").write_text("{}")
+    before = _snapshot(real)
+
+    (real / "claude-config" / ".claude.json").write_text('{"a": 1}')
+    (real / "claude-config" / "session.jsonl").write_text("{}")
+    assert _changed(real, before, set())
+    _bridge_record(live, process_identity.own_token())
+    assert not _changed(real, before, {"live"})
+
+
+@pytest.mark.no_base_failure(reason="#600 test infrastructure: it checks this file's own liveness helper, not brain code")
+def test_a_live_tokenless_supervisor_of_the_real_home_is_seen_as_live(tmp_path):
+    """The installed app's supervisor on a dev machine (`supervisor run --persona nell`, bridge.json without a pid_token) is proven
+    by its home, compared with `get_home()`. Under the autouse fixture that is the test's own home, so the real one's supervisor
+    read as GONE and its persona's writes counted as this test's."""
+    import subprocess
+    import sys
+
+    real = tmp_path / "home"
+    live = real / "personas" / "live"
+    live.mkdir(parents=True)
+    env = {**os.environ, "KINDLED_HOME": str(real)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "supervisor", "run", "--persona", "live"], env=env
+    )
+    try:
+        _bridge_record(live, None)
+        record = json.loads((live / "bridge.json").read_text(encoding="utf-8"))
+        record.update(pid=proc.pid, identity=None)
+        (live / "bridge.json").write_text(json.dumps(record), encoding="utf-8")
+        assert _live_personas(real) == {"live"}
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 @pytest.mark.no_base_failure(reason="#600 guard: only a live supervisor's own persona is skipped")
 @pytest.mark.parametrize("record", ["none", "stale"])
 def test_a_write_into_a_persona_without_a_live_supervisor_is_a_leak(tmp_path, record):
@@ -166,6 +216,20 @@ def test_a_write_into_a_persona_without_a_live_supervisor_is_a_leak(tmp_path, re
     assert live_before == set()
 
     (idle / "memories.db").write_bytes(b"ab")
+    assert _changed(real, before, live_before)
+
+
+@pytest.mark.no_base_failure(reason="#600 guard: only a live supervisor's own sidecars are skipped")
+def test_a_sidecar_in_a_persona_without_a_live_supervisor_is_a_leak(tmp_path):
+    """ToT's re-review of #617: the sidecar filter still applied to every persona, so a test opening an idle persona's database (which
+    creates its -wal/-shm and changes nothing else) went unseen."""
+    real = tmp_path / "home"
+    idle = real / "personas" / "idle"
+    idle.mkdir(parents=True)
+    (idle / "memories.db").write_bytes(b"a")
+    live_before, before = _live_personas(real), _snapshot(real)
+
+    (idle / "memories.db-wal").write_bytes(b"")
     assert _changed(real, before, live_before)
 
 

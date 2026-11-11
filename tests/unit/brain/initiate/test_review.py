@@ -773,8 +773,8 @@ def test_delivered_reach_out_writes_source_emotions(tmp_path: Path, monkeypatch)
         delivered = [m for m in initiate_mems if "delivered" in (m.tags or [])]
         assert delivered, f"no delivered-tagged memory; initiate_mems={initiate_mems}"
         m = delivered[0]
-        assert m.emotions.get("tenderness", 0) > 0, (
-            f"tenderness missing or zero in emotions: {m.emotions}"
+        assert m._stored_emotions.get("tenderness", 0) > 0, (
+            f"tenderness missing or zero in emotions: {m._stored_emotions}"
         )
     finally:
         store.close()

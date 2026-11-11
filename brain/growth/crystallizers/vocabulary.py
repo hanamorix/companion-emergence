@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.vocabulary import canonical_name
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import Memory, MemoryStore
@@ -76,7 +77,7 @@ def crystallize_vocabulary(
 def _cluster_active_memories(memories: list[Memory]) -> dict[frozenset[str], _Cluster]:
     clusters: dict[frozenset[str], _Cluster] = {}
     for memory in sorted(memories, key=lambda m: m.created_at):
-        top = sorted(memory.emotions.items(), key=lambda item: item[1], reverse=True)[:2]
+        top = sorted(memory_feelings(memory, None, None, None).feelings.items(), key=lambda item: item[1], reverse=True)[:2]
         if len(top) < 2:
             continue
         if top[0][1] < _MIN_EMOTION_INTENSITY or top[1][1] < _MIN_EMOTION_INTENSITY:

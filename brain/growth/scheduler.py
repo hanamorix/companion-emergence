@@ -294,13 +294,14 @@ def _aggregate_recent_emotion_vector(
     """
     try:
         from brain.emotion.aggregate import aggregate_state
+        from brain.emotion.engine_utils import memory_feelings
         from brain.utils.memory import list_conversation_memories
 
         cutoff = now - timedelta(days=look_back_days)
         recent = [
             m
             for m in list_conversation_memories(store, active_only=True)
-            if m.created_at >= cutoff and m.emotions
+            if m.created_at >= cutoff and memory_feelings(m, None, None, None).feelings
         ]
         if not recent:
             return {}

@@ -44,8 +44,8 @@ def test_create_new_drops_non_finite_emotion_and_keeps_score_finite(raw, caplog)
             emotions={"joy": raw, "love": 4.0},
         )
 
-    assert mem.emotions == {"love": 4.0}
-    assert mem.score == 4.0
+    assert mem._stored_emotions == {"love": 4.0}
+    assert mem._stored_score == 4.0
     assert math.isfinite(mem.importance)
-    assert math.isfinite(mem.peak_emotion_intensity)
+    assert math.isfinite(mem._stored_peak)
     assert "joy" in caplog.text and "conversation" in caplog.text

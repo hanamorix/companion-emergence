@@ -14,11 +14,16 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from brain import dev_constants
+from brain.emotion.engine_utils import memory_feelings
 from brain.felt_time.state import FeltTimeState
+from brain.memory import memory_utils
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
 
 DEFAULT_WEIGHTS: dict[str, float] = {
     "emotion": 0.30,
@@ -56,11 +61,17 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def _emotion_input(memory: Memory) -> float:
-    if not memory.emotions:
+def _emotion_input(memory: Memory, eng: EmotionEngine | None) -> float:
+    """The strongest emotion of the memory as a fraction of the denominator.
+
+    `eng` is the emotion engine, whose `memory_feelings` read gives the values the memory carries now (faded once the
+    persona has switched over, held to 0-10), or None for the pure read of the stored values held (an in-memory store has
+    no engine). Required, no default: every caller says which it means.
+    """
+    feelings = (memory_feelings(memory, None, None, None) if eng is None else eng.memory_feelings(memory)).feelings
+    if not feelings:
         return 0.0
-    max_intensity = max(memory.emotions.values())
-    return _clamp(float(max_intensity) / _EMOTION_DENOMINATOR)
+    return _clamp(float(max(feelings.values())) / _EMOTION_DENOMINATOR)
 
 
 def _hebbian_input(memory: Memory, hebbian: HebbianMatrix) -> float:
@@ -128,19 +139,19 @@ def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> f
     if lived is None:
         return 1.0  # cold-start cases — treat as fresh (spec §7)
     # P3 retention rework, Change 2: importance extends the effective horizon.
-    # r=0 (importance 0) -> horizon_eff == _FRESHNESS_LIVED_HOURS_HORIZON,
-    # byte-identical to pre-change. Rising importance stretches the horizon,
-    # slowing freshness decay proportionally; never shrinks it below baseline.
-    r = min(1.0, max(0.0, memory.importance / 10.0))
-    horizon_eff = _FRESHNESS_LIVED_HOURS_HORIZON * (1.0 + dev_constants.HORIZON_IMPORTANCE_GAIN * r)
+    # Importance 0 -> horizon_eff == _FRESHNESS_LIVED_HOURS_HORIZON. Rising
+    # importance stretches the horizon, slowing freshness decay proportionally;
+    # never shrinks it below baseline. The stretch comes from the one function
+    # the emotion fade shares (`memory_utils.importance_stretch`).
+    horizon_eff = _FRESHNESS_LIVED_HOURS_HORIZON * memory_utils.importance_stretch(memory.importance)
     return 1.0 - _clamp(lived / horizon_eff)
 
 
 def _peak_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
     """Salience residue of having mattered: log-scaled peak intensity with a
-    long linear linger. Survives emotion decay + noise-floor deletion by
-    reading the monotone peak field, not the live dict."""
-    peak = getattr(memory, "peak_emotion_intensity", 0.0) or 0.0
+    long linear linger. Survives the fading of the stored emotions and noise-floor deletion by
+    reading the monotone peak (the stored highest value, held to 0-10, not faded), not the live dict."""
+    peak = memory_feelings(memory, None, None, None).peak
     if peak <= 0.0:
         return 0.0
     anchor = memory.last_accessed_at or memory.created_at
@@ -157,11 +168,17 @@ def score(
     felt_time_state: FeltTimeState | None,
     soul_linked_ids: Iterable[str],
     weights: dict[str, float] | None = None,
+    emotion_engine: EmotionEngine | None = None,
 ) -> float:
-    """Composite salience in [0, 1]. See module docstring."""
+    """Composite salience in [0, 1]. See module docstring.
+
+    `emotion_engine` is the engine the emotion input fades through; None resolves it from `store` (an in-memory
+    store resolves to no engine, so stored values). A pass over many memories resolves it once and passes it.
+    """
     w = weights or DEFAULT_WEIGHTS
+    eng = emotion_engine if emotion_engine is not None else store.emotion_engine()
     inputs = SalienceInputs(
-        emotion=max(_emotion_input(memory), _peak_input(memory, felt_time_state)),
+        emotion=max(_emotion_input(memory, eng), _peak_input(memory, felt_time_state)),
         hebbian=_hebbian_input(memory, hebbian),
         recall=_recall_input(memory),
         soul=_soul_input(memory, soul_linked_ids),
@@ -183,11 +200,13 @@ def compute_inputs(
     hebbian: HebbianMatrix,
     felt_time_state: FeltTimeState | None,
     soul_linked_ids: Iterable[str],
+    emotion_engine: EmotionEngine | None = None,
 ) -> SalienceInputs:
     """Return the per-input breakdown — used by the graveyard writer to
-    record salience_inputs_at_drop for audit."""
+    record salience_inputs_at_drop for audit. `emotion_engine` as in `score`."""
+    eng = emotion_engine if emotion_engine is not None else store.emotion_engine()
     return SalienceInputs(
-        emotion=max(_emotion_input(memory), _peak_input(memory, felt_time_state)),
+        emotion=max(_emotion_input(memory, eng), _peak_input(memory, felt_time_state)),
         hebbian=_hebbian_input(memory, hebbian),
         recall=_recall_input(memory),
         soul=_soul_input(memory, soul_linked_ids),

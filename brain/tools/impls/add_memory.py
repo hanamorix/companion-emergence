@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from brain.emotion.engine_utils import memory_feelings
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _write_gate_check
@@ -70,13 +71,14 @@ def add_memory(
     )
     store.create(memory)
 
-    # Body event hook: when an LLM-tagged memory commits with climax >= 7,
-    # auto-write a private journal_entry referencing this originating memory.
-    # Fail-soft inside record_climax_event — never affects the add_memory
-    # return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
-    if memory.emotions.get("climax", 0.0) >= 7.0:
-        from brain.body.events import record_climax_event
+    # Body event hook: when an LLM-tagged memory commits with climax at or above
+    # CLIMAX_THRESHOLD, auto-write a private journal_entry referencing this
+    # originating memory. Fail-soft inside record_climax_event — never affects the
+    # add_memory return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
+    from brain.body.events import CLIMAX_THRESHOLD, record_climax_event
 
+    # A memory created this instant has no age to fade: the pure read (no engine call, which could raise after the row is committed).
+    if memory_feelings(memory, None, None, None).feelings.get("climax", 0.0) >= CLIMAX_THRESHOLD:
         record_climax_event(
             originating_memory=memory,
             store=store,

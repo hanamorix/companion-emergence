@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -188,7 +189,6 @@ def test_heartbeat_result_default_growth_emotions_added_is_zero() -> None:
     r = HeartbeatResult(
         trigger="manual",
         elapsed_seconds=0.0,
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         dream_gated_reason=None,
@@ -310,7 +310,6 @@ def test_heartbeat_result_fields() -> None:
     r = HeartbeatResult(
         trigger="open",
         elapsed_seconds=3600.0,
-        memories_decayed=5,
         edges_pruned=2,
         dream_id=None,
         dream_gated_reason="not_due",
@@ -437,7 +436,6 @@ def test_first_tick_initializes_and_defers_work(live_engine: HeartbeatEngine) ->
 
     result = live_engine.run_tick(trigger="open")
     assert result.initialized is True
-    assert result.memories_decayed == 0
     assert result.edges_pruned == 0
     assert result.dream_id is None
     assert result.dream_gated_reason == "first_tick"
@@ -447,8 +445,8 @@ def test_first_tick_initializes_and_defers_work(live_engine: HeartbeatEngine) ->
     assert second.initialized is False
 
 
-def test_second_tick_applies_decay(live_engine: HeartbeatEngine) -> None:
-    """Second tick after simulated elapsed time decays emotions."""
+def test_second_tick_leaves_stored_emotions_as_written(live_engine: HeartbeatEngine) -> None:
+    """A tick 48 h later does not rewrite a memory's stored emotions: the engine fades a value when it is read."""
     m = _seed_conversation(live_engine.store, "seed")
     live_engine.run_tick(trigger="open")  # init
 
@@ -464,9 +462,8 @@ def test_second_tick_applies_decay(live_engine: HeartbeatEngine) -> None:
 
     reloaded = live_engine.store.get(m.id)
     assert reloaded is not None
-    # love has decay_half_life_days=None (identity-level) so it never decays.
-    # tenderness has a 7-day half-life; after 48 h it should drop from 5.0.
-    assert reloaded.emotions.get("tenderness", 0.0) < 5.0
+    # tenderness has a 7-day half-life: the old per-memory pass dropped it from 5.0 after 48 h.
+    assert reloaded._stored_emotions == {"love": 9.0, "tenderness": 5.0}
 
 
 def test_dream_gate_respects_config(live_engine: HeartbeatEngine) -> None:
@@ -496,24 +493,6 @@ def test_dream_gated_when_not_due(live_engine: HeartbeatEngine) -> None:
     assert result.dream_gated_reason == "not_due"
 
 
-def test_protected_memories_skipped_by_decay(live_engine: HeartbeatEngine) -> None:
-    """protected=True memories don't get their emotions decayed."""
-    m = _seed_conversation(live_engine.store, "protected")
-    live_engine.store.update(m.id, protected=True)
-    live_engine.run_tick(trigger="open")
-
-    state = HeartbeatState.load(live_engine.state_path)
-    assert state is not None
-    state.last_tick_at = state.last_tick_at - timedelta(hours=72)
-    state.save(live_engine.state_path)
-
-    live_engine.run_tick(trigger="close")
-
-    reloaded = live_engine.store.get(m.id)
-    assert reloaded is not None
-    assert reloaded.emotions.get("love", 0.0) == 9.0
-
-
 def test_hebbian_gc_prunes_weak_edges(live_engine: HeartbeatEngine) -> None:
     """decay_all + gc removes weak edges."""
     live_engine.hebbian.strengthen("a", "b", delta=0.005)
@@ -539,14 +518,14 @@ def test_research_always_deferred(live_engine: HeartbeatEngine) -> None:
 
 
 def test_dry_run_does_not_mutate_store_or_state(live_engine: HeartbeatEngine) -> None:
-    """--dry-run: no state file written, no memory decay, no dream."""
+    """--dry-run: no state file written, no stored emotions changed, no dream."""
     m = _seed_conversation(live_engine.store, "seed", importance=9.0)
     live_engine.run_tick(trigger="manual", dry_run=True)
 
     assert not live_engine.state_path.exists()
     reloaded = live_engine.store.get(m.id)
     assert reloaded is not None
-    assert reloaded.emotions.get("love", 0.0) == 9.0
+    assert reloaded._stored_emotions.get("love", 0.0) == 9.0
 
 
 def test_heartbeats_log_has_init_entry(live_engine: HeartbeatEngine) -> None:
@@ -559,7 +538,7 @@ def test_heartbeats_log_has_init_entry(live_engine: HeartbeatEngine) -> None:
 
 
 def test_heartbeats_log_has_tick_entry(live_engine: HeartbeatEngine) -> None:
-    """Second tick writes a JSONL entry with elapsed/memories_decayed/etc."""
+    """Second tick writes a JSONL entry with elapsed/edges_pruned/etc. and no count of decayed memories."""
     _seed_conversation(live_engine.store, "seed")
     live_engine.run_tick(trigger="open")
     live_engine.run_tick(trigger="close")
@@ -570,6 +549,8 @@ def test_heartbeats_log_has_tick_entry(live_engine: HeartbeatEngine) -> None:
     assert tick["trigger"] == "close"
     assert tick.get("initialized") is False
     assert "elapsed_seconds" in tick
+    assert "edges_pruned" in tick
+    assert "memories_decayed" not in tick
     assert "tick_count" in tick
 
 
@@ -595,6 +576,95 @@ def test_heartbeat_memory_skipped_when_never_mode(live_engine: HeartbeatEngine) 
 
     hb_memories = live_engine.store.list_by_type("heartbeat")
     assert len(hb_memories) == 0
+
+
+def test_the_heartbeat_result_has_no_count_of_decayed_memories() -> None:
+    import dataclasses
+
+    assert "memories_decayed" not in {f.name for f in dataclasses.fields(HeartbeatResult)}
+
+
+@pytest.mark.parametrize(
+    ("mode", "dream_id", "edges_pruned", "expected"),
+    [
+        ("conditional", None, 0, False),
+        ("conditional", None, 10, False),
+        ("conditional", None, 11, True),
+        ("conditional", "dream-1", 0, True),
+        ("always", None, 0, True),
+        ("never", "dream-1", 99, False),
+    ],
+)
+def test_should_emit_memory_depends_on_a_dream_or_pruned_edges_only(
+    live_engine: HeartbeatEngine, mode: str, dream_id: str | None, edges_pruned: int, expected: bool
+) -> None:
+    config = HeartbeatConfig(emit_memory=mode)  # type: ignore[arg-type]
+    assert live_engine._should_emit_memory(config, dream_id, edges_pruned) is expected
+
+
+def test_many_emotioned_memories_no_longer_make_a_conditional_tick_write_a_heartbeat_memory(
+    live_engine: HeartbeatEngine,
+) -> None:
+    """The old pass touched almost every emotioned row each tick, so it nearly always counted more than 20 and a
+    conditional heartbeat wrote a memory; with the pass gone only a dream or more than 10 pruned edges does."""
+    for i in range(25):
+        _seed_conversation(live_engine.store, f"seed {i}")
+    HeartbeatConfig(dream_every_hours=999, emit_memory="conditional").save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")  # init
+    state = HeartbeatState.load(live_engine.state_path)
+    assert state is not None
+    state.last_tick_at = state.last_tick_at - timedelta(hours=48)
+    state.save(live_engine.state_path)
+
+    result = live_engine.run_tick(trigger="close")
+
+    assert result.heartbeat_memory_id is None
+    _promote_queue(live_engine)
+    assert live_engine.store.list_by_type("heartbeat") == []
+
+
+def test_the_heartbeat_memory_prompt_names_no_decay_pass(
+    live_engine: HeartbeatEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.bridge.provider import FakeProvider as _Fake
+
+    captured: dict[str, str] = {}
+
+    class CapturingProvider(_Fake):
+        def generate(self, prompt, *, system=None):
+            captured["prompt"] = prompt
+            captured["system"] = system or ""
+            return "HEARTBEAT: tended"
+
+    monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", lambda persona_dir, tier: CapturingProvider())
+    _seed_conversation(live_engine.store, "seed")
+    HeartbeatConfig(dream_every_hours=999, emit_memory="always").save(live_engine.config_path)
+    live_engine.run_tick(trigger="open")
+    live_engine.run_tick(trigger="close")
+
+    assert re.fullmatch(r"elapsed=\d+\.\dh, edges_pruned=0, dream_fired=no", captured["prompt"])
+    assert "decay" not in captured["system"].lower()
+    assert "—" not in captured["system"]
+    assert captured["system"].startswith("You are Nell. You just finished a background heartbeat cycle")
+
+
+def test_a_heartbeat_state_file_with_a_decay_cursor_from_an_older_build_still_loads_and_drops_it_on_save(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.json"
+    HeartbeatState.fresh("open").save(path)
+    data = json.loads(path.read_text())
+    assert "decay_cursor" not in data
+    for cursor in (
+        {"tick_at": "2026-01-01T00:00:00+00:00", "created_at": "2026-01-01T00:00:00+00:00", "id": "x"},
+        "not an object",
+    ):
+        path.write_text(json.dumps({**data, "decay_cursor": cursor}))
+        loaded = HeartbeatState.load(path)
+        assert loaded is not None
+        assert loaded.tick_count == 0
+        loaded.save(path)
+        assert "decay_cursor" not in json.loads(path.read_text())
 
 
 def test_dry_run_dream_eligible_returns_would_fire_reason(
@@ -674,8 +744,17 @@ def test_dream_gate_no_seed_reason_does_not_poison(live_engine: HeartbeatEngine)
     assert state_after.last_dream_at == dream_at_before
 
 
-def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path) -> None:
+def _engine_reads_high_love(stub) -> None:
+    """The emotion engine reads love at 8.0 and calls it high (what an arc triggered on love needs to fire)."""
+    from brain.emotion.engine import Reading
+
+    stub.readings = {"love": Reading(short=8.0, long=8.0, difference=0.0, shift=0)}
+    stub.high = {"love"}
+
+
+def test_heartbeat_runs_reflex_when_enabled(tmp_path: Path, emotion_engine_stub) -> None:
     """Heartbeat fires reflex arc when enabled and trigger met."""
+    _engine_reads_high_love(emotion_engine_stub)
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
     from brain.memory.hebbian import HebbianMatrix
@@ -794,9 +873,10 @@ def test_heartbeat_skips_reflex_when_disabled(tmp_path: Path) -> None:
 
 
 def test_heartbeat_isolates_reflex_llm_failure(
-    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
 ) -> None:
     """Reflex LLM failure is isolated from the tick — decay/state still run."""
+    _engine_reads_high_love(emotion_engine_stub)
     import logging
 
     from brain.bridge.provider import FakeProvider
@@ -868,8 +948,8 @@ def test_heartbeat_isolates_reflex_llm_failure(
         assert result.reflex_fired == ()
         # Warning was logged
         assert any("reflex tick raised" in r.message for r in caplog.records)
-        # Decay still ran
-        assert result.memories_decayed >= 0
+        # The rest of the tick still ran (the Hebbian pass reports its count)
+        assert result.edges_pruned >= 0
     finally:
         store.close()
         hm.close()
@@ -962,8 +1042,9 @@ def test_heartbeat_runs_research_when_enabled(tmp_path: Path) -> None:
         hm.close()
 
 
-def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path) -> None:
+def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path, emotion_engine_stub) -> None:
     """When both reflex and research eligible, reflex fires, research skipped."""
+    _engine_reads_high_love(emotion_engine_stub)
     import json
 
     from brain.bridge.provider import FakeProvider
@@ -1160,9 +1241,10 @@ def test_heartbeat_interest_bump_hook(tmp_path: Path) -> None:
 
 
 def test_heartbeat_isolates_research_failure(
-    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, caplog, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
 ) -> None:
     """Research LLM failure is isolated — tick completes."""
+    _engine_reads_high_love(emotion_engine_stub)
     import json
     import logging
 
@@ -2087,8 +2169,9 @@ def test_daemon_state_dream_entry_written_when_dream_fires(tmp_path: Path) -> No
         engine.hebbian.close()
 
 
-def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path) -> None:
+def test_daemon_state_reflex_entry_written_when_reflex_fires(tmp_path: Path, emotion_engine_stub) -> None:
     """When a reflex arc fires, daemon_state.json has last_reflex with trigger set."""
+    _engine_reads_high_love(emotion_engine_stub)
     from brain.engines.daemon_state import load_daemon_state
 
     arcs_path = tmp_path / "reflex_arcs.json"
@@ -2527,3 +2610,104 @@ def test_research_fire_through_heartbeat_appends_notes_and_memory_and_verdict_ca
     finally:
         store.close()
         hm.close()
+
+
+# ── the heartbeat's emotion readers (the engine's short averages) ─────────────
+
+
+def _live_reading(short: float):
+    from brain.emotion.engine import Reading
+
+    return Reading(short=short, long=0.0, difference=0.0, shift=0)
+
+
+def test_live_status_summary_writes_the_short_peak_and_no_calm_default(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.engines.daemon_state import load_daemon_state
+
+    heartbeat, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        # The stored sum would be love 10 (clamped); the engine's short peak is joy 6.
+        for value in (8.0, 7.0):
+            heartbeat.store.create(
+                Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": value})
+            )
+        emotion_engine_stub.readings = {"joy": _live_reading(5.6), "love": _live_reading(2.0)}
+        heartbeat._write_daemon_state_for_heartbeat(
+            persona_dir, elapsed_seconds=900.0, edges_pruned=0, dream_id=None
+        )
+        state, _ = load_daemon_state(persona_dir)
+        assert (state.last_heartbeat.dominant_emotion, state.last_heartbeat.intensity) == ("joy", 6)
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()
+
+
+def test_live_status_summary_with_an_empty_read_writes_nothing_and_keeps_the_previous_line(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.engines.daemon_state import load_daemon_state, update_daemon_state
+
+    heartbeat, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        update_daemon_state(
+            persona_dir,
+            daemon_type="heartbeat",
+            dominant_emotion="awe",
+            intensity=4,
+            theme="heartbeat tick",
+            summary="Previous heartbeat",
+        )
+        heartbeat._write_daemon_state_for_heartbeat(
+            persona_dir, elapsed_seconds=900.0, edges_pruned=0, dream_id=None
+        )
+        state, _ = load_daemon_state(persona_dir)
+        assert (state.last_heartbeat.dominant_emotion, state.last_heartbeat.intensity) == ("awe", 4)
+        assert state.last_heartbeat.summary == "Previous heartbeat"
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()
+
+
+def test_live_spike_resonance_is_zero_and_the_forced_resonance_path_is_unchanged(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    heartbeat, _ = _make_engine_with_persona_dir(tmp_path)
+    try:
+        heartbeat.store.create(
+            Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 9.0})
+        )
+        assert heartbeat._compute_current_resonance(None) == (0.0, {})
+        assert heartbeat._compute_current_resonance(6.5) == (6.5, {"forced": 6.5})
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()
+
+
+def test_the_fired_row_peak_helper_uses_the_faded_value(tmp_path: Path, emotion_engine_stub) -> None:
+    """`_faded_emotions` (shared by the dream, reflex and research daemon-state writes) fades through the engine."""
+    mem = Memory.create_new(
+        content="a dream", memory_type="dream", domain="us", emotions={"love": 9.0, "joy": 6.0}
+    )
+    emotion_engine_stub.faded = {(mem.id, "love"): 2.0, (mem.id, "joy"): 5.0}
+    assert HeartbeatEngine._peak_emotion(HeartbeatEngine._faded_emotions(tmp_path, mem)) == ("joy", 5)
+
+
+def test_the_reflex_daemon_state_entry_takes_its_peak_from_the_faded_values(tmp_path: Path, emotion_engine_stub) -> None:
+    """`_write_daemon_state_for_reflex` reads the fired row's FADED emotions (the dream and research writes share the
+    one `_faded_emotions` call)."""
+    from brain.engines.daemon_state import load_daemon_state
+
+    heartbeat, persona_dir = _make_engine_with_persona_dir(tmp_path)
+    try:
+        row = Memory.create_new(
+            content="a reflex journal", memory_type="reflex_journal", domain="us", emotions={"love": 9.0, "joy": 6.0}
+        )
+        heartbeat.store.create(row)
+        emotion_engine_stub.faded = {(row.id, "love"): 2.0, (row.id, "joy"): 5.0}
+        heartbeat._write_daemon_state_for_reflex(persona_dir, ("an_arc",))
+        state, _ = load_daemon_state(persona_dir)
+        entry = state.last_reflex
+        assert (entry.dominant_emotion, entry.intensity) == ("joy", 5)
+    finally:
+        heartbeat.store.close()
+        heartbeat.hebbian.close()

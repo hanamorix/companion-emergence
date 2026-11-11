@@ -2,7 +2,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from brain.emotion.aggregate import aggregate_state
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.memory.store import Memory
@@ -10,7 +9,7 @@ from brain.soul.crystallization import Crystallization
 
 
 def _mem(mid: str, *, emotions=None, importance=0.0, mtype="meta") -> Memory:
-    return Memory(
+    return Memory.from_stored_row(
         id=mid,
         content=f"content-{mid}",
         memory_type=mtype,
@@ -60,7 +59,7 @@ def _cryst(cid: str, *, moment: str, resonance: int, age_days: float = 0.0) -> C
 
 
 def _mem_text(content: str) -> Memory:
-    return Memory(
+    return Memory.from_stored_row(
         id=f"id-{content[:8]}",
         content=content,
         memory_type="meta",
@@ -213,15 +212,14 @@ def test_select_seed_refractory_pushes_to_breadth():
 
 
 def test_congruence_matches_a_variant_spelled_candidate_against_the_aggregate_mood():
-    # The aggregate pools by canonical name, so its channel is `comfort_seeking`; a candidate
+    # A mood's channels are canonical names, so its channel is `comfort_seeking`; a candidate
     # stored under the hyphen spelling still has to score against that channel.
-    mood = aggregate_state([_mem("seed", emotions={"comfort_seeking": 7.0})])
-    assert mood.emotions == {"comfort_seeking": 7.0}
+    mood = EmotionalState(emotions={"comfort_seeking": 7.0})
 
     candidate = _mem("a", emotions={"comfort-seeking": 7.0})
 
     assert dream_seeds.emotional_congruence(candidate, mood) == 49.0
-    assert candidate.emotions == {"comfort-seeking": 7.0}  # the stored key is not rewritten
+    assert candidate._stored_emotions == {"comfort-seeking": 7.0}  # the stored key is not rewritten
 
 
 @pytest.mark.parametrize(
@@ -236,9 +234,9 @@ def test_congruence_counts_two_spellings_once_and_ignores_look_alikes(memory_emo
     look_alikes = {"comfort": 9.0, "comfort_seeking_extra": 9.0, "not-a-real-emotion-2": 9.0}
     mem = _mem("a", emotions={**memory_emotions, **look_alikes})
 
-    # the larger spelling counts once (6 * 4), not summed (36) and not first-wins on the smaller one;
-    # none of the look-alikes lands on a mood channel
-    assert dream_seeds.emotional_congruence(mem, mood) == 24.0
+    # the two spellings count once, as the engine's one read of the memory's feelings gives them: their average (6 * 3), not
+    # summed (36) and not first-wins on one of them; none of the look-alikes lands on a mood channel
+    assert dream_seeds.emotional_congruence(mem, mood) == 18.0
 
     # a memory key that canonicalises to the unknown mood channel does match it
     spelled = _mem("b", emotions={"Not-A-Real-Emotion": 2.0})

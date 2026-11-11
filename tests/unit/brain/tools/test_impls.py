@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
@@ -47,26 +49,6 @@ def _seed_memory(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_get_emotional_state_with_memories(tmp_path: Path) -> None:
-    """Returns dominant emotion, top_5, all, summary when memories exist."""
-    from brain.tools.impls.get_emotional_state import get_emotional_state
-
-    store = _make_store()
-    hebbian = _make_hebbian()
-    _seed_memory(store, emotions={"love": 9.0, "joy": 7.0, "grief": 3.0})
-
-    result = get_emotional_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
-
-    assert "dominant" in result
-    assert "top_5" in result
-    assert "all" in result
-    assert "summary" in result
-    # dominant should be love (highest score)
-    assert result["dominant"] == "love"
-    assert len(result["top_5"]) > 0
-    assert result["top_5"][0]["emotion"] == "love"
-
-
 def test_get_emotional_state_no_active_memories(tmp_path: Path) -> None:
     """Returns None dominant + empty lists when store is empty."""
     from brain.tools.impls.get_emotional_state import get_emotional_state
@@ -81,28 +63,23 @@ def test_get_emotional_state_no_active_memories(tmp_path: Path) -> None:
     assert result["all"] == {}
 
 
-def test_get_emotional_state_top_5_max_length(tmp_path: Path) -> None:
-    """top_5 has at most 5 entries regardless of how many emotions exist."""
+def test_get_emotional_state_top_5_max_length(tmp_path: Path, emotion_engine_stub) -> None:
+    """top_5 has at most 5 entries regardless of how many emotions the engine reads."""
+    from brain.emotion.engine import Reading
     from brain.tools.impls.get_emotional_state import get_emotional_state
 
     store = _make_store()
     hebbian = _make_hebbian()
-    # Seed a memory with 7 emotions
-    _seed_memory(
-        store,
-        emotions={
-            "love": 9.0,
-            "joy": 8.0,
-            "grief": 7.0,
-            "anger": 6.0,
-            "fear": 5.0,
-            "warmth": 4.0,
-            "longing": 3.0,
-        },
-    )
+    emotion_engine_stub.readings = {
+        name: Reading(short=value, long=0.0, difference=0.0, shift=0)
+        for name, value in (
+            ("love", 9.0), ("joy", 8.0), ("grief", 7.0), ("anger", 6.0), ("fear", 5.0), ("warmth", 4.0), ("longing", 3.0)
+        )
+    }
 
     result = get_emotional_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
-    assert len(result["top_5"]) <= 5
+    assert len(result["top_5"]) == 5
+    assert [e["emotion"] for e in result["top_5"]] == ["love", "joy", "grief", "anger", "fear"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,15 +116,8 @@ def test_get_body_state_returns_real_shape(tmp_path: Path) -> None:
     assert isinstance(result["temperature"], int)
     assert isinstance(result["exhaustion"], int)
     assert result["session_hours"] == 0.0
-    assert "body_emotions" in result
-    assert set(result["body_emotions"].keys()) == {
-        "arousal",
-        "desire",
-        "climax",
-        "touch_hunger",
-        "comfort_seeking",
-        "rest_need",
-    }
+    # an empty read: no body emotion is read, so none is a key
+    assert result["body_emotions"] == {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -827,6 +797,37 @@ def test_add_memory_climax_below_threshold_writes_no_climax_journal(tmp_path: Pa
     assert len(journal_entries) == 0
 
 
+@pytest.mark.no_base_failure(reason="pins the climax journal at the shared threshold; the value (7.0) is unchanged")
+def test_add_memory_climax_journal_fires_at_the_threshold_and_not_below(tmp_path: Path) -> None:
+    from brain.body.events import CLIMAX_THRESHOLD
+    from brain.tools.impls.add_memory import add_memory
+
+    store = _make_store()
+    hebbian = _make_hebbian()
+    for content, climax in (("just under", CLIMAX_THRESHOLD - 0.01), ("right at it", CLIMAX_THRESHOLD)):
+        add_memory(
+            content=content,
+            memory_type="event",
+            domain="relationship",
+            emotions={"climax": climax, "arousal": 8, "desire": 8},  # enough weight for add_memory's own write gate
+            store=store,
+            hebbian=hebbian,
+            persona_dir=tmp_path,
+        )
+    journal_entries = store.list_by_type("journal_entry", active_only=True)
+    assert len(journal_entries) == 1
+    assert store.get(journal_entries[0].metadata["originating_memory_id"]).content == "right at it"
+
+
+def test_add_memory_uses_the_shared_climax_threshold() -> None:
+    """The climax journal compares with body.events.CLIMAX_THRESHOLD, so the threshold lives in one place."""
+    import brain.tools.impls.add_memory as module
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "7.0" not in source
+    assert ">= CLIMAX_THRESHOLD" in source
+
+
 def test_add_memory_no_climax_emotion_writes_no_climax_journal(tmp_path: Path) -> None:
     """No climax key in emotions → no journal."""
     from brain.tools.impls.add_memory import add_memory
@@ -883,3 +884,37 @@ def test_crystallize_soul_schema_does_not_reference_hana() -> None:
 
     desc = SCHEMAS["crystallize_soul"]["description"]
     assert "Hana" not in desc, f"crystallize_soul description hardcodes 'Hana': {desc!r}"
+
+
+# ── the emotion tools read the engine's short averages ──
+
+
+def test_get_emotional_state_carries_present_zeros_ranked_last(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import Reading
+    from brain.tools.impls.get_emotional_state import get_emotional_state
+
+    store = _make_store()
+    _seed_memory(store, emotions={"anger": 9.0})  # the stored value must not appear
+    emotion_engine_stub.readings = {
+        "calm": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+        "love": Reading(short=6.0, long=0.0, difference=0.0, shift=0),
+        "joy": Reading(short=2.0, long=0.0, difference=0.0, shift=0),
+    }
+    result = get_emotional_state(store=store, hebbian=_make_hebbian(), persona_dir=tmp_path)
+    assert result["all"] == {"calm": 0.0, "love": 6.0, "joy": 2.0}
+    assert [e["emotion"] for e in result["top_5"]] == ["love", "joy", "calm"]
+    assert result["dominant"] == "love"
+
+
+def test_get_emotional_state_empty_read_says_no_active_emotions(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.tools.impls.get_emotional_state import get_emotional_state
+
+    store = _make_store()
+    _seed_memory(store, emotions={"anger": 9.0})
+    result = get_emotional_state(store=store, hebbian=_make_hebbian(), persona_dir=tmp_path)
+    assert result == {
+        "dominant": None,
+        "top_5": [],
+        "all": {},
+        "summary": "No active emotions recorded.",
+    }

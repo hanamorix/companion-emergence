@@ -120,6 +120,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 pythonpath = ["."]
 tdd_guard_project_root = "the project root"
+# #680: on a machine with `claude`, these would spend subscription usage. Run them on purpose by passing
+# your own -m, which replaces this one: `uv run pytest -m requires_claude_cli`.
+addopts = '-m "not live and not requires_claude_cli"'
 # #540: per-test ceiling (seconds). The slowest ordinary tests take far less; the real-model and network-install
 # modules raise it for themselves with @pytest.mark.timeout(3600).
 timeout = 600

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -147,7 +148,7 @@ def _load_vocab() -> frozenset[str]:
 
 
 def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
-    """Keep only registered names with intensity in (0, 10]; clamp to 10."""
+    """Keep only registered names with a finite intensity above 0; clamp to 10. NaN and inf are dropped."""
     result: dict[str, float] = {}
     for name, intensity in raw.items():
         if vocab and name not in vocab:
@@ -156,7 +157,7 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
             v = float(intensity)
         except (TypeError, ValueError):
             continue
-        if v <= 0.0:
+        if not math.isfinite(v) or v <= 0.0:
             continue
         result[name] = min(v, 10.0)
     return result
@@ -223,8 +224,7 @@ def should_run_emotion_backfill(persona_dir: Path) -> bool:
     from brain.memory.store import MemoryStore
     store = MemoryStore(str(db_path), integrity_check=False)
     try:
-        memories = store.list_active()
-        return any(not m.emotions for m in memories)
+        return store.has_active_without_emotions()
     finally:
         store.close()
 
@@ -264,20 +264,8 @@ def has_emotion_backfill_work(
         if raw.get("date") == _today_str(now):
             return False
 
-    def _scan(s: MemoryStore) -> bool:
-        cur = s._conn.execute(  # noqa: SLF001 — one-column streaming read
-            "SELECT emotions_json FROM memories WHERE active = 1"
-        )
-        try:
-            for (emotions_json,) in cur:
-                if not json.loads(emotions_json):
-                    return True
-            return False
-        finally:
-            cur.close()
-
     if store is not None:
-        return _scan(store)
+        return store.has_active_without_emotions()
 
     db_path = persona_dir / "memories.db"
     if not db_path.exists():
@@ -287,7 +275,7 @@ def has_emotion_backfill_work(
 
     own = _MemoryStore(str(db_path), integrity_check=False)
     try:
-        return _scan(own)
+        return own.has_active_without_emotions()
     finally:
         own.close()
 
@@ -370,7 +358,7 @@ def run_emotion_backfill(
 
         # Filter to emotion-less only, sorted deterministically by id (stable cursor).
         candidates = sorted(
-            [m for m in all_active if not m.emotions],
+            [m for m in all_active if not store.has_stored_emotions(m)],
             key=lambda m: m.id,
         )
 

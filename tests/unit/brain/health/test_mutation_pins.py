@@ -19,13 +19,14 @@ from types import SimpleNamespace
 import pytest
 
 from brain.health import json_io as jio
+from brain.utils import file_ops
 
 NOW = datetime(2026, 1, 1, 12, tzinfo=UTC)
 
 
 @pytest.fixture
 def deny(monkeypatch):
-    """deny("needle"): any open() by json_io of a path containing the needle raises PermissionError (not a directory)."""
+    """deny("needle"): any open() by json_io or file_ops of a path containing the needle raises PermissionError (not a directory)."""
     real_open = builtins.open
     needles: list[str] = []
 
@@ -34,7 +35,8 @@ def deny(monkeypatch):
             raise PermissionError(13, "denied")
         return real_open(file, *a, **k)
 
-    monkeypatch.setattr(jio, "open", fake_open, raising=False)
+    monkeypatch.setattr(jio, "open", fake_open, raising=False)  # the streaming readers open through json_io
+    monkeypatch.setattr(file_ops, "open", fake_open, raising=False)  # the whole-file reads open through file_ops
 
     def add(needle: str) -> None:
         needles.append(needle)
@@ -300,8 +302,8 @@ def _mem_nan():
     # The NaN is set after construction, so the helper works whether or not Memory.create_new itself rejects a
     # non-finite emotion (it may): the tests below are about what the writers do with a record that carries one.
     mem = Memory.create_new(content="x", memory_type="conversation", domain="us", emotions={"love": 0.5})
-    mem.emotions["love"] = float("nan")
-    mem.score = float("nan")
+    mem._stored_emotions["love"] = float("nan")
+    mem._stored_score = float("nan")
     return mem
 
 
@@ -335,14 +337,14 @@ def test_mut_pending_enqueue_of_a_nan_memory_is_promoted_by_the_gate(tmp_path: P
     msgs = [r.getMessage() for r in caplog.records if r.name == "brain.utils.finite"]
     assert len(msgs) == 1 and "pending candidate" in msgs[0] and "emotions.love=nan" in msgs[0] and "score=nan" in msgs[0]
     back = Memory.from_dict(json.loads(q.path.read_text().splitlines()[0]))  # raised TypeError with null
-    assert back.emotions["love"] == 0.0 and back.score == 0.0
+    assert back._stored_emotions["love"] == 0.0 and back._stored_score == 0.0
 
     store = MemoryStore(tmp_path / "memories.db")
     try:
         result = run_consolidation(store, persona_dir=tmp_path)
         assert result.promoted == 1  # reached store.create without IntegrityError
         stored = store.get(mem.id, bump=False)
-        assert stored.emotions == {"love": 0.0} and stored.score == 0.0 and stored.content == "x"
+        assert stored._stored_emotions == {"love": 0.0} and stored._stored_score == 0.0 and stored.content == "x"
     finally:
         store.close()
 

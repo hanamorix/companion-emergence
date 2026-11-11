@@ -94,7 +94,7 @@ def test_build_dream_entries_reads_memories(tmp_path):
     try:
         # Insert two dreams + one non-dream (should be filtered out by type)
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="dream_a",
                 memory_type="dream",
                 content="I'm in a hallway, the lights are dim.",
@@ -108,7 +108,7 @@ def test_build_dream_entries_reads_memories(tmp_path):
             )
         )
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="dream_b",
                 memory_type="dream",
                 content="A lighthouse, the lantern won't catch.",
@@ -122,7 +122,7 @@ def test_build_dream_entries_reads_memories(tmp_path):
             )
         )
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="other",
                 memory_type="research",
                 content="non-dream — must not appear in dream feed.",
@@ -167,7 +167,7 @@ def test_build_dream_entries_respects_limit(tmp_path):
     try:
         for i in range(5):
             store.create(
-                Memory(
+                Memory.from_stored_row(
                     id=f"d_{i}",
                     memory_type="dream",
                     content=f"dream {i}",
@@ -200,7 +200,7 @@ def test_build_research_entries_reads_memories(tmp_path):
     store = _make_memory_store(tmp_path)
     try:
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="r_a",
                 memory_type="research",
                 content="History of seasonal grief — the Victorians had a vocabulary.",
@@ -448,7 +448,7 @@ def test_build_feed_merges_all_sources_sorted_desc(tmp_path):
     store = _make_memory_store(tmp_path)
     try:
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="d",
                 memory_type="dream",
                 content="dream content",
@@ -462,7 +462,7 @@ def test_build_feed_merges_all_sources_sorted_desc(tmp_path):
             )
         )
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="r",
                 memory_type="research",
                 content="research content",
@@ -536,7 +536,7 @@ def test_build_feed_respects_limit(tmp_path):
     try:
         for i in range(10):
             store.create(
-                Memory(
+                Memory.from_stored_row(
                     id=f"d_{i}",
                     memory_type="dream",
                     content=f"dream {i}",
@@ -570,7 +570,7 @@ def test_build_feed_isolates_source_failures(tmp_path, monkeypatch):
     store = _make_memory_store(tmp_path)
     try:
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="d",
                 memory_type="dream",
                 content="dream content",

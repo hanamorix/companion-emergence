@@ -134,6 +134,30 @@ def test_pc12_write_append_and_rewrite_take_the_parameter(tmp_path: Path) -> Non
     assert json.loads((tmp_path / "b.jsonl").read_text()) == {"x": None}
 
 
+def test_write_jsonl_bytes_replaces_a_file_with_the_bytes_as_given_valid_utf8_or_not(tmp_path: Path) -> None:
+    p = tmp_path / "q.jsonl"
+    p.write_bytes(b'{"old": 1}\n')
+    kept = [text for text, _ in jio.iter_jsonl_raw(p, bad_lines=True)]
+    assert kept == ['{"old": 1}']
+    data = b'{"a": 1}\n' + b"broken \xff\xfe line\n" + b'{"b": 2}\n'
+    jio.write_jsonl_bytes(p, data)
+    assert p.read_bytes() == data  # `write_jsonl` would have refused the 0xff byte
+    # a line read by `iter_jsonl_raw` and re-encoded with surrogateescape is the original bytes
+    lines = [t.encode("utf-8", "surrogateescape") + b"\n" for t, _ in jio.iter_jsonl_raw(p, bad_lines=True)]
+    assert b"".join(lines) == data
+    assert not [q for q in tmp_path.iterdir() if q.name != "q.jsonl"]  # no temp file left behind
+
+
+def test_write_jsonl_bytes_refuses_a_half_line_and_leaves_the_file_as_it_was(tmp_path: Path) -> None:
+    p = tmp_path / "q.jsonl"
+    p.write_bytes(b'{"keep": 1}\n')
+    with pytest.raises(ValueError, match="newline"):
+        jio.write_jsonl_bytes(p, b'{"half": ')
+    assert p.read_bytes() == b'{"keep": 1}\n'
+    jio.write_jsonl_bytes(p, b"")  # the empty file is a valid payload
+    assert p.read_bytes() == b""
+
+
 # ---------------------------------------------------------------------------------------------
 # iter_jsonl_raw
 # ---------------------------------------------------------------------------------------------

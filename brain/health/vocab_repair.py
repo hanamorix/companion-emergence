@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.utils.llm_output import extract_json_object
@@ -284,7 +286,7 @@ def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
         candidates = store.search_text(name, limit=10)
         excerpts = []
         for mem in candidates:
-            if name in (mem.emotions or {}):
+            if canonical_name(name) in memory_feelings(mem, None, None, None).feelings:
                 text = mem.content[:_EXCERPT_CHAR_LIMIT]
                 excerpts.append(text)
                 if len(excerpts) >= _MAX_EXCERPTS_PER_NAME:

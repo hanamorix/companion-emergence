@@ -68,9 +68,9 @@ def test_journal_carries_originating_emotions(store, persona_dir):
         persona_dir=persona_dir,
     )
     j = store.list_by_type("journal_entry", active_only=True)[0]
-    assert j.emotions["climax"] == 8.0
-    assert j.emotions["arousal"] == 8.0
-    assert j.emotions["desire"] == 8.0
+    assert j._stored_emotions["climax"] == 8.0
+    assert j._stored_emotions["arousal"] == 8.0
+    assert j._stored_emotions["desire"] == 8.0
 
 
 def test_journal_content_includes_originating_snippet(store, persona_dir):
