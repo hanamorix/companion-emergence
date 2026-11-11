@@ -1424,7 +1424,7 @@ def build_app(
         # The emotion engine's switch-over (Engine 6, spec 3.1 S6): a persona's first start does its x10 fix and first rebuild
         # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so
         # start-up stops before the supervisor thread is spawned (an emotion state that exists but cannot be read is not a
-        # failure: `ensure` decides from the database's x10 record, rebuilds the state and keeps the damaged copies aside; only
+        # failure: `ensure` decides from the database's x10 record, rebuilds the state and replaces the unreadable one; only
         # when `memories.db` cannot be read either does it skip this start and log why).
         emotion_engine.ensure_engine_ready(persona_dir)
 

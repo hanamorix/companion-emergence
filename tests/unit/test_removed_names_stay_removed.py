@@ -705,8 +705,14 @@ REMOVED: tuple[Removed, ...] = (
     # --- an unreadable emotion state is decided from the x10 record, never skipped (Engine 6 SW4) ---------------------------
     Removed(
         names=("_skip_start_for_unreadable_state",),
-        why="the start-up skip for a state that exists but cannot be read; the owner ruled (S79) that such a state is decided from the database's x10 progress note and rebuilt, with the damaged copies kept aside",
+        why="the start-up skip for a state that exists but cannot be read; the owner ruled (S79) that such a state is decided from the database's x10 progress note and rebuilt",
         ref="Engine 6 SW4 (#584, draft PR #633)",
+        kind="code",
+    ),
+    Removed(
+        names=("_move_unreadable_state_aside", "state_copy_paths"),
+        why="the rebuild's rename of an unreadable state file and its backups to `<name>.corrupt-<stamp>` (and the helper that listed those copies); the owner ruled (S88) that an unreadable state is simply replaced by the rebuild's normal state write, whose backup rotation ages the old copies out, and nothing is moved aside or deleted",
+        ref="Engine 6 RD2 (#584, draft PR #633)",
         kind="code",
     ),
     # --- "switched over" is read off the state, not off a switch file (Engine 6 SW2) ----------------------------------------

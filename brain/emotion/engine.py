@@ -31,8 +31,10 @@ The switch-over and the live engine (Engine 6, #584):
   one-time x10 fix of small feelings (`nudge_scale_fix`: database rows and queued `making` candidates), then rebuilds the state from the last 30 days under the engine lock
   (`engine_rebuild.rebuild`, whose one verified state write records `switch_over_at` as the switch-over's last step). A state
   that exists but cannot be read is decided from the database's own record of the x10 fix (owner S79, Planning B31 SW4): the
-  same two steps run, and the first rebuild writes a fresh state while the damaged copies are kept aside; only when
-  `memories.db` cannot be read either is that start skipped with one warning. Any other failure raises `EngineStartupError`.
+  same two steps run, and the first rebuild writes a fresh state in place of the unreadable one (owner S88: it is simply
+  replaced; the normal backup rotation moves the old file into `.bak1`). A start is skipped with one warning, and retried at
+  the next start, when `memories.db` cannot be read either, or when the rebuild's own state write fails with an I/O error on
+  such a state. Any other failure raises `EngineStartupError`.
 - `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
   time when that is later; before the switch it returns the stored value. It raises `KeyError`, naming the memory id and the
   emotion, when the memory has no such emotion. It never returns 0.0: "absent" is for the caller to decide.
@@ -541,7 +543,7 @@ class EmotionEngine:
             # that is nothing to save by itself. A state that exists but cannot be read is NEVER replaced here (Planning B31
             # SW4, owner S79): the pass is skipped and the queue and its position are kept, so nothing is lost and nothing is
             # started empty. The first rebuild at the next start decides from the database's x10 record, writes a readable
-            # state and keeps the damaged copies aside (`engine_rebuild.rebuild`). A direct apply has no queue: its event is
+            # state in place of the unreadable one (`engine_rebuild.rebuild`). A direct apply has no queue: its event is
             # dropped, and the row it came from is folded by that rebuild.
             if loaded.problem == "unreadable":
                 self._skip_unreadable_pass()
@@ -930,9 +932,14 @@ class EmotionEngine:
         3. The engine lock, taken once, the state read again under it (a second process that waited runs nothing), then
         `engine_rebuild.rebuild` in first mode with the lock held; its one verified state write records `switch_over_at` (now) and
         is the switch-over's last step. First mode, not recovery mode: a recovery copies `switch_over_at` from a loaded state, and
-        an unreadable state has none to load. Inside `rebuild` the unreadable state file and each unreadable backup are renamed
-        aside to `<name>.corrupt-<UTC stamp>` before that write, so the damaged copies are kept for a repair.
-        The clock is read once inside the hold.
+        an unreadable state has none to load. The rebuild's state write replaces the unreadable state like any other (owner S88,
+        Planning B36 RD2: "the state file should just get replaced with a new one with anything needed reconstructed"): its normal
+        backup rotation moves the unreadable main file into `.bak1`, the old copies age out over the next saves, and nothing moves
+        or deletes them. If that write fails with an I/O error (`RebuildStateWriteError`: a directory or an unreadable file at the
+        state path, a directory at `.bak3`) on a state this call found unreadable, the start is skipped with one warning naming
+        the file and the error, and retried at the next start (the fail-safe S61 rules out stopping start-up at every start; this
+        skip is derived from it, not stated by it); the persona stays not live until the fault is cleared. Any other rebuild
+        write failure raises. The clock is read once inside the hold.
 
         Accepted edges (Planning B25 SW2, B31 SW4): see `engine_files.switch_over_state` (every copy of the state lost or
         unreadable, or the live state corrupted while `.bak1` is still the pre-switch state: the persona reads as not switched
@@ -966,7 +973,7 @@ class EmotionEngine:
             self._start_failed("the memories.db integrity check", exc)
         except Exception as exc:  # noqa: BLE001 - every failure of the x10 fix stops start-up, named
             self._start_failed("the x10 fix of small feelings", exc)
-        self._locked_rebuild("first", self._first_rebuild_needed)
+        self._locked_rebuild("first", self._first_rebuild_needed, found_unreadable=loaded.problem == "unreadable")
 
     def _first_rebuild_needed(self) -> bool:
         """Under the lock: False when the state now holds `switch_over_at` (another process switched over while this one waited). A state that exists but cannot be read is not switched: the rebuild runs."""
@@ -978,7 +985,7 @@ class EmotionEngine:
         logger.error("emotion engine: %s failed (%s: %s); start-up stops", what, type(cause).__name__, cause, exc_info=cause)
         raise EngineStartupError(what, cause) from cause
 
-    def _locked_rebuild(self, mode: str, needed: Callable[[], bool]) -> None:
+    def _locked_rebuild(self, mode: str, needed: Callable[[], bool], *, found_unreadable: bool = False) -> None:
         """Take the engine lock ONCE, ask `needed()` under it, and rebuild in `mode` ("first" or "recovery") if it says so.
 
         The one place that holds the lock for a rebuild, so "lock taken once" is true by construction. `needed` runs with the
@@ -986,6 +993,15 @@ class EmotionEngine:
         hold, once, and is the clock `faded_value` uses. The peer-trust memo is made for this call (`_replay_modifier_with_memo`)
         and dropped when the call ends, success or failure. A failure (a lock that did not come within its wait, a failed
         rebuild) is logged and raised as `EngineStartupError`.
+
+        One exception to that: `found_unreadable` is True when `ensure_ready` found the state unreadable. Then, in first mode
+        only, a `RebuildStateWriteError` (the rebuild's own state write failed with an `OSError`) skips the switch-over for this
+        start: one warning names the state file and the error, start-up goes on, and the next start tries again (the persona
+        stays not live until the fault is cleared). Derived from S61's fail-safe (an I/O fault: skip and retry); the rejected
+        alternative is to let the `OSError` stop start-up at every start, which S61 rules out. Accepted edges (P4, owner S88): the
+        rebuild empties the queue before its state write, so each skipped start loses that start's queued changes (the E7.18
+        class); recovery mode is unchanged: it never skips, the supervisor's recovery job logs once per active day and retries
+        at the next idle pass.
         """
         modifier_of = self._replay_modifier_with_memo()
         held = False
@@ -1008,6 +1024,15 @@ class EmotionEngine:
                     # on its next call), so a state lost later in this process is a recovery, not an unknown.
                     self._switch_over_at = lenient_utc(now)
         except Exception as exc:  # noqa: BLE001 - every failure is named and raised as the start-up error
+            if isinstance(exc, engine_rebuild.RebuildStateWriteError) and mode == "first" and found_unreadable:
+                logger.warning(
+                    "emotion engine: the rebuilt state could not be written to %s (%s: %s), so this start skips the switch-over "
+                    "and the next start tries again",
+                    exc.path,
+                    type(exc.cause).__name__,
+                    exc.cause,
+                )
+                return
             what = f"the {mode} rebuild" if held else "the engine lock"
             if mode == "recovery":
                 # Not a start-up: the recovery job (`recovery_job_run`) logs the failure once per active day, so a rebuild that

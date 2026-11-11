@@ -260,7 +260,8 @@ def test_a_state_write_failure_after_the_emptying_leaves_the_old_state_and_an_em
         patch.setattr(engine_files, "save_state", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
         with pytest.raises(EngineStartupError) as failure:
             ensure_engine_ready(persona)
-    assert failure.value.what == "the first rebuild" and isinstance(failure.value.cause, OSError)
+    assert failure.value.what == "the first rebuild" and isinstance(failure.value.cause, engine_rebuild.RebuildStateWriteError)
+    assert isinstance(failure.value.cause.cause, OSError)  # a readable state: no skip, start-up stops
     assert engine_files.state_path(persona).read_bytes() == state_before
     assert engine_files.queue_path(persona).read_text(encoding="utf-8") == ""
     assert state_of(persona).switch_over_at is None
