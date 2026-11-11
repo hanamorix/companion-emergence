@@ -17,6 +17,7 @@ did before extended markers existed.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from bisect import bisect_left
@@ -32,9 +33,11 @@ _EXT_COLON = re.compile(
 _EXT_UPPER = re.compile(
     r"^(?:\*\*|__)(?P<name>NOTES|MEMORY|VERDICT)(?:\*\*|__)[ \t\r]*$", re.MULTILINE | re.ASCII
 )
+logger = logging.getLogger(__name__)
 _ORDER = ("NOTES", "MEMORY", "VERDICT")
 _SPAWN_CAP = 2
 # A felt line (emotion rework B1): a name, optionally in bold or underscores, with the colon inside or outside them.
+# The value may be wrapped too (`**7**`, `**7**/10`); `_unwrap` removes the markers (#709).
 _FELT_LINE = re.compile(
     r"^(?:\*\*|__)?(?P<name>EMOTIONS|ENGAGEMENT)(?:\*\*|__)?:(?:\*\*|__)?[ \t]*(?P<value>.*)$",
     re.IGNORECASE | re.ASCII,
@@ -133,7 +136,7 @@ def extract_felt_lines(raw: str) -> tuple[str, dict[str, float] | None, float | 
         match = _FELT_LINE.match(text)
         if not match:
             break
-        values.setdefault(match.group("name").upper(), match.group("value").strip())
+        values.setdefault(match.group("name").upper(), _unwrap(match.group("value").strip()))
         earliest = index
     if earliest == len(lines):
         return raw, None, None
@@ -141,6 +144,17 @@ def extract_felt_lines(raw: str) -> tuple[str, dict[str, float] | None, float | 
     emotions = _felt_emotions(values["EMOTIONS"]) if "EMOTIONS" in values else None
     rating = _felt_rating(values["ENGAGEMENT"]) if "ENGAGEMENT" in values else None
     return rest, emotions, rating
+
+
+def _unwrap(value: str) -> str:
+    """A value set in bold or underscores, whole or in part (``**7**/10``), without the markers (#709)."""
+    for mark in ("**", "__"):
+        if value.startswith(mark):
+            inner = value[len(mark):]
+            end = inner.find(mark)
+            if end != -1:
+                return (inner[:end] + inner[end + len(mark):]).strip()
+    return value
 
 
 def _felt_emotions(value: str) -> dict[str, float] | None:
@@ -158,7 +172,10 @@ def _felt_emotions(value: str) -> dict[str, float] | None:
             kept[str(name)] = min(float(number), _FELT_MAX)
     from brain.chat.extractor import _filter_to_registered
 
-    return _filter_to_registered(kept)
+    registered = _filter_to_registered(kept)
+    if dropped := sorted(set(kept) - set(registered)):  # a model inventing names leaves a trace (#709)
+        logger.warning("research: EMOTIONS named emotions that are not registered, dropped: %s", ", ".join(dropped))
+    return registered
 
 
 def _felt_rating(value: str) -> float | None:

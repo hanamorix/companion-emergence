@@ -26,7 +26,7 @@ from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
+from brain.health.json_io import JsonFileError, Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -293,7 +293,9 @@ def _service_status_field(status: object, *names: str, default: object = None) -
 
 def _service_print_plist_handler(args: argparse.Namespace) -> int:
     """Print the macOS LaunchAgent plist for a persona without installing it."""
-    if sys.platform != "darwin":
+    from brain import service as _service
+
+    if _service.current_platform() != "darwin":
         print(
             "service print-plist: macOS launchd plist output is only supported on macOS",
             file=sys.stderr,
@@ -638,7 +640,6 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
     print(f"importance: {memory.importance:.2f}")
     print(f"score: {memory.score:.2f}")
     print(f"active: {'yes' if memory.active else 'no'}")
-    print(f"protected: {'yes' if memory.protected else 'no'}")
     print(f"tags: {', '.join(memory.tags) if memory.tags else '(none)'}")
     print(f"emotions: {_format_mapping(memory.emotions)}")
     print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")
@@ -1239,7 +1240,11 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
+    # Listing only reads (#708): a corrupt vocabulary is left as it is for a load that has the store and can rebuild it.
+    try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+    except JsonFileError as exc:
+        print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
     interests = InterestSet.load(
         persona_dir / "interests.json", default_path=_default_interests_path()
     )

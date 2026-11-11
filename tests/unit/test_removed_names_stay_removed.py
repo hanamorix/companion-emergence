@@ -618,6 +618,43 @@ REMOVED: tuple[Removed, ...] = (
         ref="#583 (draft PR #632): Readers 1",
         kind="code",
     ),
+    # --- unused emotion code removed before the writer work (#672, A2a) ------------------------------------------------------
+    Removed(
+        names=("brain/emotion/blend.py",),
+        why="the blend detector had no production caller; felt blends are named by the vocabulary crystallizer",
+        ref="#672 A2a cleanup",
+        kind="file",
+    ),
+    Removed(
+        names=("BlendDetector", "DetectedBlend"),
+        why="the blend detector had no production caller",
+        ref="#672 A2a cleanup",
+    ),
+    Removed(
+        names=("ResidueEntry", "add_residue", "residue_max"),
+        why="EmotionalState's residue queue was never filled or read in production; daemon_state's emotional_residue is a separate, live thing",
+        ref="#672 A2a cleanup",
+    ),
+    Removed(
+        names=("residue",),
+        why="EmotionalState holds no residue queue, and from_dict ignores a legacy residue key by not naming it",
+        ref="#672 A2a cleanup",
+        kind="code",
+        scope=("brain/emotion/state.py",),
+    ),
+    Removed(
+        names=("_EMOTION_BASE", "_EMOTION_ACCENT", "relationship_emotion_delta"),
+        why="the peer emotion table had no live producer; a peer's emotion comes from the reflection reply through apply_peer_emotion",
+        ref="#672 A2a cleanup",
+        scope=("brain/kindled_link",),
+    ),
+    Removed(
+        names=("protected",),
+        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field, the column and the heartbeat check stay until phase C",
+        ref="#672 A2a cleanup",
+        kind="code",
+        scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
+    ),
 )
 
 

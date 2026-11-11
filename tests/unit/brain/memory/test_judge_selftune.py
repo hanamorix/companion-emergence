@@ -87,19 +87,19 @@ def _seed_labeled_rows(
 
 
 def test_read_total_ram_bytes_parses_memtotal_kb_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(judge_selftune.sys, "platform", "linux")
+    monkeypatch.setattr(judge_selftune, "_platform", lambda: "linux")
     meminfo = "MemTotal:       16333000 kB\nMemFree:         2000000 kB\nMemAvailable:    5000000 kB\n"
     monkeypatch.setattr("builtins.open", mock_open(read_data=meminfo))
     assert judge_selftune._read_total_ram_bytes() == 16_333_000 * 1024.0
 
 
 def test_read_total_ram_bytes_none_on_non_linux(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(judge_selftune.sys, "platform", "darwin")
+    monkeypatch.setattr(judge_selftune, "_platform", lambda: "darwin")
     assert judge_selftune._read_total_ram_bytes() is None
 
 
 def test_read_total_ram_bytes_none_on_read_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(judge_selftune.sys, "platform", "linux")
+    monkeypatch.setattr(judge_selftune, "_platform", lambda: "linux")
 
     def _boom(*a, **k):
         raise OSError("no /proc on this box")
@@ -109,7 +109,7 @@ def test_read_total_ram_bytes_none_on_read_error(monkeypatch: pytest.MonkeyPatch
 
 
 def test_read_total_ram_bytes_none_when_memtotal_line_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(judge_selftune.sys, "platform", "linux")
+    monkeypatch.setattr(judge_selftune, "_platform", lambda: "linux")
     monkeypatch.setattr("builtins.open", mock_open(read_data="MemFree: 2000000 kB\n"))
     assert judge_selftune._read_total_ram_bytes() is None
 

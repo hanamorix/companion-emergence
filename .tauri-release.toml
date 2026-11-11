@@ -1,22 +1,20 @@
 # companion-emergence is NOT released by the generic tauri-release script.
 #
-# Canonical release = the manual four-file version-pin flow documented in
-# CLAUDE.md ("Releases — four-file version pin"):
+# Canonical release = the manual six-file version-pin flow:
 #   1. Bump pyproject.toml + app/src-tauri/Cargo.toml +
-#      app/src-tauri/tauri.conf.json, then run `uv lock` to update uv.lock.
-#      (Also align app/package.json, which is not part of the official pin.)
-#   2. Commit.
-#   3. `bash .public-sync/sync-to-public.sh` — scrubs private data and
-#      force-pushes the public mirror. NEVER `git push` to origin directly.
-#   4. Tag via `gh api` on the public repo, which triggers the GitHub
-#      Actions release build.
+#      app/src-tauri/tauri.conf.json + app/package.json, then refresh
+#      uv.lock (`uv lock`) and the nellface entry in app/src-tauri/Cargo.lock.
+#   2. Add the release entry to CHANGELOG.md (docs/release-checklist.md).
+#   3. Land the bump and the entry on main through a PR.
+#   4. Run `bash scripts/release_preflight.sh <tag>` and see GREEN.
+#   5. Tag via `gh api`, which triggers the GitHub Actions release build.
 #
 # The generic script does NOT understand pyproject.toml or uv.lock, and
-# `origin` here is the PUBLIC repo (hanamorix/companion-emergence). The
-# push and gh_release stages are DISABLED below so an accidental invocation
-# can never push unscrubbed content to the public mirror. This file exists
-# to make the routed `nell-tools:tauri-release` skill safe, not to automate
-# this repo's release.
+# `origin` here is the PUBLIC repo (hanamorix/companion-emergence), where main
+# changes only through a PR. The push and gh_release stages are DISABLED below
+# so an accidental invocation can never push or publish a release. This file
+# exists to make the routed `nell-tools:tauri-release` skill safe, not to
+# automate this repo's release.
 
 [project]
 name = "companion-emergence"
@@ -27,7 +25,7 @@ cargo_toml = "app/src-tauri/Cargo.toml"
 tauri_conf = "app/src-tauri/tauri.conf.json"
 
 [stages]
-build = false       # CI builds the release bundles (GitHub Actions on the public tag)
+build = false       # CI builds the release bundles (GitHub Actions on the version tag)
 sign = false        # no local signing; CI builds are signed via the Actions workflow
-push = false        # never push directly to origin (public) — use sync-to-public.sh
-gh_release = false  # release bundles are built by GitHub Actions on the public tag
+push = false        # main changes only through a PR, so a release never pushes it
+gh_release = false  # release bundles are built by GitHub Actions on the version tag
