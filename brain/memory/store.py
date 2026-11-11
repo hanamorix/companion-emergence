@@ -125,7 +125,7 @@ def clamp_importance(x: float) -> float:
     importance, however derived, passes through here before it can reach a
     Memory row. Applied inside Memory.create_new (covers an unclamped
     emotion-sum default, e.g. engines/dream.py's saturated aggregate) AND
-    inside migrator/transform.py's bespoke Memory(...) construction (which
+    inside migrator/transform.py's Memory.from_stored_row construction (which
     bypasses create_new). One helper, both boundaries: no producer can ever
     emit importance > 10.0, and a legitimate value already in range is
     never altered.
