@@ -472,7 +472,7 @@ def _compute_arc_close_emotion_inputs(
     best_emotion_value = 0.0
     best_named: tuple[str, float] | None = None
     for member in arc.members:
-        live = store.get(member.memory_id)
+        live = store.get(member.memory_id, bump=False)  # reading emotions to close an arc is not a recall (#587)
         if live is not None and live.emotions:
             for name in live.emotions:
                 if name == "memory_grief":
