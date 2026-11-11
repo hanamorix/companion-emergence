@@ -79,3 +79,22 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     # discard moves nothing — empty-emotion act-memory only
     assert not mems[0].emotions
     store2.close()
+
+
+def test_make_and_wire_gives_a_baseline_persona_pride_for_satisfaction(tmp_path):
+    """#720: through the real path, a persona without "satisfaction" feels pride from a making, not nothing."""
+    from brain.emotion import vocabulary
+    from brain.maker.charge import MakerCharge, save_charge
+
+    assert vocabulary.get("satisfaction") is None
+    store = MemoryStore(tmp_path / "memories.db")
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        [made] = store2.list_by_type("making", limit=10)
+    finally:
+        store2.close()
+    assert made.emotions == {"pride": 0.12, "tenderness": 0.08}
