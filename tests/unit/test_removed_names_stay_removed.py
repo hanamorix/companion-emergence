@@ -432,10 +432,10 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("O_DIRECTORY",),
-        why="the directory-fsync flag is named only in the shared writer (#465, G3b)",
+        why="the directory-fsync flag is named only in the shared writer (#465, G3b); the write guard opens folders by descriptor to pin a commit's target (#699), never to fsync",
         ref=_ATOMIC_REF,
         kind="code",
-        allow=("brain/utils/atomic_write.py",),
+        allow=("brain/utils/atomic_write.py", "brain/files/write_guard.py"),
     ),
     Removed(
         names=("os.replace", "uuid", ".new"),

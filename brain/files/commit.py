@@ -2,6 +2,7 @@
 Wires a file_write memory + feed event either way."""
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
@@ -9,9 +10,16 @@ import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.files import pending
+from brain.files import pending, write_guard
 from brain.files.audit import audit
-from brain.files.write_guard import _MAX_RESULT_FILE_BYTES, check_size, check_write_target
+from brain.files.write_guard import (
+    _DIR_OPEN,
+    _MAX_RESULT_FILE_BYTES,
+    _denied,
+    check_size,
+    check_write_target,
+    dir_fd_denied,
+)
 from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
@@ -25,28 +33,138 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # POSIX; Windows has no symlink-follow
 _BINARY = getattr(os, "O_BINARY", 0)  # Windows: a raw fd is CRT text mode otherwise, translating "\n" a second time
 
 
-def _open_target(path: Path, op: str, expect: os.stat_result | None):
-    """Open the approved target and check the OPENED file, not the path (#694).
-
-    The guard checks a path, then this opens it again, so anything swapped in
-    between (a hard link to ~/.ssh/authorized_keys, a symlink) would be written
-    to. The last component is opened without following a symlink; a create uses
-    O_EXCL, so it can only make a new file; an append must reopen the same file
-    the guard saw. Either way the opened file must be a regular file with exactly
-    one link. Returns a text file (utf-8, newline translation as before) and
-    whether an append needs a separating newline.
-    """
+def _open_final(name, op: str, dir_fd: int | None) -> int:
+    """Open the target's last component without following a symlink; a create can only make a new file."""
     try:
         if op == "create":
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o666)
-        else:
-            fd = os.open(path, os.O_RDWR | os.O_APPEND | _NOFOLLOW | _BINARY)
+            return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o666, dir_fd=dir_fd)
+        return os.open(name, os.O_RDWR | os.O_APPEND | _NOFOLLOW | _BINARY, dir_fd=dir_fd)
     except FileExistsError as exc:  # something appeared at a create target after it was checked
-        raise _TargetChangedError(f"refused: {path} appeared after it was checked") from exc
+        raise _TargetChangedError(f"refused: {name} appeared after it was checked") from exc
     except OSError as exc:
         if exc.errno == errno.ELOOP:  # the last component became a symlink after it was checked
-            raise _TargetChangedError(f"refused: {path} became a symlink after it was checked") from exc
+            raise _TargetChangedError(f"refused: {name} became a symlink after it was checked") from exc
         raise
+
+
+def _walk_without_links(folder: Path) -> tuple[int, list[str]]:
+    """Open `folder` one component at a time from its root, refusing a link at every
+    step (#699). The guard's path is fully resolved, so it holds no links when it is
+    checked: a link found now was swapped in afterwards. Returns the deepest existing
+    folder's descriptor and the names below it that don't exist yet."""
+    parts = folder.parts
+    dfd = os.open(parts[0], _DIR_OPEN)
+    try:
+        for i, name in enumerate(parts[1:], start=1):
+            try:
+                nfd = os.open(name, _DIR_OPEN | _NOFOLLOW, dir_fd=dfd)
+            except FileNotFoundError:
+                return dfd, list(parts[i:])
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):  # a link, or a file where a folder was
+                    raise _TargetChangedError(f"refused: {name} on the path to {folder} changed after it was checked") from exc
+                raise
+            os.close(dfd)
+            dfd = nfd
+    except BaseException:
+        os.close(dfd)
+        raise
+    return dfd, []
+
+
+def _open_pinned(path: Path, op: str, persona_dir: Path) -> int:
+    """POSIX (#699): open the target inside the folder that was checked, not one looked up again.
+
+    The folder is opened component by component, refusing a link at every step,
+    so it is the approved folder and not one a swapped link points to. Missing
+    folders and the file are made relative to it, again without following a link.
+    After the open the folder is judged on its real ancestry (walked through ``..``
+    from the descriptor), which catches it being moved into a protected folder
+    meanwhile; a create it catches is removed again.
+    """
+    dfd, missing = _walk_without_links(path.parent)
+    try:
+        for name in missing:
+            try:
+                os.mkdir(name, 0o777, dir_fd=dfd)
+            except FileExistsError:
+                pass
+            try:
+                nfd = os.open(name, _DIR_OPEN | _NOFOLLOW, dir_fd=dfd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):  # a link (or a file) where a folder was made
+                    raise _TargetChangedError(f"refused: {name} on the path to {path} changed after it was checked") from exc
+                raise
+            os.close(dfd)
+            dfd = nfd
+        fd = _open_final(path.name, op, dfd)
+        try:
+            denied = dir_fd_denied(dfd, persona_dir)
+        except OSError:  # the folder became unreadable mid-commit: don't keep what can't be checked
+            denied = True
+        if denied:
+            os.close(fd)
+            if op == "create":
+                with contextlib.suppress(OSError):  # best effort; the refusal stands either way
+                    os.unlink(path.name, dir_fd=dfd)
+            raise _TargetChangedError(f"refused: {path} moved into a protected location while it was opened")
+        return fd
+    finally:
+        os.close(dfd)
+
+
+def _handle_path(fd: int) -> str | None:
+    """Windows: where an open file really is (GetFinalPathNameByHandleW), or None if that can't be read."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+    get.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get.restype = wintypes.DWORD
+    buf = ctypes.create_unicode_buffer(32768)
+    n = get(wintypes.HANDLE(msvcrt.get_osfhandle(fd)), buf, len(buf), 0)
+    if not n or n >= len(buf):
+        return None
+    p = buf.value
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    return p[4:] if p.startswith("\\\\?\\") else p
+
+
+def _open_by_path(path: Path, op: str, persona_dir: Path) -> int:
+    """Windows (#699): no dir_fd or O_NOFOLLOW there, so open by path, then require the
+    opened handle's real location (a junction swapped in is resolved by the handle) to
+    be the approved path, and outside the protected locations. A create that fails it
+    is removed again. Missing folders are still made by path first (#703)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = _open_final(str(path), op, None)
+    try:
+        real = _handle_path(fd)
+    except OSError:
+        real = None
+    if real is None or os.path.normcase(real) != os.path.normcase(str(path)) or _denied(Path(real), persona_dir):
+        os.close(fd)
+        if op == "create":
+            with contextlib.suppress(OSError):  # best effort; the refusal stands either way
+                os.unlink(real or str(path))
+        raise _TargetChangedError(f"refused: {path} leads to {real or 'an unreadable location'} now")
+    return fd
+
+
+def _open_target(path: Path, op: str, expect: os.stat_result | None, persona_dir: Path):
+    """Open the approved target and check the OPENED file, not the path (#694, #699).
+
+    The guard checks a path, then commit opens it, so anything swapped in between
+    (a hard link to ~/.ssh/authorized_keys, a symlink, a folder on the path
+    replaced by a link) would be written to. The file is opened inside the folder
+    that was checked (POSIX) or its handle's real location is judged (Windows);
+    the last component never follows a symlink; a create can only make a new file;
+    an append must reopen the file the guard saw. The opened file must be a
+    regular file with exactly one link. Returns a text file (utf-8, newline
+    translation as before) and whether an append needs a separating newline.
+    """
+    fd = _open_by_path(path, op, persona_dir) if write_guard._is_windows() else _open_pinned(path, op, persona_dir)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
@@ -119,6 +237,10 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
     op, content = rec["op"], rec["content"]
     # TOCTOU: re-run the guard on the resolved path RIGHT NOW.
     g = check_write_target(rec["resolved_path"], op=op, persona_dir=persona_dir)
+    if g.ok and g.resolved != Path(rec["resolved_path"]):
+        # the card's path resolves somewhere else now (a folder on it was swapped for a link while the card
+        # waited): write to the place the user approved or nowhere (#702)
+        g = type(g)(ok=False, error=f"refused: {rec['resolved_path']} now leads to {g.resolved}")
     # the file the guard judged (one link); the opened file must be that one. Not a second stat:
     # a link swapped in between would become the "expected" file (#694)
     expect = g.stat if op == "append" else None
@@ -149,11 +271,11 @@ def commit_write(persona_dir: Path, rid: str, *, store) -> dict:
         return {"ok": False, "error": "could not claim the write for commit"}
 
     try:
-        g.resolved.parent.mkdir(parents=True, exist_ok=True)
         # #100: an append must not run together with the block before it.
         # write_guard already requires the target to exist for append, so the
         # only run-together case is a non-empty file with no trailing newline.
-        f, needs_separator = _open_target(g.resolved, op, expect)
+        # Missing parent folders are made inside _open_target, in the checked folder (#699).
+        f, needs_separator = _open_target(g.resolved, op, expect, persona_dir)
         with f:
             if needs_separator:
                 f.write("\n")
