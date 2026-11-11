@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from brain import prompt_strings
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
 from brain.chat.tool_inventory import build_tool_inventory
+from brain.emotion.engine_utils import memory_feelings
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.health.json_io import read_jsonl
@@ -1923,16 +1924,12 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
         source = (m.metadata or {}).get("source", "unknown")
         arc_name = (m.metadata or {}).get("reflex_arc_name")
         source_str = f"reflex_arc({arc_name})" if arc_name else source
-        # Top-2 emotions by intensity, faded (the engine's faded_value returns the stored value until the switch;
-        # an in-memory store has no engine, so its stored values stand).
-        emotions = sorted(
-            (
-                (n, v if live_engine is None else live_engine.faded_value(m, n))
-                for n, v in (m.emotions or {}).items()
-            ),
-            key=lambda kv: kv[1],
-            reverse=True,
-        )[:2]
+        # Top-2 emotions by intensity, through the one read of a memory's feelings (faded once the persona has switched over,
+        # held to 0-10; an in-memory store has no engine, so the pure read returns its stored values held).
+        feelings = (
+            memory_feelings(m, None, None, None) if live_engine is None else live_engine.memory_feelings(m)
+        ).feelings
+        emotions = sorted(feelings.items(), key=lambda kv: kv[1], reverse=True)[:2]
         if emotions:
             emotions_str = ", ".join(f"{n} {v:.0f}" for n, v in emotions)
         else:

@@ -1916,10 +1916,11 @@ def _dormant_emotional_intensity(persona_dir: Path) -> float:
         # Max positive sigma-deviation from per-channel baseline.
         # Channels with < 10 samples skipped (cold-start guard). 3σ ceiling clips to 1.0.
         _channel_samples: dict[str, list] = defaultdict(list)
+        _engine = emotion_engine.engine_for(persona_dir)
         for _mem in memories:
             if _mem.created_at is None:
                 continue
-            for _ch, _val in _mem.emotions.items():
+            for _ch, _val in _engine.memory_feelings(_mem).feelings.items():
                 try:
                     _fval = float(_val)
                 except (TypeError, ValueError):

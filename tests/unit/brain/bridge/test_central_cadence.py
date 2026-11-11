@@ -1280,7 +1280,7 @@ def _mem(content="a memory long enough to embed", emotions=None):
 
     m = Memory.create_new(content=content, memory_type="meta", domain="test")
     if emotions is not None:
-        m.emotions = emotions
+        m._stored_emotions = emotions
     return m
 
 

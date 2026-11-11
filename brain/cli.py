@@ -20,6 +20,7 @@ from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
 from brain.emotion import engine_files
+from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
@@ -622,6 +623,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         return rc
     try:
         memory = store.get(args.memory_id)
+        engine = store.emotion_engine()
     finally:
         store.close()
 
@@ -629,6 +631,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         print(f"unknown memory id: {args.memory_id}", file=sys.stderr)
         return 1
 
+    felt = engine.memory_feelings(memory) if engine is not None else memory_feelings(memory, None, None, None)
     print(f"id: {memory.id}")
     print(f"type: {memory.memory_type}")
     print(f"domain: {memory.domain}")
@@ -637,10 +640,10 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         f"last_accessed_at: {memory.last_accessed_at.isoformat() if memory.last_accessed_at else '(never)'}"
     )
     print(f"importance: {memory.importance:.2f}")
-    print(f"score: {memory.score:.2f}")
+    print(f"score: {felt.score:.2f}")
     print(f"active: {'yes' if memory.active else 'no'}")
     print(f"tags: {', '.join(memory.tags) if memory.tags else '(none)'}")
-    print(f"emotions: {_format_mapping(memory.emotions)}")
+    print(f"emotions: {_format_mapping(felt.feelings)}")
     print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")
     print("content:")
     print(memory.content)

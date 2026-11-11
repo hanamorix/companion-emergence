@@ -54,7 +54,7 @@ def test_make_and_wire_writes_act_memory_with_emotion_for_nondiscard(tmp_path):
     mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # the emotion delta was applied W8-style: seeded onto the act-memory
-    assert mems[0].emotions
+    assert mems[0]._stored_emotions
     store2.close()
 
 
@@ -77,5 +77,5 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # discard moves nothing — empty-emotion act-memory only
-    assert not mems[0].emotions
+    assert not mems[0]._stored_emotions
     store2.close()

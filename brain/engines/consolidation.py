@@ -38,7 +38,6 @@ import numpy as np
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.emotion import engine
-from brain.emotion.engine_utils import resolve_emotions
 from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
@@ -928,7 +927,7 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
         if fresh is None:
             return  # hard-deleted since the importance update: nothing to write
         row = replace(fresh, importance=memory.importance)
-        faded = {name: live_engine.faded_value(row, name) for name in row.emotions}
+        faded = dict(live_engine.memory_feelings(row).feelings)
         store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
     except Exception:  # noqa: BLE001
         # A lost write-back costs one refresh; the importance update has already committed.
@@ -1004,14 +1003,11 @@ def _dispatch(
             merged = _fold(target.content, cand.content)
         # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
         live = engine.engine_for(persona_dir).is_live()
-        fields: dict = {"content": merged}
-        if live:
-            # Once the engine is live the merge combines both memories' emotions (see `_merge_emotions`), in the one update that
-            # writes the content. fold=False: the target's own update fires no hook (not even "assigned" when its emotions were
-            # empty); the incoming memory's mood move is sent below.
-            fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
         try:
-            store.update(target.id, **fields)
+            # Once the engine is live the merge combines both memories' emotions (`merge_into`, `store._merge_emotions`), in the
+            # one update that writes the content. fold=False: the target's own update fires no hook (not even "assigned" when
+            # its emotions were empty); the incoming memory's mood move is sent below.
+            store.merge_into(target, cand, merged, engine_live=live)
         except KeyError:
             # Target hard-deleted between the read and the write (a concurrent
             # forgetting LOSE). Defer the candidate; the archive record is
@@ -1076,19 +1072,6 @@ def _dispatch(
         result.continuations += 1
     else:
         result.promoted += 1
-
-
-def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, float]:
-    """The emotions of two memories that merge. Each memory goes through the engine's one name-resolution step first
-    (`resolve_emotions`: each name in its standard spelling, two spellings of one emotion one entry with their average, every
-    value held to 0-10, a value that is not a finite number dropped with a log line). Then an emotion on both memories is the
-    average of the two, and an emotion on one memory only is copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory counts
-    once in the average across the two. Returns a new dict, the target's names first.
-    """
-    merged = resolve_emotions(target_emotions)
-    for name, value in resolve_emotions(cand_emotions).items():
-        merged[name] = (merged[name] + value) / 2 if name in merged else value
-    return merged
 
 
 def _fold(existing: str, addition: str) -> str:

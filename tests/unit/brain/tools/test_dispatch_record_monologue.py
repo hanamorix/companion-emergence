@@ -74,8 +74,8 @@ def test_live_capture_stores_digest_two_feelings_and_keeps_raw_for_pass2(tmp_pat
         hebbian.close()
     assert result["monologue_text"] == "raw drift about the rain"
     assert trace.content == "she listened to the rain"
-    assert trace.emotions == pytest.approx({"anger": reading["anger"].short, "joy": reading["joy"].long})
-    assert trace.importance == pytest.approx(_trace_importance(trace.emotions))
+    assert trace._stored_emotions == pytest.approx({"anger": reading["anger"].short, "joy": reading["joy"].long})
+    assert trace.importance == pytest.approx(_trace_importance(trace._stored_emotions))
 
 
 def test_live_capture_same_strongest_feeling_stores_one_key_with_the_long_value(tmp_path: Path):
@@ -89,7 +89,7 @@ def test_live_capture_same_strongest_feeling_stores_one_key_with_the_long_value(
     finally:
         store.close()
         hebbian.close()
-    assert trace.emotions == pytest.approx({"joy": reading["joy"].long})
+    assert trace._stored_emotions == pytest.approx({"joy": reading["joy"].long})
 
 
 def test_live_capture_with_an_empty_read_stores_no_feelings(tmp_path: Path):
@@ -116,7 +116,7 @@ def test_live_capture_with_an_empty_read_stores_no_feelings(tmp_path: Path):
         store.close()
         hebbian.close()
     assert trace.content == "she drifted"
-    assert trace.emotions == {}
+    assert trace._stored_emotions == {}
     assert trace.importance == pytest.approx(0.2)
 
 
@@ -203,7 +203,7 @@ def test_engine_read_that_raises_stores_no_feelings_and_keeps_the_trace(tmp_path
     finally:
         store.close()
         hebbian.close()
-    assert (trace.content, trace.emotions) == ("she drifted", {})
+    assert (trace.content, trace._stored_emotions) == ("she drifted", {})
 
 
 @pytest.mark.no_base_failure(reason="base never reads the switch; bites when _is_live stops treating a raise as off")
@@ -265,7 +265,7 @@ def test_switch_off_capture_stores_todays_trace(tmp_path: Path):
         store.close()
         hebbian.close()
     assert result == {"ok": True, "monologue_text": "raw drift"}
-    assert (trace.content, trace.emotions) == ("raw drift", expected)
+    assert (trace.content, trace._stored_emotions) == ("raw drift", expected)
     assert trace.importance == pytest.approx(_trace_importance(expected))
 
 
@@ -296,7 +296,7 @@ def test_live_answer_without_a_persona_dir_is_still_off(tmp_path: Path):
     finally:
         store.close()
         hebbian.close()
-    assert (trace.content, trace.emotions) == ("raw drift", expected)
+    assert (trace.content, trace._stored_emotions) == ("raw drift", expected)
 
 
 def test_live_interior_block_shows_the_digest_not_the_raw_thought(tmp_path: Path):
@@ -366,7 +366,7 @@ def test_engine_does_not_count_a_promoted_trace(tmp_path: Path):
         store.close()
         hebbian.close()
     assert [m.content for m in promoted] == ["she drifted"]
-    assert promoted[0].emotions["joy"] - before["joy"].short > 0.5  # stored (long) differs from the other average
+    assert promoted[0]._stored_emotions["joy"] - before["joy"].short > 0.5  # stored (long) differs from the other average
     assert after == before
 
 

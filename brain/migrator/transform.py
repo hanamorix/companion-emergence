@@ -144,7 +144,7 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
     tags_raw = og.get("tags")
     tags = list(tags_raw) if isinstance(tags_raw, list) else []
 
-    mem = Memory(
+    mem = Memory.from_stored_row(
         id=og_id,
         content=content,
         memory_type=str(og.get("memory_type") or "conversation"),

@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.behavioral.log import append_behavioral_event
+from brain.emotion.engine_utils import memory_feelings
 from brain.memory.store import Memory, MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -58,12 +59,17 @@ def record_climax_event(
             ts = ts.replace(tzinfo=UTC)
         snippet = (originating_memory.content or "")[:100].replace("\n", " ").strip()
         content = f"the body crested. {ts.isoformat()}. context: {snippet}"
+        # The originating memory's feelings through the one read (faded and held to 0-10), a new row's own values.
+        engine = store.emotion_engine()
+        feelings = dict(
+            (engine.memory_feelings(originating_memory) if engine is not None else memory_feelings(originating_memory, None, None, None)).feelings
+        )
 
         journal = Memory.create_new(
             content=content,
             memory_type="journal_entry",
             domain="self",
-            emotions=dict(originating_memory.emotions),
+            emotions=feelings,
             metadata={
                 "private": True,
                 "source": "climax_event",
@@ -93,7 +99,7 @@ def record_climax_event(
             timestamp=datetime.now(UTC),
             source="climax_event",
             reflex_arc_name=None,
-            emotional_state=dict(originating_memory.emotions),
+            emotional_state=feelings,
         )
     except (OSError, ValueError) as exc:
         logger.warning(

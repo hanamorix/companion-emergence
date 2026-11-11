@@ -1120,7 +1120,7 @@ def test_live_fire_stores_feelings_and_rating(tmp_path: Path):
     finally:
         store.close()
     assert result.fired is not None
-    assert memory.emotions == {"awe": 8.0}
+    assert memory._stored_emotions == {"awe": 8.0}
     assert memory.metadata["engagement_rating"] == 6.0
     interests = json.loads((tmp_path / "interests.json").read_text(encoding="utf-8"))["interests"]
     assert interests[0]["status"] == "dormant"  # the verdict still reads "close" with the felt lines after it
@@ -1134,7 +1134,7 @@ def test_live_fire_with_only_the_three_markers_keeps_the_memory_and_logs(tmp_pat
     finally:
         store.close()
     assert result.fired is not None and memory.content == "m"
-    assert memory.emotions == {}
+    assert memory._stored_emotions == {}
     assert "engagement_rating" not in memory.metadata
     rows = (tmp_path / "parse_failures.jsonl").read_text(encoding="utf-8").splitlines()
     assert [json.loads(row)["site"] for row in rows] == ["research_felt"]
@@ -1175,6 +1175,6 @@ def test_off_fire_is_unchanged_and_leaves_felt_lines_to_the_old_parser(tmp_path:
     finally:
         store.close()
     assert result.fired is not None
-    assert memory.emotions == {}
+    assert memory._stored_emotions == {}
     assert "engagement_rating" not in memory.metadata
     assert not (tmp_path / "parse_failures.jsonl").exists()

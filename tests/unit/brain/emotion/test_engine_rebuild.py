@@ -33,7 +33,7 @@ D = [local_noon(local_day(n)) for n in range(12)]  # D[n] = local noon of day n
 
 
 def _emotions_of(memory: Memory) -> dict:
-    return dict(memory.emotions)
+    return dict(memory._stored_emotions)
 
 
 def _mods(**by_id: float):

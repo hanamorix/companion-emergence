@@ -276,7 +276,7 @@ class EmotionEngine:
     @staticmethod
     def _stored_climax(memory: Memory) -> float:
         """The memory's STORED climax value (the climax test is on the stored value, the fold uses the faded one), 0.0 if none."""
-        stored = {name: value for name, value in memory.emotions.items() if isinstance(name, str) and vocabulary.canonical_name(name) == "climax"}
+        stored = {name: value for name, value in memory._stored_emotions.items() if isinstance(name, str) and vocabulary.canonical_name(name) == "climax"}
         return resolve_emotions(stored).get("climax", 0.0)
 
     def _modifier(self, memory: Memory, kind: str, *, trust_memo: dict[str, float] | None = None) -> float:

@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from brain.emotion import engine
 from brain.grief import breadcrumb, policy
 from brain.grief.prompt import render_grief_block
 from brain.grief.recall import handle_recall_touch
@@ -63,12 +64,14 @@ def handle_drop(
     guards only against import-time failures, not runtime errors in this function.
     """
     try:
-        emotion_max = max(memory.emotions.values()) / 10.0 if memory.emotions else 0.0
+        # The memory's feelings through the engine's one read (the row is already deleted; the read needs no store).
+        feelings = engine.engine_for(persona_dir).memory_feelings(memory).feelings
+        emotion_max = max(feelings.values()) / 10.0 if feelings else 0.0
         emotion_max = max(0.0, min(1.0, emotion_max))
         intensity = breadcrumb.compute_drop_intensity(emotion_at_ingest_max=emotion_max)
         if intensity < policy.THRESHOLD:
             return
-        residue = _dominant_non_grief_emotion(dict(memory.emotions or {}))
+        residue = _dominant_non_grief_emotion(dict(feelings))
         breadcrumb.write_breadcrumb(
             store=store,
             intensity=intensity,

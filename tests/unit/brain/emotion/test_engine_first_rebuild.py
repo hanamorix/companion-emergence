@@ -420,8 +420,8 @@ def test_a_failed_record_of_the_queue_step_stops_start_up_and_the_next_start_com
     assert state_of(persona).switch_over_at == NOW
     store = MemoryStore(persona / "memories.db", integrity_check=False)
     try:
-        assert store.get("made", bump=False).emotions == pytest.approx({"pride": 4.0})  # 0.4 x 10 once, not 40
-        assert store.get("late-row", bump=False).emotions == pytest.approx({"pride": 0.2})  # accepted edge (S77): the rows were done
+        assert store.get("made", bump=False)._stored_emotions == pytest.approx({"pride": 4.0})  # 0.4 x 10 once, not 40
+        assert store.get("late-row", bump=False)._stored_emotions == pytest.approx({"pride": 0.2})  # accepted edge (S77): the rows were done
     finally:
         store.close()
     entries = {e["id"]: e for e in pending.read_jsonl(persona / "pending_candidates.jsonl")}
@@ -526,7 +526,7 @@ def test_a_first_rebuild_folds_stored_values_and_a_recovery_rebuild_folds_the_fa
     persona = make_persona(tmp_path, [row(T[35], emotions={"joy": 8.0}, mid="a")])
     _rebuild(persona, "first")
     assert state_of(persona).emotions["joy"].short.avg == pytest.approx(8.0)
-    half = lambda memory: {name: value / 2 for name, value in memory.emotions.items()}  # noqa: E731
+    half = lambda memory: {name: value / 2 for name, value in memory._stored_emotions.items()}  # noqa: E731
     _rebuild(persona, "recovery", faded=half)
     assert state_of(persona).emotions["joy"].short.avg == pytest.approx(4.0)
 

@@ -89,4 +89,4 @@ def test_add_journal_emotions_field_is_dict(tmp_path, store, hebbian):
         persona_dir=tmp_path,
     )
     mem = store.get(result["created_id"])
-    assert isinstance(mem.emotions, dict)
+    assert isinstance(mem._stored_emotions, dict)

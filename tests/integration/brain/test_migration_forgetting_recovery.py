@@ -31,7 +31,7 @@ def test_canary_loop_heals(tmp_path, monkeypatch):
     src = tmp_path / "Downloads" / "Canary"
     src.mkdir(parents=True)
     s = MemoryStore(src / "memories.db")
-    s.create(Memory(id="anchor", content="the important one", memory_type="conversation",
+    s.create(Memory.from_stored_row(id="anchor", content="the important one", memory_type="conversation",
                     domain="us", created_at=_old(400), importance=10.0,
                     emotions={"love": 9.0}, score=9.0))
     for n in ("n1", "n2", "n3"):

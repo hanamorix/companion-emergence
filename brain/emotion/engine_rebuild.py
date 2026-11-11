@@ -435,4 +435,4 @@ def rebuild(
 
 def _stored_emotions(memory: Memory) -> Mapping[str, float]:
     """What a FIRST rebuild folds for a row: its stored feelings (names canonical, each held to 0-10) when it counts, else nothing."""
-    return resolve_emotions(memory.emotions) if counted_kind(memory) is not None else {}
+    return resolve_emotions(memory._stored_emotions) if counted_kind(memory) is not None else {}

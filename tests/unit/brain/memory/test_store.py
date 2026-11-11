@@ -41,13 +41,13 @@ def test_memory_create_new_computes_score_from_emotions() -> None:
         domain="us",
         emotions={"love": 9.0, "tenderness": 6.0},
     )
-    assert m.score == 15.0
+    assert m._stored_score == 15.0
 
 
 def test_memory_create_new_score_zero_when_no_emotions() -> None:
     """Empty emotions dict → score 0."""
     m = Memory.create_new(content="note", memory_type="meta", domain="work")
-    assert m.score == 0.0
+    assert m._stored_score == 0.0
 
 
 def test_memory_create_new_importance_defaults_to_score_over_ten() -> None:
@@ -96,9 +96,9 @@ def test_memory_to_dict_round_trips() -> None:
     assert restored.content == original.content
     assert restored.memory_type == original.memory_type
     assert restored.domain == original.domain
-    assert restored.emotions == original.emotions
+    assert restored._stored_emotions == original._stored_emotions
     assert restored.tags == original.tags
-    assert restored.score == original.score
+    assert restored._stored_score == original._stored_score
     assert restored.importance == original.importance
     assert restored.created_at == original.created_at
     assert restored.active == original.active
@@ -128,8 +128,9 @@ def test_memory_from_dict_treats_null_like_missing(field: str) -> None:
     missing = {k: v for k, v in data.items() if k != field}
     nulled = {**data, field: None}
 
-    assert getattr(Memory.from_dict(nulled), field) == 0.0
-    assert getattr(Memory.from_dict(nulled), field) == getattr(Memory.from_dict(missing), field)
+    attribute = "_stored_score" if field == "score" else field  # the dict key `score` is the private field `_stored_score`
+    assert getattr(Memory.from_dict(nulled), attribute) == 0.0
+    assert getattr(Memory.from_dict(nulled), attribute) == getattr(Memory.from_dict(missing), attribute)
 
 
 def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
@@ -279,8 +280,8 @@ def test_store_create_and_get_round_trips(store: MemoryStore) -> None:
     assert restored is not None
     assert restored.id == original.id
     assert restored.content == original.content
-    assert restored.emotions == original.emotions
-    assert restored.score == original.score
+    assert restored._stored_emotions == original._stored_emotions
+    assert restored._stored_score == original._stored_score
 
 
 def test_store_get_unknown_returns_none(store: MemoryStore) -> None:
@@ -1948,8 +1949,8 @@ def test_peak_captured_on_create(store):
                             emotions={"joy": 6.0, "warmth": 3.0})
     store.create(mem)
     got = store.get(mem.id)
-    assert got.peak_emotion_intensity == 6.0
-    assert isinstance(mem.peak_emotion_intensity, float)  # one scalar, not a per-emotion vector (deferred D3 design)
+    assert got._stored_peak == 6.0
+    assert isinstance(mem._stored_peak, float)  # one scalar, not a per-emotion vector (deferred D3 design)
 
 
 def test_peak_is_monotone_under_update(store):
@@ -1957,10 +1958,10 @@ def test_peak_is_monotone_under_update(store):
     store.create(mem)
     # Decay-shaped write: lower intensities must NOT lower the peak.
     store.update(mem.id, emotions={"joy": 0.5})
-    assert store.get(mem.id).peak_emotion_intensity == 6.0
+    assert store.get(mem.id)._stored_peak == 6.0
     # A hotter later delta raises it.
     store.update(mem.id, emotions={"joy": 8.5})
-    assert store.get(mem.id).peak_emotion_intensity == 8.5
+    assert store.get(mem.id)._stored_peak == 8.5
 
 
 def test_peak_survives_emotions_emptied(store):
@@ -1970,14 +1971,14 @@ def test_peak_survives_emotions_emptied(store):
     store.create(mem)
     store.update(mem.id, emotions={})
     got = store.get(mem.id)
-    assert got.emotions == {}
-    assert got.peak_emotion_intensity == 6.0
+    assert got._stored_emotions == {}
+    assert got._stored_peak == 6.0
 
 
 def test_peak_defaults_zero_without_emotions(store):
     mem = Memory.create_new("flat", "conversation", "us")
     store.create(mem)
-    assert store.get(mem.id).peak_emotion_intensity == 0.0
+    assert store.get(mem.id)._stored_peak == 0.0
 
 
 def test_peak_migration_seeds_from_current_intensities(tmp_path):
@@ -2017,8 +2018,8 @@ def test_peak_migration_seeds_from_current_intensities(tmp_path):
     conn.close()
 
     migrated = MemoryStore(db)  # reopen → column added + seeded
-    assert migrated.get("a" * 36).peak_emotion_intensity == 4.5
-    assert migrated.get("b" * 36).peak_emotion_intensity == 0.0
+    assert migrated.get("a" * 36)._stored_peak == 4.5
+    assert migrated.get("b" * 36)._stored_peak == 0.0
     # Corrupt-JSON row: _row_to_memory itself can't parse it, so verify the
     # migrated DB value directly — the seeding must have written honest 0.0.
     row = migrated._conn.execute(

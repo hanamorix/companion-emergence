@@ -335,7 +335,7 @@ def _first_rebuild(persona: Path, now) -> None:  # noqa: ANN001
         persona,
         "first",
         now,
-        faded_emotions_of=lambda memory: dict(memory.emotions),
+        faded_emotions_of=lambda memory: dict(memory._stored_emotions),
         modifier_of=lambda memory: 1.0,
     )
 

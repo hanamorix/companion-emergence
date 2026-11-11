@@ -182,16 +182,16 @@ def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     # The id keeps its history: before Engine 6 the heartbeat's per-memory decay pass erased this value. The pass is gone
     # (the engine fades on read), so a heartbeat leaves every stored value as written. The out-of-range write is B1-4's.
     dream, seed = _write_dream_over_ten(store, hebbian, persona_dir)
-    assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
+    assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
     _one_heartbeat(store, hebbian, persona_dir)
-    assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
-    assert store.get(seed.id).emotions == {"love": pytest.approx(6.0)}
+    assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
+    assert store.get(seed.id)._stored_emotions == {"love": pytest.approx(6.0)}
 
 
 @_flipped_by("B1-4")
 def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix) -> None:
     dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir)
-    assert store.get(dream.id).emotions["love"] <= 10.0
+    assert store.get(dream.id)._stored_emotions["love"] <= 10.0
 
 
 def test_today_negative_peer_value_is_erased_by_one_heartbeat(
@@ -200,9 +200,9 @@ def test_today_negative_peer_value_is_erased_by_one_heartbeat(
     # The id keeps its history: before Engine 6 the heartbeat's decay pass erased the negative value. The pass is gone, so
     # a heartbeat leaves the row as written. The negative write is B1-2's.
     memory_id = _write_negative_peer_memory(store)
-    assert store.get(memory_id).emotions["tenderness"] == pytest.approx(-0.3)
+    assert store.get(memory_id)._stored_emotions["tenderness"] == pytest.approx(-0.3)
     _one_heartbeat(store, hebbian, persona_dir)
-    emotions = store.get(memory_id).emotions
+    emotions = store.get(memory_id)._stored_emotions
     assert emotions["tenderness"] == pytest.approx(-0.3)
     assert emotions["joy"] == pytest.approx(5.0)
 
@@ -210,7 +210,7 @@ def test_today_negative_peer_value_is_erased_by_one_heartbeat(
 @_flipped_by("B1-2")
 def test_intended_peer_values_are_never_negative(store: MemoryStore) -> None:
     memory_id = _write_negative_peer_memory(store)
-    assert all(value >= 0.0 for value in store.get(memory_id).emotions.values())
+    assert all(value >= 0.0 for value in store.get(memory_id)._stored_emotions.values())
 
 
 @_PINNED

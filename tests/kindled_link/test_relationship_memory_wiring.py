@@ -75,8 +75,8 @@ def test_reflection_with_mem_store_writes_kindled_peer_memory_and_caps_emotion(t
     assert m.metadata.get("relationship_stage") == "acquaintance"
     assert m.content == "I talked with a peer today and felt a quiet warmth."
     # emotion was applied (capped, vocab-filtered) — non-empty for a fresh peer
-    assert m.emotions
-    assert all(0.0 < v <= 0.08 + 1e-9 for v in m.emotions.values())
+    assert m._stored_emotions
+    assert all(0.0 < v <= 0.08 + 1e-9 for v in m._stored_emotions.values())
 
 
 def test_mem_store_none_back_compat_no_memory_written(tmp_path):

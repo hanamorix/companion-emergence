@@ -33,9 +33,9 @@ def _memory(created: datetime, emotions: dict, *, importance: float = 0.0, peak:
     base = row(created, emotions=emotions, mid="m")
     changes: dict = {"importance": importance}
     if peak is not None:
-        changes["peak_emotion_intensity"] = peak
+        changes["_stored_peak"] = peak
     if score is not None:
-        changes["score"] = score
+        changes["_stored_score"] = score
     return dataclasses.replace(base, **changes)
 
 
@@ -156,7 +156,7 @@ def test_faded_value_and_the_pure_read_agree_for_the_same_inputs(tmp_path: Path)
     ]
     for memory in memories:
         read = memory_feelings(memory, instance.half_life, T[0], T[50])
-        for name in memory.emotions:
+        for name in memory._stored_emotions:
             assert instance.faded_value(memory, name) == pytest.approx(read.feelings[name])
         assert instance.memory_feelings(memory).feelings == read.feelings
 
@@ -194,7 +194,7 @@ def test_the_engine_wrapper_uses_the_engines_switch_time_and_clock(tmp_path: Pat
     # live now; the age counts from the switch, day 44, to the clock, day 50: 6 days, joy half-life 3: 8 x 0.25
     read = instance.memory_feelings(memory)
     assert read.feelings["joy"] == pytest.approx(2.0)
-    assert (read.peak, read.score) == (memory.peak_emotion_intensity, memory.score)
+    assert (read.peak, read.score) == (memory._stored_peak, memory._stored_score)
     # the clock is read when the read is made, not when the feelings are first asked for
     lazy = instance.memory_feelings(memory)
     clock.now = T[56]

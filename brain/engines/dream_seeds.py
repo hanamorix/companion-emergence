@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.state import EmotionalState
-from brain.emotion.vocabulary import pool_by_canonical_name
 from brain.memory.store import Memory
 from brain.soul.crystallization import Crystallization
 
@@ -28,10 +28,11 @@ def emotional_congruence(memory: Memory, mood: EmotionalState) -> float:
     """Sum over emotions shared by mood and memory of (mood_intensity * memory_value).
 
     The mood's channels are canonical emotion names (a mood is keyed by canonical name),
-    so the memory's stored emotions are read by canonical name too; two spellings of one emotion in
-    a memory count their larger value once.
+    so the memory's feelings are read by canonical name too: the one read of a memory's feelings
+    (`memory_feelings`, no engine here, so its stored values held to 0-10) gives canonical names, and two
+    spellings of one emotion in a memory count once, as their average.
     """
-    memory_values = pool_by_canonical_name(memory.emotions)
+    memory_values = memory_feelings(memory, None, None, None).feelings
     total = 0.0
     for name, intensity in mood.emotions.items():
         mv = memory_values.get(name, 0.0)
@@ -96,7 +97,7 @@ def grief_pull(memory: Memory) -> float:
     within a grief-congruent pool. Fires only for grief_event memories."""
     if memory.memory_type != "grief_event":
         return 0.0
-    return memory.emotions.get("memory_grief", 0.0) / 10.0
+    return memory_feelings(memory, None, None, None).feelings.get("memory_grief", 0.0) / 10.0
 
 
 def refractory_penalty(memory_id: str, recent_seed_ids: list[str]) -> float:

@@ -14,6 +14,7 @@ from typing import Any
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
+from brain.emotion.engine_utils import memory_feelings
 from brain.engines import dream_seeds
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 from brain.memory.hebbian import HebbianMatrix
@@ -249,9 +250,9 @@ class DreamEngine:
         # show love=80 across 8 activated memories. Downstream consumers that
         # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
         # ingest, not here.
-        aggregated_emotions: dict[str, float] = dict(seed.emotions)
+        aggregated_emotions: dict[str, float] = dict(memory_feelings(seed, None, None, None).feelings)
         for mem, _ in neighbours:
-            for k, v in mem.emotions.items():
+            for k, v in memory_feelings(mem, None, None, None).feelings.items():
                 aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
 
         dream = Memory.create_new(
@@ -339,7 +340,7 @@ class DreamEngine:
                 source="dream",
                 source_id=dream_memory.id,
                 emotional_snapshot=EmotionalSnapshot(
-                    vector=dict(dream_memory.emotions),
+                    vector=dict(memory_feelings(dream_memory, None, None, None).feelings),
                     rolling_baseline_mean=0.0,
                     rolling_baseline_stdev=0.0,
                     current_resonance=0.0,

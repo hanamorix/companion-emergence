@@ -559,7 +559,7 @@ def faded_emotion(
     has no such emotion: "absent" is for the caller to decide.
     """
     try:
-        stored = memory.emotions[emotion]
+        stored = memory._stored_emotions[emotion]
     except KeyError:
         raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}") from None
     created = lenient_utc(memory.created_at)
@@ -596,7 +596,7 @@ class MemoryFeelings:
     @cached_property
     def feelings(self) -> dict[str, float]:
         faded: dict = {}
-        for name in self._memory.emotions:
+        for name in self._memory._stored_emotions:
             try:
                 faded[name] = faded_emotion(self._memory, name, self._half_lives, self._switch_over_at, self._now)
             except Exception:
@@ -618,8 +618,8 @@ def memory_feelings(
     negative reads as 0 in `feelings` and `peak`.
     """
     return MemoryFeelings(
-        peak=_held_or_zero(memory.peak_emotion_intensity),
-        score=memory.score,
+        peak=_held_or_zero(memory._stored_peak),
+        score=memory._stored_score,
         _memory=memory,
         _half_lives=half_lives,
         _switch_over_at=switch_over_at,

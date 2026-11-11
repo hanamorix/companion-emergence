@@ -48,9 +48,9 @@ def _assert_scaled_down(rows: list[Memory]) -> None:
     assert rows, "the writer stored nothing"
     for row in rows:
         assert row.memory_type in dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES
-        assert row.emotions, f"{row.memory_type} row stored no feelings"
-        assert all(0 < value < dev_constants.NUDGE_SCALE_FIX_THRESHOLD for value in row.emotions.values())
-        assert 0 < row.peak_emotion_intensity < dev_constants.NUDGE_SCALE_FIX_THRESHOLD
+        assert row._stored_emotions, f"{row.memory_type} row stored no feelings"
+        assert all(0 < value < dev_constants.NUDGE_SCALE_FIX_THRESHOLD for value in row._stored_emotions.values())
+        assert 0 < row._stored_peak < dev_constants.NUDGE_SCALE_FIX_THRESHOLD
 
 
 @pytest.mark.parametrize("source", sorted(reach_emotion._SOURCE_ACCENT))

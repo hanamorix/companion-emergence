@@ -43,7 +43,7 @@ def row(
 ) -> Memory:
     emo = {"joy": 6.0} if emotions is None else dict(emotions)
     numbers = [float(v) for v in emo.values()]
-    return Memory(
+    return Memory.from_stored_row(
         id=mid or str(uuid.uuid4()),
         content="an engine test memory",
         memory_type=memory_type,

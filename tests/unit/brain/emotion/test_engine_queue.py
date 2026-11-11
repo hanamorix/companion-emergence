@@ -1505,7 +1505,7 @@ def _hook_mem(
 ) -> Memory:
     emo = {"joy": 6.0} if emotions is None else dict(emotions)
     numbers = [v for v in emo.values() if isinstance(v, (int, float)) and math.isfinite(v)]
-    return Memory(
+    return Memory.from_stored_row(
         id=mid or str(uuid.uuid4()),
         content="a hook test memory",
         memory_type=memory_type,
@@ -1646,7 +1646,7 @@ def test_create_with_fold_false_writes_no_queue_and_no_state_folder(tmp_path: Pa
 def test_commit_and_assigned_carry_faded_emotions_and_the_stored_climax(
     tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: memory.emotions[emotion] / 4)
+    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: memory._stored_emotions[emotion] / 4)
     hook_store.create(_hook_mem(emotions={"joy": 8.0, "climax": 8.0}))
     empty = _hook_mem(emotions={})
     hook_store.create(empty, fold=False)
@@ -1664,7 +1664,7 @@ def test_a_faded_value_that_raises_drops_that_name_with_a_line_and_queues_the_re
     def faded(memory: Memory, emotion: str, half_lives: object, switch_over_at: object, now: object) -> float:
         if emotion == "grief":
             raise RuntimeError("no half-life")
-        return memory.emotions[emotion]
+        return memory._stored_emotions[emotion]
 
     monkeypatch.setattr(engine_utils, "faded_emotion", faded)
     engine = engine_module.engine_for(tmp_path)
@@ -2078,7 +2078,7 @@ def test_a_failure_inside_a_hook_is_logged_once_and_the_row_stays(
         patch.setattr("brain.memory.store.replace", raiser)
         empty = _row_without_emotions(hook_store)
         hook_store.update(empty.id, emotions={"joy": 3.0})  # returns
-        assert hook_store.get(empty.id, bump=False).emotions == {"joy": 3.0}
+        assert hook_store.get(empty.id, bump=False)._stored_emotions == {"joy": 3.0}
         _one_error(caplog, boom)
     with monkeypatch.context() as patch, caplog.at_level(logging.ERROR):
         caplog.clear()
@@ -2205,7 +2205,7 @@ def test_an_existing_queued_event_is_kept_when_another_is_appended(tmp_path: Pat
 def test_a_showing_carries_the_faded_value_at_the_given_or_the_entry_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: memory.emotions[emotion] / 2)
+    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: memory._stored_emotions[emotion] / 2)
     engine = EngineCls(tmp_path, now=lambda: NOW)
     mem = _hook_mem(emotions={"joy": 8.0})
     shown_at = NOW - timedelta(hours=1)
@@ -2250,7 +2250,7 @@ def test_the_store_calls_out_through_engine_for(tmp_path: Path, hook_store: Memo
     hook_store.update(mem.id, content="again", fold=False)
     names = [call[0] for call in emotion_engine_stub.recorded_calls]
     assert names == ["on_memory_committed", "on_emotions_assigned"]
-    assert emotion_engine_stub.recorded_calls[1][1].emotions == {"joy": 3.0}
+    assert emotion_engine_stub.recorded_calls[1][1]._stored_emotions == {"joy": 3.0}
     assert not engine_files.queue_path(tmp_path).exists()  # the stub queued nothing
 
 

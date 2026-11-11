@@ -323,9 +323,10 @@ def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunR
     events: list = []
     for m in rows:
         kind = eu.counted_kind(m)
-        if kind is None or not m.emotions:
+        if kind is None:
             continue
-        emotions = eu.resolve_emotions(m.emotions)
+        # The replay folds each row's stored feelings as written (no fade): the pure read, held to 0-10, canonical names.
+        emotions = eu.memory_feelings(m, None, None, None).feelings
         if not emotions:
             continue
         events.append(
@@ -335,7 +336,7 @@ def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunR
                 memory_id=m.id,
                 emotions=emotions,
                 modifier=eu.source_modifier(m, 0.0),
-                climax=float(m.emotions.get("climax", 0.0) or 0.0),
+                climax=float(emotions.get("climax", 0.0) or 0.0),
             )
         )
     event_times = [e.at for e in events]
@@ -666,6 +667,7 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
     started = time.perf_counter()
     source, commit = _step_source(db)
     from brain import dev_constants
+    from brain.emotion import engine_utils as eu
     from brain.emotion import vocabulary
     from brain.memory.store import _row_to_memory
     from brain.paths import get_home
@@ -684,7 +686,7 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
         ]
         rows = [m for m in rows if m.created_at is not None]
         rows.sort(key=lambda m: m.created_at)
-        with_emotions = sum(1 for m in rows if m.emotions)
+        with_emotions = sum(1 for m in rows if eu.memory_feelings(m, None, None, None).feelings)
         first, last = rows[0].created_at.date(), rows[-1].created_at.date()
         dates = [first + timedelta(days=i) for i in range((last - first).days + 1)]
         arcs = reflex_arcs()

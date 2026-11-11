@@ -54,7 +54,7 @@ def read_source_memories(source_dir: Path) -> dict[str, Memory]:
                 last_accessed = _coerce_utc(la)
             except ValueError:
                 last_accessed = None
-        out[mid] = Memory(
+        out[mid] = Memory.from_stored_row(
             id=mid,
             content=content,
             memory_type=d.get("memory_type") or "conversation",

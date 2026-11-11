@@ -61,7 +61,7 @@ def test_commit_item_passes_emotions_to_memory(tmp_path):
 
     assert mem_id is not None
     memory = PendingQueue(store.persona_dir).read_recent("observation", limit=1)[0]
-    assert memory.emotions == {"longing": 7.0, "nostalgia": 5.0}
+    assert memory._stored_emotions == {"longing": 7.0, "nostalgia": 5.0}
 
 
 def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty(
@@ -126,12 +126,12 @@ def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty
 
     # At least one committed memory carries non-empty emotions.
     mems = [store.get(mid) for mid in report.memory_ids]
-    assert any(m is not None and m.emotions for m in mems), (
+    assert any(m is not None and m._stored_emotions for m in mems), (
         "Expected at least one committed memory with non-empty emotions"
     )
 
     # loneliness is a baseline vocabulary name: the promoted row still carries it.
     promoted = store.list_active()
-    assert any(m.emotions.get("loneliness", 0.0) > 0.0 for m in promoted), (
-        f"Expected loneliness > 0 on a promoted row; got {[m.emotions for m in promoted]}"
+    assert any(m._stored_emotions.get("loneliness", 0.0) > 0.0 for m in promoted), (
+        f"Expected loneliness > 0 on a promoted row; got {[m._stored_emotions for m in promoted]}"
     )

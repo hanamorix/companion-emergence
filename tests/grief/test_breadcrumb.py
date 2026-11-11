@@ -110,7 +110,7 @@ def test_write_breadcrumb_drop_with_residue(tmp_path: Path) -> None:
     assert saved is not None
     assert saved.memory_type == "grief_event"
     assert saved.domain == "grief"
-    assert saved.emotions == {"memory_grief": 4.4, "joy": 3.5}
+    assert saved._stored_emotions == {"memory_grief": 4.4, "joy": 3.5}
     assert saved.metadata["grief_referent_id"] == "mem-abc-123"
     assert saved.metadata["grief_referent_type"] == "memory"
     assert saved.metadata["grief_subtype"] == "drop"
@@ -132,7 +132,7 @@ def test_write_breadcrumb_recall_touch_with_triggering_arc(tmp_path: Path) -> No
     )
     saved = store.get(bc_id)
     assert saved is not None
-    assert saved.emotions == {"memory_grief": 3.5}
+    assert saved._stored_emotions == {"memory_grief": 3.5}
     assert saved.metadata["triggering_arc_id"] == "arc-foo"
     assert saved.metadata["grief_subtype"] == "recall_touch"
 
