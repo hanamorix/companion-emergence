@@ -158,10 +158,10 @@ def run_dedup_sweep(
     soul-linked is archived (full pre-image, reason "dedup_sweep") then
     hard-deleted, and the canonical's importance is raised to the max of itself
     and the rows actually merged into it. Each row is re-read first: one that
-    vanished, was deactivated or no longer normalises to the canonical is
-    skipped, and a canonical that vanished ends its group (#505), and so is a
-    row whose type changed so that it may no longer merge into the canonical
-    (#619). A group that removed nothing is not counted as merged.
+    vanished, was deactivated, no longer normalises to the canonical, or was
+    retyped so that it may no longer merge into the canonical (#619) is
+    skipped, and a canonical that vanished ends its group (#505). A group that
+    removed nothing is not counted as merged.
 
     Optional near-dup layer: when ``judge`` is supplied, canonical survivors
     left after the exact-normalize pass are compared pairwise, only pairs of one
@@ -210,7 +210,8 @@ def run_dedup_sweep(
             # the opening ``list_active`` snapshot, and another writer may have deleted or deactivated
             # either since. A gone canonical ends the group (nothing may be merged into it); a gone
             # duplicate is skipped, never archived from the stale copy or deleted. So is one rewritten
-            # since so that it no longer normalises to the canonical: it is not a duplicate any more.
+            # since so that it no longer normalises to the canonical: it is not a duplicate any more. And one
+            # retyped since so that it may no longer merge into the canonical (#619): a type rule, not a text one.
             canonical_live = _live_row(store, canonical.id)
             if canonical_live is None:
                 break
