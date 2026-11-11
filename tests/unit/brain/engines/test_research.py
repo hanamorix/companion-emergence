@@ -30,7 +30,7 @@ DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "defa
 
 
 def _build_engine(
-    tmp_path: Path, store: MemoryStore, provider=None, searcher=None
+    tmp_path: Path, store: MemoryStore, provider=None, searcher=None, **fields
 ) -> ResearchEngine:
     return ResearchEngine(
         store=store,
@@ -41,6 +41,7 @@ def _build_engine(
         interests_path=tmp_path / "interests.json",
         research_log_path=tmp_path / "research_log.json",
         default_interests_path=DEFAULT_INTERESTS_PATH,
+        **fields,
     )
 
 
@@ -140,6 +141,44 @@ def test_run_tick_days_since_human_triggers(tmp_path: Path):
         assert result.fired.topic == "marine bioluminescence"
     finally:
         store.close()
+
+
+def test_run_tick_gate_reads_the_configured_days_since_human_min(tmp_path: Path):
+    """Below the configured minimum the tick is not due; at it, the tick would fire."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store, research_days_since_human_min=3.0)
+        below = engine.run_tick(dry_run=True, days_since_human_override=2.0)
+        assert below.reason == "not_due"
+        assert below.would_fire is None
+        at = engine.run_tick(dry_run=True, days_since_human_override=3.0)
+        assert at.would_fire == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_run_tick_gate_opens_earlier_when_the_configured_minimum_is_lowered(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store, research_days_since_human_min=0.5)
+        result = engine.run_tick(dry_run=True, days_since_human_override=1.0)
+        assert result.would_fire == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_research_engine_default_minimum_is_the_heartbeat_config_default():
+    import dataclasses
+
+    from brain.engines.heartbeat import HeartbeatConfig
+
+    defaults = {f.name: f.default for f in dataclasses.fields(ResearchEngine)}
+    assert (
+        defaults["research_days_since_human_min"]
+        == HeartbeatConfig().research_days_since_human_min
+    )
 
 
 def test_run_tick_emotion_high_triggers(tmp_path: Path, emotion_engine_stub):

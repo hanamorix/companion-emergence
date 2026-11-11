@@ -109,6 +109,23 @@ def test_heartbeat_config_load_tolerates_unknown_fields(tmp_path: Path) -> None:
     assert c.dream_every_hours == 12.0
 
 
+def test_heartbeat_config_old_research_emotion_threshold_key_loads_and_is_not_saved_again(
+    tmp_path: Path,
+) -> None:
+    """The research emotion setting is gone (the engine's own "high" level is the gate's); an old file holding it still loads."""
+    path = tmp_path / "cfg.json"
+    path.write_text(
+        json.dumps({"research_days_since_human_min": 4.0, "research_emotion_threshold": 7.0})
+    )
+    c = HeartbeatConfig.load(path)
+    assert c.research_days_since_human_min == 4.0
+    assert not hasattr(c, "research_emotion_threshold")
+    c.save(path)
+    saved = json.loads(path.read_text())
+    assert "research_emotion_threshold" not in saved
+    assert saved["research_days_since_human_min"] == 4.0
+
+
 def test_heartbeat_config_invalid_emit_memory_falls_back_to_default(tmp_path: Path) -> None:
     """Invalid emit_memory value falls back to 'conditional' (safe default)."""
     path = tmp_path / "cfg.json"
@@ -1042,6 +1059,69 @@ def test_heartbeat_runs_research_when_enabled(tmp_path: Path) -> None:
         hm.close()
 
 
+def test_heartbeat_research_gate_reads_the_configured_days_since_human_min(tmp_path: Path) -> None:
+    """A persona's research_days_since_human_min reaches the research gate: no human turn for 999 days, a 1000-day minimum."""
+    from brain.search.base import NoopWebSearcher
+
+    interests_path = tmp_path / "interests.json"
+    interests_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": "i1",
+                        "topic": "marine bio",
+                        "pull_score": 8.0,
+                        "scope": "either",
+                        "related_keywords": ["marine", "bio"],
+                        "notes": "",
+                        "first_seen": "2026-01-01T00:00:00Z",
+                        "last_fed": "2026-01-01T00:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 1,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "heartbeat_config.json"
+    HeartbeatConfig(
+        reflex_enabled=False, research_enabled=True, research_days_since_human_min=1000.0
+    ).save(config_path)
+
+    store = MemoryStore(":memory:")
+    hm = HebbianMatrix(":memory:")
+    try:
+        HeartbeatState.fresh("manual").save(tmp_path / "heartbeat_state.json")
+        engine = HeartbeatEngine(
+            store=store,
+            hebbian=hm,
+            provider=FakeProvider(),
+            state_path=tmp_path / "heartbeat_state.json",
+            config_path=config_path,
+            dream_log_path=tmp_path / "dreams.log.jsonl",
+            heartbeat_log_path=tmp_path / "heartbeats.log.jsonl",
+            reflex_arcs_path=tmp_path / "reflex_arcs.json",
+            reflex_log_path=tmp_path / "reflex_log.json",
+            reflex_default_arcs_path=DEFAULT_REFLEX_ARCS_PATH,
+            searcher=NoopWebSearcher(),
+            interests_path=interests_path,
+            research_log_path=tmp_path / "research_log.json",
+            default_interests_path=DEFAULT_INTERESTS_PATH,
+            persona_name="Nell",
+            persona_system_prompt="You are Nell.",
+        )
+        result = engine.run_tick(trigger="manual", dry_run=False)
+        assert result.research_fired is None
+        assert result.research_gated_reason == "not_due"
+    finally:
+        store.close()
+        hm.close()
+
+
 def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path, emotion_engine_stub) -> None:
     """When both reflex and research eligible, reflex fires, research skipped."""
     _engine_reads_high_love(emotion_engine_stub)
@@ -1104,7 +1184,6 @@ def test_heartbeat_reflex_wins_tie_over_research(tmp_path: Path, emotion_engine_
     HeartbeatConfig(
         reflex_enabled=True,
         research_enabled=True,
-        research_emotion_threshold=5.0,
     ).save(config_path)
 
     store = MemoryStore(tmp_path / "memories.db")
@@ -1280,9 +1359,7 @@ def test_heartbeat_isolates_research_failure(
     )
 
     config_path = tmp_path / "heartbeat_config.json"
-    HeartbeatConfig(
-        reflex_enabled=False, research_enabled=True, research_emotion_threshold=5.0
-    ).save(config_path)
+    HeartbeatConfig(reflex_enabled=False, research_enabled=True).save(config_path)
 
     class FailingProvider(FakeProvider):
         def generate(self, prompt, *, system=None):

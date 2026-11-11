@@ -24,7 +24,7 @@ from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
-from brain.engines.heartbeat import HeartbeatEngine
+from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
@@ -1243,6 +1243,7 @@ def _research_handler(args: argparse.Namespace) -> int:
             return refused
         provider = get_provider(provider_name)
         searcher = get_searcher(searcher_name)
+        heartbeat_config = HeartbeatConfig.load(persona_dir / "heartbeat_config.json")
         engine = ResearchEngine(
             store=store,
             provider=provider,
@@ -1255,6 +1256,7 @@ def _research_handler(args: argparse.Namespace) -> int:
             interests_path=persona_dir / "interests.json",
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=_default_interests_path(),
+            research_days_since_human_min=heartbeat_config.research_days_since_human_min,
         )
         result = engine.run_tick(
             trigger=args.trigger,

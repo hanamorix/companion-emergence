@@ -43,6 +43,76 @@ def test_cli_research_dry_run_no_interests(monkeypatch, tmp_path: Path, capsys):
     assert "no" in out  # "no interests" or "no eligible" — either acceptable
 
 
+def _write_one_eligible_interest(persona_dir: Path) -> None:
+    import json
+
+    (persona_dir / "interests.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "interests": [
+                    {
+                        "id": "i1",
+                        "topic": "marine bioluminescence",
+                        "pull_score": 7.0,
+                        "scope": "either",
+                        "related_keywords": ["marine"],
+                        "notes": "",
+                        "first_seen": "2026-04-01T10:00:00Z",
+                        "last_fed": "2026-04-15T10:00:00Z",
+                        "last_researched_at": None,
+                        "feed_count": 3,
+                        "source_types": ["manual"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _research_dry_run_output(capsys) -> str:
+    rc = main(
+        [
+            "research",
+            "--persona",
+            "testpersona",
+            "--provider",
+            "fake",
+            "--searcher",
+            "noop",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    return capsys.readouterr().out
+
+
+def test_cli_research_gate_reads_the_persona_heartbeat_config(monkeypatch, tmp_path: Path, capsys):
+    """No human turn for 999 days; a configured 1000-day minimum keeps the gate closed."""
+    from brain.engines.heartbeat import HeartbeatConfig
+
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    persona_dir = _setup_persona(tmp_path / "personas")
+    _write_one_eligible_interest(persona_dir)
+    HeartbeatConfig(research_days_since_human_min=1000.0).save(persona_dir / "heartbeat_config.json")
+    ensure_engine_ready(persona_dir)
+    assert "not_due" in _research_dry_run_output(capsys)
+
+
+@pytest.mark.no_base_failure(
+    reason="control arm: with no heartbeat_config.json the 1.5-day default holds, and the base code's typed-in 1.5 gives the same answer"
+)
+def test_cli_research_gate_without_a_config_uses_the_default_minimum(
+    monkeypatch, tmp_path: Path, capsys
+):
+    monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
+    persona_dir = _setup_persona(tmp_path / "personas")
+    _write_one_eligible_interest(persona_dir)
+    ensure_engine_ready(persona_dir)
+    assert "would fire: marine bioluminescence" in _research_dry_run_output(capsys)
+
+
 def test_cli_research_missing_persona_raises(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
     with pytest.raises(FileNotFoundError):

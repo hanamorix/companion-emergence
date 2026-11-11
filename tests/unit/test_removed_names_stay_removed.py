@@ -792,6 +792,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="#652 (draft PR #656)",
         kind="code",
     ),
+    # --- the research gate's emotion setting (#653) ------------------------------------------------------------------------
+    Removed(
+        names=("research_emotion_threshold",),
+        why="the research gate asks the emotion engine's own reading of high (`feels_high`) and holds no level of its own, so the setting had no reader and left HeartbeatConfig; an old heartbeat_config.json that still holds the key loads and drops it on the next save",
+        ref="#653 (draft PR #656)",
+        kind="code",
+    ),
 )
 
 
