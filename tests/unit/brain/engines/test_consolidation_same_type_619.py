@@ -257,6 +257,7 @@ def test_cosine_context_holds_only_types_the_candidate_may_match(persona, monkey
     for i in range(9):  # nine closer rows of other types would fill the top 8 before a post-hoc filter
         store.create(_mem(f"Bob closer note {i}", "dream"))
     store.create(_mem("Bob far fact", "fact"))
+    store.create(_mem("Bob far observation", "observation"))
     cand_vec = np.array([1.0, 0.0, 0.0])
     _pool_patch(monkeypatch, store, cand_vec, lambda m: np.array([1.0, 0.0, 0.0] if m.memory_type == "dream" else [1.0, 1.0, 0.0]))
     queue.enqueue(_mem("Bob says a new fact", "fact"), source="x")
@@ -264,10 +265,10 @@ def test_cosine_context_holds_only_types_the_candidate_may_match(persona, monkey
     queue.enqueue(_mem("Bob observed a thing", "observation"), source="x")
     seen: dict = {}
     _run(persona, _capture_context(seen))
-    assert seen["Bob says a new fact"] == ["fact"]
+    assert seen["Bob says a new fact"] == ["fact"]  # not the far observation, not a dream
     assert set(seen["Bob dreamt a new thing"]) == {"dream"} and len(seen["Bob dreamt a new thing"]) == 8
-    # An observation also sees facts (the far one and the fact stored earlier in this run), and no dream.
-    assert set(seen["Bob observed a thing"]) == {"fact"}
+    # An observation also sees facts (the far one and the fact stored earlier in this run) and observations, and no dream.
+    assert set(seen["Bob observed a thing"]) == {"fact", "observation"}
 
 
 def test_lexical_context_holds_only_types_the_candidate_may_match(persona, monkeypatch):

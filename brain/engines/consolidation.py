@@ -1062,8 +1062,9 @@ def _dispatch(
             #
             # Only memories of one merge type reach this write (#619), so no memory's feelings pass into a memory of another
             # type. Two memories of ONE merge type can still differ in whether the engine counts them; they merge with no
-            # extra check and the incoming memory's own commit event counts it if its type is counted. That same-type case of the counted/uncounted requirement is
-            # deferred to Phase 5 with the "newer memory keeps the feelings" rule (owner S13, S14).
+            # extra check and the incoming memory's own commit event counts it if its type is counted. That same-type case
+            # of the counted/uncounted requirement is deferred to Phase 5 with the "newer memory keeps the feelings" rule
+            # (owner S13, S14).
             fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
         try:
             store.update(target.id, **fields)
