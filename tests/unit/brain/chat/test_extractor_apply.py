@@ -658,3 +658,75 @@ def test_crystallisation_rejected_theme_does_not_block_requeue(persona_dir: Path
     new_entry = json.loads(lines[1])
     assert new_entry.get("status") == "auto_pending"
     assert "fresh moment" in new_entry.get("text", "")
+
+
+# ---------------------------------------------------------------------------
+# Emotion rework B1 PR 2: signed changes once the engine is live
+# ---------------------------------------------------------------------------
+
+
+def test_signed_change_values_keeps_sign_caps_and_skips_zero():
+    from brain.chat.extractor import signed_change_values
+
+    assert signed_change_values({"joy": -0.2, "awe": 0.5, "grief": 0.0, "fear": -1.0}) == pytest.approx(
+        {"joy": -2.0, "awe": 3.0, "fear": -3.0}
+    )
+
+
+def _go_live(persona_dir: Path, **seed: float):
+    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    from datetime import UTC, datetime
+
+    from brain.emotion import engine, engine_files
+    from brain.memory.store import Memory, MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    finally:
+        store.close()
+    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    return engine.engine_for(persona_dir)
+
+
+def _settled(eng):
+    from datetime import UTC, datetime
+
+    eng.note_active(datetime.now(UTC))
+    return eng.read()
+
+
+def _rows_of(persona_dir: Path, memory_type: str) -> list:
+    from brain.memory.pending import PendingQueue
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        stored = store.list_by_type(memory_type, active_only=False)
+    finally:
+        store.close()
+    return stored + PendingQueue(persona_dir).read_recent(memory_type, limit=50)
+
+
+def test_live_pass2_lowers_the_feeling_and_writes_no_row(persona_dir: Path):
+    eng = _go_live(persona_dir, joy=5.0)
+    before = _settled(eng)["joy"].short
+    apply_side_effects(ExtractorOutput(emotion_delta={"joy": -0.2}), persona_dir=persona_dir)
+    assert _settled(eng)["joy"].short < before
+    assert _rows_of(persona_dir, "monologue_emotion") == []
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that the live fold keeps the vocabulary filter (B1 PR 2); main drops an unregistered name too, on the old path"
+)
+def test_live_pass2_unregistered_name_folds_nothing(persona_dir: Path):
+    from brain.emotion import engine_files
+
+    eng = _go_live(persona_dir, joy=5.0)
+    before = _settled(eng)
+    apply_side_effects(ExtractorOutput(emotion_delta={"zorblesque": 0.5}), persona_dir=persona_dir)
+    after = _settled(eng)
+    assert "zorblesque" not in after and after == before
+    events, _ = engine_files.read_queue(persona_dir, from_line=0)
+    assert [e for e in events if e.source == "monologue_emotion"] == []
+    assert _rows_of(persona_dir, "monologue_emotion") == []

@@ -8,6 +8,8 @@ Best-effort by design: every step is wrapped so a failure is logged to
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -357,6 +359,18 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
 _MAX_DELTA_INTENSITY: float = 3.0
 
 
+def signed_change_values(delta: Mapping[str, float]) -> dict[str, float]:
+    """A [-1, 1] delta as signed 0-10-scale changes for the emotion engine: x10, capped at +/-_MAX_DELTA_INTENSITY.
+
+    Keeps the sign, so a negative delta lowers the feeling once the engine is live (B1 PR 2). A zero change is skipped.
+    """
+    return {
+        name: math.copysign(min(abs(v) * 10.0, _MAX_DELTA_INTENSITY), v)
+        for name, v in delta.items()
+        if abs(v) > 1e-9
+    }
+
+
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
     memory is committed per the system's existing aggregation model.
@@ -384,7 +398,17 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     # aggregate_state. Owner-accepted 2026-09-26: "the odds of it happening
     # are tiny, the consequence if it happens are small." See #240
     # (emotion-system untangle) for the durable fix.
+    from brain.emotion import engine
     from brain.memory.store import Memory, MemoryStore
+
+    # Live (B1 PR 2): fold the signed change straight into the engine and write no row, so a negative delta lowers
+    # the feeling. An unknown switch counts as off and takes the old path below.
+    live_engine = engine.engine_for(persona_dir)
+    if live_engine.is_live():
+        changes = signed_change_values(_filter_to_registered(delta))
+        if changes:
+            live_engine.fold_change(changes, None, "monologue_emotion")
+        return
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
