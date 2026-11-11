@@ -294,10 +294,11 @@ class EmotionEngine:
     def _trust_in(self, peer_id: str, memo: dict[str, float] | None) -> float:
         """How far the persona trusts `peer_id`, the one place that calls `engine_files.peer_trust`.
 
-        The kindled-link accessor answers 0.0 for no database, no row, a database error or an unreadable row. Anything else it
-        raises (an `OSError` from a permission fault on its database path) becomes 0.0 here, the lowest weight, with a throttled
-        warning: a raise would drop a hook's event (`_never_raises`), fail a catch-up, or, inside a rebuild's replay, skip the
-        peer's row for good (a first rebuild cannot repair that later).
+        The kindled-link accessor answers 0.0 for no database, no row, a database error or an unreadable row. Any read fault in it,
+        a permission fault on its database path included, is answered 0.0 there, so this guard is a second safety net:
+        anything else it raises becomes 0.0 here, the lowest weight, with a throttled warning: a raise would drop a hook's
+        event (`_never_raises`), fail a catch-up, or, inside a rebuild's replay, skip the peer's row for good (a first rebuild
+        cannot repair that later).
         """
         if memo is not None and peer_id in memo:
             return memo[peer_id]
