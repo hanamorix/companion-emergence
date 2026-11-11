@@ -8,7 +8,14 @@ corpus, so an existing near-duplicate pair created before the gate existed
 removed row's full pre-image is archived to the same
 ``consolidation_archive.jsonl`` the gate's merge path writes to (reason
 ``"dedup_sweep"``) BEFORE the row is removed. Idempotent: re-running finds
-no exact-normalize group with more than one surviving member.
+no exact-normalize group of one merge type (see below) with more than one
+surviving member.
+
+Rows merge only within one merge type, the gate's rule (#619:
+``consolidation.merge_type``, ``consolidation.matchable_types``): the three
+monologue types are one merge type, and an ``observation`` may merge into a
+``fact`` but a ``fact`` never into an ``observation``. Rows of other
+different types are never merged, even with identical text.
 
 An optional near-dup layer accepts an injectable ``judge`` (same
 duplicate/distinct classifier shape as the gate's Haiku classifier),
@@ -24,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.engines.consolidation import _ARCHIVE_FILENAME, _normalize
+from brain.engines.consolidation import _ARCHIVE_FILENAME, _normalize, matchable_types, merge_type
 from brain.health.json_io import append_jsonl
 from brain.memory.store import Memory, MemoryStore
 
@@ -97,6 +104,12 @@ def _pick_canonical(members: list[Memory], exempt: set[str]) -> Memory:
     return ordered[0]
 
 
+def _may_merge(keep: Memory, drop: Memory) -> bool:
+    """True when ``drop`` may be merged into ``keep`` by type (#619): ``keep``'s type is one ``drop`` may match
+    (its own merge type, or ``fact`` for an ``observation``). Directed: a ``fact`` is never merged into an ``observation``."""
+    return keep.memory_type in matchable_types(drop.memory_type)
+
+
 def _live_row(store: MemoryStore, memory_id: str) -> Memory | None:
     """The row as stored now, or None if it was deleted or deactivated (#505). Never a recall."""
     row = store.get(memory_id, bump=False)
@@ -136,22 +149,29 @@ def run_dedup_sweep(
     "nothing is exempt").
 
     Primary layer (always on): exact-normalize grouping over ``store.list_active()``
-    rows — zero false-merge risk, deterministic. For each group of size > 1 the
+    rows, keyed by text and merge type — zero false-merge risk, deterministic. One
+    text held by ``fact`` and ``observation`` rows is a single group, and its
+    canonical is chosen among the ``fact`` rows only (a soul-linked ``observation``
+    stays beside it). For each group of size > 1 the
     canonical is a soul-linked member if there is one, else the
     highest-importance member (ties: oldest). Every other member that is not
     soul-linked is archived (full pre-image, reason "dedup_sweep") then
     hard-deleted, and the canonical's importance is raised to the max of itself
     and the rows actually merged into it. Each row is re-read first: one that
     vanished, was deactivated or no longer normalises to the canonical is
-    skipped, and a canonical that vanished ends its group (#505). A group that
-    removed nothing is not counted as merged.
+    skipped, and a canonical that vanished ends its group (#505), and so is a
+    row whose type changed so that it may no longer merge into the canonical
+    (#619). A group that removed nothing is not counted as merged.
 
     Optional near-dup layer: when ``judge`` is supplied, canonical survivors
-    left after the exact-normalize pass are compared pairwise; a "duplicate"
+    left after the exact-normalize pass are compared pairwise, only pairs of one
+    merge type or of one ``fact`` and one ``observation`` (#619); a "duplicate"
     verdict merges the later-created of the pair into the earlier the same
     way (archive-then-delete, carry max importance). If the later one is
     soul-linked, the earlier one is removed instead; a pair of soul-linked
-    rows is left alone. Off by default so the sweep needs no provider to be
+    rows is left alone. In a ``fact`` and ``observation`` pair the ``observation``
+    is the row removed whichever is later, and a soul-linked ``observation``
+    leaves the pair alone. Off by default so the sweep needs no provider to be
     fully deterministic and testable.
 
     Returns a Report (groups merged, rows removed, archive path, per-merge
@@ -161,12 +181,16 @@ def run_dedup_sweep(
     exempt = _load_exempt_ids(persona_dir)
     memories = store.list_active()
 
-    groups: dict[str, list[Memory]] = {}
+    groups: dict[tuple[str, str], list[Memory]] = {}
     for mem in memories:
         norm = _normalize(mem.content)
         if not norm:
             continue
-        groups.setdefault(norm, []).append(mem)
+        groups.setdefault((norm, merge_type(mem.memory_type)), []).append(mem)
+    # One text held by fact and observation rows is one group: an observation may merge into a fact (#619).
+    for norm, mtype in list(groups):
+        if mtype == "observation" and (norm, "fact") in groups:
+            groups[(norm, "fact")].extend(groups.pop((norm, mtype)))
 
     report = Report(archive_path=str(persona_dir / _ARCHIVE_FILENAME))
     canonicals: list[Memory] = []
@@ -175,7 +199,9 @@ def run_dedup_sweep(
         if len(members) < 2:
             canonicals.append(members[0])
             continue
-        canonical = _pick_canonical(members, exempt)
+        # The kept row is never an observation while a fact of the group exists (#619); only a fact group holds both.
+        keepable = [m for m in members if m.memory_type != "observation"] or members
+        canonical = _pick_canonical(keepable, exempt)
         # A soul-linked row always stays (#431); if every other member is one, nothing merges.
         removable = [m for m in members if m.id != canonical.id and m.id not in exempt]
         removed: list[Memory] = []
@@ -199,6 +225,13 @@ def run_dedup_sweep(
             if _normalize(dup_now.content) != _normalize(canonical_live.content):
                 logger.warning(
                     "dedup_sweep: skipping %s: its content changed mid-pass, no longer a duplicate of %s",
+                    dup.id,
+                    canonical.id,
+                )
+                continue
+            if not _may_merge(canonical_live, dup_now):
+                logger.warning(
+                    "dedup_sweep: skipping %s: its type changed mid-pass, it may no longer merge into %s",
                     dup.id,
                     canonical.id,
                 )
@@ -252,7 +285,8 @@ def _near_dup_pass(
     survivors and merge any pair the judge calls "duplicate". Fail-open per
     pair (a judge fault skips that pair, never loses a row). The later of a
     pair is removed, unless it is soul-linked: then the earlier goes instead,
-    and a pair of two soul-linked rows is left alone (#431)."""
+    and a pair of two soul-linked rows is left alone (#431). Only pairs of one merge type, or of one fact and
+    one observation, are judged; of a fact and an observation the observation is the one removed (#619)."""
     # Rows this pass deleted, or found deleted (#431) or deactivated (#505) under it by another writer.
     # Never judged again: a gone ``other`` would cost every later ``cand`` a judge call, and a gone
     # ``cand`` can never merge.
@@ -264,6 +298,8 @@ def _near_dup_pass(
         for other in ordered[i + 1 :]:
             if other.id in gone:
                 continue
+            if not (_may_merge(cand, other) or _may_merge(other, cand)):
+                continue  # not one merge type, nor a fact with an observation (#619): never judged
             try:
                 verdict = judge(other, cand)
             except Exception:  # noqa: BLE001 — a judge fault must not lose a row
@@ -271,7 +307,13 @@ def _near_dup_pass(
                 continue
             if verdict != "duplicate" or (other.id in exempt and cand.id in exempt):
                 continue
-            keep, drop = (other, cand) if other.id in exempt else (cand, other)
+            if {cand.memory_type, other.memory_type} == {"fact", "observation"}:
+                # The observation is the row removed, never the fact; a soul-linked observation stays (#619, #431).
+                keep, drop = (cand, other) if cand.memory_type == "fact" else (other, cand)
+                if drop.id in exempt:
+                    continue
+            else:
+                keep, drop = (other, cand) if other.id in exempt else (cand, other)
             # Re-read both (#431): an earlier merge in this pass may have raised either one's
             # importance and the in-memory objects never see it. Stale, the carry-over below lowers
             # a raised canonical again, or drops its max with it, and the archive gets a stale pre-image.
@@ -285,6 +327,13 @@ def _near_dup_pass(
                 gone |= vanished
                 logger.warning(
                     "dedup_sweep: skipping pair %s / %s: a row vanished or was deactivated mid-pass",
+                    keep.id,
+                    drop.id,
+                )
+            elif not _may_merge(keep_now, drop_now):
+                # A type changed since the pass listed the rows (#619): the pair may no longer merge.
+                logger.warning(
+                    "dedup_sweep: skipping pair %s / %s: a type changed mid-pass, the pair may no longer merge",
                     keep.id,
                     drop.id,
                 )
