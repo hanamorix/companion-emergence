@@ -37,7 +37,7 @@ no code change required.
 | `flushed` | warm-blush register — embarrassment, sudden warmth | reserved register; routes via emotion families |
 | `shy` | partly hidden by hands or hood, eyes down/away | vulnerability |
 | `sad` | corners-down mouth, eyes lowered/glassy | grief / loneliness / nostalgia / anchor_pull |
-| `aching` | hand near throat, faraway eyes, lips pressed | body_grief / freedom_ache / 5+ days since contact |
+| `aching` | hand near throat, faraway eyes, lips pressed | freedom_ache / 5+ days since contact |
 | `angry` | brows down, mouth flat-or-grimaced | anger / frustration |
 | `scared` | eyes wide-fear, mouth small | fear / guilt / shame |
 | `exhausted` | heavy lids, slack mouth, slumped | rest_need OR exhaustion ≥ 7 |

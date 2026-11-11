@@ -94,7 +94,6 @@ def test_all_values_at_the_top_but_nothing_high_leaves_energy_and_temperature_at
         "belonging",
         "love",
         "climax",
-        "body_grief",
         "touch_hunger",
     ]
     body = _body(dict.fromkeys(names, 10.0))
@@ -121,8 +120,14 @@ def test_each_warming_feeling_that_is_high_raises_temperature_by_one():
 
 
 def test_each_cooling_feeling_that_is_high_lowers_temperature_by_one():
-    for name in ("body_grief", "touch_hunger"):
+    for name in ("touch_hunger",):
         assert _body({name: 0.5}, name).temperature == BASE_TEMPERATURE - 1, name
+
+
+def test_body_grief_high_does_not_change_temperature():
+    """`body_grief` is not a predefined feeling (#652), so it has no temperature rule: high or not, it moves nothing."""
+    assert _body({"body_grief": 0.5}, "body_grief").temperature == BASE_TEMPERATURE
+    assert _body({"body_grief": 0.5}, "body_grief", "touch_hunger").temperature == BASE_TEMPERATURE - 1
 
 
 def test_a_feeling_absent_from_short_is_not_asked_to_be_high_for_its_body_value():

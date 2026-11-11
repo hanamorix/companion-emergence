@@ -150,7 +150,7 @@ const AWE_FAMILY = new Set(["awe", "emergence", "hope"]);
 const CONTENT_FAMILY = new Set(["contentment", "peace"]);
 const INTENT_FAMILY = new Set(["creative_hunger"]); // also in HAPPY — INTENT wins via order
 const DEFIANT_FAMILY = new Set(["defiance"]);
-const ACHING_FAMILY = new Set(["body_grief", "freedom_ache"]);
+const ACHING_FAMILY = new Set(["freedom_ache"]);
 
 /**
  * Body-emotion thresholds — when these fire, override whatever the

@@ -94,7 +94,7 @@ def body_state_from_short(
         peace_high=feels_high("peace"),
     )
     ups = sum(feels_high(name) for name in ("arousal", "desire", "belonging", "love", "climax"))
-    downs = sum(feels_high(name) for name in ("body_grief", "touch_hunger"))
+    downs = int(feels_high("touch_hunger"))
     temperature = _temperature_from_flags(days_since_contact, ups=ups, downs=downs)
     return _assemble(
         energy=energy,
@@ -176,7 +176,7 @@ def _temperature_from_flags(days_since_contact: float, *, ups: int, downs: int) 
     """Temperature 1-9, baseline 4 (asymmetric — midpoint 5; OG range).
 
     Up: one for each of arousal/desire/belonging/love/climax that is high (warmth, presence, release): `ups`.
-    Down: one for each of body_grief/touch_hunger that is high (distance, lack): `downs`; and the days since contact.
+    Down: one when touch_hunger is high (distance, lack): `downs`; and the days since contact.
     """
     temp = 4.0 + ups - downs
 

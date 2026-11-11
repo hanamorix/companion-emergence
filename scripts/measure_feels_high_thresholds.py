@@ -34,7 +34,7 @@ feeling called high at floor F is exactly a feeling called high at floor 0 whose
 firings are zero at any floor of 0.1 or more, and the dev constant is restored.
 
 R and the proposal. R(F) is the number of firings removed by floor F, summed over both runs after day 30 and over the
-reflex and temperature rows only (temperature: arousal, desire, belonging, love, climax, body_grief, touch_hunger; reflex arcs
+reflex and temperature rows only (temperature: arousal, desire, belonging, love, climax, touch_hunger; reflex arcs
 loneliness_journal, defiance_burst, creative_pitch, self_check): the rows' floor-0 firings minus their firings at F. The
 proposal is the smallest candidate floor (floor 0 is the baseline, not a candidate) whose next candidate removes nothing
 more (R(next) = R(F)); with no such plateau it is the largest candidate. The proposal is a proposal: the owner decides.
@@ -80,7 +80,6 @@ R_ROWS = (
     "temperature: belonging",
     "temperature: love",
     "temperature: climax",
-    "temperature: body_grief",
     "temperature: touch_hunger",
     "reflex arc loneliness_journal",
     "reflex arc defiance_burst",
@@ -265,7 +264,6 @@ def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> di
         "temperature: belonging": names("belonging"),
         "temperature: love": names("love"),
         "temperature: climax": names("climax"),
-        "temperature: body_grief": names("body_grief"),
         "temperature: touch_hunger": names("touch_hunger"),
         "research gate: any feeling high": lambda e, high: any(high(n) for n in e),
     }

@@ -785,6 +785,13 @@ REMOVED: tuple[Removed, ...] = (
             "brain/memory/store.py",
         ),
     ),
+    # --- the predefined `body_grief` feeling (#652) -----------------------------------------------------------------------
+    Removed(
+        names=("body_grief",),
+        why="a feeling like this comes from the kindled naming it herself, so it is not predefined: it left the migrator's canonical personal-emotions list and the body temperature rule; a persona whose memories carry it keeps it as an ordinary feeling through the vocabulary repair",
+        ref="#652 (draft PR #656)",
+        kind="code",
+    ),
 )
 
 

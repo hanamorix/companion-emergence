@@ -3,9 +3,8 @@
 Baseline: 26 emotions (11 core + 11 complex + 4 body) shipped with the framework.
 Personas extend via register() — typically via the persona-loader at
 engine startup, which reads `{persona_dir}/emotion_vocabulary.json`.
-The 5 emotions previously in `nell_specific` (body_grief, emergence,
-anchor_pull, creative_hunger, freedom_ache) are now per-persona and
-ship via the migrator. See spec 2026-04-25-vocabulary-split-design.md.
+The 4 emotions previously in `nell_specific` that the migrator still ships
+(emergence, anchor_pull, creative_hunger, freedom_ache) are now per-persona. See spec 2026-04-25-vocabulary-split-design.md.
 
 Decay half-lives per spec Section 10.1:
 - grief: 60-day half-life
@@ -38,7 +37,7 @@ class Emotion:
         category: One of "core", "complex", "nell_specific", "persona_extension"
             (enforced at edit time via the EmotionCategory Literal annotation).
         decay_half_life_days: Time for intensity to halve. None = identity-level
-            (no temporal decay — for anchor_pull, love, belonging, body_grief,
+            (no temporal decay — for anchor_pull, love, belonging,
             and freedom_ache).
         intensity_clamp: Maximum intensity value (typically 10.0). Float so
             comparisons against state.py's float intensities don't silently

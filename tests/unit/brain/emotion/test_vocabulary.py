@@ -104,13 +104,12 @@ def test_canonical_personal_anchor_pull_is_identity_level() -> None:
     assert anchor.decay_half_life_days is None
 
 
-def test_canonical_personal_emotions_has_five() -> None:
-    """The migrator's canonical personal-emotions fixture has the 5 known names."""
+def test_canonical_personal_emotions_has_four() -> None:
+    """The migrator's canonical personal-emotions fixture has the 4 known names (`body_grief` is not predefined, #652)."""
     from brain.emotion._canonical_personal_emotions import _CANONICAL
 
     assert set(_CANONICAL.keys()) == {
         "anchor_pull",
-        "body_grief",
         "emergence",
         "creative_hunger",
         "freedom_ache",

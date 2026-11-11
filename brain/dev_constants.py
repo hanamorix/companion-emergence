@@ -64,7 +64,7 @@ KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 # answers `half_life(name)` from the persona's own vocabulary file first, then
 # this table, then EMOTION_DEFAULT_HALF_LIFE_DAYS. Keys are canonical names
 # (`vocabulary.canonical_name`). Emotions the old vocabulary stored as "never
-# fades" and that have no entry here (body_grief, anchor_pull, freedom_ache) take
+# fades" and that have no entry here (anchor_pull, freedom_ache) take
 # the default; love and belonging are given their long half-lives here.
 EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "love": 730.0,
