@@ -87,6 +87,11 @@ JUDGE_TUNE_FOOTPRINT_FULL_FT_BYTES: float = tunables.register(
 )
 
 
+def _platform() -> str:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662, #710)."""
+    return sys.platform
+
+
 def _read_total_ram_bytes() -> float | None:
     """Host TOTAL physical RAM (`/proc/meminfo`'s `MemTotal:` line) — the
     RAM-tier detector's raw signal (spec §1: "RAM is the proxy for overall
@@ -107,7 +112,7 @@ def _read_total_ram_bytes() -> float | None:
     to doing the thing... to account for any hardware upgrades in the past
     week") — callers must not memoize this across ticks.
     """
-    if sys.platform != "linux":
+    if _platform() != "linux":
         return None
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:

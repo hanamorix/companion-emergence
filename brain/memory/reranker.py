@@ -81,10 +81,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-
 def _platform() -> str:
     """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662, #710)."""
     return sys.platform
+
 
 def _detect_avx2() -> bool:
     """Best-effort startup AVX2 capability check (F2a inc3, #250 §3).

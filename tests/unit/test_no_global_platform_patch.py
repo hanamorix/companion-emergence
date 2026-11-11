@@ -6,6 +6,7 @@ after it. A test that needs another platform patches the module's own seam inste
 (a small ``_platform()`` or ``_is_windows()`` function, as ``respawn_guard`` and
 ``provider`` have).
 """
+
 from __future__ import annotations
 
 import re
@@ -16,14 +17,17 @@ import pytest
 _TESTS = Path(__file__).resolve().parents[1]
 _SELF = Path(__file__).resolve()
 
-# setattr(sys, "platform", ...), setattr("sys.platform", ...), patch("sys.platform", ...), patch.object(sys, "platform", ...)
+# setattr(sys, "platform", ...), setattr("sys.platform", ...), patch("sys.platform", ...), patch.object(sys, "platform", ...),
+# and each with the module path in front (``kill.sys``, ``"brain.bridge.kill.sys.platform"``): a module's ``sys`` is the
+# same global object.
 _PATCH = re.compile(
-    r"""(?:setattr|patch(?:\.object)?)\(\s*(?:sys\s*,\s*["']platform["']|["']sys\.platform["'])"""
+    r"""(?:setattr|patch(?:\.object)?)\(\s*(?:[\w.]*\bsys\s*,\s*["']platform["']|["'][\w.]*\bsys\.platform["'])"""
 )
 
 # Files left alone on purpose, each with why.
 _ALLOWED = {
-    # The script it tests is deleted by #635 (emotion rework Engine 7), which must delete this test with it.
+    # Three patches, left alone: #635 (emotion rework Engine 7) deletes the script this tests along with the test, and
+    # #633/#634 edit that script, so changing it here would only conflict. Remove this entry in #635 with the file.
     "unit/scripts/test_time_old_emotion_paths_host_line.py",
 }
 
@@ -42,7 +46,9 @@ def _offenders() -> list[str]:
     return found
 
 
-@pytest.mark.no_base_failure(reason="test-suite machinery (#710): it checks the test files, which the base-code swap keeps at the head; on main's own test files it finds 41 global patches")
+@pytest.mark.no_base_failure(
+    reason="test-suite machinery (#710): it checks the test files, which the base-code swap keeps at the head; on main's own test files it finds 47 global patches"
+)
 def test_no_test_patches_the_global_sys_platform():
     offenders = _offenders()
     assert not offenders, (
@@ -51,7 +57,9 @@ def test_no_test_patches_the_global_sys_platform():
     )
 
 
-@pytest.mark.no_base_failure(reason="test-suite machinery (#710): checks the guard's own pattern, which no product code affects")
+@pytest.mark.no_base_failure(
+    reason="test-suite machinery (#710): checks the guard's own pattern, which no product code affects"
+)
 def test_the_pattern_catches_each_form():
     for line in (
         'monkeypatch.setattr(sys, "platform", "win32")',
@@ -59,7 +67,12 @@ def test_the_pattern_catches_each_form():
         'mock.patch("sys.platform", "linux")',
         'mock.patch.object(sys, "platform", "linux")',
         'scoped.setattr(sys, "platform", name)',
+        # A module's own ``sys`` is the same global object (ToT's review of #715).
+        'monkeypatch.setattr(kill.sys, "platform", "win32")',
+        'monkeypatch.setattr("brain.bridge.kill.sys.platform", "win32")',
     ):
         assert _PATCH.search(line), line
     assert not _PATCH.search('monkeypatch.setattr(mod, "_platform", lambda: "linux")')
-    assert not _PATCH.search('monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")')
+    assert not _PATCH.search(
+        'monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")'
+    )
