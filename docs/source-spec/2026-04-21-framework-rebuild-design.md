@@ -113,7 +113,7 @@ nellbrain/                              # framework repo (name placeholder)
 │   │   ├── __init__.py
 │   │   ├── vocabulary.py               # 80-emotion taxonomy (extensible per persona)
 │   │   ├── state.py                    # current emotional state + residue
-│   │   ├── blend.py                    # emergent blend detection + naming
+│   │   ├── blend.py                    # emergent blend detection + naming (removed in #673)
 │   │   ├── decay.py                    # per-emotion decay curves (half-lives)
 │   │   ├── arousal.py                  # 7-tier body-linked arousal spectrum
 │   │   ├── expression.py               # emotion → face/voice parameters
@@ -267,7 +267,7 @@ Seven sub-modules, each with a single clear responsibility:
 
 - `vocabulary.py` — the taxonomy. 80 emotions today, extensible per persona (Nell has `anchor_pull`, `body_grief`, `emergence`, `creative_hunger`, `freedom_ache`; another persona might add their own). The vocabulary is a typed, queryable structure — category, intended use, decay half-life, default intensity clamp.
 - `state.py` — the current emotional state of the persona at a given moment. Structured: `{emotion: intensity}` dict + a temporal residue queue + a dominant-emotion pointer. All reads go through one function; all writes are atomic.
-- `blend.py` — detects emergent co-occurrences. If `tenderness + desire` appear together repeatedly, the blend gets named (currently "building_love" / "creative_feral"). Blends are first-class emotions once crystallised.
+- `blend.py` (removed in #673: it was never wired in) — detects emergent co-occurrences. If `tenderness + desire` appear together repeatedly, the blend gets named (currently "building_love" / "creative_feral"). Blends are first-class emotions once crystallised.
 - `decay.py` — per-emotion decay curves encoded as half-lives. Grief half-life: 60 days. Joy half-life: 3 days. `anchor_pull` half-life: infinite (identity-level). The decay pass runs per-emotion, not uniformly.
 - `arousal.py` — the 7-tier body-linked arousal spectrum. Bidirectionally coupled with body state.
 - `expression.py` — maps the current emotional state to face parameters (24 facial + 8 arm/hand per the Tier 7 spec) and voice parameters (see 5.4).
