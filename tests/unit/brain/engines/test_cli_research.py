@@ -89,7 +89,7 @@ def _research_dry_run_output(capsys) -> str:
 
 
 def test_cli_research_gate_reads_the_persona_heartbeat_config(monkeypatch, tmp_path: Path, capsys):
-    """No human turn for 999 days; a configured 1000-day minimum keeps the gate closed."""
+    """No conversation file holds a human turn (days_since_human gives 999.0); a configured 1000-day minimum keeps the gate closed."""
     from brain.engines.heartbeat import HeartbeatConfig
 
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))

@@ -1060,7 +1060,7 @@ def test_heartbeat_runs_research_when_enabled(tmp_path: Path) -> None:
 
 
 def test_heartbeat_research_gate_reads_the_configured_days_since_human_min(tmp_path: Path) -> None:
-    """A persona's research_days_since_human_min reaches the research gate: no human turn for 999 days, a 1000-day minimum."""
+    """A persona's research_days_since_human_min reaches the research gate: no conversation file holds a human turn (days_since_human gives 999.0), a 1000-day minimum."""
     from brain.search.base import NoopWebSearcher
 
     interests_path = tmp_path / "interests.json"
