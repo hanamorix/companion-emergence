@@ -27,7 +27,7 @@ from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
+from brain.health.json_io import JsonFileError, Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -1281,7 +1281,11 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
+    # Listing only reads (#708): a corrupt vocabulary is left as it is for a load that has the store and can rebuild it.
+    try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+    except JsonFileError as exc:
+        print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
     interests = InterestSet.load(
         persona_dir / "interests.json", default_path=_default_interests_path()
     )
