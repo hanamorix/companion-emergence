@@ -25,7 +25,7 @@ brain/growth/crystallizers/reflex.py::not-file-io::2   # not-file: model-reply
 brain/health/attempt_heal.py::write::1   # held: save_with_backup is kept byte-identical for the held felt-time files
 brain/health/jsonl_reader.py::not-file-io::1   # legacy helper (deleted at migration)
 brain/health/vocab_repair.py::not-file-io::1   # not-file: model-reply
-brain/ingest/emotion_backfill.py::not-file-io::1  # not-file: sqlite-or-wire
+brain/ingest/emotion_backfill.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/ingest/extract.py::not-file-io::1   # not-file: model-reply
 brain/initiate/adaptive.py::not-file-io::2   # not-file: string-codec
 brain/initiate/d_call_schema.py::not-file-io::2   # not-file: string-codec
@@ -44,7 +44,7 @@ brain/maker/persist.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/mcp_server/audit.py::not-file-io::2   # not-file: prompt-or-log
 brain/mcp_server/tools.py::not-file-io::2   # not-file: prompt-or-log
 brain/memory/relevance_judge.py::not-file-io::1   # not-file: model-reply
-brain/memory/store.py::not-file-io::34  # not-file: sqlite-or-wire
+brain/memory/store.py::not-file-io::34   # not-file: sqlite-or-wire
 brain/migrator/cli.py::not-file-io::1   # not-file: prompt-or-log
 brain/migrator/report.py::not-file-io::1   # not-file: string-codec
 brain/notes/compose.py::not-file-io::1   # not-file: model-reply

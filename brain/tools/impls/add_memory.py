@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from brain.emotion import engine
+from brain.emotion.engine_utils import memory_feelings
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _write_gate_check
@@ -77,7 +77,8 @@ def add_memory(
     # add_memory return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
     from brain.body.events import CLIMAX_THRESHOLD, record_climax_event
 
-    if engine.engine_for(persona_dir).memory_feelings(memory).feelings.get("climax", 0.0) >= CLIMAX_THRESHOLD:
+    # A memory created this instant has no age to fade: the pure read (no engine call, which could raise after the row is committed).
+    if memory_feelings(memory, None, None, None).feelings.get("climax", 0.0) >= CLIMAX_THRESHOLD:
         record_climax_event(
             originating_memory=memory,
             store=store,

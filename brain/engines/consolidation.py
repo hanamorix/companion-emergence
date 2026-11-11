@@ -927,6 +927,9 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
         if fresh is None:
             return  # hard-deleted since the importance update: nothing to write
         row = replace(fresh, importance=memory.importance)
+        # The engine's one read: faded, held to 0-10, canonical names. A name whose stored value is not a finite number (or whose fade
+        # failed, with a warning from the read) is left out of the written map, where it used to be written as 0.0: accepted edge, a
+        # value no writer produces (decisions.md, runner 6).
         faded = dict(live_engine.memory_feelings(row).feelings)
         store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
     except Exception:  # noqa: BLE001

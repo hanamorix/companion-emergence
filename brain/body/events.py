@@ -59,11 +59,9 @@ def record_climax_event(
             ts = ts.replace(tzinfo=UTC)
         snippet = (originating_memory.content or "")[:100].replace("\n", " ").strip()
         content = f"the body crested. {ts.isoformat()}. context: {snippet}"
-        # The originating memory's feelings through the one read (faded and held to 0-10), a new row's own values.
-        engine = store.emotion_engine()
-        feelings = dict(
-            (engine.memory_feelings(originating_memory) if engine is not None else memory_feelings(originating_memory, None, None, None)).feelings
-        )
+        # The originating memory was committed this instant by `add_memory` (nothing to fade): its feelings through the pure read
+        # (held to 0-10, canonical names), with no engine call that could raise on this never-raises path.
+        feelings = dict(memory_feelings(originating_memory, None, None, None).feelings)
 
         journal = Memory.create_new(
             content=content,
