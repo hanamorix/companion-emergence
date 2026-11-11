@@ -22,8 +22,8 @@ _SOURCE_ACCENT = {
 _BASELINE_FALLBACK = {"satisfaction": "pride", "wonder": "awe"}
 
 
-def making_emotion_delta(making: Making, *, dominant_source: str) -> dict[str, float]:
-    """Small vocab-filtered emotion delta for having made. Decay-subordinate."""
+def making_emotion_delta(making: Making, *, dominant_source: str | None) -> dict[str, float]:
+    """Small vocab-filtered emotion delta for having made. Decay-subordinate. No source means the base nudge only."""
     from brain.chat.extractor import _filter_to_registered
     from brain.emotion.vocabulary import get as vocab_get
 

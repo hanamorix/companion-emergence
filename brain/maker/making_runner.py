@@ -58,8 +58,10 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     # wire-back (eventual_share → shared) is driven by flip_ready_shares from
     # run_maker_tick, not here.
     from brain.maker import wiring
+    from brain.maker.sources import making_source
     if making.disposition != "discard":
-        delta = wiring.making_emotion_delta(making, dominant_source=sources[0] if sources else "soul")
+        # The accent comes from what built the charge (#721); `sources` above is prompt provenance, not a source key.
+        delta = wiring.making_emotion_delta(making, dominant_source=making_source(charge, store))
         wiring.write_making_memory(store, making, emotions=delta)
     else:
         wiring.write_making_memory(store, making, emotions={})

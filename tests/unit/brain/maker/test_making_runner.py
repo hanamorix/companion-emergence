@@ -98,3 +98,24 @@ def test_make_and_wire_gives_a_baseline_persona_pride_for_satisfaction(tmp_path)
     finally:
         store2.close()
     assert made.emotions == {"pride": 0.12, "tenderness": 0.08}
+
+
+def test_make_and_wire_applies_the_accent_of_what_built_the_charge(tmp_path):
+    """#721: a dream-built charge gives the dream accent (wonder, which a baseline persona feels as awe, #720)."""
+    import pytest
+
+    from brain.emotion import vocabulary
+    from brain.maker.charge import MakerCharge, save_charge
+
+    assert vocabulary.get("wonder") is None
+    store = MemoryStore(tmp_path / "memories.db")
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0, emotion_part=9.0, soul_part=0.0, dream_part=90.0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        [made] = store2.list_by_type("making", limit=10)
+    finally:
+        store2.close()
+    assert made.emotions == pytest.approx({"pride": 0.12, "tenderness": 0.08, "awe": 0.10})

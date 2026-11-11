@@ -30,28 +30,7 @@ def current_emotional_intensity(store: MemoryStore) -> float:
     ``brain/bridge/persona_state.py::_build_emotions``: pull the recent active
     emotion-carrying rows directly, aggregate, and take the peak.
     """
-    live_engine = store.emotion_engine()
-    if live_engine is not None and live_engine.is_live():
-        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
-        # or retrying, read() returns nothing and the intensity is 0.0.
-        return max((r.short for r in live_engine.read().values()), default=0.0)
-    try:
-        rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT ?",
-            (_RECENT_EMOTION_WINDOW,),
-        ).fetchall()
-        mems = [_row_to_memory(row) for row in rows]
-    except Exception:
-        logger.exception("maker.sources: listing recent memories failed")
-        return 0.0
-    state = aggregate_state(mems)
-    if not state.emotions:
-        return 0.0
-    return max(state.emotions.values())
+    return max(_current_feelings(store).values(), default=0.0)
 
 
 def dreams_since(store: MemoryStore, cutoff_iso: str) -> int:
@@ -76,3 +55,44 @@ def soul_pending_count(persona_dir: Path) -> int:
     except Exception:
         logger.exception("maker.sources: soul pending count failed")
         return 0
+
+
+def _current_feelings(store: MemoryStore) -> dict[str, float]:
+    """Her current feelings by name: the engine's short averages when it is live, else the recent aggregate."""
+    live_engine = store.emotion_engine()
+    if live_engine is not None and live_engine.is_live():
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
+        # or retrying, read() returns nothing, so there are no feelings and the intensity is 0.0.
+        return {name: r.short for name, r in live_engine.read().items()}
+    try:
+        rows = store._conn.execute(  # noqa: SLF001
+            "SELECT * FROM memories "
+            "WHERE active = 1 "
+            "AND emotions_json IS NOT NULL "
+            "AND emotions_json != '{}' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (_RECENT_EMOTION_WINDOW,),
+        ).fetchall()
+        mems = [_row_to_memory(row) for row in rows]
+    except Exception:
+        logger.exception("maker.sources: listing recent memories failed")
+        return {}
+    return dict(aggregate_state(mems).emotions)
+
+
+def making_source(charge, store: MemoryStore) -> str | None:
+    """The source accent key for a making: whichever of soul, dream and emotion built most of the charge (#721).
+
+    Ties go soul, then dream, then emotion. A charge with no parts (all zero, as one an older brain left) has no
+    source, so the making carries the base nudge only.
+    """
+    parts = (("soul", charge.soul_part), ("dream", charge.dream_part), ("emotion", charge.emotion_part))
+    name, size = max(parts, key=lambda part: part[1])  # max keeps the first of equal parts: the tie order above
+    if size <= 0.0:
+        return None
+    if name != "emotion":
+        return name
+    # Emotion built it: her strongest feeling now says which. Only grief and joy have an accent.
+    feelings = _current_feelings(store)
+    strongest = max(feelings, key=feelings.__getitem__) if feelings else None
+    return strongest if strongest in ("grief", "joy") else None
