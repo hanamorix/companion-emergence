@@ -1646,7 +1646,7 @@ def test_create_with_fold_false_writes_no_queue_and_no_state_folder(tmp_path: Pa
 def test_commit_and_assigned_carry_faded_emotions_and_the_stored_climax(
     tmp_path: Path, hook_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] / 4)
+    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: memory.emotions[emotion] / 4)
     hook_store.create(_hook_mem(emotions={"joy": 8.0, "climax": 8.0}))
     empty = _hook_mem(emotions={})
     hook_store.create(empty, fold=False)
@@ -1661,19 +1661,19 @@ def test_commit_and_assigned_carry_faded_emotions_and_the_stored_climax(
 def test_a_faded_value_that_raises_drops_that_name_with_a_line_and_queues_the_rest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def faded(self: object, memory: Memory, emotion: str) -> float:
+    def faded(memory: Memory, emotion: str, half_lives: object, switch_over_at: object, now: object) -> float:
         if emotion == "grief":
             raise RuntimeError("no half-life")
         return memory.emotions[emotion]
 
-    monkeypatch.setattr(EngineCls, "faded_value", faded)
+    monkeypatch.setattr(engine_utils, "faded_emotion", faded)
     engine = engine_module.engine_for(tmp_path)
     with caplog.at_level(logging.WARNING, logger=HOOK_LOGGER):
         engine.on_memory_committed(_hook_mem(emotions={"joy": 6.0, "grief": 3.0}))
     assert [dict(e.emotions) for e in _events(tmp_path)] == [{"joy": 6.0}]
     assert any("grief" in r.getMessage() for r in caplog.records)
     # every name failing leaves nothing to fold: this hook appends the start-only event instead (B02.6; the spec makes it a direct apply, Engine 4 moves it)
-    monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: 1 / 0)
+    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: 1 / 0)
     engine.on_memory_committed(_hook_mem(emotions={"joy": 6.0}))
     assert [e.kind for e in _events(tmp_path)] == ["commit", "start"]
 
@@ -2177,11 +2177,12 @@ def test_the_hook_resolves_everything_before_it_takes_the_lock_and_touches_no_da
     for owner, name in (
         (engine_module, "source_modifier"),
         (engine_files, "peer_trust"),
-        (EngineCls, "faded_value"),
+        (engine_utils, "faded_emotion"),
         (engine_module, "resolve_emotions"),
+        (engine_utils, "resolve_emotions"),  # the feelings read resolves inside engine_utils
         (MemoryStore, "get"),
     ):
-        probe.wrap(owner, name)
+        probe.wrap(owner, name, "faded_value" if name == "faded_emotion" else None)
     hook_store.create(_hook_mem(**_COUNTED_ROWS["peer"]))
     for name in ("source_modifier", "peer_trust", "faded_value", "resolve_emotions"):
         assert probe.n(name) >= 1, name
@@ -2204,7 +2205,7 @@ def test_an_existing_queued_event_is_kept_when_another_is_appended(tmp_path: Pat
 def test_a_showing_carries_the_faded_value_at_the_given_or_the_entry_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(EngineCls, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] / 2)
+    monkeypatch.setattr(engine_utils, "faded_emotion", lambda memory, emotion, half_lives, switch_over_at, now: memory.emotions[emotion] / 2)
     engine = EngineCls(tmp_path, now=lambda: NOW)
     mem = _hook_mem(emotions={"joy": 8.0})
     shown_at = NOW - timedelta(hours=1)
