@@ -377,36 +377,30 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
         from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
         from brain.emotion import engine
-        from brain.memory.store import MemoryStore
         from brain.utils.memory import days_since_human
 
         live_engine = engine.engine_for(persona_dir)
-        store = MemoryStore(persona_dir / "memories.db")
-        try:
-            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-            # pending or retrying, read() returns nothing and the panel shows baselines.
-            short = engine.short_values(live_engine.read())
-            days = days_since_human(store, now=now, persona_dir=persona_dir)
-            # session_hours from the active conversation buffer's
-            # earliest entry — 0 when no session is open.
-            session_hours = _active_session_hours(persona_dir, now=now)
-            words = count_words_in_session(
-                store,
-                persona_dir=persona_dir,
-                session_hours=session_hours,
-                now=now,
-            )
-            body = body_state_from_short(
-                short,
-                feels_high=live_engine.feels_high,
-                session_hours=session_hours,
-                words_written=words,
-                days_since_contact=days,
-                now=now,
-            )
-            return body.to_dict()
-        finally:
-            store.close()
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the panel shows baselines.
+        short = engine.short_values(live_engine.read())
+        days = days_since_human(now=now, persona_dir=persona_dir)
+        # session_hours from the active conversation buffer's
+        # earliest entry — 0 when no session is open.
+        session_hours = _active_session_hours(persona_dir, now=now)
+        words = count_words_in_session(
+            persona_dir=persona_dir,
+            session_hours=session_hours,
+            now=now,
+        )
+        body = body_state_from_short(
+            short,
+            feels_high=live_engine.feels_high,
+            session_hours=session_hours,
+            words_written=words,
+            days_since_contact=days,
+            now=now,
+        )
+        return body.to_dict()
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: body computation failed", exc_info=True)
         return None

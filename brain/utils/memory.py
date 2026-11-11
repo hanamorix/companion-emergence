@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 
 def days_since_human(
-    store: MemoryStore,
     now: datetime,
     *,
     persona_dir: Path,
@@ -21,8 +20,7 @@ def days_since_human(
 
     The time of the user's last turn is ``brain.ingest.buffer.last_user_turn_ts`` (the active conversation files, then the
     archive when no active file holds a user turn). The function reads no memory and no presence file: a recalled
-    memory's ``created_at`` can move, a conversation file's user row cannot. ``store`` is unused; the removal change
-    (Engine 7, #635) drops it with the argument at every call.
+    memory's ``created_at`` can move, a conversation file's user row cannot.
 
     ``last_user_turn_ts`` is imported here, not at the top: ``brain.ingest`` pulls the ingest pipeline and the provider
     stack, and this module is imported by the emotion engine (through ``engine_utils``) in every process.

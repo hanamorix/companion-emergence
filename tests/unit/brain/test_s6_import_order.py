@@ -65,7 +65,7 @@ def test_the_ingest_stack_loads_when_days_since_human_is_first_called_not_when_t
         "before = ingest()\n"
         "assert not before, f'imported with the engine: {before}'\n"
         "with tempfile.TemporaryDirectory() as folder:\n"
-        "    brain.utils.memory.days_since_human(None, datetime.now(UTC), persona_dir=Path(folder))\n"
+        "    brain.utils.memory.days_since_human(datetime.now(UTC), persona_dir=Path(folder))\n"
         "assert 'brain.ingest.buffer' in sys.modules, 'days_since_human did not reach brain.ingest.buffer'\n"
     )
     proc = _run(code)

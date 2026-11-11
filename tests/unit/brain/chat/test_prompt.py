@@ -1550,7 +1550,7 @@ def test_body_block_uses_the_short_average_and_shows_absent_body_emotions_as_abs
 
     _seed_contradiction(store)  # a stored rest_need 9.0 would show if the block read the store
     emotion_engine_stub.readings = {"arousal": _reading(short=6.5), "love": _reading(short=8.0)}
-    block = _build_body_block(store, tmp_path)
+    block = _build_body_block(tmp_path)
     assert "body emotions: arousal 6.5" in block
     assert "rest_need" not in block
 
@@ -1560,12 +1560,12 @@ def test_body_block_with_an_empty_read_has_no_body_emotions_line(store, tmp_path
 
     _seed_contradiction(store)
     emotion_engine_stub.readings = {}
-    block = _build_body_block(store, tmp_path)
+    block = _build_body_block(tmp_path)
     assert block.startswith("── body ──")
     assert "body emotions:" not in block
 
 
-def test_body_block_a_read_that_raises_is_caught_by_the_existing_except(store, tmp_path, emotion_engine_stub):
+def test_body_block_a_read_that_raises_is_caught_by_the_existing_except(tmp_path, emotion_engine_stub):
     from brain.chat.prompt import _build_body_block
 
 
@@ -1573,7 +1573,7 @@ def test_body_block_a_read_that_raises_is_caught_by_the_existing_except(store, t
         raise RuntimeError("engine fault")
 
     emotion_engine_stub.read = boom
-    assert _build_body_block(store, tmp_path) == ""
+    assert _build_body_block(tmp_path) == ""
 
 
 def test_journal_block_sorts_and_prints_the_faded_values(store, emotion_engine_stub):
@@ -1676,27 +1676,27 @@ def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor
     assert "love:7.0" in first and "awe:5.5" in first
 
 
-def _body_block_numbers(store, tmp_path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+def _body_block_numbers(tmp_path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
     import re
 
     from brain.chat.prompt import _build_body_block
 
     stub.high = set(high)
     stub.readings = {n: _reading(short=v) for n, v in readings.items()}
-    block = _build_body_block(store, tmp_path)
+    block = _build_body_block(tmp_path)
     match = re.search(r"energy: (\d+)/10, temperature: (\d+)/9", block)
     assert match is not None, block
     return int(match.group(1)), int(match.group(2))
 
 
 def test_body_block_energy_and_temperature_follow_the_engines_predicate_not_a_level(
-    store, tmp_path, emotion_engine_stub
+    tmp_path, emotion_engine_stub
 ):
-    energy, temperature = _body_block_numbers(store, tmp_path, emotion_engine_stub, {}, set())
+    energy, temperature = _body_block_numbers(tmp_path, emotion_engine_stub, {}, set())
     # Far above every old level, but the engine calls nothing high: no change.
     top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
-    assert _body_block_numbers(store, tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
+    assert _body_block_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
     # Far below every old level, but high: energy -1 (rest_need) and temperature +1 (desire) +1 (love) -1 (touch_hunger).
     low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
-    got = _body_block_numbers(store, tmp_path, emotion_engine_stub, low, set(low))
+    got = _body_block_numbers(tmp_path, emotion_engine_stub, low, set(low))
     assert got == (energy - 1, temperature + 1)

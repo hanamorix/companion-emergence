@@ -195,7 +195,7 @@ class ResearchEngine:
         days_since = (
             days_since_human_override
             if days_since_human_override is not None
-            else days_since_human(self.store, now, persona_dir=self.interests_path.parent)
+            else days_since_human(now, persona_dir=self.interests_path.parent)
         )
         emo_state = emotion_state_override
         from brain.emotion import engine

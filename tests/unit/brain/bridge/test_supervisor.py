@@ -1443,11 +1443,11 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
 
 
-def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and_closes_its_store(
+def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and_opens_no_store(
     tmp_path: Path, emotion_engine_stub, monkeypatch
 ) -> None:
     """The gate's body is built from the engine's short averages (not the store's
-    rows), reports rest when the energy is low, and closes the store it opened."""
+    rows), reports rest when the energy is low, and opens no memory store."""
     from datetime import UTC, datetime
     from unittest.mock import MagicMock, patch
 
@@ -1463,7 +1463,7 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
     seeded.close()
     emotion_engine_stub.readings = {"rest_need": Reading(short=8.5, long=0.0, difference=0.0, shift=0)}
 
-    seen: dict[str, object] = {"emotions": None, "closed": 0}
+    seen: dict[str, object] = {"emotions": None, "opened": 0}
     low = BodyState(
         energy=_REST_ENERGY_THRESHOLD,
         temperature=5,
@@ -1478,13 +1478,13 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
         seen["emotions"] = dict(short)
         return low
 
-    real_close = MemoryStore.close
+    real_init = MemoryStore.__init__
 
-    def counting_close(self):
-        seen["closed"] += 1
-        return real_close(self)
+    def counting_init(self, *args, **kwargs):
+        seen["opened"] += 1
+        return real_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(MemoryStore, "close", counting_close)
+    monkeypatch.setattr(MemoryStore, "__init__", counting_init)
 
     captured: dict[str, object] = {}
 
@@ -1500,7 +1500,7 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
 
     assert seen["emotions"] == {"rest_need": 8.5}
     assert captured["is_rest_state"] is True
-    assert seen["closed"] == 1
+    assert seen["opened"] == 0, "the gate reads no memory, so it opens no store"
 
 
 def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail_open(

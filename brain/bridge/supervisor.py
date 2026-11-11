@@ -1955,8 +1955,7 @@ def _derive_intensity_drivers(
     so lived-age advances at baseline rate rather than crashing.
 
     Body strain is derived from exhaustion + energy via the body state built
-    from the emotion engine's short averages (opens its own MemoryStore
-    per-call, thread-local, same pattern as _run_heartbeat_tick).
+    from the emotion engine's short averages.
 
     Emotional intensity is not computed: it stays 0.0 (flagged for the
     felt-time rework, #386; the old measure is kept, uncalled, in
@@ -1973,38 +1972,31 @@ def _derive_intensity_drivers(
         from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
         from brain.emotion import engine
-        from brain.memory.store import MemoryStore
         from brain.utils.memory import days_since_human
 
         live_engine = engine.engine_for(persona_dir)
-        store = MemoryStore(persona_dir / "memories.db")
-        try:
-            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-            # pending or retrying, read() returns nothing and body strain is computed from baseline energy.
-            short = engine.short_values(live_engine.read())
-            _now = datetime.now(UTC)
-            days = days_since_human(store, now=_now, persona_dir=persona_dir)
-            words = count_words_in_session(
-                store, persona_dir=persona_dir, session_hours=0.0, now=_now
-            )
-            body = body_state_from_short(
-                short,
-                feels_high=live_engine.feels_high,
-                session_hours=0.0,
-                words_written=words,
-                days_since_contact=days,
-                now=_now,
-            )
-            # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
-            # Normalize each to [0, 1] then take the max (strain = worst axis).
-            raw_exhaustion = float(body.exhaustion) / 9.0
-            raw_energy_lack = 1.0 - float(body.energy) / 10.0
-            body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
-            # emotional_intensity is never computed here and stays at its initial 0.0. The old measure (a sigma
-            # deviation over the 200-row max-pool, `_dormant_emotional_intensity`) has no engine counterpart; it is
-            # unplugged until the felt-time rework decides what replaces it (#386).
-        finally:
-            store.close()
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and body strain is computed from baseline energy.
+        short = engine.short_values(live_engine.read())
+        _now = datetime.now(UTC)
+        days = days_since_human(now=_now, persona_dir=persona_dir)
+        words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=_now)
+        body = body_state_from_short(
+            short,
+            feels_high=live_engine.feels_high,
+            session_hours=0.0,
+            words_written=words,
+            days_since_contact=days,
+            now=_now,
+        )
+        # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
+        # Normalize each to [0, 1] then take the max (strain = worst axis).
+        raw_exhaustion = float(body.exhaustion) / 9.0
+        raw_energy_lack = 1.0 - float(body.energy) / 10.0
+        body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
+        # emotional_intensity is never computed here and stays at its initial 0.0. The old measure (a sigma
+        # deviation over the 200-row max-pool, `_dormant_emotional_intensity`) has no engine counterpart; it is
+        # unplugged until the felt-time rework decides what replaces it (#386).
     except Exception:
         logger.debug("supervisor felt-time: body strain read failed; using 0.0", exc_info=True)
 
@@ -2460,7 +2452,6 @@ def _self_model_reflect(
     from brain.body.state import body_state_from_short
     from brain.body.words import count_words_in_session
     from brain.emotion import engine
-    from brain.memory.store import MemoryStore
     from brain.utils.memory import days_since_human
     from brain.utils.time import iso_utc
 
@@ -2471,13 +2462,8 @@ def _self_model_reflect(
         _self_model_apply_reset(persona_dir, state, reads)
         return False
     short_values = engine.short_values(reads.read)
-    with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db")
-        stack.callback(store.close)
-        days = days_since_human(store, now=now, persona_dir=persona_dir)
-        words = count_words_in_session(
-            store, persona_dir=persona_dir, session_hours=0.0, now=now
-        )
+    days = days_since_human(now=now, persona_dir=persona_dir)
+    words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=now)
     body = body_state_from_short(
         short_values,
         feels_high=engine.engine_for(persona_dir).feels_high,
@@ -3426,24 +3412,19 @@ def _run_initiate_review_tick(
     # Soft rest gate: suppress recall-resonance when body energy is low.
     # Fail-open: a body-read error must never permanently silence her.
     is_rest_state = False
-    _store = None
     try:
         from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
         from brain.emotion import engine
-        from brain.memory.store import MemoryStore
         from brain.utils.memory import days_since_human
 
         _live_engine = engine.engine_for(persona_dir)
-        _store = MemoryStore(persona_dir / "memories.db")
         _now = datetime.now(UTC)
         # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
         # pending or retrying, read() returns nothing and the gate sees baseline energy (not resting).
         _short = engine.short_values(_live_engine.read())
-        _days = days_since_human(_store, now=_now, persona_dir=persona_dir)
-        _words = count_words_in_session(
-            _store, persona_dir=persona_dir, session_hours=0.0, now=_now
-        )
+        _days = days_since_human(now=_now, persona_dir=persona_dir)
+        _words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=_now)
         _body = body_state_from_short(
             _short,
             feels_high=_live_engine.feels_high,
@@ -3459,10 +3440,6 @@ def _run_initiate_review_tick(
             exc_info=True,
         )
         is_rest_state = False  # fail-open: a body bug must never silence her permanently
-    finally:
-        # The store used to stay open for the rest of the process; close it whichever way the gate read ended.
-        if _store is not None:
-            _store.close()
     _paused_out: list[bool] = []
     run_initiate_review_tick(
         persona_dir,

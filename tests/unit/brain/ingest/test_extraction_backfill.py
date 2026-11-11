@@ -781,12 +781,12 @@ def test_b15_the_silence_clock_is_unchanged_when_a_newer_memory_exists(kestrel) 
     run_consolidation(store, persona_dir=persona, classifier=_PROMOTE_ALL)
     assert store.get(recent) is not None
     now = datetime.now(UTC)
-    before = days_since_human(store, now, persona_dir=persona)
+    before = days_since_human(now, persona_dir=persona)
     assert before == pytest.approx(5.0, abs=0.1)  # the archived history's newest user turn, not the 2-day-old memory
     _arm(persona, "all")
     _run_all(persona, store, hebbian, _Stub())
     run_consolidation(store, persona_dir=persona, classifier=_PROMOTE_ALL)
-    assert days_since_human(store, now, persona_dir=persona) == before
+    assert days_since_human(now, persona_dir=persona) == before
 
 
 def test_b15_a_chunk_with_no_user_row(kestrel) -> None:

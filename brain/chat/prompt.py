@@ -223,7 +223,7 @@ def build_system_message(
             parts.append(reply_block)
 
     # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
-    body_block = _build_body_block(store, persona_dir)
+    body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -484,7 +484,7 @@ def build_volatile_context(
             parts.append(reply_block)
 
     # 5. Body block.
-    body_block = _build_body_block(store, persona_dir)
+    body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -658,7 +658,7 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
+def _build_body_block(persona_dir: Path) -> str:
     """Render the body block: computed energy/temperature/exhaustion +
     six body emotions inline.
 
@@ -672,7 +672,7 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     Inviolate properties enforced here:
     - #4 the body projection does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
       the input reads below are this function's, not the projection's
-    - #5 no self-perpetuation (we read from store, never write)
+    - #5 no self-perpetuation (this block reads only, never writes)
     - #8 no cache (the body state is recomputed every call)
     """
     try:
@@ -692,12 +692,11 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         # pending or retrying, read() returns nothing and the body block shows baselines.
         short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
-        days = days_since_human(store, now=now, persona_dir=persona_dir)
+        days = days_since_human(now=now, persona_dir=persona_dir)
         # Chat composer doesn't track session_hours yet — passes 0.0; words
         # falls back to 1-hour window. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
         words = count_words_in_session(
-            store,
             persona_dir=persona_dir,
             session_hours=0.0,
             now=now,

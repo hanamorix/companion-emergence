@@ -159,7 +159,7 @@ def _persona_body(c: SimpleNamespace) -> None:
 
 
 def _prompt_body(c: SimpleNamespace) -> None:
-    prompt._build_body_block(c.store, c.persona_dir)
+    prompt._build_body_block(c.persona_dir)
 
 
 def _get_emotional_state(c: SimpleNamespace) -> None:
