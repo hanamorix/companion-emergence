@@ -771,6 +771,20 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 G4 (#584, draft PR #633)",
         kind="code",
     ),
+    # --- one thing reads emotions (the stored feelings of a memory are private to the store and the engine) -------------
+    Removed(
+        names=("_stored_emotions", "_stored_score", "_stored_peak"),
+        why="the private stored feelings of a `Memory` (its emotions, score and highest value as the row holds them, faded by nothing and held by nothing); only the store and the emotion engine may read them, and every other reader asks the engine for `memory_feelings` (faded by age, held to 0-10)",
+        ref="Engine 7 ONE4 (#635)",
+        kind="code",
+        allow=(
+            "brain/emotion/engine.py",
+            "brain/emotion/engine_files.py",
+            "brain/emotion/engine_rebuild.py",
+            "brain/emotion/engine_utils.py",
+            "brain/memory/store.py",
+        ),
+    ),
 )
 
 
