@@ -36,8 +36,11 @@ The switch-over and the live engine (Engine 6, #584):
   the next start, when `memories.db` cannot be read either, or when the rebuild's own state write fails with an I/O error on
   such a state. Any other failure raises `EngineStartupError`.
 - `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
-  time when that is later; before the switch it returns the stored value. It raises `KeyError`, naming the memory id and the
-  emotion, when the memory has no such emotion. It never returns 0.0: "absent" is for the caller to decide.
+  time when that is later (before the switch it does not fade), and holds the result to 0-10 (a stored negative reads as 0).
+  It raises `KeyError`, naming the memory id and the emotion, when the memory has no such emotion: "absent" is for the caller
+  to decide, never a 0.0.
+- `memory_feelings(memory)` is the one read of a memory's feelings, peak and score (`engine_utils.memory_feelings` with this
+  engine's half-lives, switch time and clock). Its fade is the same one copy `faded_value` uses.
 - `needs_recovery()` and `recovery_rebuild()`: a live persona whose state is missing or unreadable is rebuilt from its rows.
 - `fold_change` also writes a change-log line once the persona is live.
 
@@ -62,13 +65,15 @@ from brain.emotion.engine_files import VocabularyHalfLives
 from brain.emotion.engine_utils import (
     EngineState,
     Event,
+    MemoryFeelings,
     close_days,
     counted_kind,
     day_of,
-    fade,
+    faded_emotion,
     feels_high_from,
     fold_event,
     fold_guarded,
+    memory_feelings,
     resolve_emotions,
     shift_for,
     source_modifier,
@@ -255,15 +260,9 @@ class EmotionEngine:
         """The memory's emotions as the engine folds them: faded, names canonical, each held to 0-10, bad values dropped.
 
         A name whose faded value cannot be worked out is left out with a log line, so one bad name does not stop the others.
-        The memory is read, never changed.
+        The memory is read, never changed. This is `memory_feelings(memory).feelings`, as a copy.
         """
-        faded: dict = {}
-        for name in memory.emotions:
-            try:
-                faded[name] = self.faded_value(memory, name)
-            except Exception:
-                logger.warning("emotion engine: no faded value for %r of memory %s; left out", name, memory.id, exc_info=True)
-        return resolve_emotions(faded)
+        return dict(self.memory_feelings(memory).feelings)
 
     @staticmethod
     def _stored_climax(memory: Memory) -> float:
@@ -792,29 +791,27 @@ class EmotionEngine:
     def faded_value(self, memory: Memory, emotion: str) -> float:
         """The memory's stored value for `emotion`, faded by its age once the persona is live.
 
-        Live: `engine_utils.fade` with the emotion's half-life (`half_life`), the memory's importance and the floor of the
-        emotion (love and belonging only), at an age counted from the memory's creation or from the switch-over time when that
-        is later (a value stored before the switch-over was never faded by the engine, and is not faded for the time before
-        it). Before the switch, and when the state cannot be read, the stored value: never a fade from `created_at`
-        alone, which would fade a pre-switch value twice. It works from the memory it is given and this instance's own switch
-        time and half-life lookup, and reads no store, so it also serves a row that `hard_delete` has already removed. Raises
+        The fade is `engine_utils.faded_emotion` (the one copy, also used by `memory_feelings`): live, with the emotion's
+        half-life (`half_life`), the memory's importance and the floor of the emotion, at an age counted from the memory's
+        creation or from the switch-over time when that is later. Before the switch, and when the state cannot be read, the
+        stored value is not faded. The result is held to 0-10 through `resolve_emotions`, so a stored negative reads as 0 and a
+        value that step drops reads as 0.0. It works from the memory it is given and this instance's own switch time and
+        half-life lookup, and reads no store, so it also serves a row that `hard_delete` has already removed. Raises
         `KeyError` naming the memory id and the emotion when the memory has no such emotion: "absent" is for the caller to decide.
         """
-        try:
-            stored = memory.emotions[emotion]
-        except KeyError:
-            raise KeyError(
-                f"memory {memory.id} has no stored value for emotion {emotion!r}"
-            ) from None
-        if not self.is_live():
-            return stored
-        switched = self._switch_over_at  # set by `is_live` above
-        created = lenient_utc(memory.created_at)
-        if switched is None or created is None:
-            return stored
-        age_days = (self._now() - max(created, switched)).total_seconds() / 86400.0
-        floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION.get(vocabulary.canonical_name(emotion))
-        return fade(stored, age_days, self.half_life(emotion), memory.importance, floor)
+        switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
+        value = faded_emotion(memory, emotion, self.half_life, switched, self._now())
+        return resolve_emotions({emotion: value}).get(vocabulary.canonical_name(emotion), 0.0)
+
+    def memory_feelings(self, memory: Memory) -> MemoryFeelings:
+        """The one read of a memory's feelings, peak and score, with this engine's half-lives, switch time and clock.
+
+        `engine_utils.memory_feelings` with `half_life`, the switch-over time this instance has seen (None before the switch
+        and when the state cannot be read: nothing fades) and the clock as it is now. The feelings are worked out on first
+        access, at the time read here. The memory is read, never changed, and no store is read.
+        """
+        switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
+        return memory_feelings(memory, self.half_life, switched, self._now())
 
     def feels_high(self, name: str) -> bool:
         """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.
