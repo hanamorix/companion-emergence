@@ -120,8 +120,7 @@ def test_each_warming_feeling_that_is_high_raises_temperature_by_one():
 
 
 def test_each_cooling_feeling_that_is_high_lowers_temperature_by_one():
-    for name in ("touch_hunger",):
-        assert _body({name: 0.5}, name).temperature == BASE_TEMPERATURE - 1, name
+    assert _body({"touch_hunger": 0.5}, "touch_hunger").temperature == BASE_TEMPERATURE - 1
 
 
 def test_body_grief_high_does_not_change_temperature():
