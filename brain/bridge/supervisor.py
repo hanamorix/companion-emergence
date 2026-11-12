@@ -45,6 +45,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from brain.utils.file_lock import LockTimeoutError
+
 if TYPE_CHECKING:
     from brain.engines.heartbeat import HeartbeatResult
     from brain.memory.relevance_judge import RelevanceJudgeProvider
@@ -2413,8 +2415,9 @@ def _self_model_apply_reset(
     acknowledged or dismissed that held for the sustained number of ticks is kept (its `reset_seen` brought up to
     date). Any other gap is cleared without the resolution path and without a history entry.
 
-    Returns True when a reconcile changed the state since the tick loaded it, so the rule wrote nothing and the tick
-    should retry soon ("deferred", as step 5b does for the same race); False otherwise.
+    Returns True when the rule wrote nothing and the tick should retry soon ("deferred", as step 5b does for the
+    same cases): a reconcile changed the state since the tick loaded it, or another writer kept the state lock for
+    the whole bounded wait. False otherwise.
     """
     from brain.utils.time import iso_utc
 
@@ -2423,31 +2426,35 @@ def _self_model_apply_reset(
         return False
     # #558: a reconcile may have saved since the tick loaded `state`. Re-load under the state lock; if it changed,
     # her write wins and the next tick applies the rule to what she left.
-    with self_model_state.locked(persona_dir):
-        if self_model_state.load_or_recover(persona_dir)[0] != state:
-            logger.info("self_model: the state changed before the spare rule saved (a reconcile); retrying soon")
-            return True
-        # The two private constants of the resolution path are read, not copied: which statuses mean "she has
-        # answered this gap" and how many sustained ticks make a gap worth keeping, so the rule and the resolution
-        # path cannot drift.
-        if (
-            prior_gap.status in sm_resolve._RESOLVED_STATUSES  # noqa: SLF001
-            and prior_gap.sustained_ticks >= sm_resolve._SUSTAINED_TICKS  # noqa: SLF001
-        ):
-            prior_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
+    try:
+        with self_model_state.locked(persona_dir):
+            if self_model_state.load_or_recover(persona_dir)[0] != state:
+                logger.info("self_model: the state changed before the spare rule saved (a reconcile); retrying soon")
+                return True
+            # The two private constants of the resolution path are read, not copied: which statuses mean "she has
+            # answered this gap" and how many sustained ticks make a gap worth keeping, so the rule and the
+            # resolution path cannot drift.
+            if (
+                prior_gap.status in sm_resolve._RESOLVED_STATUSES  # noqa: SLF001
+                and prior_gap.sustained_ticks >= sm_resolve._SUSTAINED_TICKS  # noqa: SLF001
+            ):
+                prior_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
+                self_model_state.save(
+                    persona_dir,
+                    self_model_state.SelfModelState(current_gap=prior_gap, gap_history=state.gap_history),
+                )
+                return False
+            # Accepted edge: clearing a gap here drops its reconcile cooldowns, so a channel she has just reconciled
+            # can come back on the next ordinary tick. After a rebuild or a catch-up the saved flags are only
+            # approximate, so a gap that is neither acknowledged nor dismissed with 3 or more sustained ticks is
+            # cleared without the resolution path. A follow-up issue records the deferral.
             self_model_state.save(
                 persona_dir,
-                self_model_state.SelfModelState(current_gap=prior_gap, gap_history=state.gap_history),
+                self_model_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
             )
-            return False
-        # Accepted edge: clearing a gap here drops its reconcile cooldowns, so a channel she has just reconciled can
-        # come back on the next ordinary tick. After a rebuild or a catch-up the saved flags are only approximate, so
-        # a gap that is neither acknowledged nor dismissed with 3 or more sustained ticks is cleared without the
-        # resolution path. A follow-up issue records the deferral.
-        self_model_state.save(
-            persona_dir,
-            self_model_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
-        )
+    except LockTimeoutError as exc:
+        logger.warning("self_model: %s; the spare rule wrote nothing and retries soon", exc)
+        return True
     return False
 
 
@@ -2633,28 +2640,33 @@ def _self_model_reflect(
     # for its own load → change → save. Her write wins: this tick writes nothing and retries soon ("deferred").
     # Nothing slow runs under the lock, so a chat-turn reconcile never waits long: the articulate call is before it,
     # and the audit counter and the resolution path (whose soul-candidate append can wait on soul review's lock,
-    # held across its LLM calls) run after it.
-    with self_model_state.locked(persona_dir):
-        if self_model_state.load_or_recover(persona_dir)[0] != state:
-            logger.info("self_model: the state changed during this tick (a reconcile); retrying on the next tick")
-            return True
+    # held across its LLM calls) run after it. The wait for the lock is bounded: if another writer keeps it the whole
+    # time (stalled in its save), this tick writes nothing and retries soon, as for a changed snapshot.
+    try:
+        with self_model_state.locked(persona_dir):
+            if self_model_state.load_or_recover(persona_dir)[0] != state:
+                logger.info("self_model: the state changed during this tick (a reconcile); retrying on the next tick")
+                return True
 
-        # ── 6: persist state (displaced-gap helper) ─────────────────────────
-        if gap_active:
-            new_state = self_model_state.push_gap(state, new_gap)
-        else:
-            # No active gap this tick. If a prior gap is still open, displace it
-            # into history (push None is not supported, so move it manually) —
-            # otherwise just persist the (unchanged) state so the file exists.
-            if prior_gap is not None:
-                new_history = list(state.gap_history)
-                new_history.append(prior_gap)
-                new_state = self_model_state.SelfModelState(
-                    current_gap=None, gap_history=new_history[-20:]
-                )
+            # ── 6: persist state (displaced-gap helper) ─────────────────────
+            if gap_active:
+                new_state = self_model_state.push_gap(state, new_gap)
             else:
-                new_state = state
-        self_model_state.save(persona_dir, new_state)
+                # No active gap this tick. If a prior gap is still open, displace it
+                # into history (push None is not supported, so move it manually) —
+                # otherwise just persist the (unchanged) state so the file exists.
+                if prior_gap is not None:
+                    new_history = list(state.gap_history)
+                    new_history.append(prior_gap)
+                    new_state = self_model_state.SelfModelState(
+                        current_gap=None, gap_history=new_history[-20:]
+                    )
+                else:
+                    new_state = state
+            self_model_state.save(persona_dir, new_state)
+    except LockTimeoutError as exc:
+        logger.warning("self_model: %s; this tick wrote nothing and retries on the next tick", exc)
+        return True
 
     # ── 7: audit counter, after the save and outside the lock ───────────────
     if gap_active:

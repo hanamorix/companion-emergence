@@ -21,7 +21,7 @@ from pathlib import Path
 
 from brain.health.json_io import read_json_result, write_json
 from brain.self_model.gap import UNSET, Gap
-from brain.utils.file_lock import file_lock
+from brain.utils.file_lock import locked_within
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -189,8 +189,14 @@ def locked(persona_dir: Path) -> Iterator[None]:
     that checks its snapshot still holds, and its save) and the one-time repair. Readers that only render it (the
     chat prompt, tool recruitment) do not: ``save`` replaces the file atomically. Not re-entrant: never load-and-save
     under it through a helper that takes it again.
+
+    The wait is bounded by ``dev_constants.SELF_MODEL_LOCK_WAIT_S``: a holder stalled inside its save (a hung disk)
+    must not hang a chat turn's reconcile. When another holder keeps the lock for the whole wait this raises
+    :class:`brain.utils.file_lock.LockTimeoutError` and the body never runs; each caller handles that.
     """
-    with file_lock(_state_path(persona_dir)):
+    from brain import dev_constants
+
+    with locked_within(_state_path(persona_dir), dev_constants.SELF_MODEL_LOCK_WAIT_S):
         yield
 
 

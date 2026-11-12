@@ -278,3 +278,150 @@ def test_the_startup_repair_waits_for_a_reconcile_in_flight_so_its_clear_is_not_
     assert sm_state.load_or_recover(persona_dir)[0].current_gap is None, (
         "the reconcile wrote the cleared gap back"
     )
+
+
+# ── the wait is bounded (#730 review) ──────────────────────────────────────────────────────────────────────────────
+# `file_lock` blocks forever, so a holder stalled inside its save (a hung disk) would hang the next chat turn's
+# reconcile with no error. Every writer waits at most dev_constants.SELF_MODEL_LOCK_WAIT_S, then gives up cleanly.
+
+_SHORT_WAIT_S = 0.2
+
+
+def _hold_the_state_lock(persona_dir: Path):
+    """The lock as a stalled holder keeps it: taken on its own file handle, so this process's waiters contend for it."""
+    from brain.utils.file_lock import file_lock
+
+    return file_lock(persona_dir / "self_model_state.json")
+
+
+def _run_bounded(fn) -> tuple[list, bool]:
+    """Run fn in a thread; (its result in a list, whether it was still waiting after _JOIN_S)."""
+    out: list = []
+    t = _in_thread(lambda: out.append(fn()))
+    t.join(_JOIN_S)
+    return out, t.is_alive()
+
+
+def test_a_reconcile_that_cannot_get_the_lock_gives_up_and_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """She dismisses grief while a stalled holder keeps the lock. The reconcile returns an error within the wait
+    instead of hanging the chat turn, and writes nothing: the gap is still open, so trying again is safe."""
+    from brain import dev_constants
+    from brain.self_model.resolve import load_audit
+
+    monkeypatch.setattr(dev_constants, "SELF_MODEL_LOCK_WAIT_S", _SHORT_WAIT_S, raising=False)
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+
+    with _hold_the_state_lock(persona_dir):
+        out, still_waiting = _run_bounded(
+            lambda: reconcile_self_read(persona_dir=persona_dir, action="dismiss", channel="grief")
+        )
+        assert not still_waiting, "the reconcile waited on the lock with no bound"
+
+    assert "error" in out[0], out
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None and gap.status == "open", gap
+    assert load_audit(persona_dir)["reconciles_called"] == 0
+
+
+def test_a_tick_that_cannot_get_the_lock_writes_nothing_and_retries_soon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
+) -> None:
+    """A stalled holder keeps the lock while the tick reaches its save. The tick gives up within the wait, leaves the
+    file as it was and ends "deferred", so the next run (about a minute later) tries again."""
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "SELF_MODEL_LOCK_WAIT_S", _SHORT_WAIT_S, raising=False)
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+    _live_engine(emotion_engine_stub)
+    monkeypatch.setattr(supervisor, "sm_articulate", lambda gap, *, provider, persona_dir: "a note")
+
+    with _hold_the_state_lock(persona_dir):
+        _out, still_waiting = _run_bounded(
+            lambda: supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+        )
+        assert not still_waiting, "the tick waited on the lock with no bound"
+
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None and gap.sustained_ticks == 1 and gap.note is None, gap
+    assert _cadence_outcome(persona_dir) == "deferred"
+
+
+def test_a_spare_rule_that_cannot_get_the_lock_writes_nothing_and_retries_soon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
+) -> None:
+    """The spare rule's save takes the same lock: with a stalled holder it gives up within the wait, the open gap
+    stays as it was, and the tick ends "deferred" so the rule runs again soon."""
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "SELF_MODEL_LOCK_WAIT_S", _SHORT_WAIT_S, raising=False)
+    persona_dir = _persona(tmp_path)
+    gap = Gap(
+        per_channel={"grief": 2.0},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        status="open",
+        sustained_ticks=3,
+        directions={"grief": 1},
+    )  # reset_seen never stored → the live tick runs the spare rule
+    sm_state.save(persona_dir, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+    _live_engine(emotion_engine_stub)
+
+    with _hold_the_state_lock(persona_dir):
+        _out, still_waiting = _run_bounded(
+            lambda: supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+        )
+        assert not still_waiting, "the spare rule waited on the lock with no bound"
+
+    saved = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert saved is not None and saved.status == "open", saved
+    assert _cadence_outcome(persona_dir) == "deferred"
+
+
+def test_a_startup_repair_that_cannot_get_the_lock_leaves_its_marker_unwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-time repair gives up within the wait when a stalled holder keeps the lock. It has not cleared the gap,
+    so it must not write its one-time marker either: the next start runs it again."""
+    from brain import dev_constants
+    from brain.health.self_model_repair import run_self_model_repair, should_run_self_model_repair
+
+    monkeypatch.setattr(dev_constants, "SELF_MODEL_LOCK_WAIT_S", _SHORT_WAIT_S, raising=False)
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+
+    with _hold_the_state_lock(persona_dir):
+        _out, still_waiting = _run_bounded(lambda: run_self_model_repair(persona_dir))
+        assert not still_waiting, "the repair waited on the lock with no bound"
+
+    assert sm_state.load_or_recover(persona_dir)[0].current_gap is not None
+    assert should_run_self_model_repair(persona_dir), "the marker was written though the repair did not run"
+
+
+def test_an_accept_that_cannot_get_the_lock_writes_no_delta_so_trying_again_is_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """accept/revise change the gap before they write the emotion delta: when the lock wait gives up, the delta has
+    not been written, so the same call made again does not write it twice."""
+    from brain import dev_constants
+    from brain.self_model import reconcile
+
+    monkeypatch.setattr(dev_constants, "SELF_MODEL_LOCK_WAIT_S", _SHORT_WAIT_S, raising=False)
+    deltas: list[str] = []
+    monkeypatch.setattr(reconcile, "_write_self_authored_delta", lambda pd, ch, d: deltas.append(ch) or True)
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+
+    with _hold_the_state_lock(persona_dir):
+        out, still_waiting = _run_bounded(
+            lambda: reconcile_self_read(persona_dir=persona_dir, action="accept", channel="grief", delta=0.3)
+        )
+        assert not still_waiting
+
+    assert "error" in out[0], out
+    assert deltas == [], "the delta was written though the reconcile gave up"
+    again = reconcile_self_read(persona_dir=persona_dir, action="accept", channel="grief", delta=0.3)
+    assert again.get("ok") is True and deltas == ["grief"]

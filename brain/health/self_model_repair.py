@@ -17,6 +17,7 @@ from pathlib import Path
 
 from brain.health.json_io import write_json
 from brain.self_model import state as sm_state
+from brain.utils.file_lock import LockTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,11 @@ def run_self_model_repair(persona_dir: Path) -> None:
                 logger.info(
                     "self_model_repair: cleared a persisted gap (windowed-peak migration)"
                 )
+    except LockTimeoutError as exc:
+        # Another writer kept the state lock for the whole bounded wait: nothing was cleared, so the marker is not
+        # written and the next start runs the repair again.
+        logger.warning("self_model_repair: %s; not run, retried at the next start", exc)
+        return
     except Exception:
         logger.exception("self_model_repair: failed (non-fatal)")
-    finally:
-        write_json(persona_dir / _MARKER_FILENAME, {"done": True}, indent=None, fsync=False, on_error="log")
+    write_json(persona_dir / _MARKER_FILENAME, {"done": True}, indent=None, fsync=False, on_error="log")
