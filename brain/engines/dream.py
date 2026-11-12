@@ -171,9 +171,7 @@ class DreamEngine:
         """The persona's emotion engine when its switch is on; None when off, unknown, or there is no persona_dir."""
         if self.persona_dir is None:
             return None
-        from brain.emotion.engine import engine_for
-
-        eng = engine_for(self.persona_dir)
+        eng = emotion_engine.engine_for(self.persona_dir)
         return eng if eng.is_live() else None
 
     def _select_seed(
@@ -324,9 +322,10 @@ class DreamEngine:
     def _faded_means(
         seed: Memory, neighbours: list[tuple[Memory, float]], eng: EmotionEngine
     ) -> dict[str, float]:
-        """Per emotion, the mean of the faded values across the seed and the neighbours that carry it, held to 0-10.
+        """Per emotion, the mean of the engine's read values across the seed and the neighbours that carry it.
 
-        Old rows can hold values below 0 or over 10. A mean held to 0 is kept, not dropped.
+        The read fades each memory's values and holds each to 0-10 (old rows can hold values below 0 or over 10), so the
+        mean stays within 0-10 too. A value held to 0 is kept, not dropped.
         """
         totals: dict[str, float] = {}
         counts: dict[str, int] = {}
@@ -334,7 +333,7 @@ class DreamEngine:
             for name, value in eng.memory_feelings(mem).feelings.items():
                 totals[name] = totals.get(name, 0.0) + value
                 counts[name] = counts.get(name, 0) + 1
-        return {name: min(max(total / counts[name], 0.0), 10.0) for name, total in totals.items()}
+        return {name: total / counts[name] for name, total in totals.items()}
 
     def _strengthen_edges(
         self,
