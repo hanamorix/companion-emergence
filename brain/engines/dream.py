@@ -142,6 +142,16 @@ class DreamEngine:
             self._log(seed, neighbours, dream_memory)
             self._emit_initiate_candidate(seed, neighbours, dream_memory)
 
+            # The dream was dreamed, so the memories in its prompt were in front of her: one recall each (#587).
+            # A dry run, a denied slot or a failed call returns or raises before here and ticks nothing. After
+            # the writes above and fail-soft, so a store error here can't cost the dream. An auto-picked seed
+            # comes from list reads, which never ticked; a seed asked for by id did.
+            try:
+                for mem in ([seed] if seed_id is not None else []) + [m for m, _ in neighbours]:
+                    self.store.get(mem.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("dream recall tick failed for seed %s: %s", seed.id, exc)
+
             return DreamResult(
                 seed=seed,
                 neighbours=neighbours,
@@ -154,7 +164,7 @@ class DreamEngine:
 
     def _select_seed(self, *, seed_id: str | None, lookback_hours: int) -> Memory:
         if seed_id is not None:
-            mem = self.store.get(seed_id)
+            mem = self.store.get(seed_id, bump=False)  # ticked by run_cycle once the dream is dreamed (#587)
             if mem is None:
                 raise NoSeedAvailable(f"Seed id {seed_id!r} not found in store.")
             return mem
@@ -215,7 +225,7 @@ class DreamEngine:
         activation.pop(seed.id, None)
         results: list[tuple[Memory, float]] = []
         for mid, act in sorted(activation.items(), key=lambda p: p[1], reverse=True):
-            mem = self.store.get(mid)
+            mem = self.store.get(mid, bump=False)  # ticked by run_cycle once the dream is dreamed (#587)
             if mem is not None:
                 results.append((mem, act))
                 if len(results) >= limit:

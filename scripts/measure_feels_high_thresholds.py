@@ -179,13 +179,18 @@ def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
     return _guarded("vocabulary", load)
 
 
+def _platform() -> str:
+    """``sys.platform``, behind a seam so a test fakes another platform here, never on the global (#710)."""
+    return sys.platform
+
+
 def _cpu_model() -> str:
     """The first ``model name`` field of /proc/cpuinfo on Linux; "unknown" elsewhere or when it is missing or unreadable.
 
     A plain read: this script is not part of the app, and starting a process (platform.processor() runs ``uname -p``)
     is not allowed here.
     """
-    if sys.platform != "linux":
+    if _platform() != "linux":
         return "unknown"
     try:
         text = CPUINFO.read_text(encoding="utf-8", errors="replace")
@@ -203,7 +208,7 @@ def _host_line() -> str:
     avx2 = "unknown"
     ram = "unknown"
     try:
-        if sys.platform == "linux":
+        if _platform() == "linux":
             from brain.memory.reranker import _detect_avx2
 
             avx2 = "yes" if _detect_avx2() else "no"

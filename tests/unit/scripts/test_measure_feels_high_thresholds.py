@@ -32,11 +32,10 @@ _spec.loader.exec_module(mod)
 
 
 def _cpu_model_on(monkeypatch: pytest.MonkeyPatch, cpuinfo: Path, platform_name: str = "linux") -> str:
-    """Call ``_cpu_model`` with CPUINFO pointed at ``cpuinfo`` and sys.platform patched for that call only."""
+    """Call ``_cpu_model`` with CPUINFO pointed at ``cpuinfo`` and the script's platform seam (`mod._platform`) faked."""
     monkeypatch.setattr(mod, "CPUINFO", cpuinfo)
-    with monkeypatch.context() as scoped:
-        scoped.setattr(sys, "platform", platform_name)
-        return mod._cpu_model()
+    monkeypatch.setattr(mod, "_platform", lambda: platform_name)
+    return mod._cpu_model()
 
 
 def test_cpu_model_reads_first_model_name_collapsed(tmp_path, monkeypatch):
@@ -97,9 +96,8 @@ def test_host_line_prints_cpu_model_and_arch(tmp_path, monkeypatch):
     # Only the platform string is patched, and only for the linux case, so the app's AVX2 probe is never
     # called under a non-linux value. The avx2 and ram values come from the app's probes (real /proc files) and
     # are not asserted.
-    with monkeypatch.context() as scoped:
-        scoped.setattr(sys, "platform", "linux")
-        line = mod._host_line()
+    monkeypatch.setattr(mod, "_platform", lambda: "linux")
+    line = mod._host_line()
     assert line.startswith("host: ")
     assert "cpu Sentinel CPU 9000" in line
     assert f"arch {platform.machine() or 'unknown'}" in line
@@ -120,9 +118,8 @@ def test_cpu_model_starts_no_process(tmp_path, monkeypatch):
     cpuinfo = tmp_path / "cpuinfo"
     cpuinfo.write_bytes(b"model name\t: Sentinel CPU\n")
     assert _cpu_model_on(monkeypatch, cpuinfo) == "Sentinel CPU"  # also points mod.CPUINFO at the file
-    with monkeypatch.context() as scoped:
-        scoped.setattr(sys, "platform", "linux")
-        mod._host_line()
+    monkeypatch.setattr(mod, "_platform", lambda: "linux")
+    mod._host_line()
     assert started == []
 
     # The same property read from the source: no call to subprocess, platform.processor, os.popen or os.system
