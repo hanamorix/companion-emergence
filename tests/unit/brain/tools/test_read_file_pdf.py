@@ -99,3 +99,45 @@ def test_read_file_corrupt_pdf_fails_soft(tmp_path: Path) -> None:
     out = read_file(path=str(f), persona_dir=tmp_path)
 
     assert "error" in out and "content" not in out
+
+
+# #590: a PDF's extracted text gets the same window as a text file.
+
+
+def test_read_file_pdf_offset_without_max_lines_windows_from_offset(tmp_path: Path) -> None:
+    f = tmp_path / "long.pdf"
+    f.write_bytes(_make_pdf([f"p{i}" for i in range(1, 301)]))  # page 1: 1 line, then 2 lines per page
+
+    out = read_file(path=str(f), persona_dir=tmp_path, offset=401)
+
+    assert out["total_lines"] == 599
+    assert out["content"].startswith("--- page 202 ---\np202\n")
+    assert out["note"] == "showing lines 401-599 of 599 across 300 page(s); pass offset/max_lines to read more"
+
+
+def test_read_file_pdf_without_range_shows_first_window(tmp_path: Path) -> None:
+    f = tmp_path / "long0.pdf"
+    f.write_bytes(_make_pdf([f"p{i}" for i in range(1, 301)]))
+
+    out = read_file(path=str(f), persona_dir=tmp_path)
+
+    assert out["content"].count("\n") == 400
+    assert out["content"].startswith("p1\n--- page 2 ---\np2\n")
+    assert out["note"] == "showing lines 0-400 of 599 across 300 page(s); pass offset/max_lines to read more"
+
+
+def test_read_file_pdf_long_line_is_cut_to_the_window_budget(tmp_path: Path, monkeypatch) -> None:
+    """A PDF's extracted text has the same per-read character budget as a text file."""
+    import brain.tools.impls.read_file as rf
+
+    monkeypatch.setattr(rf, "_WINDOW_MAX_CHARS", 50)
+    f = tmp_path / "wide.pdf"
+    f.write_bytes(_make_pdf(["z" * 200]))
+
+    out = read_file(path=str(f), persona_dir=tmp_path)
+
+    assert out["content"] == "z" * 50
+    assert out["note"] == (
+        "showing lines 0-1 of 1 across 1 page(s); line 0 is longer than 50 characters and was cut short; "
+        "pass offset/max_lines to read more"
+    )
