@@ -12,7 +12,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from brain.files.path_identity import stat_or_none, under_any
+from brain.files.path_identity import stat_or_none, under_any, unusable
 
 _MAX_WRITE_BYTES = 1 * 1024 * 1024          # 1 MB per proposal
 _MAX_RESULT_FILE_BYTES = 25 * 1024 * 1024   # 25 MB resulting-file ceiling (append)
@@ -115,11 +115,19 @@ def _denied(resolved: Path, persona_dir: Path) -> bool:
 def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardResult:
     try:
         resolved = Path(os.path.expandvars(os.path.expanduser(raw_path))).resolve()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.12 (#695)
         return GuardResult(ok=False, error=f"bad path: {exc}")
+    try:  # a lone surrogate (from a JSON argument) isn't text; the OS may take it, the audit and card ids can't (#695)
+        str(resolved).encode("utf-8")
+    except UnicodeEncodeError:
+        return GuardResult(ok=False, error="bad path: not valid text (lone surrogate)")
     if _is_windows() and any(":" in part for part in resolved.parts[1:]):
         # an NTFS stream (``.aws::$INDEX_ALLOCATION`` creates the directory) slips past both comparisons
         return GuardResult(ok=False, error=f"bad path: {resolved} names an NTFS stream")
+    # before the deny-list scan, which stats every ancestor per protected location: a 2600-part path
+    # took 3 s of CPU there. Either way it's refused.
+    if (why := unusable(resolved)) is not None:
+        return GuardResult(ok=False, error=f"bad path: {why}")
     if _denied(resolved, persona_dir):
         return GuardResult(ok=False, error=f"denied: {resolved} is in a protected location")
     if op == "create":
@@ -138,7 +146,14 @@ def check_size(content: str, *, op: str, resolved: Path) -> GuardResult:
     nbytes = len(content.encode("utf-8"))
     if nbytes > _MAX_WRITE_BYTES:
         return GuardResult(ok=False, error=f"too large ({nbytes} > {_MAX_WRITE_BYTES} cap)")
-    if op == "append" and resolved.exists():
-        if resolved.stat().st_size + nbytes > _MAX_RESULT_FILE_BYTES:
+    if op == "append":
+        # Python 3.14's exists() reads a too-long path as missing instead of raising, so ask unusable() first.
+        if (why := unusable(resolved)) is not None:
+            return GuardResult(ok=False, error=f"bad path: {why}")
+        try:
+            size = resolved.stat().st_size if resolved.exists() else 0
+        except OSError as exc:  # #695: the path stopped being usable since check_write_target
+            return GuardResult(ok=False, error=f"bad path: {exc.strerror or type(exc).__name__}")
+        if size + nbytes > _MAX_RESULT_FILE_BYTES:
             return GuardResult(ok=False, error="append would exceed the file-size ceiling")
     return GuardResult(ok=True, resolved=resolved)
