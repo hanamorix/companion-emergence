@@ -5,9 +5,12 @@ diverged (the ambient gap block), this is how she acts on it — by her own
 choice, never anyone else's insistence.
 
 Actions:
-  accept / revise  — mark the gap ``acknowledged`` and give the channel a
-                     cooldown (R-B2 anti-oscillation). No emotion row is written:
-                     the old aggregate that pooled such rows is gone.
+  accept / revise  — fold a self-authored emotion delta for one channel into the
+                     emotion engine as a signed change (bounded [-1, 1] + clamped,
+                     routed through the registered vocabulary filter; off-vocab
+                     channels are dropped; no memory row is written). The gap
+                     is marked ``acknowledged`` and the channel gets a cooldown
+                     (R-B2 anti-oscillation).
   dismiss          — let the gap pass; mark it ``dismissed`` + channel cooldown.
   name             — name an *unnamed pressure*. This NEVER mints a vocabulary
                      entry directly. It runs the existing guarded crystalliser
@@ -85,6 +88,25 @@ def is_channel_in_cooldown(gap, channel: str, *, now: datetime | None = None) ->
     return now < expiry
 
 
+def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) -> bool:
+    """Fold a self-authored revision into the emotion engine as a signed change; no row is written.
+
+    The delta is clamped to [-1, 1] and routed through ``_filter_to_registered`` (off-vocab channel → dropped); the
+    signed change is the delta times 10, capped at ``extractor._MAX_DELTA_INTENSITY`` (``signed_change_values``), so
+    one reconcile can't peg a channel any more than one chat-turn extraction can.
+
+    Returns True if a change was folded, False if the channel was off-vocab or the delta was effectively zero.
+    """
+    from brain.chat.extractor import _filter_to_registered, signed_change_values
+    from brain.emotion import engine
+
+    changes = signed_change_values(_filter_to_registered({channel: _clamp_delta(delta)}))
+    if not changes:
+        return False
+    engine.engine_for(persona_dir).fold_change(changes, None, "self_model_reconcile")
+    return True
+
+
 def _propose_vocabulary_candidate(persona_dir: Path) -> dict[str, Any]:
     """Run the guarded vocabulary-crystalliser path for a named unnamed pressure.
 
@@ -137,14 +159,16 @@ def reconcile_self_read(
             gap.channel_cooldowns = {**(gap.channel_cooldowns or {}), channel: _cooldown_until(now)}
             gap.last_seen_ts = _iso(now)
 
-        # If the lock wait gives up, nothing has been changed, so the same call can simply be made again.
+        # The state change comes first: if its lock wait gives up, nothing has been written yet, so the same call can
+        # simply be made again (the delta written first would be written twice).
         busy = _change_current_gap(persona_dir, acknowledge)
         if busy is not None:
             return busy
+        wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
         # Dead-loop observability (R-E4): record a successful reconcile so the
         # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
         increment_reconciles(persona_dir)
-        return {"ok": True, "action": action, "channel": channel}
+        return {"ok": True, "action": action, "channel": channel, "delta_written": wrote}
 
     if action == "dismiss":
 

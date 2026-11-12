@@ -36,6 +36,9 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _REFLECTION_PROMPT_SEGMENTS = prompt_strings.register_segments(
     "kindled_link.relationship.reflection_prompt_segments"
 )
+_REFLECTION_PROMPT_LAST_SEGMENT_LIVE = prompt_strings.register(
+    "kindled_link.relationship.reflection_prompt_last_segment_live"
+)
 
 
 def _normalise(text: str) -> str:
@@ -57,9 +60,27 @@ def _is_grounded(quote: str, transcript: str) -> bool:
     return q in _normalise(transcript)
 
 
-def _build_reflection_prompt(*, current_stage: str, transcript: str) -> str:
+def _live_peer_values(raw: object) -> dict[str, float]:
+    """A reflection's ``emotion`` field as 0-10 values for a live peer memory (B1 PR 3).
+
+    Numbers only (``bool`` excluded) and finite; anything else is dropped, so one bad value no longer loses the memory.
+    A negative is held to 0 (and kept, like any 0) and the rest are held to 10.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            continue
+        out[str(name)] = min(max(float(value), 0.0), 10.0)
+    return out
+
+
+def _build_reflection_prompt(*, current_stage: str, transcript: str, live: bool = False) -> str:
+    """The reflection prompt. ``live`` (the emotion engine's switch is on) asks for emotion values from 0 to 10."""
     seg = _REFLECTION_PROMPT_SEGMENTS
-    return seg[0] + current_stage + seg[1] + transcript + seg[2]
+    last = _REFLECTION_PROMPT_LAST_SEGMENT_LIVE if live else seg[2]
+    return seg[0] + current_stage + seg[1] + transcript + last
 
 
 @dataclass
@@ -210,6 +231,9 @@ def run_relationship_reflection(
     if today != now.strftime("%Y-%m-%d"):
         log.warning("relationship reflection: today disagrees with now; skipping")
         return get_relationship_state(store, peer_id)
+    from brain.emotion.engine import engine_for
+
+    live = persona_dir is not None and engine_for(Path(persona_dir)).is_live()  # B1 PR 3: off without a persona_dir
     state = get_relationship_state(store, peer_id)
     # Atomically reserve the provider slot up front (race-safe vs a concurrent
     # gate/reflection call for the same peer); refund if the LLM call never
@@ -220,7 +244,7 @@ def run_relationship_reflection(
     # Slot reserved — the try spans the prompt build too, so any raise before the
     # call releases it (no leaked reservation; fail-soft to unchanged state).
     try:
-        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript)
+        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript, live=live)
         with throttle.background_slot() as granted:
             if not granted:
                 store.release_provider_slot(peer_id, today)  # no call → refund
@@ -299,7 +323,15 @@ def run_relationship_reflection(
     if mem_store is not None:
         try:
             memory_summary = str(data.get("memory_summary", "")).strip()
-            if memory_summary:
+            if memory_summary and live:
+                from brain.chat.extractor import _filter_to_registered
+
+                write_kindled_peer_memory(
+                    mem_store, peer_id=peer_id, session_id=session_id,
+                    speaker=persona_name, stage=state.stage,
+                    content=memory_summary, emotions=_filter_to_registered(_live_peer_values(data.get("emotion"))),
+                )
+            elif memory_summary:
                 emotion_raw = data.get("emotion")
                 emotion_delta = (
                     {str(k): float(v) for k, v in emotion_raw.items()}
