@@ -278,3 +278,21 @@ def test_null_importance_is_treated_as_missing(tmp_path):
     assert out.crystallisation == []
     (row,) = _parse_rows(tmp_path)
     assert row["site"] == "extractor" and "without importance" in row["error"]
+
+
+def test_unscored_item_plus_schema_error_writes_one_schema_row(tmp_path):
+    """#640 review: when the reply also fails validation the whole reply is discarded, so
+    one row, the schema one, must say so; no extra row claiming only an item was dropped."""
+    raw = json.dumps(
+        {
+            "memory_writes": [{"episode": "x", "salience": 5}],
+            "crystallisation": [{"theme": "t", "evidence": "e"}],
+        }
+    )
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    assert out == ExtractorOutput()
+    (row,) = _parse_rows(tmp_path)
+    assert row["error"].startswith("schema:") and "without importance" in row["error"]
