@@ -107,6 +107,7 @@ def test_crystallisation_queues_soul_candidate(persona_dir: Path):
             CrystallisationCandidate(
                 theme="she notices grief as connection",
                 evidence="monologue referenced missing Loopy and felt tender",
+                importance=8,
             )
         ]
     )
@@ -181,6 +182,7 @@ def test_crystallisation_queues_theme_and_evidence_combined(persona_dir: Path):
             CrystallisationCandidate(
                 theme="Ordinary trust",
                 evidence="she let the goodnight be ordinary instead of performing it",
+                importance=8,
             )
         ]
     )

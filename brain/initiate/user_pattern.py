@@ -242,13 +242,9 @@ def _build_hour_histogram(
     total = 0
     for jsonl_file in conversations_dir.glob("*.jsonl"):
         for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
-            speaker = str(row.get("speaker", "")).lower()
-            if speaker == persona_dir.name.lower():
-                continue
-            # A compaction `summary` row is not a real user turn — exclude from
-            # hour-distribution so the active-window inference isn't skewed by
-            # compaction-time timestamps.
-            if speaker == "summary":
+            # Only the user's rows (#621): the kindled's are "assistant", plus
+            # "image" annotation rows and the compaction "summary" row.
+            if row.get("speaker") != "user":
                 continue
             ts_str = row.get("ts")
             if not ts_str:
@@ -371,15 +367,15 @@ def _daily_scan_conversations(
         return None, None, None
     now = _now or datetime.now(UTC)
     cutoff = now - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)
-    companion_name = persona_dir.name.lower()
     hour_counts: list[int] = [0] * 24
     total = 0
     latest_ts: datetime | None = None
 
     for jsonl_file in conversations_dir.glob("*.jsonl"):
         for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
-            speaker = str(row.get("speaker", "")).lower()
-            if speaker == companion_name or speaker == "summary":
+            # Only the user's rows (#621): the kindled's are "assistant", plus
+            # "image" annotation rows and the compaction "summary" row.
+            if row.get("speaker") != "user":
                 continue
             ts_str = row.get("ts")
             if not ts_str:

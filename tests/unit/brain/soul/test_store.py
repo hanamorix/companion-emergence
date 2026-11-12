@@ -380,3 +380,30 @@ def _pre_371_row_to_crystal(row) -> Crystallization:
         revoked_at=revoked_at,
         revoked_reason=row["revoked_reason"] or "",
     )
+
+
+def test_list_active_page_is_newest_first_with_a_total_order() -> None:
+    """#596: pages walk every active row exactly once, even on shared timestamps."""
+    store = _make_store()
+    same = datetime(2026, 1, 1, tzinfo=UTC)
+    crystals = [
+        Crystallization(
+            id=str(uuid.uuid4()),
+            moment=f"m{i}",
+            love_type="craft",
+            why_it_matters="w",
+            crystallized_at=same if i < 6 else datetime(2026, 2, i, tzinfo=UTC),
+        )
+        for i in range(10)
+    ]
+    for c in crystals:
+        store.create(c)
+    store.mark_revoked(crystals[0].id, "test")
+
+    pages = [store.list_active_page(offset=o, limit=3) for o in range(0, 12, 3)]
+    seen = [c.id for page in pages for c in page]
+    assert len(seen) == len(set(seen)) == 9
+    assert set(seen) == {c.id for c in crystals[1:]}
+    stamps = [c.crystallized_at for page in pages for c in page]
+    assert stamps == sorted(stamps, reverse=True)
+    store.close()

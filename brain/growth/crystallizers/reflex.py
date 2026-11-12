@@ -131,7 +131,7 @@ def _build_corpus(
         excerpt = ""
         if f.output_memory_id:
             try:
-                mem = store.get(f.output_memory_id)
+                mem = store.get(f.output_memory_id, bump=False)  # a judging pass, not a recall (#587)
                 if mem is not None:
                     excerpt = (mem.content or "")[:200]
             except Exception:

@@ -715,7 +715,7 @@ def test_windows_kill_never_ends_a_process_that_reused_the_pid(monkeypatch):
     """Review of #458 (finding 3): the Windows exit-0 terminate opens the pid, then confirms it is still the remembered
     process (psutil's create-time check) before ending it."""
     k32 = _FakeKernel32()
-    monkeypatch.setattr(kill.sys, "platform", "win32")
+    monkeypatch.setattr(kill, "_platform", lambda: "win32")
     monkeypatch.setattr(kill, "_kernel32", lambda: k32)
     kill._kill_proc(_ReusedPid())
     assert k32.terminated == []
@@ -723,7 +723,7 @@ def test_windows_kill_never_ends_a_process_that_reused_the_pid(monkeypatch):
 
 def test_windows_kill_ends_the_remembered_process_with_exit_code_0(monkeypatch):
     k32 = _FakeKernel32()
-    monkeypatch.setattr(kill.sys, "platform", "win32")
+    monkeypatch.setattr(kill, "_platform", lambda: "win32")
     monkeypatch.setattr(kill, "_kernel32", lambda: k32)
 
     class _Same(_ReusedPid):

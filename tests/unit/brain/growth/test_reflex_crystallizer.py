@@ -1065,3 +1065,34 @@ def test_render_prompt_uses_user_name_not_hana(tmp_path: Path):
     )
     assert "Henryk" in rendered
     assert "Hana" not in rendered
+
+
+def test_corpus_fire_log_excerpt_does_not_count_as_a_recall(persona_dir: Path, store: MemoryStore):
+    """#587: the crystallizer reads a fire's output memory for its log excerpt; that judging pass shows her nothing."""
+    from brain.engines.reflex import ArcFire
+    from brain.memory.store import Memory
+
+    mem = Memory.create_new(content="a journal entry the arc wrote", memory_type="reflex_journal", domain="brain")
+    store.create(mem)
+    fire = ArcFire(
+        arc_name="creative_pitch",
+        fired_at=datetime(2026, 4, 27, tzinfo=UTC),
+        trigger_state={"vulnerability": 8.0},
+        output_memory_id=mem.id,
+    )
+    (persona_dir / "reflex_log.json").write_text(_json.dumps({"fires": [fire.to_dict()]}), encoding="utf-8")
+
+    corpus = _build_corpus(
+        store=store,
+        persona_dir=persona_dir,
+        persona_name="nell",
+        persona_pronouns="she/her",
+        current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(),
+        emotion_vocabulary=["vulnerability"],
+        now=datetime(2026, 4, 28, tzinfo=UTC),
+        look_back_days=30,
+    )
+    assert corpus["fire_log_30d"][0]["output_excerpt"] == "a journal entry the arc wrote"
+    row = store.get(mem.id, bump=False)
+    assert (row.recall_count, row.last_accessed_at) == (0.0, None)
