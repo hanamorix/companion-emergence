@@ -137,8 +137,7 @@ def reconcile_self_read(
             gap.channel_cooldowns = {**(gap.channel_cooldowns or {}), channel: _cooldown_until(now)}
             gap.last_seen_ts = _iso(now)
 
-        # The state change comes first: if its lock wait gives up, nothing has been written yet, so the same call can
-        # simply be made again (the delta written first would be written twice).
+        # If the lock wait gives up, nothing has been changed, so the same call can simply be made again.
         busy = _change_current_gap(persona_dir, acknowledge)
         if busy is not None:
             return busy

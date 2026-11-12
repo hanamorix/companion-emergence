@@ -500,7 +500,8 @@ def test_live_initiate_candidate_carries_short_averages(persona_dir: Path) -> No
 
 
 def test_old_memories_do_not_form_a_blend_when_live(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from brain.emotion.engine import EmotionEngine
+    from brain.emotion import engine_utils
+    from tests.unit.brain.emotion._engine_support import half_fade
 
     _seed_vocab(persona_dir, ["love", "joy", "grief"])
     disk = MemoryStore(persona_dir / "memories.db")
@@ -508,7 +509,7 @@ def test_old_memories_do_not_form_a_blend_when_live(persona_dir: Path, monkeypat
         _go_live(persona_dir, disk)
         _blend_rows(disk, {"love": 7.0, "grief": 7.0})
         # Faded to 3.5 each: below the 6.0 floor, so no blend.
-        monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+        monkeypatch.setattr(engine_utils, "faded_emotion", half_fade)
 
         result = run_growth_tick(persona_dir, disk, datetime.now(UTC))
     finally:
@@ -519,7 +520,7 @@ def test_old_memories_do_not_form_a_blend_when_live(persona_dir: Path, monkeypat
 
 
 def test_top_two_are_chosen_by_faded_value(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from brain.emotion.engine import EmotionEngine
+    from brain.emotion import engine_utils
 
     _seed_vocab(persona_dir, ["love", "joy", "grief"])
     disk = MemoryStore(persona_dir / "memories.db")
@@ -528,9 +529,10 @@ def test_top_two_are_chosen_by_faded_value(persona_dir: Path, monkeypatch: pytes
         _blend_rows(disk, {"love": 9.0, "grief": 8.0, "joy": 7.0})
         # love fades to 4.5 while grief and joy hold, so the strongest two are grief and joy.
         monkeypatch.setattr(
-            EmotionEngine,
-            "faded_value",
-            lambda self, memory, emotion: memory.emotions[emotion] * (0.5 if emotion == "love" else 1.0),
+            engine_utils,
+            "faded_emotion",
+            lambda memory, emotion, half_lives, switch_over_at, now: memory._stored_emotions[emotion]
+            * (0.5 if emotion == "love" else 1.0),
         )
 
         run_growth_tick(persona_dir, disk, datetime.now(UTC))

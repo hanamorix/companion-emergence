@@ -230,7 +230,9 @@ def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> N
 from datetime import UTC, datetime  # noqa: E402
 
 from brain.emotion import engine as emotion_engine  # noqa: E402
+from brain.emotion import engine_utils  # noqa: E402
 from brain.emotion.engine import EmotionEngine  # noqa: E402
+from tests.unit.brain.emotion._engine_support import half_fade as _half_fade  # noqa: E402
 from tests.unit.brain.emotion._engine_support import make_live  # noqa: E402
 
 
@@ -252,7 +254,7 @@ def test_live_drop_uses_faded_values(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     store = MemoryStore(tmp_path / "memories.db")
     _go_live(tmp_path, store)
-    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+    monkeypatch.setattr(engine_utils, "faded_emotion", _half_fade)
 
     grief.handle_drop(memory=_make_dropped_memory(memory_id="mem-live", joy=10.0), persona_dir=tmp_path, store=store)
 
@@ -266,7 +268,7 @@ def test_live_drop_below_threshold_once_faded_writes_nothing(tmp_path: Path, mon
 
     store = MemoryStore(tmp_path / "memories.db")
     _go_live(tmp_path, store)
-    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+    monkeypatch.setattr(engine_utils, "faded_emotion", _half_fade)
 
     # joy 8 stored gives 5.6, above the 3.0 threshold; faded to 4 it gives 2.8, below it.
     grief.handle_drop(memory=_make_dropped_memory(memory_id="mem-live", joy=8.0), persona_dir=tmp_path, store=store)

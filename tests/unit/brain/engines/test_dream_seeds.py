@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -246,8 +247,8 @@ def test_congruence_counts_two_spellings_once_and_ignores_look_alikes(memory_emo
 class _HalfFaded:
     """Stands in for a live engine whose fade halves every stored value."""
 
-    def faded_value(self, memory: Memory, emotion: str) -> float:
-        return memory.emotions[emotion] * 0.5
+    def memory_feelings(self, memory: Memory) -> SimpleNamespace:
+        return SimpleNamespace(feelings={name: value * 0.5 for name, value in memory._stored_emotions.items()})
 
 
 def test_congruence_and_grief_pull_read_faded_values():
