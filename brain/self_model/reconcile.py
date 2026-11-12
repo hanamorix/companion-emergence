@@ -28,11 +28,14 @@ it.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from brain.self_model.state import SelfModelState, load_or_recover, save
+from brain.self_model.gap import Gap
+from brain.self_model.state import SelfModelState, load_or_recover, locked, save
+from brain.utils.file_lock import LockTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -178,25 +181,30 @@ def reconcile_self_read(
     from brain.self_model.resolve import increment_reconciles
 
     now = _utcnow()
-    state, _recovered = load_or_recover(persona_dir)
-    gap = state.current_gap
 
     if action in ("accept", "revise"):
         if not channel:
             return {"error": f"{action} requires a 'channel'"}
-        wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
-        if gap is not None:
+
+        def acknowledge(gap: Gap) -> None:
             gap.status = "acknowledged"
             gap.channel_cooldowns = {**(gap.channel_cooldowns or {}), channel: _cooldown_until(now)}
             gap.last_seen_ts = _iso(now)
-            save(persona_dir, SelfModelState(current_gap=gap, gap_history=state.gap_history))
+
+        # The state change comes first: if its lock wait gives up, nothing has been written yet, so the same call can
+        # simply be made again (the delta written first would be written twice).
+        busy = _change_current_gap(persona_dir, acknowledge)
+        if busy is not None:
+            return busy
+        wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
         # Dead-loop observability (R-E4): record a successful reconcile so the
         # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
         increment_reconciles(persona_dir)
         return {"ok": True, "action": action, "channel": channel, "delta_written": wrote}
 
     if action == "dismiss":
-        if gap is not None:
+
+        def dismiss(gap: Gap) -> None:
             gap.status = "dismissed"
             if channel:
                 gap.channel_cooldowns = {
@@ -204,23 +212,57 @@ def reconcile_self_read(
                     channel: _cooldown_until(now),
                 }
             gap.last_seen_ts = _iso(now)
-            save(persona_dir, SelfModelState(current_gap=gap, gap_history=state.gap_history))
+
+        busy = _change_current_gap(persona_dir, dismiss)
+        if busy is not None:
+            return busy
         increment_reconciles(persona_dir)
         return {"ok": True, "action": "dismiss", "channel": channel}
 
     if action == "name":
         if not name or not str(name).strip():
             return {"error": "name requires a non-empty 'name'"}
-        candidate = _propose_vocabulary_candidate(persona_dir)
-        if gap is not None:
+
+        def note_named(gap: Gap) -> None:
             # ``name`` resolves *unnamed pressure*. Only mark the gap acknowledged
             # if it actually carried unnamed pressure — a pure channel divergence
             # is not what ``name`` addressed, so leave its status untouched.
             if gap.unnamed_pressure > 0.0:
                 gap.status = "acknowledged"
             gap.last_seen_ts = _iso(now)
-            save(persona_dir, SelfModelState(current_gap=gap, gap_history=state.gap_history))
+
+        # State change first, as for accept/revise: a lock timeout leaves nothing done.
+        busy = _change_current_gap(persona_dir, note_named)
+        if busy is not None:
+            return busy
+        candidate = _propose_vocabulary_candidate(persona_dir)
         increment_reconciles(persona_dir)
         return {"ok": True, "action": "name", "name": name, **candidate}
 
     return {"error": f"unknown action: {action!r}"}
+
+
+def _change_current_gap(persona_dir: Path, change: Callable[[Gap], None]) -> dict[str, Any] | None:
+    """Load, change and save the current gap under the state lock (#558); no current gap → nothing to do.
+
+    The memory write or growth tick that goes with a reconcile runs after this, outside the lock, so the lock covers
+    only the state file's own load → change → save, and a supervisor tick saving at the same moment is never lost or
+    clobbered. The wait for the lock is bounded: when another writer keeps it for the whole wait, nothing is changed
+    and the error result for the tool is returned (None on success).
+    """
+    try:
+        with locked(persona_dir):
+            state, _recovered = load_or_recover(persona_dir)
+            if state.current_gap is None:
+                return None
+            change(state.current_gap)
+            save(persona_dir, SelfModelState(current_gap=state.current_gap, gap_history=state.gap_history))
+    except LockTimeoutError as exc:
+        logger.warning("reconcile_self_read: %s; nothing was changed", exc)
+        return {
+            "error": (
+                "another update was saving the self-model state the whole time this call waited, so nothing was "
+                "changed. Make the same call again in a moment."
+            )
+        }
+    return None
