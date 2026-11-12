@@ -182,7 +182,7 @@ def crystallize_creative_dna(
 
     # Aggregate a real emotion vector over recent active memories so emitted
     # initiate candidates carry honest context instead of a zero-filled lie.
-    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now)
+    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now, persona_dir=persona_dir)
 
     # Apply atomically — single save_creative_dna after mutating dna in place
     try:
@@ -469,6 +469,7 @@ def _aggregate_recent_emotion_vector(
     store: MemoryStore,
     *,
     now: datetime,
+    persona_dir: Path,
     look_back_days: int = 30,
 ) -> dict[str, float]:
     """Return a max-pooled emotion vector across recent active memories.
@@ -476,9 +477,16 @@ def _aggregate_recent_emotion_vector(
     Used by the creative_dna crystallizer so emitted initiate candidates
     carry a real signal of what's been emotionally alive in the window
     that produced the crystallization, rather than zero-filled fields.
+    Once the emotion engine is live, its short averages above 0 instead.
     Empty dict on any failure.
     """
     try:
+        from brain.emotion.engine import engine_for
+
+        eng = engine_for(persona_dir)
+        if eng.is_live():
+            # Once the engine is live: her short averages above 0. Context only.
+            return {name: r.short for name, r in eng.read().items() if r.short > 0}
         from brain.emotion.aggregate import aggregate_state
         from brain.utils.memory import list_conversation_memories
 

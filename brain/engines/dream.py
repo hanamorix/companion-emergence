@@ -10,16 +10,20 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion.aggregate import aggregate_state
+from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.soul.store import SoulStore
 from brain.utils.memory import list_conversation_memories
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +93,8 @@ class DreamEngine:
         seed_id: str | None = None,
         dry_run: bool = False,
     ) -> DreamResult:
-        seed = self._select_seed(seed_id=seed_id, lookback_hours=self.lookback_hours)
+        eng = self._live_engine()
+        seed = self._select_seed(seed_id=seed_id, lookback_hours=self.lookback_hours, eng=eng)
         neighbours = self._spread_activate(
             seed,
             depth=self.depth,
@@ -128,7 +133,7 @@ class DreamEngine:
             raw_text = self.provider.generate(user_prompt, system=system_prompt)
             dream_text = raw_text if raw_text.startswith("DREAM:") else f"DREAM: {raw_text}"
 
-            dream_memory = self._write_dream_memory(seed, neighbours, dream_text)
+            dream_memory = self._write_dream_memory(seed, neighbours, dream_text, eng=eng)
             edges = self._strengthen_edges(seed, neighbours, self.strengthen_delta)
             self._log(seed, neighbours, dream_memory)
             self._emit_initiate_candidate(seed, neighbours, dream_memory)
@@ -153,7 +158,18 @@ class DreamEngine:
                 strengthened_edges=edges,
             )
 
-    def _select_seed(self, *, seed_id: str | None, lookback_hours: int) -> Memory:
+    def _live_engine(self) -> EmotionEngine | None:
+        """The persona's emotion engine when its switch is on; None when off, unknown, or there is no persona_dir."""
+        if self.persona_dir is None:
+            return None
+        from brain.emotion.engine import engine_for
+
+        eng = engine_for(self.persona_dir)
+        return eng if eng.is_live() else None
+
+    def _select_seed(
+        self, *, seed_id: str | None, lookback_hours: int, eng: EmotionEngine | None
+    ) -> Memory:
         if seed_id is not None:
             mem = self.store.get(seed_id, bump=False)  # ticked by run_cycle once the dream is dreamed (#587)
             if mem is None:
@@ -178,8 +194,13 @@ class DreamEngine:
             )
 
         # Mood from conversation residue only (not grief breadcrumbs) so a
-        # breadcrumb cannot self-set the mood that retrieves it.
-        mood = aggregate_state(convo)
+        # breadcrumb cannot self-set the mood that retrieves it. Live, the mood is
+        # the engine's short averages: every counted source, and the engine does not
+        # count a grief_event either. An empty read during a rebuild is accepted.
+        if eng is not None:
+            mood = EmotionalState(emotions={name: r.short for name, r in eng.read().items()})
+        else:
+            mood = aggregate_state(convo)
         crystallizations = self.soul_store.list_active() if self.soul_store else []
         recent = self._recent_seed_ids(self.refractory_window)
 
@@ -188,6 +209,7 @@ class DreamEngine:
             mood,
             crystallizations,
             recent_seed_ids=recent,
+            eng=eng,
             mood_floor=self.mood_floor,
             min_congruent=self.min_congruent,
             w_identity=self.w_identity,
@@ -253,16 +275,13 @@ class DreamEngine:
         seed: Memory,
         neighbours: list[tuple[Memory, float]],
         dream_text: str,
+        *,
+        eng: EmotionEngine | None,
     ) -> Memory:
-        # Sum per-emotion across seed + neighbours. Values are intentionally
-        # NOT clamped here — a vivid "love"-saturated dream may legitimately
-        # show love=80 across 8 activated memories. Downstream consumers that
-        # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
-        # ingest, not here.
-        aggregated_emotions: dict[str, float] = dict(seed.emotions)
-        for mem, _ in neighbours:
-            for k, v in mem.emotions.items():
-                aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
+        if eng is not None:
+            aggregated_emotions = self._faded_means(seed, neighbours, eng)
+        else:
+            aggregated_emotions = self._stored_sums(seed, neighbours)
 
         dream = Memory.create_new(
             content=dream_text,
@@ -279,6 +298,35 @@ class DreamEngine:
 
         route_write(self.store, dream, source="dream")
         return dream
+
+    @staticmethod
+    def _stored_sums(seed: Memory, neighbours: list[tuple[Memory, float]]) -> dict[str, float]:
+        # Sum per-emotion across seed + neighbours. Values are intentionally
+        # NOT clamped here — a vivid "love"-saturated dream may legitimately
+        # show love=80 across 8 activated memories. Downstream consumers that
+        # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
+        # ingest, not here.
+        aggregated_emotions: dict[str, float] = dict(seed.emotions)
+        for mem, _ in neighbours:
+            for k, v in mem.emotions.items():
+                aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
+        return aggregated_emotions
+
+    @staticmethod
+    def _faded_means(
+        seed: Memory, neighbours: list[tuple[Memory, float]], eng: EmotionEngine
+    ) -> dict[str, float]:
+        """Per emotion, the mean of the faded values across the seed and the neighbours that carry it, held to 0-10.
+
+        Old rows can hold values below 0 or over 10. A mean held to 0 is kept, not dropped.
+        """
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for mem in [seed, *(m for m, _ in neighbours)]:
+            for name in mem.emotions:
+                totals[name] = totals.get(name, 0.0) + eng.faded_value(mem, name)
+                counts[name] = counts.get(name, 0) + 1
+        return {name: min(max(total / counts[name], 0.0), 10.0) for name, total in totals.items()}
 
     def _strengthen_edges(
         self,
