@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "emotions": [
+    {
+      "name": "creative_hunger",
+      "description": "the need to make, write, build something",
+      "category": "persona_extension",
+      "decay_half_life_days": 5.0,
+      "intensity_clamp": 10.0
+    }
+  ]
+}
