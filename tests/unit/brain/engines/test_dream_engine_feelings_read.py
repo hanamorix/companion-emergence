@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from brain.bridge.provider import FakeProvider
+from brain.emotion import engine as emotion_engine
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.engines.dream import DreamEngine
@@ -38,13 +40,13 @@ def _engine(tmp_path: Path, *, persona_dir: Path | None) -> DreamEngine:
 
 
 class _ReadsThrough:
-    """Stands in for a live engine: its one per-memory read answers what `feelings_of` says."""
+    """Stands in for a live engine: its one per-memory read answers what the function it was given says."""
 
-    def __init__(self, feelings_of):
-        self._feelings_of = feelings_of
+    def __init__(self, answer):
+        self._answer = answer
 
     def memory_feelings(self, memory):
-        return SimpleNamespace(feelings=self._feelings_of(memory))
+        return SimpleNamespace(feelings=self._answer(memory))
 
 
 def test_dream_seeds_read_through_the_engine_they_are_given():
@@ -71,7 +73,7 @@ def test_a_dream_engine_with_a_persona_dir_reads_through_the_persona_engine(tmp_
     engine = _engine(tmp_path, persona_dir=tmp_path)
     try:
         seed, neighbour = _mem("a", emotions={"joy": 9.0}), _mem("b", emotions={"joy": 8.0})
-        assert engine._feelings_of(seed) == {"joy": 3.0}
+        assert feelings_of(seed, emotion_engine.engine_for(tmp_path)).feelings == {"joy": 3.0}
         dream = engine._write_dream_memory(seed, [(neighbour, 1.0)], "DREAM: x", eng=None)
         assert dream._stored_emotions == {"joy": 7.0}  # the off-path sum of the engine's read values, not 9 + 8
     finally:
@@ -96,7 +98,10 @@ def test_a_dream_engine_without_a_persona_dir_reads_the_pure_read(tmp_path: Path
     emotion_engine_stub.faded = {("a", "joy"): 3.0}  # would show if the engine were asked
     engine = _engine(tmp_path, persona_dir=None)
     try:
-        assert engine._feelings_of(_mem("a", emotions={"joy": 9.0, "grief": 12.0})) == {"joy": 9.0, "grief": 10.0}
+        memory = _mem("a", emotions={"joy": 9.0, "grief": 12.0})
+        assert feelings_of(memory, None).feelings == {"joy": 9.0, "grief": 10.0}
+        dream = engine._write_dream_memory(memory, [], "DREAM: x", eng=None)
+        assert dream._stored_emotions == {"joy": 9.0, "grief": 10.0}  # the pure read, held to 10
         assert emotion_engine_stub.recorded_calls == []
     finally:
         engine.store.close()

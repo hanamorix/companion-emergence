@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from brain.bridge.provider import LLMProvider
 from brain.emotion import engine as emotion_engine
 from brain.emotion.aggregate import aggregate_state
-from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
@@ -89,13 +89,6 @@ class DreamEngine:
                 "explicitly, don't rely on a default."
             )
 
-    def _feelings_of(self, memory: Memory) -> dict[str, float]:
-        """The one read of a memory's feelings: the persona's engine when this DreamEngine has a persona directory (faded values
-        once the persona has switched over), the pure read with no engine otherwise (tests). Held to 0-10, canonical names."""
-        if self.persona_dir is not None:
-            return dict(emotion_engine.engine_for(self.persona_dir).memory_feelings(memory).feelings)
-        return dict(memory_feelings(memory, None, None, None).feelings)
-
     def run_cycle(
         self,
         *,
@@ -166,6 +159,13 @@ class DreamEngine:
                 memory=dream_memory,
                 strengthened_edges=edges,
             )
+
+    def _persona_engine(self) -> EmotionEngine | None:
+        """The persona's emotion engine whether or not it is switched on (its read falls back to the pure read while it is
+        off); None when there is no persona_dir. For `feelings_of`, which makes the engine-or-pure choice."""
+        if self.persona_dir is None:
+            return None
+        return emotion_engine.engine_for(self.persona_dir)
 
     def _live_engine(self) -> EmotionEngine | None:
         """The persona's emotion engine when its switch is on; None when off, unknown, or there is no persona_dir."""
@@ -307,14 +307,15 @@ class DreamEngine:
         return dream
 
     def _stored_sums(self, seed: Memory, neighbours: list[tuple[Memory, float]]) -> dict[str, float]:
-        # Sum per-emotion across seed + neighbours. Values are intentionally
-        # NOT clamped here — a vivid "love"-saturated dream may legitimately
-        # show love=80 across 8 activated memories. Downstream consumers that
-        # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
-        # ingest, not here.
-        aggregated_emotions: dict[str, float] = self._feelings_of(seed)
+        # Sum per-emotion across seed + neighbours. Each memory's values are held to 0-10
+        # by the one read before they are summed (love 18 and love 2 give 10 + 2 = 12, not
+        # 20); the SUM is not clamped, so a vivid "love"-saturated dream may legitimately
+        # show love=80 across 8 activated memories. Downstream consumers that need a
+        # bounded 0..10 range (e.g. EmotionalState.set) clamp on ingest, not here.
+        eng = self._persona_engine()
+        aggregated_emotions: dict[str, float] = dict(feelings_of(seed, eng).feelings)  # a copy: the read's map is shared
         for mem, _ in neighbours:
-            for k, v in self._feelings_of(mem).items():
+            for k, v in feelings_of(mem, eng).feelings.items():
                 aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
         return aggregated_emotions
 
@@ -404,7 +405,7 @@ class DreamEngine:
                 source="dream",
                 source_id=dream_memory.id,
                 emotional_snapshot=EmotionalSnapshot(
-                    vector=self._feelings_of(dream_memory),
+                    vector=dict(feelings_of(dream_memory, self._persona_engine()).feelings),
                     rolling_baseline_mean=0.0,
                     rolling_baseline_stdev=0.0,
                     current_resonance=0.0,

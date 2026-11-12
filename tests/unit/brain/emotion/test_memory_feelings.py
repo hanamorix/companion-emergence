@@ -17,7 +17,7 @@ import pytest
 
 from brain.emotion import engine_utils
 from brain.emotion.engine import EmotionEngine
-from brain.emotion.engine_utils import MemoryFeelings, memory_feelings
+from brain.emotion.engine_utils import MemoryFeelings, feelings_of, memory_feelings
 from tests.unit.brain.emotion._engine_support import local_day, local_noon, make_live, row
 
 T = [local_noon(local_day(n)) for n in range(60)]  # T[n] = local noon of day n
@@ -211,3 +211,31 @@ def test_resolved_faded_is_the_feelings_map_of_the_engine_read(tmp_path: Path) -
     assert resolved["joy"] == pytest.approx((4.0 * 0.25 + 8.0 * 0.25) / 2)
     assert resolved["grief"] == 0.0
     assert "love" not in resolved
+
+
+# --- feelings_of: the one choice between an engine's read and the pure read -------------------------------------------
+
+
+def test_feelings_of_with_an_engine_is_the_engines_read(tmp_path: Path) -> None:
+    make_live(tmp_path, T[44])
+    instance = EmotionEngine(tmp_path, now=lambda: T[50])
+    memory = _memory(T[0], {"joy": 8.0}, peak=8.0, score=12.0)
+    read = feelings_of(memory, instance)
+    # live, 6 days from the switch to now, joy half-life 3: 8 x 0.25 = 2.0 (the pure read would give 8.0)
+    assert read.feelings["joy"] == pytest.approx(2.0)
+    assert read.feelings == instance.memory_feelings(memory).feelings
+    assert (read.peak, read.score) == (8.0, 12.0)
+
+
+def test_feelings_of_without_an_engine_is_the_pure_read_of_the_stored_values_held_to_0_10() -> None:
+    memory = _memory(T[0], {"joy": 8.0, "grief": 14.0, "pride": -3.0}, peak=14.0, score=19.0)
+    read = feelings_of(memory, None)
+    assert read.feelings == {"joy": 8.0, "grief": 10.0, "pride": 0.0}
+    assert (read.peak, read.score) == (10.0, 19.0)
+    assert read.feelings == memory_feelings(memory, None, None, None).feelings
+
+
+def test_feelings_of_an_engine_not_switched_over_is_the_pure_read(tmp_path: Path) -> None:
+    instance = EmotionEngine(tmp_path, now=lambda: T[50])  # no state file: not live, so nothing fades
+    memory = _memory(T[0], {"joy": 8.0})
+    assert feelings_of(memory, instance).feelings == feelings_of(memory, None).feelings == {"joy": 8.0}

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.vocabulary import canonical_name
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import Memory, MemoryStore
@@ -81,20 +81,12 @@ def crystallize_vocabulary(
     return proposals
 
 
-def _values(memory: Memory, eng: EmotionEngine | None) -> dict[str, float]:
-    """The memory's feelings through the one per-memory read: the live engine's (faded values; the pure read never fades)
-    when ``eng`` is given, the pure read of the stored values (held to 0-10) when it is None."""
-    if eng is None:
-        return dict(memory_feelings(memory, None, None, None).feelings)
-    return dict(eng.memory_feelings(memory).feelings)
-
-
 def _cluster_active_memories(
     memories: list[Memory], *, eng: EmotionEngine | None
 ) -> dict[frozenset[str], _Cluster]:
     clusters: dict[frozenset[str], _Cluster] = {}
     for memory in sorted(memories, key=lambda m: m.created_at):
-        top = sorted(_values(memory, eng).items(), key=lambda item: item[1], reverse=True)[:2]
+        top = sorted(feelings_of(memory, eng).feelings.items(), key=lambda item: item[1], reverse=True)[:2]
         if len(top) < 2:
             continue
         if top[0][1] < _MIN_EMOTION_INTENSITY or top[1][1] < _MIN_EMOTION_INTENSITY:

@@ -20,7 +20,7 @@ from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
 from brain.emotion import engine_files
-from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
@@ -633,7 +633,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         print(f"unknown memory id: {args.memory_id}", file=sys.stderr)
         return 1
 
-    felt = engine.memory_feelings(memory) if engine is not None else memory_feelings(memory, None, None, None)
+    felt = feelings_of(memory, engine)
     print(f"id: {memory.id}")
     print(f"type: {memory.memory_type}")
     print(f"domain: {memory.domain}")
