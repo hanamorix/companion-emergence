@@ -8,6 +8,8 @@ Best-effort by design: every step is wrapped so a failure is logged to
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -177,8 +179,8 @@ _SYSTEM_PROMPT = prompt_strings.register("chat.extractor.system_prompt")
 def _vocab_prompt_line() -> str:
     """Registered emotion names appended to the system prompt (soft assist).
 
-    The pass-2 emotion_delta is validated but no longer written anywhere; this
-    line just steers the LLM away from inventing channel names. Fail-soft:
+    The pass-2 emotion_delta is folded into the emotion engine; this
+    line steers the LLM away from inventing channel names. Fail-soft:
     any registry error → empty string, the extraction call proceeds unassisted.
     """
     try:
@@ -327,6 +329,8 @@ def apply_side_effects(out: ExtractorOutput, *, persona_dir: Path) -> None:
         )
     if out.crystallisation:
         _safely("crystallisation", persona_dir, lambda: _apply_crystallisation(out.crystallisation, persona_dir))
+    if out.emotion_delta:
+        _safely("emotion_delta", persona_dir, lambda: _apply_emotion_delta(out.emotion_delta, persona_dir))
     if out.reflex_audit:
         _safely("reflex_audit", persona_dir, lambda: _apply_reflex_audit(out.reflex_audit, persona_dir))
 
@@ -378,6 +382,41 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
 # vector", but bounds the delta, not what the delta becomes. Sustained feeling still climbs across turns; one turn cannot
 # peak her.
 _MAX_DELTA_INTENSITY: float = 3.0
+
+
+def signed_change_values(delta: Mapping[str, float]) -> dict[str, float]:
+    """A [-1, 1] delta as signed 0-10-scale changes for the emotion engine: x10, capped at +/-_MAX_DELTA_INTENSITY.
+
+    Keeps the sign, so a negative delta lowers the feeling once the engine is live (B1 PR 2). A zero change is skipped.
+    """
+    return {
+        name: math.copysign(min(abs(v) * 10.0, _MAX_DELTA_INTENSITY), v)
+        for name, v in delta.items()
+        if abs(v) > 1e-9
+    }
+
+
+def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
+    """Fold the pass-2 emotion deltas into the emotion engine as signed changes; no memory row is written.
+
+    Deltas are on a [-1.0, 1.0] scale from the extractor. ``signed_change_values`` maps each to a signed change on the
+    0..10 scale (x10, capped at +/-_MAX_DELTA_INTENSITY), so a negative delta lowers the feeling and one extraction
+    can't peg a channel (#94).
+
+    Channel names are constrained to the registered emotion vocabulary first: LLM-invented names are dropped here
+    (mirrors the _normalize pattern in brain/ingest/emotion_backfill.py).
+    """
+    # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
+    # pass2_queue.py's drain_all_locked pop-after-process step) can call
+    # this twice for one logical item, folding one extra emotion nudge.
+    # Owner-accepted 2026-09-26: "the odds of it happening
+    # are tiny, the consequence if it happens are small." See #240
+    # (emotion-system untangle) for the durable fix.
+    from brain.emotion import engine
+
+    changes = signed_change_values(_filter_to_registered(delta))
+    if changes:
+        engine.engine_for(persona_dir).fold_change(changes, None, "monologue_emotion")
 
 
 _INTEREST_SPAWN_STATE = "interest_spawn_state.json"

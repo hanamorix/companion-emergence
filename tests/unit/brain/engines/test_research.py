@@ -1126,6 +1126,19 @@ def test_live_fire_stores_feelings_and_rating(tmp_path: Path):
     assert interests[0]["status"] == "dormant"  # the verdict still reads "close" with the felt lines after it
 
 
+def test_live_fire_holds_a_negative_feeling_to_zero_and_keeps_zeros(tmp_path: Path):
+    """A 0 counts as an entry in the engine's averages and a dropped value doesn't, so a negative or a given 0 is kept."""
+    reply = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8, "fear": -2, "joy": 0}\nENGAGEMENT: 6'
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        result, memory = _fire_with(tmp_path, store, reply)
+    finally:
+        store.close()
+    assert result.fired is not None
+    assert memory._stored_emotions == {"awe": 8.0, "fear": 0.0, "joy": 0.0}
+
+
 def test_live_fire_with_only_the_three_markers_keeps_the_memory_and_logs(tmp_path: Path):
     store = MemoryStore(tmp_path / "memories.db")
     try:
