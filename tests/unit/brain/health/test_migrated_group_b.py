@@ -70,7 +70,7 @@ APPENDERS = {
     ),
     "consolidation._archive_preimage": (
         lambda tmp, n: __import__("brain.engines.consolidation", fromlist=["x"])._archive_preimage(
-            tmp, _memory(f"m{n} café"), f"src{n}"
+            tmp, _memory(f"m{n} café"), f"src{n}", "dream"
         ),
         "consolidation_archive.jsonl",
     ),

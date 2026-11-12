@@ -296,7 +296,7 @@ class ResearchEngine:
                 )
 
             # Memory sweep: keyword-matched seed memories
-            memory_context = self._build_memory_context(winner)
+            memory_context, context_ids = self._memory_context(winner)
             notes_tail = read_notes_tail(self.interests_path.parent, winner.id)
 
             # Web search (conditional on scope)
@@ -421,6 +421,14 @@ class ResearchEngine:
                 output_memory_id=mem_id,
             )
             log.appended(fire).save(self.research_log_path)
+
+            # The session ran, so the memories in its prompt were in front of her: one recall each (#587). After the
+            # writes above and fail-soft, so a store error here can't cost the fire it follows.
+            try:
+                for mid in context_ids:
+                    self.store.get(mid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("research recall tick failed for %r: %s", winner.id, exc)
 
             # D-reflection Task 18: emit research_completion initiate candidate (gated).
             # Best-effort: gate/emit failure does NOT prevent the research fire.
@@ -580,28 +588,35 @@ class ResearchEngine:
             return False
 
     def _build_memory_context(self, interest: Interest) -> str:
-        """Keyword-seeded memory sweep. Returns formatted string.
+        """The formatted memory sweep for ``interest``; counts nothing as a recall (#587)."""
+        return self._memory_context(interest)[0]
+
+    def _memory_context(self, interest: Interest) -> tuple[str, list[str]]:
+        """Keyword-seeded memory sweep. Returns the formatted string and the ids it holds.
 
         Uses direct text search rather than Hebbian spreading activation
         because the engine doesn't hold a HebbianMatrix. This gives a
         thematic slice through related memories — sufficient for Phase 1.
+
+        Reads nothing as a recall (#587): the searches and the selection prompt
+        put nothing in front of the kindled. The fire ticks the returned ids
+        once its research session has run.
         """
         if not interest.related_keywords:
-            mems = self.store.search_text(interest.topic, active_only=True, limit=5)
+            mems = self.store.search_text(interest.topic, active_only=True, limit=5, bump=False)
         else:
             seed_ids: set[str] = set()
             for kw in interest.related_keywords[:5]:
-                for m in self.store.search_text(kw, active_only=True, limit=3):
+                for m in self.store.search_text(kw, active_only=True, limit=3, bump=False):
                     seed_ids.add(m.id)
             mems = []
             for sid in list(seed_ids)[:20]:
-                mem = self.store.get(sid)
+                mem = self.store.get(sid, bump=False)
                 if mem is not None:
                     mems.append(mem)
-        return (
-            "\n".join(f"- {m.content[:140]}" for m in mems[:20])
-            or "(no prior memories on this topic)"
-        )
+        mems = mems[:20]
+        text = "\n".join(f"- {m.content[:140]}" for m in mems) or "(no prior memories on this topic)"
+        return text, [m.id for m in mems]
 
     def _render_system_prompt(self, *, live: bool = False) -> str:
         seg = _RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE if live else _RENDER_SYSTEM_PROMPT_SEGMENTS

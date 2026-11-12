@@ -232,3 +232,67 @@ def test_a_schema_failure_keeps_reply_text_out_of_the_runtime_log(tmp_path, capl
         extract_from_thinking(provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
                               recent_turn_context=(), persona_dir=tmp_path)
     assert "SECRET-EPISODE-TEXT" not in caplog.text
+
+
+# ── #640: an unscored crystallisation item is a parse problem, not an 8 ───────
+def test_unscored_crystallisation_item_is_dropped_and_recorded_through_pass2(tmp_path, monkeypatch):
+    """A reply item with no `importance` must not reach the soul queue (the old default
+    of 8 sat exactly on DEFAULT_SOUL_THRESHOLD), and the drop is kept in the parse-failure
+    log. The rest of the same reply still applies: a scored item is queued and the reflex
+    audit lands. Driven through run_pass2_monologue → extract_from_thinking → apply_side_effects."""
+    import brain.bridge.model_tier as model_tier
+    from brain.chat.tool_loop import run_pass2_monologue
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    raw = json.dumps(
+        {
+            "crystallisation": [
+                {"theme": "Unscored hunch", "evidence": "the reply forgot to score this one"},
+                {"theme": "Scored pull", "evidence": "she came back to the river again", "importance": 9},
+            ],
+            "reflex_audit": [{"tool": "search_memories", "reason": "named a known place"}],
+        }
+    )
+    monkeypatch.setattr(model_tier, "build_tier_provider", lambda *_a, **_k: _FakeProvider(raw))
+
+    run_pass2_monologue(monologue_text="thinking", visible_reply="hi", recent_user_msgs=(), persona_dir=persona_dir)
+
+    queued = (persona_dir / "soul_candidates.jsonl").read_text(encoding="utf-8")
+    assert "Unscored hunch" not in queued, "an item with no importance must not be queued as a soul candidate"
+    texts = [json.loads(line)["text"] for line in queued.splitlines()]
+    assert len(texts) == 1 and texts[0].startswith("Scored pull"), texts
+    assert (persona_dir / "reflex_audit.jsonl").exists(), "the rest of the reply must still apply"
+    (row,) = _parse_rows(persona_dir)
+    assert row["site"] == "extractor" and "importance" in row["error"] and row["raw"] == raw
+    assert "Unscored hunch" not in row["error"]  # #427: no reply text in the error field
+
+
+def test_null_importance_is_treated_as_missing(tmp_path):
+    raw = json.dumps({"crystallisation": [{"theme": "t", "evidence": "e", "importance": None}]})
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    assert out.crystallisation == []
+    (row,) = _parse_rows(tmp_path)
+    assert row["site"] == "extractor" and "without importance" in row["error"]
+
+
+def test_unscored_item_plus_schema_error_writes_one_schema_row(tmp_path):
+    """#640 review: when the reply also fails validation the whole reply is discarded, so
+    one row, the schema one, must say so; no extra row claiming only an item was dropped."""
+    raw = json.dumps(
+        {
+            "memory_writes": [{"episode": "x", "salience": 5}],
+            "crystallisation": [{"theme": "t", "evidence": "e"}],
+        }
+    )
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    assert out == ExtractorOutput()
+    (row,) = _parse_rows(tmp_path)
+    assert row["error"].startswith("schema:") and "without importance" in row["error"]

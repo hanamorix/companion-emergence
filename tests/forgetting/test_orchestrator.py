@@ -579,7 +579,7 @@ def _merge_a_candidate_into_a_target(persona_dir) -> tuple[str, str, str]:
         control_id = _old_memory(store, "Bob walked to the harbour")
         store.get(control_id)  # the same recall bump the gate gives the target
         cand = Memory.create_new(
-            content="Bob likes tea with honey", memory_type="dream", domain="us", emotions={}
+            content="Bob likes tea with honey", memory_type="conversation", domain="us", emotions={}
         )
         PendingQueue(persona_dir).enqueue(cand, source="x")
         res = run_consolidation(
