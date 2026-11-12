@@ -219,6 +219,7 @@ def test_a_reconcile_before_the_spare_rule_saves_is_not_cleared_by_it(
     assert _cadence_outcome(persona_dir) == "deferred"
 
 
+@pytest.mark.no_base_failure(reason="control for the race test above: a spare-rule run with no reconcile already ends clean on the base")
 def test_the_spare_rule_with_no_reconcile_in_between_ends_clean(
     tmp_path: Path, emotion_engine_stub
 ) -> None:
