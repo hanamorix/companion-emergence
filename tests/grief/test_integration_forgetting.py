@@ -102,3 +102,44 @@ def test_forgetting_pass_writes_grief_breadcrumb_on_high_emotion_drop(
         "intensity should be joy_normalised * DROP_SCALE = 0.9 * 7.0 = 6.3"
     )
     store.close()
+
+
+def test_live_drop_reached_through_the_real_forgetting_pass_reads_faded_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Emotion rework B1 PR 5: once the engine is live, the breadcrumb the real pass writes reads the faded value."""
+    from brain.emotion import engine_utils
+    from brain.felt_time.state import FeltTimeState
+    from brain.felt_time.state import persist as persist_felt_time
+    from tests.unit.brain.emotion._engine_support import half_fade, make_live
+
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=720.0 * 5, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        tmp_path,
+    )
+    store = MemoryStore(tmp_path / "memories.db")
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    _seed_memory(store, id_="mem-target", joy=10.0, last_accessed_days_ago=180)
+    store.close()
+    make_live(tmp_path, datetime.now(UTC))
+    monkeypatch.setattr(engine_utils, "faded_emotion", half_fade)
+
+    monkeypatch.setattr(dev_constants, "LOST_THRESHOLD", 0.5)
+    monkeypatch.setattr(dev_constants, "FADE_THRESHOLD", 0.6)
+    monkeypatch.setattr(dev_constants, "LOST_PASS_COUNT", 1)
+
+    for _ in range(5):
+        run_pass(tmp_path, event_bus=_NullBus())
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        assert store._conn.execute("SELECT id FROM memories WHERE id = 'mem-target'").fetchall() == []
+        grief_rows = store._conn.execute(
+            "SELECT metadata_json, emotions_json FROM memories WHERE memory_type = 'grief_event'"
+        ).fetchall()
+        assert len(grief_rows) == 1
+        assert json.loads(grief_rows[0]["metadata_json"])["grief_referent_id"] == "mem-target"
+        # joy 10 fades to 5: 0.5 x 7.0 = 3.5, where the stored value would give 7.0.
+        assert json.loads(grief_rows[0]["emotions_json"])["memory_grief"] == pytest.approx(3.5, abs=0.01)
+    finally:
+        store.close()

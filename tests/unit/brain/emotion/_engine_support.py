@@ -229,3 +229,9 @@ def joy_of(state: EngineState) -> EmotionState:
     return state.emotions["joy"]
 
 
+def half_fade(memory: Memory, emotion: str, half_lives: object, switch_over_at: object, now: object) -> float:
+    """A stand-in for `engine_utils.faded_emotion` that halves the stored value: `monkeypatch.setattr(engine_utils,
+    "faded_emotion", half_fade)` makes the engine's one per-memory read fade, so a faded read differs from a stored one."""
+    return memory._stored_emotions[emotion] * 0.5
+
+

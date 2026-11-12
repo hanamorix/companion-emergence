@@ -9,11 +9,15 @@ safe, testable, and cheap in private/local development.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.vocabulary import canonical_name
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import Memory, MemoryStore
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
 
 VOCABULARY_CRYSTALLIZER_STATUS = "implemented"
 _MIN_EVIDENCE_MEMORIES = 3
@@ -33,14 +37,17 @@ def crystallize_vocabulary(
     store: MemoryStore,
     *,
     current_vocabulary_names: set[str],
+    eng: EmotionEngine | None,
 ) -> list[EmotionProposal]:
     """Mine memory + relational dynamics for novel emotional configurations.
 
     The first implementation detects a repeated two-emotion blend: at least
     three active memories whose two strongest emotions are both intense. It
     returns at most one proposal per tick, matching the growth rate limit.
+    ``eng`` is the live emotion engine, whose faded values pick and score the
+    two strongest emotions, or None for the stored values.
     """
-    clusters = _cluster_active_memories(store.list_active())
+    clusters = _cluster_active_memories(store.list_active(), eng=eng)
     current_names = {canonical_name(name) for name in current_vocabulary_names}
 
     proposals: list[EmotionProposal] = []
@@ -74,10 +81,20 @@ def crystallize_vocabulary(
     return proposals
 
 
-def _cluster_active_memories(memories: list[Memory]) -> dict[frozenset[str], _Cluster]:
+def _values(memory: Memory, eng: EmotionEngine | None) -> dict[str, float]:
+    """The memory's feelings through the one per-memory read: the live engine's (faded values; the pure read never fades)
+    when ``eng`` is given, the pure read of the stored values (held to 0-10) when it is None."""
+    if eng is None:
+        return dict(memory_feelings(memory, None, None, None).feelings)
+    return dict(eng.memory_feelings(memory).feelings)
+
+
+def _cluster_active_memories(
+    memories: list[Memory], *, eng: EmotionEngine | None
+) -> dict[frozenset[str], _Cluster]:
     clusters: dict[frozenset[str], _Cluster] = {}
     for memory in sorted(memories, key=lambda m: m.created_at):
-        top = sorted(memory_feelings(memory, None, None, None).feelings.items(), key=lambda item: item[1], reverse=True)[:2]
+        top = sorted(_values(memory, eng).items(), key=lambda item: item[1], reverse=True)[:2]
         if len(top) < 2:
             continue
         if top[0][1] < _MIN_EMOTION_INTENSITY or top[1][1] < _MIN_EMOTION_INTENSITY:
