@@ -10,6 +10,9 @@ import pytest
 
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import FakeProvider, LLMProvider
+from brain.emotion import engine as emotion_engine
+from brain.emotion import engine_files
+from brain.emotion.engine import EmotionEngine
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
@@ -556,7 +559,7 @@ def test_select_seed_neutral_mood_matches_importance(
     # No emotional signal -> gate skipped -> highest importance wins (unchanged).
     store.create(_mem("low", importance=2.0))
     store.create(_mem("high", importance=8.0))
-    seed = engine._select_seed(seed_id=None, lookback_hours=24)
+    seed = engine._select_seed(seed_id=None, lookback_hours=24, eng=None)
     assert seed.content == "high"
 
 
@@ -576,7 +579,7 @@ def test_select_seed_includes_grief_events_in_pool(
         domain="grief",
     )
     store.create(bc)
-    seed = engine._select_seed(seed_id=None, lookback_hours=24)
+    seed = engine._select_seed(seed_id=None, lookback_hours=24, eng=None)
     assert seed.id == bc.id
 
 
@@ -585,7 +588,7 @@ def test_select_seed_explicit_id_unchanged(
 ) -> None:
     m = _mem("x", importance=1.0)
     store.create(m)
-    assert engine._select_seed(seed_id=m.id, lookback_hours=24).id == m.id
+    assert engine._select_seed(seed_id=m.id, lookback_hours=24, eng=None).id == m.id
 
 
 def test_build_prompt_grief_seed_uses_processing_framing(engine: DreamEngine) -> None:
@@ -641,3 +644,105 @@ def test_strengthen_edges_all_active_unchanged(engine: DreamEngine) -> None:
     assert count == 2
     assert engine.hebbian.weight(seed.id, n1.id) > 0.0
     assert engine.hebbian.weight(seed.id, n2.id) > 0.0
+
+
+# --- emotion rework B1 PR 5: a live persona's dreams read the engine ------------------------------------------------
+
+
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    return emotion_engine.engine_for(persona_dir)
+
+
+def _half_faded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Until Engine 6, faded_value returns the stored value; halving it tells a faded read from a stored one.
+    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+
+
+def _live_dream_engine(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path) -> DreamEngine:
+    return DreamEngine(
+        store=store,
+        hebbian=hebbian,
+        provider=FakeProvider(),
+        log_path=persona_dir / "dreams.log.jsonl",
+        persona_dir=persona_dir,
+        persona_name="Nell",
+        persona_system_prompt="You are Nell. Reflect in first person, starting with 'DREAM: '.",
+    )
+
+
+def test_live_cycle_stores_the_mean_of_faded_values(
+    store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _go_live(tmp_path, store, love=6.0)
+    _half_faded(monkeypatch)
+    seed = _mem("seed", emotions={"love": 8.0})
+    neighbour = _mem("neighbour", emotions={"love": 4.0, "awe": 6.0})
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.7)
+
+    result = _live_dream_engine(store, hebbian, tmp_path).run_cycle(seed_id=seed.id)
+
+    # love: the mean of the faded 4 and 2; awe: only the neighbour carries it, faded to 3.
+    assert result.memory is not None
+    assert result.memory.emotions == pytest.approx({"love": 3.0, "awe": 3.0})
+
+
+def test_live_dream_holds_old_rows_within_range(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
+    _go_live(tmp_path, store)
+    seed = _mem("seed", emotions={"love": 18.0, "tenderness": -0.3})
+    neighbour = _mem("neighbour", emotions={"love": 14.0, "tenderness": -0.5})
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.7)
+
+    result = _live_dream_engine(store, hebbian, tmp_path).run_cycle(seed_id=seed.id)
+
+    assert result.memory is not None
+    assert all(0.0 <= v <= 10.0 for v in result.memory.emotions.values())
+    assert result.memory.emotions["love"] == 10.0
+    assert result.memory.emotions["tenderness"] == 0.0  # a negative mean is held to 0 and kept, not dropped
+
+
+def _mood_rows(store: MemoryStore) -> list[Memory]:
+    """Three grief conversation rows from 20 hours ago, a fresh joyful making, and three joyful breadcrumbs.
+
+    The old aggregate reads conversation rows only, so its mood is grief. The engine also counts the making, so its mood
+    holds joy too. Neither counts a grief_event, so the breadcrumbs' own joy sets no mood. Returns the breadcrumbs.
+    """
+    earlier = datetime.now(UTC) - timedelta(hours=20)
+    for i in range(3):
+        row = _mem(f"sad {i}", importance=1.0, emotions={"grief": 6.0})
+        row.created_at = earlier
+        store.create(row)
+    store.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
+    breadcrumbs = [
+        _mem(f"bright loss {i}", importance=9.0, emotions={"joy": 5.0}, memory_type="grief_event", domain="grief")
+        for i in range(3)
+    ]
+    for crumb in breadcrumbs:
+        store.create(crumb)
+    return breadcrumbs
+
+
+@pytest.mark.no_base_failure(reason="pins the switch-off mood, which is today's")
+def test_off_mood_comes_from_conversation_rows(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
+    breadcrumbs = _mood_rows(store)
+    seed = _live_dream_engine(store, hebbian, tmp_path)._select_seed(seed_id=None, lookback_hours=24, eng=None)
+    assert seed.id not in {b.id for b in breadcrumbs}
+    assert seed.emotions == {"grief": 6.0}
+
+
+def test_live_mood_comes_from_the_engine_read(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
+    breadcrumbs = _mood_rows(store)
+    assert engine_files.write_switch(tmp_path, datetime.now(UTC))
+    eng = emotion_engine.engine_for(tmp_path)
+    eng.note_active(datetime.now(UTC))
+    assert set(eng.read()) == {"grief", "joy"}
+
+    seed = _live_dream_engine(store, hebbian, tmp_path)._select_seed(seed_id=None, lookback_hours=24, eng=eng)
+
+    # The engine's joy opens the pool to the joy-congruent breadcrumbs, and their importance lifts one to the top.
+    assert seed.id in {b.id for b in breadcrumbs}

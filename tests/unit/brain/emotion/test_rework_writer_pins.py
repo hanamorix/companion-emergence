@@ -19,7 +19,9 @@ import pytest
 from brain import dev_constants
 from brain.bridge.provider import FakeProvider
 from brain.chat.extractor import _apply_emotion_delta
+from brain.emotion import engine, engine_files
 from brain.emotion.aggregate import aggregate_state
+from brain.emotion.engine import EmotionEngine, Reading
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
@@ -70,6 +72,18 @@ def _felt(store: MemoryStore) -> dict[str, float]:
     return aggregate_state(store.list_active()).emotions
 
 
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
+    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    return engine.engine_for(persona_dir)
+
+
+def _settled(eng: EmotionEngine) -> dict[str, Reading]:
+    eng.note_active(datetime.now(UTC))
+    return eng.read()
+
+
 def _seed(store: MemoryStore, emotions: dict[str, float]) -> Memory:
     memory = Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=emotions)
     store.create(memory)
@@ -91,7 +105,9 @@ def _one_heartbeat(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path
     engine._apply_emotion_decay(3600.0, tick_at=NOW, state=HeartbeatState.fresh(trigger="open"), dry_run=False)
 
 
-def _write_dream_over_ten(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path) -> tuple[Memory, Memory]:
+def _write_dream_over_ten(
+    store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path, *, eng: EmotionEngine | None
+) -> tuple[Memory, Memory]:
     """Dream on a seed and two neighbours, each love=6.0, and promote it past the gate. Returns the dream and the seed."""
     seed = _seed(store, {"love": 6.0})
     neighbours = [(_seed(store, {"love": 6.0}), 1.0), (_seed(store, {"love": 6.0}), 1.0)]
@@ -103,7 +119,7 @@ def _write_dream_over_ten(store: MemoryStore, hebbian: HebbianMatrix, persona_di
         persona_name="Pins",
         persona_system_prompt="You are Pins.",
     )
-    dream = engine._write_dream_memory(seed, neighbours, "DREAM: a warm room")
+    dream = engine._write_dream_memory(seed, neighbours, "DREAM: a warm room", eng=eng)
     run_consolidation(store, persona_dir=persona_dir, classifier=lambda _candidate, _context: Decision("new"))
     return dream, seed
 
@@ -166,7 +182,7 @@ def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path,
 def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    dream, seed = _write_dream_over_ten(store, hebbian, persona_dir)
+    dream, seed = _write_dream_over_ten(store, hebbian, persona_dir, eng=None)
     assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
     _one_heartbeat(store, hebbian, persona_dir)
     assert "love" not in store.get(dream.id).emotions
@@ -174,9 +190,9 @@ def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     assert "love" in store.get(seed.id).emotions
 
 
-@_flipped_by("B1-4")
 def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix) -> None:
-    dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir)
+    eng = _go_live(persona_dir, store)
+    dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir, eng=eng)
     assert store.get(dream.id).emotions["love"] <= 10.0
 
 
