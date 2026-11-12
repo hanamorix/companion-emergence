@@ -34,7 +34,7 @@ from brain.memory.pending import (
     PendingQueue,
     route_write,
 )
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.store import Memory, MemoryStore, _merge_emotions
 from brain.utils.file_lock import file_lock
 
 
@@ -144,7 +144,7 @@ def test_c5_promote_creates_row_and_round_trips_fields(persona):
     hits = store.search_text("distinct memory")
     assert len(hits) == 1
     got = hits[0]
-    assert got.emotions == {"joy": 4.0}
+    assert got._stored_emotions == {"joy": 4.0}
     assert got.importance == 6.5
     assert set(got.tags) == {"t1", "t2"}
     assert got.metadata.get("k") == "v"
@@ -385,13 +385,8 @@ def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
     `run_consolidation` and `HeartbeatEngine._try_fire_reflex` to record
     the order they're actually invoked in at runtime, across
     `HeartbeatEngine.run_tick`'s real dispatch (first-ever-tick init,
-    then a fresh tick). ram-spike-fix INC-7 split run_tick's old
-    monolithic body into `_run_tick_body` (fresh tick) / `_resume_decay_only`
-    (resumes an interrupted decay pass and stops, per spec §5) — a source
-    grep on `run_tick` itself no longer finds either call. The resumed
-    path runs neither consolidation nor reflex at all (nothing else that
-    tick), so it can't violate this ordering; only the fresh-tick path is
-    exercised here.
+    then a fresh tick). The tick's work lives in `_run_tick_body`, so a
+    source grep on `run_tick` itself finds neither call.
     """
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatEngine
@@ -400,7 +395,7 @@ def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
 
     # Keep dream/reflex/research/growth from constructing a real CLI
     # provider against a bare tmp_path persona (same guard
-    # test_heartbeat_decay_batching.py uses).
+    # test_heartbeat.py uses).
     monkeypatch.setattr(
         "brain.engines.heartbeat.build_tier_provider", lambda *a, **k: FakeProvider()
     )
@@ -638,7 +633,7 @@ _MERGE_TABLE = [
 @pytest.mark.parametrize(("target", "cand", "expected"), _MERGE_TABLE)
 def test_e5_merge_emotions_table(target, cand, expected):
     target_before, cand_before = dict(target), dict(cand)
-    got = consolidation._merge_emotions(target, cand)
+    got = _merge_emotions(target, cand)
     assert got == expected
     assert list(got) == list(expected)
     assert got is not target
@@ -648,7 +643,7 @@ def test_e5_merge_emotions_table(target, cand, expected):
 
 
 def test_e5_merge_emotions_orders_the_target_names_first():
-    got = consolidation._merge_emotions({"trust": 4, "joy": 7}, {"awe": 6, "Joy": 5})
+    got = _merge_emotions({"trust": 4, "joy": 7}, {"awe": 6, "Joy": 5})
     assert list(got) == ["trust", "joy", "awe"]
     assert got["joy"] == 6.0
 
@@ -672,7 +667,7 @@ def test_e5_merge_emotions_drops_a_value_that_is_not_a_finite_number(bad, side, 
     other = {"joy": 4.0}
     target, cand = (with_bad, other) if side == "target" else (other, with_bad)
     with caplog.at_level(logging.WARNING, logger="brain.emotion.engine_utils"):
-        got = consolidation._merge_emotions(target, cand)  # no exception
+        got = _merge_emotions(target, cand)  # no exception
     # The bad value is dropped; on a shared name the other side's value is then the only one. The rest merges.
     assert got == {"trust": 3.0, "joy": 4.0}
     dropped = [r.getMessage() for r in caplog.records if "not a finite number" in r.getMessage()]
@@ -681,8 +676,8 @@ def test_e5_merge_emotions_drops_a_value_that_is_not_a_finite_number(bad, side, 
 
 
 def test_e5_merge_emotions_of_an_all_unusable_side_with_an_empty_side_is_empty():
-    assert consolidation._merge_emotions({"joy": float("nan"), "awe": None}, {}) == {}
-    assert consolidation._merge_emotions({}, {"joy": "5", "awe": True}) == {}
+    assert _merge_emotions({"joy": float("nan"), "awe": None}, {}) == {}
+    assert _merge_emotions({}, {"joy": "5", "awe": True}) == {}
 
 
 def test_e5_live_merge_averages_shared_and_copies_one_sided(persona, emotion_engine_stub):
@@ -691,7 +686,7 @@ def test_e5_live_merge_averages_shared_and_copies_one_sided(persona, emotion_eng
     target_id, res = _merge_run(persona, {"joy": 7.0, "trust": 4.0}, {"joy": 5.0, "awe": 6.0})
     assert res.merged == 1
     got = store.get(target_id, bump=False)
-    assert got.emotions == {"joy": 6.0, "trust": 4.0, "awe": 6.0}
+    assert got._stored_emotions == {"joy": 6.0, "trust": 4.0, "awe": 6.0}
     assert got.content == "Bob likes tea with honey"
     assert store.count(active_only=False) == 1  # the candidate was not promoted
 
@@ -700,14 +695,14 @@ def test_e5_live_merge_joy_5_and_7_is_joy_6_under_the_standard_spelling(persona,
     _tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     target_id, _res = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0})
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0}
 
 
 def test_e5_live_merge_lone_Joy_becomes_joy_with_the_same_value(persona, emotion_engine_stub):
     _tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     target_id, _res = _merge_run(persona, {"Joy": 5.0}, {})
-    assert store.get(target_id, bump=False).emotions == {"joy": 5.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 5.0}
 
 
 def test_e5_live_merge_sends_one_commit_event_for_the_incoming_memory_and_none_for_the_target(
@@ -717,7 +712,7 @@ def test_e5_live_merge_sends_one_commit_event_for_the_incoming_memory_and_none_f
     emotion_engine_stub.live = True
     # A target with NO emotions that gets some by the merge: with fold left True this is the "assigned" hook's own case.
     target_id, _res = _merge_run(persona, {}, {"joy": 5.0})
-    assert store.get(target_id, bump=False).emotions == {"joy": 5.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 5.0}
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # the target's update fired none
     # The probe can see: the same empty-to-filled update with fold left True records the assigned hook.
     emotion_engine_stub.recorded_calls.clear()
@@ -732,12 +727,12 @@ def test_e5_the_commit_event_is_the_incoming_memorys_own_not_the_merged_emotions
     emotion_engine_stub.live = True
     target_id, res, cand = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0, "awe": 2.0}, with_cand=True)
     assert res.merged == 1
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0, "awe": 2.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0, "awe": 2.0}
     assert len(emotion_engine_stub.recorded_calls) == 1
     name, sent = emotion_engine_stub.recorded_calls[0]
     assert name == "on_memory_committed"
     assert sent.id == cand.id
-    assert sent.emotions == {"joy": 7.0, "awe": 2.0}  # the candidate's own, not the merged {joy: 6, awe: 2}
+    assert sent._stored_emotions == {"joy": 7.0, "awe": 2.0}  # the candidate's own, not the merged {joy: 6, awe: 2}
     assert sent.created_at == cand.created_at
     assert sent.memory_type == cand.memory_type
     assert store.get(cand.id, bump=False) is None  # the merged candidate was never created as a row
@@ -782,9 +777,9 @@ def test_e5_live_merge_leaves_score_and_raises_peak_only_by_max(persona, emotion
     # A candidate-only emotion above the old peak raises the peak (update()'s own MAX); score is a snapshot.
     target_id, _res = _merge_run(persona, {"joy": 3.0}, {"joy": 3.0, "awe": 9.0})
     got = store.get(target_id, bump=False)
-    assert got.score == pytest.approx(3.0)
-    assert got.peak_emotion_intensity == pytest.approx(9.0)
-    assert got.emotions == {"joy": 3.0, "awe": 9.0}
+    assert got._stored_score == pytest.approx(3.0)
+    assert got._stored_peak == pytest.approx(9.0)
+    assert got._stored_emotions == {"joy": 3.0, "awe": 9.0}
 
 
 def test_e5_live_merge_never_lowers_the_peak(persona, emotion_engine_stub):
@@ -792,8 +787,8 @@ def test_e5_live_merge_never_lowers_the_peak(persona, emotion_engine_stub):
     emotion_engine_stub.live = True
     target_id, _res = _merge_run(persona, {"joy": 9.0}, {"joy": 1.0})
     got = store.get(target_id, bump=False)
-    assert got.emotions == {"joy": 5.0}
-    assert got.peak_emotion_intensity == pytest.approx(9.0)
+    assert got._stored_emotions == {"joy": 5.0}
+    assert got._stored_peak == pytest.approx(9.0)
 
 
 def test_e5_not_live_merge_is_todays_content_only_call(persona, emotion_engine_stub, monkeypatch):
@@ -812,7 +807,7 @@ def test_e5_not_live_merge_is_todays_content_only_call(persona, emotion_engine_s
     # Live first, the control: the same rows, a live merge, DO write the emotions (so the not-live arm below is a real contrast).
     emotion_engine_stub.live = True
     live_id, _ = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0, "awe": 6.0})
-    assert store.get(live_id, bump=False).emotions == {"joy": 6.0, "awe": 6.0}
+    assert store.get(live_id, bump=False)._stored_emotions == {"joy": 6.0, "awe": 6.0}
     assert {"emotions", "fold"} <= set(next(f for mid, f in calls if mid == live_id))
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # the live merge's event
     assert store.get(live_id, bump=False).content == "Bob likes tea with honey"  # a merge adds no date to the text
@@ -824,8 +819,8 @@ def test_e5_not_live_merge_is_todays_content_only_call(persona, emotion_engine_s
     assert emotion_engine_stub.recorded_calls == []  # not live: no event either
     assert [fields for mid, fields in calls if mid == target_id] == [{"content": "Bob likes tea with honey"}]
     got = store.get(target_id, bump=False)
-    assert got.emotions == {"Joy": 5.0}  # untouched, spelling included
-    assert got.peak_emotion_intensity == pytest.approx(5.0)
+    assert got._stored_emotions == {"Joy": 5.0}  # untouched, spelling included
+    assert got._stored_peak == pytest.approx(5.0)
     assert got.content == "Bob likes tea with honey"
 
 
@@ -884,7 +879,7 @@ def test_e5_a_deferred_merge_sends_no_event_and_the_tick_that_writes_it_sends_on
     assert second.deferred == 1
     assert second.merged == 0
     assert emotion_engine_stub.recorded_calls == []
-    assert store.get(target_id, bump=False).emotions == {"joy": 5.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 5.0}
     # Tick 3: the target is active again, the verdict is the same: the merge is written and the event is sent, once.
     store._conn.execute("UPDATE memories SET state = 'active' WHERE id = ?", (target_id,))
     store._conn.commit()
@@ -892,7 +887,7 @@ def test_e5_a_deferred_merge_sends_no_event_and_the_tick_that_writes_it_sends_on
     assert third.merged == 1
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]
     assert emotion_engine_stub.recorded_calls[0][1].id == cand.id
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0}
     # The probe can see.
     _assert_probe_can_see_hooks(store, emotion_engine_stub)
 
@@ -945,7 +940,7 @@ def test_e5_live_merge_drops_a_stored_value_that_is_not_a_finite_number_and_merg
     assert res.merged == 1
     got = store.get(target_id, bump=False)
     assert got.content == "merged text"  # the content merge happens
-    assert got.emotions == {"trust": 3.0, "awe": 6.0}  # the unusable value is dropped, the rest merged
+    assert got._stored_emotions == {"trust": 3.0, "awe": 6.0}  # the unusable value is dropped, the rest merged
     assert sum("not a finite number" in r.getMessage() for r in caplog.records) == 1
     # The pre-merge row is in the archive (NaN and inf are written as null there).
     assert _archived_target_emotions(tmp, target_id) == {"joy": archived, "trust": 3.0}
@@ -965,16 +960,16 @@ def test_e5_live_merge_of_an_all_unusable_target_and_an_empty_candidate_writes_e
         classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content="merged text")}),
     )
     assert res.merged == 1
-    assert store.get(target_id, bump=False).emotions == {}
+    assert store.get(target_id, bump=False)._stored_emotions == {}
 
 
 def test_e5_live_merge_holds_an_out_of_range_value_to_0_10(persona, emotion_engine_stub):
     _tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     target_id, _res = _merge_run(persona, {"joy": 12.5}, {})
-    assert store.get(target_id, bump=False).emotions == {"joy": 10.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 10.0}
     target_id, _res = _merge_run(persona, {}, {"joy": 15.0})
-    assert store.get(target_id, bump=False).emotions == {"joy": 10.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 10.0}
 
 
 def test_e5_live_merge_drops_a_bool_value_on_the_candidate_with_a_log_line(persona, emotion_engine_stub, caplog):
@@ -983,7 +978,7 @@ def test_e5_live_merge_drops_a_bool_value_on_the_candidate_with_a_log_line(perso
     with caplog.at_level(logging.WARNING, logger="brain.emotion.engine_utils"):
         target_id, res = _merge_run(persona, {}, {"joy": True, "awe": 6.0})
     assert res.merged == 1
-    assert store.get(target_id, bump=False).emotions == {"awe": 6.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"awe": 6.0}
     assert sum("not a finite number" in r.getMessage() for r in caplog.records) == 1
 
 
@@ -992,7 +987,7 @@ def test_e5_live_merge_two_spellings_in_one_memory_then_across(persona, emotion_
     _tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     target_id, _res = _merge_run(persona, {"Joy": 5.0, "joy": 7.0}, {"joy": 8.0})
-    assert store.get(target_id, bump=False).emotions == {"joy": 7.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 7.0}
 
 
 def test_e5_live_merge_leaves_the_target_created_at_alone(persona, emotion_engine_stub):
@@ -1010,7 +1005,7 @@ def test_e5_live_merge_leaves_the_target_created_at_alone(persona, emotion_engin
         classifier=_stub({cand.content: Decision("merge", target_id=target_id, merged_content="merged text")}),
     )
     assert res.merged == 1
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}  # the live merge ran
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0}  # the live merge ran
     assert _raw(store, target_id, "created_at")[0] == before == old.isoformat()
 
 
@@ -1032,7 +1027,7 @@ def test_e5_live_merge_preread_is_not_an_access(persona, emotion_engine_stub):
 
 
 def test_e5_not_live_merge_preread_is_not_an_access(persona):
-    # No stub: the real engine with no switch file, so this fails on the bump alone on any base.
+    # No stub: the real engine, not switched over, so this fails on the bump alone on any base.
     _tmp, store, _heb, _queue = persona
     target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     _assert_preread_is_not_an_access(store, target_id, res)
@@ -1044,7 +1039,7 @@ def test_e5_live_merge_archives_the_pre_merge_emotions(persona, emotion_engine_s
     tmp, store, _heb, _queue = persona
     emotion_engine_stub.live = True
     target_id, _res = _merge_run(persona, {"Joy": 5.0, "trust": 4.0}, {"joy": 7.0})
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0, "trust": 4.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0, "trust": 4.0}
     records = [json.loads(line) for line in (tmp / _ARCHIVE_FILENAME).read_text().splitlines() if line.strip()]
     mine = [r for r in records if r["target"]["id"] == target_id]
     assert len(mine) == 1
@@ -1107,11 +1102,11 @@ def test_e5_write_back_writes_faded_values_and_a_new_created_at(
 
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
-    assert got.emotions == {"joy": 3.5, "trust": 1.25}
+    assert got._stored_emotions == {"joy": 3.5, "trust": 1.25}
     assert got.created_at == _FIXED_NOW
     assert _raw(store, mem.id, "created_at")[0] == "2031-05-06T07:08:09+00:00"
     assert got.importance == pytest.approx(7.25)
-    assert got.peak_emotion_intensity == pytest.approx(8.0)
+    assert got._stored_peak == pytest.approx(8.0)
     # The write-back's own read of the row is a maintenance read, not an access.
     assert got.recall_count == 0.0
     assert got.last_accessed_at is None
@@ -1134,7 +1129,7 @@ def test_e5_write_back_includes_rows_of_every_state(persona, emotion_engine_stub
     res = _reappraise_run(tmp, store, mem)
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
-    assert got.emotions == {"joy": 2.0}
+    assert got._stored_emotions == {"joy": 2.0}
     assert got.created_at == _FIXED_NOW
 
 
@@ -1149,9 +1144,9 @@ def test_e5_write_back_for_a_memory_with_empty_emotions_resets_created_at_only(
     res = _reappraise_run(tmp, store, mem)
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
-    assert got.emotions == {}
+    assert got._stored_emotions == {}
     assert got.created_at == _FIXED_NOW
-    assert got.peak_emotion_intensity == 0.0
+    assert got._stored_peak == 0.0
     assert got.importance == pytest.approx(7.25)
 
 
@@ -1173,7 +1168,7 @@ def test_e5_not_live_writes_nothing_back(persona, emotion_engine_stub, monkeypat
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
     assert got.importance == pytest.approx(7.25)  # the importance update still happens
-    assert got.emotions == before.emotions
+    assert got._stored_emotions == before._stored_emotions
     assert got.created_at == before.created_at
     assert got.content == before.content  # no date added when not live
     assert refreshed == []
@@ -1203,7 +1198,7 @@ def test_e5_a_raising_write_back_is_logged_and_leaves_the_row_alone(
     assert attempts == [mem.id]  # the probe was reached
     assert any(r.levelno == logging.ERROR and mem.id in r.getMessage() for r in caplog.records)
     got = store.get(mem.id, bump=False)
-    assert got.emotions == before.emotions
+    assert got._stored_emotions == before._stored_emotions
     assert got.created_at == before.created_at
     assert got.content == before.content
     assert got.importance == pytest.approx(7.25)  # the importance update stands
@@ -1236,7 +1231,7 @@ def test_e5_a_failing_faded_value_is_logged_and_nothing_is_written(
     assert asked  # the probe was reached
     assert any(r.levelno == logging.ERROR and mem.id in r.getMessage() for r in caplog.records)
     got = store.get(mem.id, bump=False)
-    assert got.emotions == before.emotions
+    assert got._stored_emotions == before._stored_emotions
     assert got.created_at == before.created_at
     assert got.content == before.content
     assert got.importance == pytest.approx(7.25)
@@ -1323,20 +1318,20 @@ def test_e5_an_emotions_write_during_the_reappraiser_call_is_kept(
     store.create(mem, fold=False)
 
     def reappraiser_while_backfill_writes(m):
-        assert m.emotions == {}  # the gate holds the stale row
+        assert m._stored_emotions == {}  # the gate holds the stale row
         store.update(m.id, emotions={"joy": 6.0}, fold=False)  # the emotion backfill lands meanwhile
         return Reappraisal(7.25)
 
     res = _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
-    assert got.emotions == {"joy": 6.0}  # not erased by a fade of the stale empty dict
+    assert got._stored_emotions == {"joy": 6.0}  # not erased by a fade of the stale empty dict
     assert got.created_at == _FIXED_NOW
 
 
 def _importance_sensitive_fade(memory, emotion):
     """A fade whose answer moves with the memory's importance, so the importance a write-back fades under shows in its output."""
-    return memory.emotions[emotion] * (1 - memory.importance / 20)
+    return memory._stored_emotions[emotion] * (1 - memory.importance / 20)
 
 
 @pytest.mark.parametrize("new_importance", [7.25, 9.5])
@@ -1353,7 +1348,7 @@ def test_e5_the_fade_in_a_write_back_does_not_depend_on_the_reappraised_importan
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
     assert got.importance == pytest.approx(new_importance)  # the re-appraisal itself is stored
-    assert got.emotions["joy"] == pytest.approx(8.0 * (1 - 3.0 / 20))  # 6.8: faded under the loaded 3.0
+    assert got._stored_emotions["joy"] == pytest.approx(8.0 * (1 - 3.0 / 20))  # 6.8: faded under the loaded 3.0
 
 
 def test_e5_the_fade_takes_emotions_from_the_reread_row_and_importance_from_the_loaded_memory(
@@ -1372,7 +1367,7 @@ def test_e5_the_fade_takes_emotions_from_the_reread_row_and_importance_from_the_
     _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
     got = store.get(mem.id, bump=False)
     assert got.importance == pytest.approx(9.5)
-    assert got.emotions["joy"] == pytest.approx(6.0 * (1 - 3.0 / 20))  # 5.1: fresh emotions, loaded importance
+    assert got._stored_emotions["joy"] == pytest.approx(6.0 * (1 - 3.0 / 20))  # 5.1: fresh emotions, loaded importance
 
 
 def test_e5_a_later_fade_reads_the_reappraised_importance_and_the_reset_created_at(
@@ -1398,43 +1393,43 @@ def test_e5_a_later_fade_reads_the_reappraised_importance_and_the_reset_created_
     stretched = 14.0 * (1.0 + dev_constants.HORIZON_IMPORTANCE_GAIN * 9.0 / 10.0)
     from brain.emotion.engine_utils import fade
 
-    assert fade(row.emotions["joy"], age_days, 14.0, row.importance) == pytest.approx(6.0 * 0.5 ** (10.0 / stretched))
+    assert fade(row._stored_emotions["joy"], age_days, 14.0, row.importance) == pytest.approx(6.0 * 0.5 ** (10.0 / stretched))
 
 
-# --- the real engine and a real switch file (the stub ignores which directory it is asked about) ---------
+# --- the real engine and a real switch-over (the stub ignores which directory it is asked about) ---------
 
 
 def _switch_on(persona_dir):
-    from brain.emotion import engine_files
+    from tests.unit.brain.emotion._engine_support import make_live
 
-    assert engine_files.write_switch(persona_dir, datetime(2030, 1, 1, tzinfo=UTC))
+    make_live(persona_dir, datetime(2030, 1, 1, tzinfo=UTC))
 
 
-def test_e5_real_engine_merge_is_live_only_with_a_switch_file(persona):
+def test_e5_real_engine_merge_is_live_only_once_the_state_holds_a_switch_over_time(persona):
     tmp, store, _heb, _queue = persona
     off_id, _ = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0})
-    assert store.get(off_id, bump=False).emotions == {"Joy": 5.0}  # no switch file: today's content-only merge
+    assert store.get(off_id, bump=False)._stored_emotions == {"Joy": 5.0}  # not switched over: today's content-only merge
     _switch_on(tmp)
     on_id, _ = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0})
-    assert store.get(on_id, bump=False).emotions == {"joy": 6.0}  # switch file present: the merged emotions
+    assert store.get(on_id, bump=False)._stored_emotions == {"joy": 6.0}  # switched over: the merged emotions
 
 
-def test_e5_real_engine_write_back_is_live_only_with_a_switch_file(persona):
+def test_e5_real_engine_write_back_is_live_only_once_the_state_holds_a_switch_over_time(persona):
     tmp, store, _heb, _queue = persona
     long_ago = datetime.now(UTC) - timedelta(days=30)
     off = replace(_mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0), created_at=long_ago)
     store.create(off, fold=False)
     before = store.get(off.id, bump=False)
     _reappraise_run(tmp, store, off)
-    assert store.get(off.id, bump=False).created_at == before.created_at  # no switch file: nothing written back
+    assert store.get(off.id, bump=False).created_at == before.created_at  # not switched over: nothing written back
     _switch_on(tmp)
     on = replace(_mem("Bob's phone", "conversation", emotions={"joy": 8.0}, importance=3.0), created_at=long_ago)
     store.create(on, fold=False)
     on_before = store.get(on.id, bump=False)
     _reappraise_run(tmp, store, on)
     after = store.get(on.id, bump=False)
-    assert after.created_at > on_before.created_at  # switch file present: created_at reset to the gate's now
-    assert after.emotions == {"joy": 8.0}  # the engine's own faded_value (today: the stored value)
+    assert after.created_at > on_before.created_at  # switched over: created_at reset to the gate's now
+    assert after._stored_emotions == {"joy": 8.0}  # the engine's own faded_value (today: the stored value)
     assert after.importance == pytest.approx(7.25)
 
 
@@ -1459,7 +1454,7 @@ def test_e5_real_engine_live_merge_sends_the_commit_event_for_the_persona_dir_it
     target_id, res, cand = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0}, with_cand=True)
     assert res.merged == 1
     assert [(path, m.id) for path, m in seen] == [(tmp.resolve(), cand.id)]
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0}
 
 
 def test_e5_real_engine_not_live_merge_sends_no_event(persona, monkeypatch):
@@ -1471,7 +1466,7 @@ def test_e5_real_engine_not_live_merge_sends_no_event(persona, monkeypatch):
     target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     assert res.merged == 1
     assert off_seen == []
-    assert store.get(target_id, bump=False).emotions == {"joy": 5.0}  # not live: content only
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 5.0}  # not live: content only
 
 
 def test_e5_the_gate_asks_is_live_once_per_merge_and_it_gates_the_write_and_the_event_together(
@@ -1488,7 +1483,7 @@ def test_e5_the_gate_asks_is_live_once_per_merge_and_it_gates_the_write_and_the_
     target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     assert res.merged == 1
     assert len(asked) == 1
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}  # the emotions write happened
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0}  # the emotions write happened
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_memory_committed"]  # and so did the event
 
 
@@ -1506,7 +1501,7 @@ def test_e5_a_raising_commit_event_is_not_swallowed_by_the_merge(persona, emotio
     assert res.merged == 0
     assert res.failed == 1
     assert res.quarantined == 1
-    assert store.get(target_id, bump=False).emotions == {"joy": 6.0}
+    assert store.get(target_id, bump=False)._stored_emotions == {"joy": 6.0}
 
 
 # --- Engine 5, 2026-11-04: the date the write-back puts at the start of a recalled memory's text (sfa S31(c)) --------
@@ -1568,7 +1563,7 @@ def test_e5_write_back_dates_a_memory_with_empty_emotions_too(persona, emotion_e
     _reappraise_run(tmp, store, mem)
     got = store.get(mem.id, bump=False)
     assert got.content == _expected_prefix(store_module, "2031-03-04") + "a quiet fact"
-    assert got.emotions == {}
+    assert got._stored_emotions == {}
     assert got.created_at == _FIXED_NOW
 
 

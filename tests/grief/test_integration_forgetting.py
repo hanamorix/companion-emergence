@@ -108,10 +108,10 @@ def test_live_drop_reached_through_the_real_forgetting_pass_reads_faded_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Emotion rework B1 PR 5: once the engine is live, the breadcrumb the real pass writes reads the faded value."""
-    from brain.emotion import engine_files
-    from brain.emotion.engine import EmotionEngine
+    from brain.emotion import engine_utils
     from brain.felt_time.state import FeltTimeState
     from brain.felt_time.state import persist as persist_felt_time
+    from tests.unit.brain.emotion._engine_support import half_fade, make_live
 
     persist_felt_time(
         FeltTimeState(lived_age_hours=720.0 * 5, last_tick_ts="2026-05-18T00:00:00+00:00"),
@@ -121,8 +121,8 @@ def test_live_drop_reached_through_the_real_forgetting_pass_reads_faded_values(
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
     _seed_memory(store, id_="mem-target", joy=10.0, last_accessed_days_ago=180)
     store.close()
-    assert engine_files.write_switch(tmp_path, datetime.now(UTC))
-    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+    make_live(tmp_path, datetime.now(UTC))
+    monkeypatch.setattr(engine_utils, "faded_emotion", half_fade)
 
     monkeypatch.setattr(dev_constants, "LOST_THRESHOLD", 0.5)
     monkeypatch.setattr(dev_constants, "FADE_THRESHOLD", 0.6)

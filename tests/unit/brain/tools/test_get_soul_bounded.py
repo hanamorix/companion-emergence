@@ -425,7 +425,7 @@ def test_boot_over_mcp_names_the_prefixed_tool_for_the_next_soul_page(soul_perso
     assert "message" not in result["soul"]
 
 
-def test_whole_boot_payload_over_mcp_stays_within_the_bound(tmp_path: Path) -> None:
+def test_whole_boot_payload_over_mcp_stays_within_the_bound(tmp_path: Path, emotion_engine_stub) -> None:
     """boot is one tool result: the soul page plus everything beside it must fit.
 
     The persona has a full soul page's worth of ~400-byte crystallizations, an
@@ -435,6 +435,7 @@ def test_whole_boot_payload_over_mcp_stays_within_the_bound(tmp_path: Path) -> N
     from mcp.server import Server
     from mcp.types import CallToolRequest, CallToolRequestParams
 
+    from brain.emotion.engine import Reading
     from brain.engines.daemon_state import update_daemon_state
     from brain.mcp_server.tools import register_tools
     from brain.memory.store import Memory
@@ -465,6 +466,10 @@ def test_whole_boot_payload_over_mcp_stays_within_the_bound(tmp_path: Path) -> N
             emotions={e: 5.0 + n * 0.5 for n, e in enumerate(emotions)},
         )
     )
+    # The emotional state is read from the engine alone (Readers 2), so the engine holds the full day's emotions.
+    emotion_engine_stub.readings = {
+        e: Reading(short=5.0 + n * 0.5, long=0.0, difference=0.0, shift=0) for n, e in enumerate(emotions)
+    }
     for daemon in ("dream", "heartbeat", "reflex", "research"):
         update_daemon_state(
             persona_dir,

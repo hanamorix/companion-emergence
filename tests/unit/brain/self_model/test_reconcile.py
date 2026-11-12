@@ -42,68 +42,14 @@ def test_accept_marks_gap_acknowledged_and_sets_cooldown(tmp_path: Path) -> None
     assert "grief" in state.current_gap.channel_cooldowns
 
 
-def test_revise_writes_clamped_registered_emotion_memory(tmp_path: Path) -> None:
-    from brain.chat.extractor import _MAX_DELTA_INTENSITY
+def test_revise_writes_no_row_and_still_acknowledges_the_gap(tmp_path: Path) -> None:
+    """Accept/revise used to commit a standalone `self_model_reconcile` row for the old aggregate to pool. That aggregate
+    is gone, so no row is written; the gap is still acknowledged and the channel still gets its cooldown."""
     from brain.memory.store import MemoryStore
 
     _seed_open_gap(tmp_path)
-    # delta over the [-1, 1] bound — must be clamped to 1.0 → abs(1.0)*10 = 10.0,
-    # then capped at _MAX_DELTA_INTENSITY (F1/#94 twin of the extractor ceiling).
-    result = reconcile_self_read(
-        persona_dir=tmp_path, action="revise", channel="grief", delta=5.0
-    )
+    result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="grief", delta=0.5)
     assert result.get("ok") is True
-    assert result.get("delta_written") is True
-
-    # self_model_reconcile BYPASSES the consolidation gate (owner decision, see
-    # GATE_BYPASS_TYPES in brain/memory/pending.py): the emotion-carrying memory
-    # commits straight to memories.db, immediately visible via list_active.
-    store = MemoryStore(tmp_path / "memories.db")
-    try:
-        mems = [m for m in store.list_active() if m.memory_type == "self_model_reconcile"]
-    finally:
-        store.close()
-    assert len(mems) == 1
-    assert mems[0].emotions.get("grief") == _MAX_DELTA_INTENSITY
-
-
-def test_revise_delta_is_capped_at_max_delta_intensity(tmp_path: Path) -> None:
-    """F1/#94 twin: brain/chat/extractor.py::_apply_emotion_delta caps a minted
-    vector at _MAX_DELTA_INTENSITY so one extraction can't peg a channel to the
-    full 10.0 clamp. This self-authored path must be capped the same way — a
-    delta well inside the [-1, 1] bound (not touched by _clamp_delta) whose x10
-    mapping would exceed the ceiling must still be capped."""
-    from brain.chat.extractor import _MAX_DELTA_INTENSITY
-    from brain.memory.store import MemoryStore
-
-    _seed_open_gap(tmp_path)
-    # 0.5 is within the [-1, 1] delta bound — abs(0.5) * 10 = 5.0, which must
-    # be capped down to _MAX_DELTA_INTENSITY (3.0).
-    result = reconcile_self_read(
-        persona_dir=tmp_path, action="revise", channel="grief", delta=0.5
-    )
-    assert result.get("ok") is True
-    assert result.get("delta_written") is True
-
-    store = MemoryStore(tmp_path / "memories.db")
-    try:
-        mems = [m for m in store.list_active() if m.memory_type == "self_model_reconcile"]
-    finally:
-        store.close()
-    assert len(mems) == 1
-    assert mems[0].emotions.get("grief") == _MAX_DELTA_INTENSITY
-
-
-def test_revise_off_vocab_channel_is_dropped(tmp_path: Path) -> None:
-    from brain.memory.store import MemoryStore
-
-    _seed_open_gap(tmp_path)
-    result = reconcile_self_read(
-        persona_dir=tmp_path, action="revise", channel="zorblefright", delta=0.5
-    )
-    # call succeeds but writes nothing — off-vocab name silently dropped
-    assert result.get("ok") is True
-    assert result.get("delta_written") is False
 
     store = MemoryStore(tmp_path / "memories.db")
     try:
@@ -111,6 +57,10 @@ def test_revise_off_vocab_channel_is_dropped(tmp_path: Path) -> None:
     finally:
         store.close()
     assert mems == []
+    state, _ = load_or_recover(tmp_path)
+    assert state.current_gap is not None
+    assert state.current_gap.status == "acknowledged"
+    assert "grief" in state.current_gap.channel_cooldowns
 
 
 def test_dismiss_marks_gap_dismissed_and_sets_cooldown(tmp_path: Path) -> None:
@@ -347,15 +297,16 @@ def _go_live(persona_dir: Path, **seed: float):
     """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
     from datetime import UTC, datetime
 
-    from brain.emotion import engine, engine_files
+    from brain.emotion import engine
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
         store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
     finally:
         store.close()
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return engine.engine_for(persona_dir)
 
 

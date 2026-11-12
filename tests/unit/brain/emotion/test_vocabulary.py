@@ -49,37 +49,39 @@ def test_get_returns_none_for_unknown() -> None:
     assert vocabulary.get("nonsense") is None
 
 
-def test_list_all_contains_baseline_26() -> None:
-    """The baseline vocabulary ships 26 emotions (11 core + 11 complex + 4 body).
+def test_list_all_contains_baseline_30() -> None:
+    """The baseline vocabulary ships 30 emotions (12 core + 14 complex + 4 body).
 
-    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1); contentment, peace, calm and groundedness in #648.
     """
     all_emotions = vocabulary.list_all()
-    assert len(all_emotions) == 26
+    assert len(all_emotions) == 30
     assert all(isinstance(e, Emotion) for e in all_emotions)
 
 
-def test_by_category_core_has_eleven() -> None:
-    """The 'core' category has 11 emotions."""
+def test_by_category_core_has_twelve() -> None:
+    """The 'core' category has 12 emotions (contentment added in #648)."""
     core = vocabulary.by_category("core")
-    assert len(core) == 11
+    assert len(core) == 12
     names = {e.name for e in core}
     assert "love" in names
     assert "joy" in names
     assert "grief" in names
+    assert "contentment" in names
 
 
-def test_by_category_complex_has_eleven() -> None:
-    """The 'complex' category has 11 emotions.
+def test_by_category_complex_has_fourteen() -> None:
+    """The 'complex' category has 14 emotions.
 
-    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1); peace, calm and groundedness in #648.
     """
     complex_ = vocabulary.by_category("complex")
-    assert len(complex_) == 11
+    assert len(complex_) == 14
     names = {e.name for e in complex_}
     assert "nostalgia" in names
     assert "curiosity" in names
     assert "memory_grief" in names
+    assert {"peace", "calm", "groundedness"} <= names
 
 
 def test_baseline_excludes_nell_specific() -> None:
@@ -89,11 +91,11 @@ def test_baseline_excludes_nell_specific() -> None:
 
 
 def test_baseline_count_after_split() -> None:
-    """Framework baseline ships exactly 26 emotions (11 core + 11 complex + 4 body).
+    """Framework baseline ships exactly 30 emotions (12 core + 14 complex + 4 body).
 
-    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1); contentment, peace, calm and groundedness in #648.
     """
-    assert len(vocabulary._BASELINE) == 26
+    assert len(vocabulary._BASELINE) == 30
 
 
 def test_canonical_personal_anchor_pull_is_identity_level() -> None:
@@ -104,13 +106,12 @@ def test_canonical_personal_anchor_pull_is_identity_level() -> None:
     assert anchor.decay_half_life_days is None
 
 
-def test_canonical_personal_emotions_has_five() -> None:
-    """The migrator's canonical personal-emotions fixture has the 5 known names."""
+def test_canonical_personal_emotions_has_four() -> None:
+    """The migrator's canonical personal-emotions fixture has the 4 known names (`body_grief` is not predefined, #652)."""
     from brain.emotion._canonical_personal_emotions import _CANONICAL
 
     assert set(_CANONICAL.keys()) == {
         "anchor_pull",
-        "body_grief",
         "emergence",
         "creative_hunger",
         "freedom_ache",

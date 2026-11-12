@@ -41,13 +41,13 @@ def test_memory_create_new_computes_score_from_emotions() -> None:
         domain="us",
         emotions={"love": 9.0, "tenderness": 6.0},
     )
-    assert m.score == 15.0
+    assert m._stored_score == 15.0
 
 
 def test_memory_create_new_score_zero_when_no_emotions() -> None:
     """Empty emotions dict → score 0."""
     m = Memory.create_new(content="note", memory_type="meta", domain="work")
-    assert m.score == 0.0
+    assert m._stored_score == 0.0
 
 
 def test_memory_create_new_importance_defaults_to_score_over_ten() -> None:
@@ -74,10 +74,10 @@ def test_memory_create_new_importance_manual_override() -> None:
 
 
 def test_memory_defaults_active_and_unprotected() -> None:
-    """New memories are active and unprotected by default."""
+    """New memories are active by default; the removed `protected` flag is not an attribute any more."""
     m = Memory.create_new(content="x", memory_type="meta", domain="work")
     assert m.active is True
-    assert m.protected is False
+    assert not hasattr(m, "protected")
 
 
 def test_memory_to_dict_round_trips() -> None:
@@ -96,9 +96,9 @@ def test_memory_to_dict_round_trips() -> None:
     assert restored.content == original.content
     assert restored.memory_type == original.memory_type
     assert restored.domain == original.domain
-    assert restored.emotions == original.emotions
+    assert restored._stored_emotions == original._stored_emotions
     assert restored.tags == original.tags
-    assert restored.score == original.score
+    assert restored._stored_score == original._stored_score
     assert restored.importance == original.importance
     assert restored.created_at == original.created_at
     assert restored.active == original.active
@@ -106,7 +106,7 @@ def test_memory_to_dict_round_trips() -> None:
 
 
 def test_memory_to_dict_round_trips_last_accessed_and_protected() -> None:
-    """Set last_accessed_at + protected=True and confirm they round-trip."""
+    """Set last_accessed_at and confirm it round-trips."""
     original = Memory.create_new(
         content="important memory",
         memory_type="conversation",
@@ -114,11 +114,10 @@ def test_memory_to_dict_round_trips_last_accessed_and_protected() -> None:
         emotions={"love": 9.0},
     )
     original.last_accessed_at = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
-    original.protected = True
 
     restored = Memory.from_dict(original.to_dict())
     assert restored.last_accessed_at == original.last_accessed_at
-    assert restored.protected is True
+    assert "protected" not in original.to_dict()
 
 
 @pytest.mark.parametrize("field", ["score", "importance"])
@@ -129,8 +128,9 @@ def test_memory_from_dict_treats_null_like_missing(field: str) -> None:
     missing = {k: v for k, v in data.items() if k != field}
     nulled = {**data, field: None}
 
-    assert getattr(Memory.from_dict(nulled), field) == 0.0
-    assert getattr(Memory.from_dict(nulled), field) == getattr(Memory.from_dict(missing), field)
+    attribute = "_stored_score" if field == "score" else field  # the dict key `score` is the private field `_stored_score`
+    assert getattr(Memory.from_dict(nulled), attribute) == 0.0
+    assert getattr(Memory.from_dict(nulled), attribute) == getattr(Memory.from_dict(missing), attribute)
 
 
 def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
@@ -147,7 +147,6 @@ def test_memory_from_dict_coerces_naive_timestamps_to_utc() -> None:
         "created_at": "2024-01-01T12:00:00",  # no tz
         "last_accessed_at": "2024-01-02T08:00:00",  # no tz
         "active": True,
-        "protected": False,
     }
     m = Memory.from_dict(data)
     assert m.created_at.tzinfo is not None
@@ -212,7 +211,6 @@ def test_memory_from_dict_missing_metadata_defaults_empty() -> None:
         "created_at": datetime.now(UTC).isoformat(),
         "last_accessed_at": None,
         "active": True,
-        "protected": False,
         # no 'metadata' key
     }
     restored = Memory.from_dict(data)
@@ -247,7 +245,6 @@ def test_memory_from_dict_metadata_null_defaults_empty() -> None:
         "created_at": datetime.now(UTC).isoformat(),
         "last_accessed_at": None,
         "active": True,
-        "protected": False,
         "metadata": None,  # explicit null
     }
     restored = Memory.from_dict(data)
@@ -283,8 +280,8 @@ def test_store_create_and_get_round_trips(store: MemoryStore) -> None:
     assert restored is not None
     assert restored.id == original.id
     assert restored.content == original.content
-    assert restored.emotions == original.emotions
-    assert restored.score == original.score
+    assert restored._stored_emotions == original._stored_emotions
+    assert restored._stored_score == original._stored_score
 
 
 def test_store_get_unknown_returns_none(store: MemoryStore) -> None:
@@ -458,99 +455,6 @@ def test_store_list_active_is_explicit_list_all_path(store: MemoryStore) -> None
     store.deactivate(inactive.id)
 
     results = store.list_active()
-
-    assert [m.id for m in results] == [active.id]
-
-
-def test_store_list_active_since_none_cursor_returns_from_beginning(
-    store: MemoryStore,
-) -> None:
-    """cursor_iso=None starts from the oldest active memory, ascending."""
-    older = _mem("older")
-    older.created_at = datetime(2020, 1, 1, tzinfo=UTC)
-    newer = _mem("newer")
-    newer.created_at = datetime(2020, 1, 2, tzinfo=UTC)
-    store.create(older)
-    store.create(newer)
-
-    results = store.list_active_since(None, limit=10)
-
-    assert [m.id for m in results] == [older.id, newer.id]
-
-
-def test_store_list_active_since_excludes_at_or_before_cursor(
-    store: MemoryStore,
-) -> None:
-    """Only rows strictly AFTER the (created_at, id) cursor are returned."""
-    a = _mem("a")
-    a.created_at = datetime(2020, 1, 1, tzinfo=UTC)
-    b = _mem("b")
-    b.created_at = datetime(2020, 1, 2, tzinfo=UTC)
-    c = _mem("c")
-    c.created_at = datetime(2020, 1, 3, tzinfo=UTC)
-    store.create(a)
-    store.create(b)
-    store.create(c)
-
-    results = store.list_active_since((b.created_at.isoformat(), b.id), limit=10)
-
-    assert [m.id for m in results] == [c.id]
-
-
-def test_store_list_active_since_tie_inclusive_on_shared_created_at(
-    store: MemoryStore,
-) -> None:
-    """A cursor pinned at (ts, id) of one row must still return ANOTHER row
-    sharing that EXACT created_at, provided its id sorts after the cursor's.
-
-    Regression for the keyset-pagination fix: the old cursor was a bare
-    `created_at > ?` filter, so pinning it at the created_at of a row that
-    shared its timestamp with siblings made every sibling but the pinned one
-    permanently invisible to every future call — exactly the shape produced
-    by a bulk migrator import (brain/migrator/emergence_kit.py) where many
-    rows commonly share a second-granularity created_at.
-    """
-    shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
-    first = _mem("first")
-    first.created_at = shared_ts
-    second = _mem("second")
-    second.created_at = shared_ts
-    # Force a deterministic id ordering regardless of uuid4 randomness, so
-    # the test asserts the intended tie-break rather than depending on luck.
-    first.id = "aaaa0000-0000-0000-0000-000000000000"
-    second.id = "bbbb0000-0000-0000-0000-000000000000"
-    store.create(first)
-    store.create(second)
-
-    # Pin the cursor exactly at `first`'s (created_at, id) — as
-    # embedding_backfill does after processing `first`.
-    results = store.list_active_since((shared_ts.isoformat(), first.id), limit=10)
-
-    assert [m.id for m in results] == [second.id]
-
-
-def test_store_list_active_since_respects_limit(store: MemoryStore) -> None:
-    """Bounded per call — never returns more than `limit` rows."""
-    for i in range(5):
-        m = _mem(f"item-{i}")
-        m.created_at = datetime(2020, 1, i + 1, tzinfo=UTC)
-        store.create(m)
-
-    results = store.list_active_since(None, limit=2)
-
-    assert len(results) == 2
-    assert [m.content for m in results] == ["item-0", "item-1"]
-
-
-def test_store_list_active_since_excludes_inactive(store: MemoryStore) -> None:
-    """Same active=1 filter as list_active() — deactivated rows never appear."""
-    active = _mem("active")
-    inactive = _mem("inactive")
-    store.create(active)
-    store.create(inactive)
-    store.deactivate(inactive.id)
-
-    results = store.list_active_since(None, limit=10)
 
     assert [m.id for m in results] == [active.id]
 
@@ -762,7 +666,7 @@ def test_store_list_unembedded_since_respects_limit(store: MemoryStore) -> None:
 
 
 def test_store_list_unembedded_since_excludes_inactive(store: MemoryStore) -> None:
-    """Same active=1 filter as list_active()/list_active_since() —
+    """Same active=1 filter as list_active() —
     deactivated rows never appear even if unembedded."""
     active = _mem("active")
     inactive = _mem("inactive")
@@ -989,6 +893,38 @@ def test_store_update_rejects_unknown_field_still(store: MemoryStore) -> None:
     store.create(m)
     with pytest.raises(ValueError, match="Unknown update field"):
         store.update(m.id, nonsense_field="oops")
+
+
+def test_store_update_no_longer_accepts_protected(store: MemoryStore) -> None:
+    """`protected` left the accepted update fields with the Memory field; the column stays but nothing sets it."""
+    m = _mem("x")
+    store.create(m)
+    with pytest.raises(ValueError, match="Unknown update field"):
+        store.update(m.id, protected=True)
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that old data stays readable after the field is removed; the old code read it too, so it passes on base by design"
+)
+def test_memory_from_dict_ignores_an_old_protected_key() -> None:
+    """A queued candidate line (pending_candidates.jsonl) written before the field was removed still loads."""
+    data = {
+        "id": "legacy-protected",
+        "content": "legacy",
+        "memory_type": "meta",
+        "domain": "work",
+        "emotions": {},
+        "tags": [],
+        "importance": 0.0,
+        "score": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": None,
+        "active": True,
+        "protected": True,
+    }
+    restored = Memory.from_dict(data)
+    assert restored.content == "legacy"
+    assert restored.active is True
 
 
 def test_store_row_with_null_metadata_string_returns_empty_dict(store: MemoryStore) -> None:
@@ -2013,8 +1949,8 @@ def test_peak_captured_on_create(store):
                             emotions={"joy": 6.0, "warmth": 3.0})
     store.create(mem)
     got = store.get(mem.id)
-    assert got.peak_emotion_intensity == 6.0
-    assert isinstance(mem.peak_emotion_intensity, float)  # one scalar, not a per-emotion vector (deferred D3 design)
+    assert got._stored_peak == 6.0
+    assert isinstance(mem._stored_peak, float)  # one scalar, not a per-emotion vector (deferred D3 design)
 
 
 def test_peak_is_monotone_under_update(store):
@@ -2022,10 +1958,10 @@ def test_peak_is_monotone_under_update(store):
     store.create(mem)
     # Decay-shaped write: lower intensities must NOT lower the peak.
     store.update(mem.id, emotions={"joy": 0.5})
-    assert store.get(mem.id).peak_emotion_intensity == 6.0
+    assert store.get(mem.id)._stored_peak == 6.0
     # A hotter later delta raises it.
     store.update(mem.id, emotions={"joy": 8.5})
-    assert store.get(mem.id).peak_emotion_intensity == 8.5
+    assert store.get(mem.id)._stored_peak == 8.5
 
 
 def test_peak_survives_emotions_emptied(store):
@@ -2035,14 +1971,14 @@ def test_peak_survives_emotions_emptied(store):
     store.create(mem)
     store.update(mem.id, emotions={})
     got = store.get(mem.id)
-    assert got.emotions == {}
-    assert got.peak_emotion_intensity == 6.0
+    assert got._stored_emotions == {}
+    assert got._stored_peak == 6.0
 
 
 def test_peak_defaults_zero_without_emotions(store):
     mem = Memory.create_new("flat", "conversation", "us")
     store.create(mem)
-    assert store.get(mem.id).peak_emotion_intensity == 0.0
+    assert store.get(mem.id)._stored_peak == 0.0
 
 
 def test_peak_migration_seeds_from_current_intensities(tmp_path):
@@ -2082,8 +2018,8 @@ def test_peak_migration_seeds_from_current_intensities(tmp_path):
     conn.close()
 
     migrated = MemoryStore(db)  # reopen → column added + seeded
-    assert migrated.get("a" * 36).peak_emotion_intensity == 4.5
-    assert migrated.get("b" * 36).peak_emotion_intensity == 0.0
+    assert migrated.get("a" * 36)._stored_peak == 4.5
+    assert migrated.get("b" * 36)._stored_peak == 0.0
     # Corrupt-JSON row: _row_to_memory itself can't parse it, so verify the
     # migrated DB value directly — the seeding must have written honest 0.0.
     row = migrated._conn.execute(

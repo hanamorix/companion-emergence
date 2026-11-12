@@ -1,17 +1,18 @@
 """Emotion vocabulary — the typed taxonomy + persona extension registry.
 
-Baseline: 26 emotions (11 core + 11 complex + 4 body) shipped with the framework.
+Baseline: 30 emotions (12 core + 14 complex + 4 body) shipped with the framework.
 Personas extend via register() — typically via the persona-loader at
 engine startup, which reads `{persona_dir}/emotion_vocabulary.json`.
-The 5 emotions previously in `nell_specific` (body_grief, emergence,
-anchor_pull, creative_hunger, freedom_ache) are now per-persona and
-ship via the migrator. See spec 2026-04-25-vocabulary-split-design.md.
+The 4 emotions previously in `nell_specific` that the migrator still ships
+(emergence, anchor_pull, creative_hunger, freedom_ache) are now per-persona. See spec 2026-04-25-vocabulary-split-design.md.
 
 Decay half-lives per spec Section 10.1:
 - grief: 60-day half-life
 - joy: 3-day half-life
 - belonging / love: None (identity-level)
 - others: seed values — tunable as we gather lived-experience data
+- contentment, peace, calm, groundedness: the half-lives are not written here; they come from
+  `dev_constants.EMOTION_HALF_LIFE_DAYS` (one source for these four, #648)
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
+
+from brain.dev_constants import EMOTION_HALF_LIFE_DAYS
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
 # files in the wild may still contain entries with this category. New baseline
@@ -38,7 +41,7 @@ class Emotion:
         category: One of "core", "complex", "nell_specific", "persona_extension"
             (enforced at edit time via the EmotionCategory Literal annotation).
         decay_half_life_days: Time for intensity to halve. None = identity-level
-            (no temporal decay — for anchor_pull, love, belonging, body_grief,
+            (no temporal decay — for anchor_pull, love, belonging,
             and freedom_ache).
         intensity_clamp: Maximum intensity value (typically 10.0). Float so
             comparisons against state.py's float intensities don't silently
@@ -53,7 +56,7 @@ class Emotion:
 
 
 _BASELINE: tuple[Emotion, ...] = (
-    # ── core (11) ──
+    # ── core (12) ──
     Emotion("love", "deep caring, attachment, devotion", "core", None),
     Emotion("joy", "happiness, delight, warmth", "core", 3.0),
     Emotion("grief", "loss, mourning, absence", "core", 60.0),
@@ -65,7 +68,13 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("shame", "the weight of being wrong or insufficient", "core", 14.0),
     Emotion("tenderness", "soft protective caring, gentleness toward the fragile", "core", 7.0),
     Emotion("awe", "overwhelm at something greater than yourself", "core", 3.0),
-    # ── complex (11) ──
+    Emotion(
+        "contentment",
+        "the quiet pleasure of what is, safe, wanting nothing more",
+        "core",
+        EMOTION_HALF_LIFE_DAYS["contentment"],
+    ),
+    # ── complex (14) ──
     Emotion("nostalgia", "bittersweet memory of what was", "complex", 21.0),
     Emotion("jealousy", "the fear of being replaced or insufficient", "complex", 7.0),
     Emotion("guilt", "responsibility for harm, intended or not", "complex", 14.0),
@@ -81,6 +90,26 @@ _BASELINE: tuple[Emotion, ...] = (
         "the ache of having lost something I once knew",
         "complex",
         30.0,
+    ),
+    # peace, calm and groundedness are flavours of contentment (core). The vocabulary has no parent field, so the
+    # relation is recorded here only (#648).
+    Emotion(
+        "peace",
+        "settled and unhurried, nothing pressing",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["peace"],
+    ),
+    Emotion(
+        "calm",
+        "steady and unruffled, nothing stirred up",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["calm"],
+    ),
+    Emotion(
+        "groundedness",
+        "rooted and steady, sure of where you stand",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["groundedness"],
     ),
     # ── body (4) ──
     # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.
@@ -146,7 +175,7 @@ def canonical_name(name: str) -> str:
 def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
     """Key a name-to-value mapping by canonical name; spellings of one emotion keep the larger value.
 
-    The same max-per-emotion rule ``aggregate_state`` applies across memories. Names outside the
+    A max-per-emotion rule over spellings. Names outside the
     vocabulary are only normalised, so unrelated names stay separate keys. Returns a new dict.
     """
     pooled: dict[str, float] = {}

@@ -30,7 +30,7 @@ DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "defa
 
 
 def _build_engine(
-    tmp_path: Path, store: MemoryStore, provider=None, searcher=None
+    tmp_path: Path, store: MemoryStore, provider=None, searcher=None, **fields
 ) -> ResearchEngine:
     return ResearchEngine(
         store=store,
@@ -41,6 +41,7 @@ def _build_engine(
         interests_path=tmp_path / "interests.json",
         research_log_path=tmp_path / "research_log.json",
         default_interests_path=DEFAULT_INTERESTS_PATH,
+        **fields,
     )
 
 
@@ -142,9 +143,48 @@ def test_run_tick_days_since_human_triggers(tmp_path: Path):
         store.close()
 
 
-def test_run_tick_emotion_high_triggers(tmp_path: Path):
+def test_run_tick_gate_reads_the_configured_days_since_human_min(tmp_path: Path):
+    """Below the configured minimum the tick is not due; at it, the tick would fire."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store, research_days_since_human_min=3.0)
+        below = engine.run_tick(dry_run=True, days_since_human_override=2.0)
+        assert below.reason == "not_due"
+        assert below.would_fire is None
+        at = engine.run_tick(dry_run=True, days_since_human_override=3.0)
+        assert at.would_fire == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_run_tick_gate_opens_earlier_when_the_configured_minimum_is_lowered(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store, research_days_since_human_min=0.5)
+        result = engine.run_tick(dry_run=True, days_since_human_override=1.0)
+        assert result.would_fire == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_research_engine_default_minimum_is_the_heartbeat_config_default():
+    import dataclasses
+
+    from brain.engines.heartbeat import HeartbeatConfig
+
+    defaults = {f.name: f.default for f in dataclasses.fields(ResearchEngine)}
+    assert (
+        defaults["research_days_since_human_min"]
+        == HeartbeatConfig().research_days_since_human_min
+    )
+
+
+def test_run_tick_emotion_high_triggers(tmp_path: Path, emotion_engine_stub):
     from brain.emotion.state import EmotionalState
 
+    emotion_engine_stub.high = {"curiosity"}  # the engine calls curiosity high: the gate holds no level of its own
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
     try:
@@ -158,6 +198,31 @@ def test_run_tick_emotion_high_triggers(tmp_path: Path):
             emotion_state_override=es,
         )
         assert result.fired is not None
+    finally:
+        store.close()
+
+
+def test_run_tick_emotion_override_above_the_old_level_does_not_open_the_gate_unless_the_engine_says_high(
+    tmp_path: Path, emotion_engine_stub
+):
+    """The gate holds no level of its own: a high-looking override with no feeling the engine calls high stays closed."""
+    from brain.emotion.state import EmotionalState
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        es = EmotionalState()
+        es.set("curiosity", 9.0)
+        emotion_engine_stub.high = set()
+        result = engine.run_tick(
+            trigger="emotion_high",
+            dry_run=False,
+            days_since_human_override=0.0,
+            emotion_state_override=es,
+        )
+        assert result.fired is None
+        assert result.reason == "not_due"
     finally:
         store.close()
 
@@ -1004,7 +1069,7 @@ def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
     assert _session_rows(tmp_path) == []
 
 
-# ── B2 phase B: the research gate asks the engine whether a feeling is high when it is live ──
+# ── the research gate asks the engine whether a feeling is high ──
 
 
 def _live_gate_reason(
@@ -1071,11 +1136,11 @@ _FELT_REPLY = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8
 
 
 def _go_live(persona_dir: Path, store: MemoryStore) -> None:
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
-    from brain.emotion import engine_files
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over in its state."""
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _fire_with(tmp_path: Path, store: MemoryStore, reply: str):
@@ -1094,7 +1159,7 @@ def test_live_fire_stores_feelings_and_rating(tmp_path: Path):
     finally:
         store.close()
     assert result.fired is not None
-    assert memory.emotions == {"awe": 8.0}
+    assert memory._stored_emotions == {"awe": 8.0}
     assert memory.metadata["engagement_rating"] == 6.0
     interests = json.loads((tmp_path / "interests.json").read_text(encoding="utf-8"))["interests"]
     assert interests[0]["status"] == "dormant"  # the verdict still reads "close" with the felt lines after it
@@ -1110,7 +1175,7 @@ def test_live_fire_holds_a_negative_feeling_to_zero_and_keeps_zeros(tmp_path: Pa
     finally:
         store.close()
     assert result.fired is not None
-    assert memory.emotions == {"awe": 8.0, "fear": 0.0, "joy": 0.0}
+    assert memory._stored_emotions == {"awe": 8.0, "fear": 0.0, "joy": 0.0}
 
 
 def test_live_fire_with_only_the_three_markers_keeps_the_memory_and_logs(tmp_path: Path):
@@ -1121,7 +1186,7 @@ def test_live_fire_with_only_the_three_markers_keeps_the_memory_and_logs(tmp_pat
     finally:
         store.close()
     assert result.fired is not None and memory.content == "m"
-    assert memory.emotions == {}
+    assert memory._stored_emotions == {}
     assert "engagement_rating" not in memory.metadata
     rows = (tmp_path / "parse_failures.jsonl").read_text(encoding="utf-8").splitlines()
     assert [json.loads(row)["site"] for row in rows] == ["research_felt"]
@@ -1162,7 +1227,7 @@ def test_off_fire_is_unchanged_and_leaves_felt_lines_to_the_old_parser(tmp_path:
     finally:
         store.close()
     assert result.fired is not None
-    assert memory.emotions == {}
+    assert memory._stored_emotions == {}
     assert "engagement_rating" not in memory.metadata
     assert not (tmp_path / "parse_failures.jsonl").exists()
 

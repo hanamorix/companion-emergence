@@ -110,7 +110,7 @@ def test_write_breadcrumb_drop_with_residue(tmp_path: Path) -> None:
     assert saved is not None
     assert saved.memory_type == "grief_event"
     assert saved.domain == "grief"
-    assert saved.emotions == {"memory_grief": 4.4, "joy": 3.5}
+    assert saved._stored_emotions == {"memory_grief": 4.4, "joy": 3.5}
     assert saved.metadata["grief_referent_id"] == "mem-abc-123"
     assert saved.metadata["grief_referent_type"] == "memory"
     assert saved.metadata["grief_subtype"] == "drop"
@@ -132,7 +132,7 @@ def test_write_breadcrumb_recall_touch_with_triggering_arc(tmp_path: Path) -> No
     )
     saved = store.get(bc_id)
     assert saved is not None
-    assert saved.emotions == {"memory_grief": 3.5}
+    assert saved._stored_emotions == {"memory_grief": 3.5}
     assert saved.metadata["triggering_arc_id"] == "arc-foo"
     assert saved.metadata["grief_subtype"] == "recall_touch"
 
@@ -230,13 +230,15 @@ def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> N
 from datetime import UTC, datetime  # noqa: E402
 
 from brain.emotion import engine as emotion_engine  # noqa: E402
-from brain.emotion import engine_files  # noqa: E402
+from brain.emotion import engine_utils  # noqa: E402
 from brain.emotion.engine import EmotionEngine  # noqa: E402
+from tests.unit.brain.emotion._engine_support import half_fade as _half_fade  # noqa: E402
+from tests.unit.brain.emotion._engine_support import make_live  # noqa: E402
 
 
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return emotion_engine.engine_for(persona_dir)
 
 
@@ -252,7 +254,7 @@ def test_live_drop_uses_faded_values(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     store = MemoryStore(tmp_path / "memories.db")
     _go_live(tmp_path, store)
-    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+    monkeypatch.setattr(engine_utils, "faded_emotion", _half_fade)
 
     grief.handle_drop(memory=_make_dropped_memory(memory_id="mem-live", joy=10.0), persona_dir=tmp_path, store=store)
 
@@ -266,7 +268,7 @@ def test_live_drop_below_threshold_once_faded_writes_nothing(tmp_path: Path, mon
 
     store = MemoryStore(tmp_path / "memories.db")
     _go_live(tmp_path, store)
-    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+    monkeypatch.setattr(engine_utils, "faded_emotion", _half_fade)
 
     # joy 8 stored gives 5.6, above the 3.0 threshold; faded to 4 it gives 2.8, below it.
     grief.handle_drop(memory=_make_dropped_memory(memory_id="mem-live", joy=8.0), persona_dir=tmp_path, store=store)
@@ -297,7 +299,7 @@ def test_live_old_row_over_ten_stays_in_range(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     _go_live(tmp_path, store)
     memory = _make_dropped_memory(memory_id="mem-old", joy=1.0)
-    object.__setattr__(memory, "emotions", {"love": 18.0, "joy": 22.0})
+    object.__setattr__(memory, "_stored_emotions", {"love": 18.0, "joy": 22.0})
 
     grief.handle_drop(memory=memory, persona_dir=tmp_path, store=store)
 

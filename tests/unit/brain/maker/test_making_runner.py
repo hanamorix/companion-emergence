@@ -56,7 +56,7 @@ def test_make_and_wire_writes_act_memory_with_emotion_for_nondiscard(tmp_path):
     mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # the emotion delta was applied W8-style: seeded onto the act-memory
-    assert mems[0].emotions
+    assert mems[0]._stored_emotions
     store2.close()
 
 
@@ -79,7 +79,7 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # discard moves nothing — empty-emotion act-memory only
-    assert not mems[0].emotions
+    assert not mems[0]._stored_emotions
     store2.close()
 
 
@@ -87,14 +87,14 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
 
 
 def _go_live(persona_dir, store):
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     from datetime import UTC, datetime
 
-    from brain.emotion import engine_files
     from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _made_emotions(tmp_path, *, live):
@@ -109,7 +109,7 @@ def _made_emotions(tmp_path, *, live):
     _promote_pending(tmp_path)
     store2 = MemoryStore(tmp_path / "memories.db")
     try:
-        return store2.list_by_type("making", limit=10)[0].emotions
+        return store2.list_by_type("making", limit=10)[0]._stored_emotions
     finally:
         store2.close()
 

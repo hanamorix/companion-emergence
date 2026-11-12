@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain.bridge.provider import LLMProvider
+from brain.emotion import engine as emotion_engine
 from brain.emotion.aggregate import aggregate_state
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
@@ -158,13 +160,18 @@ class DreamEngine:
                 strengthened_edges=edges,
             )
 
+    def _persona_engine(self) -> EmotionEngine | None:
+        """The persona's emotion engine whether or not it is switched on (its read falls back to the pure read while it is
+        off); None when there is no persona_dir. For `feelings_of`, which makes the engine-or-pure choice."""
+        if self.persona_dir is None:
+            return None
+        return emotion_engine.engine_for(self.persona_dir)
+
     def _live_engine(self) -> EmotionEngine | None:
         """The persona's emotion engine when its switch is on; None when off, unknown, or there is no persona_dir."""
         if self.persona_dir is None:
             return None
-        from brain.emotion.engine import engine_for
-
-        eng = engine_for(self.persona_dir)
+        eng = emotion_engine.engine_for(self.persona_dir)
         return eng if eng.is_live() else None
 
     def _select_seed(
@@ -299,16 +306,16 @@ class DreamEngine:
         route_write(self.store, dream, source="dream")
         return dream
 
-    @staticmethod
-    def _stored_sums(seed: Memory, neighbours: list[tuple[Memory, float]]) -> dict[str, float]:
-        # Sum per-emotion across seed + neighbours. Values are intentionally
-        # NOT clamped here — a vivid "love"-saturated dream may legitimately
-        # show love=80 across 8 activated memories. Downstream consumers that
-        # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
-        # ingest, not here.
-        aggregated_emotions: dict[str, float] = dict(seed.emotions)
+    def _stored_sums(self, seed: Memory, neighbours: list[tuple[Memory, float]]) -> dict[str, float]:
+        # Sum per-emotion across seed + neighbours. Each memory's values are held to 0-10
+        # by the one read before they are summed (love 18 and love 2 give 10 + 2 = 12, not
+        # 20); the SUM is not clamped, so a vivid "love"-saturated dream may legitimately
+        # show love=80 across 8 activated memories. Downstream consumers that need a
+        # bounded 0..10 range (e.g. EmotionalState.set) clamp on ingest, not here.
+        eng = self._persona_engine()
+        aggregated_emotions: dict[str, float] = dict(feelings_of(seed, eng).feelings)  # a copy: the read's map is shared
         for mem, _ in neighbours:
-            for k, v in mem.emotions.items():
+            for k, v in feelings_of(mem, eng).feelings.items():
                 aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
         return aggregated_emotions
 
@@ -316,17 +323,18 @@ class DreamEngine:
     def _faded_means(
         seed: Memory, neighbours: list[tuple[Memory, float]], eng: EmotionEngine
     ) -> dict[str, float]:
-        """Per emotion, the mean of the faded values across the seed and the neighbours that carry it, held to 0-10.
+        """Per emotion, the mean of the engine's read values across the seed and the neighbours that carry it.
 
-        Old rows can hold values below 0 or over 10. A mean held to 0 is kept, not dropped.
+        The read fades each memory's values and holds each to 0-10 (old rows can hold values below 0 or over 10), so the
+        mean stays within 0-10 too. A value held to 0 is kept, not dropped.
         """
         totals: dict[str, float] = {}
         counts: dict[str, int] = {}
         for mem in [seed, *(m for m, _ in neighbours)]:
-            for name in mem.emotions:
-                totals[name] = totals.get(name, 0.0) + eng.faded_value(mem, name)
+            for name, value in eng.memory_feelings(mem).feelings.items():
+                totals[name] = totals.get(name, 0.0) + value
                 counts[name] = counts.get(name, 0) + 1
-        return {name: min(max(total / counts[name], 0.0), 10.0) for name, total in totals.items()}
+        return {name: total / counts[name] for name, total in totals.items()}
 
     def _strengthen_edges(
         self,
@@ -397,7 +405,7 @@ class DreamEngine:
                 source="dream",
                 source_id=dream_memory.id,
                 emotional_snapshot=EmotionalSnapshot(
-                    vector=dict(dream_memory.emotions),
+                    vector=dict(feelings_of(dream_memory, self._persona_engine()).feelings),
                     rolling_baseline_mean=0.0,
                     rolling_baseline_stdev=0.0,
                     current_resonance=0.0,

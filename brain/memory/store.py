@@ -125,7 +125,7 @@ def clamp_importance(x: float) -> float:
     importance, however derived, passes through here before it can reach a
     Memory row. Applied inside Memory.create_new (covers an unclamped
     emotion-sum default, e.g. engines/dream.py's saturated aggregate) AND
-    inside migrator/transform.py's bespoke Memory(...) construction (which
+    inside migrator/transform.py's Memory.from_stored_row construction (which
     bypasses create_new). One helper, both boundaries: no producer can ever
     emit importance > 10.0, and a legitimate value already in range is
     never altered.
@@ -133,10 +133,160 @@ def clamp_importance(x: float) -> float:
     return min(10.0, max(0.0, float(x)))
 
 
-def _emotions_column(emotions: dict[str, float]) -> str:
-    """Encode an emotions dict for the ``emotions_json`` column. The batch and the refresh writers share this one encoder, so the
-    refresh adds no direct ``json.dumps`` site to ``store.py`` (the json-io allowlist's count for this file does not grow)."""
-    return json.dumps(emotions)
+def _json_column(value: dict[str, Any]) -> str:
+    """Encode a mapping for a JSON text column (``emotions_json``). The batch and
+    the refresh writers and the x10 fix share this one encoder, so they add no direct ``json.dumps`` site to ``store.py`` (the
+    json-io allowlist's count for this file does not grow)."""
+    return json.dumps(value)
+
+
+def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, float]:
+    """The emotions of two memories that merge. Each memory goes through the engine's one name-resolution step first
+    (`resolve_emotions`: each name in its standard spelling, two spellings of one emotion one entry with their average, every
+    value held to 0-10, a value that is not a finite number dropped with a log line). Then an emotion on both memories is the
+    average of the two, and an emotion on one memory only is copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory counts
+    once in the average across the two. Returns a new dict, the target's names first.
+
+    `brain.emotion.engine_utils` is imported here, not at the top: it pulls `brain.utils.memory`, which imports this module.
+    """
+    from brain.emotion.engine_utils import resolve_emotions
+
+    merged = resolve_emotions(target_emotions)
+    for name, value in resolve_emotions(cand_emotions).items():
+        merged[name] = (merged[name] + value) / 2 if name in merged else value
+    return merged
+
+
+def _metadata_or_none(raw: object) -> dict[str, Any] | None:
+    """The mapping a `metadata_json` value holds, or None when it cannot be read as one.
+
+    An empty value or JSON `null` (what a legacy writer stored) is the empty mapping. Text that is not JSON (or nested past the
+    parser's limit, or an integer past its digit limit), or JSON that is not a mapping, is None. The ONE reader of the metadata
+    column: `_safe_load_metadata` turns None into `{}` for every ordinary read, and the x10 fix leaves a row whose metadata is None
+    alone (a row the writers could not have made; nothing is lost; the row is skipped with a warning).
+    """
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if loaded is None:
+        return {}
+    return loaded if isinstance(loaded, dict) else None
+
+
+def times_if_finite(value: object, factor: float) -> float | None:
+    """`value * factor` for a number (not a bool) whose product is finite, else None.
+
+    One rule for the score of a row and of a queued candidate in the x10 fix: text, a bool, NaN, an infinity, a number whose
+    product overflows (a whole number too large for a float, which `json.loads` accepts, raises `OverflowError` here) are None.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        product = value * factor
+    except OverflowError:
+        return None
+    return product if math.isfinite(product) else None
+
+
+def has_feeling_at_or_above(emotions: object, threshold: float) -> bool:
+    """True when `emotions` is a mapping holding a number (not a bool) at or above `threshold`: its largest value is not below it.
+
+    The quiet half of the x10 fix's selection for a queued candidate (the database half selects by the stored peak column): an
+    entry already on the 0-10 scale is simply not selected, with no warning, because most queued entries are. NaN is not at or
+    above anything; `scaled_small_emotions` then refuses it with a warning.
+    """
+    return isinstance(emotions, dict) and any(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and v >= threshold for v in emotions.values()
+    )
+
+
+def scaled_small_emotions(emotions: object, *, factor: float, threshold: float, where: str) -> dict[str, float] | None:
+    """The feelings of one row or queued candidate of the x10 fix, every member held to 0 or more and multiplied by `factor`, or None to leave it.
+
+    THE one multiply rule of the fix, shared by the database half (`_scaled_small_feelings`) and the queue half
+    (`brain/memory/pending.py`). None, with a warning that names `where` (an id, never content), when the feelings are not a
+    mapping of numbers, or hold a number at or above `threshold` or one that cannot be held (NaN) or whose product with `factor`
+    is not finite (`_small_feeling_times`). A negative number (a peer's model delta keeps its sign) is held to 0.0 and then
+    multiplied with the rest, so it becomes 0.0 (the owner's ruling of 2026-10-06; the engine holds a stored negative at 0.0
+    before any fold in any case) and the positive members reach the 0-10 scale. The empty mapping gives the empty mapping: a row
+    or entry with no feelings is still multiplied in its peak and score (Planning B27 Q15), so no caller skips it.
+    """
+    if not isinstance(emotions, dict):
+        logger.warning("x10 fix: %s skipped, its feelings are not a mapping of numbers", where)
+        return None
+    multiplied: dict[str, float] = {}
+    for name, value in emotions.items():
+        product = _small_feeling_times(value, factor, threshold)
+        if product is None:
+            logger.warning(
+                "x10 fix: %s skipped, a stored feeling is not a number below %s that times %s stays finite", where, threshold, factor
+            )
+            return None
+        multiplied[name] = product
+    return multiplied
+
+
+def _scaled_small_feelings(row: sqlite3.Row, factor: float, threshold: float) -> tuple[str, float, float] | None:
+    """The new `(emotions_json, score, peak)` of one row of the x10 fix (`MemoryStore.scale_up_small_nudge_rows`), or None to leave it.
+
+    The feelings and the peak are each held to 0.0 or more and multiplied (`scaled_small_emotions`, `_small_feeling_times`);
+    the score is multiplied as stored (it is a creation-time snapshot, not recomputed). A row with no feelings is multiplied like any other, in its peak
+    and score (Planning B27 Q15): its peak survives the decay of its feelings, so it can still be on the old scale.
+
+    None WITH a warning naming the row's id (never its content) for a row that cannot be multiplied safely: `metadata_json` that
+    is not a mapping (`_metadata_or_none`: a row the writers could not have made, left as it is; Planning B29 C2 item 3, P4),
+    feelings that cannot be multiplied (`scaled_small_emotions`), a score that is not a number, or a score or peak whose product
+    is not finite (the peak is a REAL column the caller's selector has already compared with the threshold, so it is a number).
+    The caller has already selected rows whose stored peak is below the threshold, so a feeling at or above it is a row whose own
+    columns disagree.
+    """
+    memory_id = row["id"]
+    if _metadata_or_none(row["metadata_json"]) is None:
+        logger.warning("x10 fix: row %s skipped, its metadata is not a mapping", memory_id)
+        return None
+    try:
+        emotions = json.loads(row["emotions_json"])
+    except (TypeError, ValueError, RecursionError):
+        emotions = None
+    multiplied = scaled_small_emotions(emotions, factor=factor, threshold=threshold, where=f"row {memory_id}")
+    if multiplied is None:
+        return None
+    new_score = times_if_finite(row["score"], factor)
+    if new_score is None:
+        logger.warning("x10 fix: row %s skipped, its score is not a number, or its score times %s is not a finite number", memory_id, factor)
+        return None
+    new_peak = _small_feeling_times(row["peak_emotion_intensity"], factor, threshold)
+    if new_peak is None:
+        logger.warning("x10 fix: row %s skipped, its peak is not a number below %s that times %s stays finite", memory_id, threshold, factor)
+        return None
+    return _json_column(multiplied), new_score, new_peak
+
+
+def _small_feeling_times(value: object, factor: float, threshold: float) -> float | None:
+    """The held `value` times `factor` for a stored feeling the x10 fix can multiply, else None.
+
+    A number (not a bool) below the threshold. A negative one is held to 0.0 first, by `engine_utils._hold`, the engine's own
+    hold (Planning B29 C2 item 1; the owner ruled on 2026-10-06 that negatives are converted to 0), so the product is 0.0. THE
+    one place the fix holds a value: the feelings and the peak of a row, and the feelings of a queued candidate, all come through
+    here. `engine_utils` is imported here, not at the top (the same cycle `day_of` avoids, see its use above). A value `_hold`
+    cannot hold (NaN stays NaN), an infinity, and a number whose product overflows (a finite 1e308-sized value, or a whole number
+    too large for a float, which `json.loads` accepts and whose comparison or product raises `OverflowError`) are None: storing
+    an infinity or a NaN would be a new damaged row.
+    """
+    from brain.emotion.engine_utils import _hold
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        if value >= threshold:
+            return None
+        product = _hold(value) * factor
+    except OverflowError:
+        return None
+    return product if math.isfinite(product) else None
 
 
 # PLACEHOLDER WORDING. The date the temp gate's write-back puts at the start of a recalled memory's text (spec section 7
@@ -196,13 +346,7 @@ def _safe_load_metadata(raw: str | None) -> dict[str, Any]:
     manual DB edits or legacy writers that stored the string "null",
     malformed JSON, or non-dict top-level values.
     """
-    if not raw:
-        return {}
-    try:
-        loaded = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
+    return _metadata_or_none(raw) or {}
 
 
 @dataclass
@@ -215,18 +359,21 @@ class Memory:
         memory_type: "conversation", "meta", "dream", "consolidated",
             "heartbeat", "reflex", or any persona-defined category.
         domain: "us", "work", "craft", or any persona-defined scope.
-        emotions: {emotion_name: intensity} at creation time.
+        _stored_emotions: {emotion_name: intensity} as stored at creation time.
+            Private: the only readers are the store and the emotion engine
+            (`engine_utils.memory_feelings`, `EmotionEngine.memory_feelings`).
+            Every other reader asks the engine for the memory's feelings.
         tags: free-form labels.
         importance: 0.0..10.0 (normalised). Auto-defaults to score/10 if
             not explicitly specified at create_new() time.
-        score: sum of emotion intensities — snapshot at construction.
-            Not updated if `emotions` is mutated in place after creation;
-            consumers that want a live sum should recompute themselves.
+        _stored_score: sum of emotion intensities, a snapshot at construction.
+            Private like `_stored_emotions`; read through `MemoryFeelings.score`.
+        _stored_peak: the highest stored intensity. Private like
+            `_stored_emotions`; read through `MemoryFeelings.peak`.
         created_at: tz-aware UTC datetime of creation.
         last_accessed_at: tz-aware UTC datetime of most recent read, or None.
         active: F22 deactivation flag. Inactive memories are excluded from
             default queries but remain in the database (reversible).
-        protected: excluded from decay/consolidation.
         metadata: free-form dict for fields not modelled as first-class
             attributes — absorbs OG-only fields (source_date, supersedes,
             etc.) during migration without proliferating the dataclass.
@@ -238,18 +385,62 @@ class Memory:
     memory_type: str
     domain: str
     created_at: datetime
-    emotions: dict[str, float] = field(default_factory=dict)
+    _stored_emotions: dict[str, float] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     importance: float = 0.0
-    score: float = 0.0
+    _stored_score: float = 0.0
     last_accessed_at: datetime | None = None
     active: bool = True
-    protected: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     state: str = "active"
     content_snapshot: str | None = None
     recall_count: float = 0.0
-    peak_emotion_intensity: float = 0.0
+    _stored_peak: float = 0.0
+
+    @classmethod
+    def from_stored_row(
+        cls,
+        *,
+        id: str,
+        content: str,
+        memory_type: str,
+        domain: str,
+        created_at: datetime,
+        emotions: dict[str, float] | None = None,
+        tags: list[str] | None = None,
+        importance: float = 0.0,
+        score: float = 0.0,
+        last_accessed_at: datetime | None = None,
+        active: bool = True,
+        metadata: dict[str, Any] | None = None,
+        state: str = "active",
+        content_snapshot: str | None = None,
+        recall_count: float = 0.0,
+        peak_emotion_intensity: float = 0.0,
+    ) -> Memory:
+        """Rebuild a memory from a stored row's own values, under public parameter names.
+
+        The one way to build a `Memory` that is not new (the row mapper, `from_dict`, the migrator,
+        recovery): the private field names stay inside this module and the emotion engine.
+        """
+        return cls(
+            id=id,
+            content=content,
+            memory_type=memory_type,
+            domain=domain,
+            created_at=created_at,
+            _stored_emotions=emotions if emotions is not None else {},
+            tags=tags if tags is not None else [],
+            importance=importance,
+            _stored_score=score,
+            last_accessed_at=last_accessed_at,
+            active=active,
+            metadata=metadata if metadata is not None else {},
+            state=state,
+            content_snapshot=content_snapshot,
+            recall_count=recall_count,
+            _stored_peak=peak_emotion_intensity,
+        )
 
     @classmethod
     def create_new(
@@ -285,12 +476,12 @@ class Memory:
             memory_type=memory_type,
             domain=domain,
             created_at=datetime.now(UTC),
-            emotions=emotions,
+            _stored_emotions=emotions,
             tags=tags,
             importance=clamp_importance(raw_importance),
-            score=score,
+            _stored_score=score,
             metadata=metadata,
-            peak_emotion_intensity=max(
+            _stored_peak=max(
                 (float(v) for v in emotions.values()), default=0.0
             ),
         )
@@ -302,16 +493,15 @@ class Memory:
             "content": self.content,
             "memory_type": self.memory_type,
             "domain": self.domain,
-            "emotions": dict(self.emotions),
+            "emotions": dict(self._stored_emotions),
             "tags": list(self.tags),
             "importance": self.importance,
-            "score": self.score,
+            "score": self._stored_score,
             "created_at": self.created_at.isoformat(),
             "last_accessed_at": self.last_accessed_at.isoformat()
             if self.last_accessed_at
             else None,
             "active": self.active,
-            "protected": self.protected,
             "metadata": dict(self.metadata),
         }
 
@@ -325,7 +515,7 @@ class Memory:
         last_accessed = (
             _coerce_utc(data["last_accessed_at"]) if data.get("last_accessed_at") else None
         )
-        return cls(
+        return cls.from_stored_row(
             id=data["id"],
             content=data["content"],
             memory_type=data["memory_type"],
@@ -337,7 +527,6 @@ class Memory:
             score=float(data.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
-            protected=bool(data.get("protected", False)),
             metadata=dict(data.get("metadata") or {}),
         )
 
@@ -1188,30 +1377,43 @@ class MemoryStore:
             """
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
-                importance, score, created_at, last_accessed_at, active, protected,
+                importance, score, created_at, last_accessed_at, active,
                 metadata_json, peak_emotion_intensity
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
                 memory.content,
                 memory.memory_type,
                 memory.domain,
-                json.dumps(memory.emotions),
+                json.dumps(memory._stored_emotions),
                 json.dumps(memory.tags),
                 memory.importance,
-                memory.score,
+                memory._stored_score,
                 memory.created_at.isoformat(),
                 memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
                 1 if memory.active else 0,
-                1 if memory.protected else 0,
                 metadata_json,
                 max(
-                    [memory.peak_emotion_intensity]
-                    + [float(v) for v in memory.emotions.values()]
+                    [memory._stored_peak]
+                    + [float(v) for v in memory._stored_emotions.values()]
                 ),
             ),
         )
+
+    def merge_into(self, target: Memory, candidate: Memory, merged_content: str, *, engine_live: bool) -> None:
+        """Write the consolidation merge's result into `target`: the merged content and, once the engine is live, the
+        two memories' stored emotions merged (`_merge_emotions`), in ONE `update` call with ``fold=False``.
+
+        This reads the stored emotions of both memories on purpose and is not a reader of their feelings: the merged map is
+        written back to the row under its old ``created_at``, so a value already faded by age would be faded twice. A
+        merge before the switch-over (``engine_live`` False) writes the content only. Raises `KeyError` as `update` does when
+        the target row no longer exists.
+        """
+        fields: dict[str, Any] = {"content": merged_content}
+        if engine_live:
+            fields.update(emotions=_merge_emotions(target._stored_emotions, candidate._stored_emotions), fold=False)
+        self.update(target.id, **fields)
 
     def emotion_engine(self) -> Any | None:
         """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
@@ -1238,11 +1440,11 @@ class MemoryStore:
     def _notify_assigned(self, before: Memory, new_emotions: dict[str, float]) -> None:
         """Tell the engine a row that had no feelings now has some: the row as it was before the update, with the new emotions."""
         try:
-            if before.emotions or not new_emotions:
+            if before._stored_emotions or not new_emotions:
                 return
             target = self.emotion_engine()
             if target is not None:
-                target.on_emotions_assigned(replace(before, emotions=dict(new_emotions)))
+                target.on_emotions_assigned(replace(before, _stored_emotions=dict(new_emotions)))
         except Exception:
             logger.error("MemoryStore.update: telling the emotion engine about %s failed", before.id, exc_info=True)
 
@@ -2884,7 +3086,7 @@ class MemoryStore:
         """Update the given fields on an existing memory.
 
         Accepts: content, memory_type, domain, emotions (dict), tags (list),
-        importance, score, last_accessed_at, active, protected.
+        importance, score, last_accessed_at, active.
 
         `fold` is not a field. When true and `emotions` is among the fields, a row that had no emotions and gets some now
         is reported to the emotion engine (`on_emotions_assigned`), once the update, and the re-embed of a changed content,
@@ -2920,7 +3122,7 @@ class MemoryStore:
                     key,
                     value.isoformat() if value else None,
                 )
-            elif key in ("active", "protected"):
+            elif key == "active":
                 column_map[key] = (key, 1 if value else 0)
             elif key in (
                 "content",
@@ -2987,41 +3189,6 @@ class MemoryStore:
         if fold and "emotions" in fields:
             self._notify_assigned(before, fields["emotions"])
 
-    def update_emotions_batch(self, rows: Sequence[tuple[str, dict[str, float]]]) -> None:
-        """Write a batch of emotions-only updates in ONE transaction (C10(b),
-        S17/S45): the heartbeat's batched decay pass, not the per-row
-        ``update(emotions=...)`` path (which commits per call).
-
-        Same column semantics as ``update(emotions=...)``: ``emotions_json``
-        replaced, ``peak_emotion_intensity`` raised via ``MAX(...)`` — never
-        lowered by decay (store.py:2197-2203). No embedding/content column is
-        touched (that branch of ``update`` only fires when ``content`` is
-        among the updated fields, which is never true here) — nothing new is
-        added to the row (I2/I8), and ``PRAGMA table_info(memories)`` is
-        unaffected (no schema change).
-
-        Every ``execute`` below runs before the single trailing ``commit()``,
-        so the whole batch is exactly one transaction (sqlite3's default
-        deferred-transaction behavior: an implicit BEGIN on the first write,
-        held open until this commit) — never one transaction per row. Callers
-        are responsible for pre-filtering to rows whose emotions actually
-        changed (S18); this method does not re-check and will happily rewrite
-        an unchanged row if asked to.
-
-        No-op (no transaction opened, no commit) when ``rows`` is empty.
-        """
-        if not rows:
-            return
-        with self._rolls_back_on_error():
-            for memory_id, emotions in rows:
-                new_max = max((float(v) for v in emotions.values()), default=0.0)
-                self._conn.execute(
-                    "UPDATE memories SET emotions_json = ?, "
-                    "peak_emotion_intensity = MAX(peak_emotion_intensity, ?) WHERE id = ?",
-                    (_emotions_column(emotions), new_max, memory_id),
-                )
-            self._conn.commit()
-
     def refresh_faded_emotions(
         self, memory_id: str, emotions: dict[str, float], created_at: datetime
     ) -> None:
@@ -3064,7 +3231,7 @@ class MemoryStore:
             # this write-back keeps the day the memory was made.
             new_snapshot = None if snapshot is None else _with_date_prefix(snapshot, before)
             assignments = ["emotions_json = ?", "created_at = ?"]
-            values: list[Any] = [_emotions_column(emotions), created_at.isoformat()]
+            values: list[Any] = [_json_column(emotions), created_at.isoformat()]
             text_changed = content != row["content"]
             if text_changed:
                 assignments += ["content = ?", "embedding = NULL", "embedding_model_id = NULL"]
@@ -3098,7 +3265,7 @@ class MemoryStore:
 
     _ENGINE_WINDOW_COLUMNS = (
         "id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
-        "last_accessed_at, active, protected, metadata_json, state, content_snapshot, recall_count, "
+        "last_accessed_at, active, metadata_json, state, content_snapshot, recall_count, "
         "peak_emotion_intensity"
     )
 
@@ -3166,6 +3333,85 @@ class MemoryStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("MemoryStore.oldest_created_at: the oldest created_at %r cannot be read (%s)", row["oldest"], exc)
             return None
+
+    def x10_progress(self) -> int:
+        """The progress note of the one-time x10 fix: `PRAGMA user_version` of this database (0 when the fix never ran).
+
+        Nothing else uses `user_version` on `memories.db`. 0 = nothing done, `dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE`
+        = the rows are multiplied (set in the rows' own transaction), `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` = the
+        pending-queue step has started (set by `PendingQueue.scale_up_small_making_candidates` before it rewrites any file, so
+        it does not mean the files are done).
+        Read and written only through this method and `set_x10_progress` (P7). It is a fresh read each time, not a cached one.
+        """
+        return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def set_x10_progress(self, number: int) -> None:
+        """Set the x10 fix's progress note (`PRAGMA user_version`) and commit it; see `x10_progress`. A failure raises with the number as it was."""
+        with self._rolls_back_on_error():
+            self._conn.execute(f"PRAGMA user_version = {int(number)}")  # noqa: S608 (an int, not text)
+            self._conn.commit()
+
+    def scale_up_small_nudge_rows(self) -> int:
+        """The one-time x10 fix of small feelings (the emotion engine's first start, `brain/emotion/nudge_scale_fix.py`): returns how many rows it multiplied.
+
+        Rows of the types in `dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES` whose stored peak is below the threshold, AND whose
+        feelings are all numbers below the threshold, get `emotions_json`, `score` and `peak_emotion_intensity` multiplied by the
+        factor, the whole row at once (`importance` is not touched). A negative feeling or peak (in practice only a peer's model
+        delta is one) is held to 0.0 first and then multiplied, so it becomes 0.0 (Planning B29 C2 item 1; the owner ruled on
+        2026-10-06 that negatives are converted to 0); the score is multiplied as stored. A row with no feelings is multiplied
+        in its peak and score too (Planning B27 Q15). A row whose `emotions_json` cannot be read as a mapping of numbers (NaN
+        included), whose `metadata_json` cannot be read as a mapping, whose score is not a number, with a stored peak below the
+        threshold while a feeling is not, or whose multiplied values would not be finite, is left as it is with a logged warning
+        naming its id, and is not counted: one damaged row must not stop every start-up for good.
+
+        No row carries a marker (the owner ruled out per-row markers, S77). The progress note is `PRAGMA user_version` (see
+        `x10_progress`): inside the one write transaction (`BEGIN IMMEDIATE`, which also serialises two starters, the bridge and a
+        CLI command) the number is read; if it is not 0 the rows were done by an earlier start and nothing is multiplied; if it is
+        0 the rows are multiplied and the number is set to `NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE` in the same transaction, so a
+        crash leaves either both or neither. The transaction also holds the selection and the updates; SQLite makes it
+        all-or-nothing, so no value or row-count check is repeated here (owner S84: what the database already recovers is not
+        done again); any error rolls everything back and raises. A row written by something else while the app is down
+        between the steps of a start-up is missed (accepted edge, owner S77). The cut is not by date: a row written at the old
+        scale before the switch-over exists is multiplied too. The count and every multiplied row's id are logged once, after
+        the commit.
+        """
+        types = dev_constants.NUDGE_SCALE_FIX_MEMORY_TYPES
+        factor = dev_constants.NUDGE_SCALE_FIX_FACTOR
+        threshold = dev_constants.NUDGE_SCALE_FIX_THRESHOLD
+        if self._conn.in_transaction:
+            raise RuntimeError("the x10 fix cannot run inside an open transaction (its commit would take the caller's writes)")
+        with self._rolls_back_on_error():
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self.x10_progress() != 0:
+                self._conn.rollback()  # an earlier start did the rows: nothing to do, nothing written
+                return 0
+            marks = ",".join("?" * len(types))
+            rows = self._conn.execute(
+                "SELECT id, emotions_json, score, peak_emotion_intensity, metadata_json FROM memories "  # noqa: S608
+                f"WHERE memory_type IN ({marks}) AND peak_emotion_intensity < ?",
+                (*types, threshold),
+            ).fetchall()
+            scaled: list[tuple[str, str, float, float]] = []
+            for row in rows:
+                new_values = _scaled_small_feelings(row, factor, threshold)
+                if new_values is not None:
+                    scaled.append((row["id"], *new_values))
+            for memory_id, emotions_json, score, peak in scaled:
+                self._conn.execute(
+                    "UPDATE memories SET emotions_json = ?, score = ?, peak_emotion_intensity = ? WHERE id = ?",
+                    (emotions_json, score, peak, memory_id),
+                )
+            self._conn.execute(f"PRAGMA user_version = {int(dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)}")  # noqa: S608 (an int)
+            self._conn.commit()
+        # The ids go in the log in full, in this one record, so the rows can be found by hand if the fix ever has to be undone
+        # (a multiplied row cannot be told from one that was always on this scale).
+        logger.info(
+            "MemoryStore.scale_up_small_nudge_rows: multiplied the feelings of %d rows by %s (ids: %s)",
+            len(scaled),
+            factor,
+            ", ".join(memory_id for memory_id, *_ in scaled),
+        )
+        return len(scaled)
 
     def deactivate(self, memory_id: str) -> None:
         """Mark a memory inactive (F22 semantics). Raises KeyError if unknown."""
@@ -3656,51 +3902,37 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
-    def list_active_since(
-        self, cursor: tuple[str, str] | None, *, limit: int
-    ) -> list[Memory]:
-        """Return up to `limit` active memories strictly after `cursor`,
-        ordered ASCENDING by (created_at, id) (oldest-of-the-remainder
-        first).
+    def has_active_without_emotions(self) -> bool:
+        """True when some active memory has an empty stored emotion vector.
 
-        `cursor` is `(created_at_iso, id)` of the last row already
-        processed, or `None` to start from the beginning of history. Uses a
-        composite keyset comparison — `created_at > ts OR (created_at = ts
-        AND id > id)` — rather than filtering on `created_at` alone, so that
-        multiple rows sharing an IDENTICAL `created_at` (common after a bulk
-        migrator import — see `brain/migrator/emergence_kit.py` — since
-        `brain/migrator/transform.py` derives `created_at` from the source
-        export's own timestamp string) are still individually reachable: a
-        strict `created_at > ts` filter would make every row but the last
-        one at a shared timestamp permanently invisible to a caller that
-        pins its cursor at that timestamp (the embedding backfill's cursor
-        used to; it now walks rowid, see `list_unembedded_since`). `id` is a
-        UUID4 string (TEXT PRIMARY KEY); the comparison is a plain
-        lexicographic tiebreak, not creation order — it only needs to be a
-        stable TOTAL order so no row at a shared timestamp is skipped or
-        revisited, not a meaningful one. A bounded, cursor-paged sibling of
-        `list_active()` for a caller that walks the WHOLE corpus a little at
-        a time across many calls rather than loading it all at once — same
-        `active = 1` filter as `list_active()`. See `list_unembedded_since`
-        below for the embedding backfill's own backlog query (F1 #259
-        increment 3), which walks insertion order instead.
+        The emotion backfill's work probe: it streams only the ``emotions_json`` column and stops at the first empty vector,
+        instead of loading every active row (with its embedding) the way `list_active` does.
         """
-        if cursor is None:
-            sql = (
-                "SELECT * FROM memories WHERE active = 1 "
-                "ORDER BY created_at ASC, id ASC LIMIT ?"
-            )
-            params: list[Any] = [limit]
-        else:
-            cursor_ts, cursor_id = cursor
-            sql = (
-                "SELECT * FROM memories WHERE active = 1 AND "
-                "(created_at > ? OR (created_at = ? AND id > ?)) "
-                "ORDER BY created_at ASC, id ASC LIMIT ?"
-            )
-            params = [cursor_ts, cursor_ts, cursor_id, limit]
-        rows = self._conn.execute(sql, params).fetchall()
-        return [_row_to_memory(row) for row in rows]
+        cur = self._conn.execute("SELECT emotions_json FROM memories WHERE active = 1")
+        try:
+            for (emotions_json,) in cur:
+                if not json.loads(emotions_json):
+                    return True
+            return False
+        finally:
+            cur.close()
+
+    @staticmethod
+    def has_stored_emotions(memory: Memory) -> bool:
+        """True when the memory carries any stored emotion (the emotion backfill's emptiness check on a loaded row).
+
+        A check of whether the row was ever given feelings, not a read of their values: the values go through `memory_feelings`.
+        """
+        return bool(memory._stored_emotions)
+
+    @staticmethod
+    def stored_emotion_names(memory: Memory) -> list[str]:
+        """The names the memory has stored emotions under, text names only (a name that is not text cannot be named canonically).
+
+        The temp-gate write-back's guard input: it compares these names, in canonical form, with the names the one read returns.
+        Names only, never values: the values go through `memory_feelings`.
+        """
+        return [name for name in memory._stored_emotions if isinstance(name, str)]
 
     def list_unembedded_since(
         self,
@@ -3915,7 +4147,7 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
     created = _coerce_utc(row["created_at"])
     last_accessed = _coerce_utc(row["last_accessed_at"]) if row["last_accessed_at"] else None
     row_keys = row.keys()
-    return Memory(
+    return Memory.from_stored_row(
         id=row["id"],
         content=row["content"],
         memory_type=row["memory_type"],
@@ -3927,7 +4159,6 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         score=float(row["score"]),
         last_accessed_at=last_accessed,
         active=bool(row["active"]),
-        protected=bool(row["protected"]),
         metadata=_safe_load_metadata(row["metadata_json"]),
         state=row["state"] if "state" in row_keys else "active",
         content_snapshot=row["content_snapshot"] if "content_snapshot" in row_keys else None,

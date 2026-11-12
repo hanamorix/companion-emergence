@@ -11,7 +11,7 @@ silent corruption:
   felt_time.count_chat_turns_since           inflated turn count -> skewed rolling baseline
   ingest/extract.format_transcript           summary re-ingested as memory
   ingest/pipeline.extract_session_snapshot   cursor advanced past un-extracted turns
-  initiate/user_pattern._compute_silence_days  compaction ts = "recent user msg"
+  ingest/buffer.last_user_turn_ts            compaction ts = "recent user msg"
   initiate/user_pattern._compute_likely_active compaction ts skews hour distribution
 
 All 6 readers are covered here.
@@ -174,26 +174,25 @@ def test_extract_session_snapshot_cursor_unaffected_by_summary_ts(tmp_path):
     assert cursor_after >= real_ts, f"cursor should be >= real turn ts ({real_ts}), got {cursor_after}"
 
 
-# 5. user_pattern._compute_silence_days
+# 5. buffer.last_user_turn_ts (the one source of days_since_human and of the user-presence silence)
 
 def test_silence_days_excludes_summary_row(tmp_path):
-    from brain.initiate.user_pattern import _compute_silence_days
+    from brain.ingest.buffer import last_user_turn_ts
     persona_dir = tmp_path / "nell"
     _write_buffer(persona_dir, "s1", [_summary_row(_NOW - timedelta(seconds=10))])
-    result = _compute_silence_days(persona_dir, _now=_NOW)
-    assert result == 0.0, f"summary row should not count as user turn; expected 0.0, got {result}"
+    result = last_user_turn_ts(persona_dir)
+    assert result is None, f"summary row should not count as user turn; expected None, got {result}"
 
 
 def test_silence_days_real_turn_still_counted(tmp_path):
-    from brain.initiate.user_pattern import _compute_silence_days
+    from brain.ingest.buffer import last_user_turn_ts
     persona_dir = tmp_path / "nell"
     user_ts = _NOW - timedelta(hours=2)
     _write_buffer(persona_dir, "s1", [
         _summary_row(_NOW - timedelta(hours=10)),
         _user_row(user_ts, "a real message"),
     ])
-    result = _compute_silence_days(persona_dir, _now=_NOW)
-    assert 0.07 <= result <= 0.09, f"expected ~0.083 days (2h), got {result}"
+    assert last_user_turn_ts(persona_dir) == user_ts
 
 
 # 6. user_pattern._compute_likely_active

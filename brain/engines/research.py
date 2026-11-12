@@ -17,6 +17,7 @@ from brain import prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
+from brain.engines.heartbeat import HeartbeatConfig
 from brain.engines.research_notes import append_session_notes, read_notes_tail
 from brain.engines.research_session import extract_felt_lines, parse_session_output
 from brain.health.json_io import Recovery, read_json_result, write_json
@@ -156,6 +157,8 @@ class ResearchEngine:
 
     pull_threshold: float = 6.0
     cooldown_hours: float = 24.0
+    # The persona's `research_days_since_human_min` (HeartbeatConfig): its callers pass it; the default is the config's own.
+    research_days_since_human_min: float = HeartbeatConfig.research_days_since_human_min
 
     def run_tick(
         self,
@@ -195,43 +198,27 @@ class ResearchEngine:
         days_since = (
             days_since_human_override
             if days_since_human_override is not None
-            else days_since_human(self.store, now, persona_dir=self.interests_path.parent)
+            else days_since_human(now, persona_dir=self.interests_path.parent)
         )
         emo_state = emotion_state_override
-        high_engine = None  # the live engine, when its reading drives the emotion half of the gate
         from brain.emotion import engine
 
         live_engine = engine.engine_for(self.interests_path.parent)
-        # Read once, so the gate, the prompt and the stored feelings of this fire all agree.
+        # `live` selects Hana's research writer branch (the prompt segments, the felt-line extraction and the stored
+        # research memory below; her B1 PR #686). It is not read for the emotion state, which always comes from the engine.
         live = live_engine.is_live()
         if emo_state is None:
-            if live:
-                high_engine = live_engine
-                from brain.emotion.state import EmotionalState
+            from brain.emotion.state import EmotionalState
 
-                # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-                # pending or retrying, read() returns nothing and the research gate sees no high feeling.
-                # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
-                emo_state = EmotionalState(
-                    emotions={name: r.short for name, r in live_engine.read().items()}
-                )
-            else:
-                from brain.emotion.aggregate import aggregate_state
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the research gate sees no high feeling.
+            # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
+            emo_state = EmotionalState(emotions=engine.short_values(live_engine.read()))
 
-                all_mems = self.store.list_active(limit=None)
-                emo_state = aggregate_state(all_mems)
+        # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
+        emotion_gate = any(live_engine.feels_high(name) for name in emo_state.emotions)
 
-        if high_engine is not None:
-            # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
-            emotion_gate = any(high_engine.feels_high(name) for name in emo_state.emotions)
-        else:
-            # Old path, and a caller-supplied `emotion_state_override` (test-only: no caller in brain/).
-            emotion_gate = max(emo_state.emotions.values(), default=0.0) >= 7.0  # research_emotion_threshold default
-
-        gate_ok = (
-            days_since >= 1.5  # research_days_since_human_min default
-            or emotion_gate
-        )
+        gate_ok = days_since >= self.research_days_since_human_min or emotion_gate
         if not gate_ok:
             return ResearchResult(
                 fired=None,

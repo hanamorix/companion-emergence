@@ -2,8 +2,9 @@
 incremental/event-driven redesign (#225).
 
 Holds a small ``<persona_dir>/presence_state.json`` used to avoid a full
-history re-scan on every call: the silence-days last-seen timestamp, the
-likely-active-at-hour histogram + threshold, and the reply-lag running
+history re-scan on every call: the last-seen timestamp (silence_days no
+longer reads it: it comes from ``brain.ingest.buffer.last_user_turn_ts``),
+the likely-active-at-hour histogram + threshold, and the reply-lag running
 mean/count. ignore_streak has NO state here at all — round 6 of #225's
 red-team abandoned every attempt to translate its full backward scan into
 persisted running state (four distinct defects across rounds 2-5) and
@@ -152,7 +153,7 @@ def _presence_lock(persona_dir: Path) -> threading.Lock:
 
 
 def record_inbound_turn(persona_dir: Path, ts: str) -> None:
-    """Event hook (silence-days): update last_seen_ts to `ts` if newer.
+    """Event hook: update last_seen_ts to `ts` if newer (nothing reads it for silence-days any more).
 
     ISO-8601 strings sort correctly lexicographically, so a cheap string
     compare suffices — no parse needed. O(1): one small JSON read+write

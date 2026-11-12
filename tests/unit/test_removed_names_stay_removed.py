@@ -618,6 +618,33 @@ REMOVED: tuple[Removed, ...] = (
         ref="#583 (draft PR #632): Readers 1",
         kind="code",
     ),
+    # --- the old reader paths go now that the engine is live (#585, Readers 2) ---------------------------------------------
+    Removed(
+        names=(
+            "compute_gap",
+            "compute_derived",
+            "compute_baseline",
+            "DerivedRead",
+            "_channel_ema",
+            "_CHANNEL_FLOOR",
+            "_GAP_NOISE_FLOOR",
+            "_SHORT_HALF_LIFE_HOURS",
+            "_LONG_HALF_LIFE_HOURS",
+        ),
+        why=(
+            "the self-model's own windows, half-lives, noise floors and gap computation: the gap is the engine's shifted "
+            "channels (gap_from_read), so nothing derives a short and a long read from memory rows any more"
+        ),
+        ref="#585 (draft PR #634): Readers 2",
+        kind="code",
+    ),
+    Removed(
+        names=("_RECENT_EMOTION_WINDOW",),
+        why="the maker's 200-row window over emotion-bearing memories: it reads the engine's short averages",
+        ref="#585 (draft PR #634): Readers 2",
+        kind="code",
+        scope=("brain/maker",),
+    ),
     # --- unused emotion code removed before the writer work (#672, A2a) ------------------------------------------------------
     Removed(
         names=("brain/emotion/blend.py",),
@@ -650,10 +677,127 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("protected",),
-        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field, the column and the heartbeat check stay until phase C",
-        ref="#672 A2a cleanup",
+        why="no production code ever set the flag, so these paths stopped carrying it (#672); the Memory field, its insert and update went with the old decay pass (#586); only the database column stays",
+        ref="#672 A2a cleanup; #586 Engine 7",
         kind="code",
         scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
+    ),
+    Removed(
+        names=("brain/emotion/aggregate.py",),
+        why="the old max-pool of recent memory rows into a mood; the emotion engine is the one source of a felt state",
+        ref="#586 Engine 7",
+        kind="file",
+    ),
+    Removed(
+        names=("_warned_unregistered",),
+        why="the warn-once set of the deleted aggregate; the engine keeps its own warned-name sets on the engine instance",
+        ref="#586 Engine 7",
+        kind="code",
+    ),
+    # --- the user's last turn is read in one place (Engine 6 G3) ----------------------------------------------------------
+    Removed(
+        names=("_latest_user_turn_in_buffers", "_latest_conversation_memory_ts", "_compute_silence_days"),
+        why="three readers of the time of the user's last turn (active buffers, the newest conversation memory, a silence-days oracle); brain.ingest.buffer.last_user_turn_ts is the one",
+        ref="Engine 6 G3 (#584, draft PR #633)",
+    ),
+    # --- the x10 fix carries no marker on any row or queued candidate; its progress is `PRAGMA user_version` (Engine 6 Q10c, C2) ---
+    Removed(
+        names=("NUDGE_SCALE_FIX_MARKER", "NUDGE_SCALE_FIX_MARKER_KEY"),
+        why="the single int the x10 fix once wrote to `PRAGMA user_version`, and the metadata key it marked each multiplied row and queued candidate with; the owner ruled out per-row and per-entry markers (S77), and the fix's progress is now the two named numbers NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE and NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED in `PRAGMA user_version`",
+        ref="Engine 6 Q10c and C2 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- the x10 fix's queue step is simplified: no temporary copies, no check, no roll-forward (Engine 6 X10S, owner S84) ---
+    Removed(
+        names=("NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED", "_x10_copy_path", "_check_x10_copy", "_prepare_x10_copy", "_x10_row_is_as_expected"),
+        why="the x10 fix's temporary `.x10tmp` queue copies, their re-read check, the in-transaction value compare of the database half, and the constant that said the copies were checked; the owner ruled (S84) that what the shared atomic writer and the database's own transaction already make all-or-nothing is not done again, and 2 now means the queue step started",
+        ref="Engine 6 X10S (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- an unreadable emotion state is decided from the x10 record, never skipped (Engine 6 SW4) ---------------------------
+    Removed(
+        names=("_skip_start_for_unreadable_state",),
+        why="the start-up skip for a state that exists but cannot be read; the owner ruled (S79) that such a state is decided from the database's x10 progress note and rebuilt",
+        ref="Engine 6 SW4 (#584, draft PR #633)",
+        kind="code",
+    ),
+    Removed(
+        names=("_move_unreadable_state_aside", "state_copy_paths"),
+        why="the rebuild's rename of an unreadable state file and its backups to `<name>.corrupt-<stamp>` (and the helper that listed those copies); the owner ruled (S88) that an unreadable state is simply replaced by the rebuild's normal state write, whose backup rotation ages the old copies out, and nothing is moved aside or deleted",
+        ref="Engine 6 RD2 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- "switched over" is read off the state, not off a switch file (Engine 6 SW2) ----------------------------------------
+    Removed(
+        names=(
+            "emotion_switch.json",
+            "EMOTION_SWITCH_FILENAME",
+            "switch_path",
+            "write_switch",
+            "read_switch",
+            "switch_exists",
+            "switch_state",
+            "_switch_seen",
+            "_switch_over_time",
+            "_skip_for_unknown_switch",
+            "_skip_start_for_unknown_switch",
+        ),
+        why="the switch file `state/emotion_switch.json` and the code that wrote, stat-ed and read it; the persona's one switch-over time is the `switch_over_at` field of the emotion state (`engine_files.switch_over_state` reads 'switched' off a loaded state)",
+        ref="Engine 6 SW2 (#584, draft PR #633; Planning B25, owner S73)",
+        kind="code",
+    ),
+    # --- the heartbeat no longer decays each memory's stored emotions (Engine 6 G4) -----------------------------------------
+    Removed(
+        names=("brain/emotion/decay.py",),
+        why="per-memory emotion decay: the engine fades a stored value when it is read (engine_utils.fade), so nothing rewrites memories.db emotions on a timer",
+        ref="Engine 6 G4 (#584, draft PR #633)",
+        kind="file",
+    ),
+    Removed(
+        names=(
+            "apply_decay",
+            "_apply_emotion_decay",
+            "_resume_decay_only",
+            "DecayCursor",
+            "decay_cursor",
+            "_parse_decay_cursor",
+            "HEARTBEAT_DECAY_BATCH_BUDGET_S",
+            "_DECAY_PAGE_SIZE",
+            "memories_decayed",
+            "update_emotions_batch",
+            "list_active_since",
+        ),
+        why="the heartbeat's batched per-memory emotion decay pass with its resume cursor, its batch time budget, its page size, its count (`memories_decayed`) and the two store methods only it used; the engine fades on read, so nothing decays a stored emotion on a timer",
+        ref="Engine 6 G4 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- one thing reads emotions (the stored feelings of a memory are private to the store and the engine) -------------
+    Removed(
+        names=("_stored_emotions", "_stored_score", "_stored_peak"),
+        why="the private stored feelings of a `Memory` (its emotions, score and highest value as the row holds them, faded by nothing and held by nothing); only the store and the emotion engine may read them, and every other reader asks the engine for `memory_feelings` (faded by age, held to 0-10)",
+        ref="Engine 7 ONE4 (#635)",
+        kind="code",
+        allow=(
+            "brain/emotion/engine.py",
+            "brain/emotion/engine_files.py",
+            "brain/emotion/engine_rebuild.py",
+            "brain/emotion/engine_utils.py",
+            "brain/memory/store.py",
+        ),
+    ),
+    # --- the predefined `body_grief` feeling (#652) -----------------------------------------------------------------------
+    Removed(
+        names=("body_grief",),
+        why="a feeling like this comes from the kindled naming it herself, so it is not predefined: it left the migrator's canonical personal-emotions list and the body temperature rule; a persona whose memories carry it keeps it as an ordinary feeling through the vocabulary repair",
+        ref="#652 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the research gate's emotion setting (#653) ------------------------------------------------------------------------
+    Removed(
+        names=("research_emotion_threshold",),
+        why="the research gate asks the emotion engine's own reading of high (`feels_high`) and holds no level of its own, so the setting had no reader and left HeartbeatConfig; an old heartbeat_config.json that still holds the key loads and drops it on the next save",
+        ref="#653 (draft PR #656)",
+        kind="code",
     ),
 )
 

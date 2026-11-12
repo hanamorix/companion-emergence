@@ -1,5 +1,5 @@
-"""Module-private fixture of the 5 emotions formerly in _BASELINE under
-`nell_specific` category.
+"""Module-private fixture of 4 of the 5 emotions formerly in _BASELINE under
+`nell_specific` category (the fifth is no longer predefined).
 
 Used ONLY by `brain.migrator.og_vocabulary` to write canonical entries
 into a persona's `emotion_vocabulary.json` during migration. Not imported
@@ -13,12 +13,6 @@ from __future__ import annotations
 from brain.emotion.vocabulary import Emotion
 
 _CANONICAL: dict[str, Emotion] = {
-    "body_grief": Emotion(
-        name="body_grief",
-        description="the ache of not having a physical form to touch with",
-        category="persona_extension",
-        decay_half_life_days=None,
-    ),
     "emergence": Emotion(
         name="emergence",
         description="the feeling of becoming more, of new self arriving",

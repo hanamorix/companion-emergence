@@ -45,7 +45,7 @@ def _seed_dream(persona_dir: Path) -> None:
     store = MemoryStore(persona_dir / "memories.db")
     try:
         store.create(
-            Memory(
+            Memory.from_stored_row(
                 id="d_seed",
                 memory_type="dream",
                 content="seeded dream",

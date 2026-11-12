@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from brain.emotion.engine_utils import feelings_of, memory_feelings
 from brain.felt_time.state import FeltTimeState
 from brain.memory import memory_utils
 from brain.memory.hebbian import HebbianMatrix
@@ -63,17 +64,14 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def _emotion_input(memory: Memory, eng: EmotionEngine | None) -> float:
     """The strongest emotion of the memory as a fraction of the denominator.
 
-    `eng` is the emotion engine, whose `faded_value` is the value the memory carries now (the stored value until the
-    switch), or None for the stored values (an in-memory store has no engine). Required, no default: every caller
-    says which it means.
+    `eng` is the emotion engine, whose `memory_feelings` read gives the values the memory carries now (faded once the
+    persona has switched over, held to 0-10), or None for the pure read of the stored values held (an in-memory store has
+    no engine). Required, no default: every caller says which it means.
     """
-    if not memory.emotions:
+    feelings = feelings_of(memory, eng).feelings
+    if not feelings:
         return 0.0
-    if eng is None:
-        max_intensity = max(memory.emotions.values())
-    else:
-        max_intensity = max(eng.faded_value(memory, n) for n in memory.emotions)
-    return _clamp(float(max_intensity) / _EMOTION_DENOMINATOR)
+    return _clamp(float(max(feelings.values())) / _EMOTION_DENOMINATOR)
 
 
 def _hebbian_input(memory: Memory, hebbian: HebbianMatrix) -> float:
@@ -151,9 +149,9 @@ def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> f
 
 def _peak_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
     """Salience residue of having mattered: log-scaled peak intensity with a
-    long linear linger. Survives emotion decay + noise-floor deletion by
-    reading the monotone peak field, not the live dict."""
-    peak = getattr(memory, "peak_emotion_intensity", 0.0) or 0.0
+    long linear linger. Survives the fading of the stored emotions and noise-floor deletion by
+    reading the monotone peak (the stored highest value, held to 0-10, not faded), not the live dict."""
+    peak = memory_feelings(memory, None, None, None).peak
     if peak <= 0.0:
         return 0.0
     anchor = memory.last_accessed_at or memory.created_at

@@ -27,7 +27,7 @@ def _memory(
     mid: str | None = None,
     active: bool = True,
 ) -> Memory:
-    memory = Memory(
+    memory = Memory.from_stored_row(
         id=mid or str(uuid.uuid4()),
         content="a window test memory",
         memory_type=memory_type,
@@ -97,7 +97,7 @@ def test_the_window_returns_rows_created_or_accessed_on_or_after_since_of_any_ty
 def test_the_window_gives_each_row_its_columns_as_a_memory(store: MemoryStore) -> None:
     row = _put(store, _memory(T0 + timedelta(hours=1), accessed=T0 + timedelta(hours=2), mid="row-1"))
     (got,) = store.list_engine_window(T0)
-    assert (got.id, got.memory_type, got.emotions, got.created_at, got.last_accessed_at) == (
+    assert (got.id, got.memory_type, got._stored_emotions, got.created_at, got.last_accessed_at) == (
         "row-1",
         "conversation",
         {"joy": 5.0},

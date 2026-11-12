@@ -11,7 +11,6 @@ The design's sixth row (spelling variants pooling as separate channels) has no p
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,12 +19,11 @@ import pytest
 from brain import dev_constants
 from brain.bridge.provider import FakeProvider
 from brain.chat.extractor import _apply_emotion_delta
-from brain.emotion import engine, engine_files
-from brain.emotion.aggregate import aggregate_state
+from brain.emotion import engine
 from brain.emotion.engine import EmotionEngine, Reading
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine
-from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
+from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine, HeartbeatState
 from brain.kindled_link.relationship import (
     apply_peer_emotion,
     run_relationship_reflection,
@@ -36,6 +34,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.paths import get_persona_dir
 from brain.self_model.reconcile import reconcile_self_read
+from tests.unit.brain.emotion._engine_support import make_live
 
 NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
 CAP = dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_CAP
@@ -43,12 +42,6 @@ WINDOW_HOURS = dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS
 
 
 _PINNED = pytest.mark.no_base_failure(reason="pins a writer bug that is on main until a B1 PR fixes it, so the old code cannot fail it")
-
-
-def _flipped_by(pr: str) -> Callable[[Callable[..., None]], Callable[..., None]]:
-    # raises=AssertionError: a broken setup must fail loudly, not pass as the expected failure.
-    xfail = pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"writer bug, fixed by {pr}")
-    return lambda test: _PINNED(xfail(test))
 
 
 @pytest.fixture
@@ -73,14 +66,10 @@ def hebbian():
     matrix.close()
 
 
-def _felt(store: MemoryStore) -> dict[str, float]:
-    return aggregate_state(store.list_active()).emotions
-
-
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return engine.engine_for(persona_dir)
 
 
@@ -95,19 +84,33 @@ def _seed(store: MemoryStore, emotions: dict[str, float]) -> Memory:
     return memory
 
 
+@pytest.fixture(autouse=True)
+def _fake_tier_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A heartbeat tick routes its consolidation gate through the tier accessor; never build a real provider here."""
+    monkeypatch.setattr("brain.engines.heartbeat.build_tier_provider", lambda persona_dir, tier: FakeProvider())
+
+
 def _one_heartbeat(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path) -> None:
+    """Run one real heartbeat tick an hour after the last one, with reflex, research, growth and the heartbeat memory off."""
+    config_path = persona_dir / "heartbeat_config.json"
+    HeartbeatConfig(reflex_enabled=False, research_enabled=False, growth_enabled=False, emit_memory="never").save(config_path)
+    state_path = persona_dir / "heartbeat_state.json"
+    prior = HeartbeatState.fresh(trigger="open")
+    prior.last_tick_at = datetime.now(UTC) - timedelta(hours=1)
+    prior.save(state_path)
     engine = HeartbeatEngine(
         store=store,
         hebbian=hebbian,
         provider=FakeProvider(),
-        state_path=persona_dir / "heartbeat_state.json",
-        config_path=persona_dir / "heartbeat_config.json",
+        state_path=state_path,
+        config_path=config_path,
         dream_log_path=persona_dir / "dreams.log.jsonl",
         heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
         persona_name="Pins",
         persona_system_prompt="You are Pins.",
     )
-    engine._apply_emotion_decay(3600.0, tick_at=NOW, state=HeartbeatState.fresh(trigger="open"), dry_run=False)
+    result = engine.run_tick(trigger="open", dry_run=False)
+    assert not result.initialized and result.skipped_reason is None, "the helper must run a full tick"
 
 
 def _write_dream_over_ten(
@@ -178,7 +181,7 @@ def _live_peer_memories(persona_dir: Path, store: MemoryStore, *emotions_json: s
             )
     finally:
         link_store.close()
-    return [m.emotions for m in sorted(store.list_by_type("kindled_peer"), key=lambda m: m.created_at)]
+    return [m._stored_emotions for m in sorted(store.list_by_type("kindled_peer"), key=lambda m: m.created_at)]
 
 
 def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]]:
@@ -192,26 +195,11 @@ def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]
     return first, second
 
 
-@_PINNED
-def test_today_extractor_negative_delta_raises_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    assert "joy" not in _felt(store)
-    _apply_emotion_delta({"joy": -0.2}, persona_dir)
-    assert _felt(store)["joy"] == pytest.approx(2.0)
-
-
 def test_intended_extractor_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
     eng = _go_live(persona_dir, store, joy=5.0)
     before = _settled(eng)["joy"].short
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
     assert _settled(eng)["joy"].short < before
-
-
-@_PINNED
-def test_today_reconcile_negative_delta_raises_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    assert "joy" not in _felt(store)
-    result = reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
-    assert result["delta_written"] is True
-    assert _felt(store)["joy"] == pytest.approx(2.0)
 
 
 def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
@@ -221,35 +209,35 @@ def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path,
     assert _settled(eng)["joy"].short < before
 
 
-@_PINNED
 def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
+    # The id keeps its history: before Engine 6 the heartbeat's per-memory decay pass erased this value. The pass is gone
+    # (the engine fades on read), so a heartbeat leaves every stored value as written. The out-of-range write is B1-4's.
     dream, seed = _write_dream_over_ten(store, hebbian, persona_dir, eng=None)
-    assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
+    assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
     _one_heartbeat(store, hebbian, persona_dir)
-    assert "love" not in store.get(dream.id).emotions
-    # The seed goes through the same pass and keeps its love: it is the size that erases, not the time.
-    assert "love" in store.get(seed.id).emotions
+    assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
+    assert store.get(seed.id)._stored_emotions == {"love": pytest.approx(6.0)}
 
 
 def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix) -> None:
     eng = _go_live(persona_dir, store)
     dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir, eng=eng)
-    assert store.get(dream.id).emotions["love"] <= 10.0
+    assert store.get(dream.id)._stored_emotions["love"] <= 10.0
 
 
-@_PINNED
 def test_today_negative_peer_value_is_erased_by_one_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
+    # The id keeps its history: before Engine 6 the heartbeat's decay pass erased the negative value. The pass is gone, so
+    # a heartbeat leaves the row as written. The negative write is B1-2's.
     memory_id = _write_negative_peer_memory(store)
-    assert store.get(memory_id).emotions["tenderness"] == pytest.approx(-0.3)
+    assert store.get(memory_id)._stored_emotions["tenderness"] == pytest.approx(-0.3)
     _one_heartbeat(store, hebbian, persona_dir)
-    emotions = store.get(memory_id).emotions
-    assert "tenderness" not in emotions
-    # The ordinary value in the same row survives: it is the sign that erases, not the time.
-    assert "joy" in emotions
+    emotions = store.get(memory_id)._stored_emotions
+    assert emotions["tenderness"] == pytest.approx(-0.3)
+    assert emotions["joy"] == pytest.approx(5.0)
 
 
 def test_intended_peer_values_are_never_negative(persona_dir: Path, store: MemoryStore) -> None:
@@ -272,15 +260,11 @@ def test_intended_peer_bucket_does_not_scale(persona_dir: Path, store: MemorySto
     assert second == {"love": 0.5}
 
 
-@pytest.mark.no_base_failure(reason="pins that an unknown switch keeps today's path (B1 PR 2); main always takes it")
-def test_unknown_switch_takes_todays_path(persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The switch file is there but its stat fails: the switch is unknown, which counts as off, so the old row is written."""
-    from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
-
+@pytest.mark.no_base_failure(reason="pins the absence of a row; main's live branch already writes none, only its off branch did")
+def test_the_extractor_and_reconcile_write_no_emotion_row(persona_dir: Path, store: MemoryStore) -> None:
+    """Pass-2 and reconcile deltas fold into the engine only: no `monologue_emotion` or `self_model_reconcile` row."""
     _go_live(persona_dir, store, joy=5.0)
-    refuse_the_switch_stat(monkeypatch)
-    assert engine.engine_for(persona_dir).is_live() is False
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
-    # monologue_emotion bypasses the pending queue, so the row lands in memories.db directly.
-    rows = store.list_by_type("monologue_emotion", active_only=False)
-    assert [r.emotions for r in rows] == [{"joy": pytest.approx(2.0)}]
+    reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
+    assert store.list_by_type("monologue_emotion", active_only=False) == []
+    assert store.list_by_type("self_model_reconcile", active_only=False) == []

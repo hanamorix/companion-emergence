@@ -10,10 +10,11 @@ import pytest
 
 
 def _live_persona(tmp_path: Path, **seed: float):
-    """A live persona: seed first (a live persona with no state applies nothing), then write the switch."""
-    from brain.emotion import engine, engine_files
+    """A live persona: seed first, then record the switch-over in the state the seed wrote."""
+    from brain.emotion import engine
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
 
     persona_dir = tmp_path / "personas" / "nell"
     persona_dir.mkdir(parents=True)
@@ -22,7 +23,7 @@ def _live_persona(tmp_path: Path, **seed: float):
     store.create(
         Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0})
     )
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return persona_dir, store, hebbian, engine.engine_for(persona_dir)
 
 
@@ -73,8 +74,8 @@ def test_live_capture_stores_digest_two_feelings_and_keeps_raw_for_pass2(tmp_pat
         hebbian.close()
     assert result["monologue_text"] == "raw drift about the rain"
     assert trace.content == "she listened to the rain"
-    assert trace.emotions == pytest.approx({"anger": reading["anger"].short, "joy": reading["joy"].long})
-    assert trace.importance == pytest.approx(_trace_importance(trace.emotions))
+    assert trace._stored_emotions == pytest.approx({"anger": reading["anger"].short, "joy": reading["joy"].long})
+    assert trace.importance == pytest.approx(_trace_importance(trace._stored_emotions))
 
 
 def test_live_capture_same_strongest_feeling_stores_one_key_with_the_long_value(tmp_path: Path):
@@ -88,22 +89,25 @@ def test_live_capture_same_strongest_feeling_stores_one_key_with_the_long_value(
     finally:
         store.close()
         hebbian.close()
-    assert trace.emotions == pytest.approx({"joy": reading["joy"].long})
+    assert trace._stored_emotions == pytest.approx({"joy": reading["joy"].long})
 
 
 def test_live_capture_with_an_empty_read_stores_no_feelings(tmp_path: Path):
-    """Switch first, then a memory with feelings: the engine applies nothing, so read() is {} while today's aggregate
-    is not."""
-    from brain.emotion import engine, engine_files
+    """A switched persona whose state is gone, then a memory with feelings: the engine applies nothing, so read() is {} while
+    today's aggregate is not."""
+    from brain.emotion import engine
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import lose_the_state, make_live
 
     persona_dir = tmp_path / "personas" / "nell"
     persona_dir.mkdir(parents=True)
     store = MemoryStore(persona_dir / "memories.db")
     hebbian = HebbianMatrix(persona_dir / "hebbian.db")
     try:
-        assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+        make_live(persona_dir, datetime.now(UTC))
+        assert engine.engine_for(persona_dir).is_live()  # the running engine has seen the switch-over; the state is gone afterwards
+        lose_the_state(persona_dir)
         store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 8.0}))
         assert _settled(engine.engine_for(persona_dir)) == {}
         _record(persona_dir, store, hebbian, "raw drift", "she drifted")
@@ -112,7 +116,7 @@ def test_live_capture_with_an_empty_read_stores_no_feelings(tmp_path: Path):
         store.close()
         hebbian.close()
     assert trace.content == "she drifted"
-    assert trace.emotions == {}
+    assert trace._stored_emotions == {}
     assert trace.importance == pytest.approx(0.2)
 
 
@@ -145,9 +149,9 @@ def test_live_duplicate_guard_compares_digests(tmp_path: Path):
 def test_rerun_across_the_switch_over_is_still_deduped(tmp_path: Path):
     """#93 at the switch-over: the first call of a recruit-on-reach pair is captured off (raw trace), the switch appears,
     and the rerun is live. It must still be recognised as the same thought."""
-    from brain.emotion import engine_files
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
 
     persona_dir = tmp_path / "personas" / "nell"
     persona_dir.mkdir(parents=True)
@@ -156,7 +160,7 @@ def test_rerun_across_the_switch_over_is_still_deduped(tmp_path: Path):
     try:
         store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
         first = _record(persona_dir, store, hebbian, "raw drift", "she drifted")
-        assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+        make_live(persona_dir, datetime.now(UTC))
         rerun = _record(persona_dir, store, hebbian, "raw drift", "she drifted")
         traces = _traces(persona_dir)
     finally:
@@ -199,7 +203,7 @@ def test_engine_read_that_raises_stores_no_feelings_and_keeps_the_trace(tmp_path
     finally:
         store.close()
         hebbian.close()
-    assert (trace.content, trace.emotions) == ("she drifted", {})
+    assert (trace.content, trace._stored_emotions) == ("she drifted", {})
 
 
 @pytest.mark.no_base_failure(reason="base never reads the switch; bites when _is_live stops treating a raise as off")
@@ -222,22 +226,14 @@ def test_switch_read_that_raises_counts_as_off_and_keeps_the_thought(tmp_path: P
     assert trace.content == "raw drift"
 
 
-@pytest.mark.no_base_failure(reason="base never reads the switch; bites if an uninspectable switch file ever counts as live")
-def test_uninspectable_switch_file_counts_as_off_through_dispatch(tmp_path: Path, monkeypatch):
-    """A real unknown switch: the file is there but its stat fails. Owner 2026-11-05: "If the system can't tell if its
+@pytest.mark.no_base_failure(reason="on the base this persona is not live either (nothing there reads the state for liveness), so it passes; bites if an unreadable state ever counts as live")
+def test_unreadable_state_counts_as_off_through_dispatch(tmp_path: Path):
+    """A real unknown: the state file is there but no copy can be read. Owner 2026-11-05: "If the system can't tell if its
     switched, assume its not." Unlike patching is_live, this goes through the engine's own handling of the unknown."""
-    from brain.emotion import engine_files
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
 
     persona_dir, store, hebbian, _eng = _live_persona(tmp_path)
-    real_stat = engine_files.file_ops.stat_path
-    switch = engine_files.switch_path(persona_dir)
-
-    def stat(path, *args, **kwargs):
-        if Path(path) == switch:
-            raise PermissionError("switch cannot be inspected")
-        return real_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(engine_files.file_ops, "stat_path", stat)
+    ruin_the_state(persona_dir)
     try:
         _record(persona_dir, store, hebbian, "raw drift", "she drifted")
         trace = _traces(persona_dir)[0]
@@ -269,7 +265,7 @@ def test_switch_off_capture_stores_todays_trace(tmp_path: Path):
         store.close()
         hebbian.close()
     assert result == {"ok": True, "monologue_text": "raw drift"}
-    assert (trace.content, trace.emotions) == ("raw drift", expected)
+    assert (trace.content, trace._stored_emotions) == ("raw drift", expected)
     assert trace.importance == pytest.approx(_trace_importance(expected))
 
 
@@ -300,7 +296,7 @@ def test_live_answer_without_a_persona_dir_is_still_off(tmp_path: Path):
     finally:
         store.close()
         hebbian.close()
-    assert (trace.content, trace.emotions) == ("raw drift", expected)
+    assert (trace.content, trace._stored_emotions) == ("raw drift", expected)
 
 
 def test_live_interior_block_shows_the_digest_not_the_raw_thought(tmp_path: Path):
@@ -370,7 +366,7 @@ def test_engine_does_not_count_a_promoted_trace(tmp_path: Path):
         store.close()
         hebbian.close()
     assert [m.content for m in promoted] == ["she drifted"]
-    assert promoted[0].emotions["joy"] - before["joy"].short > 0.5  # stored (long) differs from the other average
+    assert promoted[0]._stored_emotions["joy"] - before["joy"].short > 0.5  # stored (long) differs from the other average
     assert after == before
 
 

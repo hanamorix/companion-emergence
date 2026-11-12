@@ -86,6 +86,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
+from brain.emotion import vocabulary_swap
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -151,7 +152,7 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
 
     Idempotent — re-registering emotions is a no-op. Mirrors the supervisor tick
     load (brain/bridge/supervisor.py ~line 639), but called at bridge startup so
-    the chat path never aggregates with an empty vocab during the ~15-min window
+    the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
@@ -1411,7 +1412,7 @@ def build_app(
             logger.warning("FTS health check skipped: %s", _exc)
 
         # Load the persona emotion vocabulary before any chat request can arrive.
-        # Without this, aggregate_state silently drops all persona-extension
+        # Without this, every reader silently drops all persona-extension
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
         # fires for the first time). Uses a short-lived store — no persistent
         # handle held on app.state per HA hardening rule.
@@ -1420,6 +1421,17 @@ def build_app(
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
             _vocab_store.close()
+
+        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648), right before the
+        # engine's first rebuild so that rebuild already uses the swapped half-lives. Fail-soft: it logs and never raises.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
+
+        # The emotion engine's switch-over (Engine 6, spec 3.1 S6): a persona's first start does its x10 fix and first rebuild
+        # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so
+        # start-up stops before the supervisor thread is spawned (an emotion state that exists but cannot be read is not a
+        # failure: `ensure` decides from the database's x10 record, rebuilds the state and replaces the unreadable one; only
+        # when `memories.db` cannot be read either does it skip this start and log why).
+        emotion_engine.ensure_engine_ready(persona_dir)
 
         # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
         # own failures and never raises.

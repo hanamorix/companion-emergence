@@ -21,6 +21,9 @@ What lives here:
 
 All constants are read as `dev_constants.NAME` at call time. Times are aware datetimes (UTC); a "day" is the machine's
 local calendar day (`day_of`), written `YYYY-MM-DD`.
+
+The engine class (`EmotionEngine`) appears here only as a type, imported under `TYPE_CHECKING`: `engine.py` imports this
+module at run time, so this module takes no run-time import of the engine.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, date, datetime, time, timedelta
+from functools import cached_property
 from typing import TYPE_CHECKING, NamedTuple, get_args
 
 from brain import dev_constants
@@ -38,9 +42,10 @@ from brain.initiate.schemas import StateName
 from brain.memory import memory_utils
 from brain.utils.log_throttle import warn_throttled
 from brain.utils.memory import is_conversation_derived
-from brain.utils.time import to_local
+from brain.utils.time import lenient_utc, to_local
 
 if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
     from brain.memory.store import Memory
 
 logger = logging.getLogger(__name__)
@@ -119,7 +124,9 @@ class EngineState:
     creation time of the persona's oldest memory (a future time is held to now when it is folded), which the shift's start gate
     counts from (null: no memory yet, the gate is closed). `queue_line` is the
     number of lines of the queue file the engine has already folded: the next drain reads the lines after it. It is saved
-    with the state so that the fold and the position reach the disk in one write.
+    with the state so that the fold and the position reach the disk in one write. `switch_over_at` is the persona's one
+    switch-over time and the only record that it was switched over: the first rebuild at start-up sets it, in its one verified
+    state write; nothing else sets it, and every later save of a loaded state writes it back unchanged (None: not switched).
     """
 
     saved_at: datetime | None = None
@@ -130,6 +137,7 @@ class EngineState:
     repeats: dict[str, RepeatEntry] = field(default_factory=dict)
     emotions: dict[str, EmotionState] = field(default_factory=dict)
     queue_line: int = 0
+    switch_over_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -532,6 +540,108 @@ def resolve_emotions(raw: Mapping[str, object], *, signed: bool = False) -> dict
     if signed:
         return averaged
     return {name: _hold(value) for name, value in averaged.items()}
+
+
+# --- the one read of a memory's feelings ------------------------------------------------------------------------------
+
+
+def faded_emotion(
+    memory: Memory,
+    emotion: str,
+    half_lives: Callable[[str], float] | None,
+    switch_over_at: datetime | None,
+    now: datetime | None,
+) -> float:
+    """The memory's stored value for `emotion` faded by its age: the one copy of the per-name fade, not held to 0-10.
+
+    With `switch_over_at` None (the persona has not switched over, or no state could be read) nothing fades and the stored
+    value comes back as it is: never a fade from `created_at` alone, which would fade a pre-switch value twice. Otherwise
+    `fade` with the emotion's half-life (`half_lives(emotion)`), the memory's importance and the floor of the emotion (love
+    and belonging only), at an age counted from the memory's creation or from `switch_over_at` when that is later (a value
+    stored before the switch-over was never faded by the engine, and is not faded for the time before it); `now` and
+    `half_lives` are used only then. It reads no store. Raises `KeyError` naming the memory id and the emotion when the memory
+    has no such emotion: "absent" is for the caller to decide.
+    """
+    try:
+        stored = memory._stored_emotions[emotion]
+    except KeyError:
+        raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}") from None
+    created = lenient_utc(memory.created_at)
+    if switch_over_at is None or created is None:
+        return stored
+    age_days = (now - max(created, switch_over_at)).total_seconds() / 86400.0
+    floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION.get(canonical_name(emotion))
+    return fade(stored, age_days, half_lives(emotion), memory.importance, floor)
+
+
+def _held_or_zero(value: object) -> float:
+    """`value` held to 0-10; a value that is not a finite number reads as 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0.0
+    return _hold(float(value))
+
+
+@dataclass(frozen=True)
+class MemoryFeelings:
+    """What one memory feels: the result of `memory_feelings`, the one read every reader of a memory's feelings uses.
+
+    `feelings` is the memory's emotions faded by its age and held to 0-10 (canonical names, as the engine folds them); it is
+    worked out on first access and kept, so a caller that needs only `peak` or `score` pays no fade. `peak` is the stored
+    highest value held to 0-10 (not faded). `score` is the stored score as it is (a sum of intensities, not held).
+    """
+
+    peak: float
+    score: float
+    _memory: Memory = field(repr=False, compare=False)
+    _half_lives: Callable[[str], float] | None = field(repr=False, compare=False)
+    _switch_over_at: datetime | None = field(repr=False, compare=False)
+    _now: datetime | None = field(repr=False, compare=False)
+
+    @cached_property
+    def feelings(self) -> dict[str, float]:
+        faded: dict = {}
+        for name in self._memory._stored_emotions:
+            try:
+                faded[name] = faded_emotion(self._memory, name, self._half_lives, self._switch_over_at, self._now)
+            except Exception:
+                logger.warning("emotion engine: no faded value for %r of memory %s; left out", name, self._memory.id, exc_info=True)
+        return resolve_emotions(faded)
+
+
+def memory_feelings(
+    memory: Memory,
+    half_lives: Callable[[str], float] | None,
+    switch_over_at: datetime | None,
+    now: datetime | None,
+) -> MemoryFeelings:
+    """The one pure read of a memory's feelings, peak and score; it needs no engine running.
+
+    The inputs are the ones the engine's `faded_value` uses: the persona's half-life lookup, its `switch_over_at` (or None) and
+    the current time. A reader with no engine (an in-memory store, salience, the prompt) passes None for all three: with
+    `switch_over_at` None nothing fades and the stored values come back held (`half_lives` and `now` are unused). A stored
+    negative reads as 0 in `feelings` and `peak`.
+    """
+    return MemoryFeelings(
+        peak=_held_or_zero(memory._stored_peak),
+        score=memory._stored_score,
+        _memory=memory,
+        _half_lives=half_lives,
+        _switch_over_at=switch_over_at,
+        _now=now,
+    )
+
+
+def feelings_of(memory: Memory, eng: EmotionEngine | None) -> MemoryFeelings:
+    """A memory's feelings, peak and score through the engine when one is passed, through the pure read when `eng` is None.
+
+    The one place that choice is made. An engine's own read (`EmotionEngine.memory_feelings`) already falls back to the pure
+    read while the persona is not switched over, so a caller passes the engine it has, or None when it has none. `eng` is
+    required: None is a value the caller states. `.feelings` is a cached dict shared by every use of the returned read; a caller
+    that changes it copies it first.
+    """
+    if eng is None:
+        return memory_feelings(memory, None, None, None)
+    return eng.memory_feelings(memory)
 
 
 # --- runs and the shift rule ----------------------------------------------------------------------------------------

@@ -237,7 +237,7 @@ def test_research_defers_when_chat_active(tmp_path):
         result = engine.run_tick(
             trigger="manual",
             dry_run=False,
-            days_since_human_override=2.0,  # satisfy gate: days_since >= 1.5
+            days_since_human_override=2.0,  # opens the default gate (1.5 days)
         )
 
         assert provider.call_count == 0, "provider.generate must not be called while chat is active"

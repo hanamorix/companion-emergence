@@ -2,8 +2,8 @@
 
 No I/O — every function takes plain Memory / EmotionalState / Crystallization
 objects so it is unit-testable in isolation. The functions that read a memory's
-feelings take ``eng``: the live emotion engine, whose faded values they read, or
-None for the stored values.
+feelings take ``eng``: the live emotion engine, whose one per-memory read (faded
+values) they use, or None for the pure read of the stored values.
 See docs/superpowers/specs/2026-05-26-multi-signal-dream-seeds-design.md.
 """
 
@@ -13,8 +13,8 @@ import re
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
-from brain.emotion.vocabulary import pool_by_canonical_name
 from brain.memory.store import Memory
 from brain.soul.crystallization import Crystallization
 
@@ -30,21 +30,15 @@ W_GRIEF = 1.0
 W_REFRACTORY = 2.0
 
 
-def _values(memory: Memory, eng: EmotionEngine | None) -> dict[str, float]:
-    """The memory's feelings: stored when ``eng`` is None, else faded, by the memory's own keys."""
-    if eng is None:
-        return dict(memory.emotions)
-    return {name: eng.faded_value(memory, name) for name in memory.emotions}
-
-
 def emotional_congruence(memory: Memory, mood: EmotionalState, *, eng: EmotionEngine | None) -> float:
     """Sum over emotions shared by mood and memory of (mood_intensity * memory_value).
 
-    The mood's channels are canonical emotion names (``aggregate_state`` pools by canonical name),
-    so the memory's stored emotions are read by canonical name too; two spellings of one emotion in
-    a memory count their larger value once.
+    The mood's channels are canonical emotion names (a mood is keyed by canonical name),
+    so the memory's feelings are read by canonical name too: the one read of a memory's feelings
+    (the engine's when ``eng`` is given, else the pure read with its stored values held to 0-10) gives
+    canonical names, and two spellings of one emotion in a memory count once, as their average.
     """
-    memory_values = pool_by_canonical_name(_values(memory, eng))
+    memory_values = feelings_of(memory, eng).feelings
     total = 0.0
     for name, intensity in mood.emotions.items():
         mv = memory_values.get(name, 0.0)
@@ -107,9 +101,9 @@ def identity_congruence(
 def grief_pull(memory: Memory, *, eng: EmotionEngine | None) -> float:
     """Normalized bonus for actual grief breadcrumbs so loss gets reached
     within a grief-congruent pool. Fires only for grief_event memories."""
-    if memory.memory_type != "grief_event" or "memory_grief" not in memory.emotions:
+    if memory.memory_type != "grief_event":
         return 0.0
-    return _values(memory, eng)["memory_grief"] / 10.0
+    return feelings_of(memory, eng).feelings.get("memory_grief", 0.0) / 10.0
 
 
 def refractory_penalty(memory_id: str, recent_seed_ids: list[str]) -> float:

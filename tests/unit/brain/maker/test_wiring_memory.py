@@ -32,5 +32,5 @@ def test_act_memory_written_with_making_type_and_emotions(tmp_path):
     mems = store2.list_by_type("making", active_only=True, limit=5)
     assert len(mems) == 1
     assert "For the dog" in mems[0].content
-    assert mems[0].emotions.get("tenderness") == 0.1
+    assert mems[0]._stored_emotions.get("tenderness") == 0.1
     store2.close()

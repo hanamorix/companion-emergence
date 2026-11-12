@@ -253,7 +253,7 @@ def test_emotion_input_uses_the_faded_value_and_peak_input_is_not_faded(tmp_path
     emotion_engine_stub.faded = {(m.id, "joy"): 2.0, (m.id, "love"): 5.0}
     assert _emotion_input(m, emotion_engine_stub) == 0.5  # the faded 5.0 wins, over the stored 8.0
     assert _emotion_input(m, None) == 0.8  # no engine: the stored values
-    object.__setattr__(m, "peak_emotion_intensity", 9.0)
+    object.__setattr__(m, "_stored_peak", 9.0)
     state = FeltTimeState(lived_age_hours=100.0)
     before = _peak_input(m, state)
     assert before > 0.0
@@ -286,10 +286,12 @@ def test_score_resolves_the_engine_from_a_file_store_and_an_explicit_engine_wins
 
 
 class _StoredEngine:
-    """An engine whose faded value is the stored one (an explicit engine passed to `score`)."""
+    """An engine whose feelings are the stored ones (an explicit engine passed to `score`)."""
 
-    def faded_value(self, memory, emotion):
-        return memory.emotions[emotion]
+    def memory_feelings(self, memory):
+        from brain.emotion.engine_utils import memory_feelings
+
+        return memory_feelings(memory, None, None, None)
 
 
 def test_compute_inputs_fades_the_emotion_input_through_the_engine(tmp_path, emotion_engine_stub):

@@ -26,7 +26,7 @@ no code change required.
 | Category | Read | Drives the avatar when |
 |---|---|---|
 | `idle` | neutral, calm, no expression — just present | default — no dominant emotion fires |
-| `content` | settled small smile, eyes mostly closed, peaceful | contentment / peace |
+| `content` | settled small smile, eyes mostly closed, peaceful | contentment / peace / calm / groundedness |
 | `smile` | active warm smile, eyes soft | love / tenderness / belonging / gratitude / joy |
 | `happy` | bigger smile, eyes squinted from joy | curiosity / pride |
 | `awe` | wide eyes UP, mouth softly open | awe / emergence / hope |
@@ -37,7 +37,7 @@ no code change required.
 | `flushed` | warm-blush register — embarrassment, sudden warmth | reserved register; routes via emotion families |
 | `shy` | partly hidden by hands or hood, eyes down/away | vulnerability |
 | `sad` | corners-down mouth, eyes lowered/glassy | grief / loneliness / nostalgia / anchor_pull |
-| `aching` | hand near throat, faraway eyes, lips pressed | body_grief / freedom_ache / 5+ days since contact |
+| `aching` | hand near throat, faraway eyes, lips pressed | freedom_ache / 5+ days since contact |
 | `angry` | brows down, mouth flat-or-grimaced | anger / frustration |
 | `scared` | eyes wide-fear, mouth small | fear / guilt / shame |
 | `exhausted` | heavy lids, slack mouth, slumped | rest_need OR exhaustion ≥ 7 |
