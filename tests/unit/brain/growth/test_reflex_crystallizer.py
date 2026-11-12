@@ -1067,6 +1067,58 @@ def test_render_prompt_uses_user_name_not_hana(tmp_path: Path):
     assert "Hana" not in rendered
 
 
+def test_live_reflex_candidate_carries_short_averages(persona_dir: Path) -> None:
+    """Emotion rework B1 PR 5: once the engine is live, the candidate's vector is the engine's short averages."""
+    from brain.emotion import engine as emotion_engine
+    from brain.emotion import engine_files
+    from brain.initiate.emit import read_candidates
+    from brain.memory.store import Memory
+
+    _seed_vocab(persona_dir, ["creative_hunger", "love", "vulnerability"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        disk.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 6.0}))
+        # A making counts for the engine; the old conversation-only aggregate never saw it.
+        disk.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
+        assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+        eng = emotion_engine.engine_for(persona_dir)
+        eng.note_active(datetime.now(UTC))
+        expected = {name: r.short for name, r in eng.read().items() if r.short > 0}
+        assert "joy" in expected
+
+        response = _json.dumps(
+            {
+                "emergences": [
+                    {
+                        "name": "manuscript_obsession",
+                        "description": "creative drive narrowed to one project",
+                        "trigger": {"creative_hunger": 7.0, "love": 6.0},
+                        "cooldown_hours": 24.0,
+                        "output_memory_type": "reflex_pitch",
+                        "prompt_template": "You are {persona_name}. {emotion_summary}",
+                        "reasoning": "Fired creative_pitch four times this month.",
+                    }
+                ],
+                "prunings": [],
+            }
+        )
+        crystallize_reflex(
+            store=disk,
+            persona_dir=persona_dir,
+            current_arcs=[_arc("creative_pitch")],
+            removed_arc_names=set(),
+            provider=_FakeProvider(response),
+            persona_name="nell",
+            persona_pronouns="she/her",
+        )
+    finally:
+        disk.close()
+
+    [candidate] = [c for c in read_candidates(persona_dir) if c.source_id == "reflex_emergence:manuscript_obsession"]
+    assert candidate.emotional_snapshot is not None
+    assert candidate.emotional_snapshot.vector == pytest.approx(expected)
+
+
 def test_corpus_fire_log_excerpt_does_not_count_as_a_recall(persona_dir: Path, store: MemoryStore):
     """#587: the crystallizer reads a fire's output memory for its log excerpt; that judging pass shows her nothing."""
     from brain.engines.reflex import ArcFire

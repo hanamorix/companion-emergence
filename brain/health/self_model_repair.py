@@ -17,6 +17,7 @@ from pathlib import Path
 
 from brain.health.json_io import write_json
 from brain.self_model import state as sm_state
+from brain.utils.file_lock import LockTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +32,22 @@ def should_run_self_model_repair(persona_dir: Path) -> bool:
 def run_self_model_repair(persona_dir: Path) -> None:
     """Clear any persisted current_gap once, then write the marker. Fail-soft."""
     try:
-        state, _recovered = sm_state.load_or_recover(persona_dir)
-        if state.current_gap is not None:
-            sm_state.save(
-                persona_dir,
-                sm_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
-            )
-            logger.info(
-                "self_model_repair: cleared a persisted gap (windowed-peak migration)"
-            )
+        # Under the state lock (#558): a reconcile in flight would otherwise write the cleared gap back.
+        with sm_state.locked(persona_dir):
+            state, _recovered = sm_state.load_or_recover(persona_dir)
+            if state.current_gap is not None:
+                sm_state.save(
+                    persona_dir,
+                    sm_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
+                )
+                logger.info(
+                    "self_model_repair: cleared a persisted gap (windowed-peak migration)"
+                )
+    except LockTimeoutError as exc:
+        # Another writer kept the state lock for the whole bounded wait: nothing was cleared, so the marker is not
+        # written and the next start runs the repair again.
+        logger.warning("self_model_repair: %s; not run, retried at the next start", exc)
+        return
     except Exception:
         logger.exception("self_model_repair: failed (non-fatal)")
-    finally:
-        write_json(persona_dir / _MARKER_FILENAME, {"done": True}, indent=None, fsync=False, on_error="log")
+    write_json(persona_dir / _MARKER_FILENAME, {"done": True}, indent=None, fsync=False, on_error="log")

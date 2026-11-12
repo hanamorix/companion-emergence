@@ -221,3 +221,85 @@ def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> N
         rows[0]["content"] if isinstance(rows[0]["content"], str) else rows[0]["content"].decode()
     )
     assert "first cold week" in content_str
+
+
+# ---------------------------------------------------------------------------
+# Emotion rework B1 PR 5: a live persona's drop reads faded values
+# ---------------------------------------------------------------------------
+
+from datetime import UTC, datetime  # noqa: E402
+
+from brain.emotion import engine as emotion_engine  # noqa: E402
+from brain.emotion import engine_files  # noqa: E402
+from brain.emotion.engine import EmotionEngine  # noqa: E402
+
+
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    return emotion_engine.engine_for(persona_dir)
+
+
+def _drop_breadcrumbs(store: MemoryStore) -> list[dict[str, float]]:
+    import json
+
+    rows = store._conn.execute("SELECT emotions_json FROM memories WHERE memory_type='grief_event'").fetchall()
+    return [json.loads(row["emotions_json"]) for row in rows]
+
+
+def test_live_drop_uses_faded_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain import grief
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _go_live(tmp_path, store)
+    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+
+    grief.handle_drop(memory=_make_dropped_memory(memory_id="mem-live", joy=10.0), persona_dir=tmp_path, store=store)
+
+    # joy 10 fades to 5: intensity 0.5 x 7.0 = 3.5 (the stored 10 would give 7.0), residue 5 x 0.5 = 2.5.
+    [crumb] = _drop_breadcrumbs(store)
+    assert crumb == pytest.approx({"memory_grief": 3.5, "joy": 2.5})
+
+
+def test_live_drop_below_threshold_once_faded_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain import grief
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _go_live(tmp_path, store)
+    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+
+    # joy 8 stored gives 5.6, above the 3.0 threshold; faded to 4 it gives 2.8, below it.
+    grief.handle_drop(memory=_make_dropped_memory(memory_id="mem-live", joy=8.0), persona_dir=tmp_path, store=store)
+
+    assert _drop_breadcrumbs(store) == []
+
+
+@pytest.mark.no_base_failure(reason="guards that the real faded_value needs no row; it passes until Engine 6 changes faded_value")
+def test_faded_value_works_after_hard_delete(tmp_path: Path) -> None:
+    from brain import grief
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _go_live(tmp_path, store)
+    memory = Memory.create_new(content="the rooftop morning", memory_type="conversation", domain="us", emotions={"joy": 9.0})
+    store.create(memory)
+    store.hard_delete(memory.id)
+
+    grief.handle_drop(memory=memory, persona_dir=tmp_path, store=store)
+
+    [crumb] = _drop_breadcrumbs(store)
+    assert crumb["memory_grief"] > 0.0
+
+
+@pytest.mark.no_base_failure(reason="the drop intensity and the residue are already held to 0-10 on main")
+def test_live_old_row_over_ten_stays_in_range(tmp_path: Path) -> None:
+    from brain import grief
+
+    store = MemoryStore(tmp_path / "memories.db")
+    _go_live(tmp_path, store)
+    memory = _make_dropped_memory(memory_id="mem-old", joy=1.0)
+    object.__setattr__(memory, "emotions", {"love": 18.0, "joy": 22.0})
+
+    grief.handle_drop(memory=memory, persona_dir=tmp_path, store=store)
+
+    [crumb] = _drop_breadcrumbs(store)
+    assert all(0.0 <= value <= 10.0 for value in crumb.values())
