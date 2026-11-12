@@ -74,7 +74,7 @@ def _felt(store: MemoryStore) -> dict[str, float]:
 
 
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
     make_live(persona_dir, datetime.now(UTC))
     return engine.engine_for(persona_dir)
