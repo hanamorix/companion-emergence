@@ -127,8 +127,28 @@ EMOTION_LOCK_WAIT_S: float = 5.0
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
 EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
-EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
+
+# --- the one-time x10 fix of small feelings (emotion rework, Engine 6, #584) ------------------------------------------
+# Three memory types hold feelings stored below 1, not on the 0-10 scale: reach-outs and notes (`initiate_outbound`, small
+# constants such as 0.15 and 0.12), makings (`making`, small constants such as 0.12) and peer memories (`kindled_peer`, a
+# model's deltas scaled so a peer's total stays within `KINDLED_LINK_PEER_EMOTION_WINDOW_CAP`). At the engine's first start
+# the one-time fix (`brain/emotion/nudge_scale_fix.py`) multiplies the feelings, the score and the
+# peak of those rows by the factor, but only for a row whose stored peak and every stored feeling are below the threshold (a
+# row with any value of 1 or more is not multiplied; a negative value is held to 0.0 first). It also multiplies the `making`
+# candidates still waiting in the pending queue the same way. No row or candidate carries a marker: the fix's progress is one
+# number in `memories.db`'s `PRAGMA user_version` (rows done, then queue step started), so a start-up that fails part way
+# and is run again never multiplies twice. The list comes from a survey of every
+# writer of feelings in `brain/`; `tests/unit/brain/emotion/test_nudge_scale_types.py` drives each known writer against it.
+# They are separate named constants on purpose: the factor is the scale change itself, not the engine's value cap
+# (`EMOTION_VALUE_CAP`); "below 1" is the owner's rule for what counts as a small row; the two progress numbers are a stored
+# format of the one-time fix (the fix's progress note in `memories.db`'s `PRAGMA user_version`: nothing else uses it there).
+# None is a tunable. They go with `nudge_scale_fix.py` when #388 removes it.
+NUDGE_SCALE_FIX_MEMORY_TYPES: tuple[str, ...] = ("initiate_outbound", "kindled_peer", "making")
+NUDGE_SCALE_FIX_FACTOR: float = 10.0
+NUDGE_SCALE_FIX_THRESHOLD: float = 1.0
+NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE: int = 1
+NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED: int = 2
 
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
@@ -167,17 +187,6 @@ SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S: float = 0.1
 # own result, not this gate. Read by `brain.memory.judge_selftune` where the
 # weekly tick applies it.
 JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
-
-# --- heartbeat decay batch time budget (S24, S45, S47) ---------------------
-# Caps how long a single heartbeat decay batch (one `memories.db` write
-# transaction, `HeartbeatEngine._apply_emotion_decay`) may run before it
-# commits and the heartbeat saves its resume cursor, so a decay pass over a
-# large corpus never holds the write lock for longer than about this many
-# seconds at a stretch (S48/S58's busy-timeout sizing assumes this bound).
-# Checked after each row, not each batch (S45). ~2,500 rows/batch at the
-# measured 0.4 ms/row in-txn rate (2-plan.md §5.2, F-bob20k). A batch may
-# also end earlier if the rows run out.
-HEARTBEAT_DECAY_BATCH_BUDGET_S: float = 1.0
 
 # --- pass-2 `--no-bridge` exit-drain time budget (S80) ---------------------
 # Caps how long `nell chat --no-bridge`'s exit-drain (pass2_queue.py's

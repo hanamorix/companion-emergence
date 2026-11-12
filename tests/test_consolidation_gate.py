@@ -385,13 +385,8 @@ def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
     `run_consolidation` and `HeartbeatEngine._try_fire_reflex` to record
     the order they're actually invoked in at runtime, across
     `HeartbeatEngine.run_tick`'s real dispatch (first-ever-tick init,
-    then a fresh tick). ram-spike-fix INC-7 split run_tick's old
-    monolithic body into `_run_tick_body` (fresh tick) / `_resume_decay_only`
-    (resumes an interrupted decay pass and stops, per spec §5) — a source
-    grep on `run_tick` itself no longer finds either call. The resumed
-    path runs neither consolidation nor reflex at all (nothing else that
-    tick), so it can't violate this ordering; only the fresh-tick path is
-    exercised here.
+    then a fresh tick). The tick's work lives in `_run_tick_body`, so a
+    source grep on `run_tick` itself finds neither call.
     """
     from brain.bridge.provider import FakeProvider
     from brain.engines.heartbeat import HeartbeatEngine
@@ -400,7 +395,7 @@ def test_c9_gate_runs_before_reflex_in_run_tick(monkeypatch, tmp_path):
 
     # Keep dream/reflex/research/growth from constructing a real CLI
     # provider against a bare tmp_path persona (same guard
-    # test_heartbeat_decay_batching.py uses).
+    # test_heartbeat.py uses).
     monkeypatch.setattr(
         "brain.engines.heartbeat.build_tier_provider", lambda *a, **k: FakeProvider()
     )
@@ -1032,7 +1027,7 @@ def test_e5_live_merge_preread_is_not_an_access(persona, emotion_engine_stub):
 
 
 def test_e5_not_live_merge_preread_is_not_an_access(persona):
-    # No stub: the real engine with no switch file, so this fails on the bump alone on any base.
+    # No stub: the real engine, not switched over, so this fails on the bump alone on any base.
     _tmp, store, _heb, _queue = persona
     target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     _assert_preread_is_not_an_access(store, target_id, res)
@@ -1401,39 +1396,39 @@ def test_e5_a_later_fade_reads_the_reappraised_importance_and_the_reset_created_
     assert fade(row.emotions["joy"], age_days, 14.0, row.importance) == pytest.approx(6.0 * 0.5 ** (10.0 / stretched))
 
 
-# --- the real engine and a real switch file (the stub ignores which directory it is asked about) ---------
+# --- the real engine and a real switch-over (the stub ignores which directory it is asked about) ---------
 
 
 def _switch_on(persona_dir):
-    from brain.emotion import engine_files
+    from tests.unit.brain.emotion._engine_support import make_live
 
-    assert engine_files.write_switch(persona_dir, datetime(2030, 1, 1, tzinfo=UTC))
+    make_live(persona_dir, datetime(2030, 1, 1, tzinfo=UTC))
 
 
-def test_e5_real_engine_merge_is_live_only_with_a_switch_file(persona):
+def test_e5_real_engine_merge_is_live_only_once_the_state_holds_a_switch_over_time(persona):
     tmp, store, _heb, _queue = persona
     off_id, _ = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0})
-    assert store.get(off_id, bump=False).emotions == {"Joy": 5.0}  # no switch file: today's content-only merge
+    assert store.get(off_id, bump=False).emotions == {"Joy": 5.0}  # not switched over: today's content-only merge
     _switch_on(tmp)
     on_id, _ = _merge_run(persona, {"Joy": 5.0}, {"joy": 7.0})
-    assert store.get(on_id, bump=False).emotions == {"joy": 6.0}  # switch file present: the merged emotions
+    assert store.get(on_id, bump=False).emotions == {"joy": 6.0}  # switched over: the merged emotions
 
 
-def test_e5_real_engine_write_back_is_live_only_with_a_switch_file(persona):
+def test_e5_real_engine_write_back_is_live_only_once_the_state_holds_a_switch_over_time(persona):
     tmp, store, _heb, _queue = persona
     long_ago = datetime.now(UTC) - timedelta(days=30)
     off = replace(_mem("Bob's address", "conversation", emotions={"joy": 8.0}, importance=3.0), created_at=long_ago)
     store.create(off, fold=False)
     before = store.get(off.id, bump=False)
     _reappraise_run(tmp, store, off)
-    assert store.get(off.id, bump=False).created_at == before.created_at  # no switch file: nothing written back
+    assert store.get(off.id, bump=False).created_at == before.created_at  # not switched over: nothing written back
     _switch_on(tmp)
     on = replace(_mem("Bob's phone", "conversation", emotions={"joy": 8.0}, importance=3.0), created_at=long_ago)
     store.create(on, fold=False)
     on_before = store.get(on.id, bump=False)
     _reappraise_run(tmp, store, on)
     after = store.get(on.id, bump=False)
-    assert after.created_at > on_before.created_at  # switch file present: created_at reset to the gate's now
+    assert after.created_at > on_before.created_at  # switched over: created_at reset to the gate's now
     assert after.emotions == {"joy": 8.0}  # the engine's own faded_value (today: the stored value)
     assert after.importance == pytest.approx(7.25)
 

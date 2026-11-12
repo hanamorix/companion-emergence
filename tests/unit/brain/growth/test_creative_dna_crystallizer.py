@@ -341,13 +341,13 @@ def test_creative_dna_crystallization_emits_initiate_candidate(
 def test_live_creative_dna_candidate_carries_short_averages(persona_dir, store):
     """Emotion rework B1 PR 5: once the engine is live, the candidate's vector is the engine's short averages."""
     from brain.emotion import engine as emotion_engine
-    from brain.emotion import engine_files
     from brain.initiate.emit import read_candidates
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 6.0}))
     # A making counts for the engine; the old conversation-only aggregate never saw it.
     store.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     eng = emotion_engine.engine_for(persona_dir)
     eng.note_active(datetime.now(UTC))
     expected = {name: r.short for name, r in eng.read().items() if r.short > 0}

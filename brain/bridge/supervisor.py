@@ -5,13 +5,13 @@ run_folded() is a synchronous loop running two cadences:
   * every ``tick_interval_s`` (default: the ``embedding_backfill.tick_interval_seconds``
     setting, 60s): close stale sessions
   * every ``heartbeat_interval_s`` (default 900s = 15min): fire a
-    heartbeat tick — memory decay, dream gate, reflex, growth, research
+    heartbeat tick — Hebbian decay, dream gate, reflex, growth, research
 
 The heartbeat cadence keeps the autonomous brain alive while the user
 is away. Without it, dreams / reflex / growth / research only fire when
-the user manually runs ``nell heartbeat``, and memory decay never runs
+the user manually runs ``nell heartbeat``, and the Hebbian decay never runs
 in the background. The heartbeat engine has its own internal cadence
-gates (e.g. memory decay every N hours, dreams every M hours) so
+gates (e.g. dreams every M hours) so
 calling ``run_tick`` every 15 min is mostly cheap — only the
 gate-passes do real work.
 
@@ -979,7 +979,7 @@ def _build_gated_jobs(
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
-    test/dev disable knob) is left out. Pass 2, session snapshot/prune,
+    test/dev disable knob) is left out. The emotion recovery rebuild (#584), pass 2, session snapshot/prune,
     emotion backfill, research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
     the extraction backfill takes one chunk per pass). Deploy recalibration is due
@@ -1021,6 +1021,20 @@ def _build_gated_jobs(
             yield own
         finally:
             own.close()
+
+    # 0. emotion recovery rebuild (Engine 6, #584): a live persona whose engine state is missing or unreadable is rebuilt from its
+    # rows before any other job reads the engine. No interval: due while `needs_recovery()` holds; a failed rebuild is
+    # logged once per active day by `recovery_job_run` and retried at the next idle pass (SKIPPED, no cadence to advance).
+    def _emotion_recovery_run() -> JobOutcome:
+        return JobOutcome.COMPLETED if emotion_engine.recovery_job_run(persona_dir) else JobOutcome.SKIPPED
+
+    jobs.append(
+        GatedJob(
+            "emotion_recovery_rebuild",
+            run=_emotion_recovery_run,
+            has_work=lambda: emotion_engine.engine_for(persona_dir).needs_recovery(),
+        )
+    )
 
     # 1. pass 2 — S53: every idle pass while the saved queue is non-empty.
     def _pass2_run() -> JobOutcome:
@@ -2116,7 +2130,6 @@ def _run_heartbeat_tick(
         {
             "type": "heartbeat_tick",
             "trigger": "background",
-            "memories_decayed": result.memories_decayed,
             "edges_pruned": result.edges_pruned,
             "dream_id": result.dream_id,
             "reflex_fired": list(result.reflex_fired),

@@ -29,6 +29,7 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 | `read_jsonl_tail` | brain/health/json_io.py:1050 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
 | `append_jsonl` | brain/health/json_io.py:1145 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
 | `write_jsonl` | brain/health/json_io.py:1212 | Atomically replace a JSONL file with the given records (same writer as write_json). |
+| `write_jsonl_bytes` | brain/health/json_io.py | Atomically replace a JSONL file with bytes written exactly as given (lines kept as `iter_jsonl_raw` read them, valid UTF-8 or not); must end in a newline; raises on a fault with the file as it was. |
 | `read_jsonl_from` | brain/health/json_io.py:1016 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. Streams the file line by line (one pass; only the returned records are held). |
 | `JsonlRecord` (class) | brain/health/json_io.py:996 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
 | `JsonlRead` (class) | brain/health/json_io.py:1009 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
@@ -264,6 +265,12 @@ Live in utils but read the MemoryStore.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `days_since_human` | brain/utils/memory.py:15 | Days since the user last spoke (999.0 if never), from active session buffers first, then closed-session memories. |
-| `is_conversation_derived` | brain/utils/memory.py:70 | True if a memory came from a conversation buffer (conversation tag or `source_summary` starting `conversation:`), plus the legacy type. |
-| `list_conversation_memories` | brain/utils/memory.py:87 | List chat-derived memories, newest first, using the conversation-derived contract. |
+| `days_since_human` | brain/utils/memory.py:14 | Days since the user last spoke (999.0 if never). Reads no memory: it is the days since `brain.ingest.buffer.last_user_turn_ts` (the time of the last user turn in the active conversation files, then the archive when no active file holds one; None if none). The user-presence silence uses the same function. |
+| `is_conversation_derived` | brain/utils/memory.py:41 | True if a memory came from a conversation buffer (conversation tag or `source_summary` starting `conversation:`), plus the legacy type. |
+| `list_conversation_memories` | brain/utils/memory.py:58 | List chat-derived memories, newest first, using the conversation-derived contract. |
+
+### `brain/ingest/buffer.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `last_user_turn_ts` | brain/ingest/buffer.py:558 | The time (aware, UTC) of the user's last turn, from the conversation files only: every active file read whole, and the archive (newest session file first, bounded by file modification times) only when no active file holds a user turn; None if none. Creates no folder. The one source for `days_since_human` and the user-presence silence. |
