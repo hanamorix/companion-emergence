@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.self_model.gap import Gap
 from brain.self_model.reconcile import reconcile_self_read
 from brain.self_model.state import SelfModelState, load_or_recover, save
@@ -334,3 +336,65 @@ def test_reconcile_keeps_the_gaps_directions_and_reset_seen(tmp_path: Path) -> N
     assert state.current_gap.status == "dismissed"
     assert state.current_gap.directions == {"grief": -1}
     assert state.current_gap.reset_seen == "2026-11-04T10:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Emotion rework B1 PR 2: a revision folds a signed change once the engine is live
+# ---------------------------------------------------------------------------
+
+
+def _go_live(persona_dir: Path, **seed: float):
+    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    from datetime import UTC, datetime
+
+    from brain.emotion import engine
+    from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    finally:
+        store.close()
+    make_live(persona_dir, datetime.now(UTC))
+    return engine.engine_for(persona_dir)
+
+
+def _settled(eng):
+    from datetime import UTC, datetime
+
+    eng.note_active(datetime.now(UTC))
+    return eng.read()
+
+
+def _reconcile_rows(persona_dir: Path) -> list:
+    from brain.memory.pending import PendingQueue
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        stored = store.list_by_type("self_model_reconcile", active_only=False)
+    finally:
+        store.close()
+    return stored + PendingQueue(persona_dir).read_recent("self_model_reconcile", limit=50)
+
+
+def test_live_revise_lowers_the_feeling_and_writes_no_row(tmp_path: Path) -> None:
+    eng = _go_live(tmp_path, joy=5.0)
+    before = _settled(eng)["joy"].short
+    result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="joy", delta=-0.2)
+    assert result["delta_written"] is True
+    assert _settled(eng)["joy"].short < before
+    assert _reconcile_rows(tmp_path) == []
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that the live fold keeps the vocabulary filter (B1 PR 2); main answers False for an off-vocabulary channel too"
+)
+def test_live_revise_off_vocab_channel_folds_nothing(tmp_path: Path) -> None:
+    eng = _go_live(tmp_path, joy=5.0)
+    before = _settled(eng)
+    result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="zorblesque", delta=0.5)
+    assert result["delta_written"] is False
+    assert _settled(eng) == before
+    assert _reconcile_rows(tmp_path) == []
