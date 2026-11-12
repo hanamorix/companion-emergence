@@ -147,6 +147,9 @@ def check_size(content: str, *, op: str, resolved: Path) -> GuardResult:
     if nbytes > _MAX_WRITE_BYTES:
         return GuardResult(ok=False, error=f"too large ({nbytes} > {_MAX_WRITE_BYTES} cap)")
     if op == "append":
+        # Python 3.14's exists() reads a too-long path as missing instead of raising, so ask unusable() first.
+        if (why := unusable(resolved)) is not None:
+            return GuardResult(ok=False, error=f"bad path: {why}")
         try:
             size = resolved.stat().st_size if resolved.exists() else 0
         except OSError as exc:  # #695: the path stopped being usable since check_write_target
