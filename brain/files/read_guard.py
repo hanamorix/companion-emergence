@@ -11,7 +11,9 @@ The lists are best-effort: they name the common credential stores per platform,
 not every one. A hard link to a listed single file is refused (same identity);
 shortcut: a hard link to a file INSIDE a denied directory is not, since that would
 mean indexing every file under those trees — the read tools can't make links, so
-upgrade only if a write path ever can.
+upgrade only if a write path ever can. Decided on #694: the write guard refuses an
+append to any multi-link file, but reads keep this shortcut, because refusing every
+multi-link read would also refuse the files pnpm and uv hard-link into projects.
 """
 from __future__ import annotations
 
