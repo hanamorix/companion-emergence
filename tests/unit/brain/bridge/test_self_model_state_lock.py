@@ -66,6 +66,46 @@ def _in_thread(fn) -> threading.Thread:
     return t
 
 
+def _cadence_outcome(persona_dir: Path) -> str:
+    """What the last tick told the cadence: "deferred" retries within about a minute, "clean" waits hours."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.self_model import cadence as sm_cadence
+
+    state = sm_cadence.load(persona_dir)
+    assert state.next_reflection_at is not None, "the tick did not advance the cadence"
+    ahead = state.next_reflection_at - datetime.now(UTC)
+    if ahead <= timedelta(minutes=2):
+        return "deferred"
+    if ahead >= timedelta(hours=1) and state.consecutive_failures == 0:
+        return "clean"
+    return f"other ({ahead}, failures={state.consecutive_failures})"
+
+
+def test_a_state_file_holding_nan_does_not_wedge_the_tick_into_deferred_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
+) -> None:
+    """A NaN (old json.dumps allowed it; a hand edit can add it) never equals itself, so the tick's under-lock
+    re-load never matched its snapshot: every tick ended "deferred" and retried a minute later, paying for an
+    articulate call each time. The loader treats a non-finite number as a malformed gap, so the tick runs clean."""
+    persona_dir = _persona(tmp_path)
+    (persona_dir / "self_model_state.json").write_text(
+        '{"current_gap": {"per_channel": {"grief": 2.0}, "magnitude": NaN, "unnamed_pressure": 0.0,'
+        ' "status": "open", "sustained_ticks": 1, "directions": {"grief": 1}, "reset_seen": null},'
+        ' "gap_history": []}',
+        encoding="utf-8",
+    )
+    _live_engine(emotion_engine_stub)
+    monkeypatch.setattr(supervisor, "sm_articulate", lambda gap, *, provider, persona_dir: "a note")
+
+    supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+
+    assert _cadence_outcome(persona_dir) == "clean"
+    state, recovered = sm_state.load_or_recover(persona_dir)
+    assert not recovered, "the tick's save should have replaced the NaN-bearing gap"
+    assert state.current_gap is not None and state.current_gap.magnitude == 2.0
+
+
 def test_a_reconcile_during_the_ticks_articulate_call_is_not_lost(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
 ) -> None:
@@ -75,9 +115,8 @@ def test_a_reconcile_during_the_ticks_articulate_call_is_not_lost(
     _open_grief_gap(persona_dir)
     _live_engine(emotion_engine_stub)
 
-    still_waiting: list[
-        bool
-    ] = []  # the tick swallows a raise inside it, so the hook records and the test asserts
+    # The tick swallows a raise inside it, so the hook records and the test asserts.
+    still_waiting: list[bool] = []
 
     def articulate_while_she_reconciles(gap, *, provider, persona_dir):
         t = _in_thread(
@@ -110,13 +149,17 @@ def test_a_reconcile_that_lands_while_the_tick_saves_waits_for_it_and_both_write
 
     real_save = sm_state.save
     reconciles: list[threading.Thread] = []
+    # Whether she was still waiting after half a second: under the lock she must be (the tick holds it), so a
+    # build without the lock cannot pass just because her reconcile happened to run slowly.
+    blocked: list[bool] = []
 
     def save_while_she_reconciles(pd, st):
         t = _in_thread(
             lambda: reconcile_self_read(persona_dir=pd, action="dismiss", channel="grief")
         )
         reconciles.append(t)
-        t.join(0.5)  # under the lock she is still waiting here; without it she has already saved
+        t.join(0.5)
+        blocked.append(t.is_alive())
         real_save(pd, st)
 
     monkeypatch.setattr(sm_state, "save", save_while_she_reconciles)
@@ -124,6 +167,8 @@ def test_a_reconcile_that_lands_while_the_tick_saves_waits_for_it_and_both_write
     for t in reconciles:
         t.join(_JOIN_S)
         assert not t.is_alive()
+
+    assert blocked == [True], "the reconcile did not wait for the tick's lock"
 
     gap = sm_state.load_or_recover(persona_dir)[0].current_gap
     assert gap is not None
@@ -151,9 +196,8 @@ def test_a_reconcile_before_the_spare_rule_saves_is_not_cleared_by_it(
     _live_engine(emotion_engine_stub)
 
     real_reset_seen = supervisor._self_model_reset_seen
-    still_waiting: list[
-        bool
-    ] = []  # the tick swallows a raise inside it, so the hook records and the test asserts
+    # The tick swallows a raise inside it, so the hook records and the test asserts.
+    still_waiting: list[bool] = []
 
     def reset_seen_while_she_reconciles(reads, prior_gap):
         t = _in_thread(
@@ -171,6 +215,31 @@ def test_a_reconcile_before_the_spare_rule_saves_is_not_cleared_by_it(
     assert saved is not None, "the spare rule cleared a gap she had dismissed"
     assert saved.status == "dismissed"
     assert is_channel_in_cooldown(saved, "grief"), saved.channel_cooldowns
+    # The rule did not run, so it is retried soon, as the tick's own mismatch is (not after the 6 h clean interval).
+    assert _cadence_outcome(persona_dir) == "deferred"
+
+
+def test_the_spare_rule_with_no_reconcile_in_between_ends_clean(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """The control for the race above: with nothing changing the file, the spare rule clears the open gap and the
+    tick schedules the normal interval."""
+    persona_dir = _persona(tmp_path)
+    gap = Gap(
+        per_channel={"grief": 2.0},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        status="open",
+        sustained_ticks=3,
+        directions={"grief": 1},
+    )  # reset_seen never stored → the live tick runs the spare rule
+    sm_state.save(persona_dir, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+    _live_engine(emotion_engine_stub)
+
+    supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+
+    assert sm_state.load_or_recover(persona_dir)[0].current_gap is None
+    assert _cadence_outcome(persona_dir) == "clean"
 
 
 def test_the_startup_repair_waits_for_a_reconcile_in_flight_so_its_clear_is_not_undone(
@@ -186,14 +255,15 @@ def test_the_startup_repair_waits_for_a_reconcile_in_flight_so_its_clear_is_not_
 
     real_load = reconcile.load_or_recover
     repairs: list[threading.Thread] = []
+    # Whether the repair was still waiting after half a second: under the lock it must be (the reconcile holds it).
+    blocked: list[bool] = []
 
     def load_while_the_repair_runs(pd):
         loaded = real_load(pd)
         t = _in_thread(lambda: run_self_model_repair(pd))
         repairs.append(t)
-        t.join(
-            0.5
-        )  # under the lock the repair is still waiting here; without it, it has already cleared the gap
+        t.join(0.5)
+        blocked.append(t.is_alive())
         return loaded
 
     monkeypatch.setattr(reconcile, "load_or_recover", load_while_the_repair_runs)
@@ -201,6 +271,8 @@ def test_the_startup_repair_waits_for_a_reconcile_in_flight_so_its_clear_is_not_
     for t in repairs:
         t.join(_JOIN_S)
         assert not t.is_alive()
+
+    assert blocked == [True], "the repair did not wait for the reconcile's lock"
 
     assert sm_state.load_or_recover(persona_dir)[0].current_gap is None, (
         "the reconcile wrote the cleared gap back"

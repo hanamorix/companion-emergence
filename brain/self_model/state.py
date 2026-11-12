@@ -13,6 +13,7 @@ gap, the displaced gap MUST survive in gap_history AND a WARN log is emitted.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -66,7 +67,22 @@ def _directions_from(value: object) -> dict[str, int]:
         return {}
 
 
+def _non_finite(value: object) -> bool:
+    """True when a JSON value holds NaN or ±Infinity anywhere (json.loads accepts them; old saves could write them)."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_non_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_non_finite(v) for v in value)
+    return False
+
+
 def _gap_from_dict(d: dict) -> Gap:
+    # A NaN never equals itself, so a gap holding one never matches its own re-load (the tick's snapshot check,
+    # #558) and cannot be saved (write_json refuses NaN): it is malformed.
+    if _non_finite(d):
+        raise ValueError("a non-finite number (NaN or Infinity)")
     return Gap(
         per_channel=d.get("per_channel") or {},
         magnitude=float(d.get("magnitude", 0.0)),

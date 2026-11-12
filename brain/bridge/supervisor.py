@@ -2271,22 +2271,33 @@ def _run_self_model_tick(
          (Steps 1-4 are the old path. With the emotion engine live they are replaced: the tick reads the
          engine's status, read and status again, returns untouched on an empty read or a state that is not
          caught up, applies the spare rule after a rebuild or catch-up, and otherwise builds the gap with
-         `gap_from_read` from the engine's shifted channels.)
-      5. Track sustained_ticks vs the prior current_gap; bump the
-         gaps_surfaced audit counter while a gap is active.
-      6. If gap.magnitude >= threshold → articulate a note via Haiku. The real
-         (authoritative) throttle acquire happens inside articulate() itself,
-         only reachable once step 0a's peek has already granted — it is the
-         guard for the rare race where chat resumes (or another accessor wins
-         the shared slot) between the peek and this call, not the common-case
-         check.
-      7. check_and_emit_resolution(prior, new) → soul candidate + feed event
-         when a sustained gap just resolved (either path).
-      8. push_gap (displaced-gap helper preserves an unresolved displaced
-         gap in history), save state.
+         `gap_from_read` from the engine's shifted channels. The spare rule saves under the state lock only if
+         the file still matches what the tick loaded; if a reconcile changed it, the rule writes nothing and the
+         tick ends "deferred", as in step 6.)
+      5. Track sustained_ticks vs the prior current_gap; if gap.magnitude >=
+         threshold → articulate a note via Haiku. The real (authoritative)
+         throttle acquire happens inside articulate() itself, only reachable
+         once step 0a's peek has already granted — it is the guard for the
+         rare race where chat resumes (or another accessor wins the shared
+         slot) between the peek and this call, not the common-case check.
+      6. Under the state lock (#558): re-load self_model_state.json. If it no
+         longer matches the snapshot the tick loaded (a reconcile saved while
+         it was articulating), write nothing and end "deferred" — her write
+         wins and the tick retries soon. Otherwise push_gap (displaced-gap
+         helper preserves an unresolved displaced gap in history) and save.
+         Only the re-load and the save run under the lock; the articulate
+         call is before it and steps 7-8 after it, so a chat-turn reconcile
+         never waits on anything slow.
+      7. Bump the gaps_surfaced audit counter while a gap is active.
+      8. check_and_emit_resolution(prior, new) → soul candidate + feed event
+         when a sustained gap just resolved (either path). Accepted trade: it
+         runs after the save, so a crash between the two loses that soul
+         candidate (the next tick sees the saved state and does not resolve
+         again) instead of the old order's duplicate on a crash before the
+         save.
       9. advance + save the cadence by outcome (clean / deferred / failure) so
-         a crash backs off, a throttle deferral retries promptly at no cost,
-         and a clean pass schedules the normal interval.
+         a crash backs off, a throttle deferral or a reconcile race retries
+         promptly at no cost, and a clean pass schedules the normal interval.
 
     Fail-isolated by the caller (run_folded's try/except), AND every I/O
     step here is locally fail-soft so a single bad read degrades to
@@ -2395,24 +2406,27 @@ def _self_model_reset_seen(reads: _SelfModelEngineReads, prior_gap: Any) -> bool
 
 def _self_model_apply_reset(
     persona_dir: Path, state: self_model_state.SelfModelState, reads: _SelfModelEngineReads
-) -> None:
+) -> bool:
     """The spare rule, after a rebuild or catch-up (live path). The tick then ends: nothing else is done.
 
     After a rebuild or a catch-up the saved flags are only approximate. No gap: nothing to do. A gap she has
     acknowledged or dismissed that held for the sustained number of ticks is kept (its `reset_seen` brought up to
     date). Any other gap is cleared without the resolution path and without a history entry.
+
+    Returns True when a reconcile changed the state since the tick loaded it, so the rule wrote nothing and the tick
+    should retry soon ("deferred", as step 5b does for the same race); False otherwise.
     """
     from brain.utils.time import iso_utc
 
     prior_gap = state.current_gap
     if prior_gap is None:
-        return
+        return False
     # #558: a reconcile may have saved since the tick loaded `state`. Re-load under the state lock; if it changed,
     # her write wins and the next tick applies the rule to what she left.
     with self_model_state.locked(persona_dir):
         if self_model_state.load_or_recover(persona_dir)[0] != state:
-            logger.info("self_model: the state changed before the spare rule saved (a reconcile); leaving it")
-            return
+            logger.info("self_model: the state changed before the spare rule saved (a reconcile); retrying soon")
+            return True
         # The two private constants of the resolution path are read, not copied: which statuses mean "she has
         # answered this gap" and how many sustained ticks make a gap worth keeping, so the rule and the resolution
         # path cannot drift.
@@ -2425,7 +2439,7 @@ def _self_model_apply_reset(
                 persona_dir,
                 self_model_state.SelfModelState(current_gap=prior_gap, gap_history=state.gap_history),
             )
-            return
+            return False
         # Accepted edge: clearing a gap here drops its reconcile cooldowns, so a channel she has just reconciled can
         # come back on the next ordinary tick. After a rebuild or a catch-up the saved flags are only approximate, so
         # a gap that is neither acknowledged nor dismissed with 3 or more sustained ticks is cleared without the
@@ -2434,6 +2448,7 @@ def _self_model_apply_reset(
             persona_dir,
             self_model_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
         )
+    return False
 
 
 def _self_model_reflect(
@@ -2474,8 +2489,7 @@ def _self_model_reflect(
         state, _recovered = self_model_state.load_or_recover(persona_dir)
         prior_gap = state.current_gap
         if _self_model_reset_seen(reads, prior_gap):
-            _self_model_apply_reset(persona_dir, state, reads)
-            return False
+            return _self_model_apply_reset(persona_dir, state, reads)
         short_values = {name: r.short for name, r in reads.read.items()}
         with ExitStack() as stack:
             store = MemoryStore(persona_dir / "memories.db")
@@ -2642,10 +2656,12 @@ def _self_model_reflect(
                 new_state = state
         self_model_state.save(persona_dir, new_state)
 
+    # ── 7: audit counter, after the save and outside the lock ───────────────
     if gap_active:
         increment_gaps_surfaced(persona_dir)
 
-    # ── 7: resolution downstream (two paths) ────────────────────────────────
+    # ── 8: resolution downstream (two paths) ────────────────────────────────
+    # After the save: a crash between the two loses this soul candidate rather than duplicating it.
     # session_id is informational on the resolved soul candidate; the
     # supervisor has no live session, so label the source.
     check_and_emit_resolution(
