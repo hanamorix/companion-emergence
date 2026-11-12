@@ -142,17 +142,19 @@ def test_invalid_utf8_after_the_window_is_still_binary(tmp_path):
 
 def test_range_read_does_not_load_the_whole_file(tmp_path):
     """A range read streams to the offset: peak Python memory stays far below the file's size."""
-    p = _numbered(tmp_path, 700_000)  # ~8 MiB
+    # ~4.6 MiB: the streamed read peaks at a fixed ~0.5 MB (chunk + decoder), a whole-file read at more
+    # than the file's size. Kept this small so the call stays inside the 2 s CPU budget on CI runners.
+    p = _numbered(tmp_path, 400_000)
     size = p.stat().st_size
     tracemalloc.start()
     try:
-        out = read_file(str(p), persona_dir=tmp_path / "x", offset=600_000, max_lines=10)
+        out = read_file(str(p), persona_dir=tmp_path / "x", offset=300_000, max_lines=10)
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert out["content"].startswith("line0600000\n")
-    assert out["total_lines"] == 700_000
-    assert peak < size // 8, f"peak {peak} bytes for a {size}-byte file"
+    assert out["content"].startswith("line0300000\n")
+    assert out["total_lines"] == 400_000
+    assert peak < size // 4, f"peak {peak} bytes for a {size}-byte file"
 
 
 def test_a_huge_single_line_is_cut_to_the_window_budget(tmp_path):
