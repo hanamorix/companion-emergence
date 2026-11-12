@@ -10,6 +10,7 @@ The design's sixth row (spelling variants pooling as separate channels) has no p
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,11 +20,17 @@ import pytest
 from brain import dev_constants
 from brain.bridge.provider import FakeProvider
 from brain.chat.extractor import _apply_emotion_delta
+from brain.emotion import engine, engine_files
 from brain.emotion.aggregate import aggregate_state
+from brain.emotion.engine import EmotionEngine, Reading
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
-from brain.kindled_link.relationship import apply_peer_emotion, write_kindled_peer_memory
+from brain.kindled_link.relationship import (
+    apply_peer_emotion,
+    run_relationship_reflection,
+    write_kindled_peer_memory,
+)
 from brain.kindled_link.store import KindledLinkStore
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -70,6 +77,18 @@ def _felt(store: MemoryStore) -> dict[str, float]:
     return aggregate_state(store.list_active()).emotions
 
 
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
+    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    return engine.engine_for(persona_dir)
+
+
+def _settled(eng: EmotionEngine) -> dict[str, Reading]:
+    eng.note_active(datetime.now(UTC))
+    return eng.read()
+
+
 def _seed(store: MemoryStore, emotions: dict[str, float]) -> Memory:
     memory = Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=emotions)
     store.create(memory)
@@ -91,7 +110,9 @@ def _one_heartbeat(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path
     engine._apply_emotion_decay(3600.0, tick_at=NOW, state=HeartbeatState.fresh(trigger="open"), dry_run=False)
 
 
-def _write_dream_over_ten(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path) -> tuple[Memory, Memory]:
+def _write_dream_over_ten(
+    store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path, *, eng: EmotionEngine | None
+) -> tuple[Memory, Memory]:
     """Dream on a seed and two neighbours, each love=6.0, and promote it past the gate. Returns the dream and the seed."""
     seed = _seed(store, {"love": 6.0})
     neighbours = [(_seed(store, {"love": 6.0}), 1.0), (_seed(store, {"love": 6.0}), 1.0)]
@@ -103,7 +124,7 @@ def _write_dream_over_ten(store: MemoryStore, hebbian: HebbianMatrix, persona_di
         persona_name="Pins",
         persona_system_prompt="You are Pins.",
     )
-    dream = engine._write_dream_memory(seed, neighbours, "DREAM: a warm room")
+    dream = engine._write_dream_memory(seed, neighbours, "DREAM: a warm room", eng=eng)
     run_consolidation(store, persona_dir=persona_dir, classifier=lambda _candidate, _context: Decision("new"))
     return dream, seed
 
@@ -120,6 +141,44 @@ def _write_negative_peer_memory(store: MemoryStore) -> str:
         emotions={"tenderness": -0.3, "joy": 5.0},
     )
     return next(m.id for m in store.list_active() if m.memory_type == "kindled_peer")
+
+
+class _GrantedSlot:
+    @contextlib.contextmanager
+    def background_slot(self, *, now=None):  # noqa: ANN001, ANN202 - the throttle's shape
+        yield True
+
+    def should_yield(self, *, now=None) -> bool:  # noqa: ANN001
+        return False
+
+
+class _Reply:
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+
+    def complete(self, prompt: str) -> str:
+        return self.reply
+
+
+def _live_peer_memories(persona_dir: Path, store: MemoryStore, *emotions_json: str) -> list[dict[str, float]]:
+    """Run one live relationship reflection per reply, an hour apart. Returns each peer memory's stored emotions, in order."""
+    _go_live(persona_dir, store)
+    link_store = KindledLinkStore(persona_dir / "kindled_link.db")
+    try:
+        for hour, emotion in enumerate(emotions_json):
+            at = NOW + timedelta(hours=hour)
+            reply = (
+                '{"proposed_stage":"stranger","trust_score":0.1,"affinity_tags":[],"boundaries_seen":[],"evidence":[],'
+                '"hard_breach":false,"memory_summary":"I talked with a peer.","emotion":' + emotion + "}"
+            )
+            run_relationship_reflection(
+                store=link_store, provider=_Reply(reply), peer_id="kid_a", transcript="peer: hello there, friend",
+                now=at, today=at.strftime("%Y-%m-%d"), throttle=_GrantedSlot(), persona_dir=persona_dir,
+                mem_store=store, persona_name="Pins", session_id="s1",
+            )
+    finally:
+        link_store.close()
+    return [m.emotions for m in sorted(store.list_by_type("kindled_peer"), key=lambda m: m.created_at)]
 
 
 def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]]:
@@ -140,11 +199,11 @@ def test_today_extractor_negative_delta_raises_the_feeling(persona_dir: Path, st
     assert _felt(store)["joy"] == pytest.approx(2.0)
 
 
-@_flipped_by("B1-1")
 def test_intended_extractor_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    _seed(store, {"joy": 5.0})
+    eng = _go_live(persona_dir, store, joy=5.0)
+    before = _settled(eng)["joy"].short
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
-    assert _felt(store)["joy"] < 5.0
+    assert _settled(eng)["joy"].short < before
 
 
 @_PINNED
@@ -155,18 +214,18 @@ def test_today_reconcile_negative_delta_raises_the_feeling(persona_dir: Path, st
     assert _felt(store)["joy"] == pytest.approx(2.0)
 
 
-@_flipped_by("B1-1")
 def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    _seed(store, {"joy": 5.0})
+    eng = _go_live(persona_dir, store, joy=5.0)
+    before = _settled(eng)["joy"].short
     reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
-    assert _felt(store)["joy"] < 5.0
+    assert _settled(eng)["joy"].short < before
 
 
 @_PINNED
 def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    dream, seed = _write_dream_over_ten(store, hebbian, persona_dir)
+    dream, seed = _write_dream_over_ten(store, hebbian, persona_dir, eng=None)
     assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
     _one_heartbeat(store, hebbian, persona_dir)
     assert "love" not in store.get(dream.id).emotions
@@ -174,9 +233,9 @@ def test_today_dream_over_ten_is_erased_by_one_heartbeat(
     assert "love" in store.get(seed.id).emotions
 
 
-@_flipped_by("B1-4")
 def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix) -> None:
-    dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir)
+    eng = _go_live(persona_dir, store)
+    dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir, eng=eng)
     assert store.get(dream.id).emotions["love"] <= 10.0
 
 
@@ -193,10 +252,9 @@ def test_today_negative_peer_value_is_erased_by_one_heartbeat(
     assert "joy" in emotions
 
 
-@_flipped_by("B1-2")
-def test_intended_peer_values_are_never_negative(store: MemoryStore) -> None:
-    memory_id = _write_negative_peer_memory(store)
-    assert all(value >= 0.0 for value in store.get(memory_id).emotions.values())
+def test_intended_peer_values_are_never_negative(persona_dir: Path, store: MemoryStore) -> None:
+    [emotions] = _live_peer_memories(persona_dir, store, '{"tenderness": -0.3, "joy": 5.0}')
+    assert emotions == {"tenderness": 0.0, "joy": 5.0}
 
 
 @_PINNED
@@ -208,8 +266,21 @@ def test_today_peer_bucket_caps_summed_size_across_emotions(persona_dir: Path) -
     assert second == {"love": pytest.approx(CAP / WINDOW_HOURS)}
 
 
-@_flipped_by("B1-2")
-def test_intended_peer_bucket_does_not_scale(persona_dir: Path) -> None:
-    first, second = _peer_changes(persona_dir)
+def test_intended_peer_bucket_does_not_scale(persona_dir: Path, store: MemoryStore) -> None:
+    first, second = _live_peer_memories(persona_dir, store, '{"tenderness": 0.5, "joy": 0.5}', '{"love": 0.5}')
     assert first == {"tenderness": 0.5, "joy": 0.5}
     assert second == {"love": 0.5}
+
+
+@pytest.mark.no_base_failure(reason="pins that an unknown switch keeps today's path (B1 PR 2); main always takes it")
+def test_unknown_switch_takes_todays_path(persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The switch file is there but its stat fails: the switch is unknown, which counts as off, so the old row is written."""
+    from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
+
+    _go_live(persona_dir, store, joy=5.0)
+    refuse_the_switch_stat(monkeypatch)
+    assert engine.engine_for(persona_dir).is_live() is False
+    _apply_emotion_delta({"joy": -0.2}, persona_dir)
+    # monologue_emotion bypasses the pending queue, so the row lands in memories.db directly.
+    rows = store.list_by_type("monologue_emotion", active_only=False)
+    assert [r.emotions for r in rows] == [{"joy": pytest.approx(2.0)}]

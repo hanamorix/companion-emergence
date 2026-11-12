@@ -53,3 +53,10 @@ def grown_words():
 def test_a_persona_with_the_words_keeps_them(grown_words):
     d = making_emotion_delta(Making("ode", "t", "c", "private", None), dominant_source="dream")
     assert d == pytest.approx({"satisfaction": 0.12, "tenderness": 0.08, "wonder": 0.10})
+
+
+def test_making_delta_live_is_ten_times():
+    """B1 PR 3: once the engine is live, the making nudge is on the 0-10 scale, ten times the old values."""
+    d = making_emotion_delta(Making("ode", "t", "c", "private", None), dominant_source="joy", live=True)
+    # A baseline persona feels pride for satisfaction (#720).
+    assert d == pytest.approx({"pride": 2.2, "tenderness": 0.8})

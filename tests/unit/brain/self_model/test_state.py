@@ -223,3 +223,64 @@ def test_a_malformed_directions_value_loads_as_empty(tmp_path):
     )
     loaded, _ = load_or_recover(tmp_path)
     assert loaded.current_gap.directions == {}
+
+
+# ── #558: one bad history entry must not cost the whole gap history ───────────
+
+
+def _write_raw_state(tmp_path, raw) -> None:
+    import json
+
+    from brain.self_model.state import _state_path
+
+    _state_path(tmp_path).write_text(json.dumps(raw), encoding="utf-8")
+
+
+def _gap_dict(note: str, status: str = "resolved") -> dict:
+    from brain.self_model.gap import Gap
+    from brain.self_model.state import _gap_to_dict
+
+    return _gap_to_dict(Gap(per_channel={"joy": 1.0}, magnitude=1.0, unnamed_pressure=0.0, status=status, note=note))
+
+
+def test_a_malformed_history_entry_drops_only_that_entry_and_says_so(tmp_path, monkeypatch, caplog):
+    """#558: a single malformed gap_history entry used to make load_or_recover return a fresh state, so the next save
+    wiped the whole history. The good entries (and the current gap) load; the bad ones are dropped, reported, and the
+    load is flagged as recovered."""
+    import logging
+
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    _write_raw_state(
+        tmp_path,
+        {
+            "current_gap": _gap_dict("now", status="open"),
+            "gap_history": [_gap_dict("first"), {"magnitude": "lots"}, "not a gap", _gap_dict("second")],
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        state, recovered = load_or_recover(tmp_path)
+
+    assert [g.note for g in state.gap_history] == ["first", "second"]
+    assert state.current_gap is not None and state.current_gap.note == "now"
+    assert recovered is True
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("dropped 2 of 4 gap_history entries" in m for m in messages), messages
+
+
+def test_a_malformed_current_gap_keeps_the_history(tmp_path, monkeypatch, caplog):
+    """#558: a bad current_gap is dropped on its own; the history it sits beside still loads."""
+    import logging
+
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    _write_raw_state(tmp_path, {"current_gap": {"magnitude": "lots"}, "gap_history": [_gap_dict("kept")]})
+    with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        state, recovered = load_or_recover(tmp_path)
+
+    assert state.current_gap is None
+    assert [g.note for g in state.gap_history] == ["kept"]
+    assert recovered is True
+    assert any("current_gap" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)

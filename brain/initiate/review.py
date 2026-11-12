@@ -324,6 +324,7 @@ def _process_one_candidate(
             except Exception:  # noqa: BLE001
                 _pron = _resolve_pronouns(None)
 
+            from brain.emotion.engine import engine_for
             from brain.initiate.reach_emotion import reach_emotions_for
 
             store = MemoryStore(persona_dir / "memories.db")
@@ -337,7 +338,7 @@ def _process_one_candidate(
                     ts=now.isoformat(),
                     user_name=user_name,
                     pronouns=_pron,
-                    reach_emotions=reach_emotions_for(candidate.source),
+                    reach_emotions=reach_emotions_for(candidate.source, live=engine_for(persona_dir).is_live()),
                 )
             finally:
                 store.close()

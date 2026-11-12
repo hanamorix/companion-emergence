@@ -13,11 +13,15 @@ gap, the displaced gap MUST survive in gap_history AND a WARN log is emitted.
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from brain.health.json_io import read_json_result, write_json
 from brain.self_model.gap import UNSET, Gap
+from brain.utils.file_lock import locked_within
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -63,7 +67,22 @@ def _directions_from(value: object) -> dict[str, int]:
         return {}
 
 
+def _non_finite(value: object) -> bool:
+    """True when a JSON value holds NaN or ±Infinity anywhere (json.loads accepts them; old saves could write them)."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_non_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_non_finite(v) for v in value)
+    return False
+
+
 def _gap_from_dict(d: dict) -> Gap:
+    # A NaN never equals itself, so a gap holding one never matches its own re-load (the tick's snapshot check,
+    # #558) and cannot be saved (write_json refuses NaN): it is malformed.
+    if _non_finite(d):
+        raise ValueError("a non-finite number (NaN or Infinity)")
     return Gap(
         per_channel=d.get("per_channel") or {},
         magnitude=float(d.get("magnitude", 0.0)),
@@ -109,6 +128,9 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
     - Missing file  → (fresh state, False)   — normal first-run
     - Corrupt JSON  → (fresh state, True)    — R-state recovery
     - Valid file    → (loaded state, False)
+    - Valid file with malformed gaps → (the gaps that parse, True): a bad
+      current_gap loads as None and a bad history entry is left out, so one
+      bad entry no longer costs the whole history (#558).
     """
     path = _state_path(persona_dir)
     # An unreadable, corrupt or non-object file is the module's default (None) and its evidence is logged there.
@@ -119,29 +141,63 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
         return SelfModelState(), True
     raw = res.data
 
-    try:
-        current_gap: Gap | None = None
-        raw_gap = raw.get("current_gap")
-        if raw_gap is not None:
+    problems: list[str] = []
+    current_gap: Gap | None = None
+    raw_gap = raw.get("current_gap")
+    if raw_gap is not None:
+        try:
             current_gap = _gap_from_dict(raw_gap)
+        except Exception as exc:  # noqa: BLE001 -- a malformed current gap loads as None
+            problems.append(f"dropped a malformed current_gap ({exc})")
 
-        gap_history: list[Gap] = []
-        for item in raw.get("gap_history") or []:
+    gap_history: list[Gap] = []
+    raw_history = raw.get("gap_history") or []
+    if not isinstance(raw_history, list):
+        problems.append(f"dropped gap_history: expected a list, got {type(raw_history).__name__}")
+        raw_history = []
+    bad: list[str] = []
+    for item in raw_history:
+        try:
             gap_history.append(_gap_from_dict(item))
+        except Exception as exc:  # noqa: BLE001 -- a malformed entry is left out, the rest load
+            bad.append(str(exc))
+    if bad:
+        problems.append(f"dropped {len(bad)} of {len(raw_history)} gap_history entries ({'; '.join(bad)})")
 
-        return SelfModelState(current_gap=current_gap, gap_history=gap_history), False
-    except Exception as exc:  # noqa: BLE001 -- any malformed gap starts fresh
-        return _recovered(path, f"malformed gap: {exc}")
+    state = SelfModelState(current_gap=current_gap, gap_history=gap_history)
+    if problems:
+        return _recovered(path, state, "; ".join(problems))
+    return state, False
 
 
-def _recovered(path: Path, why: str) -> tuple[SelfModelState, bool]:
-    """Start fresh, and say so: every caller discards the flag (#367)."""
+def _recovered(path: Path, state: SelfModelState, why: str) -> tuple[SelfModelState, bool]:
+    """Keep what parsed, and say so: every caller discards the flag (#367)."""
     # Callers load this every chat turn until the supervisor saves over it.
     warn_throttled(
         logger, f"self_model_state:{path}",
-        "self-model state %s %s; starting from an empty gap history", path, why,
+        "self-model state %s: %s; kept %d gap_history entries", path, why, len(state.gap_history),
+        exc_info=False,
     )
-    return SelfModelState(), True
+    return state, True
+
+
+@contextmanager
+def locked(persona_dir: Path) -> Iterator[None]:
+    """Hold the state file's cross-process lock for a whole load → change → save (#558).
+
+    Every writer takes it around its read-modify-write: the reconcile tool, the supervisor tick (around a re-load
+    that checks its snapshot still holds, and its save) and the one-time repair. Readers that only render it (the
+    chat prompt, tool recruitment) do not: ``save`` replaces the file atomically. Not re-entrant: never load-and-save
+    under it through a helper that takes it again.
+
+    The wait is bounded by ``dev_constants.SELF_MODEL_LOCK_WAIT_S``: a holder stalled inside its save (a hung disk)
+    must not hang a chat turn's reconcile. When another holder keeps the lock for the whole wait this raises
+    :class:`brain.utils.file_lock.LockTimeoutError` and the body never runs; each caller handles that.
+    """
+    from brain import dev_constants
+
+    with locked_within(_state_path(persona_dir), dev_constants.SELF_MODEL_LOCK_WAIT_S):
+        yield
 
 
 def save(persona_dir: Path, state: SelfModelState) -> None:

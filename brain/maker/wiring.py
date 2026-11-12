@@ -22,8 +22,12 @@ _SOURCE_ACCENT = {
 _BASELINE_FALLBACK = {"satisfaction": "pride", "wonder": "awe"}
 
 
-def making_emotion_delta(making: Making, *, dominant_source: str | None) -> dict[str, float]:
-    """Small vocab-filtered emotion delta for having made. Decay-subordinate. No source means the base nudge only."""
+def making_emotion_delta(making: Making, *, dominant_source: str | None, live: bool = False) -> dict[str, float]:
+    """Small vocab-filtered emotion delta for having made. Decay-subordinate. No source means the base nudge only.
+
+    ``live`` (the emotion engine's switch is on) gives the same nudge on the engine's 0-10 scale, ten times the old
+    small values (B1 PR 3).
+    """
     from brain.chat.extractor import _filter_to_registered
     from brain.emotion.vocabulary import get as vocab_get
 
@@ -36,6 +40,8 @@ def making_emotion_delta(making: Making, *, dominant_source: str | None) -> dict
         if fallback is not None and vocab_get(name) is None:
             name = fallback
         resolved[name] = resolved.get(name, 0.0) + v
+    if live:
+        resolved = {name: v * 10.0 for name, v in resolved.items()}
     return _filter_to_registered(resolved)
 
 

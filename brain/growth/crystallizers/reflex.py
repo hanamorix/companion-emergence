@@ -131,7 +131,7 @@ def _build_corpus(
         excerpt = ""
         if f.output_memory_id:
             try:
-                mem = store.get(f.output_memory_id)
+                mem = store.get(f.output_memory_id, bump=False)  # a judging pass, not a recall (#587)
                 if mem is not None:
                     excerpt = (mem.content or "")[:200]
             except Exception:
@@ -480,7 +480,7 @@ def crystallize_reflex(
     # Phase 4.2 — emit one initiate candidate per accepted decision. Wrapped
     # in try/except so a downstream emit failure can never crash the
     # crystallizer: reflex emergence is physiology, initiate is signal.
-    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now)
+    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now, persona_dir=persona_dir)
     for emergence in accepted_emergences:
         _emit_initiate_candidate(
             persona_dir=persona_dir,
@@ -505,6 +505,7 @@ def _aggregate_recent_emotion_vector(
     store: MemoryStore,
     *,
     now: datetime,
+    persona_dir: Path,
     look_back_days: int = 7,
 ) -> dict[str, float]:
     """Return a max-pooled emotion vector across recent active memories.
@@ -513,9 +514,16 @@ def _aggregate_recent_emotion_vector(
     emotional context — what's been alive in the persona over the
     last week, not a moment-in-time felt state. Empty dict on any
     failure (the emit candidate just carries no vector — better than
-    a zero-filled lie).
+    a zero-filled lie). Once the emotion engine is live, its short
+    averages above 0 instead.
     """
     try:
+        from brain.emotion.engine import engine_for
+
+        eng = engine_for(persona_dir)
+        if eng.is_live():
+            # Once the engine is live: her short averages above 0. Context only.
+            return {name: r.short for name, r in eng.read().items() if r.short > 0}
         from brain.emotion.aggregate import aggregate_state
 
         cutoff = now - timedelta(days=look_back_days)
