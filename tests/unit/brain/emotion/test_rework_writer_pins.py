@@ -156,11 +156,11 @@ def test_today_extractor_negative_delta_raises_the_feeling(persona_dir: Path, st
     assert _felt(store)["joy"] == pytest.approx(2.0)
 
 
-@_flipped_by("B1-1")
 def test_intended_extractor_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    _seed(store, {"joy": 5.0})
+    eng = _go_live(persona_dir, store, joy=5.0)
+    before = _settled(eng)["joy"].short
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
-    assert _felt(store)["joy"] < 5.0
+    assert _settled(eng)["joy"].short < before
 
 
 @_PINNED
@@ -171,11 +171,11 @@ def test_today_reconcile_negative_delta_raises_the_feeling(persona_dir: Path, st
     assert _felt(store)["joy"] == pytest.approx(2.0)
 
 
-@_flipped_by("B1-1")
 def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    _seed(store, {"joy": 5.0})
+    eng = _go_live(persona_dir, store, joy=5.0)
+    before = _settled(eng)["joy"].short
     reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
-    assert _felt(store)["joy"] < 5.0
+    assert _settled(eng)["joy"].short < before
 
 
 @_PINNED
@@ -229,3 +229,17 @@ def test_intended_peer_bucket_does_not_scale(persona_dir: Path) -> None:
     first, second = _peer_changes(persona_dir)
     assert first == {"tenderness": 0.5, "joy": 0.5}
     assert second == {"love": 0.5}
+
+
+@pytest.mark.no_base_failure(reason="pins that an unknown switch keeps today's path (B1 PR 2); main always takes it")
+def test_unknown_switch_takes_todays_path(persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The switch file is there but its stat fails: the switch is unknown, which counts as off, so the old row is written."""
+    from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
+
+    _go_live(persona_dir, store, joy=5.0)
+    refuse_the_switch_stat(monkeypatch)
+    assert engine.engine_for(persona_dir).is_live() is False
+    _apply_emotion_delta({"joy": -0.2}, persona_dir)
+    # monologue_emotion bypasses the pending queue, so the row lands in memories.db directly.
+    rows = store.list_by_type("monologue_emotion", active_only=False)
+    assert [r.emotions for r in rows] == [{"joy": pytest.approx(2.0)}]

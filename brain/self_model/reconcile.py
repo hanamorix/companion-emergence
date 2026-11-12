@@ -103,14 +103,33 @@ def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) ->
     then capped at ``extractor._MAX_DELTA_INTENSITY`` — one reconcile can't peg
     a channel to the full clamp any more than one chat-turn extraction can.
 
-    Returns True if a memory was written, False if the channel was off-vocab or
-    the delta was effectively zero (nothing to write).
+    Once the engine is live, the signed change is folded into the engine instead
+    and no memory is written (B1 PR 2).
+
+    Returns True if a memory was written (or, live, a change was folded), False
+    if the channel was off-vocab or the delta was effectively zero.
     """
-    from brain.chat.extractor import _MAX_DELTA_INTENSITY, _filter_to_registered
+    from brain.chat.extractor import (
+        _MAX_DELTA_INTENSITY,
+        _filter_to_registered,
+        signed_change_values,
+    )
+    from brain.emotion import engine
     from brain.memory.store import Memory, MemoryStore
 
     clamped = _clamp_delta(delta)
     registered = _filter_to_registered({channel: clamped})
+
+    # Live (B1 PR 2): fold the signed change into the engine and write no row; True means something was folded. An
+    # unknown switch counts as off and takes the old path below.
+    live_engine = engine.engine_for(persona_dir)
+    if live_engine.is_live():
+        changes = signed_change_values(registered)
+        if not changes:
+            return False
+        live_engine.fold_change(changes, None, "self_model_reconcile")
+        return True
+
     emotions = {
         ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
         for ch, v in registered.items()
