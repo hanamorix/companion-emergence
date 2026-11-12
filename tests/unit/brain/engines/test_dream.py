@@ -730,7 +730,7 @@ def _mood_rows(store: MemoryStore) -> list[Memory]:
 @pytest.mark.no_base_failure(reason="pins the switch-off mood, which is today's")
 def test_off_mood_comes_from_conversation_rows(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
     breadcrumbs = _mood_rows(store)
-    seed = _live_dream_engine(store, hebbian, tmp_path)._select_seed(seed_id=None, lookback_hours=24, eng=None)
+    seed = _live_dream_engine(store, hebbian, tmp_path).run_cycle(dry_run=True).seed
     assert seed.id not in {b.id for b in breadcrumbs}
     assert seed.emotions == {"grief": 6.0}
 
@@ -742,7 +742,7 @@ def test_live_mood_comes_from_the_engine_read(store: MemoryStore, hebbian: Hebbi
     eng.note_active(datetime.now(UTC))
     assert set(eng.read()) == {"grief", "joy"}
 
-    seed = _live_dream_engine(store, hebbian, tmp_path)._select_seed(seed_id=None, lookback_hours=24, eng=eng)
+    seed = _live_dream_engine(store, hebbian, tmp_path).run_cycle(dry_run=True).seed
 
     # The engine's joy opens the pool to the joy-congruent breadcrumbs, and their importance lifts one to the top.
     assert seed.id in {b.id for b in breadcrumbs}
