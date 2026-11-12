@@ -43,6 +43,29 @@ def test_the_half_life_is_in_the_engines_table_and_the_baseline_reads_it_from_th
     assert baseline.decay_half_life_days == dev_constants.EMOTION_HALF_LIFE_DAYS[name]
 
 
+def test_the_four_baseline_entries_take_their_half_life_from_the_table_and_hold_no_literal_of_their_own():
+    """One source: each of the four `Emotion(...)` calls in the baseline passes `EMOTION_HALF_LIFE_DAYS[<name>]`, not a number."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(vocabulary))
+    found: dict[str, ast.expr] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Emotion"
+            and len(node.args) >= 4
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in {f[0] for f in FOUR}
+        ):
+            found[node.args[0].value] = node.args[3]
+    assert set(found) == {f[0] for f in FOUR}
+    for name, argument in found.items():
+        assert isinstance(argument, ast.Subscript), name
+        assert ast.unparse(argument) == f"EMOTION_HALF_LIFE_DAYS['{name}']"
+
+
 def test_the_engine_knows_the_half_life_of_each_without_a_persona_file(tmp_path):
     engine = engine_module.EmotionEngine(tmp_path)
     for name, _category, _description, days in FOUR:

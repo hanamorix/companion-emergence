@@ -178,7 +178,15 @@ def test_the_reflex_crystallizer_still_accepts_triggers_on_the_four_names(person
     run_vocabulary_swap_648(persona)
     names_after = reflex._load_emotion_vocabulary(persona)
     assert names_after == names_before and set(FOUR) <= names_after
-    proposal = {"name": "quiet_arc", "description": "d", "trigger": {"calm": 7.0, "peace": 7.0}, "prompt_template": "x"}
+    proposal = {
+        "name": "quiet_arc",
+        "description": "a quiet stretch",
+        "trigger": {"calm": 7.0, "peace": 7.0},
+        "cooldown_hours": 24,
+        "prompt_template": "a quiet moment",
+        "output_memory_type": "reflex_firing",
+        "reasoning": "a pattern of steadiness",
+    }
     accepted, reason = reflex._validate_emergence_proposal(
         proposal_dict=proposal,
         current_arc_names=set(),
@@ -188,7 +196,7 @@ def test_the_reflex_crystallizer_still_accepts_triggers_on_the_four_names(person
         active_arc_count=0,
         total_cap=10,
     )
-    assert "gate 4" not in reason  # the four names are known; any later gate is about something else
+    assert accepted, reason
 
 
 # --- the write path: verified, with backups ----------------------------------------------------------------------------
