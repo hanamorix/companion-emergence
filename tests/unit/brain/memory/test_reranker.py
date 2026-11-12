@@ -14,7 +14,6 @@ integration" — requires_network alone is not part of that expression).
 from __future__ import annotations
 
 import ast as _ast
-import sys
 from unittest.mock import mock_open
 
 import pytest
@@ -307,7 +306,7 @@ def test_avx2_detection_error_is_fail_soft_and_conservative(monkeypatch: pytest.
     """AVX2 detection failing outright (e.g. /proc/cpuinfo unreadable) must
     never raise into startup — it degrades to "no AVX2" (the conservative,
     larger-budget default), matching #250 §3's fail-soft requirement."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
 
     def _boom(*args, **kwargs):
         raise OSError("simulated /proc/cpuinfo read failure")
@@ -337,7 +336,7 @@ def test_detect_avx2_true_when_flags_line_has_the_bare_avx2_token(
     """A realistic multi-token `flags` line with `avx2` present among many
     other flags (including the related-but-distinct `avx`) must detect
     True."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     cpuinfo = (
         "processor\t: 0\n"
         "vendor_id\t: GenuineIntel\n"
@@ -358,7 +357,7 @@ def test_detect_avx2_false_when_flags_line_has_avx_but_not_avx2(
 ) -> None:
     """Guards the avx/avx2 PREFIX confusion: `avx` present, `avx2` absent ->
     must be False, not True from a loose `avx` prefix match."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     cpuinfo = "processor\t: 0\nflags\t\t: fpu vme de pse avx f16c rdrand bmi1 bmi2\n"
     monkeypatch.setattr("builtins.open", mock_open(read_data=cpuinfo))
 
@@ -382,7 +381,7 @@ def test_detect_avx2_false_for_decoy_substring_token_without_bare_avx2(
     assert "avx2" in "avx2_vnni"  # sanity: the decoy IS a substring match
     assert "avx2" not in "avx2_vnni".split()  # but NOT a whole-token match
 
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     cpuinfo = "processor\t: 0\nflags\t\t: fpu vme de pse avx2_vnni bmi1 bmi2\n"
     monkeypatch.setattr("builtins.open", mock_open(read_data=cpuinfo))
 
@@ -395,7 +394,7 @@ def test_detect_avx2_false_for_arm_style_cpuinfo_with_no_flags_line(
     """An ARM-style /proc/cpuinfo has a `Features:` line, not `flags` — the
     loop never finds a line starting with "flags" and falls through to the
     trailing `return False`."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     cpuinfo = (
         "processor\t: 0\n"
         "model name\t: ARMv8 Processor rev 1 (v8l)\n"
@@ -460,7 +459,7 @@ def _fake_open_dispatcher(contents: dict[str, str]):
 def test_cgroup_v2_headroom_reads_limit_minus_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     """Process is at the v2 root itself (`0::/`) -> the root's own
     memory.max/memory.current are the ones read."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -485,7 +484,7 @@ def test_cgroup_v2_nested_cgroup_reads_process_own_limit_not_root(
     FileNotFoundError on `/sys/fs/cgroup/memory.max` and return None here;
     the corrected reader resolves the process's own cgroup via
     `/proc/self/cgroup` and finds its cap."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -519,7 +518,7 @@ def test_cgroup_v2_walk_up_uses_ancestor_cap_when_own_level_is_max(
         "/sys/fs/cgroup/user.slice/memory.current": "1000000000\n",
         # root's memory.max deliberately absent -> must be tolerated
     }
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr("builtins.open", _fake_open_dispatcher(files))
     assert reranker_mod._cgroup_v2_memory_headroom_bytes() == 3_000_000_000.0
     del files["/sys/fs/cgroup/user.slice/memory.current"]
@@ -530,7 +529,7 @@ def test_cgroup_v2_all_max_up_chain_returns_none(monkeypatch: pytest.MonkeyPatch
     """Every level on the chain (own cgroup, parent, root) reads "max" ->
     no numeric cap anywhere -> None, and usage is never even read since
     there is nothing to subtract it from."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -546,7 +545,7 @@ def test_cgroup_v2_all_max_up_chain_returns_none(monkeypatch: pytest.MonkeyPatch
 
 
 def test_cgroup_v2_unbounded_max_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -562,14 +561,14 @@ def test_cgroup_v2_unbounded_max_returns_none(monkeypatch: pytest.MonkeyPatch) -
 def test_cgroup_v2_missing_proc_self_cgroup_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail-soft: `/proc/self/cgroup` itself absent (e.g. non-Linux-like
     sandbox) -> None, never a crash."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr("builtins.open", _fake_open_dispatcher({}))
     assert reranker_mod._cgroup_v2_memory_headroom_bytes() is None
 
 
 def test_cgroup_v2_garbage_memory_max_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail-soft: an unparsable memory.max value -> None, never a crash."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -585,7 +584,7 @@ def test_cgroup_v2_garbage_memory_max_returns_none(monkeypatch: pytest.MonkeyPat
 def test_cgroup_v1_headroom_reads_limit_minus_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     """Process is at the v1 memory-controller root itself -> the root's
     own limit_in_bytes/usage_in_bytes are the ones read."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -609,7 +608,7 @@ def test_cgroup_v1_nested_cgroup_reads_process_own_limit_not_root(
     reader would hit FileNotFoundError there and return None; the
     corrected reader resolves the process's own cgroup via `/proc/self/
     cgroup`'s `memory` controller line and finds its cap."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -629,7 +628,7 @@ def test_cgroup_v1_hybrid_proc_self_cgroup_picks_memory_controller_line(
     """A combined-controller hierarchy line (e.g. `cpu,memory`) and other,
     unrelated controller lines are both present in `/proc/self/cgroup` —
     the v1 reader must pick the line that actually lists `memory`."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -650,7 +649,7 @@ def test_cgroup_v1_unbounded_sentinel_returns_none(monkeypatch: pytest.MonkeyPat
     unbounded limit reads back as the kernel's own huge sentinel value,
     which must be treated as unbounded -> None, never a fabricated huge
     headroom."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -667,14 +666,14 @@ def test_cgroup_v1_unbounded_sentinel_returns_none(monkeypatch: pytest.MonkeyPat
 
 def test_cgroup_v1_missing_proc_self_cgroup_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail-soft: `/proc/self/cgroup` itself absent -> None, never a crash."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr("builtins.open", _fake_open_dispatcher({}))
     assert reranker_mod._cgroup_v1_memory_headroom_bytes() is None
 
 
 def test_cgroup_v1_garbage_limit_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail-soft: an unparsable limit_in_bytes value -> None, never a crash."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr(
         "builtins.open",
         _fake_open_dispatcher(
@@ -785,7 +784,7 @@ def _use_files(
             raise PermissionError(path)
         return inner(path, *args, **kwargs)
 
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     monkeypatch.setattr("builtins.open", _open)
 
 
@@ -2228,7 +2227,7 @@ def test_j5_v1_on_real_files_the_container_layout_and_a_real_permission_error(
     (root / "memory.stat").write_text(_v1s(cache=300_000_000, mapped=0, dirty=0, writeback=0, shmem=0))
     monkeypatch.setattr(reranker_mod, "_CGROUP_V1_ROOT", str(root))
     monkeypatch.setattr(reranker_mod, "_read_proc_self_cgroup_v1_memory_path", lambda: "docker/abc")
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "linux")
     assert _v1() == 800_000_000.0  # the path is absent under the tree: the root (use_hierarchy 0) is the own level
     own = root / "docker" / "abc"
     own.mkdir(parents=True)
@@ -2314,7 +2313,7 @@ def test_psutil_available_bytes_reads_the_host_available_memory(monkeypatch: pyt
         available = 5_000_000 * 1024
 
     for platform in ("linux", "darwin", "win32"):
-        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(reranker_mod, "_platform", lambda p=platform: p)
         monkeypatch.setattr(psutil, "virtual_memory", lambda: _Mem())
         assert reranker_mod._psutil_available_bytes() == 5_000_000 * 1024.0
 
@@ -2343,7 +2342,7 @@ def test_headroom_is_read_on_a_non_linux_platform_through_psutil(monkeypatch: py
     class _Mem:
         available = 7e9
 
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(reranker_mod, "_platform", lambda: "darwin")
     monkeypatch.setattr(psutil, "virtual_memory", lambda: _Mem())
     assert reranker_mod._available_ram_headroom_bytes() == 7e9
 

@@ -108,8 +108,13 @@ _intent_lock = threading.Lock()
 # ---------------------------------------------------------------- service seams (I5 steps 4, 5; tests spy these)
 
 
+def _platform() -> str:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662, #710)."""
+    return sys.platform
+
+
 def _service_backend(platform: str | None = None):
-    platform = platform or sys.platform
+    platform = platform or _platform()
     try:
         if platform == "darwin":
             from brain.service import launchd as backend
@@ -130,7 +135,7 @@ def service_installed(persona: str, platform: str | None = None) -> bool:
 
 
 def _service_installed_check(persona: str, platform: str | None = None) -> bool:
-    platform = platform or sys.platform
+    platform = platform or _platform()
     backend = _service_backend(platform)
     if backend is None:
         return False
@@ -145,7 +150,7 @@ def _service_installed_check(persona: str, platform: str | None = None) -> bool:
 
 def owned_by_service(persona: str, pid: int, client_origin: str | None, platform: str | None = None) -> bool:
     """Asked only when the service is installed (S6-c): does the manager say this pid is its job?"""
-    platform = platform or sys.platform
+    platform = platform or _platform()
     backend = _service_backend(platform)
     if backend is None:
         return False
@@ -167,7 +172,7 @@ def owned_by_service(persona: str, pid: int, client_origin: str | None, platform
 def manager_stop(persona: str, platform: str | None = None) -> None:
     """The manager's stop for an owned bridge that did not end on the hard-exit request (15 s cap; any result goes on
     to the helper's own kill)."""
-    platform = platform or sys.platform
+    platform = platform or _platform()
     backend = _service_backend(platform)
     if backend is None:
         return
@@ -202,7 +207,7 @@ def _alive(proc) -> bool:
 
 def _kill_proc(proc) -> None:
     try:
-        if sys.platform.startswith("win"):  # pragma: no cover - Windows CI leg
+        if _platform().startswith("win"):  # pragma: no cover - Windows CI leg
             _terminate_exit_0(proc)
         else:
             proc.kill()

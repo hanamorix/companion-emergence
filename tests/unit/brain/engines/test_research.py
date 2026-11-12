@@ -1178,3 +1178,127 @@ def test_off_fire_is_unchanged_and_leaves_felt_lines_to_the_old_parser(tmp_path:
     assert memory.emotions == {}
     assert "engagement_rating" not in memory.metadata
     assert not (tmp_path / "parse_failures.jsonl").exists()
+
+
+# ---- #587: only what research puts in front of her counts as a recall ----
+
+
+def test_a_declined_selection_ticks_no_memories(tmp_path: Path):
+    """#587: picking among interests reads each one's memories, but none is researched, so none ticks."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        provider = ScriptedProvider(['{"choice": null, "why": "nothing pulls"}'])
+        res = _build_engine(tmp_path, store, provider=provider).run_tick(
+            trigger="manual", days_since_human_override=5.0
+        )
+        assert res.reason == "declined"
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_a_fire_ticks_each_memory_it_shows_once(tmp_path: Path):
+    """#587: a memory matched by two keywords is in the research prompt once, so it gains 1.0 once."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        provider = ScriptedProvider(
+            ['{"choice": "i1", "why": "it connects"}', "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue"]
+        )
+        res = _build_engine(tmp_path, store, provider=provider).run_tick(
+            trigger="manual", days_since_human_override=5.0
+        )
+        assert res.fired is not None
+        assert "a marine creature glowing" in provider.calls[1][0]  # it really was in front of her
+        row = store.get(mem_id, bump=False)
+        assert row.recall_count == 1.0 and row.last_accessed_at is not None
+    finally:
+        store.close()
+
+
+def test_a_research_session_that_fails_ticks_no_memories(tmp_path: Path):
+    """#587: the memories tick once the session has run; a session that raises never reached her."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+
+    class SelectsThenFails(ScriptedProvider):
+        def generate(self, prompt, *, system=None):
+            if self.calls:
+                raise RuntimeError("simulated session failure")
+            return super().generate(prompt, system=system)
+
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        engine = _build_engine(tmp_path, store, provider=SelectsThenFails(['{"choice": "i1", "why": "it connects"}']))
+        with pytest.raises(RuntimeError, match="simulated session failure"):
+            engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_a_failed_recall_tick_does_not_cost_the_fire(tmp_path: Path, monkeypatch):
+    """#587: the tick comes after the fire's writes and is fail-soft, so a store error there loses nothing paid for."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        real_get = store.get
+
+        def _get(memory_id, *, bump=True):
+            if bump is True:
+                raise RuntimeError("simulated tick failure")
+            return real_get(memory_id, bump=bump)
+
+        monkeypatch.setattr(store, "get", _get)
+        provider = ScriptedProvider(
+            ['{"choice": "i1", "why": "it connects"}', "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue"]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None and res.fired.output_memory_id is not None
+        assert (tmp_path / "research_log.json").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.no_base_failure(
+    reason="keeps _build_memory_context's str return, which main already has, for the callers on open emotion-rework branches (#587)"
+)
+def test_build_memory_context_still_returns_text_and_ticks_nothing(tmp_path: Path):
+    """#587: open branches call ``_build_memory_context`` and format its str; a tuple would reach the prompt silently."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        engine = _build_engine(tmp_path, store)
+        interest = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH).interests[0]
+        text = engine._build_memory_context(interest)
+        assert isinstance(text, str) and "a marine creature glowing" in text
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_a_declined_selection_with_no_keywords_ticks_no_memories(tmp_path: Path):
+    """#587: an interest with no keywords is matched by its topic; that search shows her nothing either."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict(related_keywords=[])])
+    store = MemoryStore(":memory:")
+    try:
+        mem_id = _seed_conversation_memory(store, "notes on marine bioluminescence at night")
+        provider = ScriptedProvider(['{"choice": null, "why": "nothing pulls"}'])
+        res = _build_engine(tmp_path, store, provider=provider).run_tick(
+            trigger="manual", days_since_human_override=5.0
+        )
+        assert res.reason == "declined"
+        assert "notes on marine bioluminescence" in provider.calls[0][0]  # the topic search did find it
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()

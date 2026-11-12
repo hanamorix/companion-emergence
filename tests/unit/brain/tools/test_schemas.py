@@ -96,7 +96,8 @@ def test_search_memories_required_fields() -> None:
 def test_no_arg_tools_have_empty_required() -> None:
     """Tools that take no args have empty required lists and empty properties."""
     # get_body_state now takes an optional session_hours arg — excluded from this set.
-    no_arg_tools = {"get_emotional_state", "get_personality", "boot", "get_soul"}
+    # get_soul takes optional limit/offset/love_type (#596) — see test_get_soul_bounded.py.
+    no_arg_tools = {"get_emotional_state", "get_personality", "boot"}
     for tool_name in no_arg_tools:
         schema = SCHEMAS[tool_name]
         assert schema["parameters"]["required"] == [], (

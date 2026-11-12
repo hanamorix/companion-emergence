@@ -316,7 +316,7 @@ def test_group_c_soul_candidate_repair_save_and_repair_locked(tmp_path: Path) ->
     path = tmp_path / scr._CANDIDATES_FILE
     scr._save_candidates(path, [{"memory_id": "m1", "text": "t", "status": scr._TARGET_STATUS, "session_id": scr._TARGET_SESSION_ID}])
     assert json.loads(path.read_text())["memory_id"] == "m1"
-    store = SimpleNamespace(get=lambda mid: SimpleNamespace(content="body text"))
+    store = SimpleNamespace(get=lambda mid, **_kw: SimpleNamespace(content="body text"))
     report = scr._repair_locked(tmp_path, path, store=store)
     assert report.repaired == 1 and "body text" in json.loads(path.read_text())["text"]
     # An unreadable candidates file: skipped through the site's own handler, and left untouched.

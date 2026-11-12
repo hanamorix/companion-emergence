@@ -294,7 +294,9 @@ def _service_status_field(status: object, *names: str, default: object = None) -
 
 def _service_print_plist_handler(args: argparse.Namespace) -> int:
     """Print the macOS LaunchAgent plist for a persona without installing it."""
-    if sys.platform != "darwin":
+    from brain import service as _service
+
+    if _service.current_platform() != "darwin":
         print(
             "service print-plist: macOS launchd plist output is only supported on macOS",
             file=sys.stderr,
