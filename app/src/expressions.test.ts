@@ -128,6 +128,19 @@ describe("expression picker, feels_high null or absent: nothing counts as high",
   });
 });
 
+describe("expression picker, the content family", () => {
+  it.each(["contentment", "peace", "calm", "groundedness"])(
+    "shows the content expression when %s is the top feeling",
+    (name) => {
+      expect(pickExpressionCategory({ emotions: { [name]: 6 }, body: null })).toBe("content");
+    },
+  );
+
+  it("does not show it for a feeling outside the family", () => {
+    expect(pickExpressionCategory({ emotions: { relief: 6 }, body: null })).not.toBe("content");
+  });
+});
+
 describe("expression picker, no state at all", () => {
   it("shows the neutral expression", () => {
     expect(pickExpressionFromState(null)).toBe("idle");

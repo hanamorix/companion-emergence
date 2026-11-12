@@ -95,6 +95,13 @@ EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "rest_need": 0.75,
     "emergence": 60.0,
     "creative_hunger": 5.0,
+    # The four feelings of #648 (contentment and its three flavours). Their half-lives are written only here: the four
+    # `brain.emotion.vocabulary._BASELINE` entries read them from this table. The owner set them: contentment one day,
+    # peace and calm four hours each, groundedness two days.
+    "contentment": 1.0,
+    "peace": 4.0 / 24.0,
+    "calm": 4.0 / 24.0,
+    "groundedness": 2.0,
 }
 # The half-life of an emotion that is in neither the persona's vocabulary file nor the table above.
 EMOTION_DEFAULT_HALF_LIFE_DAYS: float = 14.0

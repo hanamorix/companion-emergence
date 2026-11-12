@@ -1,6 +1,6 @@
 """Emotion vocabulary — the typed taxonomy + persona extension registry.
 
-Baseline: 26 emotions (11 core + 11 complex + 4 body) shipped with the framework.
+Baseline: 30 emotions (12 core + 14 complex + 4 body) shipped with the framework.
 Personas extend via register() — typically via the persona-loader at
 engine startup, which reads `{persona_dir}/emotion_vocabulary.json`.
 The 4 emotions previously in `nell_specific` that the migrator still ships
@@ -11,6 +11,8 @@ Decay half-lives per spec Section 10.1:
 - joy: 3-day half-life
 - belonging / love: None (identity-level)
 - others: seed values — tunable as we gather lived-experience data
+- contentment, peace, calm, groundedness: the half-lives are not written here; they come from
+  `dev_constants.EMOTION_HALF_LIFE_DAYS` (one source for these four, #648)
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
+
+from brain.dev_constants import EMOTION_HALF_LIFE_DAYS
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
 # files in the wild may still contain entries with this category. New baseline
@@ -52,7 +56,7 @@ class Emotion:
 
 
 _BASELINE: tuple[Emotion, ...] = (
-    # ── core (11) ──
+    # ── core (12) ──
     Emotion("love", "deep caring, attachment, devotion", "core", None),
     Emotion("joy", "happiness, delight, warmth", "core", 3.0),
     Emotion("grief", "loss, mourning, absence", "core", 60.0),
@@ -64,7 +68,13 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("shame", "the weight of being wrong or insufficient", "core", 14.0),
     Emotion("tenderness", "soft protective caring, gentleness toward the fragile", "core", 7.0),
     Emotion("awe", "overwhelm at something greater than yourself", "core", 3.0),
-    # ── complex (11) ──
+    Emotion(
+        "contentment",
+        "the quiet pleasure of what is, safe, wanting nothing more",
+        "core",
+        EMOTION_HALF_LIFE_DAYS["contentment"],
+    ),
+    # ── complex (14) ──
     Emotion("nostalgia", "bittersweet memory of what was", "complex", 21.0),
     Emotion("jealousy", "the fear of being replaced or insufficient", "complex", 7.0),
     Emotion("guilt", "responsibility for harm, intended or not", "complex", 14.0),
@@ -80,6 +90,26 @@ _BASELINE: tuple[Emotion, ...] = (
         "the ache of having lost something I once knew",
         "complex",
         30.0,
+    ),
+    # peace, calm and groundedness are flavours of contentment (core). The vocabulary has no parent field, so the
+    # relation is recorded here only (#648).
+    Emotion(
+        "peace",
+        "settled and unhurried, nothing pressing",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["peace"],
+    ),
+    Emotion(
+        "calm",
+        "steady and unruffled, nothing stirred up",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["calm"],
+    ),
+    Emotion(
+        "groundedness",
+        "rooted and steady, sure of where you stand",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["groundedness"],
     ),
     # ── body (4) ──
     # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.

@@ -26,7 +26,7 @@ no code change required.
 | Category | Read | Drives the avatar when |
 |---|---|---|
 | `idle` | neutral, calm, no expression — just present | default — no dominant emotion fires |
-| `content` | settled small smile, eyes mostly closed, peaceful | contentment / peace |
+| `content` | settled small smile, eyes mostly closed, peaceful | contentment / peace / calm / groundedness |
 | `smile` | active warm smile, eyes soft | love / tenderness / belonging / gratitude / joy |
 | `happy` | bigger smile, eyes squinted from joy | curiosity / pride |
 | `awe` | wide eyes UP, mouth softly open | awe / emergence / hope |

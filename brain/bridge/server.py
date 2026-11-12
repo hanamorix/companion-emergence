@@ -86,6 +86,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
+from brain.emotion import vocabulary_swap
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -1420,6 +1421,10 @@ def build_app(
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
             _vocab_store.close()
+
+        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648), right before the
+        # engine's first rebuild so that rebuild already uses the swapped half-lives. Fail-soft: it logs and never raises.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
 
         # The emotion engine's switch-over (Engine 6, spec 3.1 S6): a persona's first start does its x10 fix and first rebuild
         # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so

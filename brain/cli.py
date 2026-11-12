@@ -19,7 +19,7 @@ from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
-from brain.emotion import engine_files
+from brain.emotion import engine_files, vocabulary_swap
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
@@ -1010,14 +1010,17 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
 def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
     """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6): None to go on, or an exit code to return.
 
-    Called by the six commands that touch the engine, right after their own vocabulary load. A real run calls
-    `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and a failure raises `EngineStartupError`
-    out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run first runs the one-time
+    vocabulary swap (#648), then calls `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and
+    a failure raises `EngineStartupError` out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
     not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
     plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
     on a switched persona it goes on as today.
     """
     if not dry_run:
+        # The one-time vocabulary swap for contentment, calm, peace and groundedness (#648) comes first, so the switch-over's
+        # rebuild uses the swapped half-lives. It logs and never raises; a dry run (below) writes nothing and never calls it.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
         emotion_engine.ensure_engine_ready(persona_dir)
         return None
     if emotion_engine.engine_for(persona_dir).is_live():

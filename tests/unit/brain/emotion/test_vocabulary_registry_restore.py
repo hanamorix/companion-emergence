@@ -1,7 +1,7 @@
 """#540: a test's change to the emotion vocabulary registry must not reach the next test.
 
 ``vocabulary.register`` (a persona's extension emotions) is process-global. Under pytest-xdist the order of tests in a
-worker is not the order in a file, so a count such as "the baseline has 26 emotions" is only stable when every test
+worker is not the order in a file, so a count such as "the baseline has 30 emotions" is only stable when every test
 restores it. The autouse fixture in tests/conftest.py does it; these tests run two ordered tests in an inner session to
 prove it, with a control arm without the fixture.
 """
