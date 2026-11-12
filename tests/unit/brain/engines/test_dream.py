@@ -11,12 +11,12 @@ import pytest
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import FakeProvider, LLMProvider
 from brain.emotion import engine as emotion_engine
-from brain.emotion import engine_files
 from brain.emotion.engine import EmotionEngine
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from tests.unit.brain.emotion._engine_support import make_live
 
 
 class _PrefixedFakeProvider(LLMProvider):
@@ -651,7 +651,7 @@ def test_strengthen_edges_all_active_unchanged(engine: DreamEngine) -> None:
 
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return emotion_engine.engine_for(persona_dir)
 
 
@@ -737,7 +737,7 @@ def test_off_mood_comes_from_conversation_rows(store: MemoryStore, hebbian: Hebb
 
 def test_live_mood_comes_from_the_engine_read(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
     breadcrumbs = _mood_rows(store)
-    assert engine_files.write_switch(tmp_path, datetime.now(UTC))
+    make_live(tmp_path, datetime.now(UTC))
     eng = emotion_engine.engine_for(tmp_path)
     eng.note_active(datetime.now(UTC))
     assert set(eng.read()) == {"grief", "joy"}

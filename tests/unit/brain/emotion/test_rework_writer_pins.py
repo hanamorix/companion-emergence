@@ -19,7 +19,7 @@ import pytest
 from brain import dev_constants
 from brain.bridge.provider import FakeProvider
 from brain.chat.extractor import _apply_emotion_delta
-from brain.emotion import engine, engine_files
+from brain.emotion import engine
 from brain.emotion.aggregate import aggregate_state
 from brain.emotion.engine import EmotionEngine, Reading
 from brain.engines.consolidation import Decision, run_consolidation
@@ -31,6 +31,7 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.paths import get_persona_dir
 from brain.self_model.reconcile import reconcile_self_read
+from tests.unit.brain.emotion._engine_support import make_live
 
 NOW = datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
 CAP = dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_CAP
@@ -75,7 +76,7 @@ def _felt(store: MemoryStore) -> dict[str, float]:
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
     """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return engine.engine_for(persona_dir)
 
 
