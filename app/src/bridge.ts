@@ -125,9 +125,9 @@ export interface InteriorEntry {
 export interface PersonaState {
   persona: string;
   emotions: Record<string, number>;
-  /** The feeling names the emotion engine calls high, from `engine.feels_high` (computed server-side). An array only
-   *  when the engine is live (possibly empty); null or absent on the old path and on older bridge builds, where the
-   *  expressions keep their own levels. */
+  /** The feeling names the emotion engine calls high, from `engine.feels_high` (computed server-side). An array
+   *  whenever the server's read of the engine worked (possibly empty); null when that call failed, and absent on
+   *  older bridge builds. Without the list the avatar counts nothing as high. */
   feels_high?: string[] | null;
   body: BodyState | null;
   interior: {

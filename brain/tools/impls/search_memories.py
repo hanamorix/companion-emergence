@@ -43,7 +43,7 @@ def _reinforce_corecall(hebbian, memories: list) -> None:
 
     Fail-soft: a reinforcement error must never break recall. Decay-subordinate:
     only existing hebbian state is touched (no new salience term); abandoned
-    edges are GC'd by the heartbeat hebbian decay pass.
+    edges are removed by the heartbeat's edge decay and cleanup pass (Hebbian edge weights only, not memory emotions).
     """
     try:
         if len(memories) < _CORECALL_MIN_RESULTS:

@@ -79,20 +79,20 @@ def test_note_prompt_carries_persona_identity(tmp_path):
 
 
 def _note_emotions(tmp_path, *, live):
-    from brain.emotion import engine_files
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
 
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
     folder = tmp_path / "Notes"
     folder.mkdir()
-    if live:  # a live persona with no state file applies nothing, so seed a memory first, then write the switch
+    if live:  # a live persona with no state file applies nothing, so seed a memory first, then record the switch-over
         seed_store = MemoryStore(persona_dir / "memories.db")
         try:
             seed_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
         finally:
             seed_store.close()
-        assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+        make_live(persona_dir, datetime.now(UTC))
     make_note_and_wire(persona_dir=persona_dir, config=_Cfg(str(folder)), provider=_Provider(),
                        now=datetime(2026, 6, 15, tzinfo=UTC))
     store = MemoryStore(persona_dir / "memories.db")

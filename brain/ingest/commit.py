@@ -60,8 +60,8 @@ def commit_item(
 
     created_at:
         Optional creation time for the memory instead of now: the extraction backfill
-        back-dates a memory to the conversation it came from (#523), so it does not reset
-        the time since the user last spoke. It survives the pending queue and the gate
+        back-dates a memory to the conversation it came from (#523), so the memory carries
+        the time of that conversation, not the time of the backfill. It survives the pending queue and the gate
         (``Memory.to_dict`` / ``from_dict``). The pipeline passes neither argument.
 
     Returns the new memory's id, or None if creation fails.

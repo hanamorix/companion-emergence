@@ -17,7 +17,7 @@ from typing import Any
 
 import brain.dev_constants as dev_constants  # pure data, listed in the purity guard's _PURE_BRAIN_MODULES
 
-# The 6-emotion body set tracked by compute_body_state.
+# The 6-emotion body set tracked by the body projections.
 # Reconciliation 2026-04-30: arousal + desire are existing core emotions
 # (not new); the four new ones live in vocabulary._BASELINE under category="body".
 BODY_EMOTION_NAMES: frozenset[str] = frozenset(
@@ -79,12 +79,12 @@ def compute_body_state(
 ) -> BodyState:
     """Pure projection — no I/O, no LLM call, no cache. Sub-millisecond.
 
-    `emotions` MUST be the post-aggregation, post-climax-reset state
-    (i.e. what aggregate_state() returns). compute_body_state does not
-    re-aggregate or re-reset.
+    `emotions` is a map of emotion name to value; compute_body_state does not
+    aggregate or reset it.
 
-    This is the projection for the old emotion path: it fires on fixed levels (the only place that holds them).
-    `body_state_from_short` is the one for the emotion engine.
+    This projection fires on fixed levels (the only place that holds them). Nothing in `brain/` calls it since
+    the readers moved onto the emotion engine: `body_state_from_short` is the projection they use, and this one
+    stays as the fixed-level oracle that its tests and `scripts/measure_feels_high_thresholds.py` compare against.
     """
     energy = _energy_from_flags(
         session_hours,

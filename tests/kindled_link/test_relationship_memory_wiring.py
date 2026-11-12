@@ -176,12 +176,12 @@ def _verdict(emotion_json: str) -> str:
 
 
 def _go_live(persona_dir, mem_store):
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
-    from brain.emotion import engine_files
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     mem_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _live_reflect(tmp_path, reply: str, *, now=NOW, today=TODAY, ms=None, s=None):
