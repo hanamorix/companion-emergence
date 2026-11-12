@@ -232,6 +232,12 @@ MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_trace", "monologue_emotion", "monologue_soul_candidate"}
 )
 
+# --- same-type merges (#619) ---------------------------------------------------
+# The memory types that count as ONE type when the temp gate or the dedup sweep decides whether two memories may merge
+# (owner S10: "a subset of the same category"). Not `MONOLOGUE_FAMILY_TYPES`: that set also holds `monologue_emotion`, which
+# does not merge with these. See `brain.engines.consolidation.merge_type`.
+MONOLOGUE_MERGE_TYPES: frozenset[str] = frozenset({"monologue", "monologue_trace", "monologue_soul_candidate"})
+
 # --- recall result order (name-recall fix, spec §4, S97, S98) ---------------
 # The order of the six result groups of a recall (passive recall and the
 # `search_memories` tool alike): reorder the names on this one line to change
