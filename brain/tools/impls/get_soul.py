@@ -26,11 +26,12 @@ DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 
 # Byte bound on the whole serialized result (what the MCP handler sends). The
-# CLI's inlining threshold is not measured: #595 recorded a 55 KB result being
-# withheld, and the largest MCP result seen inlined in ~6,400 transcripts was
-# 2.6 KB. 8 KB is well under the known failure and still holds ~15 typical
-# crystallizations (~430 bytes each in the #596 soul). Retune here once the
-# threshold is measured.
+# CLI inlines an MCP tool result of up to 50,000 characters and persists anything
+# longer to a file with a 2 KB preview, which chat cannot open (Read is not in its
+# --tools); measured on claude 2.1.321, see docs/cli-provider-capabilities.md. 8 KB
+# sits far under that hard ceiling (bytes >= characters, so a byte bound is the
+# stricter one) and is sized for context cost instead: about 2k tokens and ~15
+# typical crystallizations (~430 bytes each in the #596 soul) per call.
 MAX_RESULT_BYTES = 8_000
 
 _CLIP_MARK = "…"
