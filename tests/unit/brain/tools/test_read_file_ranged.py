@@ -110,12 +110,15 @@ def test_default_text_cap_matches_the_upload_cap():
 @pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base (a whole-file decode): the streamed read keeps a character split across chunks")
 def test_multibyte_character_split_across_read_chunks_decodes(tmp_path):
     """A UTF-8 character that straddles two read chunks is decoded, not reported as binary."""
-    body = b"a" * (rf._READ_CHUNK_BYTES - 1) + "é".encode() + b"\nnext\n"
+    # Short lines (the window is bounded), with the 2-byte "é" starting on the chunk's last byte.
+    full, rem = divmod(rf._READ_CHUNK_BYTES - 1, 100)
+    body = b"a" * 99 + b"\n"
+    body = body * full + b"a" * rem + "é".encode() + b"\nnext\n"
     p = tmp_path / "accent.txt"
     p.write_bytes(body)
-    out = read_file(str(p), persona_dir=tmp_path / "x")
-    assert out["content"] == body.decode("utf-8")
-    assert out["total_lines"] == 2
+    out = read_file(str(p), persona_dir=tmp_path / "x", offset=full, max_lines=2)
+    assert out["content"] == "a" * rem + "é\nnext\n"
+    assert out["total_lines"] == full + 2
 
 
 @pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base (str.splitlines on the whole file): the streamed read splits lines the same way across chunks")

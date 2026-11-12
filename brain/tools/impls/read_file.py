@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import codecs
 import difflib
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,10 +45,21 @@ _FILE_PDF_MAX_BYTES = tunables.register(
 _PDF_MAGIC = b"%PDF-"
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
-# #590: the most text one read returns, in characters, however long its lines are:
-# the old 256 KiB whole-file cap, so a file that opened whole before still does.
-_WINDOW_MAX_CHARS = 256 * 1024
+# #595: the most text one read returns, counted as the characters of its JSON-encoded form
+# (what the MCP handler sends: quotes, backslashes and control characters grow when
+# escaped). The Claude CLI passes a tool result to the model only up to 50,000 characters
+# and persists anything longer behind a 2 KB preview that chat cannot open (measured on
+# claude 2.1.321, docs/cli-provider-capabilities.md). 40,000 leaves room under that cap for
+# the path, the note and the keys.
+_WINDOW_MAX_CHARS = 40_000
 _READ_CHUNK_BYTES = 64 * 1024
+# #595: the tool knows only that it returned this recently, not that the result reached the
+# model (an over-size result never did), so the note says no more than that.
+_DEDUP_NOTE = (
+    "this part of the file was already returned less than 90 seconds ago, so it is not sent again; "
+    "read a different part with offset/max_lines, or ask again shortly to re-read it."
+)
+_DEDUP_NOTE_IMAGE = "this image was already returned less than 90 seconds ago, so it is not sent again."
 # The characters str.splitlines() breaks on, so streamed lines match it exactly.
 _LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85  "
 
@@ -66,6 +78,23 @@ def _image_max_bytes() -> int:
 
 def _pdf_max_bytes() -> int:
     return tunables.get_tunable("files.pdf_max_bytes", _FILE_PDF_MAX_BYTES)
+
+
+def _encoded_len(text: str) -> int:
+    """Characters ``text`` takes inside the JSON the MCP handler sends (ensure_ascii=False)."""
+    return len(json.dumps(text, ensure_ascii=False)) - 2
+
+
+def _encoded_prefix(text: str, room: int) -> str:
+    """The longest prefix of ``text`` whose encoded form fits in ``room`` characters."""
+    lo, hi = 0, min(len(text), room)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _encoded_len(text[:mid]) <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
 
 
 class _Window:
@@ -93,13 +122,15 @@ class _Window:
         if self.full or not self.start <= index < self.end:
             return
         room = self.budget - self.used
-        if len(line) > room:
+        size = _encoded_len(line)
+        if size > room:
             self.full = True
             if self.parts:
                 return
-            line, cut = line[:room], True
+            line, cut = _encoded_prefix(line, room), True
+            size = _encoded_len(line)
         self.parts.append(line)
-        self.used += len(line)
+        self.used += size
         if cut:
             self.cut_line = index
             self.full = True
@@ -179,7 +210,7 @@ def _read_pdf(
         return {
             "path": str(p),
             "deduped": True,
-            "note": "you already read this file moments ago this turn — its content is above.",
+            "note": _DEDUP_NOTE,
         }
     _read_cache.mark(_dedup_key)
 
@@ -335,7 +366,7 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             return {
                 "path": str(p),
                 "deduped": True,
-                "note": "you already read this file moments ago this turn — its content is above.",
+                "note": _DEDUP_NOTE_IMAGE,
             }
         _read_cache.mark(_dedup_key)
         try:
@@ -414,7 +445,7 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
         return {
             "path": str(p),
             "deduped": True,
-            "note": "you already read this file moments ago this turn — its content is above.",
+            "note": _DEDUP_NOTE,
         }
     _read_cache.mark(_dedup_key)
 
