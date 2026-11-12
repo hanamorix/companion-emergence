@@ -89,6 +89,7 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.state_compat",               # tolerant dataclass construction — no tool surface (relationship.py Evidence rollback tolerance)
     "brain.utils.time",                 # #485 pure stdlib timestamp readers (lenient_utc/hours_since), no tool surface, no I/O (session_engine pacing)
     "brain.health.parse_failures",      # #364 parse-failure evidence log — no tool surface (stdlib + jsonl_reader + log_rotation only; relationship.py and privacy_gate.py keep a malformed verdict)
+    "brain.utils.file_ops",             # #705: relationship.peer_trust reads the shared stat_path accessor — no tool surface (stdlib plus brain.dev_constants only, which is already allowlisted)
     "brain.emotion.engine",             # emotion rework B1 PR 3: relationship.py reads the switch (engine_for(...).is_live()) — no tool surface; importing it after brain.chat.extractor and brain.memory.store loads no new brain module, so it adds nothing to the reachable set
 }
 
