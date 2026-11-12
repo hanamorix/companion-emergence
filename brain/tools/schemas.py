@@ -690,7 +690,7 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Optional: start reading at this 0-based line (with max_lines).",
+                    "description": "Optional: start reading at this 0-based line; without max_lines the usual 400-line window starts here.",
                 },
             },
             "required": ["path"],

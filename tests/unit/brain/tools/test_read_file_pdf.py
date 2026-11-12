@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain import tunables
 from brain.tools.impls.read_file import read_file
 
@@ -115,6 +117,7 @@ def test_read_file_pdf_offset_without_max_lines_windows_from_offset(tmp_path: Pa
     assert out["note"] == "showing lines 401-599 of 599 across 300 page(s); pass offset/max_lines to read more"
 
 
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base: a PDF read with no range shows the first 400-line window")
 def test_read_file_pdf_without_range_shows_first_window(tmp_path: Path) -> None:
     f = tmp_path / "long0.pdf"
     f.write_bytes(_make_pdf([f"p{i}" for i in range(1, 301)]))

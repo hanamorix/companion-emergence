@@ -1,5 +1,7 @@
 import tracemalloc
 
+import pytest
+
 import brain.tools.impls.read_file as rf
 from brain.tools.impls.read_file import read_file
 
@@ -87,6 +89,7 @@ def test_offset_without_max_lines_windows_from_offset(tmp_path):
     assert out["note"] == "showing lines 1000-1400 of 2000; pass offset/max_lines to read more"
 
 
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base: a file over the cap is refused with the same error")
 def test_file_over_the_cap_is_still_refused_with_the_same_error(tmp_path, monkeypatch):
     """The byte cap stays as a guard against pathological files: same refusal shape and audit."""
     monkeypatch.setattr(rf, "_file_read_max_bytes", lambda: 1024)
@@ -125,6 +128,7 @@ def test_line_breaks_split_like_str_splitlines_across_read_chunks(tmp_path):
     assert out["content"] == "b\rc\x0cd"
 
 
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base: the streamed read still calls a file binary when invalid UTF-8 lies past the window")
 def test_invalid_utf8_after_the_window_is_still_binary(tmp_path):
     """Binary detection covers the whole file, as the old whole-file decode did, not just the lines shown."""
     p = tmp_path / "late.bin"
