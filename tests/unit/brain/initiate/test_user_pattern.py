@@ -1121,3 +1121,91 @@ def test_c15_bootstrap_runs_at_most_once_even_with_zero_history(
 
     from brain.initiate import presence_state
     assert presence_state.load_presence_state(tmp_path).bootstrapped is True
+
+
+# ---------------------------------------------------------------------------
+# #621 — only the user's rows count. The chat writes the user's rows with
+# speaker "user" and the kindled's with "assistant" (plus "image" annotation
+# rows and the compaction "summary" row); none of those may count as the user.
+# ---------------------------------------------------------------------------
+
+_T621_NOW = datetime(2026, 11, 10, 12, 0, 0, tzinfo=UTC)
+
+
+def _write_621_conversation(persona_dir: Path) -> list[datetime]:
+    """Write user rows, each answered by an assistant row 90 minutes later
+    (so a different local hour), plus a newer image, summary and assistant
+    row. Returns the user rows' timestamps."""
+    conv_dir = persona_dir / "active_conversations"
+    conv_dir.mkdir(parents=True)
+    from brain.initiate.user_pattern import _SCHEDULE_MIN_TURNS
+
+    user_times = [
+        _T621_NOW - timedelta(days=1 + i // 5, minutes=17 * i) for i in range(_SCHEDULE_MIN_TURNS)
+    ]
+    for ts in user_times:
+        _write_turn(conv_dir, speaker="user", ts=ts)
+        _write_turn(conv_dir, speaker="assistant", ts=ts + timedelta(minutes=90))
+    _write_turn(conv_dir, speaker="image", ts=_T621_NOW - timedelta(minutes=3))
+    _write_turn(conv_dir, speaker="summary", ts=_T621_NOW - timedelta(minutes=2))
+    _write_turn(conv_dir, speaker="assistant", ts=_T621_NOW - timedelta(minutes=1))
+    return user_times
+
+
+def _user_only_hour_counts(user_times: list[datetime]) -> list[int]:
+    counts = [0] * 24
+    for ts in user_times:
+        counts[ts.astimezone().hour] += 1
+    return counts
+
+
+def test_621_daily_scan_counts_only_the_user_rows(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _daily_scan_conversations
+
+    persona_dir = tmp_path / "nell"
+    user_times = _write_621_conversation(persona_dir)
+
+    hour_counts, _threshold, latest_ts = _daily_scan_conversations(persona_dir, _now=_T621_NOW)
+
+    assert latest_ts == max(user_times).isoformat()
+    assert hour_counts == _user_only_hour_counts(user_times)
+
+
+def test_621_daily_recompute_persists_the_user_last_seen(tmp_path: Path) -> None:
+    """Through the path: the daily recompute's max-merge must not move
+    last_seen_ts forward to the kindled's reply."""
+    from brain.initiate import presence_state
+    from brain.initiate.user_pattern import _run_daily_presence_recompute
+
+    persona_dir = tmp_path / "nell"
+    user_times = _write_621_conversation(persona_dir)
+
+    _run_daily_presence_recompute(persona_dir, _now=_T621_NOW)
+
+    state = presence_state.load_presence_state(persona_dir)
+    assert state.last_seen_ts == max(user_times).isoformat()
+    assert list(state.hour_counts) == _user_only_hour_counts(user_times)
+
+
+def test_621_hour_histogram_counts_only_the_user_rows(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _build_hour_histogram
+
+    persona_dir = tmp_path / "nell"
+    user_times = _write_621_conversation(persona_dir)
+
+    hour_counts, _threshold = _build_hour_histogram(persona_dir, _now=_T621_NOW)
+
+    assert hour_counts == _user_only_hour_counts(user_times)
+
+
+def test_621_silence_days_ignores_assistant_rows(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _compute_silence_days
+
+    persona_dir = tmp_path / "nell"
+    conv_dir = persona_dir / "active_conversations"
+    conv_dir.mkdir(parents=True)
+    _write_turn(conv_dir, speaker="user", ts=_T621_NOW - timedelta(days=3))
+    _write_turn(conv_dir, speaker="assistant", ts=_T621_NOW - timedelta(minutes=5))
+    _write_turn(conv_dir, speaker="image", ts=_T621_NOW - timedelta(minutes=4))
+
+    assert _compute_silence_days(persona_dir, _now=_T621_NOW) == pytest.approx(3.0)
