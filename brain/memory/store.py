@@ -3531,6 +3531,7 @@ class MemoryStore:
         include_fading: bool = True,
         *,
         bump: bool | float = True,
+        memory_types: Collection[str] | None = None,
     ) -> list[Memory]:
         """Case-insensitive substring search on content.
 
@@ -3550,9 +3551,14 @@ class MemoryStore:
         not inflate committed-row salience (which would perturb the
         forgetting pass). A float bumps recall_count by that amount instead
         of 1.0.
+
+        memory_types: when given, only rows of these memory types match; the filter is part of the SQL, so it applies
+        before ``limit``. None (default) is every type; an empty collection matches nothing.
         """
         if query == "":
             raise ValueError("empty query passed to search_text; use list_active() instead")
+        if memory_types is not None and not memory_types:
+            return []
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         sql = "SELECT * FROM memories WHERE content LIKE ? ESCAPE '\\' COLLATE NOCASE"
         params: list[Any] = [f"%{escaped}%"]
@@ -3560,6 +3566,10 @@ class MemoryStore:
             sql += " AND active = 1"
         if not include_fading:
             sql += " AND state != 'fading'"
+        if memory_types is not None:
+            types = sorted(memory_types)
+            sql += f" AND memory_type IN ({','.join('?' * len(types))})"
+            params.extend(types)
         sql += " ORDER BY created_at DESC"
         if limit is not None:
             sql += " LIMIT ?"

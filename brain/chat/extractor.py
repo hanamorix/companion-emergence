@@ -58,7 +58,10 @@ class CrystallisationCandidate(BaseModel):
 
     theme: str = Field(min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=500)
-    importance: int = Field(ge=1, le=10, default=8)
+    # Required (#640): the old default of 8 sat exactly on DEFAULT_SOUL_THRESHOLD, so an
+    # unscored item was queued as a soul candidate. extract_from_thinking drops and records
+    # an unscored item before validation, so it can't take the rest of the reply with it.
+    importance: int = Field(ge=1, le=10)
 
     # The extractor LLM occasionally returns a field longer than its cap. Truncate
     # (mode="before", so it runs ahead of the max_length constraint) rather than
@@ -213,6 +216,23 @@ def _build_user_prompt(
     return "\n".join(parts)
 
 
+def _drop_unscored_crystallisation(data: dict) -> int:
+    """Remove crystallisation items with no ``importance`` (missing or null) from ``data``
+    in place and return how many were removed (#640).
+
+    An unscored item is a parse problem, not a soul-worthy one. Dropping it here, per item,
+    keeps the rest of the reply: a whole-reply schema failure would also lose the scored
+    items, memory writes and deltas. Other shapes are left to pydantic. The caller records
+    the drop once validation's outcome is known, naming only the count, never reply text
+    (#427)."""
+    items = data.get("crystallisation")
+    if not isinstance(items, list):
+        return 0
+    kept = [i for i in items if not (isinstance(i, dict) and i.get("importance") is None)]
+    data["crystallisation"] = kept
+    return len(items) - len(kept)
+
+
 def extract_from_thinking(
     *,
     provider: LLMProvider,
@@ -252,11 +272,19 @@ def extract_from_thinking(
         record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"non-JSON: {exc}")
         return ExtractorOutput()
 
+    # One row per reply (#640): if the reply fails validation anyway, the whole reply is
+    # discarded, so the drop note rides on the single schema row instead of a row of its own.
+    unscored = _drop_unscored_crystallisation(data)
+    unscored_note = f"{unscored} crystallisation item(s) without importance" if unscored else ""
     try:
-        return ExtractorOutput.model_validate(data)
+        out = ExtractorOutput.model_validate(data)
     except Exception as exc:  # noqa: BLE001
-        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"schema: {exc}")
+        prefix = f"schema: {unscored_note}; " if unscored else "schema: "
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"{prefix}{exc}")
         return ExtractorOutput()
+    if unscored:
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"{unscored_note} dropped")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

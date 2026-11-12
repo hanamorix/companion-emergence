@@ -295,7 +295,7 @@ def test_c6_pass1_exact_dup_only_never_non_identical(persona):
 def test_c6_exact_dup_vs_existing_db(persona):
     tmp, store, hebbian, queue = persona
     store.create(_mem("already committed here", "conversation"))
-    queue.enqueue(_mem("already committed here", "dream"), source="x")
+    queue.enqueue(_mem("already committed here", "conversation"), source="x")  # an exact repeat of a row of its own type
     res = run_consolidation(store, persona_dir=tmp, hebbian=hebbian, classifier=_stub({}))
     assert res.exact_dropped == 1
     assert store.count(active_only=False) == 1  # nothing new added
@@ -305,7 +305,7 @@ def test_c6_exact_dup_vs_existing_db(persona):
 def test_c7_merge_archives_surgical_no_graveyard(persona):
     tmp, store, hebbian, queue = persona
     target_id = store.create(_mem("Bob likes tea", "conversation"))
-    queue.enqueue(_mem("Bob likes tea with honey", "dream"), source="x")
+    queue.enqueue(_mem("Bob likes tea with honey", "conversation"), source="x")
     run_consolidation(
         store, persona_dir=tmp, hebbian=hebbian,
         classifier=_stub({
@@ -503,7 +503,7 @@ def test_c11_overlapping_gate_run_skips(persona):
 def test_c11_merge_folded_exactly_once(persona):
     tmp, store, hebbian, queue = persona
     target_id = store.create(_mem("base fact", "conversation"))
-    queue.enqueue(_mem("base fact plus extra", "dream"), source="x")
+    queue.enqueue(_mem("base fact plus extra", "conversation"), source="x")
     run_consolidation(
         store, persona_dir=tmp, hebbian=hebbian,
         classifier=_stub({
@@ -592,7 +592,7 @@ def _merge_run(persona, target_emotions, cand_emotions, *, merged="Bob likes tea
     n = next(_RUN_COUNTER)
     target = _mem(f"Bob likes tea number {n}", "conversation", emotions=target_emotions)
     target_id = store.create(target, fold=False)
-    cand = _mem(f"Bob likes tea with honey, take {n}", "dream", emotions=cand_emotions)
+    cand = _mem(f"Bob likes tea with honey, take {n}", "conversation", emotions=cand_emotions)
     queue.enqueue(cand, source="x")
     result = run_consolidation(
         store, persona_dir=tmp, hebbian=hebbian,
@@ -848,7 +848,7 @@ def test_e5_live_merge_of_a_target_deleted_before_the_write_defers_the_candidate
     ]
     assert res.deferred == 1
     assert res.merged == 0
-    assert queue.read_recent("dream", limit=5)  # the candidate is back in the queue
+    assert queue.read_recent("conversation", limit=5)  # the candidate is back in the queue
     assert emotion_engine_stub.recorded_calls == []  # a merge that did not happen sends no event
 
 
@@ -865,7 +865,7 @@ def test_e5_a_deferred_merge_sends_no_event_and_the_tick_that_writes_it_sends_on
     emotion_engine_stub.live = True
     target = _mem("Bob likes tea number 900", "conversation", emotions={"joy": 5.0})
     target_id = store.create(target, fold=False)
-    cand = _mem("Bob likes tea with honey, take 900", "dream", emotions={"joy": 7.0})
+    cand = _mem("Bob likes tea with honey, take 900", "conversation", emotions={"joy": 7.0})
     # Tick 1: the verdict names an id the store does not know (a missing target): deferred.
     queue.enqueue(cand, source="x")
     first = _run_merge_verdict(persona, cand, "no-such-id")
@@ -929,7 +929,7 @@ def test_e5_live_merge_drops_a_stored_value_that_is_not_a_finite_number_and_merg
     tmp, store, hebbian, queue = persona
     emotion_engine_stub.live = True
     target_id = store.create(_mem("Bob likes tea", "conversation", emotions={"joy": 7.0}), fold=False)
-    cand = _mem("Bob likes tea with honey", "dream", emotions={"awe": 6.0})
+    cand = _mem("Bob likes tea with honey", "conversation", emotions={"awe": 6.0})
     queue.enqueue(cand, source="x")
     _set_raw_emotions(store, target_id, {"joy": bad, "trust": 3.0})
     with caplog.at_level(logging.WARNING, logger="brain.emotion.engine_utils"):
@@ -952,7 +952,7 @@ def test_e5_live_merge_of_an_all_unusable_target_and_an_empty_candidate_writes_e
     tmp, store, hebbian, queue = persona
     emotion_engine_stub.live = True
     target_id = store.create(_mem("Bob likes tea", "conversation", emotions={"joy": 7.0}), fold=False)
-    cand = _mem("Bob likes tea with honey", "dream")
+    cand = _mem("Bob likes tea with honey", "conversation")
     queue.enqueue(cand, source="x")
     _set_raw_emotions(store, target_id, {"joy": float("nan"), "awe": None})
     res = run_consolidation(
@@ -997,7 +997,7 @@ def test_e5_live_merge_leaves_the_target_created_at_alone(persona, emotion_engin
     old = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
     target = replace(_mem("Bob likes tea", "conversation", emotions={"joy": 5.0}), created_at=old)
     target_id = store.create(target, fold=False)
-    cand = _mem("Bob likes tea with honey", "dream", emotions={"joy": 7.0})
+    cand = _mem("Bob likes tea with honey", "conversation", emotions={"joy": 7.0})
     queue.enqueue(cand, source="x")
     before = _raw(store, target_id, "created_at")[0]
     res = run_consolidation(
@@ -1633,7 +1633,7 @@ def _written_back_target(persona, monkeypatch, text="we walked to the shore"):
 
 def _merge_into(persona, target_id, merged_content, cand_text="we swam there too, take one"):
     tmp, store, hebbian, queue = persona
-    cand = _mem(cand_text, "dream", emotions={"joy": 7.0})
+    cand = _mem(cand_text, "conversation", emotions={"joy": 7.0})
     queue.enqueue(cand, source="x")
     return run_consolidation(
         store, persona_dir=tmp, hebbian=hebbian,

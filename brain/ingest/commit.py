@@ -109,7 +109,8 @@ def commit_item(
     try:
         words = [w for w in item.text.split() if len(w) > 4]
         keyword = words[0] if words else item.text[:20]
-        related = store.search_text(keyword, active_only=True, limit=_AUTO_HEBBIAN_LIMIT)
+        # bump=False: a background search shows the kindled nothing, so it is not a recall (#587).
+        related = store.search_text(keyword, active_only=True, limit=_AUTO_HEBBIAN_LIMIT, bump=False)
         linked = 0
         for candidate in related:
             if candidate.id == new_id:
