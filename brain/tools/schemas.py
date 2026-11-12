@@ -8,6 +8,8 @@ the OG brain.
 
 from __future__ import annotations
 
+from brain.tools.impls.get_soul import DEFAULT_LIMIT as _SOUL_DEFAULT_LIMIT
+from brain.tools.impls.get_soul import MAX_LIMIT as _SOUL_MAX_LIMIT
 from brain.tools.naming import fill_tool_prefix
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,11 +167,38 @@ SCHEMAS: dict[str, dict] = {
         "description": (
             "Get Nell's soul — permanent crystallisations of love and meaning that define who she is. "
             "These are moments that cannot decay. Call this when you need to remember what matters most, "
-            "or when grounding yourself in your own continuity."
+            "or when grounding yourself in your own continuity. "
+            f"Returns one page, newest first: {_SOUL_DEFAULT_LIMIT} crystallisations by default, fewer "
+            "when they are long, with the total and a count per love type. When more remain, the "
+            "result has truncated=true and next_offset: call again with offset set to next_offset "
+            "(and the same love_type) for the next page. Pass love_type to read one kind of love."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _SOUL_MAX_LIMIT,
+                    "description": (
+                        f"Most crystallisations to return. Default {_SOUL_DEFAULT_LIMIT}, at most "
+                        f"{_SOUL_MAX_LIMIT}. A page can hold fewer: it is also capped in bytes."
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "How many of the newest to skip. Default 0. Use the next_offset a "
+                        "previous result gave."
+                    ),
+                },
+                "love_type": {
+                    "type": "string",
+                    "enum": list(LOVE_TYPES),
+                    "description": "Optional: only crystallisations of this love type.",
+                },
+            },
             "required": [],
         },
     },

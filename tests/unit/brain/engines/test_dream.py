@@ -641,3 +641,126 @@ def test_strengthen_edges_all_active_unchanged(engine: DreamEngine) -> None:
     assert count == 2
     assert engine.hebbian.weight(seed.id, n1.id) > 0.0
     assert engine.hebbian.weight(seed.id, n2.id) > 0.0
+
+
+# ---- #587: only a dream that is dreamed counts as a recall of its memories ----
+
+
+def _ticks(store: MemoryStore, *ids: str) -> list[tuple[float, bool]]:
+    rows = [store.get(i, bump=False) for i in ids]
+    return [(r.recall_count, r.last_accessed_at is not None) for r in rows]
+
+
+def test_a_dry_run_ticks_neither_seed_nor_neighbours(
+    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    seed = _mem("seed", importance=8.0)
+    neighbour = _mem("neighbour", importance=4.0)
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.5)
+
+    result = engine.run_cycle(seed_id=seed.id, dry_run=True)
+
+    assert [m.id for m, _ in result.neighbours] == [neighbour.id]
+    assert _ticks(store, seed.id, neighbour.id) == [(0.0, False), (0.0, False)]
+
+
+def test_a_denied_slot_ticks_neither_seed_nor_neighbours(
+    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch
+) -> None:
+    import contextlib
+
+    from brain.bridge import cli_throttle
+
+    @contextlib.contextmanager
+    def _denied(**_kw):
+        yield False
+
+    monkeypatch.setattr(cli_throttle, "background_slot", _denied)
+    seed = _mem("seed", importance=8.0)
+    neighbour = _mem("neighbour", importance=4.0)
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.5)
+
+    result = engine.run_cycle(seed_id=seed.id)
+
+    assert result.dream_text is None
+    assert _ticks(store, seed.id, neighbour.id) == [(0.0, False), (0.0, False)]
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that a dreamed dream still ticks its seed and neighbours once (#587 moved the tick after the call); it did on main too"
+)
+def test_a_dreamed_dream_ticks_its_seed_and_neighbours_once(
+    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    seed = _mem("seed", importance=8.0)
+    neighbour = _mem("neighbour", importance=4.0)
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.5)
+
+    result = engine.run_cycle(seed_id=seed.id)
+
+    assert result.dream_text is not None
+    assert _ticks(store, seed.id, neighbour.id) == [(1.0, True), (1.0, True)]
+
+
+def test_a_dream_call_that_fails_ticks_nothing(
+    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch
+) -> None:
+    def _boom(*_a, **_kw):
+        raise RuntimeError("simulated dream failure")
+
+    monkeypatch.setattr(engine.provider, "generate", _boom)
+    seed = _mem("seed", importance=8.0)
+    neighbour = _mem("neighbour", importance=4.0)
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.5)
+
+    with pytest.raises(RuntimeError, match="simulated dream failure"):
+        engine.run_cycle(seed_id=seed.id)
+    assert _ticks(store, seed.id, neighbour.id) == [(0.0, False), (0.0, False)]
+
+
+def test_a_failed_recall_tick_does_not_cost_the_dream(
+    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch
+) -> None:
+    seed = _mem("seed", importance=8.0)
+    neighbour = _mem("neighbour", importance=4.0)
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.5)
+    real_get = store.get
+
+    def _get(memory_id, *, bump=True):
+        if bump is True:
+            raise RuntimeError("simulated tick failure")
+        return real_get(memory_id, bump=bump)
+
+    monkeypatch.setattr(store, "get", _get)
+    result = engine.run_cycle(seed_id=seed.id)
+
+    assert result.memory is not None and result.dream_text is not None
+    assert engine.log_path.exists()
+
+
+@pytest.mark.no_base_failure(
+    reason="pins that an auto-picked seed still doesn't tick while its neighbours tick once (#587 left that as main has it)"
+)
+def test_an_auto_picked_seed_is_not_ticked_but_its_neighbours_are(
+    engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    seed = _mem("seed", importance=8.0)
+    neighbour = _mem("neighbour", importance=4.0)
+    store.create(seed)
+    store.create(neighbour)
+    hebbian.strengthen(seed.id, neighbour.id, delta=0.5)
+
+    result = engine.run_cycle()
+
+    assert result.seed.id == seed.id and result.dream_text is not None
+    assert _ticks(store, seed.id, neighbour.id) == [(0.0, False), (1.0, True)]

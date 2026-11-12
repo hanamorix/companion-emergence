@@ -52,5 +52,6 @@ brain/recovery/report.py::not-file-io::1   # not-file: string-codec
 brain/recovery/source_reader.py::not-file-io::2   # not-file: sqlite-or-wire
 brain/soul/review.py::not-file-io::1   # not-file: model-reply
 brain/soul/store.py::not-file-io::2   # not-file: sqlite-or-wire
+brain/tools/impls/get_soul.py::not-file-io::1   # not-file: string-codec
 brain/tools/impls/read_file.py::not-file-io::1   # not-file: string-codec
 brain/utils/llm_output.py::not-file-io::2   # not-file: model-reply

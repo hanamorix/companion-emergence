@@ -48,7 +48,9 @@ def test_emotion_delta_rejects_out_of_range_magnitude():
 
 
 def test_crystallisation_candidate_requires_theme_and_evidence():
-    cc = CrystallisationCandidate(theme="late-night writing rhythm", evidence="recurred in turns 14, 19, 23")
+    cc = CrystallisationCandidate(
+        theme="late-night writing rhythm", evidence="recurred in turns 14, 19, 23", importance=8
+    )
     assert cc.theme.startswith("late-night")
 
 
@@ -62,7 +64,7 @@ def test_full_output_round_trip():
     out = ExtractorOutput(
         memory_writes=[MemoryWrite(episode="x", salience=0.5)],
         emotion_delta={"warm": 0.1},
-        crystallisation=[CrystallisationCandidate(theme="t", evidence="e")],
+        crystallisation=[CrystallisationCandidate(theme="t", evidence="e", importance=8)],
         reflex_audit=[ReflexAuditEntry(tool="search_memories", reason="r")],
     )
     dumped = out.model_dump()
@@ -99,10 +101,11 @@ def test_emotion_delta_rejects_whitespace_channel_name():
 # ---------------------------------------------------------------------------
 
 
-def test_crystallisation_candidate_importance_default_is_8():
-    """importance defaults to 8 (== DEFAULT_SOUL_THRESHOLD) for back-compat."""
-    cc = CrystallisationCandidate(theme="a theme", evidence="some evidence here")
-    assert cc.importance == 8
+def test_crystallisation_candidate_importance_is_required():
+    """#640: no default. The old default of 8 equalled DEFAULT_SOUL_THRESHOLD, so an
+    unscored item was queued as a soul candidate."""
+    with pytest.raises(ValidationError):
+        CrystallisationCandidate(theme="a theme", evidence="some evidence here")
 
 
 def test_crystallisation_candidate_importance_explicit():
@@ -143,7 +146,7 @@ def test_reflex_audit_reason_truncates_instead_of_raising():
 
 
 def test_crystallisation_candidate_fields_truncate():
-    cc = CrystallisationCandidate(theme="T" * 300, evidence="E" * 600)
+    cc = CrystallisationCandidate(theme="T" * 300, evidence="E" * 600, importance=8)
     assert len(cc.theme) == 200
     assert len(cc.evidence) == 500
 
@@ -153,7 +156,7 @@ def test_extractor_output_model_validate_survives_overlong_nested_field():
     # extraction because one nested reason/evidence overflowed.
     data = {
         "memory_writes": [{"episode": "something happened", "salience": 0.5}],
-        "crystallisation": [{"theme": "T" * 250, "evidence": "E" * 700}],
+        "crystallisation": [{"theme": "T" * 250, "evidence": "E" * 700, "importance": 8}],
         "reflex_audit": [{"tool": "search_memories", "reason": "R" * 500}],
     }
     out = ExtractorOutput.model_validate(data)
