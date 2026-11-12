@@ -123,8 +123,8 @@ def extract_felt_lines(raw: str) -> tuple[str, dict[str, float] | None, float | 
     name wins. ``rest`` is the text before the earliest felt line, or ``raw`` unchanged when there is none.
 
     ``None`` means missing or broken. For emotions, ``{}`` means a valid object whose values were all dropped: only
-    registered names with finite values above 0 are kept, held to 10. The rating is the number at the start of the
-    value (``7/10`` gives 7), held to 10; a negative is treated as missing.
+    registered names with finite values are kept, held to 0-10, so a negative is stored as 0. The rating is the number
+    at the start of the value (``7/10`` gives 7), held to 10; a negative is treated as missing.
     """
     lines = raw.splitlines(keepends=True)
     values: dict[str, str] = {}
@@ -168,8 +168,8 @@ def _felt_emotions(value: str) -> dict[str, float] | None:
     for name, number in parsed.items():
         if isinstance(number, bool) or not isinstance(number, (int, float)):
             continue
-        if math.isfinite(number) and number > 0:
-            kept[str(name)] = min(float(number), _FELT_MAX)
+        if math.isfinite(number):  # a negative is held to 0 and kept: a 0 counts in the engine's averages, a drop doesn't
+            kept[str(name)] = min(max(float(number), 0.0), _FELT_MAX)
     from brain.chat.extractor import _filter_to_registered
 
     registered = _filter_to_registered(kept)
