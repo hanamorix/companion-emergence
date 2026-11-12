@@ -299,7 +299,7 @@ def test_live_old_row_over_ten_stays_in_range(tmp_path: Path) -> None:
     store = MemoryStore(tmp_path / "memories.db")
     _go_live(tmp_path, store)
     memory = _make_dropped_memory(memory_id="mem-old", joy=1.0)
-    object.__setattr__(memory, "emotions", {"love": 18.0, "joy": 22.0})
+    object.__setattr__(memory, "_stored_emotions", {"love": 18.0, "joy": 22.0})
 
     grief.handle_drop(memory=memory, persona_dir=tmp_path, store=store)
 
