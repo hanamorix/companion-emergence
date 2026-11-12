@@ -72,7 +72,7 @@ Tests, through the real pass-2 and reconcile entry points: a negative value lowe
 - `apply_peer_emotion` isn't called on the live path, so the bucket stops applying.
 - `hard_breach` still returns early.
 
-Old rows and pending-queue rows keep their small values, with no migration.
+Old rows and pending-queue rows: B1 does not rewrite them, but Engine 6 (#633) multiplies the small ones once, at the persona's first engine start and before the switch-over is recorded (`brain/emotion/nudge_scale_fix.py`, #584). Every `initiate_outbound` (reaches and notes), `kindled_peer` and `making` row whose stored peak and every feeling are below 1 is multiplied by 10, a negative held to 0 first, and so is every `making` candidate still waiting in the pending queue. The cut is by size, not by date. The fix never runs again after the switch-over, so the 0-10 values the live writers above store are never multiplied. Its accepted edges (a row written while the app is down between its steps, a row that is below 1 only because it faded there) are listed in that module.
 
 Tests: each writer through its real entry point. A stubbed reflection returning `{"joy": 9, "grief": -3, "love": 40}` stores joy 9, grief 0 and love 10. The live prompt asks for 0-10. Off pinned. Flips the two peer pins. Prompt-string tests may need the new segment.
 
@@ -168,7 +168,7 @@ Tests: capture through the real `_dispatch_record_monologue` with a switch file 
 | Item | Why | Revisit |
 |---|---|---|
 | Raw trust can jump | One reflection can move a peer's weight sharply; `trust_score` is model-proposed and only clamped | If peer memories swing her feelings |
-| Old rows and pending-queue rows | Keep their small values, no migration | Only if a reader shows the mix matters |
+| Old rows and pending-queue rows | B1 adds no migration; Engine 6's one-time x10 fix multiplies the small ones at the first engine start (§4 PR 3) | If rows the fix misses (its accepted edges) show up in a reader |
 | `peer_emotion_window` table | Stays under the additive-only rule; nothing writes to it on the live path | #388 |
 | Research limits | Multi-line JSON and felt lines before `VERDICT` count as missing and are logged | If `research_felt` failures show up |
 | Duplicate-check edges | §4 PR 6 | If digests repeat in practice |
