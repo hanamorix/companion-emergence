@@ -32,7 +32,7 @@ _spec.loader.exec_module(mod)
 
 
 def _cpu_model_on(monkeypatch: pytest.MonkeyPatch, cpuinfo: Path, platform_name: str = "linux") -> str:
-    """Call ``_cpu_model`` with CPUINFO pointed at ``cpuinfo`` and sys.platform patched for that call only."""
+    """Call ``_cpu_model`` with CPUINFO pointed at ``cpuinfo`` and the script's platform seam (`mod._platform`) faked."""
     monkeypatch.setattr(mod, "CPUINFO", cpuinfo)
     monkeypatch.setattr(mod, "_platform", lambda: platform_name)
     return mod._cpu_model()
