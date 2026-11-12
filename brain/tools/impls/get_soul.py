@@ -33,7 +33,9 @@ MAX_LIMIT = 50
 MAX_RESULT_BYTES = 8_000
 
 _CLIP_MARK = "…"
-_TEXT_FIELDS = ("moment", "why_it_matters")
+# Every free-text field of an active crystallization (revoked_reason is empty
+# on active ones); crystallize_soul caps none of them.
+_TEXT_FIELDS = ("moment", "why_it_matters", "who_or_what")
 
 
 def _size(obj: Any) -> int:

@@ -258,6 +258,29 @@ def test_empty_soul_is_not_truncated(tmp_path: Path) -> None:
     assert result["by_love_type"] == {}
 
 
+def test_every_free_text_field_is_clipped_to_keep_the_bound(tmp_path: Path) -> None:
+    """who_or_what is free text too: a huge one must not blow the byte bound."""
+    from brain.tools.impls.get_soul import MAX_RESULT_BYTES, get_soul
+
+    store = SoulStore(str(tmp_path / "crystallizations.db"))
+    store.create(
+        Crystallization(
+            id="huge-who",
+            moment="short",
+            love_type="craft",
+            why_it_matters="short",
+            crystallized_at=datetime(2026, 1, 1, tzinfo=UTC),
+            who_or_what=HUGE_TEXT,
+        )
+    )
+    store.close()
+    result = get_soul(**_ctx(tmp_path))
+    assert _payload_bytes(result) <= MAX_RESULT_BYTES
+    [item] = result["crystallizations"]
+    assert item["clipped"] is True
+    assert item["who_or_what"].startswith("ł")
+
+
 # ---------------------------------------------------------------------------
 # Through the paths the model actually uses
 # ---------------------------------------------------------------------------
@@ -334,6 +357,41 @@ def test_boot_embeds_the_bounded_soul_page(soul_persona) -> None:
     assert soul["total"] == len(all_ids)
     assert soul["truncated"] is True
     assert soul["next_offset"] == soul["count"]
+
+
+def test_boot_over_mcp_names_the_prefixed_tool_for_the_next_soul_page(soul_persona) -> None:
+    """boot nests the soul page; its paging hint must still reach the model filled.
+
+    fill_tool_result fills only top-level worded keys, so boot lifts the soul's
+    hint to its own top-level ``message``; left at result["soul"]["message"] it
+    would arrive as a literal "{tool_prefix}get_soul".
+    """
+    from mcp.server import Server
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    from brain.mcp_server.tools import register_tools
+
+    persona_dir, _, _ = soul_persona
+    ctx = _ctx(persona_dir)
+    prefix = "mcp__brain-tools__"
+    server = Server("brain-tools")
+    register_tools(
+        server,
+        persona_dir=persona_dir,
+        store=ctx["store"],
+        hebbian=ctx["hebbian"],
+        tool_prefix=prefix,
+    )
+    req = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name="boot", arguments={}),
+    )
+    text = asyncio.run(server.request_handlers[CallToolRequest](req)).root.content[0].text
+    assert "{tool_prefix}" not in text
+    result = json.loads(text)
+    nxt = result["soul"]["next_offset"]
+    assert f"call {prefix}get_soul with offset={nxt}" in result["message"]
+    assert "message" not in result["soul"]
 
 
 def test_schema_declares_optional_paging_and_filter_args() -> None:

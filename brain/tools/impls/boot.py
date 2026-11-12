@@ -78,7 +78,7 @@ def boot(
 
     context_prose = " ".join(prose_parts)
 
-    return {
+    result = {
         "emotional_state": emotional_state,
         "personality": personality,
         "soul": soul,
@@ -86,3 +86,10 @@ def boot(
         "daemon_residue": daemon_residue,
         "context_prose": context_prose,
     }
+    # get_soul returns one page (#596); its "how to read the next page" hint
+    # names a tool through the prefix slot, which is filled only in top-level
+    # worded keys (brain.tools.naming.fill_tool_result). Lift it to the top.
+    if isinstance(soul, dict) and "message" in soul:
+        result["soul"] = {k: v for k, v in soul.items() if k != "message"}
+        result["message"] = soul["message"]
+    return result
