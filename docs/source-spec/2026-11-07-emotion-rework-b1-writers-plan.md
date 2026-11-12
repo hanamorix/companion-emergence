@@ -52,11 +52,24 @@ def _settled(eng: EmotionEngine) -> dict[str, Reading]:
 
 `store` must be `MemoryStore(persona_dir / "memories.db")`, so its engine and the test's engine are the same one.
 
+**After Engine 6 (#633).** Engine 6 removes `engine_files.write_switch` and the switch file (its SW2 commit): a persona is live once its state file holds `switch_over_at`. The recipe above then fails with `AttributeError`. Use `make_live` from `tests/unit/brain/emotion/_engine_support.py` instead, as Engine 6 already does in `test_research.py`:
+
+```python
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+    return engine.engine_for(persona_dir)
+```
+
+An unknown switch also changes: `refuse_the_switch_stat` goes with the switch file, and "can't tell" becomes a state that exists but cannot be read (`ruin_the_state` in the same module). The B1 PRs open before Engine 6 use `write_switch` (#718: 3 calls, and `refuse_the_switch_stat` in `test_unknown_switch_takes_todays_path`; #719: 5; #726: 8). Whichever of each and #633 lands second makes the swap. Checked 2026-11-12: a trial merge of #726 with #633 had 14 failures before the swap and 1,530 passed after it. PR 7 lands after Engine 6, so it uses this version from the start.
+
 **Faded test recipe.** Until Engine 6 merges, `faded_value` returns the stored value, so an aged memory cannot prove a faded read. Tests that need to tell faded from stored patch that one method, and keep passing after Engine 6:
 
 ```python
 monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
 ```
+
+This holds through Engine 6 (checked 2026-11-12 on the #726 trial merge), because Engine 6 keeps `faded_value` and the B1 call sites call it. It stops holding where Engine 7 (#635) moves a call site to `memory_feelings`: `MemoryFeelings.feelings` fades through `engine_utils.faded_emotion(memory, emotion, half_lives, switch_over_at, now)`, not through `EmotionEngine.faded_value`, so the patch no longer reaches it. Retarget the patch to `faded_emotion` there, or age the rows; don't delete the test.
 
 **Pins.** `tests/unit/brain/emotion/test_rework_writer_pins.py` arrives with #671. Its xfail reasons use the parent design's numbers: B1-1 is PR 2, B1-2 is PR 3, B1-4 is PR 5. A fixing PR removes `@_flipped_by` from the `test_intended_*` pin, rewrites it with `_go_live`, and leaves `test_today_*` as the switch-off record.
 
@@ -660,7 +673,7 @@ Message: `drop non-finite backfill values and share the climax threshold`.
 - [ ] **Step 1: Re-check the ground**
 
 Run: `git grep -n "aggregate_state" -- brain/engines/dream.py brain/monologue/trace.py brain/growth`
-Expected: only the branches this task removes. Re-read Engine 6 as merged before deleting anything. In particular, confirm `faded_value` works on a deleted row (Task 8's test covers it) and how `DreamEngine(persona_dir=None)` should now choose a mood: an empty `EmotionalState()`, unless Engine 6 settled it differently.
+Expected: only the branches this task removes. Re-read Engine 6 as merged before deleting anything. In particular, confirm `faded_value` works on a deleted row (Task 8's test covers it; the #726 trial merge with #633 passed it on 2026-11-12), that every `_go_live` a merged B1 PR left uses `make_live` (the "After Engine 6" recipe above; `git grep -n write_switch -- tests` should find nothing), and how `DreamEngine(persona_dir=None)` should now choose a mood: an empty `EmotionalState()`, unless Engine 6 settled it differently.
 
 - [ ] **Step 2: Write the failing schema test**
 

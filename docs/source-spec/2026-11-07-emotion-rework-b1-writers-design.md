@@ -26,7 +26,7 @@ Done means: all seven PRs are merged with their tests, the `test_intended_*` pin
 **Faded reads.** Pure functions that read per-memory values take `eng` with no default, following salience's `_emotion_input`; `None` means use stored values. Iterate the memory's own keys, because `faded_value` raises `KeyError` for an absent emotion.
 
 **Tests.**
-- Live tests use the real engine and a real switch file in a temp `KINDLED_HOME`, and run through the real entry point, not the helper. A live persona with no state file applies nothing, so a test seeds a memory before it writes the switch.
+- Live tests use the real engine and a real switch-over record in a temp `KINDLED_HOME`, and run through the real entry point, not the helper. A live persona with no state file applies nothing, so a test seeds a memory before it records the switch-over. Before Engine 6 the record is the switch file (`engine_files.write_switch`); Engine 6 removes that, and the record becomes `switch_over_at` in the state file (`make_live` in the tests). The plan's "After Engine 6" recipe has the details.
 - Until Engine 6 merges, `faded_value` returns the stored value. Tests that must tell faded from stored patch that one method to a smaller value.
 - Each PR pins the off path against today's behaviour.
 - Each PR removes the `xfail` from the `test_intended_*` pins it fixes and rewrites them with the switch on. The `test_today_*` pins stay as the switch-off record.
