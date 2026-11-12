@@ -323,6 +323,21 @@ def test_a_bug_inside_the_swap_is_logged_and_does_not_stop_start_up(persona, mon
     assert any("a bug" in r.getMessage() or "RuntimeError" in r.getMessage() for r in caplog.records)
 
 
+def test_a_stat_fault_on_the_persona_folder_is_a_failed_read_warns_writes_nothing_and_no_marker(persona, monkeypatch, caplog):
+    original = _write_vocab(persona, _mixed_entries())
+
+    def faulty(_path):
+        raise PermissionError("stat denied")
+
+    monkeypatch.setattr(vocabulary_swap.file_ops, "stat_path", faulty)
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.vocabulary_swap"):
+        run_vocabulary_swap_648(persona)  # does not raise
+    assert (persona / VOCAB).read_bytes() == original
+    assert not (persona / MARKER).exists()
+    assert not (persona / (VOCAB + ".bak1")).exists()
+    assert any("stat denied" in r.getMessage() for r in caplog.records)
+
+
 def test_a_persona_folder_that_does_not_exist_gets_no_folder_and_no_marker(tmp_path):
     ghost = tmp_path / "no-such-persona"
     run_vocabulary_swap_648(ghost)

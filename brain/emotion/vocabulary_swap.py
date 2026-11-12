@@ -57,14 +57,21 @@ def run_vocabulary_swap_648(persona_dir: Path) -> None:
 
 
 def _run(persona_dir: Path) -> None:
-    if not persona_dir.is_dir():
+    try:
+        folder = file_ops.stat_path(persona_dir)
+    except OSError as exc:  # a failed stat is a failed read: warn, write nothing (no vocabulary file, no marker)
+        logger.warning("vocabulary swap (#648): the persona folder %s cannot be read (%s); nothing is swapped", persona_dir.name, exc)
+        return
+    if folder is None or not folder.is_dir:
         return  # no persona folder: nothing to swap, and no folder or marker is created for one
     marker = persona_dir / _MARKER_FILENAME
     try:
         done = read_json(marker, default=lambda: None, recover=Recovery.RAISE, expect=dict)
     except (OSError, ValueError) as exc:
         # A marker that exists but cannot be read: the swap cannot know whether it already ran, and a second run would
-        # overwrite words the persona wrote since, so nothing is swapped.
+        # overwrite words the persona wrote since, so nothing is swapped. Accepted (P4): the marker is still unreadable at the
+        # next start, so this warning repeats at each start until the marker is deleted, and the persona stays off the
+        # baseline meanwhile. #741 replaces this swap.
         logger.warning(
             "vocabulary swap (#648): the marker %s cannot be read (%s); the vocabulary file is left as it is", marker.name, exc
         )
@@ -74,6 +81,10 @@ def _run(persona_dir: Path) -> None:
     swapped = _swap_file(vocabulary_path(persona_dir))
     if swapped is None:
         return
+    # Accepted (P4): if the vocabulary write above landed and this marker write fails, the next start swaps again. The rewrite
+    # is the same baseline definition, so that second run changes nothing the first did not, unless she edited one of the four
+    # entries (category, description or half-life) between the two starts: that edit is then overwritten with the baseline.
+    # #741 replaces this swap.
     try:
         write_json(marker, {"version": 1, "swapped": swapped, "completed_at": iso_utc(datetime.now(UTC))})
     except (OSError, ValueError) as exc:
@@ -108,8 +119,10 @@ def _swap_file(path: Path) -> int | None:
         baseline = vocabulary.get(key) if key in _SWAPPED_NAMES else None
         if baseline is None:
             continue
-        # Only the three fields of the definition change. The name keeps its spelling (the reflex crystallizer's trigger check
-        # compares the file's names as written), and any other key of the entry stays.
+        # Only the three fields of the definition change. The name keeps its spelling: the reflex crystallizer's gate 4 compares
+        # the file's names as written (brain/growth/crystallizers/reflex.py:630), and the swap leaves renaming to the vocabulary
+        # repair (`_merge_variant_entries`, brain/health/vocab_repair.py:237), which renames a lone variant to the canonical
+        # name on its next tick. Any other key of the entry stays.
         definition = {
             "category": baseline.category,
             "description": baseline.description,
