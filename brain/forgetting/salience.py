@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.engine_utils import feelings_of, memory_feelings
 from brain.felt_time.state import FeltTimeState
 from brain.memory import memory_utils
 from brain.memory.hebbian import HebbianMatrix
@@ -68,7 +68,7 @@ def _emotion_input(memory: Memory, eng: EmotionEngine | None) -> float:
     persona has switched over, held to 0-10), or None for the pure read of the stored values held (an in-memory store has
     no engine). Required, no default: every caller says which it means.
     """
-    feelings = (memory_feelings(memory, None, None, None) if eng is None else eng.memory_feelings(memory)).feelings
+    feelings = feelings_of(memory, eng).feelings
     if not feelings:
         return 0.0
     return _clamp(float(max(feelings.values())) / _EMOTION_DENOMINATOR)

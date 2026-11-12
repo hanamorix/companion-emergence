@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from brain.emotion import engine
-from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.engine_utils import feelings_of
 from brain.memory.store import Memory
 from brain.tools.naming import TOOL_PREFIX_SLOT
 from brain.utils.time import format_local
@@ -32,10 +32,7 @@ def _mem_to_result(memory: Memory, persona_dir: Path | None) -> dict:
     Memory row itself stays stored in UTC; only this tool-result copy is
     converted.
     """
-    if persona_dir is None:
-        emotions = dict(memory_feelings(memory, None, None, None).feelings)
-    else:
-        emotions = dict(engine.engine_for(persona_dir).memory_feelings(memory).feelings)
+    emotions = dict(feelings_of(memory, None if persona_dir is None else engine.engine_for(persona_dir)).feelings)
     return {
         "id": memory.id,
         "content": memory.content,

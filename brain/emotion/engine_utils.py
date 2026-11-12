@@ -21,6 +21,9 @@ What lives here:
 
 All constants are read as `dev_constants.NAME` at call time. Times are aware datetimes (UTC); a "day" is the machine's
 local calendar day (`day_of`), written `YYYY-MM-DD`.
+
+The engine class (`EmotionEngine`) appears here only as a type, imported under `TYPE_CHECKING`: `engine.py` imports this
+module at run time, so this module takes no run-time import of the engine.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from brain.utils.memory import is_conversation_derived
 from brain.utils.time import lenient_utc, to_local
 
 if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
     from brain.memory.store import Memory
 
 logger = logging.getLogger(__name__)
@@ -625,6 +629,19 @@ def memory_feelings(
         _switch_over_at=switch_over_at,
         _now=now,
     )
+
+
+def feelings_of(memory: Memory, eng: EmotionEngine | None) -> MemoryFeelings:
+    """A memory's feelings, peak and score through the engine when one is passed, through the pure read when `eng` is None.
+
+    The one place that choice is made. An engine's own read (`EmotionEngine.memory_feelings`) already falls back to the pure
+    read while the persona is not switched over, so a caller passes the engine it has, or None when it has none. `eng` is
+    required: None is a value the caller states. `.feelings` is a cached dict shared by every use of the returned read; a caller
+    that changes it copies it first.
+    """
+    if eng is None:
+        return memory_feelings(memory, None, None, None)
+    return eng.memory_feelings(memory)
 
 
 # --- runs and the shift rule ----------------------------------------------------------------------------------------
