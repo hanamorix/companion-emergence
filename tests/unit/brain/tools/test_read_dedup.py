@@ -38,3 +38,12 @@ def test_next_range_of_a_file_in_the_same_turn_is_not_deduped(tmp_path):
     assert second["content"] == "row5\nrow6\nrow7\nrow8\nrow9\n"
     again = read_file(str(f), persona_dir=tmp_path / "p", offset=5, max_lines=5)
     assert again.get("deduped") is True
+
+
+def test_expired_entries_are_pruned_so_range_keys_do_not_pile_up():
+    """#590 adds one dedup key per range read; entries past the TTL must not stay forever."""
+    _read_cache.reset()
+    for i in range(1000):
+        _read_cache.mark(f"/f#lines={i}:{i + 400}", now=0.0)
+    _read_cache.mark("/g", now=_read_cache._DEDUP_TTL_S + 1.0)
+    assert len(_read_cache._seen) == 1

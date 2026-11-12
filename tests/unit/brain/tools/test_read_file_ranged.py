@@ -107,6 +107,7 @@ def test_default_text_cap_matches_the_upload_cap():
     assert rf._FILE_READ_MAX_BYTES == rf._FILE_PDF_MAX_BYTES == rf._FILE_IMAGE_MAX_BYTES == 20 * 1024 * 1024
 
 
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base (a whole-file decode): the streamed read keeps a character split across chunks")
 def test_multibyte_character_split_across_read_chunks_decodes(tmp_path):
     """A UTF-8 character that straddles two read chunks is decoded, not reported as binary."""
     body = b"a" * (rf._READ_CHUNK_BYTES - 1) + "é".encode() + b"\nnext\n"
@@ -117,6 +118,7 @@ def test_multibyte_character_split_across_read_chunks_decodes(tmp_path):
     assert out["total_lines"] == 2
 
 
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds on the base (str.splitlines on the whole file): the streamed read splits lines the same way across chunks")
 def test_line_breaks_split_like_str_splitlines_across_read_chunks(tmp_path):
     """A \\r\\n straddling two read chunks is one break; \\r and form feed break lines too,
     exactly as the old whole-file str.splitlines() did."""
@@ -177,3 +179,12 @@ def test_window_stops_at_the_character_budget(tmp_path, monkeypatch):
     assert out["note"] == "showing lines 0-3 of 50; stopped at 100 characters; pass offset/max_lines to read more"
     nxt = read_file(str(p), persona_dir=tmp_path / "y", offset=3, max_lines=2)
     assert nxt["content"] == "03" + "y" * 27 + "\n04" + "y" * 27 + "\n"
+
+
+def test_offset_past_the_end_says_so(tmp_path):
+    """An offset past the last line returns nothing and says the file ends there, not 'read more'."""
+    p = _big(tmp_path, 692)
+    out = read_file(str(p), persona_dir=tmp_path / "x", offset=1000)
+    assert out["content"] == ""
+    assert "past the end" in out["note"] and "692" in out["note"]
+    assert "read more" not in out["note"]

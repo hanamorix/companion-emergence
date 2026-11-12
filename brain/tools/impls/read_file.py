@@ -115,7 +115,10 @@ class _Window:
         return self.start > 0 or self.start + len(self.parts) < self.total or self.cut_line is not None
 
     def note(self, *, pages: int | None = None) -> str:
-        where = f"of {self.total}" + (f" across {pages} page(s)" if pages is not None else "")
+        across = f" across {pages} page(s)" if pages is not None else ""
+        if self.start >= self.total:
+            return f"offset {self.start} is past the end: there are {self.total} lines{across}"
+        where = f"of {self.total}{across}"
         text = f"showing lines {self.start}-{self.start + len(self.parts)} {where}"
         if self.cut_line is not None:
             text += f"; line {self.cut_line} is longer than {self.budget} characters and was cut short"
