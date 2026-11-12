@@ -64,7 +64,8 @@ def handle_drop(
     guards only against import-time failures, not runtime errors in this function.
     """
     try:
-        # The memory's feelings through the engine's one read (the row is already deleted; the read needs no store).
+        # The memory's feelings through the engine's one read: faded values once the persona is live, the stored values held
+        # to 0-10 otherwise (the row is already deleted; the read needs no store).
         feelings = engine.engine_for(persona_dir).memory_feelings(memory).feelings
         emotion_max = max(feelings.values()) / 10.0 if feelings else 0.0
         emotion_max = max(0.0, min(1.0, emotion_max))

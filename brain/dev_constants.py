@@ -343,6 +343,15 @@ SETTINGS_FILE_LOCK_WAIT_S: float = 3.0
 # How often the bounded wait retries the non-blocking lock attempt. A poll costs one open and one flock call.
 SETTINGS_FILE_LOCK_POLL_S: float = 0.02
 
+# --- self-model state lock wait (#558) ----------------------------------------
+# How long a writer of <persona>/self_model_state.json (the reconcile tool, the supervisor's self-model tick, the
+# start-up repair) waits for the file's lock before it gives up and writes nothing (`brain.self_model.state.locked`).
+# Each holder does what a tunables holder does under its lock: one read and one atomic write of a small JSON file, with
+# nothing slow in between (the tick's articulate call and resolution path run outside it). So the bound derived above
+# holds unchanged: R_read + 2 * R_replace = 2.95 s, set to the same value. A reconcile runs inside a chat turn, so
+# the wait must stay a few seconds at most.
+SELF_MODEL_LOCK_WAIT_S: float = SETTINGS_FILE_LOCK_WAIT_S
+
 # --- embedding backfill scan cap (moved here, #531) --------------------------
 # Bounds how many candidate rows are even *examined* (read from `memories`)
 # in one tick: cheap (an indexed WHERE-clause row), independent of
