@@ -11,6 +11,7 @@ one page, bounded in items (``limit``) and in serialized bytes
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -38,24 +39,34 @@ _CLIP_MARK = "…"
 _TEXT_FIELDS = ("moment", "why_it_matters", "who_or_what")
 
 
-def _size(obj: Any) -> int:
+def result_bytes(obj: Any) -> int:
     """Bytes as the MCP handler serialises a result."""
     return len(json.dumps(obj, default=str, ensure_ascii=False).encode("utf-8"))
 
 
 def _as_int(value: Any) -> int | None:
-    """A whole number from what the model sent (``20``, ``"20"``, ``20.0``), else None."""
+    """A whole number from what the model sent, else None.
+
+    The same whole numbers are accepted as a number or as text: ``20``, ``20.0``,
+    ``"20"``, ``" 20 "``, ``"20.0"``, ``"2e1"``. Fractions, NaN/inf, booleans and
+    Python-only spellings such as ``"1_0"`` are refused.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
     if isinstance(value, str):
+        if "_" in value:  # int()/float() accept "1_0"; JSON and people don't mean it
+            return None
         try:
             return int(value.strip())
         except ValueError:
-            return None
+            try:
+                value = float(value)
+            except ValueError:
+                return None
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
     return None
 
 
@@ -74,7 +85,7 @@ def _clip_to_fit(item: dict, budget: int) -> dict:
         for f in _TEXT_FIELDS:
             if len(item[f]) > mid:
                 trial[f] = item[f][:mid] + _CLIP_MARK
-        if _size(trial) <= budget:
+        if result_bytes(trial) <= budget:
             best, lo = trial, mid + 1
         else:
             hi = mid - 1
@@ -86,6 +97,7 @@ def get_soul(
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     love_type: str | None = None,
+    max_bytes: int | None = None,
     store: MemoryStore,
     hebbian: HebbianMatrix,
     persona_dir: Path,
@@ -97,6 +109,9 @@ def get_soul(
     ``next_offset`` is the offset of the next page, and ``message`` says how to
     call for it. ``next_offset`` counts the items actually returned, so a page
     cut short by the byte bound never skips anything.
+
+    ``max_bytes`` is not in the tool schema: ``boot`` passes the room left
+    beside its other parts. It can only lower the bound, never raise it.
     """
     from brain.soul.love_types import LOVE_TYPES
     from brain.soul.store import SoulStore
@@ -129,6 +144,9 @@ def get_soul(
     soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
     try:
         total = soul_store.count(love_type)
+        # Past the end is past the end: capping at total also keeps a huge
+        # offset (10**30, 1e300) inside SQLite's 64-bit INTEGER.
+        offset = min(offset, total)
         rows = soul_store.list_active_page(offset=offset, limit=limit, love_type=love_type)
         by_love_type = soul_store.active_love_type_counts()
     finally:
@@ -165,16 +183,24 @@ def get_soul(
 
     # The envelope with the longest hint this page could carry, plus room for
     # the real tool prefix that later replaces the slot.
-    reserve = _size(finish([])) + 64
+    reserve = result_bytes(finish([])) + 64
+    # A caller embedding this page in a larger result (boot) passes what is left
+    # of the bound; never more than the bound itself.
+    parsed_budget = _as_int(max_bytes)
+    budget = MAX_RESULT_BYTES if parsed_budget is None else min(parsed_budget, MAX_RESULT_BYTES)
     items: list[dict] = []
     for row in rows:
         item = row.to_dict()
-        if reserve + _size(items + [item]) <= MAX_RESULT_BYTES:
+        if reserve + result_bytes(items + [item]) <= budget:
             items.append(item)
             continue
         if not items:
-            # Alone it is still too big: cut its text so the page holds it.
-            items.append(_clip_to_fit(item, MAX_RESULT_BYTES - reserve))
+            # Alone it is still too big: cut its text so the page holds it. If
+            # even a clipped item cannot fit (a tiny budget), return none: the
+            # hint still points at this offset.
+            clipped = _clip_to_fit(item, budget - reserve - 2)  # 2: the list's brackets
+            if reserve + result_bytes([clipped]) <= budget:
+                items.append(clipped)
         break
 
     return finish(items)

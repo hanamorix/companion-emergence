@@ -248,6 +248,37 @@ def test_numeric_strings_are_coerced_and_out_of_range_values_clamped(soul_person
     assert past_end["total"] == len(all_ids)
 
 
+def test_whole_numbers_parse_the_same_as_number_or_text(soul_persona) -> None:
+    """A whole number is accepted however it is written; anything else is refused."""
+    from brain.tools.impls.get_soul import get_soul
+
+    persona_dir, _, _ = soul_persona
+    ctx = _ctx(persona_dir)
+    for same in (20, 20.0, "20", " 20 ", "20.0", "2e1"):
+        assert get_soul(limit=same, **ctx)["limit"] == 20, same
+        assert get_soul(offset=same, **ctx)["offset"] == 20, same
+    for bad in ("1_0", " 1_0 ", "2.5", 2.5, "nan", "inf", float("inf"), "", "0x10"):
+        assert get_soul(limit=bad, **ctx)["loaded"] is False, bad
+        assert get_soul(offset=bad, **ctx)["loaded"] is False, bad
+
+
+def test_huge_numbers_are_clamped_not_raised(soul_persona) -> None:
+    """SQLite integers are 64-bit: an offset or limit past that must not raise."""
+    from brain.tools.impls.get_soul import MAX_LIMIT, get_soul
+
+    persona_dir, all_ids, _ = soul_persona
+    ctx = _ctx(persona_dir)
+    for huge in (10**30, 2**63, 1e300, "1e300", str(10**30)):
+        past = get_soul(offset=huge, **ctx)
+        assert past["loaded"] is True, huge
+        assert past["crystallizations"] == []
+        assert past["truncated"] is False
+        assert past["offset"] == len(all_ids)
+        many = get_soul(limit=huge, **ctx)
+        assert many["loaded"] is True, huge
+        assert many["limit"] == MAX_LIMIT
+
+
 def test_empty_soul_is_not_truncated(tmp_path: Path) -> None:
     from brain.tools.impls.get_soul import get_soul
 
@@ -392,6 +423,77 @@ def test_boot_over_mcp_names_the_prefixed_tool_for_the_next_soul_page(soul_perso
     nxt = result["soul"]["next_offset"]
     assert f"call {prefix}get_soul with offset={nxt}" in result["message"]
     assert "message" not in result["soul"]
+
+
+def test_whole_boot_payload_over_mcp_stays_within_the_bound(tmp_path: Path) -> None:
+    """boot is one tool result: the soul page plus everything beside it must fit.
+
+    The persona has a full soul page's worth of ~400-byte crystallizations, an
+    emotional state with many emotions and residue from all four daemons, so
+    the parts beside the soul are not empty.
+    """
+    from mcp.server import Server
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
+    from brain.engines.daemon_state import update_daemon_state
+    from brain.mcp_server.tools import register_tools
+    from brain.memory.store import Memory
+    from brain.tools.impls.get_soul import MAX_RESULT_BYTES
+
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    soul = SoulStore(str(persona_dir / "crystallizations.db"))
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for i in range(60):
+        soul.create(
+            Crystallization(
+                id=f"c{i:03d}",
+                moment=f"{i} " + "the lamp stayed on " * 15,
+                love_type=_LOVE_KEYS[i % len(_LOVE_KEYS)],
+                why_it_matters="because it did " * 5,
+                crystallized_at=base + timedelta(minutes=i),
+            )
+        )
+    soul.close()
+    ctx = _ctx(persona_dir)
+    emotions = ("love", "joy", "grief", "longing", "curiosity", "tenderness", "awe", "pride")
+    ctx["store"].create(
+        Memory.create_new(
+            content="a full day",
+            memory_type="event",
+            domain="relationship",
+            emotions={e: 5.0 + n * 0.5 for n, e in enumerate(emotions)},
+        )
+    )
+    for daemon in ("dream", "heartbeat", "reflex", "research"):
+        update_daemon_state(
+            persona_dir,
+            daemon_type=daemon,
+            dominant_emotion="longing",
+            intensity=8,
+            theme=f"{daemon} theme",
+            summary=f"The {daemon} left something behind. " * 8,
+        )
+
+    server = Server("brain-tools")
+    register_tools(
+        server,
+        persona_dir=persona_dir,
+        store=ctx["store"],
+        hebbian=ctx["hebbian"],
+        tool_prefix="mcp__brain-tools__",
+    )
+    req = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name="boot", arguments={}),
+    )
+    text = asyncio.run(server.request_handlers[CallToolRequest](req)).root.content[0].text
+    result = json.loads(text)
+    assert result["daemon_residue"]  # the parts beside the soul are not empty
+    assert result["emotional_state"]["all"]
+    assert result["soul"]["count"] >= 1
+    assert result["soul"]["truncated"] is True
+    assert len(text.encode("utf-8")) <= MAX_RESULT_BYTES
 
 
 def test_schema_declares_optional_paging_and_filter_args() -> None:

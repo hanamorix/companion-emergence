@@ -10,7 +10,7 @@ from brain.memory.store import MemoryStore
 from brain.tools.impls.get_body_state import get_body_state
 from brain.tools.impls.get_emotional_state import get_emotional_state
 from brain.tools.impls.get_personality import get_personality
-from brain.tools.impls.get_soul import get_soul
+from brain.tools.impls.get_soul import MAX_RESULT_BYTES, get_soul, result_bytes
 
 
 def boot(
@@ -39,7 +39,6 @@ def boot(
 
     emotional_state = get_emotional_state(**ctx)
     personality = get_personality(**ctx)
-    soul = get_soul(**ctx)
     body_state = get_body_state(**ctx)
 
     daemon_state, _ = load_daemon_state(persona_dir)
@@ -81,11 +80,17 @@ def boot(
     result = {
         "emotional_state": emotional_state,
         "personality": personality,
-        "soul": soul,
+        "soul": {},
         "body_state": body_state,
         "daemon_residue": daemon_residue,
         "context_prose": context_prose,
     }
+    # boot is one tool result, bounded like get_soul's own (#596): the soul page
+    # gets whatever room the other parts leave. The margin covers the hint's
+    # "message" key moving from the soul page to the top level below.
+    soul_budget = MAX_RESULT_BYTES - result_bytes(result) - 32
+    soul = get_soul(**ctx, max_bytes=soul_budget)
+    result["soul"] = soul
     # get_soul returns one page (#596); its "how to read the next page" hint
     # names a tool through the prefix slot, which is filled only in top-level
     # worded keys (brain.tools.naming.fill_tool_result). Lift it to the top.
