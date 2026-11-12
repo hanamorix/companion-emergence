@@ -57,9 +57,14 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     # discarded making moves nothing — empty-emotion act-memory only. The feed
     # wire-back (eventual_share → shared) is driven by flip_ready_shares from
     # run_maker_tick, not here.
+    from brain.emotion import engine
     from brain.maker import wiring
     if making.disposition != "discard":
-        delta = wiring.making_emotion_delta(making, dominant_source=sources[0] if sources else "soul")
+        delta = wiring.making_emotion_delta(
+            making,
+            dominant_source=sources[0] if sources else "soul",
+            live=engine.engine_for(persona_dir).is_live(),
+        )
         wiring.write_making_memory(store, making, emotions=delta)
     else:
         wiring.write_making_memory(store, making, emotions={})
