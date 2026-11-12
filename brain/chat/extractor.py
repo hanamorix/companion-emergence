@@ -179,8 +179,8 @@ _SYSTEM_PROMPT = prompt_strings.register("chat.extractor.system_prompt")
 def _vocab_prompt_line() -> str:
     """Registered emotion names appended to the system prompt (soft assist).
 
-    The load-bearing guard is the `_filter_to_registered` apply-time filter;
-    this line just steers the LLM away from inventing channel names. Fail-soft:
+    The pass-2 emotion_delta is folded into the emotion engine; this
+    line steers the LLM away from inventing channel names. Fail-soft:
     any registry error → empty string, the extraction call proceeds unassisted.
     """
     try:
@@ -321,8 +321,6 @@ def apply_side_effects(out: ExtractorOutput, *, persona_dir: Path) -> None:
     """Apply pass-2 outputs to the relevant engines. Best-effort per step."""
     if out.memory_writes:
         _safely("memory_writes", persona_dir, lambda: _apply_memory_writes(out.memory_writes, persona_dir))
-    if out.emotion_delta:
-        _safely("emotion_delta", persona_dir, lambda: _apply_emotion_delta(out.emotion_delta, persona_dir))
     if out.interest_candidate is not None:
         _safely(
             "interest_candidate",
@@ -331,6 +329,8 @@ def apply_side_effects(out: ExtractorOutput, *, persona_dir: Path) -> None:
         )
     if out.crystallisation:
         _safely("crystallisation", persona_dir, lambda: _apply_crystallisation(out.crystallisation, persona_dir))
+    if out.emotion_delta:
+        _safely("emotion_delta", persona_dir, lambda: _apply_emotion_delta(out.emotion_delta, persona_dir))
     if out.reflex_audit:
         _safely("reflex_audit", persona_dir, lambda: _apply_reflex_audit(out.reflex_audit, persona_dir))
 
@@ -377,13 +377,10 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
         return emotions
 
 
-# A pass-2 emotion_delta is a NUDGE, not a set. The x10 mapping below turns the
-# validated [-1.0, 1.0] delta into a 0..10 MemoryStore intensity; without a
-# ceiling a single extraction mints 10.0 and wins aggregate_state's max-pool
-# outright against a whole history (#94). test_extractor_schema.py already
-# states this intent — "so a malformed extractor can't slam the vector" — but
-# bounds the delta, not what the delta becomes. Sustained feeling still climbs
-# across turns; one turn cannot peak her.
+# Ceiling on the intensity one pass-2 emotion_delta can give a channel, on the 0..10 scale (the validated [-1.0, 1.0]
+# delta times 10, capped). test_extractor_schema.py already states the intent, "so a malformed extractor can't slam the
+# vector", but bounds the delta, not what the delta becomes. Sustained feeling still climbs across turns; one turn cannot
+# peak her.
 _MAX_DELTA_INTENSITY: float = 3.0
 
 
@@ -400,70 +397,26 @@ def signed_change_values(delta: Mapping[str, float]) -> dict[str, float]:
 
 
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
-    """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
-    memory is committed per the system's existing aggregation model.
+    """Fold the pass-2 emotion deltas into the emotion engine as signed changes; no memory row is written.
 
-    EmotionalState is DERIVED from memory aggregation (see brain/emotion/aggregate.py
-    and brain/bridge/persona_state.py _build_emotions). There is no separate
-    persisted emotion JSON file — the bridge reads aggregate_state(memories) on
-    each /persona/state poll. Writing a small monologue-source memory with the
-    delta vector is the correct way to influence the felt state without bypassing
-    the engine's normal accounting.
+    Deltas are on a [-1.0, 1.0] scale from the extractor. ``signed_change_values`` maps each to a signed change on the
+    0..10 scale (x10, capped at +/-_MAX_DELTA_INTENSITY), so a negative delta lowers the feeling and one extraction
+    can't peg a channel (#94).
 
-    Deltas are on a [-1.0, 1.0] scale from the extractor. We map them to
-    importance = abs(delta) * 10, capped at _MAX_DELTA_INTENSITY, so a 0.15
-    nudge becomes importance 1.5 on the 0..10 MemoryStore scale — a maximal
-    1.0 delta caps at _MAX_DELTA_INTENSITY rather than the uncapped 10.0;
-    one extraction can't peg a channel to the full clamp (#94).
-
-    Channel names are constrained to the registered emotion vocabulary before
-    writing — LLM-invented names are silently dropped here (mirrors the
-    _normalize pattern in brain/ingest/emotion_backfill.py).
+    Channel names are constrained to the registered emotion vocabulary first: LLM-invented names are dropped here
+    (mirrors the _normalize pattern in brain/ingest/emotion_backfill.py).
     """
     # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
     # pass2_queue.py's drain_all_locked pop-after-process step) can call
-    # this twice for one logical item, adding one extra emotion nudge to
-    # aggregate_state. Owner-accepted 2026-09-26: "the odds of it happening
+    # this twice for one logical item, folding one extra emotion nudge.
+    # Owner-accepted 2026-09-26: "the odds of it happening
     # are tiny, the consequence if it happens are small." See #240
     # (emotion-system untangle) for the durable fix.
     from brain.emotion import engine
-    from brain.memory.store import Memory, MemoryStore
 
-    # Live (B1 PR 2): fold the signed change straight into the engine and write no row, so a negative delta lowers
-    # the feeling. An unknown switch counts as off and takes the old path below.
-    live_engine = engine.engine_for(persona_dir)
-    if live_engine.is_live():
-        changes = signed_change_values(_filter_to_registered(delta))
-        if changes:
-            live_engine.fold_change(changes, None, "monologue_emotion")
-        return
-
-    store = MemoryStore(persona_dir / "memories.db")
-    try:
-        registered_delta = _filter_to_registered(delta)
-        emotions = {
-            ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
-            for ch, v in registered_delta.items()
-            if abs(v) > 1e-9
-        }
-        if not emotions:
-            return
-        # Build a brief descriptive content string from the non-zero emotion channels.
-        # Use the already-filtered `emotions` dict so the content string and stored
-        # vector stay consistent (zero entries appear in neither).
-        channel_str = ", ".join(f"{ch}:{v:.2f}" for ch, v in emotions.items())
-        mem = Memory.create_new(
-            content=f"[monologue emotion influence: {channel_str}]",
-            memory_type="monologue_emotion",
-            domain="monologue",
-            emotions=emotions,
-            importance=max(emotions.values()),
-        )
-        from brain.memory.pending import route_write
-
-        route_write(store, mem, source="extractor")
-    finally:
-        store.close()
+    changes = signed_change_values(_filter_to_registered(delta))
+    if changes:
+        engine.engine_for(persona_dir).fold_change(changes, None, "monologue_emotion")
 
 
 _INTEREST_SPAWN_STATE = "interest_spawn_state.json"

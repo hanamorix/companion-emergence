@@ -109,7 +109,7 @@ def test_run_tags_emotion_less_memories(tmp_path):
     store2.close()
 
     assert updated is not None
-    assert updated.emotions == {"loneliness": 7.0}
+    assert updated._stored_emotions == {"loneliness": 7.0}
 
 
 def test_backfilled_emotions_reach_the_engine_hook(tmp_path, emotion_engine_stub):
@@ -131,7 +131,7 @@ def test_backfilled_emotions_reach_the_engine_hook(tmp_path, emotion_engine_stub
     name, reported = emotion_engine_stub.recorded_calls[0]
     assert name == "on_emotions_assigned"
     assert reported.id == m.id
-    assert reported.emotions == {"loneliness": 7.0}
+    assert reported._stored_emotions == {"loneliness": 7.0}
 
 
 def test_run_does_not_retag_emotion_bearing_memories(tmp_path):
@@ -157,7 +157,7 @@ def test_run_does_not_retag_emotion_bearing_memories(tmp_path):
     updated = store2.get(m.id)
     store2.close()
     # original emotions preserved
-    assert updated.emotions == {"loneliness": 5.0}
+    assert updated._stored_emotions == {"loneliness": 5.0}
 
 
 def test_run_drops_unregistered_names_from_tagger(tmp_path):
@@ -178,8 +178,8 @@ def test_run_drops_unregistered_names_from_tagger(tmp_path):
     updated = store2.get(m.id)
     store2.close()
 
-    assert "FAKE_UNREGISTERED_XYZ" not in updated.emotions
-    assert updated.emotions.get("loneliness") == 5.0
+    assert "FAKE_UNREGISTERED_XYZ" not in updated._stored_emotions
+    assert updated._stored_emotions.get("loneliness") == 5.0
 
 
 def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
@@ -198,7 +198,7 @@ def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
     assert state1.status == "deferred_to_next_day"
 
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
-    tagged_after_1 = sum(1 for mid in ids if store2.get(mid).emotions)
+    tagged_after_1 = sum(1 for mid in ids if store2.get(mid)._stored_emotions)
     store2.close()
     assert tagged_after_1 < 3
 
@@ -209,7 +209,7 @@ def test_run_budget_cap_halts_and_cursor_resumes(tmp_path):
     )
 
     store3 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
-    tagged_after_2 = sum(1 for mid in ids if store3.get(mid).emotions)
+    tagged_after_2 = sum(1 for mid in ids if store3.get(mid)._stored_emotions)
     store3.close()
 
     assert tagged_after_2 == 3
@@ -397,11 +397,11 @@ def test_default_tagger_path_tags_memories_via_provider(tmp_path):
 
     # The memory must have been tagged — {} means the default tagger silently failed
     assert updated is not None
-    assert updated.emotions != {}, (
+    assert updated._stored_emotions != {}, (
         "default tagger wrote no emotions — provider.generate likely failed or "
         "returned unparseable output"
     )
-    assert updated.emotions.get("loneliness") == 8.0
+    assert updated._stored_emotions.get("loneliness") == 8.0
 
 
 def test_default_tagger_zero_tagged_does_not_mark_complete(tmp_path):
@@ -516,7 +516,7 @@ def test_run_yields_when_user_active_and_does_not_call_tagger(tmp_path):
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     updated = store2.get(m.id)
     store2.close()
-    assert updated.emotions == {}, "memory was tagged despite active user session"
+    assert updated._stored_emotions == {}, "memory was tagged despite active user session"
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +572,7 @@ def test_run_defers_when_throttle_slot_unavailable(tmp_path):
     store2 = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     updated = store2.get(m.id)
     store2.close()
-    assert updated.emotions == {}, "memory was tagged despite throttle slot being unavailable"
+    assert updated._stored_emotions == {}, "memory was tagged despite throttle slot being unavailable"
 
 
 def test_caller_supplied_store_is_used_and_left_open(tmp_path):
@@ -598,12 +598,12 @@ def test_caller_supplied_store_is_used_and_left_open(tmp_path):
             )
         assert state.status == "complete"
         assert store._conn.execute("SELECT 1").fetchone()[0] == 1  # noqa: SLF001 — still open
-        assert store.get(m.id).emotions.get("loneliness") == 7.0
+        assert store.get(m.id)._stored_emotions.get("loneliness") == 7.0
     finally:
         store.close()
     reopened = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
     try:
-        assert reopened.get(m.id).emotions.get("loneliness") == 7.0
+        assert reopened.get(m.id)._stored_emotions.get("loneliness") == 7.0
     finally:
         reopened.close()
 

@@ -77,8 +77,8 @@ def test_reflection_with_mem_store_writes_kindled_peer_memory_and_caps_emotion(t
     assert m.metadata.get("relationship_stage") == "acquaintance"
     assert m.content == "I talked with a peer today and felt a quiet warmth."
     # emotion was applied (capped, vocab-filtered) — non-empty for a fresh peer
-    assert m.emotions
-    assert all(0.0 < v <= 0.08 + 1e-9 for v in m.emotions.values())
+    assert m._stored_emotions
+    assert all(0.0 < v <= 0.08 + 1e-9 for v in m._stored_emotions.values())
 
 
 def test_mem_store_none_back_compat_no_memory_written(tmp_path):
@@ -176,12 +176,12 @@ def _verdict(emotion_json: str) -> str:
 
 
 def _go_live(persona_dir, mem_store):
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
-    from brain.emotion import engine_files
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     mem_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _live_reflect(tmp_path, reply: str, *, now=NOW, today=TODAY, ms=None, s=None):
@@ -199,13 +199,13 @@ def _live_reflect(tmp_path, reply: str, *, now=NOW, today=TODAY, ms=None, s=None
 def test_live_reflection_stores_held_values_and_holds_negatives_to_zero(tmp_path):
     _, ms = _live_reflect(tmp_path, _verdict('{"joy": 9, "grief": -3, "love": 40}'))
     [peer_memory] = ms.list_by_type("kindled_peer")
-    assert peer_memory.emotions == {"joy": 9.0, "grief": 0.0, "love": 10.0}
+    assert peer_memory._stored_emotions == {"joy": 9.0, "grief": 0.0, "love": 10.0}
 
 
 def test_live_reflection_drops_non_numeric_and_non_finite_and_keeps_the_memory(tmp_path):
     _, ms = _live_reflect(tmp_path, _verdict('{"joy": 4, "love": "lots", "awe": null, "fear": true, "grief": NaN}'))
     [peer_memory] = ms.list_by_type("kindled_peer")
-    assert peer_memory.emotions == {"joy": 4.0}
+    assert peer_memory._stored_emotions == {"joy": 4.0}
 
 
 def test_live_reflection_does_not_charge_the_bucket(tmp_path):
@@ -214,7 +214,7 @@ def test_live_reflection_does_not_charge_the_bucket(tmp_path):
     s, ms = _live_reflect(tmp_path, _verdict('{"joy": 9}'))
     later = NOW + timedelta(hours=1)
     _live_reflect(tmp_path, _verdict('{"joy": 9}'), now=later, today=later.strftime("%Y-%m-%d"), ms=ms, s=s)
-    assert [m.emotions for m in ms.list_by_type("kindled_peer")] == [{"joy": 9.0}, {"joy": 9.0}]
+    assert [m._stored_emotions for m in ms.list_by_type("kindled_peer")] == [{"joy": 9.0}, {"joy": 9.0}]
 
 
 @pytest.mark.no_base_failure(reason="pins that a breach seeds no warmth on the live path too (B1 PR 3); main returns early before any write")

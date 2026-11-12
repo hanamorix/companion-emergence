@@ -1,6 +1,6 @@
 """Test that ensure_persona_vocabulary_loaded() loads the persona
 emotion vocabulary into the process-global registry at bridge startup,
-so aggregate_state never silently drops extension emotions right after
+so a persona's extension emotions are never silently dropped right after
 launch (the ~15-min window bug).
 
 Regression: before this fix, the vocabulary was only loaded inside the
@@ -16,8 +16,7 @@ from pathlib import Path
 import pytest
 
 from brain.emotion import vocabulary
-from brain.emotion.aggregate import aggregate_state
-from brain.memory.store import Memory, MemoryStore
+from brain.memory.store import MemoryStore
 
 # ---------------------------------------------------------------------------
 # Helper — minimal valid emotion_vocabulary.json payload
@@ -41,15 +40,6 @@ _VOCAB_JSON = json.dumps(
 )
 
 
-def _make_memory_with_extension_emotion() -> Memory:
-    return Memory.create_new(
-        content="test memory carrying extension emotion",
-        memory_type="conversation",
-        domain="us",
-        emotions={_EXTENSION_EMOTION_NAME: 8.0},
-    )
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -70,7 +60,7 @@ def _clean_extension_emotion():
 
 def test_ensure_persona_vocabulary_loaded_registers_extension_emotion(tmp_path: Path):
     """ensure_persona_vocabulary_loaded() registers extension emotions so
-    aggregate_state includes them on the first chat request after startup.
+    the engine and every reader see them on the first chat request after startup.
     """
     from brain.bridge.server import ensure_persona_vocabulary_loaded
 
@@ -89,26 +79,24 @@ def test_ensure_persona_vocabulary_loaded_registers_extension_emotion(tmp_path: 
         # After the call the extension emotion must be in the registry.
         assert vocabulary.get(_EXTENSION_EMOTION_NAME) is not None
 
-        # And aggregate_state now surfaces it.
-        mem = _make_memory_with_extension_emotion()
-        result = aggregate_state([mem])
-        assert _EXTENSION_EMOTION_NAME in result.emotions
-        assert result.emotions[_EXTENSION_EMOTION_NAME] == 8.0
+        # And a reader that filters to registered names keeps it.
+        from brain.chat.extractor import _filter_to_registered
+
+        assert _filter_to_registered({_EXTENSION_EMOTION_NAME: 0.5}) == {_EXTENSION_EMOTION_NAME: 0.5}
     finally:
         store.close()
 
 
 def test_without_startup_load_extension_emotion_is_dropped(tmp_path: Path):
-    """Baseline: with no startup load, aggregate_state drops the extension emotion."""
+    """Baseline: with no startup load, the extension emotion is not registered."""
     # Sanity-check: the extension emotion is NOT in the registry (the autouse
     # fixture just removed it).
     assert vocabulary.get(_EXTENSION_EMOTION_NAME) is None
 
-    mem = _make_memory_with_extension_emotion()
-    result = aggregate_state([mem])
+    # Unknown to the registry, so a reader that filters to registered names drops it.
+    from brain.chat.extractor import _filter_to_registered
 
-    # The extension emotion is unknown → silently dropped from aggregation.
-    assert _EXTENSION_EMOTION_NAME not in result.emotions
+    assert _filter_to_registered({_EXTENSION_EMOTION_NAME: 0.5}) == {}
 
 
 def test_ensure_persona_vocabulary_loaded_is_idempotent(tmp_path: Path):

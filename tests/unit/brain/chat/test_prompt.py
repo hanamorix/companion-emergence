@@ -614,9 +614,13 @@ def test_recall_block_orders_by_importance_then_recency(
 
 
 def test_build_system_message_includes_emotion_state_when_memories_present(
-    persona_dir: Path, soul_store: SoulStore
+    persona_dir: Path, soul_store: SoulStore, emotion_engine_stub
 ) -> None:
+    from brain.emotion.engine import Reading
     from brain.emotion.persona_loader import load_persona_vocabulary
+
+    # The mood summary is the engine's read.
+    emotion_engine_stub.readings = {"tenderness": Reading(short=7.0, long=7.0, difference=0.0, shift=0)}
 
     # Create a fresh in-memory store and insert a memory with known emotions
     mem_store = MemoryStore(db_path=":memory:")
@@ -929,76 +933,6 @@ def test_build_system_message_includes_current_arc_block_when_arc_open(
     )
     assert "the boat one" in msg
     assert "current:" in msg
-
-
-# ── _build_emotion_summary — non-empty-emotions filter (heartbeat-flood fix) ──
-
-
-def test_build_emotion_summary_survives_heartbeat_flood(store: MemoryStore) -> None:
-    """`_build_emotion_summary` must filter for non-empty emotions_json.
-
-    The naive LIMIT 50 ORDER BY created_at DESC slice was identified as
-    broken for `_build_body` and `_build_emotions` (see comments at
-    brain/bridge/persona_state.py:260-264). On a steady-state brain
-    the last 50 memories are almost all heartbeats / observations /
-    facts with `emotions_json = '{}'`, so the aggregator returned an
-    empty top-3 even when emotion-bearing memories existed just
-    outside the window. This regression test pins the fix.
-    """
-    from datetime import UTC, datetime, timedelta
-
-    from brain.chat.prompt import _build_emotion_summary
-
-    base = datetime.now(UTC)
-    # One emotion-bearing memory — older.
-    strong = Memory.create_new(
-        content="A moment of real love and tenderness.",
-        memory_type="episodic",
-        domain="chat",
-        emotions={"love": 8.5, "tenderness": 6.2, "awe": 5.0},
-    )
-    strong = Memory(
-        id=strong.id,
-        content=strong.content,
-        memory_type=strong.memory_type,
-        domain=strong.domain,
-        created_at=base - timedelta(hours=1),
-        emotions=strong.emotions,
-        tags=strong.tags,
-        importance=strong.importance,
-        score=strong.score,
-    )
-    store.create(strong)
-
-    # 60 heartbeat-style memories with empty emotions, newer than `strong`.
-    for i in range(60):
-        beat = Memory.create_new(
-            content=f"heartbeat {i}",
-            memory_type="heartbeat",
-            domain="engine",
-            emotions={},  # the bug — these dominate the LIMIT 50 window
-        )
-        beat = Memory(
-            id=beat.id,
-            content=beat.content,
-            memory_type=beat.memory_type,
-            domain=beat.domain,
-            created_at=base + timedelta(seconds=i),
-            emotions=beat.emotions,
-            tags=beat.tags,
-            importance=beat.importance,
-            score=beat.score,
-        )
-        store.create(beat)
-
-    summary = _build_emotion_summary(store)
-    # Before fix: returns "" because heartbeats fill the LIMIT 50.
-    # After fix: returns "love:8.5, tenderness:6.2, awe:5.0".
-    assert "love" in summary, (
-        f"emotion summary should surface 'love' even under heartbeat flood (got: {summary!r})"
-    )
-    assert "tenderness" in summary
-    assert "awe" in summary
 
 
 # ── User identity (persona_config.user_name) ──────────────────────────────────
@@ -1538,11 +1472,10 @@ def test_image_path_system_message_also_contains_the_inventory(
     assert "`propose_write`" in out
 
 
-# ── B2 phase B: the prompt's live readers (engine-backed) ─────────────────────
+# ── the prompt's readers (engine-backed) ──────────────────────────────────────
 #
-# Every live case seeds the file-backed store with values that CONTRADICT what the stub holds, so a site that
-# still read the store would give the stored number and fail. A `:memory:` store reads as not live (it has no
-# directory), so it is the not-live case, never a live one.
+# The body-block cases seed the file-backed store with values that CONTRADICT what the stub holds, so a site that
+# read the store would give the stored number and fail.
 
 
 def _reading(short: float = 0.0, long: float = 0.0, difference: float = 0.0, shift: int = 0):
@@ -1562,11 +1495,9 @@ def _seed_contradiction(store: MemoryStore) -> None:
     )
 
 
-def test_summary_is_the_top_three_by_long_with_ties_by_name(store, emotion_engine_stub):
+def test_summary_is_the_top_three_by_long_with_ties_by_name(tmp_path, emotion_engine_stub):
     from brain.chat.prompt import _build_emotion_summary
 
-    _seed_contradiction(store)
-    emotion_engine_stub.live = True
     emotion_engine_stub.readings = {
         "calm": _reading(long=2.0),
         "awe": _reading(long=5.0),
@@ -1574,18 +1505,16 @@ def test_summary_is_the_top_three_by_long_with_ties_by_name(store, emotion_engin
         "joy": _reading(long=5.0),
         "grief": _reading(long=0.0),
     }
-    assert _build_emotion_summary(store) == "love:7.2, awe:5.0, joy:5.0"
+    assert _build_emotion_summary(tmp_path) == "love:7.2, awe:5.0, joy:5.0"
 
 
-def test_summary_ranks_a_present_zero_below_non_zero_and_empty_read_is_empty(store, emotion_engine_stub):
+def test_summary_ranks_a_present_zero_below_non_zero_and_empty_read_is_empty(tmp_path, emotion_engine_stub):
     from brain.chat.prompt import _build_emotion_summary
 
-    _seed_contradiction(store)
-    emotion_engine_stub.live = True
     emotion_engine_stub.readings = {"grief": _reading(long=0.0), "calm": _reading(long=0.5)}
-    assert _build_emotion_summary(store) == "calm:0.5, grief:0.0"
+    assert _build_emotion_summary(tmp_path) == "calm:0.5, grief:0.0"
     emotion_engine_stub.readings = {}
-    assert _build_emotion_summary(store) == ""
+    assert _build_emotion_summary(tmp_path) == ""
 
 
 @pytest.mark.parametrize(
@@ -1598,12 +1527,11 @@ def test_summary_ranks_a_present_zero_below_non_zero_and_empty_read_is_empty(sto
     ],
 )
 def test_summary_mode_and_count_come_from_the_dev_constants(
-    store, emotion_engine_stub, monkeypatch, mode, count, expected
+    tmp_path, emotion_engine_stub, monkeypatch, mode, count, expected
 ):
     from brain import dev_constants
     from brain.chat.prompt import _build_emotion_summary
 
-    emotion_engine_stub.live = True
     emotion_engine_stub.readings = {
         "love": _reading(short=3.0, long=7.0, difference=-4.0, shift=-1),
         "awe": _reading(short=6.0, long=5.0, difference=1.0, shift=1),
@@ -1612,23 +1540,7 @@ def test_summary_mode_and_count_come_from_the_dev_constants(
     }
     monkeypatch.setattr(dev_constants, "EMOTION_SUMMARY_MODE", mode)
     monkeypatch.setattr(dev_constants, "EMOTION_SUMMARY_COUNT", count)
-    assert _build_emotion_summary(store) == expected
-
-
-@pytest.mark.no_base_failure(reason='pins that an in-memory store reads as not live, so the mood summary takes the old aggregate path, as the old code did')
-def test_summary_in_memory_store_is_not_live_and_takes_the_old_path(emotion_engine_stub):
-    from brain.chat.prompt import _build_emotion_summary
-
-    emotion_engine_stub.live = True
-    emotion_engine_stub.readings = {"awe": _reading(long=9.0)}
-    mem_store = MemoryStore(db_path=":memory:")
-    try:
-        _seed_contradiction(mem_store)
-        summary = _build_emotion_summary(mem_store)
-    finally:
-        mem_store.close()
-    assert "awe" not in summary
-    assert "joy:9.0" in summary
+    assert _build_emotion_summary(tmp_path) == expected
 
 
 def test_body_block_uses_the_short_average_and_shows_absent_body_emotions_as_absent(
@@ -1636,10 +1548,9 @@ def test_body_block_uses_the_short_average_and_shows_absent_body_emotions_as_abs
 ):
     from brain.chat.prompt import _build_body_block
 
-    _seed_contradiction(store)  # stored rest_need 9.0 would show in the old path
-    emotion_engine_stub.live = True
+    _seed_contradiction(store)  # a stored rest_need 9.0 would show if the block read the store
     emotion_engine_stub.readings = {"arousal": _reading(short=6.5), "love": _reading(short=8.0)}
-    block = _build_body_block(store, tmp_path)
+    block = _build_body_block(tmp_path)
     assert "body emotions: arousal 6.5" in block
     assert "rest_need" not in block
 
@@ -1648,23 +1559,21 @@ def test_body_block_with_an_empty_read_has_no_body_emotions_line(store, tmp_path
     from brain.chat.prompt import _build_body_block
 
     _seed_contradiction(store)
-    emotion_engine_stub.live = True
     emotion_engine_stub.readings = {}
-    block = _build_body_block(store, tmp_path)
+    block = _build_body_block(tmp_path)
     assert block.startswith("── body ──")
     assert "body emotions:" not in block
 
 
-def test_body_block_a_read_that_raises_is_caught_by_the_existing_except(store, tmp_path, emotion_engine_stub):
+def test_body_block_a_read_that_raises_is_caught_by_the_existing_except(tmp_path, emotion_engine_stub):
     from brain.chat.prompt import _build_body_block
 
-    emotion_engine_stub.live = True
 
     def boom():
         raise RuntimeError("engine fault")
 
     emotion_engine_stub.read = boom
-    assert _build_body_block(store, tmp_path) == ""
+    assert _build_body_block(tmp_path) == ""
 
 
 def test_journal_block_sorts_and_prints_the_faded_values(store, emotion_engine_stub):
@@ -1721,26 +1630,24 @@ def test_journal_block_in_memory_store_prints_the_stored_values(emotion_engine_s
     assert "joy 9" in block
 
 
-def test_self_model_block_is_live_when_the_engine_is_live(tmp_path, emotion_engine_stub):
+def test_self_model_block_renders_the_engines_shifted_channels_with_no_floor(tmp_path):
     from brain.chat.prompt import _build_self_model_block
     from brain.self_model.gap import Gap
     from brain.self_model.state import SelfModelState, save
 
     gap = Gap(
-        per_channel={"joy": 0.2},  # under the old 0.5 floor: the old render would omit the block
+        per_channel={"joy": 0.2},  # small, but the engine read it as shifted: there is no floor
         magnitude=0.2,
         unnamed_pressure=0.0,
         directions={"joy": 1},
     )
     save(tmp_path, SelfModelState(current_gap=gap))
-    assert _build_self_model_block(tmp_path) is None
-    emotion_engine_stub.live = True
     block = _build_self_model_block(tmp_path)
     assert block is not None and "joy" in block
 
 
 @pytest.mark.parametrize("site", ["mood_summary", "monologue_frame"])
-def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor(store, emotion_engine_stub, site):
+def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor(tmp_path, emotion_engine_stub, site):
     """The mood summary (X7) and the monologue frame that prints the same string (X8) show the long average as read.
 
     The stub holds a nonzero interval since the last fold (`last_fold_at` is years before now), so a reader that
@@ -1750,14 +1657,13 @@ def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor
     from brain.chat.monologue_prompts import build_monologue_frame
     from brain.chat.prompt import _build_emotion_summary
 
-    emotion_engine_stub.live = True
     emotion_engine_stub.readings = {
         "love": _reading(short=1.0, long=7.0),
         "awe": _reading(short=9.0, long=5.5),
     }
 
     def render() -> str:
-        summary = _build_emotion_summary(store)
+        summary = _build_emotion_summary(tmp_path)
         if site == "mood_summary":
             return summary
         frame = build_monologue_frame(
@@ -1770,28 +1676,27 @@ def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor
     assert "love:7.0" in first and "awe:5.5" in first
 
 
-def _body_block_numbers(store, tmp_path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+def _body_block_numbers(tmp_path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
     import re
 
     from brain.chat.prompt import _build_body_block
 
-    stub.live = True
     stub.high = set(high)
     stub.readings = {n: _reading(short=v) for n, v in readings.items()}
-    block = _build_body_block(store, tmp_path)
+    block = _build_body_block(tmp_path)
     match = re.search(r"energy: (\d+)/10, temperature: (\d+)/9", block)
     assert match is not None, block
     return int(match.group(1)), int(match.group(2))
 
 
 def test_body_block_energy_and_temperature_follow_the_engines_predicate_not_a_level(
-    store, tmp_path, emotion_engine_stub
+    tmp_path, emotion_engine_stub
 ):
-    energy, temperature = _body_block_numbers(store, tmp_path, emotion_engine_stub, {}, set())
+    energy, temperature = _body_block_numbers(tmp_path, emotion_engine_stub, {}, set())
     # Far above every old level, but the engine calls nothing high: no change.
     top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
-    assert _body_block_numbers(store, tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
+    assert _body_block_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
     # Far below every old level, but high: energy -1 (rest_need) and temperature +1 (desire) +1 (love) -1 (touch_hunger).
     low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
-    got = _body_block_numbers(store, tmp_path, emotion_engine_stub, low, set(low))
+    got = _body_block_numbers(tmp_path, emotion_engine_stub, low, set(low))
     assert got == (energy - 1, temperature + 1)

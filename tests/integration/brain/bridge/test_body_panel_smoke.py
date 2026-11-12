@@ -101,9 +101,10 @@ def test_single_bar_desire_strong(persona_dir, capsys):
 
     assert body_emotions["desire"] == pytest.approx(8.0)
     # Other five stay quiet
+    # (an emotion the engine did not read is absent from the dict, not a key at 0.0)
     for name in BODY_EMOTIONS:
         if name != "desire":
-            assert body_emotions[name] <= QUIET_THRESHOLD, f"{name}={body_emotions[name]}"
+            assert body_emotions.get(name, 0.0) <= QUIET_THRESHOLD, f"{name}={body_emotions.get(name)}"
     assert ui != "Body quiet."
     assert "desire" in ui
 
@@ -123,17 +124,24 @@ def test_multi_bar_arousal_desire_touch_hunger(persona_dir, capsys):
     assert body_emotions["arousal"] == pytest.approx(7.0)
     assert body_emotions["desire"] == pytest.approx(6.0)
     assert body_emotions["touch_hunger"] == pytest.approx(5.0)
-    assert body_emotions["climax"] <= QUIET_THRESHOLD
-    assert body_emotions["comfort_seeking"] <= QUIET_THRESHOLD
-    assert body_emotions["rest_need"] <= QUIET_THRESHOLD
+    # an emotion the engine did not read is absent from the dict, not a key at 0.0
+    assert body_emotions.get("climax", 0.0) <= QUIET_THRESHOLD
+    assert body_emotions.get("comfort_seeking", 0.0) <= QUIET_THRESHOLD
+    assert body_emotions.get("rest_need", 0.0) <= QUIET_THRESHOLD
     # UI sorts desc: arousal first, then desire, then touch_hunger
     assert ui.startswith("arousal 7.0")
     assert "desire 6.0" in ui
     assert "touch hunger 5.0" in ui  # underscore → space in Bar component
 
 
-def test_transition_quiet_to_stirring_to_quiet(persona_dir, capsys):
-    """Walk the full transition: empty → seed desire → wipe → empty again."""
+@pytest.mark.no_base_failure(
+    reason=(
+        'renamed from test_transition_quiet_to_stirring_to_quiet, which also deactivated every row (a step that pinned the removed store window); the two steps it keeps pass on the base by design'
+    )
+)
+def test_transition_quiet_to_stirring(persona_dir, capsys):
+    """Walk the transition: empty -> seed desire. (The engine's averages are not the store's active rows, so
+    deactivating the rows does not quiet the panel: that third step belonged to the old store window.)"""
     MemoryStore(persona_dir / "memories.db").close()
     quiet_state = _read_body_emotions(persona_dir)
     quiet_ui = _ui_render(quiet_state)
@@ -142,25 +150,12 @@ def test_transition_quiet_to_stirring_to_quiet(persona_dir, capsys):
     stirring_state = _read_body_emotions(persona_dir)
     stirring_ui = _ui_render(stirring_state)
 
-    # Deactivate the memory (mirrors the brain's natural state churn).
-    store = MemoryStore(persona_dir / "memories.db")
-    try:
-        # Set active=0 on every row.
-        store._conn.execute("UPDATE memories SET active = 0")  # noqa: SLF001
-        store._conn.commit()  # noqa: SLF001
-    finally:
-        store.close()
-    back_quiet_state = _read_body_emotions(persona_dir)
-    back_quiet_ui = _ui_render(back_quiet_state)
-
     with capsys.disabled():
         print("\n[scenario 4: transition walk]")
         print(f"  step 1 (empty):       {quiet_ui!r}")
         print(f"  step 2 (desire 7.5):  {stirring_ui!r}")
-        print(f"  step 3 (deactivated): {back_quiet_ui!r}")
 
     assert quiet_ui == "Body quiet."
     assert "desire 7.5" in stirring_ui
     # comfort_seeking=3.2 > 0.4 threshold → it should also render as a bar.
     assert "comfort seeking 3.2" in stirring_ui
-    assert back_quiet_ui == "Body quiet."

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain.emotion import vocabulary
+from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.vocabulary import Emotion
 from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.memory.store import MemoryStore
@@ -208,8 +209,8 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     never added. Returns the count healed.
 
     Replaces the old misdirecting "run nell migrate" warning. Those orphaned
-    emotions broke aggregate_state + soul crystallization (the names were
-    silently skipped). Healing them as persona_extension entries works for
+    emotions broke the emotion readers and soul crystallization (the names
+    were silently skipped). Healing them as persona_extension entries works for
     native and OG personas alike, and persists so the next load is clean.
     """
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
@@ -217,7 +218,7 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     seen: set[str] = set()
     new_entries: list[dict] = []
     for mem in store.list_active(limit=None):
-        for raw_name in mem.emotions:
+        for raw_name in memory_feelings(mem, None, None, None).feelings:
             # #174: heal under the canonical spelling so a variant memory key
             # (present-ness, Love_Grief_blend) never mints a twin entry.
             name = vocabulary.canonical_name(raw_name)

@@ -20,6 +20,8 @@ from tests.unit.brain.emotion._engine_support import (
     install,
     local_day,
     local_noon,
+    lose_the_state,
+    make_live,
     make_persona,
     save,
     save_as_backup,
@@ -50,6 +52,32 @@ def _two_emotion_state() -> EngineState:
 
 def _no_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delattr(persona_loader, "refresh_if_changed", raising=False)
+
+
+# --- short_values: the one place a reader turns readings into the short-average map ---------------------------------
+
+
+def test_short_values_maps_each_name_to_its_short_average_only() -> None:
+    readings = {
+        "joy": engine.Reading(short=6.0, long=4.0, difference=2.0, shift=1),
+        "grief": engine.Reading(short=1.0, long=3.0, difference=-2.0, shift=0),
+    }
+    assert engine.short_values(readings) == {"joy": 6.0, "grief": 1.0}
+
+
+def test_short_values_of_no_readings_is_an_empty_map_and_a_new_dict_each_time() -> None:
+    readings: dict[str, engine.Reading] = {}
+    first = engine.short_values(readings)
+    assert first == {}
+    first["joy"] = 1.0  # the result is the caller's own map
+    assert engine.short_values(readings) == {}
+
+
+def test_short_values_of_the_real_engine_read_carries_the_stored_short_averages(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_refresh(monkeypatch)
+    save(persona, _two_emotion_state())
+    values = engine.short_values(engine.engine_for(persona).read())
+    assert values == {"joy": 6.0, "grief": 1.0}  # `ghost` has no weight left, so it is not a reading and not here
 
 
 # --- read() (Rd1, Rd4) --------------------------------------------------------------------------------------
@@ -99,8 +127,10 @@ def test_read_is_empty_while_the_state_is_missing_unreadable_or_flagged_and_take
 
 def test_read_is_empty_while_a_catch_up_failed(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _no_refresh(monkeypatch)
-    engine_files.write_switch(persona, D[1])
+    make_live(persona, D[1])
     eng = install(persona, D[8])
+    assert eng.is_live()  # the running engine has seen the switch-over; the state is gone afterwards
+    lose_the_state(persona)
     eng.note_active(D[8])  # a live persona with no state: flagged
     save(persona, _two_emotion_state())
     assert eng.read() == {}

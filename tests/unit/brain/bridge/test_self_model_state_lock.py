@@ -401,17 +401,14 @@ def test_a_startup_repair_that_cannot_get_the_lock_leaves_its_marker_unwritten(
     assert should_run_self_model_repair(persona_dir), "the marker was written though the repair did not run"
 
 
-def test_an_accept_that_cannot_get_the_lock_writes_no_delta_so_trying_again_is_safe(
+def test_an_accept_that_cannot_get_the_lock_changes_nothing_so_trying_again_is_safe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """accept/revise change the gap before they write the emotion delta: when the lock wait gives up, the delta has
-    not been written, so the same call made again does not write it twice."""
+    """accept/revise change the gap under the lock: when the lock wait gives up, nothing has been changed, so the same
+    call made again works. (The self-authored emotion delta they used to write is gone with the engine rework.)"""
     from brain import dev_constants
-    from brain.self_model import reconcile
 
     monkeypatch.setattr(dev_constants, "SELF_MODEL_LOCK_WAIT_S", _SHORT_WAIT_S, raising=False)
-    deltas: list[str] = []
-    monkeypatch.setattr(reconcile, "_write_self_authored_delta", lambda pd, ch, d: deltas.append(ch) or True)
     persona_dir = _persona(tmp_path)
     _open_grief_gap(persona_dir)
 
@@ -422,6 +419,9 @@ def test_an_accept_that_cannot_get_the_lock_writes_no_delta_so_trying_again_is_s
         assert not still_waiting
 
     assert "error" in out[0], out
-    assert deltas == [], "the delta was written though the reconcile gave up"
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None and gap.status == "open", "the gap was changed though the reconcile gave up"
     again = reconcile_self_read(persona_dir=persona_dir, action="accept", channel="grief", delta=0.3)
-    assert again.get("ok") is True and deltas == ["grief"]
+    assert again.get("ok") is True
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None and gap.status == "acknowledged"

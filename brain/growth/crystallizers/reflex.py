@@ -525,12 +525,13 @@ def _aggregate_recent_emotion_vector(
             # Once the engine is live: her short averages above 0. Context only.
             return {name: r.short for name, r in eng.read().items() if r.short > 0}
         from brain.emotion.aggregate import aggregate_state
+        from brain.emotion.engine_utils import memory_feelings
 
         cutoff = now - timedelta(days=look_back_days)
         recent: list[Any] = []
         for mtype in _CONVERSATION_TYPES:
             for mem in store.list_by_type(mtype, active_only=True):
-                if mem.created_at >= cutoff and mem.emotions:
+                if mem.created_at >= cutoff and memory_feelings(mem, None, None, None).feelings:
                     recent.append(mem)
         if not recent:
             return {}

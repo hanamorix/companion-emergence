@@ -17,7 +17,7 @@ from brain.memory.store import Memory, MemoryStore
 
 def _mem(peak: float, days_old: float, emotions: dict | None = None) -> Memory:
     created = datetime.now(UTC) - timedelta(days=days_old)
-    return Memory(
+    return Memory.from_stored_row(
         id="m" * 36, content="x", memory_type="conversation", domain="us",
         created_at=created, emotions=emotions or {},
         last_accessed_at=created, peak_emotion_intensity=peak,

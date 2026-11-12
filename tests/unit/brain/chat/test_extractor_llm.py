@@ -162,8 +162,7 @@ def test_user_prompt_uses_xml_delimiters():
 
 def test_system_prompt_lists_registered_emotion_channels():
     """Soft assist: the extractor system prompt enumerates registered names so
-    the LLM is steered toward the vocabulary (the load-bearing guard is the
-    _filter_to_registered apply-time filter)."""
+    the LLM is steered toward the vocabulary."""
     from brain.emotion.vocabulary import list_all
 
     provider = _FakeProvider(

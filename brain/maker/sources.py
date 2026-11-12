@@ -1,7 +1,6 @@
 """brain.maker.sources — live charge signals, read from existing stores.
 
-Emotional intensity (peak of the engine's short averages when the engine is live,
-else of the current aggregate), soul crystallisation
+Emotional intensity (peak of the emotion engine's short averages), soul crystallisation
 activity (current pending count — caller takes the delta), and dream activity
 (dream-typed memories since a cutoff). No new producer hooks.
 """
@@ -11,47 +10,21 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from brain.emotion.aggregate import aggregate_state
-from brain.memory.store import MemoryStore, _row_to_memory
+from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
-_RECENT_EMOTION_WINDOW = 200
-
 
 def current_emotional_intensity(store: MemoryStore) -> float:
-    """Peak intensity across the current emotional state (0.0 if none).
-
-    When the emotion engine is live this is the highest short average it reads;
-    otherwise the peak of the aggregate below.
-
-    ``MemoryStore.list_by_type`` requires a concrete type string (it filters
-    ``memory_type = ?``), so there is no ``None``-means-all path. Mirror
-    ``brain/bridge/persona_state.py::_build_emotions``: pull the recent active
-    emotion-carrying rows directly, aggregate, and take the peak.
+    """Peak intensity across the current emotional state (0.0 if none): the highest short average the
+    emotion engine reads. An in-memory store has no persona directory, so it has no engine to ask and shows 0.0.
     """
     live_engine = store.emotion_engine()
-    if live_engine is not None and live_engine.is_live():
-        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
-        # or retrying, read() returns nothing and the intensity is 0.0.
-        return max((r.short for r in live_engine.read().values()), default=0.0)
-    try:
-        rows = store._conn.execute(  # noqa: SLF001
-            "SELECT * FROM memories "
-            "WHERE active = 1 "
-            "AND emotions_json IS NOT NULL "
-            "AND emotions_json != '{}' "
-            "ORDER BY created_at DESC LIMIT ?",
-            (_RECENT_EMOTION_WINDOW,),
-        ).fetchall()
-        mems = [_row_to_memory(row) for row in rows]
-    except Exception:
-        logger.exception("maker.sources: listing recent memories failed")
+    if live_engine is None:
         return 0.0
-    state = aggregate_state(mems)
-    if not state.emotions:
-        return 0.0
-    return max(state.emotions.values())
+    # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is pending
+    # or retrying, read() returns nothing and the intensity is 0.0.
+    return max((r.short for r in live_engine.read().values()), default=0.0)
 
 
 def dreams_since(store: MemoryStore, cutoff_iso: str) -> int:

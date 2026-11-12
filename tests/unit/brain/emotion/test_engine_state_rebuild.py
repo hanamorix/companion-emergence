@@ -9,8 +9,8 @@ built-in table `dev_constants.EMOTION_HALF_LIFE_DAYS`, then
 is never written) and re-read only when its stat key changes.
 
 The file also holds the cases of the engine's files (Engine 2, #577): the no-heal walk
-`json_io.read_json_walk`, the state file's validator and JSON form, the stat-key cache, the switch
-file and `is_live()`. The queue and the change log are in `test_engine_queue.py`. Later engine
+`json_io.read_json_walk`, the state file's validator and JSON form, the stat-key cache, the switch-over
+time kept in the state (there is no switch file) and `is_live()`. The queue and the change log are in `test_engine_queue.py`. Later engine
 slices extend this file.
 """
 
@@ -44,8 +44,9 @@ from brain.health import json_io
 from brain.health.json_io import JsonRead, JsonWalk, read_json_walk
 from brain.utils import file_lock, file_ops
 from brain.utils.file_lock import LockTimeoutError
+from tests.unit.brain.emotion._engine_support import lose_the_state, ruin_the_state
 
-VOCAB = "emotion_vocabulary.json"
+VOCAB ="emotion_vocabulary.json"
 FILES_LOGGER = "brain.emotion.engine_files"
 
 
@@ -602,7 +603,7 @@ def test_no_vocabulary_file_answers_from_the_table_and_default_without_a_warning
 
 
 # ================================================================================================
-# Engine 2 (#577): the no-heal walk, the state file, its cache, the switch and is_live()
+# Engine 2 (#577): the no-heal walk, the state file, its cache, the switch-over time and is_live()
 # ================================================================================================
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
@@ -624,6 +625,7 @@ def _full_state() -> EngineState:
         last_update=NOW - timedelta(hours=3),
         active_day="2026-06-10",
         persona_start_at=NOW - timedelta(days=40),
+        switch_over_at=NOW - timedelta(days=3),
         repeats={"mem-1": RepeatEntry(NOW - timedelta(hours=5), 2)},
         emotions={
             "joy": EmotionState(
@@ -667,7 +669,6 @@ def test_every_engine_path_is_built_through_paths_state_dir(
     monkeypatch.setattr(paths, "state_dir", lambda persona_dir: moved)
     assert engine_files.state_path(tmp_path) == moved / dev_constants.EMOTION_STATE_FILENAME
     assert engine_files.queue_path(tmp_path) == moved / dev_constants.EMOTION_PENDING_FILENAME
-    assert engine_files.switch_path(tmp_path) == moved / dev_constants.EMOTION_SWITCH_FILENAME
     assert engine_files.changes_dir(tmp_path) == moved / dev_constants.EMOTION_CHANGES_DIRNAME
 
 
@@ -675,7 +676,6 @@ def test_the_engine_paths_sit_under_the_persona_state_folder(tmp_path: Path) -> 
     state = tmp_path / "state"
     assert engine_files.state_path(tmp_path) == state / "emotion_state.json"
     assert engine_files.queue_path(tmp_path) == state / "emotion_pending.jsonl"
-    assert engine_files.switch_path(tmp_path) == state / "emotion_switch.json"
     assert engine_files.changes_dir(tmp_path) == state / "emotion_changes"
 
 
@@ -684,11 +684,9 @@ def test_file_names_are_read_from_dev_constants_at_call_time(
 ) -> None:
     monkeypatch.setattr(dev_constants, "EMOTION_STATE_FILENAME", "s.json")
     monkeypatch.setattr(dev_constants, "EMOTION_PENDING_FILENAME", "q.json")
-    monkeypatch.setattr(dev_constants, "EMOTION_SWITCH_FILENAME", "w.json")
     monkeypatch.setattr(dev_constants, "EMOTION_CHANGES_DIRNAME", "c")
     assert engine_files.state_path(tmp_path).name == "s.json"
     assert engine_files.queue_path(tmp_path).name == "q.json"
-    assert engine_files.switch_path(tmp_path).name == "w.json"
     assert engine_files.changes_dir(tmp_path).name == "c"
 
 
@@ -762,8 +760,7 @@ def test_the_timeout_is_an_oserror_so_a_caller_must_catch_it_first() -> None:
 def test_reading_a_persona_without_a_state_folder_creates_none(tmp_path: Path) -> None:
     assert engine_files.read_state(tmp_path).problem == "missing"
     assert engine_files.StateCache(tmp_path).get().problem == "missing"
-    assert engine_files.switch_exists(tmp_path) is False
-    assert engine_files.read_switch(tmp_path) is None
+    assert engine_files.switch_over_state(engine_files.read_state(tmp_path)) is False
     assert engine_files.read_queue(tmp_path, from_line=0) == engine_files.QueueRead([], 0)
     assert engine_files.read_changes(tmp_path, NOW) == []
     assert engine_files.list_change_files(tmp_path) == []
@@ -950,6 +947,8 @@ _REJECTIONS = {
     "last_update not a time": _set(("last_update",), "x"),
     "persona_start_at present but unparseable": _set(("persona_start_at",), "not a time"),
     "persona_start_at a number": _set(("persona_start_at",), 7),
+    "switch_over_at present but unparseable": _set(("switch_over_at",), "never"),
+    "switch_over_at a number": _set(("switch_over_at",), 7),
     "active_day not a date": _set(("active_day",), "banana"),
     "active_day compact form": _set(("active_day",), "20260610"),
     "active_day a number": _set(("active_day",), 20260610),
@@ -988,7 +987,7 @@ def test_the_validator_rejects(label: str) -> None:
 
 
 @pytest.mark.parametrize("error", [OverflowError("year 1"), OSError("pre-1970 on Windows")])
-@pytest.mark.parametrize("field", ["saved_at", "reset_at", "last_update", "persona_start_at"])
+@pytest.mark.parametrize("field", ["saved_at", "reset_at", "last_update", "persona_start_at", "switch_over_at"])
 def test_a_time_that_cannot_be_turned_into_a_local_day_is_rejected(
     field: str, error: Exception, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1020,6 +1019,16 @@ def test_the_validator_accepts_a_null_or_missing_persona_start_at() -> None:
     del data["persona_start_at"]
     engine_files.validate_state(data)
     assert engine_files.state_from_json(data).persona_start_at is None
+
+
+def test_the_validator_accepts_a_null_or_missing_switch_over_at() -> None:
+    data = _valid_json()
+    data["switch_over_at"] = None
+    engine_files.validate_state(data)
+    assert engine_files.state_from_json(data).switch_over_at is None
+    del data["switch_over_at"]
+    engine_files.validate_state(data)
+    assert engine_files.state_from_json(data).switch_over_at is None
 
 
 def test_an_average_outside_zero_to_ten_is_held_and_the_state_kept() -> None:
@@ -1400,12 +1409,13 @@ def test_the_saved_file_has_the_documented_shape(tmp_path: Path) -> None:
         "last_update",
         "active_day",
         "persona_start_at",
+        "switch_over_at",
         "queue_line",
         "repeats",
         "emotions",
     }
     assert data["queue_line"] == 0
-    for key in ("saved_at", "reset_at", "last_update", "persona_start_at"):
+    for key in ("saved_at", "reset_at", "last_update", "persona_start_at", "switch_over_at"):
         assert data[key].endswith("Z"), key
     assert data["saved_at"] == "2026-06-10T15:30:00Z"
     assert data["repeats"] == {"mem-1": {"first_at": "2026-06-10T10:30:00Z", "count": 2}}
@@ -1590,28 +1600,6 @@ def test_the_cache_hit_check_asks_file_ops_stat_path_for_the_state_file_and_no_r
     assert len(walks) == 1
 
 
-def test_switch_exists_asks_file_ops_stat_path_for_the_switch_file_and_no_raw_stat(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    written = tmp_path / "written"
-    engine_files.write_switch(written, NOW)
-    asked: list[Path] = []
-    real_stat_path = file_ops.stat_path
-
-    def spy(path: str | Path):
-        asked.append(Path(path))
-        return real_stat_path(path)
-
-    def no_raw_stat(self: Path, *args: object, **kwargs: object):
-        raise AssertionError(f"a raw Path.stat of {self}")
-
-    monkeypatch.setattr(file_ops, "stat_path", spy)
-    monkeypatch.setattr(pathlib.Path, "stat", no_raw_stat)
-    assert engine_files.switch_exists(tmp_path / "absent") is False
-    assert engine_files.switch_exists(written) is True
-    assert asked == [engine_files.switch_path(tmp_path / "absent"), engine_files.switch_path(written)]
-
-
 def test_the_cache_reloads_when_the_size_changes(tmp_path: Path, walks: list[Path]) -> None:
     engine_files.save_state(tmp_path, _full_state())
     cache = engine_files.StateCache(tmp_path)
@@ -1729,45 +1717,52 @@ def test_shifts_are_stored_only_against_the_tuple_they_were_worked_out_from(tmp_
     assert cache.get() is fresh
 
 
-# --- the switch --------------------------------------------------------------------------------
+# --- the switch-over time (a field of the state; there is no switch file) -----------------------
 
 
-def test_the_switch_is_written_once_and_holds_only_the_time(tmp_path: Path) -> None:
+def _switched_state(at: datetime = NOW) -> EngineState:
+    return EngineState(saved_at=at, switch_over_at=at)
+
+
+def test_the_state_json_holds_the_switch_over_time_and_writes_null_when_there_is_none() -> None:
     first = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
-    assert engine_files.write_switch(tmp_path, first) is True
-    path = engine_files.switch_path(tmp_path)
-    assert json.loads(path.read_text(encoding="utf-8")) == {"switch_over_at": "2026-07-01T08:00:00Z"}
-    before = path.read_bytes()
-    assert engine_files.write_switch(tmp_path, first + timedelta(days=3)) is False
-    assert path.read_bytes() == before
-    assert engine_files.read_switch(tmp_path) == first
+    assert engine_files.state_to_json(_switched_state(first))["switch_over_at"] == "2026-07-01T08:00:00Z"
+    assert engine_files.state_to_json(EngineState(saved_at=NOW))["switch_over_at"] is None
+    restored = engine_files.state_from_json(json.loads(json.dumps(engine_files.state_to_json(_switched_state(first)))))
+    assert restored.switch_over_at == first
+    assert engine_files.state_from_json(engine_files.state_to_json(EngineState(saved_at=NOW))).switch_over_at is None
 
 
-def test_a_corrupt_switch_main_reads_from_its_backup_and_still_exists(tmp_path: Path) -> None:
-    when = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
-    engine_files.write_switch(tmp_path, when)
-    path = engine_files.switch_path(tmp_path)
-    path.with_name(path.name + ".bak1").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    path.write_text("{torn", encoding="utf-8")
-    assert engine_files.switch_exists(tmp_path) is True
-    assert engine_files.read_switch(tmp_path) == when
+def test_a_state_written_before_the_field_existed_reads_as_not_switched() -> None:
+    data = engine_files.state_to_json(_full_state())
+    del data["switch_over_at"]
+    engine_files.validate_state(data)
+    assert engine_files.state_from_json(data).switch_over_at is None
 
 
-def test_a_switch_main_with_no_usable_time_falls_to_a_backup_that_has_one(tmp_path: Path) -> None:
-    when = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
-    path = engine_files.switch_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text('{"switch_over_at": "never"}', encoding="utf-8")
-    path.with_name(path.name + ".bak1").write_text('{"switch_over_at": "2026-07-01T08:00:00Z"}', encoding="utf-8")
-    assert engine_files.read_switch(tmp_path) == when
-    path.write_text('["not", "an", "object"]', encoding="utf-8")
-    assert engine_files.read_switch(tmp_path) == when
+def test_the_switch_over_time_survives_a_verified_save_and_a_walk(tmp_path: Path) -> None:
+    first = datetime(2026, 7, 1, 8, 0, tzinfo=UTC)
+    assert engine_files.save_state(tmp_path, _switched_state(first), verify=True) is True
+    loaded = engine_files.read_state(tmp_path)
+    assert loaded.state is not None and loaded.state.switch_over_at == first
+
+
+def test_switch_over_state_tells_a_switched_state_from_an_unswitched_one_a_missing_one_and_an_unreadable_one(tmp_path: Path) -> None:
+    """True: the state holds the time. False: it holds none, or there is no state file. None: it exists and no copy can be read."""
+    engine_files.save_state(tmp_path / "switched", _switched_state())
+    engine_files.save_state(tmp_path / "shadow", EngineState(saved_at=NOW))
+    engine_files.save_state(tmp_path / "ruined", _switched_state())
+    ruin_the_state(tmp_path / "ruined")
+    assert engine_files.switch_over_state(engine_files.read_state(tmp_path / "switched")) is True
+    assert engine_files.switch_over_state(engine_files.read_state(tmp_path / "shadow")) is False
+    assert engine_files.switch_over_state(engine_files.read_state(tmp_path / "missing")) is False
+    assert engine_files.switch_over_state(engine_files.read_state(tmp_path / "ruined")) is None
 
 
 def test_the_files_are_written_with_the_modes_the_design_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """State: three backups, compact. Switch: three backups, once. (The queue is appended, not written: its test is in test_engine_queue.py.)"""
+    """State: three backups, compact. (The queue is appended, not written: its test is in test_engine_queue.py.)"""
     calls: list[tuple[str, dict]] = []
     real = engine_files.write_json
 
@@ -1777,134 +1772,80 @@ def test_the_files_are_written_with_the_modes_the_design_names(
 
     monkeypatch.setattr(engine_files, "write_json", spy)
     engine_files.save_state(tmp_path, _full_state())
-    engine_files.write_switch(tmp_path, NOW)
-    assert calls == [
-        ("emotion_state.json", {"backups": 3, "indent": None}),
-        ("emotion_switch.json", {"backups": 3, "if_missing": True}),
-    ]
-
-
-def test_read_switch_is_none_for_no_file_and_for_a_switch_with_no_usable_time(tmp_path: Path) -> None:
-    assert engine_files.read_switch(tmp_path) is None
-    path = engine_files.switch_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text('{"switch_over_at": "never"}', encoding="utf-8")
-    assert engine_files.read_switch(tmp_path) is None
-    assert engine_files.switch_exists(tmp_path) is True
+    assert calls == [("emotion_state.json", {"backups": 3, "indent": None, "verify": False})]
 
 
 # --- is_live() ---------------------------------------------------------------------------------
 
 
-def test_is_live_is_false_with_no_switch_and_true_on_the_same_instance_once_it_is_written(
+def test_is_live_is_false_with_no_state_and_with_a_state_that_holds_no_switch_over_time_and_true_once_it_does(
     tmp_path: Path,
 ) -> None:
     engine = EmotionEngine(tmp_path)
-    assert engine.is_live() is False
-    assert engine.is_live() is False
-    engine_files.write_switch(tmp_path, NOW)
-    assert engine.is_live() is True
+    assert engine.is_live() is False  # no state file at all
+    engine_files.save_state(tmp_path, EngineState(saved_at=NOW))
+    assert engine.is_live() is False  # a shadow state: nothing marks a switch-over
+    engine_files.save_state(tmp_path, _switched_state())
+    assert engine.is_live() is True  # the same instance sees the first rebuild's write
 
 
 def test_a_true_answer_is_cached_for_the_life_of_the_instance(tmp_path: Path) -> None:
-    engine_files.write_switch(tmp_path, NOW)
+    engine_files.save_state(tmp_path, _switched_state())
     engine = EmotionEngine(tmp_path)
     assert engine.is_live() is True
-    engine_files.switch_path(tmp_path).unlink()
-    assert engine.is_live() is True
-    assert EmotionEngine(tmp_path).is_live() is False  # a new instance asks the file again
+    lose_the_state(tmp_path)
+    assert engine.is_live() is True  # what was seen is kept: a state lost later in this process is a recovery
+    assert EmotionEngine(tmp_path).is_live() is False  # a new instance finds no state: not switched (accepted edge (a))
 
 
-def test_a_false_answer_is_re_stated_each_time_and_a_true_one_never(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_not_live_instance_reads_the_state_only_when_the_file_changed_and_a_live_one_never_again(
+    tmp_path: Path, walks: list[Path]
 ) -> None:
-    calls: list[Path] = []
-    real = engine_files.switch_state
-
-    def counting(persona_dir: Path) -> bool | None:
-        calls.append(persona_dir)
-        return real(persona_dir)
-
-    monkeypatch.setattr(engine_files, "switch_state", counting)
+    engine_files.save_state(tmp_path, EngineState(saved_at=NOW))
     engine = EmotionEngine(tmp_path)
-    engine.is_live()
-    engine.is_live()
-    assert len(calls) == 2
-    engine_files.write_switch(tmp_path, NOW)
-    engine.is_live()
-    engine.is_live()
-    engine.is_live()
-    assert len(calls) == 3
-
-
-def _refuse_the_switch_stat(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_stat = file_ops.stat_path
-
-    def refuse(path: str | Path):
-        if Path(path).name == "emotion_switch.json":
-            raise PermissionError("denied")
-        return real_stat(path)
-
-    monkeypatch.setattr(file_ops, "stat_path", refuse)
-
-
-def test_switch_state_tells_a_seen_file_from_a_missing_one_from_an_unknown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """V3: True seen, False missing, None on a stat error other than "no such file" (logged)."""
-    engine_files.write_switch(tmp_path / "seen", NOW)
-    assert engine_files.switch_state(tmp_path / "seen") is True
-    assert engine_files.switch_state(tmp_path / "missing") is False
-    _refuse_the_switch_stat(monkeypatch)
-    with caplog.at_level(logging.WARNING, logger=FILES_LOGGER):
-        assert engine_files.switch_state(tmp_path / "seen") is None
-    assert any("emotion_switch.json" in r.getMessage() for r in caplog.records)
-
-
-def test_a_stat_error_other_than_not_found_answers_not_switched_and_switch_exists_warns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Owner 2026-11-05: "If the system can't tell if its switched, assume its not." A switch file that is on disk but
-    cannot be inspected is still answered False, with a warning that names the error."""
-    engine_files.write_switch(tmp_path, NOW)
-    _refuse_the_switch_stat(monkeypatch)
-    with caplog.at_level(logging.WARNING, logger=FILES_LOGGER):
-        assert engine_files.switch_exists(tmp_path) is False
-    assert any("emotion_switch.json" in r.getMessage() and "denied" in r.getMessage() for r in caplog.records)
-
-
-def test_is_live_is_false_on_a_stat_error_and_the_unknown_is_not_cached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[Path] = []
-    real = engine_files.switch_state
-
-    def counting(persona_dir: Path) -> bool | None:
-        calls.append(persona_dir)
-        return real(persona_dir)
-
-    monkeypatch.setattr(engine_files, "switch_state", counting)
-    engine_files.write_switch(tmp_path, NOW)  # switched, but the stat of the file fails
-    engine = EmotionEngine(tmp_path)
-    with monkeypatch.context() as fault:
-        _refuse_the_switch_stat(fault)
+    for _ in range(4):
         assert engine.is_live() is False
-        assert engine.is_live() is False
-        assert len(calls) == 2  # asked again on the next call: an unknown is never remembered
-    assert engine.is_live() is True  # the fault cleared; the file is seen now
-    assert len(calls) == 3
+    assert len(walks) == 1  # the loaded state is used; the file is stat-ed, not read again
+    engine_files.save_state(tmp_path, _switched_state(NOW + timedelta(days=1)))  # a new file key
+    assert engine.is_live() is True
+    assert len(walks) == 2
+    for _ in range(3):
+        assert engine.is_live() is True
+    assert len(walks) == 2  # seen: kept, no read at all
 
 
-def test_only_a_switch_file_that_was_seen_is_cached_as_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    engine_files.write_switch(tmp_path, NOW)
+def test_a_state_that_exists_but_cannot_be_read_is_not_live_and_the_unknown_is_not_cached(tmp_path: Path) -> None:
+    engine_files.save_state(tmp_path, _switched_state())
+    ruin_the_state(tmp_path)
+    engine = EmotionEngine(tmp_path)
+    assert engine.is_live() is False
+    assert engine.is_live() is False
+    engine_files.save_state(tmp_path, _switched_state())  # readable again (the ruined copy goes to .bak1)
+    assert engine.is_live() is True
+
+
+def test_only_a_switch_over_time_that_was_seen_is_cached_as_live(tmp_path: Path) -> None:
+    engine_files.save_state(tmp_path, _switched_state())
     engine = EmotionEngine(tmp_path)
     assert engine.is_live() is True
-    _refuse_the_switch_stat(monkeypatch)
-    assert engine.is_live() is True  # a seen file is remembered for the life of the instance, even under a later stat error
-    assert EmotionEngine(tmp_path).is_live() is False  # a new instance meeting the fault cannot tell, so not switched
-    monkeypatch.undo()
-    engine_files.switch_path(tmp_path).unlink()
-    assert engine.is_live() is True
+    ruin_the_state(tmp_path)
+    assert engine.is_live() is True  # remembered for the life of the instance, even when the state can no longer be read
+    assert EmotionEngine(tmp_path).is_live() is False  # a new instance meeting the same state cannot tell, so not switched
+
+
+def test_a_backup_copy_that_holds_the_switch_over_time_makes_the_persona_live(tmp_path: Path) -> None:
+    engine_files.save_state(tmp_path, _switched_state())
+    engine_files.save_state(tmp_path, _switched_state())  # the second save rotates the first into .bak1
+    engine_files.state_path(tmp_path).write_bytes(b"\x00 not json")
+    assert EmotionEngine(tmp_path).is_live() is True
+
+
+def test_a_backup_copy_from_before_the_switch_over_does_not(tmp_path: Path) -> None:
+    """Accepted edge (b), Planning B25 SW2: the live state is corrupted while `.bak1` is still the pre-switch state."""
+    engine_files.save_state(tmp_path, EngineState(saved_at=NOW))
+    engine_files.save_state(tmp_path, _switched_state())
+    engine_files.state_path(tmp_path).write_bytes(b"\x00 not json")
+    assert EmotionEngine(tmp_path).is_live() is False
 
 
 def test_fold_change_queues_its_event_and_read_is_still_empty(tmp_path: Path) -> None:
@@ -1915,6 +1856,6 @@ def test_fold_change_queues_its_event_and_read_is_still_empty(tmp_path: Path) ->
     ]
     assert not hasattr(engine, "recorded_calls")  # the record lives on the test fixture only
     assert engine.read() == {}
-    engine_files.write_switch(tmp_path, NOW)
+    engine_files.save_state(tmp_path, _switched_state())
     assert engine.is_live() is True
-    assert engine.read() == {}  # no state file yet: nothing to read
+    assert engine.read() == {}  # a switched state with no feelings: nothing to read

@@ -19,29 +19,36 @@ Days are numbered from 0; `D(n)` is local noon of day n. A long run is finished 
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
-from brain.emotion import engine_files
+from brain.emotion import engine_files, engine_rebuild
+from brain.emotion.engine import ensure_engine_ready
 from brain.emotion.engine_utils import (
     Average,
     EmotionState,
     EngineState,
+    Event,
     RunRecord,
     SnapshotDay,
     close_days,
 )
+from brain.memory.store import MemoryStore
 from tests.unit.brain.emotion._engine_support import (
     DAY0,
+    change,
     install,
     local_day,
     local_noon,
     make_persona,
     queue,
+    row,
     save,
+    save_as_backup,
     showing,
     state_of,
 )
@@ -293,9 +300,6 @@ def test_a_persona_whose_first_rows_are_uncounted_opens_its_gate_thirty_days_aft
     event sets `persona_start_at` to the oldest of them (day 0 noon). The snapshot of (d) with its last day 29 ends at the start
     of day 30, 29.5 days after that noon: gated, 0. With its last day 30 it ends 30.5 days after it: open, +1.
     """
-    from brain.memory.store import MemoryStore
-    from tests.unit.brain.emotion._engine_support import row
-
     persona = make_persona(tmp_path / "persona")
     install(persona, D(400))
     store = MemoryStore(persona / "memories.db")
@@ -319,6 +323,236 @@ def test_a_persona_whose_first_rows_are_uncounted_opens_its_gate_thirty_days_aft
         )
         save(persona, grafted)
         assert install(persona, D(400)).read()["joy"].shift == expected
+
+
+def _first_rebuild(persona: Path, now) -> None:  # noqa: ANN001
+    """Run the first rebuild on `persona` at `now` the way the engine's start-up does, through `engine_rebuild.rebuild`.
+
+    The two callbacks are the ones `catch_up` takes: first mode folds the stored values and does not call the fade, and the
+    weight of every row here is 1, so neither callback changes a number.
+    """
+    engine_rebuild.rebuild(
+        persona,
+        "first",
+        now,
+        faded_emotions_of=lambda memory: dict(memory._stored_emotions),
+        modifier_of=lambda memory: 1.0,
+    )
+
+
+@pytest.mark.parametrize(("oldest_day", "expected"), [(-62, 1), (18, 0)], ids=["oldest memory 90 days old", "oldest memory 10 days old"])
+def test_the_start_gate_at_the_first_rebuild_counts_from_the_oldest_memory_not_from_the_oldest_entry(
+    tmp_path: Path, oldest_day: int, expected: int
+) -> None:
+    """(f), the rebuild half of the G8 case. A persona that already has a database is rebuilt at noon of day 28 + 3 h. Its rows
+    in the 30-day window are on its last 5 days only (days 23 to 27, one conversation row each), so the engine's own oldest entry
+    is day 23 and the persona would read as new. Its oldest row of all is a journal entry (it counts for nothing) dated either 90
+    or 10 days before day 28.
+
+    The rebuild takes `persona_start_at` from that oldest row (a plain query, outside the window): day -62 noon and day 18 noon.
+    The gate then compares the end of the last snapshot day with it. The snapshot of (d) is put on the rebuilt state (the
+    rebuild itself builds only days 23 to 27, too few for any run) with its last day 27: its end is the start of day 28, 89.5
+    days after the first start and 9.5 days after the second. Open, +1 for the old persona; gated, 0 for the other.
+    """
+    now = D(28) + timedelta(hours=3)
+    persona = _gate_case_persona(tmp_path, oldest_day)
+    _first_rebuild(persona, now)
+    _assert_gate_after_first_start(persona, now, oldest_day, expected)
+
+
+def _gate_case_persona(root: Path, oldest_day: int) -> Path:
+    """The persona of case (f): an oldest journal row on `oldest_day` and one conversation row on each of days 23 to 27."""
+    rows = [row(D(oldest_day), memory_type="journal_entry", emotions={}, mid="oldest")]
+    rows += [row(D(day), emotions={"joy": 5.0 + day % 3}, mid=f"recent-{day}") for day in range(23, 28)]
+    return make_persona(root / "persona", rows)
+
+
+def _assert_gate_after_first_start(persona: Path, now, oldest_day: int, expected: int) -> None:  # noqa: ANN001
+    rebuilt = state_of(persona)
+    assert rebuilt.persona_start_at == D(oldest_day)  # not D(23): the oldest memory, not the oldest entry in the window
+    assert {entry.day for entry in rebuilt.emotions["joy"].snapshot} <= {_day(day) for day in range(23, 28)}
+    climb = [6.0, 7.0, 8.0, 9.0, 9.5, 10.0]
+    rebuilt.emotions = {
+        "joy": EmotionState(
+            short=Average(10.0, 2.0),
+            long=Average(3.2, 20.0),
+            last_entry_day=_day(27),
+            snapshot=_long_run_bar_snapshot(short_days=climb),
+        )
+    }
+    rebuilt.active_day = _day(28)
+    save(persona, rebuilt)
+    assert install(persona, now).read()["joy"].shift == expected
+
+
+@pytest.mark.parametrize(("oldest_day", "expected"), [(-62, 1), (18, 0)], ids=["oldest memory 90 days old", "oldest memory 10 days old"])
+def test_the_start_gate_after_a_real_first_start_counts_from_the_oldest_memory(tmp_path: Path, oldest_day: int, expected: int) -> None:
+    """(f) with the setup line the spec names: the persona is started through `ensure_engine_ready`, so the same case also
+    proves the start-up path runs the first rebuild on a persona that has a database and no state, and that this is what
+    leaves it switched over. The numbers are those of the case above."""
+    now = D(28) + timedelta(hours=3)
+    persona = _gate_case_persona(tmp_path, oldest_day)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    assert state_of(persona).switch_over_at == now
+    assert install(persona, now).is_live()
+    _assert_gate_after_first_start(persona, now, oldest_day, expected)
+
+
+# --- (g) the self-model after a reset ---------------------------------------------------------------------------------------
+#
+# The engine's rebuild or catch-up moves its `reset_at`; the self-model tick (`supervisor._run_self_model_tick`) sees that and
+# applies B2's spare rule; the engine itself never writes `self_model_state.json`. These cases use the real engine, started
+# through `ensure_engine_ready`, and the real tick (B2's `test_supervisor_self_model.py` covers the same entry rules with a
+# stub). The tick takes the engine path only for a persona that is switched over.
+
+
+def _self_model_persona(root: Path, rows: list) -> Path:
+    persona = make_persona(root / "persona", rows)
+    (persona / "active_conversations").mkdir()
+    (persona / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
+    return persona
+
+
+def _joy_rows() -> list:
+    return [row(D(day), emotions={"joy": 5.0 + day % 3}, mid=f"joy-{day}") for day in range(20, 28)]
+
+
+def _save_gap(persona: Path, *, status: str = "open", sustained_ticks: int = 5) -> bytes:
+    from brain.self_model import state as sm_state
+    from brain.self_model.gap import Gap
+
+    gap = Gap(
+        per_channel={"grief": 2.0},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        status=status,
+        sustained_ticks=sustained_ticks,
+        directions={"grief": 1},
+        reset_seen=None,
+    )
+    sm_state.save(persona, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+    return (persona / "self_model_state.json").read_bytes()
+
+
+def _tick(persona: Path):  # noqa: ANN202
+    from brain.bridge.provider import FakeProvider
+    from brain.bridge.supervisor import _run_self_model_tick
+
+    class _Bus:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def publish(self, event: dict) -> None:
+            self.events.append(event)
+
+    bus = _Bus()
+    return _run_self_model_tick(persona, provider=FakeProvider(), event_bus=bus), bus
+
+
+def _tick_on_the_engine_path(persona: Path):  # noqa: ANN202
+    """`_tick`, plus proof the engine branch decided it: the tick took the engine's three reads and they came back `None`."""
+    from unittest.mock import patch
+
+    from brain.bridge import supervisor
+
+    with patch.object(supervisor, "_self_model_engine_reads", wraps=supervisor._self_model_engine_reads) as reads:  # noqa: SLF001
+        result = _tick(persona)
+    assert reads.call_count == 1
+    return result
+
+
+def _cadence_is_unset(persona: Path) -> bool:
+    from brain.self_model import cadence
+
+    return cadence.load(persona).next_reflection_at is None
+
+
+def test_a_first_rebuild_resets_the_engine_and_the_tick_clears_the_open_gap_it_never_saw_the_reset_of(tmp_path: Path) -> None:
+    """(g), the reset case. A persona with eight joy rows and a saved open gap that recorded `reset_seen` None (made while the
+    engine had never reset). The first start rebuilds the engine, so its `reset_at` is the start's clock; the engine writes
+    nothing to `self_model_state.json` (the bytes are the ones saved). The next tick sees that `reset_at` differs from the gap's
+    and applies the spare rule: an open gap is cleared with no history entry, no resolution and no event. A second tick, with
+    the cadence made due again, is an ordinary one: the engine's `reset_at` is unchanged by it and the cadence saw no failure."""
+    from brain.self_model import cadence
+    from brain.self_model import state as sm_state
+
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, _joy_rows())
+    saved = _save_gap(persona)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    status = install(persona, now).status()
+    assert status.caught_up and status.reset_at == now
+    assert (persona / "self_model_state.json").read_bytes() == saved  # the engine never writes the self-model file
+    ran, bus = _tick(persona)
+    state, _ = sm_state.load_or_recover(persona)
+    assert ran is True
+    assert state.current_gap is None  # the spare rule: open and not answered, so cleared
+    assert state.gap_history == []  # cleared without a history entry
+    assert bus.events == []
+    cadence.save(persona, cadence.SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0))
+    ran_again, _bus = _tick(persona)
+    assert ran_again is True  # the tick ran (a skipped one returns False)
+    assert cadence.load(persona).next_reflection_at is not None  # and advanced the cadence
+    assert sm_state.load_or_recover(persona)[0].current_gap is None  # no new gap, nothing carried over
+    assert install(persona, now).status().reset_at == now
+    assert cadence.load(persona).consecutive_failures == 0
+
+
+def test_the_tick_keeps_a_gap_she_answered_through_a_reset_and_records_the_new_reset(tmp_path: Path) -> None:
+    """(g), the other half of the spare rule: an acknowledged gap with 3 or more sustained ticks is kept, with its `reset_seen`
+    brought up to the engine's `reset_at`; the engine did not touch the file."""
+    from brain.self_model import state as sm_state
+    from brain.utils.time import iso_utc
+
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, _joy_rows())
+    _save_gap(persona, status="acknowledged", sustained_ticks=4)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    ran, _bus = _tick(persona)
+    state, _ = sm_state.load_or_recover(persona)
+    assert ran is True
+    assert state.current_gap is not None
+    assert (state.current_gap.status, state.current_gap.sustained_ticks) == ("acknowledged", 4)
+    assert state.current_gap.reset_seen == iso_utc(now)
+
+
+def test_the_tick_does_nothing_when_the_live_engine_reads_nothing(tmp_path: Path) -> None:
+    """(g), the empty read: a switched-over persona with no memories has an engine that reads nothing. The tick returns False
+    and writes no self-model state, no audit file and no cadence."""
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, [])
+    install(persona, now)
+    ensure_engine_ready(persona)
+    assert install(persona, now).is_live()
+    ran, bus = _tick_on_the_engine_path(persona)
+    assert ran is False
+    assert not (persona / "self_model_state.json").exists()
+    assert not (persona / "self_model_audit.json").exists()
+    assert _cadence_is_unset(persona)
+    assert bus.events == []
+
+
+def test_the_tick_does_nothing_when_the_engine_is_not_caught_up(tmp_path: Path) -> None:
+    """(g), not caught up: the persona's only readable state is a backup copy (`status().caught_up` is False), so the tick
+    changes nothing: the saved gap's bytes, the cadence and the audit file are as they were."""
+    now = D(28) + timedelta(hours=3)
+    persona = _self_model_persona(tmp_path, _joy_rows())
+    saved = _save_gap(persona)
+    install(persona, now)
+    ensure_engine_ready(persona)
+    save_as_backup(persona, state_of(persona))
+    instance = install(persona, now)
+    assert instance.is_live()
+    assert not instance.status().caught_up
+    ran, bus = _tick_on_the_engine_path(persona)
+    assert ran is False
+    assert (persona / "self_model_state.json").read_bytes() == saved
+    assert not (persona / "self_model_audit.json").exists()
+    assert _cadence_is_unset(persona)
+    assert bus.events == []
 
 
 # --- (h) validity ------------------------------------------------------------------------------------------------------------
@@ -617,3 +851,98 @@ def test_an_off_day_then_a_reversal_in_one_close_starts_the_new_run_on_the_rever
     state = _close_state(snapshot, 4.9, active=2)
     close_days(state, D(3))
     assert _written_record(state, 2) == RunRecord(_day(2), -1, _day(2))
+
+
+# --- (i) catch-up ---------------------------------------------------------------------------------------------------------
+
+
+_RUN_DAYS = 40
+_COPY_DAY = 20
+
+
+def _joy_on(day: int) -> float:
+    return 2.0 + (day * 3) % 7  # 2 to 8, a different number most days
+
+
+def _grief_change_on(day: int) -> float:
+    return 1.0 + (day * 2) % 5  # 1 to 5
+
+
+def _fold_view(state: EngineState) -> dict:
+    """Everything the fold decides, in plain numbers (no save or reset times, which differ by design)."""
+    return {
+        name: {
+            "short": (emotion.short.avg, emotion.short.weight),
+            "long": (emotion.long.avg, emotion.long.weight),
+            "last_entry_day": emotion.last_entry_day,
+            "snapshot": [(d.day, d.short, d.long, d.felt, d.run) for d in emotion.snapshot],
+        }
+        for name, emotion in sorted(state.emotions.items())
+    } | {"_": {"active_day": state.active_day, "last_update": state.last_update, "start": state.persona_start_at, "repeats": state.repeats}}
+
+
+def _assert_same_fold(got: dict, want: dict) -> None:
+    assert got.keys() == want.keys()
+    for name in want:
+        if name == "_":
+            assert got[name] == want[name]
+            continue
+        for key in ("short", "long"):
+            assert got[name][key] == pytest.approx(want[name][key], abs=1e-9), (name, key)
+        assert got[name]["last_entry_day"] == want[name]["last_entry_day"], name
+        assert len(got[name]["snapshot"]) == len(want[name]["snapshot"]), name
+        for mine, theirs in zip(got[name]["snapshot"], want[name]["snapshot"], strict=True):
+            assert mine[0] == theirs[0] and mine[3:] == theirs[3:], (name, mine, theirs)
+            assert mine[1:3] == pytest.approx(theirs[1:3], abs=1e-9), (name, mine, theirs)
+
+
+@pytest.mark.no_base_failure(
+    reason="Check 25 (i) is a whole-run equality pin of `catch_up`, which Engine 4 built and main already has; it is listed under "
+    "S6 only because the change log it replays is written only live. It passes on the base by design; the check below that it "
+    "can fail (a missing change line) was run by hand."
+)
+def test_a_state_copy_from_day_twenty_caught_up_from_the_database_and_the_change_log_equals_the_uninterrupted_run(tmp_path: Path) -> None:
+    """(i) A 40-day run, one committed row and one chat change on every day (a new memory id each, so no repeat factor; no
+    showing, no climax, no access-only fold), drained at the end of each day, is the uninterrupted run. The state it held
+    after day 20 is copied: it becomes the ONLY readable state (a backup copy) of a second persona with the same database, the
+    change lines of days 21 to 38 in its change log, and only the last turn's change (day 39) in its queue.
+
+    The history is built so that equality holds by construction (E5.19: the catch-up inherits the rebuild's limits): every row
+    after day 20 is in the database, every change but the last is in the log, the replay window's upper bound is the oldest
+    queued line (exclusive), so the last change folds once through the drain and no line twice. One drain then gives the
+    uninterrupted run's averages, weights and snapshot days to 1e-9, each queued event once.
+
+    The change lines are written with `engine_files.append_change`, the writer a live engine uses for its own change log; the
+    uninterrupted run is not live here, so it writes none, and the second persona's log is what a live run would have left.
+    """
+    rows = [row(D(day), emotions={"joy": _joy_on(day)}, mid=f"day-{day}") for day in range(_RUN_DAYS)]
+    uninterrupted = make_persona(tmp_path / "uninterrupted")
+    store = MemoryStore(uninterrupted / "memories.db")
+    copied: EngineState | None = None
+    try:
+        for day in range(_RUN_DAYS):
+            live = install(uninterrupted, D(day) + timedelta(hours=1))
+            store.create(rows[day])
+            live.fold_change({"grief": _grief_change_on(day)}, D(day) + timedelta(hours=2), "pass2")
+            live.note_active(D(day) + timedelta(hours=3))
+            if day == _COPY_DAY:
+                copied = copy.deepcopy(state_of(uninterrupted))
+    finally:
+        store.close()
+    assert copied is not None
+    last = D(_RUN_DAYS - 1) + timedelta(hours=3)
+    want = _fold_view(state_of(uninterrupted))
+    assert len(want["joy"]["snapshot"]) == 30 and want["grief"]["snapshot"]  # a real 30-day snapshot, not an empty comparison
+
+    crashed = make_persona(tmp_path / "crashed", rows)
+    save_as_backup(crashed, copied)
+    for day in range(_COPY_DAY + 1, _RUN_DAYS - 1):
+        assert engine_files.append_change(
+            crashed, Event(kind="change", at=D(day) + timedelta(hours=2), emotions={"grief": _grief_change_on(day)}, source="pass2")
+        )
+    queue(crashed, change(D(_RUN_DAYS - 1) + timedelta(hours=2), {"grief": _grief_change_on(_RUN_DAYS - 1)}))
+    recovered = install(crashed, last)
+    recovered.note_active(last)
+    assert recovered.status().caught_up
+    _assert_same_fold(_fold_view(state_of(crashed)), want)
+    assert engine_files.read_queue(crashed, from_line=0).events == []  # the one queued line was folded once and the file emptied

@@ -9,6 +9,7 @@ framework baseline + persona-extensions for any unknown names found.
 from __future__ import annotations
 
 from brain.emotion import vocabulary as _vocabulary
+from brain.emotion.engine_utils import memory_feelings
 from brain.memory.store import MemoryStore
 
 PLACEHOLDER_DESCRIPTION = "(reconstructed from memory)"
@@ -24,7 +25,7 @@ def reconstruct_vocabulary_from_memories(store: MemoryStore) -> dict:
     baseline_names: set[str] = {e.name for e in _vocabulary._BASELINE}
     seen_names: set[str] = set()
     for mem in store.list_active(limit=None):
-        for name in mem.emotions:
+        for name in memory_feelings(mem, None, None, None).feelings:
             seen_names.add(_vocabulary.canonical_name(name))  # #174
 
     entries: list[dict] = []

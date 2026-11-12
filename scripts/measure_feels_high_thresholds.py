@@ -1,6 +1,6 @@
 """# Safety tier: 1
 
-Count how often each reader condition fires, old fixed level against the engine's `feels_high`, at several floors.
+Count how often each reader condition fires under the engine's `feels_high`, at several floors.
 
 Usage:
     bash scripts/measure_feels_high_thresholds.sh <path to a memories.db> [--floors 0,0.1,0.25,0.5,1.0,2.0]
@@ -8,29 +8,30 @@ Usage:
 
 The path is required: the database is not in the repository. The file is copied into a fresh temporary directory (the main
 database file only) and the copy is removed when the script ends. It refuses a path under the brain's home directory and
-aborts on a non-empty -wal file (the same checks as scripts/time_old_emotion_paths.py, whose helpers it calls). It starts one
-process (`git rev-parse HEAD`), calls no model, uses no network and reads no persona data file other than the path given.
+aborts on a non-empty -wal file. It starts one process (`git rev-parse HEAD`), calls no model, uses no network and reads no
+persona data file other than the path given. The CPU model on the host line is the first `model name` field of
+/proc/cpuinfo, read by the script itself on Linux (the read starts no process); it prints "unknown" on other systems and
+when the field is missing or unreadable.
 
 What it does. The history goes through the emotion engine's own pure functions (`fold_event`, `close_days`, the climax reset
 inside `fold_event`) from an empty state, with the live fold rules (quiet-day zeros in both averages). Ticks are on the
-4-a-day UTC grid the shift sizing used (03, 09, 15 and 21 h). "Old" is `aggregate_state` over the 200 most recent
-emotion-bearing rows at the tick, compared to each reader's old fixed level. "New" is the engine's short averages for present,
-registered names, with every row asking `engine_utils.feels_high_from`, the one function `engine.feels_high` calls, with the
-shift from `engine_utils.shift_for` (start gate included; the persona start is the oldest row's creation time, as the engine
-sets it). The new arm is computed at every floor of `--floors` in one engine pass (the floor is `dev_constants.FEELS_HIGH_FLOOR`,
-set for the duration of each floor's computation and restored). Floor 0 is the rule without a floor. Because phase B has no
-rebuild the engine starts empty, so the comparison is biased for roughly the first 30 days; the "after day 30" counts remove it.
+4-a-day UTC grid the shift sizing used (03, 09, 15 and 21 h). Each reader row asks `engine_utils.feels_high_from` about the
+engine's short averages for present, registered names, the one function `engine.feels_high` calls, with the shift from
+`engine_utils.shift_for` (start gate included; the persona start is the oldest row's creation time, as the engine sets it).
+It is computed at every floor of `--floors` in one engine pass (the floor is `dev_constants.FEELS_HIGH_FLOOR`, set for the
+duration of each floor's computation and restored). Floor 0 is the rule without a floor. The engine starts empty here, so
+the counts are biased for roughly the first 30 days; the "after day 30" counts remove it.
 
-Two runs: every day active, and a fixed set of days off (rows created on an off day are dropped from both arms and no tick
-runs that day). The days off are drawn with a fixed seed.
+Two runs: every day active, and a fixed set of days off (rows created on an off day are dropped and no tick runs that day).
+The days off are drawn with a fixed seed.
 
-It prints, per run: a host line; tables of firing counts per reader row (old, then each floor); the shift part alone and the
-range part alone per floor; the near-zero firings (rows that fire at floor 0 and stop firing once feelings with a short
-average under 0.1 are not high); for each floor-0 firing its survival floor (the highest floor at which it would still
-fire) in buckets; how many present feelings ever reach each floor; and the floor sweep summary R(F) with the plateau rule
-(see "R and the proposal" below). It checks its own invariants and exits 1 when one fails: counts never rise as the floor
-rises, a feeling called high at floor F is exactly a feeling called high at floor 0 whose short average is at least F,
-near-zero firings are zero at any floor of 0.1 or more, and the dev constant is restored.
+It prints, per run: a host line; tables of firing counts per reader row (each floor); the shift part alone and the range
+part alone per floor; the near-zero firings (rows that fire at floor 0 and stop firing once feelings with a short average
+under 0.1 are not high); for each floor-0 firing its survival floor (the highest floor at which it would still fire) in
+buckets; how many present feelings ever reach each floor; and the floor sweep summary R(F) with the plateau rule (see "R and
+the proposal" below). It checks its own invariants and exits 1 when one fails: counts never rise as the floor rises, a
+feeling called high at floor F is exactly a feeling called high at floor 0 whose short average is at least F, near-zero
+firings are zero at any floor of 0.1 or more, and the dev constant is restored.
 
 R and the proposal. R(F) is the number of firings removed by floor F, summed over both runs after day 30 and over the
 reflex and temperature rows only (temperature: arousal, desire, belonging, love, climax, body_grief, touch_hunger; reflex arcs
@@ -45,10 +46,13 @@ from __future__ import annotations
 
 import argparse
 import bisect
-import importlib.util
+import hashlib
 import json
+import os
+import platform
 import random
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -59,6 +63,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+CPUINFO = Path("/proc/cpuinfo")
 
 GRID_HOURS = (3, 9, 15, 21)
 SEED = 20261104
@@ -68,7 +73,7 @@ DEFAULT_FLOORS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)
 NEAR_ZERO = 0.1
 BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.0)  # survival-floor bucket edges: under 0.1, 0.1 to 0.25, ... 2.0 and over
 
-# The rows R(F) sums over (the reflex and temperature rows Hana named); every other row is reported, not summed.
+# The rows R(F) sums over (the reflex and temperature rows); every other row is reported, not summed.
 R_ROWS = (
     "temperature: arousal",
     "temperature: desire",
@@ -86,22 +91,138 @@ R_ROWS = (
 HighFn = Callable[[str], bool]
 
 
-_HELPERS: list = []
+class StepError(Exception):
+    """A step that cannot continue; carries the step name for the one-line abort message."""
+
+    def __init__(self, step: str, detail: str) -> None:
+        super().__init__(detail)
+        self.step = step
+        self.detail = detail
 
 
-def _load_timing_helpers():
-    """The timing script's source vetting, copy, store open and vocabulary load, and its host line (one copy of each).
+def _guarded[T](step: str, call: Callable[[], T]) -> T:
+    """Run ``call``; any exception other than a StepError becomes the one named abort for ``step``."""
+    try:
+        return call()
+    except StepError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - every failure ends the run with the one-line message
+        raise StepError(step, f"{type(exc).__name__}: {exc}") from exc
 
-    Loaded once: a second load would make a second `StepError` class that `main` would not catch.
+
+def _under_home(path: Path, home: Path) -> bool:
+    return path == home or home in path.parents
+
+
+def _step_source(arg: str) -> tuple[Path, str]:
+    """Resolve and vet the source file; return it and the commit the repository is on."""
+    import brain
+    from brain.paths import get_home
+
+    source = Path(arg).expanduser().resolve()
+    if not source.is_file():
+        raise StepError("source", f"not a regular file: {source}")
+    home = get_home()
+    if _under_home(source, home):
+        raise StepError("source", f"refusing a path under the brain's home directory: {source}")
+    wal = source.with_name(source.name + "-wal")
+    if wal.is_file() and wal.stat().st_size > 0:
+        raise StepError("source", f"{wal} has content: close the database that owns it first")
+    done = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    commit = done.stdout.strip()
+    if done.returncode != 0 or not commit:
+        raise StepError("source", f"git rev-parse HEAD failed: {done.stderr.strip() or 'no output'}")
+    code = Path(brain.__file__).resolve().parent
+    if REPO_ROOT not in code.parents:
+        raise StepError(
+            "source",
+            f"the brain package imported is {code}, not this checkout's ({REPO_ROOT}); "
+            "the commit printed would not be the code measured (set PYTHONPATH to the checkout or use its venv)",
+        )
+    return source, commit
+
+
+def _step_copy(source: Path, scratch: Path) -> str:
+    """Copy the main database file only; return the source's sha256."""
+    from brain.utils.atomic_write import save_bytes_atomic
+
+    try:
+        data = source.read_bytes()
+        save_bytes_atomic(scratch / "memories.db", data)
+    except OSError as exc:
+        raise StepError("copy", f"{type(exc).__name__}: {exc}") from exc
+    return hashlib.sha256(data).hexdigest()
+
+
+def _step_open(scratch: Path):
+    """Open the copy as the app does (default integrity check, schema and migrations)."""
+    from brain.memory.store import MemoryStore
+
+    return _guarded("open", lambda: MemoryStore(scratch / "memories.db"))
+
+
+def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
+    """Register the copy's emotion names through the app's own vocabulary load; run once per process."""
+    from brain.emotion import vocabulary
+    from brain.emotion.persona_loader import load_persona_vocabulary
+
+    def load() -> tuple[int, int]:
+        registered = load_persona_vocabulary(scratch / "emotion_vocabulary.json", store=store)
+        return registered, len(vocabulary.list_all())
+
+    return _guarded("vocabulary", load)
+
+
+def _platform() -> str:
+    """``sys.platform``, behind a seam so a test fakes another platform here, never on the global (#710)."""
+    return sys.platform
+
+
+def _cpu_model() -> str:
+    """The first ``model name`` field of /proc/cpuinfo on Linux; "unknown" elsewhere or when it is missing or unreadable.
+
+    A plain read: this script is not part of the app, and starting a process (platform.processor() runs ``uname -p``)
+    is not allowed here.
     """
-    if not _HELPERS:
-        path = REPO_ROOT / "scripts" / "time_old_emotion_paths.py"
-        spec = importlib.util.spec_from_file_location("time_old_emotion_paths_helpers", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        _HELPERS.append(module)
-    return _HELPERS[0]
+    if _platform() != "linux":
+        return "unknown"
+    try:
+        text = CPUINFO.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "unknown"
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "model name":
+            return " ".join(value.split()) or "unknown"
+    return "unknown"
+
+
+def _host_line() -> str:
+    arch = platform.machine() or "unknown"
+    avx2 = "unknown"
+    ram = "unknown"
+    try:
+        if _platform() == "linux":
+            from brain.memory.reranker import _detect_avx2
+
+            avx2 = "yes" if _detect_avx2() else "no"
+        from brain.memory.judge_selftune import _read_total_ram_bytes
+
+        total = _read_total_ram_bytes()
+        if total is not None:
+            ram = f"{total / 1024**3:.1f} GiB"
+    except ImportError:
+        pass
+    # platform.platform() and platform.processor() both start a `uname -p` process, so neither is used.
+    system = f"{platform.system() or 'unknown'} {platform.release()}".strip()
+    return f"host: {system}; cpu {_cpu_model()}; arch {arch}; avx2={avx2}; cores {os.cpu_count() or 'unknown'}; ram {ram}"
 
 
 def place_off_days(n_days: int) -> list[tuple[int, int]]:
@@ -127,31 +248,6 @@ def reflex_arcs() -> list[tuple[str, dict[str, float]]]:
     return [(a["name"], {k: float(v) for k, v in a["trigger"].items()}) for a in data["arcs"]]
 
 
-# Old arm: the fixed levels each reader held before `feels_high` (kept only in the old code path).
-def old_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> dict[str, Callable[[dict[str, float]], bool]]:
-    rows: dict[str, Callable[[dict[str, float]], bool]] = {
-        f"body: more than {many} feelings high": lambda e: sum(1 for v in e.values() if v >= 7.0) > many,
-        "body: rest_need": lambda e: e.get("rest_need", 0.0) >= 7.0,
-        "body: peace": lambda e: e.get("peace", 0.0) >= 7.0,
-        "temperature: arousal": lambda e: e.get("arousal", 0.0) >= 7.0,
-        "temperature: desire": lambda e: e.get("desire", 0.0) >= 7.0,
-        "temperature: belonging": lambda e: e.get("belonging", 0.0) >= 8.0,
-        "temperature: love": lambda e: e.get("love", 0.0) >= 8.0,
-        "temperature: climax": lambda e: e.get("climax", 0.0) >= 5.0,
-        "temperature: body_grief": lambda e: e.get("body_grief", 0.0) >= 7.0,
-        "temperature: touch_hunger": lambda e: e.get("touch_hunger", 0.0) >= 7.0,
-        "research gate: any feeling high": lambda e: max(e.values(), default=0.0) >= 7.0,
-    }
-    for name, trig in arcs:
-        rows[f"reflex arc {name}"] = lambda e, trig=trig: all(e.get(n, 0.0) >= t for n, t in trig.items())
-    rows["reflex: some arc eligible"] = lambda e: any(
-        all(e.get(n, 0.0) >= t for n, t in trig.items()) for _, trig in arcs
-    )
-    rows["expression arousal override"] = lambda e: e.get("arousal", 0.0) + e.get("desire", 0.0) >= 12.0
-    rows["expression intent"] = lambda e: _top(e) == "creative_hunger" and e.get("creative_hunger", 0.0) >= 7.0
-    return rows
-
-
 def _top(e: dict[str, float]) -> str | None:
     best, value = None, 0.0
     for name, v in e.items():
@@ -160,8 +256,8 @@ def _top(e: dict[str, float]) -> str | None:
     return best
 
 
-# New arm: the same rows, every fixed level replaced by the predicate. `e` holds the short averages of present names.
-def new_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> dict[str, Callable[[dict[str, float], HighFn], bool]]:
+# The reader rows: each reader condition, asking the predicate. `e` holds the short averages of present names.
+def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> dict[str, Callable[[dict[str, float], HighFn], bool]]:
     def names(*wanted: str) -> Callable[[dict[str, float], HighFn], bool]:
         return lambda e, high: all(n in e and high(n) for n in wanted)
 
@@ -200,7 +296,7 @@ class RunResult:
     n_after30: int
     n_post_gap: int
     floors: tuple[float, ...]
-    # (row, key) -> per-tick 0/1; key is "old" or ("new", floor), ("shift", floor), ("range", floor)
+    # (row, key) -> per-tick 0/1; key is ("new", floor), ("shift", floor) or ("range", floor)
     fire: dict = field(default_factory=dict)
     after30: list[int] = field(default_factory=list)
     post_gap: list[int] = field(default_factory=list)
@@ -215,30 +311,27 @@ class RunResult:
     invariant_failures: list = field(default_factory=list)
 
 
-def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold) -> RunResult:
+def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunResult:
     from brain import dev_constants
-    from brain.body.state import body_state_from_short, compute_body_state
+    from brain.body.state import body_state_from_short
     from brain.emotion import engine_utils as eu
     from brain.emotion import vocabulary
-    from brain.emotion.aggregate import aggregate_state
     from brain.maker import charge as maker_charge
     from brain.maker import config as maker_cfg
 
     many = dev_constants.BODY_ENERGY_HIGH_COUNT
-    old_rows = old_conditions(arcs, many)
-    new_rows = new_conditions(arcs, many)
-    row_names = list(old_rows)
+    reader_rows = reader_conditions(arcs, many)
+    row_names = list(reader_rows)
 
     rows = [m for m in rows if m.created_at.date() not in off_dates]
-    eb = [m for m in eb_rows if m.created_at.date() not in off_dates]
-    eb_times = [m.created_at for m in eb]
 
     events: list = []
     for m in rows:
         kind = eu.counted_kind(m)
-        if kind is None or not m.emotions:
+        if kind is None:
             continue
-        emotions = eu.resolve_emotions(m.emotions)
+        # The replay folds each row's stored feelings as written (no fade): the pure read, held to 0-10, canonical names.
+        emotions = eu.memory_feelings(m, None, None, None).feelings
         if not emotions:
             continue
         events.append(
@@ -248,7 +341,7 @@ def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold
                 memory_id=m.id,
                 emotions=emotions,
                 modifier=eu.source_modifier(m, 0.0),
-                climax=float(m.emotions.get("climax", 0.0) or 0.0),
+                climax=float(emotions.get("climax", 0.0) or 0.0),
             )
         )
     event_times = [e.at for e in events]
@@ -266,12 +359,19 @@ def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold
     day_of_tick: list = []
     first_date = dates[0]
     strain_base = strain_of(
-        compute_body_state(emotions={}, session_hours=0.0, words_written=0, days_since_contact=0.0, now=datetime.now(UTC))
+        body_state_from_short(
+            {},
+            feels_high=lambda _name: False,
+            session_hours=0.0,
+            words_written=0,
+            days_since_contact=0.0,
+            now=datetime.now(UTC),
+        )
     )
     strain_vals: dict = defaultdict(list)
-    arms = ("old",) + tuple(("new", f) for f in floors)
-    charge_dir = {a: Path(tempfile.mkdtemp(prefix="measure-maker-")) for a in ("old", "new")}
-    maker_state = {a: {"fires": 0, "last_fire": None, "max_charge": 0.0, "intensity_sum": 0.0} for a in ("old", "new")}
+    arms = tuple(("new", f) for f in floors)
+    charge_dir = Path(tempfile.mkdtemp(prefix="measure-maker-"))
+    maker_state = {"fires": 0, "last_fire": None, "max_charge": 0.0, "intensity_sum": 0.0}
     registered_sizes: list[int] = []
     high_counts: dict = defaultdict(list)
     peak_short: dict[str, float] = {}
@@ -301,9 +401,6 @@ def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold
                 eu.close_days(state, t)
                 last_tick = t
 
-                idx = bisect.bisect_right(eb_times, t)
-                recent = eb[max(0, idx - 200) : idx]
-                old = dict(aggregate_state(recent).emotions)
                 new = {
                     n: es.short.avg
                     for n, es in state.emotions.items()
@@ -339,28 +436,22 @@ def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold
                 after30.append(is_after30)
 
                 for name in row_names:
-                    fire[(name, "old")].append(int(old_rows[name](old)))
                     for f in floors:
                         for part in ("new", "shift", "range"):
                             hs = highs[(part, f)]
-                            fire[(name, (part, f))].append(int(new_rows[name](new, hs.__contains__)))
-                    if is_after30 and new_rows[name](new, base.__contains__):
-                        result.survival[name].append(_survival(new_rows[name], new, base))
+                            fire[(name, (part, f))].append(int(reader_rows[name](new, hs.__contains__)))
+                    if is_after30 and reader_rows[name](new, base.__contains__):
+                        result.survival[name].append(_survival(reader_rows[name], new, base))
 
                 for arm in arms:
-                    if arm == "old":
-                        body = compute_body_state(
-                            emotions=old, session_hours=0.0, words_written=0, days_since_contact=0.0, now=t
-                        )
-                    else:
-                        body = body_state_from_short(
-                            new,
-                            feels_high=highs[arm].__contains__,
-                            session_hours=0.0,
-                            words_written=0,
-                            days_since_contact=0.0,
-                            now=t,
-                        )
+                    body = body_state_from_short(
+                        new,
+                        feels_high=highs[arm].__contains__,
+                        session_hours=0.0,
+                        words_written=0,
+                        days_since_contact=0.0,
+                        now=t,
+                    )
                     strain = strain_of(body)
                     strain_vals[arm].append(strain)
                     fire[("body_strain above its empty-state value", arm)].append(int(strain > strain_base + 1e-9))
@@ -368,34 +459,32 @@ def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold
 
                 # maker: the real accumulate (soul and dream inputs zero), then the tick's own discharge test; the maker
                 # feeds the peak short average, not a "high" test, so it does not move with the floor
-                for arm, e in (("old", old), ("new", new)):
-                    intensity = max(e.values(), default=0.0)
-                    st = maker_charge.accumulate(
-                        charge_dir[arm],
-                        emotional_intensity=intensity,
-                        soul_delta=0,
-                        dream_count=0,
-                        now=t,
-                        w_emotion=maker_cfg.W_EMOTION,
-                        w_soul=maker_cfg.W_SOUL,
-                        w_dream=maker_cfg.W_DREAM,
-                        decay_per_hour=maker_cfg.DECAY_PER_HOUR,
-                    )
-                    maker_state[arm]["max_charge"] = max(maker_state[arm]["max_charge"], st.charge)
-                    maker_state[arm]["intensity_sum"] += intensity
-                    if st.charge >= maker_cfg.DISCHARGE_THRESHOLD:
-                        last = maker_state[arm]["last_fire"]
-                        if last is None or (t - last).total_seconds() / 3600.0 >= maker_cfg.COOLDOWN_HOURS:
-                            maker_state[arm]["fires"] += 1
-                            maker_state[arm]["last_fire"] = t
-                            st.charge = 0.0
-                            st.last_fire_ts = t.isoformat()
-                            maker_charge.save_charge(charge_dir[arm], st)
+                intensity = max(new.values(), default=0.0)
+                st = maker_charge.accumulate(
+                    charge_dir,
+                    emotional_intensity=intensity,
+                    soul_delta=0,
+                    dream_count=0,
+                    now=t,
+                    w_emotion=maker_cfg.W_EMOTION,
+                    w_soul=maker_cfg.W_SOUL,
+                    w_dream=maker_cfg.W_DREAM,
+                    decay_per_hour=maker_cfg.DECAY_PER_HOUR,
+                )
+                maker_state["max_charge"] = max(maker_state["max_charge"], st.charge)
+                maker_state["intensity_sum"] += intensity
+                if st.charge >= maker_cfg.DISCHARGE_THRESHOLD:
+                    last = maker_state["last_fire"]
+                    if last is None or (t - last).total_seconds() / 3600.0 >= maker_cfg.COOLDOWN_HOURS:
+                        maker_state["fires"] += 1
+                        maker_state["last_fire"] = t
+                        st.charge = 0.0
+                        st.last_fire_ts = t.isoformat()
+                        maker_charge.save_charge(charge_dir, st)
             prev_active_day = date
     finally:
         dev_constants.FEELS_HIGH_FLOOR = default_floor
-        for d in charge_dir.values():
-            shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(charge_dir, ignore_errors=True)
 
     if dev_constants.FEELS_HIGH_FLOOR != default_floor:
         failures.append("the dev constant was not restored")
@@ -411,9 +500,7 @@ def run_one(label, rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold
     result.peak_short = peak_short
     result.high_means = {k: sum(v) / max(1, n_ticks) for k, v in high_counts.items()}
     result.strain_means = {k: sum(v) / max(1, n_ticks) for k, v in strain_vals.items()}
-    result.maker = {
-        a: {**maker_state[a], "mean_intensity": maker_state[a]["intensity_sum"] / max(1, n_ticks)} for a in maker_state
-    }
+    result.maker = {**maker_state, "mean_intensity": maker_state["intensity_sum"] / max(1, n_ticks)}
     result.avg_present = sum(registered_sizes) / max(1, n_ticks)
     result.quiet_days = len(quiet_days)
     result.invariant_failures = failures
@@ -474,14 +561,14 @@ def report(results: list[RunResult], floors: tuple[float, ...], row_names: list[
             f"active days {r.n_days}, ticks {r.n_ticks} (4 a day: 03, 09, 15, 21 h UTC), quiet active days {r.quiet_days}; "
             f"ticks in the first two active days back from an off span {r.n_post_gap}; ticks after the engine's first 30 days {r.n_after30}"
         )
-        out.append(f"new-arm average count of present registered feelings per tick: {r.avg_present:.1f}")
+        out.append(f"average count of present registered feelings per tick: {r.avg_present:.1f}")
         for f in floors:
             out.append(
                 f"floor {f:g}: feelings high per tick {r.high_means[('new', f)]:.1f} "
                 f"(shift part alone {r.high_means[('shift', f)]:.2f}, range part alone {r.high_means[('range', f)]:.1f})"
             )
         out.append("")
-        head = ["reader row", "old"] + [f"floor {f:g}" for f in floors]
+        head = ["reader row"] + [f"floor {f:g}" for f in floors]
         for title, flags in (("after day 30", r.after30), ("all ticks", None)):
             denom = r.n_after30 if flags is not None else r.n_ticks
             out.append(f"Firing counts, {title} (ticks out of {denom}):")
@@ -489,12 +576,10 @@ def report(results: list[RunResult], floors: tuple[float, ...], row_names: list[
             out.append("| " + " | ".join(head) + " |")
             out.append("|" + "---|" * len(head))
             for name in _row_order(r, row_names):
-                cells = [_fmt(_count(r, name, "old", flags), denom)] + [
-                    _fmt(_count(r, name, ("new", f), flags), denom) for f in floors
-                ]
+                cells = [_fmt(_count(r, name, ("new", f), flags), denom) for f in floors]
                 out.append(f"| {name} | " + " | ".join(cells) + " |")
             out.append("")
-        out.append("New arm after day 30 by part, per floor (shift part alone / range part alone), ticks out of " f"{r.n_after30}:")
+        out.append("By part, per floor (shift part alone / range part alone), after day 30, ticks out of " f"{r.n_after30}:")
         out.append("")
         out.append("| reader row | " + " | ".join(f"floor {f:g}" for f in floors) + " |")
         out.append("|" + "---|" * (len(floors) + 1))
@@ -526,14 +611,12 @@ def report(results: list[RunResult], floors: tuple[float, ...], row_names: list[
                    f"(of {len(r.peak_short)} that were present at some tick): "
                    + "; ".join(f"floor {f:g}: {sum(1 for v in r.peak_short.values() if v >= f)}" for f in floors))
         out.append("")
-        out.append("body_strain mean: " + ", ".join(
-            [f"old {r.strain_means['old']:.3f}"] + [f"floor {f:g} {r.strain_means[('new', f)]:.3f}" for f in floors]))
-        for arm in ("old", "new"):
-            m = r.maker[arm]
-            out.append(
-                f"maker discharges ({arm}): {m['fires']} over {r.n_days} simulated active days; mean peak intensity fed in "
-                f"{m['mean_intensity']:.2f}; highest charge reached {m['max_charge']:.2f} (the maker does not use the predicate)"
-            )
+        out.append("body_strain mean: " + ", ".join(f"floor {f:g} {r.strain_means[('new', f)]:.3f}" for f in floors))
+        m = r.maker
+        out.append(
+            f"maker discharges: {m['fires']} over {r.n_days} simulated active days; mean peak intensity fed in "
+            f"{m['mean_intensity']:.2f}; highest charge reached {m['max_charge']:.2f} (the maker does not use the predicate)"
+        )
         out.append("")
 
     # R(F) over both runs, after day 30, over R_ROWS
@@ -586,29 +669,29 @@ def parse_floors(text: str) -> tuple[float, ...]:
 
 
 def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
-    helpers = _load_timing_helpers()
     started = time.perf_counter()
-    source, commit, code = helpers._step_source(db)
+    source, commit = _step_source(db)
     from brain import dev_constants
+    from brain.emotion import engine_utils as eu
     from brain.emotion import vocabulary
     from brain.memory.store import _row_to_memory
     from brain.paths import get_home
 
-    scratch = helpers._guarded("copy", lambda: Path(tempfile.mkdtemp(prefix="measure-feels-high-")).resolve())
+    scratch = _guarded("copy", lambda: Path(tempfile.mkdtemp(prefix="measure-feels-high-")).resolve())
     store = None
     try:
-        if helpers._under_home(scratch, get_home()):
-            raise helpers.StepError("copy", f"the temporary directory is under the brain's home directory: {scratch}")
-        digest = helpers._step_copy(source, scratch)
-        store = helpers._step_open(scratch)
-        registered, registry_size = helpers._step_vocabulary(scratch, store)
+        if _under_home(scratch, get_home()):
+            raise StepError("copy", f"the temporary directory is under the brain's home directory: {scratch}")
+        digest = _step_copy(source, scratch)
+        store = _step_open(scratch)
+        registered, registry_size = _step_vocabulary(scratch, store)
         rows = [
             _row_to_memory(r)
             for r in store._conn.execute("SELECT * FROM memories WHERE active = 1 ORDER BY created_at").fetchall()  # noqa: SLF001
         ]
         rows = [m for m in rows if m.created_at is not None]
         rows.sort(key=lambda m: m.created_at)
-        eb_rows = [m for m in rows if m.emotions]
+        with_emotions = sum(1 for m in rows if eu.memory_feelings(m, None, None, None).feelings)
         first, last = rows[0].created_at.date(), rows[-1].created_at.date()
         dates = [first + timedelta(days=i) for i in range((last - first).days + 1)]
         arcs = reflex_arcs()
@@ -618,11 +701,11 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
 
         spans = place_off_days(len(dates))
         off_dates = {dates[s + k] for s, ln in spans for k in range(ln)}
-        row_names = list(old_conditions(arcs, dev_constants.BODY_ENERGY_HIGH_COUNT))
-        lines = ["# Feels-high threshold measurement (old fixed levels against the predicate, at several floors)", ""]
-        lines.append(helpers._host_line())
+        row_names = list(reader_conditions(arcs, dev_constants.BODY_ENERGY_HIGH_COUNT))
+        lines = ["# Feels-high threshold measurement (the engine's predicate at several floors)", ""]
+        lines.append(_host_line())
         lines.append(f"commit: {commit}")
-        lines.append(f"database: sha256 {digest}; {len(rows)} active rows, {len(eb_rows)} with emotions; {first} to {last} ({len(dates)} days)")
+        lines.append(f"database: sha256 {digest}; {len(rows)} active rows, {with_emotions} with emotions; {first} to {last} ({len(dates)} days)")
         lines.append(f"registered emotion names from the first vocabulary load: {registered}; vocabulary size after load {len(vocabulary.list_all())}")
         lines.append(f"floors: {', '.join(f'{f:g}' for f in floors)} (floor 0 is the rule without a floor)")
         lines.append("Days off in run 2 (UTC dates; index counts from the first row's day = 0; seed "
@@ -630,8 +713,8 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
                          f"{dates[s]} to {dates[s + ln - 1]} ({ln} day{'s' if ln > 1 else ''}, index {s})" for s, ln in spans))
         lines.append("")
         results = [
-            run_one("every day active", rows, eb_rows, set(), dates, arcs, floors, rest_threshold),
-            run_one("days off (the set above)", rows, eb_rows, off_dates, dates, arcs, floors, rest_threshold),
+            run_one("every day active", rows, set(), dates, arcs, floors, rest_threshold),
+            run_one("days off (the set above)", rows, off_dates, dates, arcs, floors, rest_threshold),
         ]
         body, summary = report(results, floors, row_names)
         lines += body
@@ -663,10 +746,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     floors = parse_floors(args.floors)
-    helpers = _load_timing_helpers()
     try:
         lines, code = run(args.db, floors)
-    except helpers.StepError as exc:
+    except StepError as exc:
         print(f"measure_feels_high_thresholds: FAILED at {exc.step}: {exc.detail}", file=sys.stderr)
         return 1
     print("\n".join(lines))

@@ -854,18 +854,14 @@ def sandbox(
     # must isolate the mutation itself. Restored in the OUTER finally below, symmetric with
     # _restore_env, so it runs even when SandboxLeak is raised. See
     # hunts/harness-vocab-registry-leak/diagnosis.md.
-    import brain.emotion.aggregate as _agg
     import brain.emotion.vocabulary as _vocab
 
     _saved_registry = dict(_vocab._REGISTRY)
-    _saved_warned = set(_agg._warned_unregistered)
 
     def _restore_emotion_globals() -> None:
         # Mutate contents in place (clear + update), NOT a rebind — keeps any held reference valid.
         _vocab._REGISTRY.clear()
         _vocab._REGISTRY.update(_saved_registry)
-        _agg._warned_unregistered.clear()
-        _agg._warned_unregistered.update(_saved_warned)
 
     try:
         # #241: resolve the REAL engine home BEFORE the swap below — the live-service pre-check must

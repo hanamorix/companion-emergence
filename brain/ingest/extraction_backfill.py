@@ -16,9 +16,9 @@ Two modes. The default re-extracts only the starts the old cut lost (as the lull
 * ``all``: every archived row and every active row behind its cursor, oldest first.
 
 Backfilled memories carry ``metadata.extraction_backfill = {"from": <first row ts>, "to": <last row ts>}`` and
-``source_summary = "conversation:<sid>"``, and are BACK-DATED to the chunk's last user turn: a memory dated now and sourced
-``conversation:<sid>`` would reset the time since the user last spoke (``days_since_human``), which the body state and the
-reach-out gates read; back-dated, that clock never moves past the real newest user turn. Soul candidates are queued in
+``source_summary = "conversation:<sid>"``, and are BACK-DATED to the chunk's last user turn: a memory carries the time of the
+conversation it came from, not the time the backfill ran. (The time since the user last spoke, ``days_since_human``, is read
+from the conversation files and not from memories, so a memory's date does not move it.) Soul candidates are queued in
 ``heads`` mode only: that text was never extracted, so it never had its chance at the soul queue, while most ``--all`` text was
 extracted once already, and the soul queue itself has no dedup (an accepted candidate becomes a permanent crystallisation). The
 pipeline's soul stage skips only an exact repeat: a candidate whose session id and text are already queued, so a chunk that runs
@@ -408,6 +408,7 @@ def _all_rows(persona_dir: Path, sid: str) -> Iterator[dict]:
 
 
 def _newest_user_ts(persona_dir: Path) -> datetime | None:
+    """A duplicate reader of the newest user turn (see ``buffer.last_user_turn_ts``); left as it is."""
     newest = None
     for sid in _session_ids(persona_dir):
         for row in _all_rows(persona_dir, sid):
@@ -422,7 +423,7 @@ def _backdate(persona_dir: Path, rows: tuple[dict, ...], cursor_ts: str | None, 
     A reply row is stamped after its user row (seconds, or minutes on a tool-using turn), so the chunk's end could be later
     than the user's last turn; the user row's ts cannot. A chunk with no user row (only rows before a session's first user
     turn) takes the earliest of its end, the newest user turn of the persona's sessions, and now. Either way a back-dated
-    memory is never newer than the real newest user turn, so the time since the user last spoke never moves past it."""
+    memory is never newer than the real newest user turn."""
     users = [lenient_utc(r.get("ts")) for r in rows if r.get("speaker") == "user"]
     users = [u for u in users if u is not None]
     if users:

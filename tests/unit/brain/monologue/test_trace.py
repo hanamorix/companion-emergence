@@ -44,8 +44,8 @@ def test_write_trace_memory_seeds_current_emotion_aggregate(tmp_path):
     )
     write_trace_memory(store, "drifting again", feed_digest="a digest", persona_dir=None)
     mem = _trace_candidate(store)
-    assert mem.emotions, "trace should inherit the current emotional aggregate"
-    assert "love" in mem.emotions
+    assert mem._stored_emotions, "trace should inherit the current emotional aggregate"
+    assert "love" in mem._stored_emotions
 
 
 def test_capture_writes_trace_memory_and_surfaced_digest(tmp_path):
