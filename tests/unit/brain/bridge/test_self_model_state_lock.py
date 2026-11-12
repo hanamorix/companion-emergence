@@ -1,0 +1,207 @@
+"""#558: the self-model tick and the reconcile tool both load, change and save self_model_state.json.
+
+Without a lock spanning the whole read-modify-write, a reconcile that lands while the tick is mid-flight is lost
+(the tick saves over it from its stale snapshot), and vice versa. These tests force the interleavings with real
+threads through the real tick (`_run_self_model_tick`, live engine path) and the real `reconcile_self_read`.
+"""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+import pytest
+
+from brain.bridge import supervisor
+from brain.bridge.provider import FakeProvider
+from brain.self_model import state as sm_state
+from brain.self_model.gap import Gap
+from brain.self_model.reconcile import is_channel_in_cooldown, reconcile_self_read
+
+_JOIN_S = 10.0
+
+
+class _Bus:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def publish(self, event: dict) -> None:
+        self.events.append(event)
+
+
+def _persona(tmp_path: Path) -> Path:
+    p = tmp_path / "persona"
+    p.mkdir()
+    (p / "active_conversations").mkdir()
+    (p / "persona_config.json").write_text(
+        '{"provider": "fake", "searcher": "noop"}', encoding="utf-8"
+    )
+    return p
+
+
+def _open_grief_gap(persona_dir: Path) -> None:
+    """A saved open grief gap the live tick continues (same channel, engine never reset)."""
+    gap = Gap(
+        per_channel={"grief": 2.0},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        status="open",
+        sustained_ticks=1,
+        directions={"grief": 1},
+        reset_seen=None,
+    )
+    sm_state.save(persona_dir, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+
+
+def _live_engine(stub) -> None:
+    from brain.emotion.engine import Reading
+
+    stub.live = True
+    stub.readings = {"grief": Reading(short=6.0, long=4.0, difference=2.0, shift=1)}
+
+
+def _in_thread(fn) -> threading.Thread:
+    t = threading.Thread(target=fn, daemon=True)
+    t.start()
+    return t
+
+
+def test_a_reconcile_during_the_ticks_articulate_call_is_not_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
+) -> None:
+    """She dismisses grief while the tick is waiting on its articulate (Haiku) call. The tick must not then save its
+    stale snapshot over her dismissal: the grief cooldown she set has to survive."""
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+    _live_engine(emotion_engine_stub)
+
+    still_waiting: list[
+        bool
+    ] = []  # the tick swallows a raise inside it, so the hook records and the test asserts
+
+    def articulate_while_she_reconciles(gap, *, provider, persona_dir):
+        t = _in_thread(
+            lambda: reconcile_self_read(persona_dir=persona_dir, action="dismiss", channel="grief")
+        )
+        t.join(_JOIN_S)
+        still_waiting.append(t.is_alive())
+        return "a note"
+
+    monkeypatch.setattr(supervisor, "sm_articulate", articulate_while_she_reconciles)
+    supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+
+    assert still_waiting == [False], "reconcile must not wait on the tick's articulate call"
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None
+    assert gap.status == "dismissed", gap
+    assert is_channel_in_cooldown(gap, "grief"), gap.channel_cooldowns
+
+
+def test_a_reconcile_that_lands_while_the_tick_saves_waits_for_it_and_both_writes_survive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
+) -> None:
+    """She dismisses grief just as the tick is saving. The reconcile must take the same lock for its own load → change
+    → save, so it waits, then loads the tick's new gap and dismisses that: the tick's update (sustained_ticks 2, its
+    note) and her dismissal both survive. Without the lock she saves first and the tick's save wipes her out."""
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+    _live_engine(emotion_engine_stub)
+    monkeypatch.setattr(supervisor, "sm_articulate", lambda gap, *, provider, persona_dir: "a note")
+
+    real_save = sm_state.save
+    reconciles: list[threading.Thread] = []
+
+    def save_while_she_reconciles(pd, st):
+        t = _in_thread(
+            lambda: reconcile_self_read(persona_dir=pd, action="dismiss", channel="grief")
+        )
+        reconciles.append(t)
+        t.join(0.5)  # under the lock she is still waiting here; without it she has already saved
+        real_save(pd, st)
+
+    monkeypatch.setattr(sm_state, "save", save_while_she_reconciles)
+    supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+    for t in reconciles:
+        t.join(_JOIN_S)
+        assert not t.is_alive()
+
+    gap = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert gap is not None
+    assert gap.status == "dismissed", gap
+    assert is_channel_in_cooldown(gap, "grief"), gap.channel_cooldowns
+    assert gap.sustained_ticks == 2 and gap.note == "a note", gap
+
+
+def test_a_reconcile_before_the_spare_rule_saves_is_not_cleared_by_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, emotion_engine_stub
+) -> None:
+    """After an engine rebuild the tick's spare rule clears an open gap from its snapshot. If she dismissed that gap
+    after the tick loaded it, the spare rule must not clear her dismissal (a dismissed gap held for the sustained
+    ticks is one the rule keeps)."""
+    persona_dir = _persona(tmp_path)
+    gap = Gap(
+        per_channel={"grief": 2.0},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        status="open",
+        sustained_ticks=3,
+        directions={"grief": 1},
+    )  # reset_seen never stored → the live tick runs the spare rule
+    sm_state.save(persona_dir, sm_state.SelfModelState(current_gap=gap, gap_history=[]))
+    _live_engine(emotion_engine_stub)
+
+    real_reset_seen = supervisor._self_model_reset_seen
+    still_waiting: list[
+        bool
+    ] = []  # the tick swallows a raise inside it, so the hook records and the test asserts
+
+    def reset_seen_while_she_reconciles(reads, prior_gap):
+        t = _in_thread(
+            lambda: reconcile_self_read(persona_dir=persona_dir, action="dismiss", channel="grief")
+        )
+        t.join(_JOIN_S)
+        still_waiting.append(t.is_alive())
+        return real_reset_seen(reads, prior_gap)
+
+    monkeypatch.setattr(supervisor, "_self_model_reset_seen", reset_seen_while_she_reconciles)
+    supervisor._run_self_model_tick(persona_dir, provider=FakeProvider(), event_bus=_Bus())
+
+    assert still_waiting == [False]
+    saved = sm_state.load_or_recover(persona_dir)[0].current_gap
+    assert saved is not None, "the spare rule cleared a gap she had dismissed"
+    assert saved.status == "dismissed"
+    assert is_channel_in_cooldown(saved, "grief"), saved.channel_cooldowns
+
+
+def test_the_startup_repair_waits_for_a_reconcile_in_flight_so_its_clear_is_not_undone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-time startup repair clears the current gap. If it saves while a reconcile is between its load and its
+    save, the reconcile then writes the old gap back. The repair takes the same lock, so it clears after her save."""
+    from brain.health.self_model_repair import run_self_model_repair
+    from brain.self_model import reconcile
+
+    persona_dir = _persona(tmp_path)
+    _open_grief_gap(persona_dir)
+
+    real_load = reconcile.load_or_recover
+    repairs: list[threading.Thread] = []
+
+    def load_while_the_repair_runs(pd):
+        loaded = real_load(pd)
+        t = _in_thread(lambda: run_self_model_repair(pd))
+        repairs.append(t)
+        t.join(
+            0.5
+        )  # under the lock the repair is still waiting here; without it, it has already cleared the gap
+        return loaded
+
+    monkeypatch.setattr(reconcile, "load_or_recover", load_while_the_repair_runs)
+    reconcile_self_read(persona_dir=persona_dir, action="dismiss", channel="grief")
+    for t in repairs:
+        t.join(_JOIN_S)
+        assert not t.is_alive()
+
+    assert sm_state.load_or_recover(persona_dir)[0].current_gap is None, (
+        "the reconcile wrote the cleared gap back"
+    )

@@ -31,15 +31,17 @@ def should_run_self_model_repair(persona_dir: Path) -> bool:
 def run_self_model_repair(persona_dir: Path) -> None:
     """Clear any persisted current_gap once, then write the marker. Fail-soft."""
     try:
-        state, _recovered = sm_state.load_or_recover(persona_dir)
-        if state.current_gap is not None:
-            sm_state.save(
-                persona_dir,
-                sm_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
-            )
-            logger.info(
-                "self_model_repair: cleared a persisted gap (windowed-peak migration)"
-            )
+        # Under the state lock (#558): a reconcile in flight would otherwise write the cleared gap back.
+        with sm_state.locked(persona_dir):
+            state, _recovered = sm_state.load_or_recover(persona_dir)
+            if state.current_gap is not None:
+                sm_state.save(
+                    persona_dir,
+                    sm_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
+                )
+                logger.info(
+                    "self_model_repair: cleared a persisted gap (windowed-peak migration)"
+                )
     except Exception:
         logger.exception("self_model_repair: failed (non-fatal)")
     finally:

@@ -13,11 +13,14 @@ gap, the displaced gap MUST survive in gap_history AND a WARN log is emitted.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from brain.health.json_io import read_json_result, write_json
 from brain.self_model.gap import UNSET, Gap
+from brain.utils.file_lock import file_lock
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -160,6 +163,19 @@ def _recovered(path: Path, state: SelfModelState, why: str) -> tuple[SelfModelSt
         exc_info=False,
     )
     return state, True
+
+
+@contextmanager
+def locked(persona_dir: Path) -> Iterator[None]:
+    """Hold the state file's cross-process lock for a whole load → change → save (#558).
+
+    Every writer takes it around its read-modify-write: the reconcile tool, the supervisor tick (around a re-load
+    that checks its snapshot still holds, and its save) and the one-time repair. Readers that only render it (the
+    chat prompt, tool recruitment) do not: ``save`` replaces the file atomically. Not re-entrant: never load-and-save
+    under it through a helper that takes it again.
+    """
+    with file_lock(_state_path(persona_dir)):
+        yield
 
 
 def save(persona_dir: Path, state: SelfModelState) -> None:
