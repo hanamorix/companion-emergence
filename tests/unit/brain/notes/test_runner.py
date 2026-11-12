@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from brain.notes.runner import make_note_and_wire
 
 
@@ -71,3 +73,41 @@ def test_note_prompt_carries_persona_identity(tmp_path):
     make_note_and_wire(persona_dir=persona_dir, config=_Cfg(str(folder)),
                        provider=_CaptureProvider(), now=datetime(2026, 6, 15, tzinfo=UTC))
     assert "You are Nell" in seen["prompt"]
+
+
+# ---- emotion rework B1 PR 3: the note nudge is on the 0-10 scale once the engine is live ----
+
+
+def _note_emotions(tmp_path, *, live):
+    from brain.emotion import engine_files
+    from brain.memory.store import Memory, MemoryStore
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    folder = tmp_path / "Notes"
+    folder.mkdir()
+    if live:  # a live persona with no state file applies nothing, so seed a memory first, then write the switch
+        seed_store = MemoryStore(persona_dir / "memories.db")
+        try:
+            seed_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+        finally:
+            seed_store.close()
+        assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_note_and_wire(persona_dir=persona_dir, config=_Cfg(str(folder)), provider=_Provider(),
+                       now=datetime(2026, 6, 15, tzinfo=UTC))
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        wired = store.list_by_type("initiate_outbound", active_only=False)
+    finally:
+        store.close()
+    assert len(wired) == 1
+    return wired[0].emotions
+
+
+def test_note_wire_back_stores_the_nudge_ten_times_when_live(tmp_path):
+    assert _note_emotions(tmp_path, live=True) == pytest.approx({"tenderness": 1.2})
+
+
+@pytest.mark.no_base_failure(reason="pins today's small note nudge with the switch off (B1 PR 3); main stores it too")
+def test_note_wire_back_keeps_todays_nudge_when_off(tmp_path):
+    assert _note_emotions(tmp_path, live=False) == pytest.approx({"tenderness": 0.12})

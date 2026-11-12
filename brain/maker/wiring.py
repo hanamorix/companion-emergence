@@ -17,12 +17,18 @@ _SOURCE_ACCENT = {
 }
 
 
-def making_emotion_delta(making: Making, *, dominant_source: str) -> dict[str, float]:
-    """Small vocab-filtered emotion delta for having made. Decay-subordinate."""
+def making_emotion_delta(making: Making, *, dominant_source: str, live: bool = False) -> dict[str, float]:
+    """Small vocab-filtered emotion delta for having made. Decay-subordinate.
+
+    ``live`` (the emotion engine's switch is on) gives the same nudge on the engine's 0-10 scale, ten times the old
+    small values (B1 PR 3).
+    """
     from brain.chat.extractor import _filter_to_registered
     raw = dict(_BASE)
     for name, v in _SOURCE_ACCENT.get(dominant_source, {}).items():
         raw[name] = raw.get(name, 0.0) + v
+    if live:
+        raw = {name: v * 10.0 for name, v in raw.items()}
     return _filter_to_registered(raw)
 
 

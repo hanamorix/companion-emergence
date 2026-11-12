@@ -21,13 +21,16 @@ _SOURCE_ACCENT: dict[str, str] = {
 }
 
 
-def reach_emotions_for(source: str) -> dict[str, float]:
+def reach_emotions_for(source: str, *, live: bool = False) -> dict[str, float]:
     """Emotion vector for a delivered reach-out of the given source.
 
-    Unknown/future source -> base tenderness only (fail-safe).
+    Unknown/future source -> base tenderness only (fail-safe). ``live`` (the
+    emotion engine's switch is on) gives the same nudge on the engine's 0-10
+    scale, ten times the old small values (B1 PR 3).
     """
-    out = {"tenderness": _BASE_TENDERNESS}
+    scale = 10.0 if live else 1.0
+    out = {"tenderness": _BASE_TENDERNESS * scale}
     accent = _SOURCE_ACCENT.get(source, "")
     if accent:
-        out[accent] = _ACCENT_MAGNITUDE
+        out[accent] = _ACCENT_MAGNITUDE * scale
     return out

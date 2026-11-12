@@ -10,6 +10,7 @@ The design's sixth row (spelling variants pooling as separate channels) has no p
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,7 +26,11 @@ from brain.emotion.engine import EmotionEngine, Reading
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatEngine, HeartbeatState
-from brain.kindled_link.relationship import apply_peer_emotion, write_kindled_peer_memory
+from brain.kindled_link.relationship import (
+    apply_peer_emotion,
+    run_relationship_reflection,
+    write_kindled_peer_memory,
+)
 from brain.kindled_link.store import KindledLinkStore
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -138,6 +143,44 @@ def _write_negative_peer_memory(store: MemoryStore) -> str:
     return next(m.id for m in store.list_active() if m.memory_type == "kindled_peer")
 
 
+class _GrantedSlot:
+    @contextlib.contextmanager
+    def background_slot(self, *, now=None):  # noqa: ANN001, ANN202 - the throttle's shape
+        yield True
+
+    def should_yield(self, *, now=None) -> bool:  # noqa: ANN001
+        return False
+
+
+class _Reply:
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+
+    def complete(self, prompt: str) -> str:
+        return self.reply
+
+
+def _live_peer_memories(persona_dir: Path, store: MemoryStore, *emotions_json: str) -> list[dict[str, float]]:
+    """Run one live relationship reflection per reply, an hour apart. Returns each peer memory's stored emotions, in order."""
+    _go_live(persona_dir, store)
+    link_store = KindledLinkStore(persona_dir / "kindled_link.db")
+    try:
+        for hour, emotion in enumerate(emotions_json):
+            at = NOW + timedelta(hours=hour)
+            reply = (
+                '{"proposed_stage":"stranger","trust_score":0.1,"affinity_tags":[],"boundaries_seen":[],"evidence":[],'
+                '"hard_breach":false,"memory_summary":"I talked with a peer.","emotion":' + emotion + "}"
+            )
+            run_relationship_reflection(
+                store=link_store, provider=_Reply(reply), peer_id="kid_a", transcript="peer: hello there, friend",
+                now=at, today=at.strftime("%Y-%m-%d"), throttle=_GrantedSlot(), persona_dir=persona_dir,
+                mem_store=store, persona_name="Pins", session_id="s1",
+            )
+    finally:
+        link_store.close()
+    return [m.emotions for m in sorted(store.list_by_type("kindled_peer"), key=lambda m: m.created_at)]
+
+
 def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]]:
     """Apply two peer changes an hour apart, the second to a different emotion. Returns what each one applied."""
     link_store = KindledLinkStore(persona_dir / "kindled_link.db")
@@ -209,10 +252,9 @@ def test_today_negative_peer_value_is_erased_by_one_heartbeat(
     assert "joy" in emotions
 
 
-@_flipped_by("B1-2")
-def test_intended_peer_values_are_never_negative(store: MemoryStore) -> None:
-    memory_id = _write_negative_peer_memory(store)
-    assert all(value >= 0.0 for value in store.get(memory_id).emotions.values())
+def test_intended_peer_values_are_never_negative(persona_dir: Path, store: MemoryStore) -> None:
+    [emotions] = _live_peer_memories(persona_dir, store, '{"tenderness": -0.3, "joy": 5.0}')
+    assert emotions == {"tenderness": 0.0, "joy": 5.0}
 
 
 @_PINNED
@@ -224,9 +266,8 @@ def test_today_peer_bucket_caps_summed_size_across_emotions(persona_dir: Path) -
     assert second == {"love": pytest.approx(CAP / WINDOW_HOURS)}
 
 
-@_flipped_by("B1-2")
-def test_intended_peer_bucket_does_not_scale(persona_dir: Path) -> None:
-    first, second = _peer_changes(persona_dir)
+def test_intended_peer_bucket_does_not_scale(persona_dir: Path, store: MemoryStore) -> None:
+    first, second = _live_peer_memories(persona_dir, store, '{"tenderness": 0.5, "joy": 0.5}', '{"love": 0.5}')
     assert first == {"tenderness": 0.5, "joy": 0.5}
     assert second == {"love": 0.5}
 
