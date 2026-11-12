@@ -25,7 +25,11 @@ def seen_recently(key: str, *, now: float | None = None) -> bool:
 
 
 def mark(key: str, *, now: float | None = None) -> None:
-    _seen[key] = time.monotonic() if now is None else now
+    now = time.monotonic() if now is None else now
+    # Ranged reads add one key per range (#590), so drop expired entries instead of keeping them forever.
+    for stale in [k for k, ts in _seen.items() if (now - ts) >= _DEDUP_TTL_S]:
+        del _seen[stale]
+    _seen[key] = now
 
 
 def reset() -> None:
