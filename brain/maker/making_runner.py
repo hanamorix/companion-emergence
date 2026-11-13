@@ -59,10 +59,12 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     # run_maker_tick, not here.
     from brain.emotion import engine
     from brain.maker import wiring
+    from brain.maker.sources import making_source
     if making.disposition != "discard":
+        # The accent comes from what built the charge (#721); `sources` above is prompt provenance, not a source key.
         delta = wiring.making_emotion_delta(
             making,
-            dominant_source=sources[0] if sources else "soul",
+            dominant_source=making_source(charge, store),
             live=engine.engine_for(persona_dir).is_live(),
         )
         wiring.write_making_memory(store, making, emotions=delta)

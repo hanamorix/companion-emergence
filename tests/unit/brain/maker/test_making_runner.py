@@ -83,6 +83,46 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     store2.close()
 
 
+def test_make_and_wire_gives_a_baseline_persona_pride_for_satisfaction(tmp_path):
+    """#720: through the real path, a persona without "satisfaction" feels pride from a making, not nothing."""
+    from brain.emotion import vocabulary
+    from brain.maker.charge import MakerCharge, save_charge
+
+    assert vocabulary.get("satisfaction") is None
+    store = MemoryStore(tmp_path / "memories.db")
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        [made] = store2.list_by_type("making", limit=10)
+    finally:
+        store2.close()
+    assert made.emotions == {"pride": 0.12, "tenderness": 0.08}
+
+
+def test_make_and_wire_applies_the_accent_of_what_built_the_charge(tmp_path):
+    """#721: a dream-built charge gives the dream accent (wonder, which a baseline persona feels as awe, #720)."""
+    import pytest
+
+    from brain.emotion import vocabulary
+    from brain.maker.charge import MakerCharge, save_charge
+
+    assert vocabulary.get("wonder") is None
+    store = MemoryStore(tmp_path / "memories.db")
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0, emotion_part=9.0, soul_part=0.0, dream_part=90.0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        [made] = store2.list_by_type("making", limit=10)
+    finally:
+        store2.close()
+    assert made.emotions == pytest.approx({"pride": 0.12, "tenderness": 0.08, "awe": 0.10})
+
+
 # ---- emotion rework B1 PR 3: the making nudge is on the 0-10 scale once the engine is live ----
 
 
@@ -115,11 +155,9 @@ def _made_emotions(tmp_path, *, live):
 
 
 def test_make_and_wire_stores_the_nudge_ten_times_when_live(tmp_path):
-    # satisfaction is not a registered name, so the vocabulary filter drops it and tenderness is what reaches her.
-    assert _made_emotions(tmp_path, live=True) == pytest.approx({"tenderness": 0.8})
+    # A baseline persona feels pride for satisfaction (#720), so both names reach her at ten times the old values.
+    assert _made_emotions(tmp_path, live=True) == pytest.approx({"pride": 1.2, "tenderness": 0.8})
 
 
-
-@pytest.mark.no_base_failure(reason="pins today's small making nudge with the switch off (B1 PR 3); main stores it too")
 def test_make_and_wire_keeps_todays_nudge_when_off(tmp_path):
-    assert _made_emotions(tmp_path, live=False) == pytest.approx({"tenderness": 0.08})
+    assert _made_emotions(tmp_path, live=False) == pytest.approx({"pride": 0.12, "tenderness": 0.08})
