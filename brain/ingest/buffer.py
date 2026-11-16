@@ -503,7 +503,8 @@ def _latest_user_ts_in_session_archive(persona_dir: Path, session_id: str) -> da
     return None
 
 
-def _latest_user_ts_in_archive(persona_dir: Path) -> datetime | None:
+def _latest_user_ts_in_archive(persona_dir: Path, best: datetime | None) -> datetime | None:
+    """The later of ``best`` (the newest user ``ts`` already found, None for none) and the newest archived user ``ts``."""
     # Not ``_archived_conversations_dir``: it creates the folder. A missing folder lists as [].
     folder = persona_dir / "archived_conversations"
     try:
@@ -512,7 +513,7 @@ def _latest_user_ts_in_archive(persona_dir: Path) -> datetime | None:
         warn_throttled(
             logger, "last_user_turn_ts:unlistable_archive", "last_user_turn_ts: the archived conversations folder cannot be listed"
         )
-        return None
+        return best
     # The session ids come from the names (``<sid>.jsonl`` legacy, ``<sid>.<NNN>.jsonl`` segments; a session id holds no
     # dot). Each session's last file is read off this one listing: its largest numbered segment, else the legacy file.
     last_file: dict[str, tuple[int, str]] = {}
@@ -545,7 +546,6 @@ def _latest_user_ts_in_archive(persona_dir: Path) -> datetime | None:
             continue
         visits.append((_EPOCH + timedelta(microseconds=stat.mtime_ns // 1000), session_id))
     visits.sort(reverse=True)
-    best: datetime | None = None
     for mtime, session_id in visits:
         if best is not None and best >= mtime:
             break  # no later session can hold a turn newer than the best found, so no further file is opened
@@ -559,16 +559,14 @@ def last_user_turn_ts(persona_dir: Path) -> datetime | None:
     """The ``ts`` (aware, UTC) of the user's last turn, from the conversation files, or None when no file holds one.
 
     Active step: every ``active_conversations/*.jsonl`` read whole (a file holds about the newest forty raw turns), the
-    latest ``speaker == "user"`` row's ``ts`` across them. Archive step, only when no active file holds a user turn (after a
-    full fold the successor holds only a summary row): the archived sessions visited newest file first, each read from its
-    last file backwards to the first that holds a user turn, the walk ending as soon as the best ``ts`` found is not older
-    than the next session's last-file modification time, so the read is bounded with no window constant. The answer is the
-    latest ``ts`` across the sessions visited. A naive ``ts`` means UTC. Reads only: no folder is created.
+    latest ``speaker == "user"`` row's ``ts`` across them. Archive step, always run, seeded with the active result (a
+    lingering active buffer must not hide a newer archived session; after a full fold the successor holds only a summary
+    row): the archived sessions visited newest file first, each read from its last file backwards to the first that holds
+    a user turn, the walk ending as soon as the best ``ts`` found (the active one included) is not older than the next
+    session's last-file modification time, so the read is bounded with no window constant. The answer is the later of the
+    active files' and the archive's newest user ``ts``. A naive ``ts`` means UTC. Reads only: no folder is created.
     """
-    latest = _latest_user_ts_in_active_files(persona_dir)
-    if latest is not None:
-        return latest
-    return _latest_user_ts_in_archive(persona_dir)
+    return _latest_user_ts_in_archive(persona_dir, _latest_user_ts_in_active_files(persona_dir))
 
 
 # --- Archive commit marker (Bug 3: idempotent archive-under-crash-retry) -----

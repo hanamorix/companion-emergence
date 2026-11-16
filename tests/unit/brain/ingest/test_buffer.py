@@ -729,16 +729,57 @@ def test_last_user_turn_ts_takes_the_latest_ts_across_sessions_not_the_newest_fi
     assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9)
 
 
-def test_last_user_turn_ts_leaves_the_archive_unread_when_an_active_file_holds_a_user_turn(
+def test_last_user_turn_ts_takes_a_newer_archived_turn_over_an_older_active_one(tmp_path: Path, reads: list[str]) -> None:
+    # A stale buffer that lingers in the active folder (a wedged finalise, an orphan) must not hide a newer archived session.
+    _active(tmp_path, "sess_stale", [_row("user", _hours(3))])
+    _archived(tmp_path, "sess_newer.jsonl", [_row("user", _hours(99))], mtime=_hours(100))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(99)
+    assert reads == ["sess_stale.jsonl", "sess_newer.jsonl"]
+
+
+@pytest.mark.no_base_failure(
+    reason="retained behaviour: a newer active turn won on the old code too (it never opened the archive); this pins that the seeded walk still wins and opens nothing"
+)
+def test_last_user_turn_ts_keeps_a_newer_active_turn_over_an_older_archive_and_opens_no_archive_file(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(50))])
+    _archived(tmp_path, "sess_old.jsonl", [_row("user", _hours(3))], mtime=_hours(4))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(50)
+    assert reads == ["sess_live.jsonl"]  # the archive file's mtime is not newer than the active best: never opened
+
+
+@pytest.mark.no_base_failure(
+    reason="boundary of retained behaviour: the old code opened no archive file when an active turn existed; this pins that the walk's break rule still stops at an equal mtime"
+)
+def test_last_user_turn_ts_opens_no_archive_file_whose_mtime_equals_the_active_best(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(5))])
+    _archived(tmp_path, "sess_a.jsonl", [_row("user", _hours(1))], mtime=_hours(5))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(5)
+    assert reads == ["sess_live.jsonl"]
+
+
+def test_last_user_turn_ts_keeps_the_active_turn_when_a_newer_archive_file_holds_only_an_older_user_turn(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(50))])
+    _archived(tmp_path, "sess_a.jsonl", [_row("user", _hours(3)), _row("assistant", _hours(60)), _row("summary", _hours(61))], mtime=_hours(61))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(50)
+    assert reads == ["sess_live.jsonl", "sess_a.jsonl"]  # the file is newer by mtime, so it is read, and holds nothing newer
+
+
+@pytest.mark.no_base_failure(
+    reason="failure path of the new archive step: the old code never listed the archive when an active turn existed, so it passes there; this pins that the new always-run step keeps the active answer"
+)
+def test_last_user_turn_ts_keeps_the_active_turn_when_the_archive_cannot_be_listed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _active(tmp_path, "sess_live", [_row("user", _hours(3))])
-    _archived(tmp_path, "sess_old.jsonl", [_row("user", _hours(99))])
 
-    def boom(folder):
-        raise AssertionError(f"the archive folder was listed: {folder}")
+    def unlistable(folder):
+        raise OSError("cannot list")
 
-    monkeypatch.setattr(buffer_mod, "list_dir", boom)
+    monkeypatch.setattr(buffer_mod, "list_dir", unlistable)
     assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
 
 
