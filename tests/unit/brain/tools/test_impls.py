@@ -351,6 +351,54 @@ def test_add_memory_auto_links_related(tmp_path: Path) -> None:
     assert len(result["auto_linked_to"]) >= 1
 
 
+def test_add_memory_sets_last_accessed(tmp_path: Path) -> None:
+    """A memory she adds has been accessed at the moment she made it (emotion rework, Hana half, Task 6 step 3)."""
+    from brain.tools.impls.add_memory import add_memory
+
+    store = MemoryStore(tmp_path / "memories.db")
+    result = add_memory(
+        content="the harbour at dusk, writing the last chapter",
+        memory_type="event",
+        domain="creative_writing",
+        emotions={"love": 9, "joy": 6},
+        importance=8,
+        store=store,
+        hebbian=HebbianMatrix(tmp_path / "hebbian.db"),
+        persona_dir=tmp_path,
+    )
+    assert result["created"] is True
+    stored = store.get(result["id"], bump=False)
+    assert stored.last_accessed_at is not None
+    assert stored.last_accessed_at == stored.created_at
+    store.close()
+
+
+def test_add_memory_auto_link_does_not_bump_related(tmp_path: Path) -> None:
+    """Finding memories to link is not recalling them (Task 6 step 4): a related memory and the new one keep their counts."""
+    from brain.tools.impls.add_memory import add_memory
+
+    store = MemoryStore(tmp_path / "memories.db")
+    related = _seed_memory(store, content="the harbour lights the night we wrote together")
+    before = store.get(related.id, bump=False)
+    result = add_memory(
+        content="harbour lights again tonight, writing beside the window",
+        memory_type="event",
+        domain="creative_writing",
+        emotions={"love": 9, "joy": 6},
+        importance=8,
+        store=store,
+        hebbian=HebbianMatrix(tmp_path / "hebbian.db"),
+        persona_dir=tmp_path,
+    )
+    assert related.id in result["auto_linked_to"]
+    after = store.get(related.id, bump=False)
+    assert after.recall_count == before.recall_count
+    assert after.last_accessed_at == before.last_accessed_at
+    # Each keyword search used to bump every hit, the new memory included, before its own id was skipped.
+    assert store.get(result["id"], bump=False).recall_count == 0.0
+    store.close()
+
+
 def test_add_memory_surfaces_auto_link_failure(tmp_path: Path) -> None:
     """A graph-linking failure keeps the memory but returns a visible warning."""
     from brain.tools.impls.add_memory import add_memory
