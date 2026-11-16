@@ -14,26 +14,26 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `Recovery` (class) | brain/health/json_io.py:151 | Enum of what a JSON read does with a bad file: DEFAULT (use the default), CONTENT (default for bad content, raise on I/O faults), RAISE, RESTORE (from the .bak chain), HEAL (restore and record an anomaly). |
-| `JsonFileError` (class) | brain/health/json_io.py:163 | Exception for an unusable JSON file; `.kind` is missing, io, empty, malformed, encoding, shape, schema or line; is both an OSError and a ValueError. |
-| `JsonFileNotFound` (class) | brain/health/json_io.py:191 | The `kind == "missing"` JsonFileError; also a FileNotFoundError. |
-| `JsonRead` (class) | brain/health/json_io.py:200 | Result record of read_json_result: `data`, `outcome` (ok, missing, defaulted, restored, reset), `kind` and any `anomaly`. |
-| `read_json` | brain/health/json_io.py:269 | Read a whole JSON file under a Recovery policy (default factory, expected type, validator, fallback files) and return its data. |
-| `read_json_result` | brain/health/json_io.py:289 | Same read as read_json but returns a JsonRead, so the caller can see whether the file was missing, defaulted or restored. |
-| `write_json` | brain/health/json_io.py:703 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
-| `encode_jsonl` | brain/health/json_io.py:821 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
+| `Recovery` (class) | brain/health/json_io.py:155 | Enum of what a JSON read does with a bad file: DEFAULT (use the default), CONTENT (default for bad content, raise on I/O faults), RAISE, RESTORE (from the .bak chain), HEAL (restore and record an anomaly). |
+| `JsonFileError` (class) | brain/health/json_io.py:167 | Exception for an unusable JSON file; `.kind` is missing, io, empty, malformed, encoding, shape, schema or line; is both an OSError and a ValueError. |
+| `JsonFileNotFound` (class) | brain/health/json_io.py:195 | The `kind == "missing"` JsonFileError; also a FileNotFoundError. |
+| `JsonRead` (class) | brain/health/json_io.py:204 | Result record of read_json_result: `data`, `outcome` (ok, missing, defaulted, restored, reset), `kind` and any `anomaly`. |
+| `read_json` | brain/health/json_io.py:273 | Read a whole JSON file under a Recovery policy (default factory, expected type, validator, fallback files) and return its data. |
+| `read_json_result` | brain/health/json_io.py:293 | Same read as read_json but returns a JsonRead, so the caller can see whether the file was missing, defaulted or restored. |
+| `write_json` | brain/health/json_io.py:766 | Atomically write data as JSON: strict encoding (no NaN), optional .bak1..N chain, file mode, read-back verify, create-only, and log-instead-of-raise; returns True if written. |
+| `encode_jsonl` | brain/health/json_io.py:884 | The one JSONL encoder: dict records to ASCII lines (newline terminated) as bytes; raises before anything is written. |
 | `parse_jsonl` | brain/health/json_io.py:912 | Parse JSONL text or bytes already in memory, skipping bad lines (or raising when strict); a line the JSON parser cannot load stops the read. |
 | `iter_jsonl` | brain/health/json_io.py:942 | Yield the dict records of a JSONL file (.gz by suffix), skipping bad lines with a warning (a line the JSON parser cannot load stops the read); a missing file yields nothing. |
 | `read_jsonl` | brain/health/json_io.py:977 | iter_jsonl collected into a list. |
 | `iter_jsonl_raw` | brain/health/json_io.py:983 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
 | `read_jsonl_tail` | brain/health/json_io.py:1113 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
 | `iter_jsonl_reversed` | brain/health/json_io.py:1187 | Yield the dict records of a .jsonl file from the last line back, reading only as far back as the caller goes (for "the newest row that matches"); a bad line is skipped with a throttled warning naming its position from the end; a missing file yields nothing; a .gz path raises ValueError. |
-| `append_jsonl` | brain/health/json_io.py:1145 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
-| `write_jsonl` | brain/health/json_io.py:1212 | Atomically replace a JSONL file with the given records (same writer as write_json). |
+| `append_jsonl` | brain/health/json_io.py:1247 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
+| `write_jsonl` | brain/health/json_io.py:1314 | Atomically replace a JSONL file with the given records (same writer as write_json). |
 | `write_jsonl_bytes` | brain/health/json_io.py | Atomically replace a JSONL file with bytes written exactly as given (lines kept as `iter_jsonl_raw` read them, valid UTF-8 or not); must end in a newline; raises on a fault with the file as it was. |
-| `read_jsonl_from` | brain/health/json_io.py:1016 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. Streams the file line by line (one pass; only the returned records are held). |
-| `JsonlRecord` (class) | brain/health/json_io.py:996 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
-| `JsonlRead` (class) | brain/health/json_io.py:1009 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
+| `read_jsonl_from` | brain/health/json_io.py:1079 | Read a JSONL file from a line position: skip the first `start_line` complete lines, return each later complete line as a `JsonlRecord` (line number, object or bad-line reason) and `end_line`, the position to pass next time; a torn last line is left for the next read. Streams the file line by line (one pass; only the returned records are held). |
+| `JsonlRecord` (class) | brain/health/json_io.py:1059 | One line from read_jsonl_from: `line` (1-based), `data` (the object, or None for a bad line) and `reason` (why it is bad, never the line's content). |
+| `JsonlRead` (class) | brain/health/json_io.py:1072 | Result of read_jsonl_from: `records` and `end_line` (the number of complete lines in the file). |
 
 ### `brain/health/jsonl_reader.py`
 
@@ -101,9 +101,9 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 | function | where (path:line) | what it is for |
 |---|---|---|
 | `OpenProfile` (class) | brain/utils/sqlite_open.py:39 | Settings that differ per store: busy timeout and WAL-failure policy. |
-| `close_on_error` | brain/utils/sqlite_open.py:53 | Context manager: if the body raises anything, close the sqlite connection and re-raise the same exception. |
-| `check_integrity` | brain/utils/sqlite_open.py:72 | Run PRAGMA integrity_check (with transient-error retry) and raise BrainIntegrityError unless the result is ok; does not close the connection. |
-| `open_store_connection` | brain/utils/sqlite_open.py:87 | Open a SQLite file with the store's busy-timeout and WAL profile, optionally run the integrity check, then the store's own setup callback; on any failure close the connection and re-raise. |
+| `close_on_error` | brain/utils/sqlite_open.py:59 | Context manager: if the body raises anything, close the sqlite connection and re-raise the same exception. |
+| `check_integrity` | brain/utils/sqlite_open.py:78 | Run PRAGMA integrity_check (with transient-error retry) and raise BrainIntegrityError unless the result is ok; does not close the connection. |
+| `open_store_connection` | brain/utils/sqlite_open.py:93 | Open a SQLite file with the store's busy-timeout and WAL profile, optionally run the integrity check, then the store's own setup callback; on any failure close the connection and re-raise. |
 
 ## File access: log files on disk
 
@@ -127,15 +127,15 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `validate_persona_name` | brain/paths.py:27 | Raise ValueError unless the name matches `[A-Za-z0-9_-]{1,40}`; the single persona-name validator. |
-| `home_for_env` | brain/paths.py:79 | Resolve the app home directory for this process or for another process's environment: KINDLED_HOME, then deprecated NELLBRAIN_HOME, then the platform default. |
-| `get_home` | brain/paths.py:115 | Root directory for all app state (home_for_env for this process). |
-| `get_persona_dir` | brain/paths.py:122 | Directory for one persona's private data, after validating the name. |
-| `list_persona_names` | brain/paths.py:134 | Sorted names of valid persona directories under `<home>/personas/`; `[]` if none. |
-| `get_cache_dir` | brain/paths.py:159 | Cache directory (embeddings, computed matrices), resolved like get_home. |
-| `get_log_dir` | brain/paths.py:171 | Log file directory, resolved like get_home. |
-| `cadence_state_path` | brain/paths.py:186 | Path of a persona's cadence state file under `<persona>/cadence/`, moving a legacy root-level file into place on first use. |
-| `presence_state_path` | brain/paths.py:214 | Path of the persona's `presence_state.json` sidecar (directly under the persona dir). |
+| `validate_persona_name` | brain/paths.py:29 | Raise ValueError unless the name matches `[A-Za-z0-9_-]{1,40}`; the single persona-name validator. |
+| `home_for_env` | brain/paths.py:81 | Resolve the app home directory for this process or for another process's environment: KINDLED_HOME, then deprecated NELLBRAIN_HOME, then the platform default. |
+| `get_home` | brain/paths.py:117 | Root directory for all app state (home_for_env for this process). |
+| `get_persona_dir` | brain/paths.py:124 | Directory for one persona's private data, after validating the name. |
+| `list_persona_names` | brain/paths.py:136 | Sorted names of valid persona directories under `<home>/personas/`; `[]` if none. |
+| `get_cache_dir` | brain/paths.py:161 | Cache directory (embeddings, computed matrices), resolved like get_home. |
+| `get_log_dir` | brain/paths.py:173 | Log file directory, resolved like get_home. |
+| `cadence_state_path` | brain/paths.py:199 | Path of a persona's cadence state file under `<persona>/cadence/`, moving a legacy root-level file into place on first use. |
+| `presence_state_path` | brain/paths.py:227 | Path of the persona's `presence_state.json` sidecar (directly under the persona dir). |
 
 ## Settings
 
@@ -234,7 +234,7 @@ Storage is UTC everywhere; local time is for display only.
 |---|---|---|
 | `token_of` | brain/process_identity.py:134 | Identity token of a pid that tells a reused pid apart from the original process (per platform), or GONE or UNKNOWN. |
 | `own_token` | brain/process_identity.py:154 | This process's identity token (cached), or None if unreadable. |
-| `holder_alive` | brain/process_identity.py:174 | Is the process recorded in a lock or marker file still alive? Uses the recorded token if present, else pid only; UNKNOWN counts as alive. |
+| `holder_alive` | brain/process_identity.py:178 | Is the process recorded in a lock or marker file still alive? Uses the recorded token if present, else pid only; UNKNOWN counts as alive. |
 
 ### `brain/bridge/state_file.py`
 
