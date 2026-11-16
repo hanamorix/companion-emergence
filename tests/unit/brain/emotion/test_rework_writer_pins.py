@@ -209,11 +209,12 @@ def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path,
     assert _settled(eng)["joy"].short < before
 
 
-def test_today_dream_over_ten_is_erased_by_one_heartbeat(
+def test_today_dream_over_ten_survives_a_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    # The id keeps its history: before Engine 6 the heartbeat's per-memory decay pass erased this value. The pass is gone
-    # (the engine fades on read), so a heartbeat leaves every stored value as written. The out-of-range write is B1-4's.
+    # Renamed from test_today_dream_over_ten_is_erased_by_one_heartbeat: before Engine 6 the heartbeat's per-memory decay pass
+    # erased this value. The pass is gone (the engine fades on read), so a heartbeat leaves every stored value as written.
+    # The out-of-range write is B1-4's.
     dream, seed = _write_dream_over_ten(store, hebbian, persona_dir, eng=None)
     assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
     _one_heartbeat(store, hebbian, persona_dir)
@@ -227,11 +228,11 @@ def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemorySto
     assert store.get(dream.id)._stored_emotions["love"] <= 10.0
 
 
-def test_today_negative_peer_value_is_erased_by_one_heartbeat(
+def test_today_negative_peer_value_survives_a_heartbeat(
     persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
-    # The id keeps its history: before Engine 6 the heartbeat's decay pass erased the negative value. The pass is gone, so
-    # a heartbeat leaves the row as written. The negative write is B1-2's.
+    # Renamed from test_today_negative_peer_value_is_erased_by_one_heartbeat: before Engine 6 the heartbeat's decay pass erased
+    # the negative value. The pass is gone, so a heartbeat leaves the row as written. The negative write is B1-2's.
     memory_id = _write_negative_peer_memory(store)
     assert store.get(memory_id)._stored_emotions["tenderness"] == pytest.approx(-0.3)
     _one_heartbeat(store, hebbian, persona_dir)
