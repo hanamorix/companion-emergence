@@ -73,3 +73,151 @@ def test_interior_footer_defaults_to_the_user(tmp_path):
     write_trace_memory(store, "a quiet thought", feed_digest="a digest", persona_dir=None)
     block = build_interior_continuity_block(store)
     assert "speaks to the user directly as 'you'" in block
+
+
+# ---- #688: once the emotion engine is live, the block is a trail of whole notes ----
+
+LIVE_HEADER = "── interior continuity (your recent thoughts, as you noted them) ──"
+OLD_HEADER = "── interior continuity (your own recent thought) ──"
+
+
+def _go_live(persona_dir, store):
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
+    from datetime import UTC, datetime
+
+    from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+
+
+def _queue_digest(store, persona_dir, digest):
+    write_trace_memory(store, "raw " + digest, feed_digest=digest, persona_dir=persona_dir, live=True)
+
+
+def _live_store(tmp_path):
+    store = MemoryStore(tmp_path / "memories.db")
+    _go_live(tmp_path, store)
+    return store
+
+
+def _body(block):
+    return "\n".join(block.splitlines()[:-1])
+
+
+def _digests(n, size):
+    return [f"{i}" + chr(ord("a") + i) * (size - 1) for i in range(n)]
+
+
+def test_live_shows_whole_notes_newest_first(tmp_path):
+    store = _live_store(tmp_path)
+    ds = _digests(5, 220)
+    for d in ds:
+        _queue_digest(store, tmp_path, d)
+    body = _body(build_interior_continuity_block(store))
+    lines = body.splitlines()
+    assert lines[0] == LIVE_HEADER
+    assert lines[1:] == ["· " + d for d in reversed(ds)]
+    assert len(body) <= 1200
+
+
+def test_live_drops_the_note_that_would_pass_the_cap(tmp_path):
+    store = _live_store(tmp_path)
+    ds = _digests(5, 300)
+    for d in ds:
+        _queue_digest(store, tmp_path, d)
+    body = _body(build_interior_continuity_block(store))
+    lines = body.splitlines()
+    assert lines[0] == LIVE_HEADER
+    assert lines[1:] == ["· " + d for d in reversed(ds)][:3]
+
+
+def test_live_newest_longer_than_cap_is_cut_and_alone(tmp_path):
+    store = _live_store(tmp_path)
+    _queue_digest(store, tmp_path, "short older note")
+    _queue_digest(store, tmp_path, "n" * 1500)
+    body = _body(build_interior_continuity_block(store))
+    lines = body.splitlines()
+    assert len(lines) == 2
+    assert lines[0] == LIVE_HEADER
+    assert lines[1].startswith("· nnn")
+    assert len(body) == 1200
+
+
+def test_live_drops_long_older_thought_whole(tmp_path):
+    store = _live_store(tmp_path)
+    write_trace_memory(store, "r" * 1400, feed_digest="unused", persona_dir=tmp_path, live=False)
+    digest = "she " + "w" * 216
+    _queue_digest(store, tmp_path, digest)
+    body = _body(build_interior_continuity_block(store))
+    assert body.splitlines() == [LIVE_HEADER, "· " + digest]
+
+
+def test_live_with_two_notes(tmp_path):
+    store = _live_store(tmp_path)
+    ds = _digests(2, 220)
+    for d in ds:
+        _queue_digest(store, tmp_path, d)
+    body = _body(build_interior_continuity_block(store))
+    assert body.splitlines() == [LIVE_HEADER] + ["· " + d for d in reversed(ds)]
+
+
+def test_live_collapses_whitespace(tmp_path):
+    store = _live_store(tmp_path)
+    _queue_digest(store, tmp_path, "she paused.\n\nthen  smiled")
+    body = _body(build_interior_continuity_block(store))
+    assert body.splitlines() == [LIVE_HEADER, "· she paused. then smiled"]
+
+
+@pytest.mark.no_base_failure(reason="#688 pins today's switch-off block byte for byte, so it passes on the old code by design")
+def test_switch_off_is_todays_block(tmp_path):
+    store = MemoryStore(tmp_path / "memories.db")
+    ts = [f"thought {i} " + "x" * 400 for i in range(5)]
+    for t in ts:
+        write_trace_memory(store, t, feed_digest="d", persona_dir=tmp_path, live=False)
+    block = build_interior_continuity_block(store)
+    footer = block.splitlines()[-1]
+    expected = "\n".join([OLD_HEADER] + ["· " + t for t in reversed(ts)])[:1200]
+    assert block == expected + "\n" + footer
+
+
+@pytest.mark.no_base_failure(reason="#688 pins that an unknown switch keeps today's block, so it passes on the old code by design")
+def test_unknown_switch_takes_today_path(tmp_path):
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
+
+    store = _live_store(tmp_path)
+    for d in _digests(3, 220):
+        _queue_digest(store, tmp_path, d)
+    ruin_the_state(tmp_path)
+    block = build_interior_continuity_block(store)
+    footer = block.splitlines()[-1]
+    ds = _digests(3, 220)
+    expected = "\n".join([OLD_HEADER] + ["· " + d for d in reversed(ds)])[:1200]
+    assert block == expected + "\n" + footer
+    assert LIVE_HEADER not in block
+
+
+def test_switch_read_failure_is_logged_and_takes_today_path(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    store = MemoryStore(tmp_path / "memories.db")
+    write_trace_memory(store, "a thought", feed_digest="d", persona_dir=tmp_path, live=False)
+
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(store, "emotion_engine", boom)
+    with caplog.at_level(logging.WARNING, logger="brain.monologue.ambient"):
+        block = build_interior_continuity_block(store)
+    assert block.startswith(OLD_HEADER)
+    assert any("could not read the emotion switch" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.no_base_failure(reason="#688 pins that an in-memory store returns an empty block without raising, which the old code already does")
+def test_in_memory_store_takes_today_path():
+    store = MemoryStore(":memory:")
+    assert build_interior_continuity_block(store) == ""
