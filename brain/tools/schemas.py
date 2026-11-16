@@ -674,10 +674,10 @@ SCHEMAS: dict[str, dict] = {
     "recall_monologue": {
         "name": "recall_monologue",
         "description": (
-            "Reach back into your own past interior — search your retained "
-            "monologue traces for an earlier thought. Recent thoughts come back "
-            "verbatim; older ones return blurred (you kept the gist, not the "
-            "words). Reaching for a thought keeps it vivid."
+            "Search your own recent interior for an earlier thought. Each match "
+            "comes back as you kept it, with when you had it: the short note you "
+            "made at the time, or the whole thought if it is from before you kept "
+            "notes."
         ),
         "parameters": {
             "type": "object",
