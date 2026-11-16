@@ -826,6 +826,8 @@ Return ONLY JSON: {"type": <what kind of thing this is>, "title": <short>, "cont
 [monologue.ambient]
 # module-level _HEADER. Plain (no interpolation).
 header = '''── interior continuity (your own recent thought) ──'''
+# module-level _HEADER_LIVE. The header once the emotion engine is live: the block is then a trail of whole notes. Plain.
+header_live = '''── interior continuity (your recent thoughts, as you noted them) ──'''
 # module-level _FOOTER_TEMPLATE. Plain template (.format(user_name=...)).
 footer_template = '''── end interior continuity. Private thought — never quote it; your reply speaks to {user_name} directly as 'you'. ──'''
 
