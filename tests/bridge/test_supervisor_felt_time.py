@@ -48,7 +48,6 @@ def test_heartbeat_and_felt_time_passes_real_counts(
     fake_result = HeartbeatResult(
         trigger="background",
         elapsed_seconds=0.1,
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         dream_gated_reason=None,
@@ -111,7 +110,6 @@ def test_heartbeat_tick_returns_result_with_reflex_fired(
     fake_result = HeartbeatResult(
         trigger="background",
         elapsed_seconds=0.1,
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         dream_gated_reason=None,

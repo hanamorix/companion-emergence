@@ -82,14 +82,14 @@ OLD_HEADER = "── interior continuity (your own recent thought) ──"
 
 
 def _go_live(persona_dir, store):
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     from datetime import UTC, datetime
 
-    from brain.emotion import engine_files
     from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _queue_digest(store, persona_dir, digest):
@@ -183,13 +183,13 @@ def test_switch_off_is_todays_block(tmp_path):
 
 
 @pytest.mark.no_base_failure(reason="#688 pins that an unknown switch keeps today's block, so it passes on the old code by design")
-def test_unknown_switch_takes_today_path(tmp_path, monkeypatch):
-    from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
+def test_unknown_switch_takes_today_path(tmp_path):
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
 
     store = _live_store(tmp_path)
     for d in _digests(3, 220):
         _queue_digest(store, tmp_path, d)
-    refuse_the_switch_stat(monkeypatch)
+    ruin_the_state(tmp_path)
     block = build_interior_continuity_block(store)
     footer = block.splitlines()[-1]
     ds = _digests(3, 220)

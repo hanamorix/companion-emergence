@@ -1,9 +1,8 @@
 """The emotional core — organising principle of companion-emergence.
 
-Six sub-modules, each with a single responsibility:
+Sub-modules, each with a single responsibility:
 - vocabulary: typed emotion taxonomy + persona extension registry
 - state: current emotional state (dict + dominant)
-- decay: per-emotion temporal decay curves
 - arousal: 7-tier body-coupled arousal spectrum
 - influence: state → biasing hints for provider abstraction
 - expression: state → face/voice parameters for NellFace

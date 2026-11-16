@@ -454,9 +454,10 @@ def _reset_emotion_engine_registry() -> Iterator[None]:
 class EmotionEngineStub:
     """A settable stand-in for the emotion engine, for tests of the callers (see the `emotion_engine_stub` fixture).
 
-    Every public call of the engine exists. `recorded_calls` holds one entry per hook call and per `note_active` call, `(name,
-    *arguments in the call's own order)`, for example `("on_memory_shown", memory, at)` or `("note_active", now)`; the real engine keeps no such list. The rest is
-    settable: `readings` (what `read()` returns), `live`, `high` (the names `feels_high` answers True for, whatever
+    Every public call of the engine exists. `recorded_calls` holds one entry per hook call, per `note_active` call and per
+    `ensure_ready` / `recovery_rebuild` call, `(name, *arguments in the call's own order)`, for example
+    `("on_memory_shown", memory, at)`, `("note_active", now)` or `("ensure_ready",)`; the real engine keeps no such list. The rest is
+    settable: `readings` (what `read()` returns), `live`, `recovery_needed` (what `needs_recovery()` answers), `high` (the names `feels_high` answers True for, whatever
     `readings` holds, so a reader's test says which feelings are high independently of the numbers it feeds), `faded`
     (`(memory_id, emotion) -> value`, else the stored value), `engine_status` and `last_fold_at` (a fixed
     instant well before any test's "now", so a site that compares its own time with it sees a nonzero interval).
@@ -473,6 +474,7 @@ class EmotionEngineStub:
         self.high: set[str] = set()
         self.faded: dict[tuple[str, str], float] = {}
         self.engine_status = EngineStatus(True, None)
+        self.recovery_needed = False
         self.last_fold_at = datetime(2000, 1, 1, tzinfo=UTC)
 
     def on_memory_committed(self, memory: Any) -> None:
@@ -508,6 +510,16 @@ class EmotionEngineStub:
 
     def status(self) -> Any:
         return self.engine_status
+
+    def ensure_ready(self) -> None:
+        """What `engine.ensure_engine_ready(<directory>)` reaches through the patched `engine_for`: recorded, and nothing happens."""
+        self.recorded_calls.append(("ensure_ready",))
+
+    def needs_recovery(self) -> bool:
+        return self.recovery_needed
+
+    def recovery_rebuild(self) -> None:
+        self.recorded_calls.append(("recovery_rebuild",))
 
 
 @pytest.fixture

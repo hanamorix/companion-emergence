@@ -70,7 +70,7 @@ from brain.health.jsonl_reader import (
     _parse_lines,
     classify_line,
 )
-from brain.utils.atomic_write import save_with_backup_text
+from brain.utils.atomic_write import save_bytes_atomic, save_with_backup_text
 from brain.utils.file_lock import file_lock
 from brain.utils.file_ops import delete_file, open_read, read_bytes_stat, replace_file, stat_path
 from brain.utils.log_throttle import warn_throttled
@@ -1285,3 +1285,15 @@ def write_jsonl(
     return _save_text(
         _as_path(path), payload.decode("utf-8"), backups, fsync, mode, False, False, on_error
     )
+
+
+def write_jsonl_bytes(path: Path, data: bytes, *, fsync: bool = True) -> None:
+    """Atomically replace a JSONL file with ``data``, written exactly as given: bytes that need not be valid UTF-8.
+
+    For a caller that rewrites a file's lines as :func:`iter_jsonl_raw` read them (a line it could not parse, kept in place):
+    that text re-encoded with ``"utf-8", "surrogateescape"`` is the original bytes, which :func:`write_jsonl` would refuse
+    (it decodes its payload as UTF-8). ``data`` must end with a newline (a half line would fuse with the next record). The
+    replace is atomic and, with ``fsync``, durable; a failure raises ``OSError`` and leaves the file as it was. No backup chain.
+    Data that does not end with a newline raises ``ValueError`` before anything is written.
+    """
+    save_bytes_atomic(_as_path(path), _payload(data), fsync=fsync)

@@ -87,14 +87,14 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
 
 
 def _go_live(persona_dir, store):
-    """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
     from datetime import UTC, datetime
 
-    from brain.emotion import engine_files
     from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
 
 
 def _made_emotions(tmp_path, *, live):

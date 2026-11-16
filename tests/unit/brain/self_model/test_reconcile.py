@@ -347,15 +347,16 @@ def _go_live(persona_dir: Path, **seed: float):
     """A live persona with no state file applies nothing, so seed a memory first, then write the switch."""
     from datetime import UTC, datetime
 
-    from brain.emotion import engine, engine_files
+    from brain.emotion import engine
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
         store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
     finally:
         store.close()
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return engine.engine_for(persona_dir)
 
 

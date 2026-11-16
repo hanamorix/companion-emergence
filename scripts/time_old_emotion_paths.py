@@ -8,9 +8,9 @@ Usage:
 
 The path is optional and defaults to test-data/synthetic-db/memories.db under the repository root. The file is
 copied into a fresh temporary directory (the copy is the persona directory) and three paths are timed on the copy:
-get_emotional_state, one write_trace_memory, and the heartbeat's decay pass (HeartbeatEngine._apply_emotion_decay).
-Each of the first two is one cold first call plus nine warm repeats; the decay pass is ten consecutive passes, the
-first being the cold run, with the rows each pass changed. Warm timings are reported as minimum, median and maximum
+get_emotional_state, one write_trace_memory, and, on a commit that still has it, the heartbeat's decay pass
+(HeartbeatEngine._apply_emotion_decay). Each of the first two is one cold first call plus nine warm repeats; the decay
+pass is ten consecutive passes, the first being the cold run, with the rows each pass changed. Warm timings are reported as minimum, median and maximum
 in milliseconds. Nothing is asserted: there is no threshold and no pass or fail.
 
 It refuses a path under the brain's home directory, aborts when the source has a non-empty -wal file, copies only
@@ -22,6 +22,17 @@ app's own probe, which reads /proc/cpuinfo on Linux and answers "no" when that r
 "unknown" on other systems. The CPU model is the first `model name` field of /proc/cpuinfo, read by the script
 itself on Linux (the read starts no process); it prints "unknown" on other systems and when the field is missing or
 unreadable. The architecture is printed beside it.
+
+After the vocabulary load and before the first timing the script starts the copy once through `ensure_engine_ready` (not
+timed) and confirms the engine is live, so that the timed calls read the live engine; that is the script's one first
+rebuild, and it is skipped with a printed reason on a commit that has no `ensure_engine_ready`. On a commit without the
+heartbeat's decay pass (`HeartbeatEngine._apply_emotion_decay`, removed by Engine 6) the decay timing is skipped.
+
+On a commit where the copy was started through `ensure_engine_ready`, `write_trace_memory` is timed twice, each with its
+own label: the LIVE path (`persona_dir` is the copy, the engine is live, the call reads the engine's strongest feelings;
+what a live persona runs) and the switch-off path (`persona_dir=None`, a full `list_active` and `aggregate_state` per call).
+On a commit with no start step only the switch-off path is timed. The 1-minute load average is printed beside the host
+line and again as the last line ("unknown" where `os.getloadavg` does not exist), because machine load moves these timings.
 
 A timing whose function is absent on the checked-out commit is skipped with a printed reason. On a failure it
 prints one line, `time_old_emotion_paths: FAILED at <step>: <detail>`, to stderr, prints no timings and exits 1.
@@ -140,6 +151,24 @@ def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
     return _guarded("vocabulary", load)
 
 
+def _step_start(scratch: Path) -> list[str]:
+    """Start the copy the way the app's start-up does, through `ensure_engine_ready`, and confirm the engine is live.
+
+    Run once, after the vocabulary load and before any timing, the order the CLI handlers use (the load, then `ensure`), so the
+    first rebuild sees the same registered names. It is not timed (its cost is the first-rebuild check's). It is the script's
+    one rebuild: the timed calls after it read a live engine, which is what `get_emotional_state` takes its live branch on. A
+    commit with no `ensure_engine_ready` is skipped with a printed reason; a copy that is not live afterwards ends the run.
+    """
+    from brain.emotion import engine
+
+    if not _has_start_step():
+        return ["start: skipped, ensure_engine_ready is not on this commit"]
+    engine.ensure_engine_ready(scratch)
+    if not engine.engine_for(scratch).is_live():
+        raise StepError("start", "the copy is not live after ensure_engine_ready, so the timings would not read the live engine")
+    return ["start: the copy was started through ensure_engine_ready (not timed; one first rebuild) and the engine is live"]
+
+
 def _ms(seconds: float) -> str:
     return f"{seconds * 1000.0:.1f} ms"
 
@@ -187,7 +216,14 @@ def _time_state(scratch: Path, store) -> list[str]:
     )
 
 
-def _time_trace(scratch: Path, store) -> list[str]:
+def _time_trace(scratch: Path, store, started: bool = False) -> list[str]:
+    """Time `write_trace_memory`; every printed line names the path it timed.
+
+    `started` is true when the copy was started through `ensure_engine_ready` (the S6 commit): then the live path
+    (`persona_dir` = the copy, the engine live, which reads the engine's strongest feelings) is timed first and the
+    switch-off path (`persona_dir=None`, a full `list_active` and `aggregate_state` per call) second. Otherwise only the
+    switch-off path is timed, the one single timing the parent commit has.
+    """
     try:
         from brain.monologue.trace import write_trace_memory
     except (ImportError, AttributeError) as exc:
@@ -200,20 +236,37 @@ def _time_trace(scratch: Path, store) -> list[str]:
     middle = statistics.median_low(len(m.content) for m in traces)
     text = next(m.content for m in traces if len(m.content) == middle)
     queue = scratch / "pending_candidates.jsonl"
-    # Since emotion rework B1 PR 6 the writer takes feed_digest and persona_dir; persona_dir=None is the switch-off path,
-    # the one timed here. Older commits take neither.
+    # Since emotion rework B1 PR 6 the writer takes feed_digest and persona_dir; persona_dir=None is the switch-off path.
+    # Older commits take neither.
     new_signature = "feed_digest" in inspect.signature(write_trace_memory).parameters
-    extra = {"feed_digest": text, "persona_dir": None} if new_signature else {}
-    durations = _time_calls(
-        lambda: write_trace_memory(store, text, **extra),
-        1 + WARM_REPEATS,
-        before_each=lambda: write_jsonl(queue, []),
-    )
-    return _timing_lines(
-        f"write_trace_memory, one trace of {middle} characters "
-        "(adds one entry to the pending-candidates queue, resets before each call; memories.db rows changed: 0)",
-        "process-cold, OS page cache warm (fresh copy)",
-        durations,
+
+    process_cold = "process-cold, OS page cache warm (fresh copy)"
+
+    def timed(path_label: str, extra: dict, cold_label: str = process_cold) -> list[str]:
+        durations = _time_calls(
+            lambda: write_trace_memory(store, text, **extra),
+            1 + WARM_REPEATS,
+            before_each=lambda: write_jsonl(queue, []),
+        )
+        return _timing_lines(
+            f"write_trace_memory, {path_label}, one trace of {middle} characters "
+            "(adds one entry to the pending-candidates queue, resets before each call; memories.db rows changed: 0)",
+            cold_label,
+            durations,
+        )
+
+    if not new_signature:
+        return timed("old signature, no persona_dir, no engine", {})
+    off = {"feed_digest": text, "persona_dir": None}
+    off_label = "switch-off path (persona_dir=None, full-window read, not what a live persona runs)"
+    if not started:
+        return timed(off_label, off)
+    live = {"feed_digest": text, "persona_dir": scratch}
+    after_live = "first call of this path, run after the live path's calls: process and store already warm, not process-cold"
+    return (
+        timed("LIVE path (persona_dir=the copy, engine live, reads the engine)", live)
+        + [""]
+        + timed(off_label, off, after_live)
     )
 
 
@@ -305,8 +358,27 @@ def _host_line() -> str:
     return f"host: {system}; cpu {_cpu_model()}; arch {arch}; avx2={avx2}; cores {os.cpu_count() or 'unknown'}; ram {ram}"
 
 
+def _load_line(when: str) -> str:
+    """The 1-minute load average, labelled; "unknown" where `os.getloadavg` does not exist (Windows) or fails.
+
+    Machine load moved one commit's trace timing about 3x in the record run, so it is printed at the start and the end.
+    """
+    try:
+        value = f"{os.getloadavg()[0]:.2f}"
+    except (AttributeError, OSError):
+        value = "unknown"
+    return f"load average (1 min), {when}: {value}"
+
+
+def _has_start_step() -> bool:
+    """Whether this commit has `ensure_engine_ready`, i.e. whether `_step_start` starts the copy (it ends the run when
+    the copy is not live afterwards, so a true answer here means the copy is live)."""
+    from brain.emotion import engine
+
+    return getattr(engine, "ensure_engine_ready", None) is not None
+
+
 def run(arg: str | None) -> list[str]:
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
     from brain.paths import get_home
 
     source, commit, code = _step_source(arg)
@@ -321,18 +393,21 @@ def run(arg: str | None) -> list[str]:
         active = _guarded("open", lambda: len(store.list_active()))
         out = [
             _host_line(),
+            _load_line("at start"),
             f"commit: {commit}",
             f"code: {code}",
             f"database: sha256 {digest}",
             f"emotion names registered by the first vocabulary load: {registered}; registry size: {registry_size}",
-            "  (a name with no stored half-life gets the placeholder half-life in brain.health.reconstruct, "
-            f"{PLACEHOLDER_DECAY_DAYS} days, which sets how many rows the decay pass rewrites)",
             f"active rows: {active}",
             "",
         ]
+        start_lines = _guarded("start", lambda: _step_start(scratch))
+        out += start_lines + [""]
         out += _guarded("state", lambda: _time_state(scratch, store)) + [""]
-        out += _guarded("trace", lambda: _time_trace(scratch, store)) + [""]
-        out += _guarded("decay", lambda: _time_decay(scratch, store))
+        started = _has_start_step()
+        out += _guarded("trace", lambda: _time_trace(scratch, store, started)) + [""]
+        out += _guarded("decay", lambda: _time_decay(scratch, store)) + [""]
+        out.append(_load_line("at end"))
         return out
     finally:
         try:
