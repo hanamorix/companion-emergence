@@ -5,18 +5,28 @@ prior interior colours later turns. Because fade() rewrites content→summary,
 rendering `m.content` shows the trace as stored while active (the verbatim
 thought with the switch off, its feed digest once the emotion engine is live)
 and the tombstone summary once fading.
+
+Once the emotion engine is live each stored trace is a short note, so the block becomes a trail of whole notes under
+its own header: newest first, each note kept whole or dropped, never cut mid-note (only the newest, when it alone
+passes the cap, is cut). With the switch off, or when the switch cannot be read, the block is today's.
 """
 from __future__ import annotations
+
+import logging
 
 from brain import prompt_strings
 from brain.memory.store import MemoryStore
 from brain.monologue.trace import MONOLOGUE_TRACE_TYPE
+from brain.utils.log_throttle import warn_throttled
+
+logger = logging.getLogger(__name__)
 
 _AMBIENT_LIMIT = 5
 _CHAR_CAP = 1200
 
 # Text externalized to prompt_strings.toml [monologue.ambient] (issue #129 stage 2c).
 _HEADER = prompt_strings.register("monologue.ambient.header")
+_HEADER_LIVE = prompt_strings.register("monologue.ambient.header_live")
 _FOOTER_TEMPLATE = prompt_strings.register("monologue.ambient.footer_template")
 
 
@@ -46,9 +56,25 @@ def build_interior_continuity_block(
     if not traces:
         return ""
     traces = sorted(traces, key=lambda m: m.created_at, reverse=True)[:limit]
-    lines = [_HEADER]
-    for m in traces:
-        text = " ".join(m.content.split())  # collapse whitespace
-        lines.append(f"· {text}")
-    body = "\n".join(lines)[:char_cap]
+    try:
+        eng = store.emotion_engine()
+        live = eng is not None and eng.is_live()
+    except Exception:  # noqa: BLE001
+        warn_throttled(
+            logger,
+            "monologue.ambient.switch_read",
+            "interior block: could not read the emotion switch; using today's block",
+        )
+        live = False
+    texts = [" ".join(m.content.split()) for m in traces]  # collapse whitespace
+    if live:
+        lines = [f"· {t}" for t in texts]  # newest first
+        body = (_HEADER_LIVE + "\n" + lines[0])[:char_cap]
+        for line in lines[1:]:
+            candidate = body + "\n" + line
+            if len(candidate) > char_cap:
+                break
+            body = candidate
+    else:
+        body = "\n".join([_HEADER] + [f"· {t}" for t in texts])[:char_cap]
     return body + "\n" + _FOOTER_TEMPLATE.format(user_name=user_name)
