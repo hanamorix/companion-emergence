@@ -182,6 +182,9 @@ Tests: capture through the real `_dispatch_record_monologue` with a switch file 
 | Research limits | Multi-line JSON and felt lines before `VERDICT` count as missing and are logged | If `research_felt` failures show up |
 | Duplicate-check edges | §4 PR 6 | If digests repeat in practice |
 | Dynamic nudges (#566) | Out of scope | #566 |
+| Scale writers' accepted edge (PR 7) | A switched persona whose state can't be read and whose `memories.db` reads progress 0 (rebuilt or new) writes small values, because the x10 fix never runs for a switched persona. Agreed with ThinkerOfThoughts on #633 | If a rebuilt `memories.db` on a switched persona shows up |
+| Peer cap at a tenth (PR 7, Hana's call) | 0-10 peer values with `is_live()` false (state unreadable, or rescaled before the switch-over) go through the 0.6 cap at a tenth and are stored ×10, so the cap still holds the peer and the stored value is 0-10 | ThinkerOfThoughts' review of #742 |
+| Off paths take no feelings (PR 7) | With the engine not reading, the dream mood is empty, a trace has no feelings and growth's recent-emotion vectors are empty. With an empty mood, a high-importance grief breadcrumb can win the dream seed, as on the live path's empty read during a rebuild | If off-path dreams or traces read wrong while a state is unreadable |
 
 These also go in `project_companion_emergence_deferred.md` and the next brainstorm.
 
