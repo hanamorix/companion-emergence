@@ -144,9 +144,11 @@ This PR's work also rewrites the `CLAUDE.local.md` gotcha that says raw monologu
 
 Tests: capture through the real `_dispatch_record_monologue` with a switch file (digest, two feelings, importance, `monologue_text` still raw). Dedup by digest. One key when both feelings match. Empty read. All three trace readers. Off pinned. Climax at the threshold. Backfill NaN and inf. The writers table.
 
-### PR 7: cleanup (after Engine 6, before Engine 7)
+### PR 7: cleanup (after Engine 6, before Engine 7; draft #742)
 
 - Delete the old `aggregate_state` branches in `engines/dream.py`, `monologue/trace.py`, `growth/scheduler.py`, `growth/crystallizers/creative_dna.py` and `growth/crystallizers/reflex.py`.
+- Key the scale writers on the x10 fix's progress note (`MemoryStore.x10_progress()`, from Engine 6) instead of `is_live()`. These are the note value, the reach-out, the making, the peer memory with its reflection prompt, and research's prompt and felt-line condition. Agreed on #633, 2026-11-16. `is_live()` is false both before the x10 fix runs, when small values are right because the next start multiplies them, and for a switched-over persona whose state can't be read, when they're wrong and nothing rescales them. The note tells the two apart. The cut (progress 1 or 2) is ThinkerOfThoughts' call.
+- The selections that read the engine keep their `is_live()` off branch: the monologue trace, the dream seeds, growth's vocabulary clustering and the research gate. That is Engine 6's own fail-safe for an unreadable state. `write_trace_memory` keeps its raw `monologue` argument for that branch.
 - Change the `feed_digest` and `surface` descriptions in `tools/schemas.py` to first person. The Feed's voice changes here.
 
 ## 5. Wiring
@@ -162,6 +164,7 @@ Tests: capture through the real `_dispatch_record_monologue` with a switch file 
 | 5 grief | faded values of the dropped memory | breadcrumb row (not counted), recall |
 | 5 growth | short averages, faded values | crystallizer context, vocabulary blends |
 | 6 monologue note | `feed_digest`, `read()` | interior-continuity block, monologue recall, interest sweep |
+| 7 scale writers | the x10 fix's progress note in `memories.db` | the same memory rows PR 3 and PR 4 write, then the engine |
 
 ## 6. Deferred / kept on purpose
 
@@ -193,7 +196,7 @@ Answers to their open questions, posted once this spec is approved:
 2. Faded values: yes.
 3. `peer_trust` shape: yes, with raw trust.
 4. `ensure_engine_ready` in the dream handler is fine (`_dream_handler`, `cli.py:918`, is developer-only; production dreams come from the heartbeat).
-5. The old branches go in PR 7.
+5. The old branches go in PR 7. Its scope widened on 2026-11-16 (see §4 PR 7).
 
 New question: `handle_drop` runs after `hard_delete`. Today's `faded_value` reads only the memory object, so this works. Engine 6 replaces it, so it must keep working for a row that is already deleted. PR 5 pins that with a test.
 

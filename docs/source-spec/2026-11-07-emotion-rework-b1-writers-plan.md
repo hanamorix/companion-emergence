@@ -4,7 +4,7 @@
 
 **Goal:** Make every emotion writer feed the engine honestly once the switch is on, without changing anything she feels while it is off.
 
-**Architecture:** Seven independent PRs, each off `main`, each gating its writer inline on `engine_for(persona_dir).is_live()`. The old path stays byte-for-byte until PR 7 removes the old `aggregate_state` branches after Engine 6.
+**Architecture:** Seven independent PRs, each off `main`, each gating its writer inline on `engine_for(persona_dir).is_live()`. The old path stays byte-for-byte until PR 7, after Engine 6. PR 7 removes the old `aggregate_state` branches and moves the scale writers' choice from `is_live()` to the x10 fix's progress note (Task 12).
 
 **Tech Stack:** Python 3 (`uv`, pytest, ruff), SQLite stores, the merged emotion engine (`brain/emotion/engine.py`), `brain/prompt_strings.toml`.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - With the switch off, nothing she feels changes. Every task pins its off path.
-- `persona_dir=None` counts as off. An unknown switch (`is_live()` False on a stat error) counts as off.
+- `persona_dir=None` counts as off. An unknown switch (`is_live()` False on a stat error) counts as off. From PR 7 on, the writers that only pick a scale key on the x10 fix's progress note instead, so a switched-over persona whose state can't be read still writes on the 0-10 scale (Task 12).
 - Inline gating only; there is no shared gate helper. Pure functions take `live: bool = False`. Long-running operations read the switch once at the top.
 - Pure functions that read per-memory values take `eng` with no default (pattern: `brain/forgetting/salience.py::_emotion_input`). `None` means stored values. Iterate the memory's own keys, because `faded_value` raises `KeyError` for an absent emotion.
 - Every stored value is on the 0-10 scale. New persisted fields are additive and optional.
@@ -659,41 +659,78 @@ Message: `drop non-finite backfill values and share the climax threshold`.
 
 ---
 
-## PR 7: cleanup (branch `hana/emotion-b1-cleanup`, after Engine 6, before Engine 7)
+## PR 7: cleanup (branch `hana/emotion-b1-cleanup`, draft #742, after Engine 6, before Engine 7)
 
-### Task 12: Remove the old branches
+### Task 12: Remove the old branches, and key the scale writers on the x10 fix
+
+Widened on #633 (2026-11-16, answering ThinkerOfThoughts' 2026-11-13 question). `is_live()` answers false in two cases that need different scales:
+
+- **Not yet switched over.** This means a first start on the new code, or a start where an I/O fault skips the switch-over and start-up goes on. The x10 fix hasn't run, so rows must stay small, because the next start multiplies them with no cutoff.
+- **Switched over, but the state can't be read right now.** The x10 fix has run, so an old-scale row written now is never rescaled.
+
+The x10 fix's progress note in `memories.db` (`MemoryStore.x10_progress()`, from Engine 6) tells the two apart and survives an unreadable state file. So the writers that only pick a scale key on that note instead of `is_live()`. The selections that read the engine keep their `is_live()` off branch, which is the same fail-safe Engine 6 takes for an unreadable state.
 
 **Files:**
-- Modify: `brain/engines/dream.py`, `brain/monologue/trace.py`, `brain/chat/monologue_capture.py`, `brain/growth/scheduler.py`, `brain/growth/crystallizers/creative_dna.py`, `brain/growth/crystallizers/reflex.py`, `brain/tools/schemas.py:623,633`
+- Modify (`aggregate_state` removal): `brain/engines/dream.py`, `brain/monologue/trace.py`, `brain/growth/scheduler.py`, `brain/growth/crystallizers/creative_dna.py`, `brain/growth/crystallizers/reflex.py`
+- Modify (scale writers): `brain/notes/runner.py`, `brain/initiate/review.py`, `brain/initiate/reach_emotion.py`, `brain/maker/making_runner.py`, `brain/maker/wiring.py` (on top of #722), `brain/kindled_link/relationship.py`, `brain/engines/research.py`
+- Modify (schema wording): `brain/tools/schemas.py:623,633`
+- Keep their `is_live()` off branch (no change beyond the `aggregate_state` removal): `brain/monologue/trace.py` with `brain/chat/monologue_capture.py`, `brain/engines/dream.py` with the seed functions' `eng=None` path, `brain/growth/scheduler.py`, and the gate half of `brain/engines/research.py`
 - Test: the same test files, plus `tests/unit/brain/emotion/test_rework_writer_pins.py`
 
 **Interfaces:**
-- Produces: `write_trace_memory(store, *, feed_digest, persona_dir)` once the raw `monologue` argument has no reader.
+- Consumes: `MemoryStore.x10_progress()` and the `NUDGE_SCALE_FIX_PROGRESS_*` constants in `brain/dev_constants.py`, both from Engine 6.
+- The `live` parameters of `reach_emotions_for` and `making_emotion_delta`, and the `live` passed to `_build_reflection_prompt`, now mean "the x10 fix has run". Rename them if the name would mislead, and update every caller.
+- `write_trace_memory` keeps its `monologue` argument, because the off branch still stores the raw thought. This replaces the earlier line that dropped it.
+
+**Open with ThinkerOfThoughts:** whether the cut is `NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE` (1) or `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` (2). That depends on whether a queued candidate written between the two steps gets multiplied. Settle it before Step 4. If they'd rather the scale change land on its own after Engine 7, split it into its own PR.
+
+**Overlap:** ThinkerOfThoughts' #656 touches `dream.py`, `research.py`, `creative_dna.py`, `crystallizers/reflex.py`, `growth/scheduler.py`, `relationship.py` and `making_runner.py`. Whichever lands second rebases.
 
 - [ ] **Step 1: Re-check the ground**
 
 Run: `git grep -n "aggregate_state" -- brain/engines/dream.py brain/monologue/trace.py brain/growth`
-Expected: only the branches this task removes. Re-read Engine 6 as merged before deleting anything. In particular, confirm `faded_value` works on a deleted row (Task 8's test covers it; the #726 trial merge with #633 passed it on 2026-11-12), that every `_go_live` a merged B1 PR left uses `make_live` (the "After Engine 6" recipe above; `git grep -n write_switch -- tests` should find nothing), and how `DreamEngine(persona_dir=None)` should now choose a mood: an empty `EmotionalState()`, unless Engine 6 settled it differently.
+Expected: only the branches this task removes.
 
-- [ ] **Step 2: Write the failing schema test**
+Run: `git grep -n "is_live()" -- brain/notes brain/initiate brain/maker brain/kindled_link/relationship.py brain/engines/research.py`
+Expected: only the scale selections listed above, plus the research gate's read, which stays.
+
+Re-read Engine 6 as merged before changing anything. In particular, confirm:
+- `faded_value` works on a deleted row. Task 8's test covers it, and the #726 trial merge with #633 passed it on 2026-11-12.
+- Every `_go_live` a merged B1 PR left uses `make_live` (the "After Engine 6" recipe above). `git grep -n write_switch -- tests` should find nothing.
+- How `DreamEngine(persona_dir=None)` should now choose a mood: an empty `EmotionalState()`, unless Engine 6 settled it differently.
+- What `x10_progress()` returns on a persona with no `memories.db`, and on a fresh persona whose first rebuild ran on an empty database.
+
+- [ ] **Step 2: Write the failing tests**
 
 ```python
 def test_digest_and_surface_descriptions_are_first_person():
     # the record_monologue schema's feed_digest and surface descriptions contain "third-person" nowhere and ask for first person
+
+def test_note_wires_on_the_engine_scale_when_switched_over_but_state_unreadable():
+    # switch over through ensure_engine_ready, ruin the state (ruin_the_state), run the real notes runner:
+    # the note-state memory carries tenderness 1.2, not 0.12
+
+def test_note_keeps_todays_scale_before_the_x10_fix_runs():
+    # a persona whose x10 progress is 0 (no switch-over yet): the note carries 0.12, which the next start multiplies
 ```
 
-- [ ] **Step 3: Run it to verify it fails**
+Add one through-path test of each kind for reach-out (`run_initiate_review_tick`), making (`make_and_wire`), the peer memory (`run_relationship_reflection`) and the research fire. Each test goes through the real caller, not the pure function alone.
 
-Run: `uv run pytest tests/unit/brain/tools -k first_person -v`
-Expected: FAIL.
+- [ ] **Step 3: Run them to verify they fail**
 
-- [ ] **Step 4: Delete and reword**
+Run: `uv run pytest tests/unit/brain/tools tests/unit/brain/notes tests/unit/brain/initiate tests/unit/brain/maker tests/kindled_link tests/unit/brain/engines -k "first_person or unreadable or before_the_x10" -v`
+Expected: the schema test and every "unreadable" test fail. The "before the x10 fix" tests pass, because they pin today's behaviour.
 
-Delete each `aggregate_state` branch and its import. Rewrite the off-path tests that pin the removed code, and delete the `test_today_*` pins whose writers are gone. Change the two schema descriptions to first person, which changes the Feed's voice. Approve the wording snapshot if it flags, and name the change in the PR body.
+- [ ] **Step 4: Delete, re-key and reword**
+
+1. Delete each `aggregate_state` branch and its import.
+2. Re-key the scale writers on the x10 note, read once per operation with a lazy import, and fail toward today's scale only when the database itself can't be read.
+3. Rewrite the off-path tests that pin the removed code, and delete the `test_today_*` pins whose writers are gone.
+4. Change the two schema descriptions to first person, which changes the Feed's voice. Approve the wording snapshot if it flags, and name the change in the PR body.
 
 - [ ] **Step 5: Run the gate and commit**
 
-Message: `remove the old emotion branches from the writers`. PR body: `Refs #240`, and `Closes #N` for any issue this finishes.
+Message: `remove the old emotion branches from the writers`. PR body (#742): `Refs #240`, and `Closes #N` for any issue this finishes.
 
 ---
 
