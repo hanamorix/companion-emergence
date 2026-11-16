@@ -68,6 +68,8 @@ def add_memory(
         importance=float(effective_importance),
         metadata={"tags": tags, "importance": effective_importance},
     )
+    # She reaches this memory at the moment she makes it (emotion rework, Hana half, Task 6).
+    memory.last_accessed_at = memory.created_at
     store.create(memory)
 
     # Body event hook: when an LLM-tagged memory commits with climax at or above
@@ -100,7 +102,8 @@ def add_memory(
         for kw in keywords:
             if len(related_ids) >= 3:
                 break
-            hits = store.search_text(kw, active_only=True, limit=4)
+            # bump=False: finding memories to link is not recalling them, this new one included.
+            hits = store.search_text(kw, active_only=True, limit=4, bump=False)
             for rel in hits:
                 if rel.id in seen_ids:
                     continue
