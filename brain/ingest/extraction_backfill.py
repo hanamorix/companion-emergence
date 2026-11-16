@@ -17,8 +17,10 @@ Two modes. The default re-extracts only the starts the old cut lost (as the lull
 
 Backfilled memories carry ``metadata.extraction_backfill = {"from": <first row ts>, "to": <last row ts>}`` and
 ``source_summary = "conversation:<sid>"``, and are BACK-DATED to the chunk's last user turn: a memory carries the time of the
-conversation it came from, not the time the backfill ran. (The time since the user last spoke, ``days_since_human``, is read
-from the conversation files and not from memories, so a memory's date does not move it.) Soul candidates are queued in
+conversation it came from, not the time the backfill ran. The creation time sets where the memory's feelings start fading (the
+engine fades from the later of the memory's creation and the switch-over), the memory's age for forgetting, and its recency in
+recall and dream seeding. A months-old conversation dated now would come back as fresh, full-strength feeling and would resist
+forgetting. Soul candidates are queued in
 ``heads`` mode only: that text was never extracted, so it never had its chance at the soul queue, while most ``--all`` text was
 extracted once already, and the soul queue itself has no dedup (an accepted candidate becomes a permanent crystallisation). The
 pipeline's soul stage skips only an exact repeat: a candidate whose session id and text are already queued, so a chunk that runs
