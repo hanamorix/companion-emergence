@@ -241,6 +241,9 @@ def test_peer_memory_is_on_the_engine_scale_and_capped_when_switched_over_but_st
     assert s.get_peer_emotion_accumulated("kid_a", NOW) == pytest.approx(0.4)
 
 
+@pytest.mark.no_base_failure(
+    reason="B1 PR 7 keeps today's behaviour here (the old code asked for 0-10 whenever is_live() was True); it guards the scale rule from undoing that"
+)
 def test_an_engine_that_saw_the_switch_asks_for_zero_to_ten_even_when_the_state_is_lost(tmp_path):
     # is_live() caches a switch-over it has seen, so it stays True after the state turns unreadable, while a fresh read
     # of the state cannot tell. The prompt must then match the live branch that parses the answer as 0-10.
