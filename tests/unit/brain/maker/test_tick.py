@@ -124,3 +124,41 @@ def test_tick_respects_cooldown(tmp_path):
     )
     assert fired == []  # cooldown blocks
     store.close()
+
+
+# ---- #721: the charge's source parts follow the charge through a discharge ----
+
+
+def test_a_making_resets_the_source_parts_with_the_charge(tmp_path):
+    store = _store(tmp_path)
+    save_charge(tmp_path, MakerCharge(50.0, "2026-06-14T00:00:00+00:00", None, 0, emotion_part=10.0, soul_part=30.0, dream_part=10.0))
+    run_maker_tick(
+        tmp_path, store=store, provider=None, now=datetime(2026, 6, 14, 0, 1, tzinfo=UTC),
+        make_fn=lambda **k: None, threshold=1.0,
+    )
+    c = load_charge(tmp_path)
+    assert c.charge == 0.0
+    assert (c.emotion_part, c.soul_part, c.dream_part) == (0.0, 0.0, 0.0)
+    store.close()
+
+
+def test_a_failed_making_scales_the_source_parts_with_the_partial_charge(tmp_path):
+    import pytest
+
+    from brain.maker import config as _cfg
+
+    store = _store(tmp_path)
+    save_charge(tmp_path, MakerCharge(50.0, "2026-06-14T00:00:00+00:00", None, 0, emotion_part=10.0, soul_part=30.0, dream_part=10.0))
+
+    def _boom(**_k):
+        raise RuntimeError("simulated making failure")
+
+    run_maker_tick(
+        tmp_path, store=store, provider=None, now=datetime(2026, 6, 14, 0, 1, tzinfo=UTC), make_fn=_boom, threshold=1.0,
+    )
+    c = load_charge(tmp_path)
+    assert c.charge == _cfg.FAILED_MAKE_CHARGE
+    assert c.emotion_part + c.soul_part + c.dream_part == pytest.approx(c.charge)
+    # This tick only decays soul and dream (no new soul candidate or dream), so their 3:1 proportion survives the scale.
+    assert c.soul_part == pytest.approx(3 * c.dream_part)
+    store.close()
