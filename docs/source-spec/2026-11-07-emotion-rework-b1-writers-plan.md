@@ -668,23 +668,31 @@ Widened on #633 (2026-11-16, answering ThinkerOfThoughts' 2026-11-13 question). 
 - **Not yet switched over.** This means a first start on the new code, or a start where an I/O fault skips the switch-over and start-up goes on. The x10 fix hasn't run, so rows must stay small, because the next start multiplies them with no cutoff.
 - **Switched over, but the state can't be read right now.** The x10 fix has run, so an old-scale row written now is never rescaled.
 
-The x10 fix's progress note in `memories.db` (`MemoryStore.x10_progress()`, from Engine 6) tells the two apart and survives an unreadable state file. So the writers that only pick a scale key on that note instead of `is_live()`. The selections that read the engine keep their `is_live()` off branch, which is the same fail-safe Engine 6 takes for an unreadable state.
+ThinkerOfThoughts' ruling on #633 (2026-11-16) settles the rule. For each scale write:
+1. If `engine_files.switch_over_state(read_state())` says the persona is switched over, write 0-10. `is_live()` alone can't tell "not switched" from "unreadable", so it isn't used here.
+2. Otherwise (not switched, or the state can't be read), the x10 fix's progress note (`MemoryStore.x10_progress()`) decides, with the cut of the step that rescales where the value lands:
+   - a value written straight to `memories.db` (the note's and reach-out's `initiate_outbound` values, the `kindled_peer` values) is 0-10 once progress is at least `NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE` (1);
+   - a `making` value, which goes to the pending queue, is 0-10 once progress is at least `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` (2).
+3. If the progress can't be read, write today's scale.
+
+A single cut gets one case wrong either way: with 2 for everything, a direct row written while progress sits at 1 stays small for good; with 1 for everything, the queue step multiplies a 0-10 `making` entry. One case stays small, accepted as a rare edge with a code comment: a switched persona whose state can't be read and whose `memories.db` reads progress 0 (rebuilt or new), because the x10 fix never runs for a switched persona.
+
+Which selections follow the rule: one that only picks the scale of a stored value, together with the scale of a prompt whose answer is stored as that value. A selection that reads the engine, or that picks what the model is asked for and whether its answer is parsed, keeps `is_live()` and its off branch, the same fail-safe Engine 6 takes for an unreadable state. So all of `brain/engines/research.py` stays on one `is_live()` test (research isn't an x10 type, and nothing there is rescaled). At `relationship.py` the prompt's scale and the stored peer values follow the rule, while the `apply_peer_emotion` choice keeps `is_live()`.
 
 **Files:**
-- Modify (`aggregate_state` removal): `brain/engines/dream.py`, `brain/monologue/trace.py`, `brain/growth/scheduler.py`, `brain/growth/crystallizers/creative_dna.py`, `brain/growth/crystallizers/reflex.py`
-- Modify (scale writers): `brain/notes/runner.py`, `brain/initiate/review.py`, `brain/initiate/reach_emotion.py`, `brain/maker/making_runner.py`, `brain/maker/wiring.py` (on top of #722), `brain/kindled_link/relationship.py`, `brain/engines/research.py`
+- Modify (`aggregate_state` removal): `brain/engines/dream.py`, `brain/monologue/trace.py`, `brain/growth/scheduler.py`, `brain/growth/crystallizers/creative_dna.py`, `brain/growth/crystallizers/reflex.py`. Readers 2 (#634) removes every other caller.
+- Create: one helper for the rule, taking the cut as a parameter, so the four writers can't drift apart.
+- Modify (scale writers): `brain/notes/runner.py`, `brain/initiate/review.py`, `brain/initiate/reach_emotion.py`, `brain/maker/making_runner.py`, `brain/maker/wiring.py` (on top of #722), `brain/kindled_link/relationship.py`
 - Modify (schema wording): `brain/tools/schemas.py:623,633`
-- Keep their `is_live()` off branch (no change beyond the `aggregate_state` removal): `brain/monologue/trace.py` with `brain/chat/monologue_capture.py`, `brain/engines/dream.py` with the seed functions' `eng=None` path, `brain/growth/scheduler.py`, and the gate half of `brain/engines/research.py`
-- Test: the same test files, plus `tests/unit/brain/emotion/test_rework_writer_pins.py`
+- Keep their `is_live()` off branch (no change beyond the `aggregate_state` removal): `brain/monologue/trace.py` with `brain/chat/monologue_capture.py`, `brain/engines/dream.py` with the seed functions' `eng=None` path, `brain/growth/scheduler.py`, all of `brain/engines/research.py`, and `apply_peer_emotion`'s choice in `relationship.py`
+- Test: the helper's rule matrix once, one through-path test per writer, plus `tests/unit/brain/emotion/test_rework_writer_pins.py`
 
 **Interfaces:**
-- Consumes: `MemoryStore.x10_progress()` and the `NUDGE_SCALE_FIX_PROGRESS_*` constants in `brain/dev_constants.py`, both from Engine 6.
-- The `live` parameters of `reach_emotions_for` and `making_emotion_delta`, and the `live` passed to `_build_reflection_prompt`, now mean "the x10 fix has run". Rename them if the name would mislead, and update every caller.
+- Consumes: `MemoryStore.x10_progress()`, `engine_files.switch_over_state` with `read_state`, and the `NUDGE_SCALE_FIX_PROGRESS_*` constants in `brain/dev_constants.py`, all from Engine 6.
+- The `live` parameters of `reach_emotions_for` and `making_emotion_delta`, and the `live` passed to `_build_reflection_prompt`, now mean "write the 0-10 scale". Rename them if the name would mislead, and update every caller.
 - `write_trace_memory` keeps its `monologue` argument, because the off branch still stores the raw thought. This replaces the earlier line that dropped it.
 
-**Open with ThinkerOfThoughts:** whether the cut is `NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE` (1) or `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` (2). That depends on whether a queued candidate written between the two steps gets multiplied. Settle it before Step 4. If they'd rather the scale change land on its own after Engine 7, split it into its own PR.
-
-**Overlap:** ThinkerOfThoughts' #656 touches `dream.py`, `research.py`, `creative_dna.py`, `crystallizers/reflex.py`, `growth/scheduler.py`, `relationship.py` and `making_runner.py`. Whichever lands second rebases.
+**Order:** after Engine 6 (#633), before Engine 7 (#635) is flipped. Built on #633's head and #722 before either merges, then rebased onto main with `git rebase --onto origin/main <last merge commit> <branch>` and the full gate re-run. ThinkerOfThoughts asked that it not start from #656. Whichever of the two lands second rebases.
 
 - [ ] **Step 1: Re-check the ground**
 
@@ -692,7 +700,7 @@ Run: `git grep -n "aggregate_state" -- brain/engines/dream.py brain/monologue/tr
 Expected: only the branches this task removes.
 
 Run: `git grep -n "is_live()" -- brain/notes brain/initiate brain/maker brain/kindled_link/relationship.py brain/engines/research.py`
-Expected: only the scale selections listed above, plus the research gate's read, which stays.
+Expected: the scale selections listed above, research's read (which stays), and `maker/sources.py`'s engine read, which Readers 2 removes.
 
 Re-read Engine 6 as merged before changing anything. In particular, confirm:
 - `faded_value` works on a deleted row. Task 8's test covers it, and the #726 trial merge with #633 passed it on 2026-11-12.
@@ -714,17 +722,26 @@ def test_note_keeps_todays_scale_before_the_x10_fix_runs():
     # a persona whose x10 progress is 0 (no switch-over yet): the note carries 0.12, which the next start multiplies
 ```
 
-Add one through-path test of each kind for reach-out (`run_initiate_review_tick`), making (`make_and_wire`), the peer memory (`run_relationship_reflection`) and the research fire. Each test goes through the real caller, not the pure function alone.
+The helper's rule matrix, tested once:
+- switched over and readable, progress 0: 0-10 (the switch check comes first);
+- not switched or unreadable, progress 1: 0-10 at cut 1, today's scale at cut 2 (the only case that tells the per-writer cut from a single one);
+- not switched or unreadable, progress 2: 0-10 at both cuts;
+- progress unreadable: today's scale;
+- the accepted edge (switched, state unreadable, progress 0): today's scale.
+
+Add one through-path test for reach-out (`run_initiate_review_tick`), making (`make_and_wire`) and the peer memory (`run_relationship_reflection`), each through the real caller. The making test sits at progress 1 and expects today's scale. The peer test makes the two choices differ (state unreadable, progress at least 1): the stored peer values are 0-10 and `apply_peer_emotion` takes its off branch. A `persona_dir=None` peer reflection keeps today's scale.
+
+Every test that passes on the old code by design (the "before the x10 fix" pins, making at progress 1, the accepted edge) carries `@pytest.mark.no_base_failure(reason=...)` from the start.
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `uv run pytest tests/unit/brain/tools tests/unit/brain/notes tests/unit/brain/initiate tests/unit/brain/maker tests/kindled_link tests/unit/brain/engines -k "first_person or unreadable or before_the_x10" -v`
-Expected: the schema test and every "unreadable" test fail. The "before the x10 fix" tests pass, because they pin today's behaviour.
+Run: `uv run pytest tests/unit/brain/tools tests/unit/brain/notes tests/unit/brain/initiate tests/unit/brain/maker tests/kindled_link tests/unit/brain/emotion -k "first_person or unreadable or before_the_x10 or scale_rule" -v`
+Expected: the schema test and every "unreadable" test fail. The marked tests pass, because they pin today's behaviour.
 
 - [ ] **Step 4: Delete, re-key and reword**
 
 1. Delete each `aggregate_state` branch and its import.
-2. Re-key the scale writers on the x10 note, read once per operation with a lazy import, and fail toward today's scale only when the database itself can't be read.
+2. Re-key the scale writers on the helper, read once per operation with a lazy import.
 3. Rewrite the off-path tests that pin the removed code, and delete the `test_today_*` pins whose writers are gone.
 4. Change the two schema descriptions to first person, which changes the Feed's voice. Approve the wording snapshot if it flags, and name the change in the PR body.
 

@@ -147,8 +147,14 @@ Tests: capture through the real `_dispatch_record_monologue` with a switch file 
 ### PR 7: cleanup (after Engine 6, before Engine 7; draft #742)
 
 - Delete the old `aggregate_state` branches in `engines/dream.py`, `monologue/trace.py`, `growth/scheduler.py`, `growth/crystallizers/creative_dna.py` and `growth/crystallizers/reflex.py`.
-- Key the scale writers on the x10 fix's progress note (`MemoryStore.x10_progress()`, from Engine 6) instead of `is_live()`. These are the note value, the reach-out, the making, the peer memory with its reflection prompt, and research's prompt and felt-line condition. Agreed on #633, 2026-11-16. `is_live()` is false both before the x10 fix runs, when small values are right because the next start multiplies them, and for a switched-over persona whose state can't be read, when they're wrong and nothing rescales them. The note tells the two apart. The cut (progress 1 or 2) is ThinkerOfThoughts' call.
-- The selections that read the engine keep their `is_live()` off branch: the monologue trace, the dream seeds, growth's vocabulary clustering and the research gate. That is Engine 6's own fail-safe for an unreadable state. `write_trace_memory` keeps its raw `monologue` argument for that branch.
+- Choose the scale writers' scale by a rule that tells "not switched over" from "state unreadable", instead of `is_live()` (agreed on #633, 2026-11-16). `is_live()` is false both before the x10 fix runs, when small values are right because the next start multiplies them, and for a switched-over persona whose state can't be read, when they're wrong and nothing rescales them. The rule, per write:
+  1. If `engine_files.switch_over_state(read_state())` says the persona is switched over, write 0-10.
+  2. Otherwise (not switched, or the state can't be read), the x10 fix's progress note (`MemoryStore.x10_progress()`) decides, with a cut for the step that rescales where the value lands. A value written straight to `memories.db` (the note's and reach-out's `initiate_outbound` values, the `kindled_peer` values) is 0-10 once progress is at least `NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE` (1). A `making` value, which goes to the pending queue, is 0-10 once progress is at least `NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED` (2), because the queue step is the only thing that multiplies a queued value.
+  3. If the progress can't be read, write today's scale.
+
+  One case stays small, accepted as a rare edge with a code comment: a switched persona whose state can't be read and whose `memories.db` reads progress 0 (rebuilt or new), because the x10 fix never runs for a switched persona.
+- Which selections move to this rule: one that only picks the scale of a stored value, together with the scale of a prompt whose answer is stored as that value. A selection that reads the engine, or that picks what the model is asked for and whether its answer is parsed, keeps `is_live()`. So all of `engines/research.py` stays on `is_live()` (research isn't an x10 type, and nothing there is rescaled). At `kindled_link/relationship.py` the reflection prompt's scale and the stored peer values follow the rule, while the `apply_peer_emotion` choice keeps `is_live()`.
+- The selections that read the engine keep their `is_live()` off branch: the monologue trace, the dream seeds, growth's vocabulary clustering and all of research. That is Engine 6's own fail-safe for an unreadable state. `write_trace_memory` keeps its raw `monologue` argument for that branch.
 - Change the `feed_digest` and `surface` descriptions in `tools/schemas.py` to first person. The Feed's voice changes here.
 
 ## 5. Wiring
@@ -164,7 +170,7 @@ Tests: capture through the real `_dispatch_record_monologue` with a switch file 
 | 5 grief | faded values of the dropped memory | breadcrumb row (not counted), recall |
 | 5 growth | short averages, faded values | crystallizer context, vocabulary blends |
 | 6 monologue note | `feed_digest`, `read()` | interior-continuity block, monologue recall, interest sweep |
-| 7 scale writers | the x10 fix's progress note in `memories.db` | the same memory rows PR 3 and PR 4 write, then the engine |
+| 7 scale writers | the switch-over state, then the x10 fix's progress note in `memories.db` | the same memory rows and queue entries PR 3 writes, then the engine |
 
 ## 6. Deferred / kept on purpose
 
