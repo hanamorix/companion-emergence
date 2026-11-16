@@ -236,11 +236,13 @@ def run_relationship_reflection(
     # Two choices (ThinkerOfThoughts' ruling on #633, B1 PR 7). The prompt's scale and the peer values stored from its
     # answer are one: the scale rule, cut 1, as a peer memory goes straight to memories.db. Whether the peer cap
     # (apply_peer_emotion) runs reads the engine, so it stays on `live`. With no memory store nothing is stored, so the
-    # prompt follows `live` as before. A live persona always writes the engine scale (the switch-over answer comes first).
+    # prompt follows `live` as before. A live persona always writes the engine scale, because the `live` branch below
+    # stores the answer as 0-10: `is_live()` remembers a switch-over it has seen, so it can be True while a fresh read
+    # of an unreadable state cannot tell.
     if persona_dir is not None and mem_store is not None:
         from brain.emotion.write_scale import writes_engine_scale
 
-        engine_scale = writes_engine_scale(
+        engine_scale = live or writes_engine_scale(
             Path(persona_dir), mem_store, cut=dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
         )
     else:
