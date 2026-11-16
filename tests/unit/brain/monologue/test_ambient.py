@@ -170,6 +170,7 @@ def test_live_collapses_whitespace(tmp_path):
     assert body.splitlines() == [LIVE_HEADER, "· she paused. then smiled"]
 
 
+@pytest.mark.no_base_failure(reason="#688 pins today's switch-off block byte for byte, so it passes on the old code by design")
 def test_switch_off_is_todays_block(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
     ts = [f"thought {i} " + "x" * 400 for i in range(5)]
@@ -181,6 +182,7 @@ def test_switch_off_is_todays_block(tmp_path):
     assert block == expected + "\n" + footer
 
 
+@pytest.mark.no_base_failure(reason="#688 pins that an unknown switch keeps today's block, so it passes on the old code by design")
 def test_unknown_switch_takes_today_path(tmp_path, monkeypatch):
     from tests.unit.brain.emotion._engine_support import refuse_the_switch_stat
 
@@ -215,6 +217,7 @@ def test_switch_read_failure_is_logged_and_takes_today_path(tmp_path, monkeypatc
     assert any("could not read the emotion switch" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.no_base_failure(reason="#688 pins that an in-memory store returns an empty block without raising, which the old code already does")
 def test_in_memory_store_takes_today_path():
     store = MemoryStore(":memory:")
     assert build_interior_continuity_block(store) == ""
