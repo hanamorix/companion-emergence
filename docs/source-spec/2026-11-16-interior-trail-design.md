@@ -48,7 +48,7 @@ Hana picked A on 2026-11-16.
 
 ### The block (`brain/monologue/ambient.py`)
 
-`build_interior_continuity_block` reads the switch once, with `engine_for(store.persona_dir).is_live()` and a lazy import. An error counts as off.
+`build_interior_continuity_block` reads the switch once, with `store.emotion_engine()` and `is_live()`. Any error counts as off and is logged, throttled.
 
 - **Off:** today's code path, unchanged.
 - **Live:**

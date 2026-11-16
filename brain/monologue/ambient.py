@@ -12,9 +12,14 @@ passes the cap, is cut). With the switch off, or when the switch cannot be read,
 """
 from __future__ import annotations
 
+import logging
+
 from brain import prompt_strings
 from brain.memory.store import MemoryStore
 from brain.monologue.trace import MONOLOGUE_TRACE_TYPE
+from brain.utils.log_throttle import warn_throttled
+
+logger = logging.getLogger(__name__)
 
 _AMBIENT_LIMIT = 5
 _CHAR_CAP = 1200
@@ -55,6 +60,11 @@ def build_interior_continuity_block(
         eng = store.emotion_engine()
         live = eng is not None and eng.is_live()
     except Exception:  # noqa: BLE001
+        warn_throttled(
+            logger,
+            "monologue.ambient.switch_read",
+            "interior block: could not read the emotion switch; using today's block",
+        )
         live = False
     texts = [" ".join(m.content.split()) for m in traces]  # collapse whitespace
     if live:

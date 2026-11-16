@@ -189,8 +189,30 @@ def test_unknown_switch_takes_today_path(tmp_path, monkeypatch):
         _queue_digest(store, tmp_path, d)
     refuse_the_switch_stat(monkeypatch)
     block = build_interior_continuity_block(store)
-    assert block.startswith(OLD_HEADER)
+    footer = block.splitlines()[-1]
+    ds = _digests(3, 220)
+    expected = "\n".join([OLD_HEADER] + ["· " + d for d in reversed(ds)])[:1200]
+    assert block == expected + "\n" + footer
     assert LIVE_HEADER not in block
+
+
+def test_switch_read_failure_is_logged_and_takes_today_path(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    store = MemoryStore(tmp_path / "memories.db")
+    write_trace_memory(store, "a thought", feed_digest="d", persona_dir=tmp_path, live=False)
+
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(store, "emotion_engine", boom)
+    with caplog.at_level(logging.WARNING, logger="brain.monologue.ambient"):
+        block = build_interior_continuity_block(store)
+    assert block.startswith(OLD_HEADER)
+    assert any("could not read the emotion switch" in r.getMessage() for r in caplog.records)
 
 
 def test_in_memory_store_takes_today_path():

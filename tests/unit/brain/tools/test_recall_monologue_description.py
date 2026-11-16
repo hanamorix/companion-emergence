@@ -1,4 +1,5 @@
 """The recall_monologue description must say only what is true (#688)."""
+
 from __future__ import annotations
 
 from brain.tools.schemas import SCHEMAS
