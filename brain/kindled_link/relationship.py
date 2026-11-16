@@ -75,10 +75,10 @@ def _live_peer_values(raw: object) -> dict[str, float]:
     return out
 
 
-def _build_reflection_prompt(*, current_stage: str, transcript: str, live: bool = False) -> str:
-    """The reflection prompt. ``live`` (the emotion engine's switch is on) asks for emotion values from 0 to 10."""
+def _build_reflection_prompt(*, current_stage: str, transcript: str, engine_scale: bool = False) -> str:
+    """The reflection prompt. ``engine_scale`` asks for emotion values from 0 to 10 (B1 PR 3; chosen by the scale rule, PR 7)."""
     seg = _REFLECTION_PROMPT_SEGMENTS
-    last = _REFLECTION_PROMPT_LAST_SEGMENT_LIVE if live else seg[2]
+    last = _REFLECTION_PROMPT_LAST_SEGMENT_LIVE if engine_scale else seg[2]
     return seg[0] + current_stage + seg[1] + transcript + last
 
 
@@ -233,6 +233,18 @@ def run_relationship_reflection(
     from brain.emotion.engine import engine_for
 
     live = persona_dir is not None and engine_for(Path(persona_dir)).is_live()  # B1 PR 3: off without a persona_dir
+    # Two choices (ThinkerOfThoughts' ruling on #633, B1 PR 7). The prompt's scale and the peer values stored from its
+    # answer are one: the scale rule, cut 1, as a peer memory goes straight to memories.db. Whether the peer cap
+    # (apply_peer_emotion) runs reads the engine, so it stays on `live`. With no memory store nothing is stored, so the
+    # prompt follows `live` as before. A live persona always writes the engine scale (the switch-over answer comes first).
+    if persona_dir is not None and mem_store is not None:
+        from brain.emotion.write_scale import writes_engine_scale
+
+        engine_scale = writes_engine_scale(
+            Path(persona_dir), mem_store, cut=dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
+        )
+    else:
+        engine_scale = live
     state = get_relationship_state(store, peer_id)
     # Atomically reserve the provider slot up front (race-safe vs a concurrent
     # gate/reflection call for the same peer); refund if the LLM call never
@@ -243,7 +255,7 @@ def run_relationship_reflection(
     # Slot reserved — the try spans the prompt build too, so any raise before the
     # call releases it (no leaked reservation; fail-soft to unchanged state).
     try:
-        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript, live=live)
+        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript, engine_scale=engine_scale)
         with throttle.background_slot() as granted:
             if not granted:
                 store.release_provider_slot(peer_id, today)  # no call → refund
@@ -329,6 +341,19 @@ def run_relationship_reflection(
                     mem_store, peer_id=peer_id, session_id=session_id,
                     speaker=persona_name, stage=state.stage,
                     content=memory_summary, emotions=_filter_to_registered(_live_peer_values(data.get("emotion"))),
+                )
+            elif memory_summary and engine_scale:
+                # 0-10 values, but the engine is not reading (a switched persona whose state cannot be read, or one the
+                # x10 fix rescaled before its switch-over), so the peer cap still holds her, as on today's path. The cap
+                # and its bucket count on today's small scale, so the values go in at a tenth and are stored at 0-10.
+                from brain.chat.extractor import _filter_to_registered
+
+                values = _filter_to_registered(_live_peer_values(data.get("emotion")))
+                applied = apply_peer_emotion(store, peer_id, {k: v / 10.0 for k, v in values.items()}, now)
+                write_kindled_peer_memory(
+                    mem_store, peer_id=peer_id, session_id=session_id,
+                    speaker=persona_name, stage=state.stage,
+                    content=memory_summary, emotions={k: v * 10.0 for k, v in applied.items()},
                 )
             elif memory_summary:
                 emotion_raw = data.get("emotion")

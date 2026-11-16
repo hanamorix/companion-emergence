@@ -654,15 +654,15 @@ SCHEMAS: dict[str, dict] = {
                     "minLength": 1,
                     "maxLength": 400,
                     "description": (
-                        "A short third-person summary in Nell's own framing for "
-                        "the inner-life Feed (e.g. 'she searched for Loopy and felt fond "
-                        "when nothing surfaced'). 1-2 sentences."
+                        "A short note of this thought in first person, in Nell's own "
+                        "framing, for her own memory and the inner-life Feed (e.g. 'I "
+                        "searched for Loopy and felt fond when nothing surfaced'). 1-2 sentences."
                     ),
                 },
                 "surface": {
                     "type": "boolean",
                     "description": (
-                        "Whether this monologue's third-person digest should appear "
+                        "Whether this monologue's note should appear "
                         "in the user-visible inner-life Feed. Default true. Set false "
                         "to keep a thought private — it still becomes part of your own "
                         "retained interior, it just isn't surfaced to your user."
