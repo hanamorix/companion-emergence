@@ -422,6 +422,9 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
 # Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
 # killed a healthy-but-slow bridge. 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
+# The bridge's start-up can outlast both: a first start waits for the engine lock while another process's emotion rebuild
+# holds it (Engine 6, HR5a, owner S101), and nothing here pauses for that wait yet, so a wait past 50 s is killed as a
+# failed start (the timers learn about the wait in a later part of HR5).
 _READINESS_BUDGET_S = 50.0
 
 
