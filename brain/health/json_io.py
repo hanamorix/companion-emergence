@@ -24,7 +24,8 @@ never quarantined by any policy.
 
 Writing: :func:`write_json` (atomic, optional ``.bak`` chain, optional verify-after-write),
 :func:`append_jsonl` (one write, torn-tail safe), :func:`write_jsonl`. Reading JSONL:
-:func:`iter_jsonl`, :func:`read_jsonl`, :func:`read_jsonl_tail`, :func:`parse_jsonl`.
+:func:`iter_jsonl`, :func:`read_jsonl`, :func:`read_jsonl_tail`, :func:`iter_jsonl_reversed` (rows from the last line back,
+for a reader that wants the newest matching row and stops there), :func:`parse_jsonl`.
 
 Output is always UTF-8 and pure ASCII (``ensure_ascii``): a torn write cannot cut a
 multi-byte character (#433), a raw U+2028 cannot split a line for a ``splitlines()`` reader,
@@ -55,10 +56,11 @@ import os
 import shutil
 import zlib
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -1147,39 +1149,78 @@ def read_jsonl_tail(
         raise JsonFileError(exc.path, "line", exc.reason, exc.line) from exc
 
 
+def _lines_backwards(f) -> Iterator[bytes]:
+    """The non-blank lines of an open binary file as bytes (CR stripped), last line first: the one chunked backward loop.
+
+    Reads ``_TAIL_CHUNK``-byte chunks from the end and yields each line as soon as its start is in hand, so a caller that
+    stops early reads no further back. Each byte is looked at once (a line longer than a chunk is not re-scanned). The
+    first line of the file has its byte-order mark removed."""
+    remaining = f.seek(0, os.SEEK_END)
+    head: deque[bytes] = deque()  # pieces of the partial line at the left edge of what has been read
+    while remaining > 0:
+        size = min(_TAIL_CHUNK, remaining)
+        remaining -= size
+        f.seek(remaining)
+        chunk = f.read(size)
+        if b"\n" not in chunk:
+            head.appendleft(chunk)  # the partial line extends further left; do not re-scan it
+            continue
+        parts = chunk.split(b"\n")
+        tail_line = parts[-1] + b"".join(head)  # the newline before it makes it complete
+        head = deque([parts[0]])
+        for line in [tail_line, *parts[-2:0:-1]]:  # rightmost complete line first
+            if line.strip():
+                yield line.rstrip(b"\r")
+    first = b"".join(head)  # the first line of the file
+    if first.startswith(_BOM):
+        first = first[len(_BOM) :]
+    if first.strip():
+        yield first.rstrip(b"\r")
+
+
 def _tail_lines(path: Path, n: int) -> list[bytes]:
-    """The last ``n`` non-blank lines as bytes (CR stripped), in file order. Each byte is looked at once."""
+    """The last ``n`` non-blank lines as bytes (CR stripped), in file order."""
     with open(path, "rb") as f:
-        remaining = f.seek(0, os.SEEK_END)
-        if remaining == 0:
-            return []
-        head: deque[bytes] = (
-            deque()
-        )  # pieces of the partial line at the left edge of what has been read
-        found: list[bytes] = []  # complete non-blank lines, rightmost first
-        while remaining > 0 and len(found) < n:
-            size = min(_TAIL_CHUNK, remaining)
-            remaining -= size
-            f.seek(remaining)
-            chunk = f.read(size)
-            if b"\n" not in chunk:
-                head.appendleft(chunk)  # the partial line extends further left; do not re-scan it
-                continue
-            parts = chunk.split(b"\n")
-            tail_line = parts[-1] + b"".join(head)  # the newline before it makes it complete
-            head = deque([parts[0]])
-            for line in [tail_line, *parts[-2:0:-1]]:  # rightmost complete line first
-                if line.strip():
-                    found.append(line.rstrip(b"\r"))
-                    if len(found) >= n:
-                        break
-        if remaining == 0 and len(found) < n:  # the head is the first line of the file
-            first = b"".join(head)
-            if first.startswith(_BOM):
-                first = first[len(_BOM) :]
-            if first.strip():
-                found.append(first.rstrip(b"\r"))
-    return found[::-1]
+        return list(islice(_lines_backwards(f), n))[::-1]
+
+
+def iter_jsonl_reversed(path: Path | str) -> Generator[dict, None, None]:
+    """Yield the dict records of a ``.jsonl`` file from its last line back to its first, reading only as far back as the caller goes.
+
+    For a reader that wants the newest row of some kind and stops there (``buffer.last_user_turn_ts``): the file is read in
+    ``_TAIL_CHUNK``-byte chunks from its end, and stopping the iteration (or ``close()``) closes the file. Each line is judged by
+    :func:`classify_line` like every other JSONL reader. A bad line (invalid UTF-8, malformed JSON, a line the parser cannot load,
+    not an object) is SKIPPED and the read goes on backwards, with one throttled warning per file (logger of this module) that names
+    the file and the line's position counted in non-blank lines from the end. Skipping is for read-only callers: the readers that
+    stop at an unloadable line (:func:`iter_jsonl`, :func:`read_jsonl_tail`) do it so a caller that rewrites or deletes what it
+    read does not lose data (#646). A missing file yields nothing; an I/O error warns (throttled) and yields nothing, as
+    :func:`iter_jsonl` does. A ``.gz`` path raises ``ValueError`` (a compressed file cannot be read backwards), at the call.
+    """
+    path = _as_path(path)
+    if path.suffix == ".gz":
+        raise ValueError(f"iter_jsonl_reversed cannot read a compressed file backwards: {path}")
+    return _reversed_rows(path)
+
+
+def _reversed_rows(path: Path) -> Generator[dict, None, None]:
+    try:
+        with open(path, "rb") as fh:
+            for position, raw in enumerate(_lines_backwards(fh), start=1):
+                verdict = classify_line(raw.decode("utf-8", "surrogateescape"))
+                if verdict.kind is not None:
+                    warn_throttled(
+                        logger,
+                        f"json_io:{path}:reversed_line",
+                        "skipping bad jsonl line %d from the end in %s: %s",
+                        position, path, verdict.reason or "",
+                        exc_info=False,
+                    )
+                elif verdict.data is not None:
+                    yield verdict.data
+    except FileNotFoundError:
+        return
+    except _JSONL_IO_ERRORS as exc:
+        yield from _io_stop(path, exc, Recovery.DEFAULT)
 
 
 def _payload(records, nonfinite: Nonfinite = "raise") -> bytes:

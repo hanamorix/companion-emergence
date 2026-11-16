@@ -17,7 +17,7 @@ import os
 import re
 import uuid
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,13 +25,12 @@ from brain.health.json_io import (
     Recovery,
     append_jsonl,
     encode_jsonl,
-    iter_jsonl,
+    iter_jsonl_reversed,
     read_json,
     read_jsonl,
     write_json,
     write_jsonl,
 )
-from brain.health.jsonl_reader import UnloadableJsonlLineError
 from brain.utils.atomic_write import fsync_dir, save_with_backup_text
 from brain.utils.file_lock import file_lock
 from brain.utils.file_ops import delete_file, list_dir, stat_path
@@ -439,14 +438,15 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _latest_user_ts_in_file(path: Path) -> datetime | None:
-    """The latest ``ts`` of a ``speaker == "user"`` row of one conversation file, read whole, or None.
+    """The ``ts`` of the last ``speaker == "user"`` row of one conversation file (the last in file order), or None.
 
-    A row whose ``ts`` does not parse is skipped with a warning, like a bad line. A line the JSON parser cannot load
-    (``UnloadableJsonlLineError``, #646) ends the read of THIS file with a warning: the rows before it count, the rows after
-    it are not seen. A file that cannot be read reads as empty (``iter_jsonl`` warns)."""
-    latest: datetime | None = None
-    try:
-        for row in iter_jsonl(path):
+    The file is read from its end backwards and the read stops at that row (``iter_jsonl_reversed``), so only a file with no
+    user row, or whose last user row sits near its start, is read to its start. A user row whose ``ts`` does not parse is
+    skipped with a warning and the read goes on backwards. A bad line, including one the JSON parser cannot load, is skipped
+    by the reader with its own warning, so it never hides an earlier user row. A file that cannot be read reads as empty
+    (the reader warns)."""
+    with closing(iter_jsonl_reversed(path)) as rows:
+        for row in rows:
             if row.get("speaker") != "user":
                 continue
             ts = lenient_utc(row.get("ts"))
@@ -456,14 +456,8 @@ def _latest_user_ts_in_file(path: Path) -> datetime | None:
                     exc_info=False,
                 )
                 continue
-            if latest is None or ts > latest:
-                latest = ts
-    except UnloadableJsonlLineError:
-        warn_throttled(
-            logger, "last_user_turn_ts:unloadable",
-            "last_user_turn_ts: %s has a line the JSON parser cannot load; the rest of that file is not read", path.name,
-        )
-    return latest
+            return ts
+    return None
 
 
 def _latest_user_ts_in_active_files(persona_dir: Path) -> datetime | None:
@@ -558,8 +552,8 @@ def _latest_user_ts_in_archive(persona_dir: Path, best: datetime | None) -> date
 def last_user_turn_ts(persona_dir: Path) -> datetime | None:
     """The ``ts`` (aware, UTC) of the user's last turn, from the conversation files, or None when no file holds one.
 
-    Active step: every ``active_conversations/*.jsonl`` read whole (a file holds about the newest forty raw turns), the
-    latest ``speaker == "user"`` row's ``ts`` across them. Archive step, always run, seeded with the active result (a
+    Every conversation file is read from its end backwards to its last ``speaker == "user"`` row (``_latest_user_ts_in_file``).
+    Active step: every ``active_conversations/*.jsonl``, the latest of those rows' ``ts`` across the files. Archive step, always run, seeded with the active result (a
     lingering active buffer must not hide a newer archived session; after a full fold the successor holds only a summary
     row): the archived sessions visited newest file first, each read from its last file backwards to the first that holds
     a user turn, the walk ending as soon as the best ``ts`` found (the active one included) is not older than the next

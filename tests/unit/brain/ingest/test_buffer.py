@@ -620,15 +620,15 @@ def fresh_throttle():
 
 @pytest.fixture
 def reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """The file names ``iter_jsonl`` is asked to read inside the buffer module, in order."""
+    """The file names ``iter_jsonl_reversed`` is asked to read inside the buffer module, in order."""
     seen: list[str] = []
-    real = buffer_mod.iter_jsonl
+    real = buffer_mod.iter_jsonl_reversed
 
     def spy(path, *args, **kwargs):
         seen.append(Path(path).name)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(buffer_mod, "iter_jsonl", spy)
+    monkeypatch.setattr(buffer_mod, "iter_jsonl_reversed", spy)
     return seen
 
 
@@ -678,7 +678,7 @@ def test_last_user_turn_ts_reads_a_naive_ts_as_utc(tmp_path: Path) -> None:
 
 
 def test_last_user_turn_ts_converts_an_offset_ts_to_utc(tmp_path: Path) -> None:
-    _active(tmp_path, "sess_o", [_row("user", "2026-03-10T15:00:00+02:00"), _row("user", "2026-03-10T10:00:00Z")])
+    _active(tmp_path, "sess_o", [_row("user", "2026-03-10T10:00:00Z"), _row("user", "2026-03-10T15:00:00+02:00")])
     assert buffer_mod.last_user_turn_ts(tmp_path) == datetime(2026, 3, 10, 13, 0, 0, tzinfo=UTC)
 
 
@@ -889,7 +889,7 @@ def test_last_user_turn_ts_goes_on_to_the_archive_when_the_active_folder_cannot_
 
 
 @pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
-def test_last_user_turn_ts_stops_a_file_at_an_unloadable_line_keeps_what_it_read_and_warns(
+def test_last_user_turn_ts_reads_back_from_the_end_so_an_unloadable_line_before_the_last_user_row_is_never_reached(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, fresh_throttle
 ) -> None:
     huge = '{"speaker": "user", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
@@ -900,9 +900,121 @@ def test_last_user_turn_ts_stops_a_file_at_an_unloadable_line_keeps_what_it_read
         encoding="utf-8",
     )
     _active(tmp_path, "sess_fine", [_row("user", _hours(1))])
+    with caplog.at_level(logging.DEBUG):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
+def test_last_user_turn_ts_skips_an_unloadable_line_after_the_last_user_row_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    huge = '{"speaker": "assistant", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
+    path = tmp_path / "active_conversations" / "sess_big.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(_row("user", _hours(2))) + "\n" + json.dumps(_row("user", _hours(5))) + "\n" + huge + "\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="brain.health.json_io"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(5)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].name == "brain.health.json_io"  # the reader's own warning, not the caller's
+    assert "sess_big.jsonl" in warnings[0].getMessage()
+    assert "from the end" in warnings[0].getMessage()
+
+
+def test_last_user_turn_ts_takes_the_last_user_row_not_the_largest_ts(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_order", [_row("user", _hours(9)), _row("assistant", _hours(10)), _row("user", _hours(4))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(4)
+
+
+def test_last_user_turn_ts_finds_a_user_row_more_than_one_read_chunk_from_the_end(tmp_path: Path, reads: list[str]) -> None:
+    filler = [_row("assistant", _hours(2 + i / 1000), text="x" * 200) for i in range(120)]  # about 30 KB, over three 8 KB chunks
+    _active(tmp_path, "sess_deep", [_row("user", _hours(1))] + filler)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(1)
+    assert reads == ["sess_deep.jsonl"]  # read through the backward reader
+
+
+def test_last_user_turn_ts_reads_a_line_longer_than_a_read_chunk(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_long", [_row("user", _hours(3), text="y" * 30000), _row("assistant", _hours(4))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert reads == ["sess_long.jsonl"]
+
+
+def test_last_user_turn_ts_skips_a_torn_last_line(tmp_path: Path, reads: list[str], fresh_throttle) -> None:
+    path = _active(tmp_path, "sess_torn", [_row("user", _hours(2))])
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"speaker": "user", "ts": "2026-03-1')  # a write cut short: no newline, not JSON
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+    assert reads == ["sess_torn.jsonl"]
+
+
+def test_last_user_turn_ts_of_an_empty_file_is_none(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_empty", [])
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert reads == ["sess_empty.jsonl"]
+
+
+def test_last_user_turn_ts_of_a_file_with_no_user_row_is_none(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_none", [_row("assistant", _hours(1)), _row("summary", _hours(2))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert reads == ["sess_none.jsonl"]
+
+
+def test_last_user_turn_ts_goes_back_past_a_user_row_with_an_unusable_ts_to_a_good_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, reads: list[str], fresh_throttle
+) -> None:
+    _active(tmp_path, "sess_bad", [_row("user", _hours(2)), _row("user", "not a time"), _row("assistant", _hours(5))])
     with caplog.at_level(logging.WARNING, logger="brain.ingest.buffer"):
         assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
     assert [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert reads == ["sess_bad.jsonl"]
+
+
+def test_last_user_turn_ts_reads_a_file_deleted_after_it_was_listed_as_no_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = _active(tmp_path, "gone", [_row("user", _hours(9))])
+    _active(tmp_path, "kept", [_row("user", _hours(2))])
+    real = buffer_mod.iter_jsonl_reversed
+
+    def delete_then_read(path, *args, **kwargs):
+        if Path(path).name == "gone.jsonl":
+            gone.unlink()
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(buffer_mod, "iter_jsonl_reversed", delete_then_read)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_of_an_archived_session_goes_back_a_segment_when_the_last_has_no_user_row(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _archived(tmp_path, "sess_s.000.jsonl", [_row("user", _hours(3)), _row("assistant", _hours(3.5))])
+    _archived(tmp_path, "sess_s.001.jsonl", [_row("assistant", _hours(4)), _row("summary", _hours(4.5))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert reads == ["sess_s.001.jsonl", "sess_s.000.jsonl"]
+
+
+def test_last_user_turn_ts_stops_reading_a_file_at_its_last_user_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.health import json_io
+
+    monkeypatch.setattr(json_io, "_TAIL_CHUNK", 64)
+    rows = [_row("user", _hours(1))] + [_row("assistant", _hours(2), text="z" * 60)] + [_row("user", _hours(3))]
+    _active(tmp_path, "sess_stop", rows + [_row("assistant", _hours(4))])
+    seen: list[int] = []
+    real_read = json_io._lines_backwards
+
+    def counting(fh):
+        for line in real_read(fh):
+            seen.append(len(line))
+            yield line
+
+    monkeypatch.setattr(json_io, "_lines_backwards", counting)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert len(seen) == 2  # the last assistant row, then the user row; the older rows were not read
 
 
 def test_last_user_turn_ts_reads_a_listed_file_that_cannot_be_opened_as_no_turn_and_goes_on(

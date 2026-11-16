@@ -27,6 +27,7 @@ Use these for every JSON/JSONL read or write; do not call json.load/open/os.repl
 | `read_jsonl` | brain/health/json_io.py:914 | iter_jsonl collected into a list. |
 | `iter_jsonl_raw` | brain/health/json_io.py:920 | Like iter_jsonl but yields (line_text, record), for callers that must rewrite the lines exactly as read or still see unparsable lines. |
 | `read_jsonl_tail` | brain/health/json_io.py:1050 | Return the records on the last n non-blank lines, reading backwards in byte chunks so the I/O is bounded. |
+| `iter_jsonl_reversed` | brain/health/json_io.py:1187 | Yield the dict records of a .jsonl file from the last line back, reading only as far back as the caller goes (for "the newest row that matches"); a bad line is skipped with a throttled warning naming its position from the end; a missing file yields nothing; a .gz path raises ValueError. |
 | `append_jsonl` | brain/health/json_io.py:1145 | Append dict records as JSONL in one write under the file lock; starts with a newline if the file ends in a torn line; returns bytes written. |
 | `write_jsonl` | brain/health/json_io.py:1212 | Atomically replace a JSONL file with the given records (same writer as write_json). |
 | `write_jsonl_bytes` | brain/health/json_io.py | Atomically replace a JSONL file with bytes written exactly as given (lines kept as `iter_jsonl_raw` read them, valid UTF-8 or not); must end in a newline; raises on a fault with the file as it was. |
@@ -273,4 +274,4 @@ Live in utils but read the MemoryStore.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `last_user_turn_ts` | brain/ingest/buffer.py:558 | The time (aware, UTC) of the user's last turn, from the conversation files only: every active file read whole, then the archive walk (newest session file first, bounded by file modification times) seeded with the active result, so the answer is the later of the two; None if none. Creates no folder. The one source for `days_since_human` and the user-presence silence. |
+| `last_user_turn_ts` | brain/ingest/buffer.py:552 | The time (aware, UTC) of the user's last turn, from the conversation files only: every active file read from its end backwards to its last user row (`iter_jsonl_reversed`), then the archive walk (newest session file first, bounded by file modification times) seeded with the active result, so the answer is the later of the two; None if none. Creates no folder. The one source for `days_since_human` and the user-presence silence. |
