@@ -564,6 +564,9 @@ def faded_emotion(
         raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}") from None
     created = lenient_utc(memory.created_at)
     if switch_over_at is None or created is None:
+        # Accepted edge (HR4, P4): a persona `ensure_engine_ready` left not live (an unreadable state with a memories.db
+        # failing its integrity check, or a RebuildStateWriteError on an unreadable state) gets no fading until a later
+        # start succeeds. See "Accepted edges" in docs/source-spec/2026-11-16-emotion-rework-engine-6-as-built.md.
         return stored
     age_days = (now - max(created, switch_over_at)).total_seconds() / 86400.0
     floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION.get(canonical_name(emotion))
