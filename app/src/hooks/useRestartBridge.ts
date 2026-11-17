@@ -230,7 +230,7 @@ export function showEngineProgress(reading: EngineProgress | null): void {
  * resolves true) and reset to idle. Inside a restart run(): clear only the progress it showed, because a full reset would
  * clear `errorDetail`, which `stopBridgeThen` reads. Safe to call with nothing shown.
  */
-export function endEngineProgress(): void {
+export function endEngineProgress(_ok?: boolean): void {
   const release = releaseHold;
   const shown = engineShown;
   releaseHold = null;

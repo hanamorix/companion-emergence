@@ -1041,8 +1041,22 @@ describe("useRestartBridge: the start-up progress on the screens (HR5 part 5)", 
     act(() => {
       joined = restartBridge(PERSONA); // a restart asked for while a launch holds the start joins it
     });
-    act(() => endEngineProgress());
+    act(() => endEngineProgress(true)); // the start succeeded
     await expect(joined).resolves.toBe(true);
+    expect(restartInFlight()).toBe(false);
+    expect(result.current.state).toBe("idle");
+    expect(result.current.progress).toBeNull();
+  });
+
+  it("(HN7) a restart that joined the launch's hold is told the start's real outcome: false when the start failed", async () => {
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => showEngineProgress(REC));
+    let joined: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      joined = restartBridge(PERSONA);
+    });
+    act(() => endEngineProgress(false)); // the start threw
+    await expect(joined).resolves.toBe(false);
     expect(restartInFlight()).toBe(false);
     expect(result.current.state).toBe("idle");
     expect(result.current.progress).toBeNull();
@@ -1050,14 +1064,14 @@ describe("useRestartBridge: the start-up progress on the screens (HR5 part 5)", 
 
   it("a reading that goes absent takes the line down, and endEngineProgress with nothing shown does nothing", () => {
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    act(() => endEngineProgress());
+    act(() => endEngineProgress(true));
     expect(result.current.state).toBe("idle");
     expect(restartInFlight()).toBe(false);
     act(() => showEngineProgress(REC));
     expect(result.current.progress).toBe(REC_LINE);
     act(() => showEngineProgress(null));
     expect(result.current.progress).toBeNull();
-    act(() => endEngineProgress());
+    act(() => endEngineProgress(true));
     expect(restartInFlight()).toBe(false);
     expect(result.current.state).toBe("idle");
   });
