@@ -148,7 +148,7 @@ def test_a_refused_create_leaves_no_folder_it_made_wherever_it_was_moved_703(env
 
     monkeypatch.setattr(commit_mod, "_open_final", open_then_move)
     done = _commit(env, rid)
-    assert done["ok"] is False and done["error"].endswith("moved into a protected location while it was opened"), done
+    assert done == {"ok": False, "error": f"refused: {notes / 'a' / 'b' / 'rc'} moved into a protected location while it was opened"}
     assert pending.get(env["persona"], rid)["status"] == "refused"
     assert _last_audit_event(env) == "commit_refused"
     if moved == "Notes":
@@ -179,7 +179,10 @@ def test_a_made_folder_is_found_when_its_parent_was_not_ours_and_was_moved_703(e
 
     monkeypatch.setattr(commit_mod, "_open_final", open_then_move)
     done = _commit(env, rid)
-    assert done["ok"] is False and pending.get(env["persona"], rid)["status"] == "refused", done
+    assert done == {"ok": False, "error": f"refused: {notes / 'a' / 'b' / 'rc'} moved into a protected location while it was opened"}
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+    assert _last_audit_event(env) == "commit_refused"
+    assert list(notes.iterdir()) == []
     assert (ssh / "a").is_dir() and list((ssh / "a").iterdir()) == []  # theirs stays where the racer put it; ours is gone
 
 

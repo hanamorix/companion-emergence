@@ -153,9 +153,14 @@ def test_a_handle_at_a_drive_root_still_refuses_cleanly_and_removes_the_folders_
     real_open_final = commit_mod._open_final
     monkeypatch.setattr("brain.files.write_guard._is_windows", lambda: True)
     monkeypatch.setattr(commit_mod, "_open_final", lambda name, op, dir_fd: real_open_final(str(ssh / "rc"), op, dir_fd))
-    monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: str(Path(Path.cwd().anchor) / "rc"))
+    shallow = str(Path(Path.cwd().anchor) / "rc")
+    monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: shallow)
+    import os
+
+    real_unlink = os.unlink  # the refusal removes the file at the real location: keep that inside this test's tmp
+    monkeypatch.setattr(os, "unlink", lambda p, *a, **k: real_unlink(p, *a, **k) if str(p).startswith(str(env["home"])) else None)
     done = _commit(env, rid)
-    assert done["ok"] is False and done["error"].startswith("refused:"), done
+    assert done == {"ok": False, "error": f"refused: {notes / 'a' / 'b' / 'rc'} leads to {shallow} now"}
     assert pending.get(env["persona"], rid)["status"] == "refused"
     assert _last_audit_event(env) == "commit_refused"
     assert list(notes.iterdir()) == []
