@@ -773,7 +773,6 @@ const JOB_LABEL_PAREN_SPACE = " ";
 const JOB_DESCRIPTORS: Record<string, string> = {
   pass2: "follow-up memory pass",
   session_snapshot_prune: "conversation snapshot",
-  emotion_backfill: "emotion tagging",
   embedding_backfill: "memory indexing",
   rerank_width_remeasure: "re-scoring cost check",
   cosine_floor_bootstrap: "similarity pass mark setup",

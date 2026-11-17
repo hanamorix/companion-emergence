@@ -313,7 +313,7 @@ def _describe_stubs(
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
     described = 0
-    # F2: mirror emotion_backfill's throttle pattern — wrap each batch in a
+    # F2: wrap each batch in a
     # background slot so interactive chat is never displaced.
     from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
 

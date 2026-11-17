@@ -3902,24 +3902,9 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
-    def has_active_without_emotions(self) -> bool:
-        """True when some active memory has an empty stored emotion vector.
-
-        The emotion backfill's work probe: it streams only the ``emotions_json`` column and stops at the first empty vector,
-        instead of loading every active row (with its embedding) the way `list_active` does.
-        """
-        cur = self._conn.execute("SELECT emotions_json FROM memories WHERE active = 1")
-        try:
-            for (emotions_json,) in cur:
-                if not json.loads(emotions_json):
-                    return True
-            return False
-        finally:
-            cur.close()
-
     @staticmethod
     def has_stored_emotions(memory: Memory) -> bool:
-        """True when the memory carries any stored emotion (the emotion backfill's emptiness check on a loaded row).
+        """True when the memory carries any stored emotion (the emotion tagger's emptiness check on a loaded row).
 
         A check of whether the row was ever given feelings, not a read of their values: the values go through `memory_feelings`.
         """

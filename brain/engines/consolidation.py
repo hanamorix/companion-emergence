@@ -41,6 +41,7 @@ from brain.dev_constants import MONOLOGUE_MERGE_TYPES
 from brain.emotion import engine
 from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import append_jsonl
+from brain.ingest.emotion_tagger import EmotionTagger, make_emotion_tagger, tag_if_feelingless
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
@@ -59,6 +60,7 @@ from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
 from brain.utils.llm_output import find_json_object_block
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +232,7 @@ def run_consolidation(
     hebbian: HebbianMatrix | None = None,
     salience_floor: float | None = None,
     reappraiser: Reappraiser | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> ConsolidationResult:
     """Drain the pending queue and consolidate, under a non-blocking gate lock.
 
@@ -249,6 +252,9 @@ def run_consolidation(
         builds the Haiku-backed default when `provider` is given, else
         degrades to the no-op fallback (importance unchanged) — mirrors the
         classifier's degrade-to-`_promote_all_classifier` pattern.
+    emotion_tagger: tags a memory that is written without feelings (`tag_if_feelingless`): a promoted candidate, a merge
+        target, a recalled row. None (default) builds the provider-backed tagger when `provider` is given; with neither,
+        no memory is tagged and no model call is made.
     """
     persona_dir = Path(persona_dir)
     lock_path = persona_dir / _GATE_LOCK_FILENAME
@@ -272,7 +278,9 @@ def run_consolidation(
                 if provider is not None
                 else _noop_reappraiser
             )
-        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser)
+        if emotion_tagger is None and provider is not None:
+            emotion_tagger = make_emotion_tagger(provider)
+        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser, emotion_tagger)
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
 
@@ -288,6 +296,7 @@ def _run_locked(
     hebbian: HebbianMatrix | None,
     salience_floor: float | None,
     reappraiser: Reappraiser | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> ConsolidationResult:
     pending = PendingQueue(persona_dir)
     # Claimed, not drained: the batch stays in a processing file until each item is settled, so an exception or a kill
@@ -305,7 +314,7 @@ def _run_locked(
 
     result = ConsolidationResult(batch=len(candidate_entries))
     if reappraise_entries and _handle_reappraisals(
-        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result
+        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result, emotion_tagger
     ):
         claim.close()
         return result
@@ -382,7 +391,7 @@ def _run_locked(
                 # `UnusableClassifierReply`, re-raised above, and the candidate is quarantined.
                 raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
             decision = _clean_decision(decision)
-            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded, emotion_tagger)
             claim.settle(entry)
         except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
             # The decision's target is named in the log so a link lost to a failed post-save step can be rebuilt.
@@ -877,6 +886,7 @@ def _handle_reappraisals(
     entries: list[dict],
     reappraiser: Reappraiser,
     result: ConsolidationResult,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> bool:
     """Process Change-3 existing-memory re-appraise items: load the target
     row, compute a new importance (and names) via the injectable `reappraiser`,
@@ -934,7 +944,7 @@ def _handle_reappraisals(
                 claim.settle(entry)
                 continue
             result.reappraised += 1
-            _write_back_faded_emotions(store, persona_dir, memory)
+            _write_back_faded_emotions(store, persona_dir, memory, emotion_tagger)
             _remove_not_names(persona_dir, memory, names, not_names)
             _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
             claim.settle(entry)
@@ -944,18 +954,54 @@ def _handle_reappraisals(
     return False
 
 
-def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Memory) -> None:
+def _tag_feelingless_soft(
+    store: MemoryStore, tagger: EmotionTagger | None, memory_id: str, site: str, memory: Memory | None = None
+) -> None:
+    """`tag_if_feelingless` as a gate step that never fails the item: any failure (the tagger's deferred call included) leaves the
+    row untagged and is logged, and the gate carries on and settles the item as it would have, so a row that is already written is
+    never judged, merged or faded again (a retried merge would merge a second time). The row is tried again at its next recall,
+    and a deferred call ends the pass at the judge's own next call.
+
+    ``memory`` is the row when the caller holds it (the promoted candidate, the recalled row); without it the row is read as the
+    gate's other maintenance reads are (no recall bump), inside the same fail-soft step, and a row gone since the write is left alone.
+    """
+    if tagger is None:
+        return
+    try:
+        row = memory if memory is not None else store.get(memory_id, bump=False)
+        if row is not None:
+            tag_if_feelingless(store, tagger, row)
+    except Exception as exc:  # noqa: BLE001 — a lost tag costs one tagging; the write it follows has committed
+        warn_throttled(
+            logger,
+            "consolidation.emotion_tag",
+            "consolidation gate: emotion tagging failed at the %s for memory %s (%s: %s); row left without feelings",
+            site,
+            memory_id,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def _write_back_faded_emotions(
+    store: MemoryStore, persona_dir: Path, memory: Memory, emotion_tagger: EmotionTagger | None = None
+) -> None:
     """The temp-gate write-back, once the engine is live: the row's emotions become their faded values and its ``created_at``
     becomes now, in one store write (`refresh_faded_emotions`, no hook), which also puts the date the row had before the reset at
     the start of its text when it is not there yet. Every memory type and state, a row without emotions included (its
     ``created_at`` is still reset). Runs after the importance update committed.
 
-    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
-    have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
+    A row without emotions is tagged first (`tag_if_feelingless`), before the engine-live return, so a persona whose engine is not
+    live is tagged too, and the re-read below and the refresh carry the tags.
+
+    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and another write may have
+    put emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
     BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
     neither requeued nor settled as failed, so the outer per-item handler never sees it. A row whose stored emotion the read leaves
     out is skipped the same way (logged, left as it was), because the write replaces the row's whole map.
     """
+    _tag_feelingless_soft(store, emotion_tagger, memory.id, "recall write-back", memory)
     try:
         live_engine = engine.engine_for(persona_dir)
         if not live_engine.is_live():
@@ -1026,6 +1072,7 @@ def _dispatch(
     decision: Decision,
     result: ConsolidationResult,
     embedded: tuple[np.ndarray, str] | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> None:
     verdict = decision.verdict if decision.verdict in VERDICTS else "new"
 
@@ -1100,6 +1147,7 @@ def _dispatch(
             # - A rebuild or a catch-up counts the merged target row's current emotions once and does not restore this separate
             #   mood move (the merged memory has no row and the merge writes no change-log line): a lost event, one merge's worth.
             engine.engine_for(persona_dir).on_memory_committed(cand)
+        _tag_feelingless_soft(store, emotion_tagger, decision.target_id, "merge")
         result.merged += 1
         return
 
@@ -1133,6 +1181,8 @@ def _dispatch(
         )
     if verdict in ("correction", "continuation") and decision.target_id and hebbian is not None:
         hebbian.set_edge_weight(cand.id, decision.target_id, ASSOC_WEIGHT)
+    # Last, after the row, its embedding and its edge: a promoted row without feelings is tagged (the row holds what `cand` holds).
+    _tag_feelingless_soft(store, emotion_tagger, cand.id, "promote", cand)
 
     if verdict == "correction":
         result.corrections += 1

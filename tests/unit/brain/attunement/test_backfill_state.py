@@ -178,7 +178,7 @@ def test_run_backfill_default_detector_threads_identity(tmp_path: Path):
 
 def test_run_backfill_does_not_complete_when_every_detector_call_errors(tmp_path: Path):
     """#144: a window where every detector call raised must stay retryable,
-    mirroring emotion_backfill's zero-tagged guard."""
+    the zero-tagged guard."""
     _make_buffer_file(tmp_path, n_turns=25)
 
     def exploding_detector(*, buffer_slice, reply_text):

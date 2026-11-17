@@ -799,6 +799,35 @@ REMOVED: tuple[Removed, ...] = (
         ref="#653 (draft PR #656)",
         kind="code",
     ),
+    # --- the emotion backfill job (#747) -----------------------------------------------------------------------------------
+    Removed(
+        names=(
+            "run_emotion_backfill",
+            "has_emotion_backfill_work",
+            "should_run_emotion_backfill",
+            "EmotionBackfillState",
+            "_make_default_tagger",
+            "has_active_without_emotions",
+            "emotion_backfill",
+            "emotion_backfill_state.json",
+            "emotion_backfill_budget.json",
+        ),
+        why="the emotion backfill is a step of the consolidation gate (a written or recalled memory without feelings is tagged by `tag_if_feelingless`), so the idle job with its cursor, daily cap, pacing, yield-to-chat and two state files is gone; the prompt-string section `[ingest.emotion_backfill]` keeps its name by design, and the tagger now lives in brain/ingest/emotion_tagger.py",
+        ref="#747 (draft PR #656)",
+        kind="code",
+    ),
+    Removed(
+        names=("brain/ingest/emotion_backfill.py",),
+        why="the emotion backfill module was deleted with the job (#747)",
+        ref="#747 (draft PR #656)",
+        kind="file",
+    ),
+    Removed(
+        names=("emotion_backfill",),
+        why="the app's status label for the removed emotion backfill job (#747)",
+        ref="#747 (draft PR #656)",
+        scope=("app/src",),
+    ),
 )
 
 
