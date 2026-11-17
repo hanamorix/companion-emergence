@@ -370,7 +370,8 @@ def test_a_writer_with_no_token_removes_its_own_record_and_the_reader_sees_it_on
 def test_a_writer_with_no_token_leaves_a_record_that_names_a_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A record with a token is not this token-less writer's: keep it (data safety)."""
     own = process_identity.own_token()
-    assert own is not None, "this test needs a platform where the token can be read"
+    if own is None:
+        pytest.skip("this test needs a platform where the token can be read")
     progress = engine_files.EngineProgress(tmp_path, "rebuilding")
     progress.write()
     before = engine_files.progress_path(tmp_path).read_bytes()

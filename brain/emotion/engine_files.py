@@ -348,7 +348,7 @@ class EngineProgress:
     tried when it is attempted, so a blocked writer does not read the file again for every row. ``remove()`` deletes only a record
     that names this process's pid and token (``process_identity.is_own_identity``); with no token to read (``own_token()`` is
     None) the record carries none and is still removed, so a bridge that cannot read its own token does not leave a record
-    that reads as live for as long as it runs.
+    that reads as live for as long as it runs. A record that names a token is not removed by a writer with none.
     """
 
     def __init__(self, persona_dir: Path, phase: str) -> None:

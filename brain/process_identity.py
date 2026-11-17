@@ -161,7 +161,8 @@ def own_token() -> str | None:
     """This process's token, or None when it cannot be read here.
 
     The first answer stands for the life of the process, a failed read included: a bridge that recorded no token
-    (runner.py, identity "unavailable") must keep matching its own record in ``is_own_identity``.
+    (runner.py, identity "unavailable") must keep matching its own record in ``is_own_identity`` (``state_file.update``,
+    the engine's progress record).
     """
     global _OWN
     if _OWN is None:

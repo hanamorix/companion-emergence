@@ -260,6 +260,13 @@ def test_is_own_identity_is_false_for_another_pid_or_none(monkeypatch):
     assert not pi.is_own_identity(None, None)
 
 
+def test_is_own_identity_does_not_take_a_bool_for_a_pid(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    monkeypatch.setattr(pi, "own_pid", lambda: 1)  # True == 1: only the bool check keeps it out
+    assert not pi.is_own_identity(True, None)
+    assert pi.is_own_identity(1, None)
+
+
 def test_names_this_bridge_lives_only_in_process_identity():
     from brain.bridge import shutdown_progress
 
