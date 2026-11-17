@@ -845,7 +845,7 @@ def test_release_tree_when_the_root_kill_was_started_kills_the_frozen_root_and_d
 
 
 @pytest.mark.no_base_failure(reason="pins the no-op for a root already gone, which the new root kill relies on; base never touches the root here")
-def test_release_tree_when_the_root_kill_was_started_and_the_root_is_already_gone_raises_nothing_and_kills_the_rest(tmp_path, fake):
+def test_release_tree_when_the_root_kill_was_started_and_the_root_is_already_gone_still_kills_the_rest(tmp_path, fake):
     b = fake()
     root, remembered = _root_of(b)
     root.suspend()
