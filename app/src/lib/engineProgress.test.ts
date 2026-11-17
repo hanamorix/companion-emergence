@@ -133,25 +133,25 @@ describe("waitForHealth", () => {
   });
 
   it("takes one more read before giving up, so a record that appeared since the last read is seen", async () => {
-    // each loop is 700 ms of probe + 500 ms of waiting, so ticks do not line up with the 5 s reads
+    // Each loop is 1200 ms of probe + 500 ms of waiting, so the ticks fall at 1200 + 1700k ms: the due reads land at 1.2, 6.3,
+    // 11.4, 16.5, 21.6 and 26.7 s, and the first tick past the 30 s deadline (30.1 s) is not due for a read of its own.
     const slowDown = async (): Promise<never> => {
-      await sleep(700);
+      await sleep(1200);
       throw new Error("down");
     };
+    const start = Date.now();
     const reads: number[] = [];
     status.mockImplementation(async () => {
-      reads.push(Date.now());
-      return ABSENT as never;
+      reads.push(Date.now() - start);
+      // the record appears at 28 s, after the last due read (26.7 s) and before the give-up tick
+      return (Date.now() - start >= 28_000 ? SHOWN : ABSENT) as never;
     });
-    let settledAt = 0;
+    const settled = vi.fn();
     const p = waitForHealth("p", slowDown, HEALTH_WAIT_MS);
-    void p.then(() => {
-      settledAt = Date.now();
-    });
-    await vi.advanceTimersByTimeAsync(HEALTH_WAIT_MS + 3 * STATUS_POLL_MS);
-    await expect(p).resolves.toBe(false);
-    expect(reads.length).toBeGreaterThan(0);
-    expect(settledAt - reads[reads.length - 1]).toBeLessThanOrEqual(100);
+    p.then(settled, settled);
+    await vi.advanceTimersByTimeAsync(30_500);
+    expect(reads[reads.length - 1]).toBeGreaterThanOrEqual(30_000); // the extra read, at the tick that would have given up
+    expect(settled).not.toHaveBeenCalled(); // it saw the record, so the wait goes on
   });
 });
 

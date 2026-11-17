@@ -33,7 +33,7 @@ import {
   shutdownBridge,
 } from "../bridge";
 import { ensureBridgeRunning } from "../appConfig";
-import { alongside, waitForHealth } from "../lib/engineProgress";
+import { alongside, waitForHealth, type EngineProgressCallback } from "../lib/engineProgress";
 import { errString } from "../lib/errString";
 import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS, REQUEST_TIMEOUT_MS, STATUS_POLL_MS } from "../lib/requestTimeout";
 
@@ -128,7 +128,7 @@ export function probeHealth(persona: string): Promise<unknown> {
 }
 
 /** Wait for a starting bridge's /health: TIMEOUT_HEALTH_MS, paused while the engine's start-up record shows. */
-async function pollHealth(persona: string, onProgress?: (reading: EngineProgress | null) => void): Promise<void> {
+async function pollHealth(persona: string, onProgress?: EngineProgressCallback): Promise<void> {
   if (!(await waitForHealth(persona, () => probeHealth(persona), TIMEOUT_HEALTH_MS, onProgress))) {
     throw new Error("/health poll window expired");
   }
