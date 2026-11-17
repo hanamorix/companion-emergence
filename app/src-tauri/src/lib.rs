@@ -520,18 +520,36 @@ fn engine_progress_shown(status: &serde_json::Value) -> Option<bool> {
 /// this gives up (which kills the command, `kill_on_drop`).
 async fn wait_for_start<T, R, S, SF>(
     budget: std::time::Duration,
-    _poll: std::time::Duration,
+    poll: std::time::Duration,
     run: R,
-    _read_status: S,
+    mut read_status: S,
 ) -> Result<T, StartWaitTimeout>
 where
     R: std::future::Future<Output = T>,
     S: FnMut() -> SF,
     SF: std::future::Future<Output = Option<bool>>,
 {
-    tokio::time::timeout(budget, run)
-        .await
-        .map_err(|_| StartWaitTimeout)
+    tokio::pin!(run);
+    let mut remaining = budget;
+    let mut paused = false;
+    loop {
+        let step = if paused { poll } else { poll.min(remaining) };
+        let began = std::time::Instant::now();
+        if let Ok(done) = tokio::time::timeout(step, &mut run).await {
+            return Ok(done);
+        }
+        // A reading with no field (a timed-out status read) leaves the previous one standing. The step and the read both
+        // count against the budget, unless the reading says a rebuild is running.
+        if let Some(shown) = read_status().await {
+            paused = shown;
+        }
+        if !paused {
+            remaining = remaining.saturating_sub(began.elapsed());
+            if remaining.is_zero() {
+                return Err(StartWaitTimeout);
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -3313,9 +3331,21 @@ mod bridge_stop_tests {
 
     #[tokio::test]
     async fn wait_for_start_keeps_the_command_running_across_steps() {
-        let (r, took) = waited(finishes_after(120), vec![Some(false)]).await;
+        // a long budget, so only a restarted or dropped command could fail this
+        let began = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(
+                std::time::Duration::from_secs(2),
+                T_POLL,
+                finishes_after(120),
+                scripted(vec![Some(false)]),
+            ),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
         assert_eq!(r, Ok(7));
-        assert!(took >= std::time::Duration::from_millis(120));
+        assert!(began.elapsed() >= std::time::Duration::from_millis(120));
     }
 
     #[tokio::test]
