@@ -2533,6 +2533,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a start over a running bridge only fetches its readiness: never stops it for a rebuild (S107)
 
         daemon.cmd_start(_NoOpStartArgs(), out=readiness_out)
 

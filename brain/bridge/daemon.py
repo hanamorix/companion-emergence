@@ -3,11 +3,14 @@
 Public surface used by CLI handlers in brain.cli:
   cmd_start(args)    -> int
   cmd_run(args)      -> int
-  cmd_stop(args)     -> int
+  cmd_stop(args)     -> int  (kill_pre_pr=False: the start's stop before the rebuild never hard-kills a pre-PR bridge)
   cmd_restart(args)  -> int
   cmd_status(args)   -> int
   cmd_tail(args)     -> int
   cmd_tail_log(args) -> int
+
+Used by the commands that touch the engine:
+  run_rebuild_step(persona_dir) -> int | None  (None: go on; else the exit code)
 
 Internal:
   spawn_detached(persona_dir, idle_shutdown_seconds, client_origin, log_path) -> pid
@@ -455,6 +458,91 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         _say(f"Updating your memories did not finish (exit code {code}). Going on with your memories as they were saved.")
 
 
+def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
+    """Does a start (or a command) have to run the rebuild step first (S107, HS4 of #633)?
+
+    With no bridge recorded running it is ``engine.start_rebuild_needed``: the persona is not switched over, or a roll-forward is due.
+    With a bridge running it is only "the persona is not live": while a bridge runs, the roll-forward detector cannot be read as a need,
+    because ``engine_rebuild.rolled_forward`` is true for any row above ``rows_through`` created after ``saved_at`` and nothing says who
+    wrote the row, and a running bridge's own writes meet it (the row is committed before the engine applies it, the window S99
+    accepted). A true roll-forward (rows an older brain wrote) is found at a start with no bridge running. REVIEW, the direction: this
+    departs from S107's words in one case, a roll-forward need under a running bridge; the alternative (stop the bridge on it too)
+    would stop and restart a healthy bridge, losing its in-flight work, whenever a start is typed over it inside that window.
+
+    A check that raises is logged (type and reason, to the runtime log) and answers False: the start goes on. The bridge stack is
+    imported only in that branch, so the no-rebuild path never loads it; its transient log handler is attached only when no persistent
+    one is, and always detached again.
+    """
+    try:
+        from brain.emotion import engine
+
+        if not bridge_running:
+            return engine.start_rebuild_needed(persona_dir)
+        return not engine.engine_for(persona_dir).is_live()
+    except Exception as exc:  # noqa: BLE001 - a failed check never stops a start
+        from brain.bridge import runner
+
+        transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+        try:
+            logger.warning(
+                "could not check whether the emotion engine needs a rebuild for %s (%s: %s); going on with the saved state",
+                persona_dir.name,
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            runner._detach_runtime_log(transient)  # noqa: SLF001
+        return False
+
+
+def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
+    """Stop the running bridge so the rebuild can run (S107, HS4): the restart's stop (``cmd_restart``; reason None, so a queued
+    service run is not held back), with ``kill_pre_pr=False``: a bridge with no identity token is asked and waited for, but never
+    hard-killed (S110: no automatic hard kill; the app keeps its own hard-exit offer). A non-zero result ends the start before any
+    rebuild: one plain line, and the start returns the code. Nothing is hard-killed here: a failed request falls back to SIGTERM on
+    POSIX, the wait is the stop watch (which offers the hard exit after 180 s in a terminal and kills only on the user's "y"), and
+    on Windows an unreachable endpoint is refused unless the user runs ``nell supervisor stop --kill``.
+
+    Accepted edges (P4, R2): the app drops a start after 60 s with no rebuild record (lib.rs ``wait_for_start``, ``kill_on_drop``),
+    which ends the start command, not the stop; no data is lost, and at launch on an unconfirmed overlay a failed start reaches
+    ``recoverUnhealthyBrain`` and undoes the update (brainRecovery.ts), as HR5 (6) and (7) recorded. A stop that answers 0 while a
+    bridge is still there (an UNKNOWN identity) is not caught here: a live bridge holds the start lock, so ``cmd_start``'s lock
+    refuses with exit 2. A queued service run that wakes between the stop and ``cmd_start``'s lock takes it: this start then
+    returns 2 and that run does the rebuild (``cmd_run``).
+    """
+    rc = cmd_stop(args, reason=None, kill_pre_pr=False)
+    if rc != 0:
+        _say(
+            "The running bridge did not stop, so nothing was updated and no new bridge was started. "
+            "A bridge from a previous version may still be stopping. "
+            f'If it is stuck, end it with "nell supervisor stop --persona {persona_dir.name} --kill", then start again.'
+        )
+    return rc
+
+
+def run_rebuild_step(persona_dir: Path) -> int | None:
+    """The rebuild step for the commands that touch the engine (S107, HS6 (c) of #633): None to go on, or the exit code to return.
+
+    With a bridge recorded running it does nothing (the command runs beside the bridge, as today). Otherwise, if a rebuild is needed
+    it takes the start lock WITHOUT waiting: a start or another rebuild holds it, so the command is refused at once with exit 2 and
+    one plain line (REVIEW, the reading: S102's "everything else waits" and S36's 5 s wait become "refused at once, retry"; a
+    blocking acquire would also wait for a bridge's whole life, because the runner holds this lock from before its state file
+    shows it). It runs ``_rebuild_under_lock`` with the lock held and releases it; it starts no bridge.
+    """
+    if state_file.is_running(persona_dir):
+        return None
+    if not _rebuild_needed(persona_dir, False):
+        return None
+    fd = acquire_lock(persona_dir)
+    if fd is None:
+        _say("A start or an update of your memories is under way. Try again when it has finished.")
+        return 2
+    try:
+        return _rebuild_under_lock(persona_dir)
+    finally:
+        release_lock(persona_dir, fd)
+
+
 # S57: cmd_start's refusal paths keep their existing wording, byte-identical.
 _LOCK_HELD_MSG = "bridge already starting (lockfile held)"
 
@@ -493,6 +581,12 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     `out["readiness"]` with a BridgeReadiness carrying the verified
     pid/port/auth_token. Callers that need an immediate WS/HTTP connection
     should use that instead of re-reading state_file.
+
+    The one-shot rebuild (S107, HS6 (a) of #633) runs here, before the bridge: a bridge recorded running is first stopped when a
+    rebuild is needed (``_stop_for_rebuild``; a stop that does not finish returns its code and starts nothing), then, under the start
+    lock, ``_rebuild_under_lock``; a step that returns a code releases the lock and returns it. A start over a running bridge with no
+    rebuild needed, and an ``attach`` start (``nell chat``'s already-running branch: ``args.attach``) over a running bridge, are
+    refused with exit 2 as before, an attach start before any need check.
     """
     from brain.paths import get_log_dir, get_persona_dir
 
@@ -501,7 +595,15 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    if state_file.is_running(persona_dir):
+    running = state_file.is_running(persona_dir)
+    if running and getattr(args, "attach", False):
+        return _refuse_already_running(persona_dir, out)
+    needed = _rebuild_needed(persona_dir, running)
+    if needed and running:
+        stop_rc = _stop_for_rebuild(persona_dir, args)
+        if stop_rc != 0:
+            return stop_rc
+    elif running:
         return _refuse_already_running(persona_dir, out)
 
     # Hold the lock through the start-up steps below (so a concurrent starter
@@ -515,6 +617,18 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     if fd is None:
         print(_LOCK_HELD_MSG, file=sys.stderr)
         return 2
+
+    if needed:
+        # The rebuild runs as its own process under this lock, before the bridge (S107). It comes before the stop intent is cleared
+        # and the start back-off is reset below: a start that fails here never got going, so a kill's intent and the back-off stay.
+        try:
+            step_rc = _rebuild_under_lock(persona_dir)
+        except BaseException:
+            release_lock(persona_dir, fd)  # Ctrl-C in the chat REPL's in-process start must not leave the lock held
+            raise
+        if step_rc is not None:
+            release_lock(persona_dir, fd)
+            return step_rc
 
     client_origin = getattr(args, "client_origin", "cli")
     if client_origin == "launchd":
@@ -565,10 +679,10 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
 # Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
 # killed a healthy-but-slow bridge. (Bug 2b, v0.0.36.)
-# The bridge's start-up can outlast it: a first start waits for the engine lock while another process's emotion rebuild
-# holds it (Engine 6, HR5a, owner S101). The budget therefore pauses while an engine progress record names a live
-# writer (``_ReadinessBudget``); with no record it is this plain 50 s. The Rust caller's wait for ``nell supervisor start``
-# (lib.rs ``wait_for_start``) pauses on the same record.
+# The wait can outlast it: a service run rebuilds (the rebuild child, S107) before it becomes the bridge, and ``cmd_start``'s wait
+# after ``_start_service`` and ``cmd_restart``'s exit-2 wait are waits on such a run (the direct spawn shares the one helper, P1).
+# The budget therefore pauses while an engine progress record names a live writer (``_ReadinessBudget``); with no record it is
+# this plain 50 s. The Rust caller's wait for ``nell supervisor start`` (lib.rs ``wait_for_start``) pauses on the same record.
 _READINESS_BUDGET_S = 50.0
 
 
@@ -719,6 +833,9 @@ def cmd_run(args) -> int:
     A service run that follows starts which never proved themselves first waits out the next step of the start
     back-off (``start_backoff``, D26), before the lock and without holding anything; a start it makes is noted under
     the lock, right before the bridge runs.
+
+    With the lock held and the guard checks passed, a run for a persona that needs the rebuild runs it first
+    (``_rebuild_under_lock``, S107); a step that fails returns its code, noting a start when guarded.
     """
     from brain.paths import get_persona_dir
 
@@ -791,6 +908,15 @@ def cmd_run(args) -> int:
             print("not starting: the running bridge was stopped on request", file=sys.stderr)
             logger.info("not starting: the bridge this run waited for was stopped on request")
             return 0
+        if _rebuild_needed(persona_dir, False):
+            # The rebuild step (S107, HS6 (b)), the one a service start makes because it does not pass through cmd_start. A failed
+            # step counts as a start the back-off must see: start_backoff counts only noted starts, and without this systemd's
+            # RestartSec=2 would trip its start limit on a step that fails at once. The lock is released by the finally below.
+            step_rc = _rebuild_under_lock(persona_dir)
+            if step_rc is not None:
+                if guarded:
+                    start_backoff.note_start(persona_dir)
+                return step_rc
         if client_origin == "systemd":
             try:
                 from brain.service.systemd import refresh_installed_unit
@@ -869,11 +995,13 @@ def _print_kill_result(result) -> int:  # noqa: ANN001
     return 0 if result.succeeded else 1
 
 
-def cmd_stop(args, *, reason: str | None = REASON_USER_STOP) -> int:
+def cmd_stop(args, *, reason: str | None = REASON_USER_STOP, kill_pre_pr: bool = True) -> int:
     """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
 
     ``reason`` is what the stop request tells the bridge to record: ``"user_stop"`` for a plain stop, ``None`` for a
-    restart's stop (recorded as ``manual_restart``).
+    restart's stop (recorded as ``manual_restart``). ``kill_pre_pr`` False (the start's stop before a rebuild, S110: no
+    automatic hard kill) leaves a pre-PR bridge that does not stop in time running: the stop reports it and returns 1
+    instead of calling the kill helper; stop and restart keep the default (True).
 
     ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
     ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A kill that leaves a
@@ -911,7 +1039,7 @@ def cmd_stop(args, *, reason: str | None = REASON_USER_STOP) -> int:
             )
         )
     if state_file.is_legacy(s):
-        return _stop_pre_pr(persona_dir, s, timeout)
+        return _stop_pre_pr(persona_dir, s, timeout, kill_pre_pr=kill_pre_pr)
 
     response = None
     try:
@@ -950,9 +1078,10 @@ def cmd_stop(args, *, reason: str | None = REASON_USER_STOP) -> int:
     )
 
 
-def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float) -> int:
+def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float, *, kill_pre_pr: bool = True) -> int:
     """A proven pre-PR bridge (D22): the old request (skipped when its listener is closed), up to the app's budget,
-    then the kill helper (with its tree). No display, no offer."""
+    then the kill helper (with its tree). No display, no offer. With ``kill_pre_pr`` False the kill helper is not called: a
+    bridge still running after the budget is reported and the result is 1."""
     from brain.bridge import kill as kill_mod
 
     try:
@@ -965,6 +1094,9 @@ def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float) -
             break
         time.sleep(0.2)
     if state_file.bridge_liveness(s, persona_dir) == state_file.ALIVE:
+        if not kill_pre_pr:
+            print("The previous version of the bridge did not stop.", file=sys.stderr)
+            return 1
         result = kill_mod.kill_bridge(persona_dir, timeout=timeout)
         if not result.succeeded:
             print(result.message, file=sys.stderr)
