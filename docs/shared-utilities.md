@@ -232,9 +232,10 @@ Storage is UTC everywhere; local time is for display only.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `token_of` | brain/process_identity.py:134 | Identity token of a pid that tells a reused pid apart from the original process (per platform), or GONE or UNKNOWN. |
-| `own_token` | brain/process_identity.py:154 | This process's identity token (cached), or None if unreadable. |
-| `holder_alive` | brain/process_identity.py:178 | Is the process recorded in a lock or marker file still alive? Uses the recorded token if present, else pid only; UNKNOWN counts as alive. |
+| `token_of` | brain/process_identity.py:135 | Identity token of a pid that tells a reused pid apart from the original process (per platform), or GONE or UNKNOWN. |
+| `own_token` | brain/process_identity.py:155 | This process's identity token (cached), or None if unreadable. |
+| `holder_alive` | brain/process_identity.py:179 | Is the process recorded in a lock or marker file still alive? Uses the recorded token if present, else pid only; UNKNOWN counts as alive. |
+| `names_this_bridge` | brain/process_identity.py:197 | Does a record's pid and pid_token equal the expected pid and token (a comparison only, no liveness; no token never matches)? The own-record test of the bridge's watcher files and the engine's progress record. |
 
 ### `brain/bridge/state_file.py`
 

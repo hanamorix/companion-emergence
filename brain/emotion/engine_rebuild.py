@@ -86,8 +86,14 @@ def replay(
     stop: datetime | None,
     emotions_of: Callable[[Memory], Mapping[str, float]],
     modifier_of: Callable[[Memory], float],
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> frozenset[str]:
     """Fold a window of history into `state` and return the ids of the rows it folded.
+
+    `on_progress(done, total)` (the first rebuild passes one, `catch_up` none) is called with `total = len(rows)`: once when the
+    points are built, with `done` = the rows that did not become a point (skipped, with no feelings, out of the window), then
+    after each row point's fold with `done` one higher, a point whose fold failed included; stamp and change points are not
+    counted. So `done` reaches `total`. The callback must not raise (`engine_files.EngineProgress` never does).
 
     Points: a creation stamp for each of `stamps` (it closes the day it falls on and keeps the persona's start date through a
     start-only event); one entry for each counted row of `rows` that has emotions (below); each of `changes`. Every point is
@@ -145,6 +151,10 @@ def replay(
         points.append(_Point(change.at, _CHANGE, order, change))
         order += 1
 
+    done = 0
+    if on_progress is not None:
+        done = len(rows) - sum(1 for point in points if isinstance(point.payload, _RowPoint))  # the rows that became no point
+        on_progress(done, len(rows))
     repeat_window = timedelta(hours=dev_constants.EMOTION_REPEAT_WINDOW_H)
     folded: set[str] = set()
     for point in sorted(points, key=lambda p: (p.at, p.kind, p.order)):
@@ -167,6 +177,9 @@ def replay(
             label = f"{point.payload.kind} event at {point.at}"  # type: ignore[union-attr]
         if fold_guarded(state, step, f"catch-up {label}", key="engine_rebuild:replay") and isinstance(point.payload, _RowPoint):
             folded.add(point.payload.memory.id)
+        if on_progress is not None and isinstance(point.payload, _RowPoint):
+            done += 1
+            on_progress(done, len(rows))
     return frozenset(folded)
 
 
@@ -293,8 +306,12 @@ def rebuild(
     faded_emotions_of: Callable[[Memory], Mapping[str, float]],
     modifier_of: Callable[[Memory], float],
     switch_over_at: datetime | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Build the engine's state from the last 30 days of `memories.db` and the change log, and write it (Engine 6, #584).
+
+    `on_progress(done, total)` is the first rebuild's progress display (HR5 of #633): called with `(0, len(window.rows))` right
+    after the window is read (the total is known), then through `replay` (see there) as the rows are folded; it must not raise.
 
     Called with the engine lock held by the caller; it never takes the lock (it is not re-entrant). `mode` is "first" (a
     persona's switch-over: the stored values of its counted rows are folded as they are; a missing `memories.db` is an empty
@@ -339,6 +356,8 @@ def rebuild(
         window = _Window([], [], None)  # a fresh persona: an empty state, and nothing is created
     else:
         raise CatchUpError(f"{database} does not exist")
+    if on_progress is not None:
+        on_progress(0, len(window.rows))
 
     # E7.10 (accepted): a missing or corrupt part of the change log loses those changes at a rebuild; the log is a
     # crash-recovery record. E6.19 and E1.15 (accepted): the first rebuild has no chat-change history at all, because the
@@ -401,6 +420,7 @@ def rebuild(
         stop=None,
         emotions_of=emotions_of,
         modifier_of=modifier_of,
+        on_progress=on_progress,
     )
     close_days(state, now)
     starts = [t for t in (window.oldest, state.persona_start_at, previous_start) if t is not None]

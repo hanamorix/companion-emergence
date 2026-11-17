@@ -932,7 +932,8 @@ class EmotionEngine:
         2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock: the rows of `memories.db`, then the `making`
         candidates still waiting in the pending queue. Each step reads the progress number itself, so a finished or started step
         is skipped and an unstarted step runs. When the state is unreadable and `memories.db` fails its integrity check too,
-        this start is skipped with one warning and nothing is written.
+        this start is skipped with one warning and nothing is written. The step shows a progress record while it runs
+        (`engine_files.EngineProgress`, phase "rescaling", no count; see `nudge_scale_fix`).
         3. The engine lock, taken once, the state read again under it (a second process that waited runs nothing), then
         `engine_rebuild.rebuild` in first mode with the lock held; its one verified state write records `switch_over_at` (now) and
         is the switch-over's last step. First mode, not recovery mode: a recovery copies `switch_over_at` from a loaded state, and
@@ -943,7 +944,8 @@ class EmotionEngine:
         state path, a directory at `.bak3`) on a state this call found unreadable, the start is skipped with one warning naming
         the file and the error, and retried at the next start (the fail-safe S61 rules out stopping start-up at every start; this
         skip is derived from it, not stated by it); the persona stays not live until the fault is cleared. Any other rebuild
-        write failure raises. The clock is read once inside the hold.
+        write failure raises. The clock is read once inside the hold. While the rebuild runs it shows a progress record (phase
+        "rebuilding", memories done of the total; `_locked_rebuild`).
 
         Accepted edges (Planning B25 SW2, B31 SW4): see `engine_files.switch_over_state` (every copy of the state lost or
         unreadable, or the live state corrupted while `.bak1` is still the pre-switch state: the persona reads as not switched
@@ -1031,6 +1033,11 @@ class EmotionEngine:
         rebuild empties the queue before its state write, so each skipped start loses that start's queued changes (the E7.18
         class); recovery mode is unchanged: it never skips, the supervisor's recovery job logs once per active day and retries
         at the next idle pass.
+
+        A FIRST rebuild also writes the progress record (`engine_files.EngineProgress`, "rebuilding"): at entry with no count, with
+        the total once the window is read, then on each whole-number percentage of the rows folded; it is removed before the lock
+        hold ends, success or failure, and a write or removal that fails is logged and never fails the rebuild. A recovery rebuild
+        writes none (it runs only as the supervisor job, after start-up).
         """
         modifier_of = self._replay_modifier_with_memo()
         while True:
@@ -1041,14 +1048,25 @@ class EmotionEngine:
                     if not needed():
                         return
                     now = self._now()
-                    engine_rebuild.rebuild(
-                        self.persona_dir,
-                        mode,
-                        now,
-                        faded_emotions_of=self._replay_emotions,
-                        modifier_of=modifier_of,
-                        switch_over_at=self._switch_over_at,  # a recovery carries it when no readable copy of the state does
-                    )
+                    # The first rebuild shows its progress (HR5 of #633, owner S102): a record beside the bridge's files that
+                    # the status reads. Written inside the lock hold and removed before it ends, success or failure, so it
+                    # never outlives the rebuild. A recovery rebuild runs only as the supervisor job, after start-up: no record.
+                    progress = engine_files.EngineProgress(self.persona_dir, "rebuilding") if mode == "first" else None
+                    try:
+                        if progress is not None:
+                            progress.write()
+                        engine_rebuild.rebuild(
+                            self.persona_dir,
+                            mode,
+                            now,
+                            faded_emotions_of=self._replay_emotions,
+                            modifier_of=modifier_of,
+                            switch_over_at=self._switch_over_at,  # a recovery carries it when no readable copy of the state does
+                            on_progress=None if progress is None else progress.report,
+                        )
+                    finally:
+                        if progress is not None:
+                            progress.remove()
                     if mode == "first":
                         # The verified write recorded it: this instance has now seen the persona switched over (as `is_live` would
                         # on its next call), so a state lost later in this process is a recovery, not an unknown.

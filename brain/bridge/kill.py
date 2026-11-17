@@ -471,7 +471,7 @@ def kill_bridge(
                 _cas_intent(persona_dir, nonce, lambda _cur: None)
                 # A kill called off before it killed withdraws its hard-exit request too (review of #458): the bridge
                 # still runs and would act on it later, after the user cancelled.
-                if request_written and shutdown_progress.names_this_bridge(
+                if request_written and process_identity.names_this_bridge(
                     shutdown_progress.read_record(persona_dir, shutdown_progress.REQUEST_FILENAME), st.pid, st.pid_token
                 ):
                     shutdown_progress.delete_record(persona_dir, shutdown_progress.REQUEST_FILENAME)

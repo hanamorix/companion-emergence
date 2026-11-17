@@ -128,6 +128,9 @@ EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
 EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
+# The progress record of a start-up step that can take long (the x10 fix, the first rebuild; HR5 of #633). It lives in the
+# PERSONA directory beside `bridge.json` and the bridge's watcher files, not under `state/`, and is outside the engine lock.
+ENGINE_PROGRESS_FILENAME: str = "engine_progress.json"
 
 # --- the one-time x10 fix of small feelings (emotion rework, Engine 6, #584) ------------------------------------------
 # Three memory types hold feelings stored below 1, not on the 0-10 scale: reach-outs and notes (`initiate_outbound`, small

@@ -677,6 +677,7 @@ _PRE_PR_REQUEST_BUDGET_S = 3.0
 
 
 def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Response | None) -> bool:
+    from brain import process_identity
     from brain.bridge import shutdown_progress
 
     if response is not None:
@@ -688,7 +689,7 @@ def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Re
         except ValueError:
             pass
     rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
-    if shutdown_progress.names_this_bridge(rec, s.pid, s.pid_token):
+    if process_identity.names_this_bridge(rec, s.pid, s.pid_token):
         return True
     cur = state_file.read(persona_dir)
     return bool(cur is not None and cur.pid == s.pid and cur.phase == "stopping")
@@ -832,6 +833,8 @@ def _clear_stale_record(persona_dir: Path, s: state_file.BridgeState) -> None:
 
 def status_dict(persona_dir: Path) -> dict:
     """The machine-readable bridge status (`nell supervisor status --json`): files and process checks only."""
+    from brain.emotion import engine_files
+
     s = state_file.read(persona_dir)
     live = state_file.bridge_liveness(s, persona_dir) if s is not None else state_file.GONE
     proven = bool(
@@ -856,6 +859,9 @@ def status_dict(persona_dir: Path) -> dict:
         # the service install state, the supervisor's state and the kill helper's stated bound.
         "stop_intent": _status_intent(persona_dir),
         "remaining": _status_remaining(persona_dir, s),
+        # HR5 of #633 (owner S101, S102): the start-up step in progress (the x10 fix or the first rebuild), only while the process
+        # that writes it is alive; None otherwise. Written by `brain.emotion.engine_files.EngineProgress`.
+        "engine_progress": engine_files.read_engine_progress(persona_dir),
         "service_installed": _status_service_installed(s.persona if s and s.persona else persona_dir.name),
         "supervisor": s.supervisor if s else None,
         "kill_bound_s": _kill_bound(),
@@ -869,10 +875,11 @@ def _status_intent(persona_dir: Path) -> dict | None:
 
 
 def _status_remaining(persona_dir: Path, s: state_file.BridgeState | None) -> dict | None:
+    from brain import process_identity
     from brain.bridge import shutdown_progress
 
     rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
-    if s is None or not shutdown_progress.names_this_bridge(rec, s.pid, s.pid_token):
+    if s is None or not process_identity.names_this_bridge(rec, s.pid, s.pid_token):
         return None
     return {"count": rec.get("count"), "tasks": rec.get("tasks"), "phase": rec.get("phase"),
             "requested_at": rec.get("requested_at"), "reason": rec.get("reason"), "updated_at": rec.get("updated_at")}

@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 GONE = "gone"
 UNKNOWN = "unknown"
@@ -191,6 +192,17 @@ def holder_alive(pid: int | None, recorded: str | None) -> bool:
     from brain.bridge.state_file import pid_is_alive
 
     return pid_is_alive(pid)
+
+
+def names_this_bridge(record: dict[str, Any] | None, pid: int | None, token: str | None) -> bool:
+    """True when ``record`` names exactly ``pid`` + ``token`` (C43 a: anything else is ignored).
+
+    A comparison against an expected identity only, no liveness (that is ``holder_alive``). The bridge's watcher files and the
+    engine's progress record both use it for "is this record mine".
+    """
+    if not isinstance(record, dict) or pid is None or not token:
+        return False
+    return record.get("pid") == pid and record.get("pid_token") == token
 
 
 def token_digest(token: str) -> str:
