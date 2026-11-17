@@ -292,7 +292,7 @@ def progress_record(
 ) -> dict[str, Any]:
     """The record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/engine_progress.json).
 
-    ``phase`` "rescaling" (the x10 fix, no count) or "rebuilding" (the first rebuild); ``done`` and ``total`` are None until
+    ``phase`` "rescaling" (the x10 fix, no count) or "rebuilding" (the first rebuild, and the rebuild of a roll-forward at start-up); ``done`` and ``total`` are None until
     the rebuild knows its window (shown as "preparing") and for the x10 step.
     """
     return {
@@ -1237,7 +1237,12 @@ def switch_over_state(loaded: LoadedState) -> bool | None:
     state: the backup has no `switch_over_at`, so the persona reads as not switched until the first rebuild runs again (the
     same as (a)). Narrowed (Planning B28 Q18): a process that has already SEEN `switch_over_at` and loads a backup without it
     puts the value it saw back before its drain saves (`EmotionEngine._run_apply`), so (b) still applies to a new process
-    that starts after the live state is corrupted.
+    that starts after the live state is corrupted. (c) A brain built from main before Engine 6 merges (a rolled-back brain-main
+    overlay, a source install on main, or a release cut from main before the merge; no published release has it) runs a shadow
+    engine that rewrites the state without `switch_over_at` or `rows_through` and keeps `saved_at` fresh. A persona rolled back
+    to it and forward again reads as not switched, so the first rebuild runs again from the 30-day window and records a new
+    switch-over time, which restarts the fade clock: the rebuilt mood reads stronger than her real state for a while. Nothing
+    durable records the original switch time (TRIO HR1-C, accepted).
     """
     if loaded.state is not None:
         return loaded.state.switch_over_at is not None

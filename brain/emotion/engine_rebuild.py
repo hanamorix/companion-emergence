@@ -3,8 +3,8 @@
 `replay` folds what happened in a window of time into a state: the rows of `memories.db` created or opened in it, the day each
 row was written on, and the change-log lines. `catch_up` is the recovery-first step (design 2.8, "Recovery first", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`): a state that had to be loaded
 from a backup copy is replayed forward from that copy's `saved_at` to now. `rebuild` builds a whole state from the last 30 days
-of rows and the change log: at a persona's first start (the switch-over, which records `switch_over_at` in its one state write) and as the recovery
-of a live persona whose state cannot be used. Both read the window through `_read_window`.
+of rows and the change log: at a persona's first start (the switch-over, which records `switch_over_at` in its one state write), as the recovery
+of a live persona whose state cannot be used, and at a start whose check (`rolled_forward`) finds rows written while an older brain ran. Each reads the window through `_read_window`, as does the start check.
 
 All three are called with the engine's lock already held by the caller (the drain, a direct apply or a batch, the first start, the
 recovery job). None takes it, and the lock is not re-entrant. `catch_up` holds the caller's lock for as long as the replay takes
@@ -190,16 +190,21 @@ class _Window(NamedTuple):
     oldest: datetime | None  # the creation time of the oldest row of any type and state, in the whole database
 
 
-def _read_window(persona_dir: Path, since: datetime) -> _Window:
+def _read_window(persona_dir: Path, since: datetime, *, rowid_above: int | None = None) -> _Window:
     """The rows, creation stamps and oldest creation time `catch_up` and `rebuild` start from, read in ONE open of `memories.db`.
 
     Opens `MemoryStore(db, integrity_check=False)` (the rebuild's reads skip the check, E7.14; the one-time x10 fix before it
     ran the check on a first start), reads `list_engine_window(since)`, `creation_stamps_since(since)` and `oldest_created_at()`,
     and closes. It does not stat the file: opening a store on a missing path would create an empty database, so the missing-file
     rule belongs to each caller.
+
+    With `rowid_above` (the start check, `rolled_forward`) it reads only `list_engine_window(since, rowid_above=rowid_above)`:
+    the rows newer than that rowid, with no stamps and no oldest time (`stamps` is empty, `oldest` is None).
     """
     store = MemoryStore(persona_dir / _MEMORIES_DB, integrity_check=False)
     try:
+        if rowid_above is not None:
+            return _Window(store.list_engine_window(since, rowid_above=rowid_above), [], None)
         return _Window(store.list_engine_window(since), store.creation_stamps_since(since), store.oldest_created_at())
     finally:
         store.close()
@@ -208,6 +213,40 @@ def _read_window(persona_dir: Path, since: datetime) -> _Window:
 def _highest_rowid(rows: Sequence[Memory]) -> int | None:
     """The highest rowid among `rows` (None when none has one): what a read of the window has seen of `memories`."""
     return max((m.rowid for m in rows if m.rowid is not None), default=None)
+
+
+def rolled_forward(persona_dir: Path, loaded: engine_files.LoadedState, now: datetime) -> bool:
+    """The start check (HR1 of #633): do the rows hold something the engine's last save did not see, written while an older brain ran?
+
+    False without a read when `loaded` is not a state read from the main file (a backup-sourced state stays with the drain's
+    recovery-first catch-up) or lacks `rows_through`, `saved_at` or `switch_over_at`, and False when `memories.db` is missing
+    (it is statted, never opened: a store opened on a missing path creates the file). Otherwise it reads the rows through
+    `_read_window` with `rowid_above=rows_through`, since the later of `saved_at` and `now` minus `EMOTION_LONG_HALF_LIFE_D`, and
+    is True when one of them was created strictly after `saved_at` and has stored feelings that count (`_stored_emotions`: a
+    counted kind and a non-empty `resolve_emotions`). A refreshed row keeps its old rowid and so is never read here.
+    A failure of the read raises: the caller logs it and the start goes on. The one place the skip conditions live: the
+    start-up's check before the lock and its re-check under the lock both call it.
+    """
+    state = loaded.state
+    if loaded.source != "main" or state is None:
+        return False
+    if state.rows_through is None or state.saved_at is None or state.switch_over_at is None:
+        return False
+    saved_at = lenient_utc(state.saved_at)
+    when = lenient_utc(now)
+    if saved_at is None or when is None:
+        return False
+    if file_ops.stat_path(persona_dir / _MEMORIES_DB) is None:
+        return False
+    since = max(saved_at, when - timedelta(days=dev_constants.EMOTION_LONG_HALF_LIFE_D))
+    rows = _read_window(persona_dir, since, rowid_above=state.rows_through).rows
+    for memory in rows:
+        created = lenient_utc(memory.created_at)
+        if memory.rowid is None or memory.rowid <= state.rows_through or created is None or created <= saved_at:
+            continue
+        if _stored_emotions(memory):
+            return True
+    return False
 
 
 def catch_up(
@@ -323,9 +362,9 @@ def rebuild(
 
     Called with the engine lock held by the caller; it never takes the lock (it is not re-entrant). `mode` is "first" (a
     persona's switch-over: the stored values of its counted rows are folded as they are; a missing `memories.db` is an empty
-    window and creates nothing) or "recovery" (a live persona whose state cannot be used: the faded values `faded_emotions_of`
-    gives, faded to this rebuild's clock as `catch_up` does; a missing `memories.db` raises `CatchUpError`, because an empty
-    rebuild would rotate a readable backup out). `modifier_of` is the trust-aware weight, as for `catch_up`.
+    window and creates nothing) or "recovery" (a live persona whose state cannot be used, or whose start check found a
+    roll-forward (`rolled_forward`): the faded values `faded_emotions_of` gives, faded to this rebuild's clock as `catch_up`
+    does; a missing `memories.db` raises `CatchUpError`, because an empty rebuild would rotate a readable backup out). `modifier_of` is the trust-aware weight, as for `catch_up`.
 
     The switch-over time. First mode records it as the rebuild's own `now`, in the one verified state write (there is no
     switch file). A recovery rebuild copies it from the old state it loads (main, or a backup copy: the walk accepts either),

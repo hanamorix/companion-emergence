@@ -155,7 +155,9 @@ def test_a_first_start_runs_x10_takes_the_lock_once_empties_the_queue_and_writes
     assert state_of(persona).saved_at == state_of(persona).reset_at == NOW
 
 
-def test_a_second_start_returns_with_no_store_open_and_no_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_second_start_takes_no_lock_runs_no_rebuild_and_opens_the_store_only_for_the_roll_forward_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     persona = _standard_persona(tmp_path)
     instance = _ensure(persona)
     before = tree(persona)
@@ -163,7 +165,9 @@ def test_a_second_start_returns_with_no_store_open_and_no_lock(tmp_path: Path, m
     opened = _Spy(monkeypatch)
     ensure_engine_ready(persona)  # the same engine, which has seen the switch
     EmotionEngine(persona.resolve(), now=lambda: NOW).ensure_ready()  # a new process: it asks the file
-    assert spy.calls == 0 and opened.opened == []
+    # a switched persona's start reads its rows once (the HR1 start check, `engine_rebuild.rolled_forward`, one open per start):
+    # nothing newer than the last save, so no lock, no transaction and no write
+    assert spy.calls == 0 and opened.opened == ["rebuild", "rebuild"]
     assert tree(persona) == before
     assert instance.is_live()
 
