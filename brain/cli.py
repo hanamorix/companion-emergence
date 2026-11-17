@@ -178,10 +178,13 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
     roll-forward check and rebuild. Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
     success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
 
-    The persona directory is not checked: only the start spawns this, on a persona it has checked. A hand-run on a mistyped name
-    would make the folder and switch an empty persona over (accepted edge, P4).
+    A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
+    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing.
     """
     persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"persona directory not found: {persona_dir}", file=sys.stderr)
+        return 1
     progress = engine_files.EngineProgress(persona_dir, "rebuilding")
     progress.write()
     try:

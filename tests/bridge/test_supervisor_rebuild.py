@@ -206,6 +206,18 @@ def test_a_roll_forward_failure_that_the_engine_logs_exits_zero(persona: Path, m
     assert _record(persona) is None
 
 
+def test_a_persona_that_does_not_exist_is_refused_and_nothing_is_made_or_run(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    recorder = _Recorder(persona, monkeypatch)
+    missing = get_persona_dir("nel")  # a mistyped name
+    assert not missing.exists()
+    assert main(["supervisor", "rebuild", "--persona", "nel"]) == 1
+    assert f"persona directory not found: {missing}" in capsys.readouterr().err
+    assert not missing.exists()  # no folder was made, so no record and no empty persona
+    assert recorder.events == []  # neither the runtime log nor the engine was reached
+
+
 # --- the real process: the entry point and the exit code ------------------------------------------------------------------
 
 
