@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings
 from brain.utils.llm_output import find_json_object_block
+from brain.utils.log_throttle import warn_throttled
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
@@ -85,7 +86,8 @@ def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
 
             if isinstance(exc, ThrottleDeferred):
                 raise  # #456/#473: "not now": the row stays untagged and the caller decides
-            logger.warning("emotion_tagger: tagger error: %s", exc)
+            # The same throttled line as the gate's: with no daily cap left, a provider that fails on every call must not log on every write.
+            warn_throttled(logger, "emotion_tagger.tagger_error", "emotion_tagger: tagger error: %s", exc, exc_info=False)
             return {}
 
     return _tagger

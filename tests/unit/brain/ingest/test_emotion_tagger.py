@@ -5,12 +5,15 @@ Synthetic content only (synthetic user Bob, persona Canary); a scripted provider
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.ingest import emotion_tagger
 from brain.ingest.emotion_tagger import _normalize, make_emotion_tagger, tag_if_feelingless
 from brain.memory.store import Memory, MemoryStore
+from brain.utils import log_throttle
 
 
 class _Provider:
@@ -85,6 +88,16 @@ def test_a_provider_error_tags_nothing_and_a_deferred_call_is_not_swallowed():
     assert make_emotion_tagger(_Provider(RuntimeError("cli failed")))(_memory()) == {}
     with pytest.raises(ThrottleDeferred):
         make_emotion_tagger(_Provider(ThrottleDeferred("not now")))(_memory())
+
+
+def test_a_provider_that_fails_on_every_call_warns_once_not_on_every_write(caplog):
+    log_throttle._last.clear()
+    tagger = make_emotion_tagger(_Provider(RuntimeError("cli failed")))
+    with caplog.at_level(logging.DEBUG, logger="brain.ingest.emotion_tagger"):
+        for _ in range(3):
+            assert tagger(_memory()) == {}
+    levels = [r.levelno for r in caplog.records if "tagger error" in r.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG, logging.DEBUG]
 
 
 def test_normalize_drops_names_that_are_not_registered_and_values_that_are_not_finite_positive_numbers():
