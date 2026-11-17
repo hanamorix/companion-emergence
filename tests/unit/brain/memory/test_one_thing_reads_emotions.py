@@ -119,6 +119,9 @@ def test_merge_emotions_lives_in_the_store():
     assert _merge_emotions({"trust": 4, "joy": 7}, {"awe": 6, "Joy": 5}) == {"trust": 4.0, "joy": 6.0, "awe": 6.0}
 
 
+@pytest.mark.no_base_failure(
+    reason="the old test of this predicate lost its other half (the deleted probe) and was renamed; the predicate existed and behaves the same on base"
+)
 def test_the_emptiness_check_is_a_store_method(tmp_path: Path):
     store = MemoryStore(tmp_path / "memories.db")
     try:

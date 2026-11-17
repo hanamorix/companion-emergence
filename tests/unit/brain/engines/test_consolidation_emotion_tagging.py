@@ -13,6 +13,7 @@ import logging
 import pytest
 
 from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.engines import consolidation
 from brain.engines.consolidation import Decision, Reappraisal, run_consolidation
 from brain.health.json_io import read_jsonl
 from brain.memory.hebbian import HebbianMatrix
@@ -276,12 +277,15 @@ def test_a_tagger_that_returns_nothing_leaves_the_row_as_it_is(persona, monkeypa
     assert _emotions(store, target_id) == {}
 
 
-def test_without_a_provider_or_a_tagger_no_model_call_is_made(persona):
+def test_without_a_provider_or_a_tagger_no_model_call_is_made(persona, monkeypatch):
     tmp, store, hebbian, queue = persona
+    built: list[object] = []
+    monkeypatch.setattr(consolidation, "make_emotion_tagger", lambda provider: built.append(provider) or (lambda _m: {"joy": 1.0}))
     cand = _mem("Bob's tea")
     queue.enqueue(cand, source="x")
     res = run_consolidation(store, persona_dir=tmp, hebbian=hebbian, classifier=lambda c, _ctx: Decision("new"))
     assert res.promoted == 1
+    assert built == []  # no provider: no tagger is built, so no model call can be made
     assert _emotions(store, cand.id) == {}
 
 
