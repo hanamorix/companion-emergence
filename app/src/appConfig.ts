@@ -9,8 +9,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { fetchHealth, resetBridgeCredentialCache } from "./bridge";
-import type { EngineProgress } from "./bridge";
-import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS } from "./lib/requestTimeout";
+import { alongside, waitForHealth, type EngineProgressCallback } from "./lib/engineProgress";
+import { HEALTH_WAIT_MS } from "./lib/requestTimeout";
 import { errString } from "./lib/errString";
 
 export interface AppConfig {
@@ -111,28 +111,26 @@ export async function listPersonas(): Promise<PersonaSummary[]> {
  *  answering (a service the app's install, or the OS, has just started). */
 const START_UNDER_WAY = /supervisor start failed \(exit 2\)/;
 
-/** #456 review R2-M1: wait for a bridge another start has under way to answer /health; false after HEALTH_WAIT_MS. */
-async function awaitStartedBridge(persona: string): Promise<boolean> {
+/** #456 review R2-M1: wait for a bridge another start has under way to answer /health; false after HEALTH_WAIT_MS, a wait
+ *  that is paused while the engine's start-up record shows (HR5, lib/engineProgress.ts). */
+async function awaitStartedBridge(persona: string, onProgress?: EngineProgressCallback): Promise<boolean> {
   resetBridgeCredentialCache(persona); // the starting bridge writes a new port and token
-  const deadline = Date.now() + HEALTH_WAIT_MS;
-  while (Date.now() < deadline) {
-    try {
-      await fetchHealth(persona); // bounded per request
-      return true;
-    } catch {
-      await new Promise<void>((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS));
-    }
-  }
-  return false;
+  return waitForHealth(persona, () => fetchHealth(persona), HEALTH_WAIT_MS, onProgress); // each request is bounded
 }
 
-export async function ensureBridgeRunning(persona: string, _onProgress?: (reading: EngineProgress | null) => void): Promise<void> {
+/**
+ * Start the persona's bridge (`nell supervisor start`, which waits for /health). With `onProgress`, the engine's start-up
+ * progress (its first rebuild, the scale update) is read every few seconds while that blocking call runs and handed to the
+ * callback, which is how the launch screen shows it; the waits here and in Rust pause while it shows. No callback: the
+ * start shows nothing (the watchdog, the setup wizard).
+ */
+export async function ensureBridgeRunning(persona: string, onProgress?: EngineProgressCallback): Promise<void> {
   try {
-    await invoke("ensure_bridge_running", { persona });
+    await alongside(persona, onProgress, () => invoke("ensure_bridge_running", { persona }));
   } catch (e) {
     // A start already under way (exit 2) is not a failure: wait for that bridge instead (review R2-M1).
     if (START_UNDER_WAY.test(errString(e))) {
-      if (await awaitStartedBridge(persona)) return;
+      if (await awaitStartedBridge(persona, onProgress)) return;
       throw e;
     }
     // Browser dev mode — Tauri's invoke is undefined. Treat as a no-op
