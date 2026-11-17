@@ -469,7 +469,7 @@ def _start_service(persona: str) -> subprocess.CompletedProcess[str] | None:
 
 def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | None) -> int:
     """Readiness of a bridge the service manager started (#456 D20): a record of a live bridge (by its token) whose
-    /health answers, within what is left of the 50 s budget."""
+    /health answers, within what is left of the 50 s budget (which pauses while a rebuild's progress record shows)."""
     budget = _ReadinessBudget(persona_dir, budget_s)
     while not budget.expired():
         time.sleep(0.1)
@@ -545,7 +545,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     # Readiness failed — kill the orphan child and tell the user where to look.
     _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
-        f"bridge spawned (pid {pid}) but /health did not respond within its 50s budget (time spent on a rebuild not counted) — "
+        f"bridge spawned (pid {pid}) but /health did not respond within its readiness budget (50s, not counting a rebuild in progress) — "
         f"killed orphan child. Inspect log at {log_path}",
         file=sys.stderr,
     )
