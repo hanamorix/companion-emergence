@@ -626,6 +626,46 @@ def test_the_wait_line_reaches_the_runtime_log_without_holding_it_open(pd, clock
     assert not any(isinstance(h, _runner._AppendThenCloseHandler) for h in root_handlers.handlers)  # transient gone
 
 
+def test_the_wait_attaches_its_log_through_the_one_runtime_log_manager(pd, clock, monkeypatch):
+    """B59 HQD (iii): the back-off wait uses `daemon._runtime_log`, the one copy of the transient attach and detach."""
+    from contextlib import contextmanager
+
+    events: list[str] = []
+
+    @contextmanager
+    def spy(persona_dir):
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    real_wait = start_backoff.wait_before_start
+
+    def wait(persona_dir, **kw):
+        events.append("wait")
+        return real_wait(persona_dir, **kw)
+
+    monkeypatch.setattr(daemon, "_runtime_log", spy)
+    monkeypatch.setattr(start_backoff, "wait_before_start", wait)
+    _record(pd, 1, clock)
+    ran = _fake_run(monkeypatch)
+    assert daemon.cmd_run(_args("systemd")) == 0
+    assert ran
+    assert events[:3] == ["enter", "wait", "exit"]
+
+
+def test_a_failing_transient_log_attach_does_not_stop_the_wait(pd, clock, monkeypatch):
+    """The guarded manager: a log line is best effort, the wait and the run still happen."""
+
+    def broken(persona_dir):
+        raise RuntimeError("no log")
+
+    monkeypatch.setattr("brain.bridge.runner._attach_transient_runtime_log", broken)
+    _record(pd, 1, clock)
+    ran = _fake_run(monkeypatch)
+    assert daemon.cmd_run(_args("systemd")) == 0
+    assert ran and clock.slept
+
+
 def test_setting_up_the_runtime_log_twice_adds_one_handler(pd, monkeypatch, tmp_path, root_handlers):
     from logging.handlers import RotatingFileHandler
 

@@ -229,6 +229,16 @@ def test_an_unreadable_record_or_one_with_no_usable_pid_whose_file_name_pid_is_a
     assert path.exists()  # it may name a live command: never deleted
 
 
+def test_a_record_whose_body_pid_differs_from_its_file_name_pid_is_decided_by_the_file_name_pid(
+    persona: Path, live_other: subprocess.Popen
+) -> None:
+    """The file name is the record's identity (B58 HQB Q1): a hand-edited body pid never makes the caller name another file."""
+    other_body_pid = live_other.pid + 1 if live_other.pid + 1 != os.getpid() else live_other.pid + 2
+    record = engine_files.command_run_record(pid=other_body_pid, pid_token="t", persona="nell")
+    path = _put(persona, live_other.pid, record)
+    assert engine_files.live_command_runs(persona) == [{engine_files.UNREADABLE_RUN_KEY: True, "pid": live_other.pid, "path": str(path)}]
+
+
 def test_a_record_named_for_this_process_is_left_out_by_its_name_before_it_is_read(
     persona: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

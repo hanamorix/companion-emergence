@@ -617,7 +617,10 @@ def live_command_runs(persona_dir: Path) -> list[dict[str, Any]]:
                         exc_info=False,
                     )
         record_pid = _pid_of(record)
-        if record is not None and record_pid is not None:
+        # The file name is the record's identity (B58 HQB Q1): a record whose body names another pid than its file is not a valid
+        # record and is decided by the name pid below, so every record returned as read has the pid of its file and a caller
+        # building its path from the pid (the not-ended line, B60 HQT) names the right file.
+        if record is not None and record_pid is not None and record_pid == name_pid:
             token = record.get("pid_token")
             if not _may_be_alive(record_pid, token if isinstance(token, str) else None, path):
                 _delete_dead_run(path)

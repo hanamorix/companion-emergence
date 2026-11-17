@@ -928,17 +928,13 @@ def cmd_run(args) -> int:
         # the record, a user kill fires the guard. SIGTERM and Task Scheduler's end act at once (no handler yet).
         # The wait's log lines reach the runtime log through a handler that keeps no file open (a run that waits or is
         # queued must not block the running bridge's log rotation); the persistent handler comes after the lock.
-        from brain.bridge import runner
-
-        transient_log = runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
         try:
-            go_on = start_backoff.wait_before_start(
-                persona_dir, interrupted=lambda: respawn_guard.guard_fires(persona_dir)
-            )
+            with _runtime_log(persona_dir):
+                go_on = start_backoff.wait_before_start(
+                    persona_dir, interrupted=lambda: respawn_guard.guard_fires(persona_dir)
+                )
         except KeyboardInterrupt:
             return 0
-        finally:
-            runner._detach_runtime_log(transient_log)  # noqa: SLF001
         if not go_on:
             print("not starting: stopped on request", file=sys.stderr)
             logger.info("not starting: stopped on request (user kill of this boot)")

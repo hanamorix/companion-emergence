@@ -904,9 +904,9 @@ def test_kill_command_interrupted_inside_the_root_kill_ends_the_root_and_the_des
     real_kill = kill._kill_proc
     calls: list[int] = []
 
-    def spy(suspended, remembered, root_killed):
-        released.append(root_killed)
-        real_release(suspended, remembered, root_killed)
+    def spy(suspended, remembered, root_kill_started):
+        released.append(root_kill_started)
+        real_release(suspended, remembered, root_kill_started)
 
     def ctrl_c_once(proc) -> None:
         calls.append(proc.pid)
