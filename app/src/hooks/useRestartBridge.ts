@@ -14,12 +14,16 @@
  * The bridge's HTTP listener closes once a stop begins, so the stop is followed through files only: the progress
  * record (`read_bridge_shutdown`) and `nell supervisor status --json` (`bridge_status`).
  *
+ * A start can be long too: the new bridge may run the engine's first rebuild before it answers /health. The waits for
+ * /health pause while `engine_progress` shows in the status (lib/engineProgress.ts), and `showEngineProgress` puts that
+ * progress on the start-up and restart screens (state "starting") until `endEngineProgress`.
+ *
  * One restart app-wide (#310): App, RestartBridgeButton and useBrainUpdate each hold an instance, so the state and
  * the in-flight run live at module scope. A caller that asks while a restart is running joins it.
  */
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
-import type { BridgeShutdown, BridgeStatus, PersonaState } from "../bridge";
+import type { BridgeShutdown, BridgeStatus, EngineProgress, PersonaState } from "../bridge";
 import {
   bridgeStatus,
   fetchHealth,
@@ -29,8 +33,9 @@ import {
   shutdownBridge,
 } from "../bridge";
 import { ensureBridgeRunning } from "../appConfig";
+import { alongside, waitForHealth, type EngineProgressCallback } from "../lib/engineProgress";
 import { errString } from "../lib/errString";
-import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS, REQUEST_TIMEOUT_MS } from "../lib/requestTimeout";
+import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS, REQUEST_TIMEOUT_MS, STATUS_POLL_MS } from "../lib/requestTimeout";
 
 export type RestartState =
   | "idle"
@@ -64,15 +69,16 @@ export interface UseRestartBridge {
  *  single request this flow sends (the stop request, each /health probe): a wedged bridge can accept the connection
  *  and never answer (review M1). */
 export const TIMEOUT_SHUTDOWN_MS = REQUEST_TIMEOUT_MS;
+/** The /health wait after a start: HEALTH_WAIT_MS, paused while the engine's start-up record shows (engineProgress.ts). */
 export const TIMEOUT_HEALTH_MS = HEALTH_WAIT_MS;
-export { HEALTH_POLL_INTERVAL_MS };
+export { HEALTH_POLL_INTERVAL_MS, STATUS_POLL_MS };
 /** Owner Q1 (2026-10-19): the hard exit is offered 180 s after the stop was requested (brain/bridge/stop_watch.py
  *  HARD_EXIT_OFFER_AFTER_S). Also how long a bridge that still answers /health gets for the stop request to go
  *  through, and how long an accepted hard exit gets before the kill. */
 export const HARD_EXIT_OFFER_AFTER_MS = 180_000;
-/** How often the stop is re-read while waiting (progress record) and the status (`nell supervisor status`). */
+/** How often the stop's progress record is re-read while waiting (the status, `nell supervisor status`, is read every
+ *  STATUS_POLL_MS). */
 export const PROGRESS_POLL_MS = 500;
-export const STATUS_POLL_MS = 5000;
 
 export const EVERYTHING_STOPPED = "Everything has stopped.";
 export const HARD_EXIT_DONE = "Hard exit done. The next start will pick up anything left unfinished.";
@@ -121,16 +127,11 @@ export function probeHealth(persona: string): Promise<unknown> {
   return withRequestTimeout((signal) => fetchHealth(persona, signal), TIMEOUT_SHUTDOWN_MS);
 }
 
-async function pollHealth(persona: string, deadline: number): Promise<void> {
-  while (Date.now() < deadline) {
-    try {
-      await probeHealth(persona);
-      return;
-    } catch {
-      await sleep(HEALTH_POLL_INTERVAL_MS);
-    }
+/** Wait for a starting bridge's /health: TIMEOUT_HEALTH_MS, paused while the engine's start-up record shows. */
+async function pollHealth(persona: string, onProgress?: EngineProgressCallback): Promise<void> {
+  if (!(await waitForHealth(persona, () => probeHealth(persona), TIMEOUT_HEALTH_MS, onProgress))) {
+    throw new Error("/health poll window expired");
   }
-  throw new Error("/health poll window expired");
 }
 
 async function healthAnswers(persona: string): Promise<boolean> {
@@ -180,6 +181,69 @@ function transition(next: RestartState): void {
   setShared({ state: next });
 }
 
+/**
+ * The start-up line while the engine's first rebuild or scale update runs (HR5, owner S101, S102). Persona-app wording for
+ * the owner's end-of-build wording list. A count only once the total is known and usable; the scale update has none.
+ */
+export function engineProgressLine(reading: EngineProgress): string {
+  if (reading.phase === "rescaling") return "Updating the scale of your memories.";
+  const { done, total } = reading;
+  if (typeof total !== "number" || !Number.isFinite(total) || total <= 0 || typeof done !== "number" || !Number.isFinite(done)) {
+    return "Getting ready to update your memories.";
+  }
+  const counted = Math.min(Math.max(done, 0), total);
+  return `Updating your memories: ${counted} of ${total} (${Math.floor((counted * 100) / total)}%).`;
+}
+
+/** Whether `progress` currently holds an engine line (so `endEngineProgress` clears only what it showed: the stop's own
+ *  last line, "Everything has stopped.", stays). */
+let engineShown = false;
+/** Resolves the hold `showEngineProgress` took where no restart run() held `inFlight`; null when it holds nothing. */
+let releaseHold: ((ok: boolean) => void) | null = null;
+
+/**
+ * Show the engine's start-up progress on the start-up and restart screens (StopProgress renders it while the state is
+ * "starting"): the line, state "starting", no stop-only offers. A null reading (the record is gone) takes the line down.
+ * Where no restart run() holds `inFlight` (the launch), it holds it with its own promise so the crash watchdog stays out;
+ * a `restartBridge` asked for meanwhile joins that hold and gets true once it ends, without a restart of its own (the
+ * launch screen blocks every path that could ask). Call `endEngineProgress` in a finally.
+ */
+export function showEngineProgress(reading: EngineProgress | null): void {
+  if (reading === null) {
+    if (engineShown) {
+      engineShown = false;
+      setShared({ progress: null });
+    }
+    return;
+  }
+  if (inFlight === null) {
+    inFlight = new Promise<boolean>((resolve) => {
+      releaseHold = resolve;
+    });
+  }
+  engineShown = true;
+  setShared({ state: "starting", progress: engineProgressLine(reading), offerHardExit: false, offerText: null });
+}
+
+/**
+ * The start is over, whatever its outcome. Where `showEngineProgress` took the hold: release it (the hold's promise
+ * resolves true) and reset to idle. Inside a restart run(): clear only the progress it showed, because a full reset would
+ * clear `errorDetail`, which `stopBridgeThen` reads. Safe to call with nothing shown.
+ */
+export function endEngineProgress(): void {
+  const release = releaseHold;
+  const shown = engineShown;
+  releaseHold = null;
+  engineShown = false;
+  if (release) {
+    inFlight = null;
+    release(true);
+    setShared({ ...IDLE });
+  } else if (shown) {
+    setShared({ progress: null });
+  }
+}
+
 /** True while a restart (or a launch-time wait for a stopping bridge) runs. The crash watchdog stays out of it. */
 export function restartInFlight(): boolean {
   return inFlight !== null;
@@ -195,6 +259,8 @@ export function _resetRestartBridgeForTests(): void {
   shared = { ...IDLE };
   inFlight = null;
   answer = null;
+  engineShown = false;
+  releaseHold = null;
 }
 
 /** The user accepted the hard-exit offer. */
@@ -315,11 +381,18 @@ async function watchStop(persona: string, pinned: Pin | null, start = true): Pro
  *  Rust. Without ``start`` (a service install, M4) the bridge is only ended. */
 async function forced(persona: string, skipHardExitRequest: boolean, start = true, pin: Pin | null = null): Promise<boolean> {
   transition("forcing");
+  const kill = (): Promise<void> =>
+    pin
+      ? invokeForceRestart(persona, skipHardExitRequest, start, { pid: pin.pid, pid_token: pin.token })
+      : invokeForceRestart(persona, skipHardExitRequest, start); // a pre-PR bridge has no token to pin
   try {
-    if (pin) {
-      await invokeForceRestart(persona, skipHardExitRequest, start, { pid: pin.pid, pid_token: pin.token });
-    } else {
-      await invokeForceRestart(persona, skipHardExitRequest, start); // a pre-PR bridge has no token to pin
+    // With a start, the one blocking call includes the new bridge's start, its first rebuild too (Rust ends
+    // force_restart_bridge in ensure_bridge_running), so the engine's progress is shown while it runs (HR5b (a)).
+    // Without one (a service install) nothing starts here.
+    try {
+      await alongside(persona, start ? showEngineProgress : undefined, kill);
+    } finally {
+      if (start) endEngineProgress();
     }
   } catch (e) {
     if (errString(e).includes("bridge_changed")) {
@@ -332,7 +405,7 @@ async function forced(persona: string, skipHardExitRequest: boolean, start = tru
   if (!start) return true;
   transition("waiting_for_health");
   try {
-    await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
+    await pollHealth(persona); // the call above returned only once the start did: nothing left to show
   } catch {
     setShared({ errorDetail: FAILED_USER_MESSAGE });
     return false;
@@ -340,14 +413,17 @@ async function forced(persona: string, skipHardExitRequest: boolean, start = tru
   return true;
 }
 
-/** Wait for a bridge something else is starting (the service an install started) to answer /health. */
+/** Wait for a bridge something else is starting (the service an install started) to answer /health, showing the
+ *  engine's start-up progress meanwhile. */
 async function awaitHealth(persona: string): Promise<boolean> {
   transition("waiting_for_health");
   try {
-    await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
+    await pollHealth(persona, showEngineProgress);
   } catch {
     setShared({ errorDetail: FAILED_USER_MESSAGE });
     return false;
+  } finally {
+    endEngineProgress();
   }
   return true;
 }
@@ -355,14 +431,16 @@ async function awaitHealth(persona: string): Promise<boolean> {
 async function startFresh(persona: string): Promise<boolean> {
   transition("starting");
   try {
-    await ensureBridgeRunning(persona);
+    await ensureBridgeRunning(persona, showEngineProgress);
   } catch (e) {
     setShared({ errorDetail: errString(e) || FAILED_USER_MESSAGE });
     return false;
+  } finally {
+    endEngineProgress();
   }
   transition("waiting_for_health");
   try {
-    await pollHealth(persona, Date.now() + TIMEOUT_HEALTH_MS);
+    await pollHealth(persona);
   } catch {
     setShared({ errorDetail: FAILED_USER_MESSAGE });
     return false;

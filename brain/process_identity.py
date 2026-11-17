@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 GONE = "gone"
 UNKNOWN = "unknown"
@@ -151,6 +152,11 @@ def is_token(value: str | None) -> bool:
     return bool(value) and value not in (GONE, UNKNOWN)
 
 
+def own_pid() -> int:
+    """This process's pid: the one place code outside this module gets it (engine_files makes no raw ``os`` call)."""
+    return os.getpid()
+
+
 def own_token() -> str | None:
     """This process's token, or None when it cannot be read here.
 
@@ -159,7 +165,7 @@ def own_token() -> str | None:
     """
     global _OWN
     if _OWN is None:
-        tok = token_of(os.getpid())
+        tok = token_of(own_pid())
         _OWN = tok if is_token(tok) else ""
     return _OWN or None
 
@@ -191,6 +197,17 @@ def holder_alive(pid: int | None, recorded: str | None) -> bool:
     from brain.bridge.state_file import pid_is_alive
 
     return pid_is_alive(pid)
+
+
+def names_this_bridge(record: dict[str, Any] | None, pid: int | None, token: str | None) -> bool:
+    """True when ``record`` names exactly ``pid`` + ``token`` (C43 a: anything else is ignored).
+
+    A comparison against an expected identity only, no liveness (that is ``holder_alive``). The bridge's watcher files and the
+    engine's progress record both use it for "is this record mine".
+    """
+    if not isinstance(record, dict) or pid is None or not token:
+        return False
+    return record.get("pid") == pid and record.get("pid_token") == token
 
 
 def token_digest(token: str) -> str:

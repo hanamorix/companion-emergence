@@ -18,8 +18,8 @@ def days_since_human(
 ) -> float:
     """Days since the user last spoke. 999.0 if no conversation file holds a user turn.
 
-    The time of the user's last turn is ``brain.ingest.buffer.last_user_turn_ts`` (the active conversation files, then the
-    archive when no active file holds a user turn). The function reads no memory and no presence file: a recalled
+    The time of the user's last turn is ``brain.ingest.buffer.last_user_turn_ts`` (the later of the active conversation files'
+    newest user turn and the newest archived session's). The function reads no memory and no presence file: a recalled
     memory's ``created_at`` can move, a conversation file's user row cannot.
 
     ``last_user_turn_ts`` is imported here, not at the top: ``brain.ingest`` pulls the ingest pipeline and the provider

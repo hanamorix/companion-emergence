@@ -212,3 +212,23 @@ def test_a_test_that_fakes_the_platform_cannot_leave_later_tests_without_a_token
         check=False,
     )
     assert result.returncode == 0, result.stdout[-2000:]
+
+
+def test_names_this_bridge_needs_the_pid_and_the_token_to_match():
+    """The own-record test of the bridge's watcher files and of the engine's progress record (moved here from shutdown_progress)."""
+    token = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456"
+    record = {"pid": 4242, "pid_token": token}
+    assert pi.names_this_bridge(record, 4242, token)
+    assert not pi.names_this_bridge(record, 4243, token)
+    assert not pi.names_this_bridge(record, 4242, "linux:other:4242:9")
+    assert not pi.names_this_bridge(record, 4242, None)  # no token to match: never mine
+    assert not pi.names_this_bridge({"pid": 4242, "pid_token": None}, 4242, None)
+    assert not pi.names_this_bridge(None, 4242, token)
+    assert not pi.names_this_bridge(["pid"], 4242, token)  # type: ignore[arg-type]
+    assert not pi.names_this_bridge(record, None, token)
+
+
+def test_names_this_bridge_lives_only_in_process_identity():
+    from brain.bridge import shutdown_progress
+
+    assert not hasattr(shutdown_progress, "names_this_bridge")

@@ -25,6 +25,8 @@ vi.mock("./hooks/useRestartBridge", () => ({
   restartBridge: vi.fn(async () => true),
   clearRestartState: vi.fn(),
   awaitStoppingBridge: vi.fn(async () => true),
+  showEngineProgress: vi.fn(),
+  endEngineProgress: vi.fn(),
 }));
 
 const P = "nell";
@@ -83,6 +85,37 @@ describe("launchBrain (#335)", () => {
     expect(order).toEqual(["wait", "start"]);
     expect(restartModule.awaitStoppingBridge).toHaveBeenCalledWith(P);
     expect(restartModule.clearRestartState).toHaveBeenCalled(); // a wait nobody pressed leaves no button state
+  });
+
+  it("(HR5) the launch's start shows the engine's progress and ends it, after the stop wait's own clear", async () => {
+    status(NONE);
+    const order: string[] = [];
+    vi.mocked(restartModule.clearRestartState).mockImplementationOnce(() => void order.push("clear"));
+    vi.mocked(appConfig.ensureBridgeRunning).mockImplementationOnce(async (_persona, onProgress) => {
+      order.push(onProgress === restartModule.showEngineProgress ? "start with the display" : "start without");
+    });
+    vi.mocked(restartModule.endEngineProgress).mockImplementationOnce(() => void order.push("end"));
+    expect((await launchBrain(P)).kind).toBe("ready");
+    expect(order).toEqual(["clear", "start with the display", "end"]);
+  });
+
+  it("(HR5) the display is ended when the launch's start fails too", async () => {
+    status(NONE);
+    starts(false);
+    await launchBrain(P);
+    expect(vi.mocked(appConfig.ensureBridgeRunning).mock.calls[0]).toEqual([P, restartModule.showEngineProgress]);
+    expect(restartModule.endEngineProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it("(HR5) the recovery's own starts have no screen to show progress on and pass no callback", async () => {
+    status({ active_commit: NEW, confirmed: false, undo: "rollback" }, { active_commit: OLD, confirmed: true, undo: "revert" });
+    rollsBackTo(OLD);
+    starts(false, true);
+    await launchBrain(P);
+    const calls = vi.mocked(appConfig.ensureBridgeRunning).mock.calls;
+    expect(calls.length).toBe(2);
+    expect(calls[0]).toEqual([P, restartModule.showEngineProgress]); // the launch's start
+    expect(calls[1]).toEqual([P]); // startOk inside recoverUnhealthyBrain
   });
 
   it("no active overlay: unchanged launch", async () => {

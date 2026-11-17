@@ -410,7 +410,12 @@ def _all_rows(persona_dir: Path, sid: str) -> Iterator[dict]:
 
 
 def _newest_user_ts(persona_dir: Path) -> datetime | None:
-    """A duplicate reader of the newest user turn (see ``buffer.last_user_turn_ts``); left as it is."""
+    """The newest user turn across the active and archived rows of every session.
+
+    ``buffer.last_user_turn_ts`` answers the same question (the later of the active files and the archive) by different
+    code, so this is a duplicate implementation, left as it is (tracked on #465). The two differ only when a file's rows
+    are out of time order: this takes the largest user ``ts`` of every row, that takes each file's last user row.
+    """
     newest = None
     for sid in _session_ids(persona_dir):
         for row in _all_rows(persona_dir, sid):

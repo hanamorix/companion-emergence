@@ -113,6 +113,8 @@ def watch_stop(
 ) -> int:
     """Watch the bridge (pid + token) until it is gone. Returns 0 when it is gone (stopped, hard-exited or killed),
     1 without a terminal after ``timeout`` (nothing killed)."""
+    from brain import process_identity
+
     now = now or _clock.now
     sleep = sleep or _clock.sleep
     prompt = prompt or _prompt
@@ -132,7 +134,7 @@ def watch_stop(
             out(HARD_EXIT_DONE if request_sent_at is not None else EVERYTHING_STOPPED)
             return 0
         rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
-        mine = rec if shutdown_progress.names_this_bridge(rec, pid, token) else None
+        mine = rec if process_identity.names_this_bridge(rec, pid, token) else None
         tasks = list(mine.get("tasks") or []) if mine else None
         if tasks is not None and tasks != last_tasks:
             out(progress_line(tasks) if tasks else "Stopping. Finishing up.")

@@ -283,10 +283,3 @@ def stop_intent(
         "helper_pid": helper_pid,
         "helper_token": helper_token,
     }
-
-
-def names_this_bridge(record: dict[str, Any] | None, pid: int | None, token: str | None) -> bool:
-    """True when ``record`` names exactly the bridge ``pid`` + ``token`` (C43 a: anything else is ignored)."""
-    if not isinstance(record, dict) or pid is None or not token:
-        return False
-    return record.get("pid") == pid and record.get("pid_token") == token
