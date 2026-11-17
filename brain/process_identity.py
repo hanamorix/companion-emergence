@@ -152,6 +152,11 @@ def is_token(value: str | None) -> bool:
     return bool(value) and value not in (GONE, UNKNOWN)
 
 
+def own_pid() -> int:
+    """This process's pid: the one place code outside this module gets it (engine_files makes no raw ``os`` call)."""
+    return os.getpid()
+
+
 def own_token() -> str | None:
     """This process's token, or None when it cannot be read here.
 
@@ -160,7 +165,7 @@ def own_token() -> str | None:
     """
     global _OWN
     if _OWN is None:
-        tok = token_of(os.getpid())
+        tok = token_of(own_pid())
         _OWN = tok if is_token(tok) else ""
     return _OWN or None
 

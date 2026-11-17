@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import reprlib
 import threading
 from collections.abc import Callable, Mapping
@@ -393,10 +392,10 @@ class EngineProgress:
 
     def _put(self, done: int | None, total: int | None) -> None:
         existing = read_progress(self._persona_dir)
-        if existing is not None and _pid_of(existing) != os.getpid() and _writer_alive(existing):
+        if existing is not None and _pid_of(existing) != process_identity.own_pid() and _writer_alive(existing):
             return  # another live process's record (a second start's x10 step): never replaced
         record = progress_record(
-            pid=os.getpid(),
+            pid=process_identity.own_pid(),
             pid_token=process_identity.own_token(),
             persona=self._persona_dir.name,
             phase=self._phase,
@@ -407,7 +406,8 @@ class EngineProgress:
         write_json(progress_path(self._persona_dir), record, indent=2, sort_keys=True, fsync=False, mode=0o600)
 
     def _remove(self) -> None:
-        if process_identity.names_this_bridge(read_progress(self._persona_dir), os.getpid(), process_identity.own_token()):
+        own = (process_identity.own_pid(), process_identity.own_token())
+        if process_identity.names_this_bridge(read_progress(self._persona_dir), *own):
             file_ops.delete_file(progress_path(self._persona_dir))
 
 
