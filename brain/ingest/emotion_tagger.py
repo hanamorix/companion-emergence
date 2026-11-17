@@ -105,6 +105,11 @@ def tag_if_feelingless(store: MemoryStore, tagger: EmotionTagger | None, memory:
     Raises whatever the tagger or the store raises (a deferred model call included): the gate's caller makes it fail-soft.
 
     Accepted cost (P4): a memory the tagger returns nothing for stays untagged and is sent to the tagger again at each recall.
+
+    Accepted edge (P4): this does not filter on ``active``. An inactive row reaches the helper only if a gate path writes onto
+    it (a row opened by id after a deactivation, or a merge verdict that names an inactive id: the merge branch in
+    consolidation.py checks no active flag). Nothing in brain/ deactivates a row today (``store.deactivate`` has no production
+    caller). Such a row is tagged.
     """
     if tagger is None or store.has_stored_emotions(memory):
         return False

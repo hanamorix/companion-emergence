@@ -1360,11 +1360,11 @@ def test_e5_the_fade_takes_emotions_from_the_reread_row_and_importance_from_the_
     mem = _mem("Bob's address", "conversation", importance=3.0)  # loaded with no emotions
     store.create(mem, fold=False)
 
-    def reappraiser_while_backfill_writes(m):
+    def reappraiser_while_another_writer_stores_emotions(m):
         store.update(m.id, emotions={"joy": 6.0}, fold=False)  # emotions land during the model call
         return Reappraisal(9.5)
 
-    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
+    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_another_writer_stores_emotions)
     got = store.get(mem.id, bump=False)
     assert got.importance == pytest.approx(9.5)
     assert got._stored_emotions["joy"] == pytest.approx(6.0 * (1 - 3.0 / 20))  # 5.1: fresh emotions, loaded importance
