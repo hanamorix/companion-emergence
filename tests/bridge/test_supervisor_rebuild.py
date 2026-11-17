@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -23,9 +24,10 @@ from brain.emotion import engine, engine_files, engine_rebuild, nudge_scale_fix
 from brain.emotion.engine import EngineStartupError
 from brain.emotion.engine_utils import day_of
 from brain.health.anomaly import BrainIntegrityError
-from brain.paths import get_log_dir, get_persona_dir
+from brain.paths import get_log_dir, get_persona_dir, runtime_log_path
 from tests.unit.brain.emotion._engine_support import (
     NOW,
+    OtherHolder,
     install,
     local_day,
     local_noon,
@@ -221,14 +223,18 @@ def test_a_persona_that_does_not_exist_is_refused_and_nothing_is_made_or_run(
 # --- the real process: the entry point and the exit code ------------------------------------------------------------------
 
 
-def _run_child() -> subprocess.CompletedProcess[str]:
+def _child_env() -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO_ROOT), env.get("PYTHONPATH", "")]))
+    return env
+
+
+def _run_child() -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-P", "-m", "brain.cli", *ARGV],
         capture_output=True,
         text=True,
-        env=env,
+        env=_child_env(),
         cwd=str(REPO_ROOT),
         timeout=300,
         check=False,
@@ -241,6 +247,45 @@ def test_a_real_child_on_a_small_unswitched_persona_exits_zero_and_leaves_it_swi
     assert engine_files.read_state(persona).state is not None
     assert engine_files.switch_over_state(engine_files.read_state(persona)) is True
     assert _record(persona) is None
+
+
+def test_a_real_child_waits_for_a_held_engine_lock_past_one_wait_step_and_finishes_when_it_frees(persona: Path) -> None:
+    """S101, S107 (HS8): the child no longer gives up after one `EMOTION_LOCK_WAIT_S` step (5 s) on a lock another process holds.
+
+    The wait is observed inside a step: the child's own log line in the runtime log ("start-up waits for it") appears only after
+    a first step ran out, and only the waiting code writes it. The child is then still running; after the holder lets go it
+    takes the lock, rebuilds and exits 0. Bounded: the log is polled for at most 60 s, the exit waited for at most 120 s, and the
+    lock is released and the child killed in a `finally` (a child that waits for ever must not outlive a failing test).
+    """
+    log = runtime_log_path("nell")
+    holder = OtherHolder(persona)
+    child = subprocess.Popen(
+        [sys.executable, "-P", "-m", "brain.cli", *ARGV],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_child_env(),
+        cwd=str(REPO_ROOT),
+    )
+    try:
+        waited = False
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and child.poll() is None:
+            if log.exists() and "start-up waits for it" in log.read_text(encoding="utf-8", errors="replace"):
+                waited = True
+                break
+            time.sleep(0.1)
+        assert waited, f"the child never waited for the held lock (exit code {child.poll()})"
+        assert child.poll() is None  # still running after a whole step ran out
+        holder.release()
+        assert child.wait(timeout=120) == 0
+        assert engine_files.switch_over_state(engine_files.read_state(persona)) is True
+        assert _record(persona) is None
+    finally:
+        holder.release()
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 def test_a_real_child_on_a_database_that_is_not_a_database_exits_one_and_the_crash_log_holds_the_error(persona: Path) -> None:

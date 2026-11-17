@@ -739,6 +739,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 HR5 (#584, draft PR #633)",
         kind="text",
     ),
+    # --- the bridge and the commands stop rebuilding in-process (Engine 6 S107, HS7 and HS8) ----------------------------------
+    Removed(
+        names=("_StoppedWhileWaitingError", "stop_requested", "stop_requested_seen"),
+        why="the stop check of the engine-lock wait: the bridge's start-up no longer rebuilds in-process, the rebuild process (`nell supervisor rebuild`) waits for the lock with no stop check and no limit (`_locked_rebuild(wait_for_lock=True)`), so the `stop_requested` parameters, the stopped-while-waiting error and the test stub's `stop_requested_seen` list went (`stop_requested_at`, the bridge's stop time, is a different name)",
+        ref="Engine 6 S107 HS8 (#633, Planning B55)",
+        kind="code",
+    ),
 )
 
 

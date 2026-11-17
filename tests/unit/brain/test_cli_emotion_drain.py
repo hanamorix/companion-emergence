@@ -56,8 +56,8 @@ def test_a_one_shot_chat_drains_after_the_reply_and_again_after_the_pass_two_exi
     assert main(["chat", "--persona", "nell", "--no-bridge", "hello"]) == 0
     assert order == ["drain", "pass2", "drain"]
     assert len(_calls(emotion_engine_stub)) == 2
-    assert emotion_engine_stub.recorded_calls[0] == ("ensure_ready",)  # the command makes the engine ready first (Engine 6)
-    assert emotion_engine_stub.recorded_calls[1][1].tzinfo is not None  # an aware time
+    assert ("ensure_ready",) not in emotion_engine_stub.recorded_calls  # the command no longer rebuilds in-process (S107: its step does)
+    assert emotion_engine_stub.recorded_calls[0][1].tzinfo is not None  # an aware time
 
 
 def test_the_repl_drains_after_each_reply_and_after_the_exit_pass_two_drain(

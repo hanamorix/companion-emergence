@@ -47,7 +47,6 @@ from brain.setup import (
     validate_persona_name,
     write_persona_config,
 )
-from brain.utils.file_lock import LockTimeoutError
 from brain.utils.time import iso_utc
 
 # Text externalized to prompt_strings.toml [cli] (issue #129 stage 2b).
@@ -175,7 +174,8 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
     window show the child at once; (2) the runtime log, as `cmd_run` sets it up (its bridge-stack import comes after the record);
     (3) no store and no vocabulary are opened here: `ensure_engine_ready` opens its own and the rebuild reads half-lives from the
     persona's vocabulary file; (4) `ensure_engine_ready`, which is the x10 step and the first rebuild, or a switched persona's
-    roll-forward check and rebuild. Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
+    roll-forward check and rebuild, which waits for an engine lock another process holds until it comes (no stop check, no
+    limit: S101). Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
     success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
 
     A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
@@ -1035,25 +1035,22 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
 
 
 def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
-    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6): None to go on, or an exit code to return.
+    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
 
-    Called by the six commands that touch the engine, right after their own vocabulary load. A real run calls
-    `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and a failure raises `EngineStartupError`
-    out of the handler (the crash log gets it), except an engine lock that did not come within the one wait (another process holds
-    it: a rebuild, a hook or a drain): that is refused like the dry run's reasons, one line on stderr and 2. A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run no longer rebuilds
+    in-process: it registers the command (`engine_files.register_command_run`, so a start that needs a rebuild can end it) and runs
+    the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a rebuild needed it takes the start lock, ends every
+    other running command and runs the rebuild as its own process (`nell supervisor rebuild`), then goes on. Its code is returned:
+    1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
     not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
     plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
     on a switched persona it goes on as today.
     """
     if not dry_run:
-        try:
-            emotion_engine.ensure_engine_ready(persona_dir)
-        except emotion_engine.EngineStartupError as exc:
-            if exc.what != emotion_engine.ENGINE_LOCK_STEP or not isinstance(exc.cause, LockTimeoutError):
-                raise
-            print("The emotion engine is busy with another job. Try again when it finishes.", file=sys.stderr)
-            return 2
-        return None
+        from brain.bridge import daemon
+
+        engine_files.register_command_run(persona_dir)  # through the module: the tests' fixture replaces the name
+        return daemon.run_rebuild_step(persona_dir)
     if emotion_engine.engine_for(persona_dir).is_live():
         return None
     if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is None:
@@ -2261,7 +2258,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but a busy engine lock still refuses
+        refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but the rebuild step can still refuse (1 or 2)
         if refused is not None:
             return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")

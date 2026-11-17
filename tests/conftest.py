@@ -592,7 +592,6 @@ class EmotionEngineStub:
         from brain.emotion.engine import EngineStatus
 
         self.recorded_calls: list[tuple[Any, ...]] = []
-        self.stop_requested_seen: list[Any] = []
         self.readings: dict[str, Any] = {}
         self.live = False
         self.high: set[str] = set()
@@ -635,15 +634,12 @@ class EmotionEngineStub:
     def status(self) -> Any:
         return self.engine_status
 
-    def ensure_ready(self, *, stop_requested: Any = None) -> None:
+    def ensure_ready(self) -> None:
         """What `engine.ensure_engine_ready(<directory>)` reaches through the patched `engine_for`: recorded, and nothing happens.
 
-        The bridge lifespan passes `stop_requested` (the command-line callers never do): each one given is kept in
-        `stop_requested_seen`, and `recorded_calls` holds the same `("ensure_ready",)` entry either way.
+        Only the rebuild process calls it (`nell supervisor rebuild`); the bridge and the commands do not.
         """
         self.recorded_calls.append(("ensure_ready",))
-        if stop_requested is not None:
-            self.stop_requested_seen.append(stop_requested)
 
     def needs_recovery(self) -> bool:
         return self.recovery_needed
