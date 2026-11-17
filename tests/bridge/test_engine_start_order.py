@@ -93,7 +93,7 @@ def _files_under(persona: Path) -> set[str]:
 
 def _record_ensure(stub, order: list[str]) -> None:  # noqa: ANN001
     real = stub.ensure_ready
-    stub.ensure_ready = lambda: (order.append("ensure"), real())[1]
+    stub.ensure_ready = lambda **kwargs: (order.append("ensure"), real(**kwargs))[1]  # the lifespan passes stop_requested
 
 
 # ================================================================================================
@@ -112,6 +112,7 @@ def test_each_command_calls_ensure_after_its_vocabulary_load_and_before_its_firs
         main([*argv, "--persona", "nell"])
     assert order == ["vocabulary", "ensure", "work"]
     assert [call for call in emotion_engine_stub.recorded_calls if call[0] == "ensure_ready"] == [("ensure_ready",)]
+    assert emotion_engine_stub.stop_requested_seen == []  # a command waits the 5 s and refuses: it passes no stop check
 
 
 @pytest.mark.parametrize(("name", "argv"), SIX_COMMANDS, ids=[name for name, _ in SIX_COMMANDS])
@@ -219,12 +220,33 @@ def test_lifespan_calls_ensure_between_the_vocabulary_load_and_the_start_up_drai
     assert order == ["vocabulary", "ensure", "drain"]
 
 
+def test_the_lifespan_passes_a_stop_check_that_follows_the_shutdown_controller(
+    persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HR5a: only the bridge lifespan passes `stop_requested`, and it is the controller's `requested`: False while the start-up
+    runs, True once the lifespan's teardown has begun the stop. (The command-line callers pass nothing: see
+    `test_each_command_calls_ensure_after_its_vocabulary_load_and_before_its_first_work`.)"""
+    answers_during_start_up: list[bool] = []
+    real = emotion_engine_stub.ensure_ready
+
+    def ensure_ready(**kwargs: object) -> None:
+        real(**kwargs)
+        answers_during_start_up.append(kwargs["stop_requested"]())  # type: ignore[operator]
+
+    emotion_engine_stub.ensure_ready = ensure_ready
+    with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")):
+        pass
+    assert len(emotion_engine_stub.stop_requested_seen) == 1
+    assert answers_during_start_up == [False]
+    assert emotion_engine_stub.stop_requested_seen[0]() is True  # the teardown began the stop
+
+
 def test_a_failing_ensure_stops_the_bridge_before_the_supervisor_is_spawned(
     persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spawned = _supervisor_spawns(monkeypatch)
 
-    def fail() -> None:
+    def fail(**_kwargs: object) -> None:  # the lifespan passes stop_requested
         raise EngineStartupError("the first rebuild", OSError("disk full"))
 
     emotion_engine_stub.ensure_ready = fail

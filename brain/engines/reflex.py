@@ -337,7 +337,7 @@ class ReflexEngine:
         # log_path lives at the persona dir root, so its parent IS the
         # persona dir — same pattern used at line 450 below for prompt
         # composition. days_since_human reads the user's last turn from the
-        # conversation files under it (active buffers, then the archive).
+        # conversation files under it (the later of the active buffers and the archive).
         days_since = days_since_human(now, persona_dir=self.log_path.parent)
 
         eligible, skipped = self._evaluate(

@@ -378,6 +378,9 @@ class Memory:
             attributes — absorbs OG-only fields (source_date, supersedes,
             etc.) during migration without proliferating the dataclass.
             Forward-compatible: future engines read metadata[key] as needed.
+        rowid: the row's SQLite rowid (insertion order; it never moves on an update), or None for a memory that was not
+            read through a query that selects it. Filled by `get` and `list_engine_window` and handed to the emotion
+            engine by the store's two hooks; not part of equality, so a fetched and a created memory stay equal.
     """
 
     id: str
@@ -396,6 +399,7 @@ class Memory:
     content_snapshot: str | None = None
     recall_count: float = 0.0
     _stored_peak: float = 0.0
+    rowid: int | None = field(default=None, compare=False)
 
     @classmethod
     def from_stored_row(
@@ -417,6 +421,7 @@ class Memory:
         content_snapshot: str | None = None,
         recall_count: float = 0.0,
         peak_emotion_intensity: float = 0.0,
+        rowid: int | None = None,
     ) -> Memory:
         """Rebuild a memory from a stored row's own values, under public parameter names.
 
@@ -440,6 +445,7 @@ class Memory:
             content_snapshot=content_snapshot,
             recall_count=recall_count,
             _stored_peak=peak_emotion_intensity,
+            rowid=rowid,
         )
 
     @classmethod
@@ -1359,21 +1365,24 @@ class MemoryStore:
         build).
         """
         with self._rolls_back_on_error():
-            self._insert_memory_row(memory)
+            rowid = self._insert_memory_row(memory)
             self._conn.commit()
         if fold:
-            self._notify_committed(memory)
+            self._notify_committed(memory, rowid)
         return memory.id
 
-    def _insert_memory_row(self, memory: Memory) -> None:
-        """The one INSERT of a memory row, uncommitted: `create` and `create_grief_touch_unless_recent` both run it, so the column list is written once."""
+    def _insert_memory_row(self, memory: Memory) -> int | None:
+        """The one INSERT of a memory row, uncommitted: `create` and `create_grief_touch_unless_recent` both run it, so the column list is written once.
+
+        Returns the new row's rowid (`cursor.lastrowid`), which the caller hands to the emotion engine after the commit.
+        """
         try:
             metadata_json = json.dumps(memory.metadata)
         except TypeError as exc:
             raise TypeError(
                 f"Memory.metadata for id={memory.id!r} contains non-JSON-serialisable values: {exc}"
             ) from exc
-        self._conn.execute(
+        cursor = self._conn.execute(
             """
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
@@ -1400,6 +1409,7 @@ class MemoryStore:
                 ),
             ),
         )
+        return cursor.lastrowid
 
     def merge_into(self, target: Memory, candidate: Memory, merged_content: str, *, engine_live: bool) -> None:
         """Write the consolidation merge's result into `target`: the merged content and, once the engine is live, the
@@ -1428,17 +1438,20 @@ class MemoryStore:
 
         return engine.engine_for(persona_dir)
 
-    def _notify_committed(self, memory: Memory) -> None:
-        """Tell the engine a row was committed. All of it is inside the guard: a failure here must not reach the write."""
+    def _notify_committed(self, memory: Memory, rowid: int | None) -> None:
+        """Tell the engine a row was committed, with the rowid the insert gave it (on a copy: the caller's memory is not changed).
+
+        All of it is inside the guard: a failure here must not reach the write.
+        """
         try:
             target = self.emotion_engine()
             if target is not None:
-                target.on_memory_committed(memory)
+                target.on_memory_committed(replace(memory, rowid=rowid))
         except Exception:
             logger.error("MemoryStore.create: telling the emotion engine about %s failed", memory.id, exc_info=True)
 
     def _notify_assigned(self, before: Memory, new_emotions: dict[str, float]) -> None:
-        """Tell the engine a row that had no feelings now has some: the row as it was before the update, with the new emotions."""
+        """Tell the engine a row that had no feelings now has some: the row as it was before the update (its rowid from the update's own lookup), with the new emotions."""
         try:
             if before._stored_emotions or not new_emotions:
                 return
@@ -3010,7 +3023,7 @@ class MemoryStore:
         last_accessed_at — this is a genuine-access path, unlike
         ``bump_recall``).
         """
-        row = self._conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        row = self._conn.execute("SELECT rowid, * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if row is None:
             return None
         amount = _bump_amount(bump)
@@ -3264,7 +3277,7 @@ class MemoryStore:
     # `last_accessed_at`, no hook, no embedding column. The catch-up replays what happened since a backup state was saved.
 
     _ENGINE_WINDOW_COLUMNS = (
-        "id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
+        "rowid, id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
         "last_accessed_at, active, metadata_json, state, content_snapshot, recall_count, "
         "peak_emotion_intensity"
     )
@@ -3281,17 +3294,25 @@ class MemoryStore:
             raise ValueError(f"since is not a usable time: {since!r}")
         return when, (when - timedelta(days=1)).isoformat()
 
-    def list_engine_window(self, since: datetime) -> list[Memory]:
+    def list_engine_window(self, since: datetime, *, rowid_above: int | None = None) -> list[Memory]:
         """The rows created OR last accessed at or after `since` (any type, any state), oldest first. Bumps nothing.
+
+        Each Memory carries its `rowid`. With `rowid_above`, only rows whose rowid is greater than it are returned: the filter
+        wraps the time condition (`(created_at >= ? OR last_accessed_at >= ?) AND rowid > ?`), so it binds to both terms.
+        A `rowid_above` that is not a whole number (a bool is not one) raises ValueError.
 
         A row whose columns cannot be parsed (a bad time or bad JSON) is logged with its id and skipped, so one damaged row
         does not stop every catch-up.
         """
         when, bound = self._window_bounds(since)
-        rows = self._conn.execute(
-            f"SELECT {self._ENGINE_WINDOW_COLUMNS} FROM memories WHERE created_at >= ? OR last_accessed_at >= ?",  # noqa: S608
-            (bound, bound),
-        ).fetchall()
+        sql = f"SELECT {self._ENGINE_WINDOW_COLUMNS} FROM memories WHERE (created_at >= ? OR last_accessed_at >= ?)"  # noqa: S608
+        params: list[Any] = [bound, bound]
+        if rowid_above is not None:
+            if type(rowid_above) is not int:
+                raise ValueError(f"rowid_above must be a whole number or None, found {rowid_above!r}")
+            sql += " AND rowid > ?"
+            params.append(rowid_above)
+        rows = self._conn.execute(sql, params).fetchall()
         found: list[Memory] = []
         for row in rows:
             try:
@@ -4084,13 +4105,13 @@ class MemoryStore:
             if self._recent_grief_touch_exists(referent_id, hours):
                 self._conn.rollback()
                 return None
-            self._insert_memory_row(memory)
+            rowid = self._insert_memory_row(memory)
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
             raise
         if fold:
-            self._notify_committed(memory)
+            self._notify_committed(memory, rowid)
         return memory.id
 
     def list_since_iso(self, opened_at_iso: str, *, include_fading: bool = True) -> list[Memory]:
@@ -4153,4 +4174,5 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
             if "peak_emotion_intensity" in row_keys
             else 0.0
         ),
+        rowid=row["rowid"] if "rowid" in row_keys else None,
     )

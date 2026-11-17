@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from brain import process_identity
 from brain.bridge import daemon, shutdown_progress, state_file
+from brain.emotion import engine_files
 
 FIX = Path(__file__).resolve().parents[3] / "fixtures" / "bridge_watcher_files"
 TOKEN = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456"
@@ -59,8 +61,29 @@ def test_status_json_matches_the_fixture(tmp_path, monkeypatch):
         supervisor={"state": "running", "restarts": 0, "last_error": None, "last_error_at": None}))
     shutdown_progress.write_record(pd, shutdown_progress.PROGRESS_FILENAME, _fixture("progress.json"))
     shutdown_progress.write_record(pd, shutdown_progress.INTENT_FILENAME, _fixture("stop_intent_pending.json"))
+    engine_files.progress_path(pd).write_text(json.dumps(_fixture("engine_progress.json")), encoding="utf-8")
     monkeypatch.setattr(state_file, "bridge_liveness", lambda st, p: state_file.ALIVE)
+    monkeypatch.setattr(process_identity, "holder_alive", lambda pid, token: True)
     assert daemon.status_dict(pd) == _fixture("status.json")
+
+
+def test_engine_progress_record_matches_the_fixture(tmp_path):
+    """HR5: the rebuild's progress record; the status field above carries it as written."""
+    rec = engine_files.progress_record(
+        pid=4242, pid_token=TOKEN, persona="nell", phase="rebuilding", done=1200, total=4800,
+        updated_at="2026-10-19T21:00:30.000000+00:00",
+    )
+    assert rec == _fixture("engine_progress.json")
+    assert engine_files.progress_path(tmp_path) == tmp_path / "engine_progress.json"
+    shutdown_progress.write_record(tmp_path, "engine_progress.json", rec)
+    assert engine_files.read_progress(tmp_path) == _fixture("engine_progress.json")
+
+
+def test_status_has_no_engine_progress_without_a_record(tmp_path, monkeypatch):
+    pd = tmp_path / "nell"
+    pd.mkdir()
+    monkeypatch.setattr(state_file, "bridge_liveness", lambda st, p: state_file.ALIVE)
+    assert daemon.status_dict(pd)["engine_progress"] is None
 
 
 def test_readers_ignore_a_record_of_another_bridge(tmp_path, monkeypatch):

@@ -51,9 +51,9 @@ def _half_life_seen_by_ensure(monkeypatch: pytest.MonkeyPatch, seen: list[float]
     """Record what the engine's half-life of contentment is at the moment `ensure_engine_ready` is called, then run the real one."""
     real = engine.ensure_engine_ready
 
-    def recording(persona_dir: Path) -> None:
+    def recording(persona_dir: Path, **kwargs: object) -> None:
         seen.append(engine.engine_for(persona_dir).half_life("contentment"))
-        real(persona_dir)
+        real(persona_dir, **kwargs)
 
     monkeypatch.setattr(engine, "ensure_engine_ready", recording)
 
@@ -85,7 +85,7 @@ def test_a_command_runs_the_swap_immediately_before_ensure(cli_persona, emotion_
     order: list[str] = []
     monkeypatch.setattr(_swap(), "run_vocabulary_swap_648", lambda persona_dir: order.append("swap"))
     real = emotion_engine_stub.ensure_ready
-    emotion_engine_stub.ensure_ready = lambda: (order.append("ensure"), real())[1]
+    emotion_engine_stub.ensure_ready = lambda **kw: (order.append("ensure"), real(**kw))[1]
     assert brain_cli._engine_ready_or_refuse(cli_persona, False) is None
     assert order == ["swap", "ensure"]
 
@@ -141,7 +141,7 @@ def test_lifespan_runs_the_swap_between_the_vocabulary_load_and_ensure(persona_d
     monkeypatch.setattr(server, "ensure_persona_vocabulary_loaded", lambda *a, **k: (order.append("vocabulary"), real_load(*a, **k))[1])
     monkeypatch.setattr(_swap(), "run_vocabulary_swap_648", lambda pd: order.append("swap"))
     real = emotion_engine_stub.ensure_ready
-    emotion_engine_stub.ensure_ready = lambda: (order.append("ensure"), real())[1]
+    emotion_engine_stub.ensure_ready = lambda **kw: (order.append("ensure"), real(**kw))[1]
     with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")):
         pass
     assert order == ["vocabulary", "swap", "ensure"]

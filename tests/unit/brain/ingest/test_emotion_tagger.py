@@ -133,6 +133,17 @@ def test_a_row_without_feelings_is_tagged_with_a_store_update_that_folds(store, 
     assert [c[0] for c in emotion_engine_stub.recorded_calls] == ["on_emotions_assigned"]  # `store.update` fired the hook once
 
 
+def test_the_tags_mood_event_carries_the_rows_rowid(store, emotion_engine_stub):
+    row = _memory()
+    store.create(row, fold=False)
+    rowid = store._conn.execute("SELECT rowid FROM memories WHERE id = ?", (row.id,)).fetchone()[0]
+    assert tag_if_feelingless(store, _tagger({"joy": 6.0}), row) is True
+    assigned = [c for c in emotion_engine_stub.recorded_calls if c[0] == "on_emotions_assigned"]
+    assert len(assigned) == 1
+    assert assigned[0][1].id == row.id
+    assert assigned[0][1].rowid == rowid  # the engine's `assigned` event takes this rowid (`engine.py` `on_emotions_assigned`)
+
+
 def test_a_row_with_feelings_is_not_sent_to_the_tagger(store):
     row = _memory(emotions={"trust": 3.0})
     store.create(row, fold=False)

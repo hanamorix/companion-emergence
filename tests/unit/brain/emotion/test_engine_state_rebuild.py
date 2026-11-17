@@ -1411,10 +1411,12 @@ def test_the_saved_file_has_the_documented_shape(tmp_path: Path) -> None:
         "persona_start_at",
         "switch_over_at",
         "queue_line",
+        "rows_through",
         "repeats",
         "emotions",
     }
     assert data["queue_line"] == 0
+    assert data["rows_through"] is None  # `_full_state` sees no row
     for key in ("saved_at", "reset_at", "last_update", "persona_start_at", "switch_over_at"):
         assert data[key].endswith("Z"), key
     assert data["saved_at"] == "2026-06-10T15:30:00Z"

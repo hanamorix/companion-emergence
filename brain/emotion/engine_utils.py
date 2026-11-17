@@ -127,6 +127,11 @@ class EngineState:
     with the state so that the fold and the position reach the disk in one write. `switch_over_at` is the persona's one
     switch-over time and the only record that it was switched over: the first rebuild at start-up sets it, in its one verified
     state write; nothing else sets it, and every later save of a loaded state writes it back unchanged (None: not switched).
+
+    `rows_through` is the highest `memories` rowid the engine has seen (a row's own rowid never moves on an update, and
+    rows are numbered in the order they were inserted): the apply step raises it with each memory event it folds, and a
+    rebuild or a catch-up raises it to the highest rowid among the rows it read. It never goes down. None: no row seen yet,
+    or a state written before the field existed, or a stored value that was not a whole number of 0 or more.
     """
 
     saved_at: datetime | None = None
@@ -138,6 +143,7 @@ class EngineState:
     emotions: dict[str, EmotionState] = field(default_factory=dict)
     queue_line: int = 0
     switch_over_at: datetime | None = None
+    rows_through: int | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +159,10 @@ class Event:
 
     `modifier` is the source modifier of a commit, an assigned or a showing event. A change has no modifier (its weight is
     always 1) and a start event folds nothing, so neither reads the field.
+
+    `rowid` is the `memories` rowid of the row a commit or assigned event came from (None: the caller had no row). It
+    rides the event from the store's hook to the apply step, which raises `EngineState.rows_through` with it once the event
+    folded. It is not written to the queue (those kinds are applied directly) and takes no part in equality.
     """
 
     kind: str
@@ -162,6 +172,16 @@ class Event:
     modifier: float = 1.0
     climax: float = 0.0
     source: str | None = None
+    rowid: int | None = field(default=None, compare=False)
+
+
+def larger_rowid(first: int | None, second: int | None) -> int | None:
+    """The larger of two rowids, where None is "no value" (both None: None). The one place the `rows_through` rule lives."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return max(first, second)
 
 
 def copy_state(state: EngineState) -> EngineState:
@@ -568,6 +588,9 @@ def faded_emotion(
         raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}") from None
     created = lenient_utc(memory.created_at)
     if switch_over_at is None or created is None:
+        # Accepted edge (HR4, P4): a persona `ensure_engine_ready` left not live (an unreadable state with a memories.db
+        # failing its integrity check, or a RebuildStateWriteError on an unreadable state) gets no fading until a later
+        # start succeeds. See "Accepted edges" in docs/source-spec/2026-11-16-emotion-rework-engine-6-as-built.md.
         return stored
     age_days = (now - max(created, switch_over_at)).total_seconds() / 86400.0
     floor = dev_constants.EMOTION_FADE_FLOOR_FRACTION.get(canonical_name(emotion))

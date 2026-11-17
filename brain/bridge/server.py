@@ -1430,8 +1430,11 @@ def build_app(
         # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so
         # start-up stops before the supervisor thread is spawned (an emotion state that exists but cannot be read is not a
         # failure: `ensure` decides from the database's x10 record, rebuilds the state and replaces the unreadable one; only
-        # when `memories.db` cannot be read either does it skip this start and log why).
-        emotion_engine.ensure_engine_ready(persona_dir)
+        # when `memories.db` cannot be read either does it skip this start and log why). An engine lock held by another
+        # process's rebuild is waited for, not a failure (Hana's #633 review point 5, owner S101): `stop_requested` ends the
+        # wait when the bridge is asked to stop, and the `EngineStartupError` that raises is then a stop, not a crash (the
+        # signal is already noted, so `runner._after_run` takes its normal stop path).
+        emotion_engine.ensure_engine_ready(persona_dir, stop_requested=lambda: controller.requested)
 
         # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
         # own failures and never raises.

@@ -591,6 +591,20 @@ export interface SupervisorInfo {
   last_error_at: string | null;
 }
 
+/** The engine's start-up record while a live process runs the first rebuild ("rebuilding", counting once `total` is
+ *  known) or the scale update ("rescaling", no count): `engine_progress` of `nell supervisor status --json`
+ *  (tests/fixtures/bridge_watcher_files/engine_progress.json). Only a record whose writer is alive is reported. */
+export interface EngineProgress {
+  phase: string;
+  done: number | null;
+  total: number | null;
+  persona?: string;
+  pid?: number;
+  pid_token?: string | null;
+  updated_at?: string;
+  version?: number;
+}
+
 /** `nell supervisor status --json` (#456; tests/fixtures/bridge_watcher_files/status.json). */
 export interface BridgeStatus {
   alive: "alive" | "gone" | "unknown";
@@ -604,6 +618,8 @@ export interface BridgeStatus {
   stop_requested_at?: string | null;
   stop_intent?: { state: string; pid: number; pid_token: string | null; reason?: string } | null;
   remaining?: { count: number | null; tasks: string[] | null } | null;
+  /** Present while a live process runs the engine's start-up rebuild or scale update (HR5); null or missing otherwise. */
+  engine_progress?: EngineProgress | null;
   client_origin?: string | null;
   service_installed?: boolean;
   recovery_needed?: boolean;

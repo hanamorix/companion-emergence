@@ -421,8 +421,37 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
 
 # Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
-# killed a healthy-but-slow bridge. 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
+# killed a healthy-but-slow bridge. (Bug 2b, v0.0.36.)
+# The bridge's start-up can outlast it: a first start waits for the engine lock while another process's emotion rebuild
+# holds it (Engine 6, HR5a, owner S101). The budget therefore pauses while an engine progress record names a live
+# writer (``_ReadinessBudget``); with no record it is this plain 50 s. The Rust caller's wait for ``nell supervisor start``
+# (lib.rs ``wait_for_start``) pauses on the same record.
 _READINESS_BUDGET_S = 50.0
+
+
+class _ReadinessBudget:
+    """A readiness wait's deadline, paused while an engine progress record names a live writer (Engine 6, HR5 part 4).
+
+    ``expired()`` is asked once per 0.1 s poll. It reads the record through ``engine_files.read_engine_progress`` (liveness
+    by ``holder_alive``; the reader never raises, and a missing or unreadable record counts as absent for that poll). A poll
+    that finds a record pushes the deadline out by the time since the previous poll, so the clock stands still while the
+    record shows; time before the record appears, and after it is gone, counts as ordinary budget. With no record ever it is
+    exactly ``start + budget_s``.
+    """
+
+    def __init__(self, persona_dir: Path, budget_s: float) -> None:
+        self._persona_dir = persona_dir
+        self._last = time.time()
+        self._deadline = self._last + max(0.0, budget_s)
+
+    def expired(self) -> bool:
+        from brain.emotion import engine_files
+
+        now = time.time()
+        if engine_files.read_engine_progress(self._persona_dir) is not None:
+            self._deadline += now - self._last
+        self._last = now
+        return now >= self._deadline
 
 
 def _service_installed(persona: str) -> bool:
@@ -440,9 +469,9 @@ def _start_service(persona: str) -> subprocess.CompletedProcess[str] | None:
 
 def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | None) -> int:
     """Readiness of a bridge the service manager started (#456 D20): a record of a live bridge (by its token) whose
-    /health answers, within what is left of the 50 s budget."""
-    deadline = time.time() + max(0.0, budget_s)
-    while time.time() < deadline:
+    /health answers, within what is left of the 50 s budget (which pauses while a rebuild's progress record shows)."""
+    budget = _ReadinessBudget(persona_dir, budget_s)
+    while not budget.expired():
         time.sleep(0.1)
         s = state_file.read(persona_dir)
         if s is None or not s.port or state_file.bridge_liveness(s, persona_dir) != state_file.ALIVE:
@@ -470,8 +499,8 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     """cmd_start's readiness wait for the child it just spawned (see cmd_start)."""
     proc = _spawned_children.get(pid)
 
-    deadline = time.time() + _READINESS_BUDGET_S
-    while time.time() < deadline:
+    budget = _ReadinessBudget(persona_dir, _READINESS_BUDGET_S)
+    while not budget.expired():
         time.sleep(0.1)
         s = state_file.read(persona_dir)
         if s is not None and s.pid == pid and s.port:
@@ -516,7 +545,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     # Readiness failed — kill the orphan child and tell the user where to look.
     _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
-        f"bridge spawned (pid {pid}) but /health did not respond in 50s — "
+        f"bridge spawned (pid {pid}) but /health did not respond within its readiness budget (50s, not counting a rebuild in progress) — "
         f"killed orphan child. Inspect log at {log_path}",
         file=sys.stderr,
     )
@@ -674,6 +703,7 @@ _PRE_PR_REQUEST_BUDGET_S = 3.0
 
 
 def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Response | None) -> bool:
+    from brain import process_identity
     from brain.bridge import shutdown_progress
 
     if response is not None:
@@ -685,7 +715,7 @@ def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Re
         except ValueError:
             pass
     rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
-    if shutdown_progress.names_this_bridge(rec, s.pid, s.pid_token):
+    if process_identity.names_this_bridge(rec, s.pid, s.pid_token):
         return True
     cur = state_file.read(persona_dir)
     return bool(cur is not None and cur.pid == s.pid and cur.phase == "stopping")
@@ -829,6 +859,8 @@ def _clear_stale_record(persona_dir: Path, s: state_file.BridgeState) -> None:
 
 def status_dict(persona_dir: Path) -> dict:
     """The machine-readable bridge status (`nell supervisor status --json`): files and process checks only."""
+    from brain.emotion import engine_files
+
     s = state_file.read(persona_dir)
     live = state_file.bridge_liveness(s, persona_dir) if s is not None else state_file.GONE
     proven = bool(
@@ -853,6 +885,9 @@ def status_dict(persona_dir: Path) -> dict:
         # the service install state, the supervisor's state and the kill helper's stated bound.
         "stop_intent": _status_intent(persona_dir),
         "remaining": _status_remaining(persona_dir, s),
+        # HR5 of #633 (owner S101, S102): the start-up step in progress (the x10 fix or the first rebuild), only while the process
+        # that writes it is alive; None otherwise. Written by `brain.emotion.engine_files.EngineProgress`.
+        "engine_progress": engine_files.read_engine_progress(persona_dir),
         "service_installed": _status_service_installed(s.persona if s and s.persona else persona_dir.name),
         "supervisor": s.supervisor if s else None,
         "kill_bound_s": _kill_bound(),
@@ -866,10 +901,11 @@ def _status_intent(persona_dir: Path) -> dict | None:
 
 
 def _status_remaining(persona_dir: Path, s: state_file.BridgeState | None) -> dict | None:
+    from brain import process_identity
     from brain.bridge import shutdown_progress
 
     rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
-    if s is None or not shutdown_progress.names_this_bridge(rec, s.pid, s.pid_token):
+    if s is None or not process_identity.names_this_bridge(rec, s.pid, s.pid_token):
         return None
     return {"count": rec.get("count"), "tasks": rec.get("tasks"), "phase": rec.get("phase"),
             "requested_at": rec.get("requested_at"), "reason": rec.get("reason"), "updated_at": rec.get("updated_at")}
