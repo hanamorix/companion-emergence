@@ -342,7 +342,7 @@ def _usable_number(value: object) -> bool:
 def _rebuild_progress_line(record: dict | None) -> str | None:
     """The window's line for a progress record: the scale update has no count, a record with no usable total is "getting ready",
     a count is "N of M (P%)" (N held between 0 and M). None when there is no record. Same rule as the app's
-    ``engineProgressLine``."""
+    ``engineProgressLine`` for the whole numbers the engine writes (a fractional count is cut to a whole number here)."""
     if record is None:
         return None
     if record.get("phase") == "rescaling":
@@ -443,7 +443,10 @@ def _run_rebuild_child(persona_dir: Path) -> None:
                     pass
             stop_watch._clock.sleep(stop_watch.POLL_S)  # noqa: SLF001
     except BaseException:
-        child.kill()
+        try:
+            child.kill()
+        except OSError:  # the child is already going away; still wait for it, and let the original exception through
+            pass
         child.wait()
         raise
     code = child.returncode

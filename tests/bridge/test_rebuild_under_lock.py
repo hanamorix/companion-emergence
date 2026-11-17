@@ -212,6 +212,8 @@ def test_with_a_terminal_the_spawn_line_and_each_phase_line_show_once_as_the_rec
         {"phase": "rebuilding", "done": 3, "total": 9},
         {"phase": "rebuilding", "done": 3, "total": 9},  # unchanged: nothing
         {"phase": "rebuilding", "done": 12, "total": 9},  # clamped to the total
+        {"phase": "rebuilding", "done": -3, "total": 9},  # clamped to zero
+        {"phase": "rescaling", "done": 2, "total": 9},  # the scale update wins over a count
     ]
     _progress(monkeypatch, script)
     rebuild_spawns.running_polls = len(script)
@@ -222,6 +224,8 @@ def test_with_a_terminal_the_spawn_line_and_each_phase_line_show_once_as_the_rec
         PREPARING,
         "Updating your memories: 3 of 9 (33%).",
         "Updating your memories: 9 of 9 (100%).",
+        "Updating your memories: 0 of 9 (0%).",
+        RESCALING,
     ]
     assert clock.sleeps == [stop_watch.POLL_S] * len(script)
     assert not rebuild_spawns.children[0].killed
