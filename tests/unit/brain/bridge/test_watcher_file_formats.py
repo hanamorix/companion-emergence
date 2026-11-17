@@ -79,6 +79,7 @@ def test_engine_progress_record_matches_the_fixture(tmp_path):
     assert engine_files.read_progress(tmp_path) == _fixture("engine_progress.json")
 
 
+@pytest.mark.real_rebuild_step(reason="calls the real register_command_run, which the conftest otherwise makes a no-op")
 def test_command_run_record_matches_the_fixture(tmp_path, monkeypatch):
     """HS3: the run record of a command (`<persona>/command_runs/<pid>.json`), as `register_command_run` writes it."""
     rec = engine_files.command_run_record(pid=4242, pid_token=TOKEN, persona="nell")

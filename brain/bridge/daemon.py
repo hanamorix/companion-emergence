@@ -312,6 +312,146 @@ def _runner_argv(
     return argv
 
 
+# The owner's wording list (S101, S102): the same lines as the app's start-up screen (useRestartBridge.ts engineProgressLine).
+_REBUILD_STARTED_LINE = "Updating your memories. This can take a few minutes."
+_REBUILD_RESCALING_LINE = "Updating the scale of your memories."
+_REBUILD_PREPARING_LINE = "Getting ready to update your memories."
+
+
+def _say(line: str) -> None:
+    """One line to stderr. A stderr that is gone or a print that fails (a broken pipe) is ignored: a display line never
+    changes what the step does."""
+    try:
+        if sys.stderr is not None:
+            print(line, file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stderr_is_terminal() -> bool:
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _usable_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def _rebuild_progress_line(record: dict | None) -> str | None:
+    """The window's line for a progress record: the scale update has no count, a record with no usable total is "getting ready",
+    a count is "N of M (P%)" (N held between 0 and M). None when there is no record. Same rule as the app's
+    ``engineProgressLine``."""
+    if record is None:
+        return None
+    if record.get("phase") == "rescaling":
+        return _REBUILD_RESCALING_LINE
+    done, total = record.get("done"), record.get("total")
+    if not (_usable_number(done) and _usable_number(total)):
+        return _REBUILD_PREPARING_LINE
+    done, total = int(done), int(total)
+    if total <= 0:
+        return _REBUILD_PREPARING_LINE
+    counted = min(max(done, 0), total)
+    return f"Updating your memories: {counted} of {total} ({counted * 100 // total}%)."
+
+
+def _rebuild_under_lock(persona_dir: Path) -> int | None:
+    """The start's rebuild step (S107, HS5 of #633), run with the start lock held. Returns None to go on, or the exit code to
+    return: 1 when another running command could not be ended (nothing else ran).
+
+    (1) Every other running command (``engine_files.live_command_runs``) is ended with ``kill.kill_command``, which asks the
+    process for its identity first; a command that is not ended (survivors, an identity that could not be confirmed, no token, an
+    exception) ends the step with one plain line naming its pid. This is the one place a start acts on a running command.
+    (2) The rebuild is its own process, ``nell supervisor rebuild``, waited for with no limit (S101: the startup waits until the
+    rebuild is finished). It prints the lines below to stderr only when stderr is a terminal; the loop sleeps through
+    ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
+    from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). Any
+    BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
+
+    The runtime log is attached for the step (transient, only when no persistent handler for the log is attached), so the lines
+    logged here reach it; ``runner`` is imported here, not at module level, so a start with no rebuild never loads the bridge stack.
+
+    Accepted edges (P4, R2): a persona whose rebuild keeps failing or skipping (S61's unreadable state with a failing integrity
+    check) is needed at every start, so each start with no bridge running repeats the child (twice for a service-managed persona: the
+    start's step, then the service run's) and goes on with the saved state, and each such run first ends every other running command,
+    a ``nell chat --no-bridge`` session included; each run logs why. ``nell supervisor stop`` typed during the step finds no bridge,
+    returns 0, and the start then launches the bridge. A child left by a dropped start holds the engine lock, so the new child waits
+    for that lock in the existing lock wait and then finds the work done; a lock held by something that is not a rebuild makes the
+    start wait with no limit and no stop check (S101; the child shows its "rebuilding" record meanwhile). No console flag is added on
+    Windows (the real-child test runs on every leg). A command that goes on after a failed rebuild runs on an engine state that may
+    lag until the next start retries (REVIEW, as the bridge does).
+    """
+    from brain.bridge import kill, runner
+    from brain.emotion import engine_files
+
+    transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+    try:
+        for record in engine_files.live_command_runs(persona_dir):
+            pid, token = record.get("pid"), record.get("pid_token")
+            try:
+                result = kill.kill_command(pid, token if isinstance(token, str) else None)
+                ended = result.succeeded
+            except Exception as exc:  # noqa: BLE001 - a command that cannot be ended ends the step like a failed stop
+                logger.warning("could not end the running command %s: %s: %s", pid, type(exc).__name__, exc)
+                ended = False
+            else:
+                if ended and result.outcome == "killed":
+                    logger.info("ended the running command %s before the rebuild", pid)
+                elif not ended:
+                    logger.warning("could not end the running command %s: %s", pid, result.message)
+            if not ended:
+                _say(f"Another command (process {pid}) is still running and could not be stopped. Nothing was updated. Try again when it has finished.")
+                return 1
+        _run_rebuild_child(persona_dir)
+        return None
+    finally:
+        runner._detach_runtime_log(transient)  # noqa: SLF001
+
+
+def _run_rebuild_child(persona_dir: Path) -> None:
+    """Spawn ``nell supervisor rebuild`` and wait for it (HS5 (2)); see ``_rebuild_under_lock``. Never raises for a failed child."""
+    from brain.bridge import stop_watch
+    from brain.emotion import engine_files
+
+    python, env = bridge_python()
+    # "-P" as _runner_argv has it; the persona by name, from the same home as ours (the environment is inherited).
+    argv = [python, "-P", "-m", "brain.cli", "supervisor", "rebuild", "--persona", persona_dir.name]
+    show = _stderr_is_terminal()
+    try:
+        child = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+        )
+    except OSError as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("the rebuild child for %s could not be started (%s); going on with the saved state", persona_dir.name, reason)
+        _say(f"Updating your memories could not be started ({reason}). Going on with your memories as they were saved.")
+        return
+    try:
+        if show:
+            _say(_REBUILD_STARTED_LINE)
+        last = _REBUILD_STARTED_LINE
+        while child.poll() is None:
+            if show:
+                try:
+                    line = _rebuild_progress_line(engine_files.read_engine_progress(persona_dir))
+                    if line is not None and line != last:
+                        last = line
+                        _say(line)
+                except Exception:  # noqa: BLE001 - a display glitch never touches the child
+                    pass
+            stop_watch._clock.sleep(stop_watch.POLL_S)  # noqa: SLF001
+    except BaseException:
+        child.kill()
+        child.wait()
+        raise
+    code = child.returncode
+    if code != 0:
+        logger.warning("the rebuild child for %s exited with code %s; going on with the saved state", persona_dir.name, code)
+        _say(f"Updating your memories did not finish (exit code {code}). Going on with your memories as they were saved.")
+
+
 # S57: cmd_start's refusal paths keep their existing wording, byte-identical.
 _LOCK_HELD_MSG = "bridge already starting (lockfile held)"
 

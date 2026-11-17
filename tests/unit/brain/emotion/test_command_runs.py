@@ -81,6 +81,7 @@ def test_the_folder_name_is_the_dev_constant_beside_the_progress_filename(person
     assert engine_files.command_run_path(persona, 77) == persona / "command_runs" / "77.json"
 
 
+@pytest.mark.real_rebuild_step(reason="calls the real register_command_run, which the conftest otherwise makes a no-op")
 def test_register_writes_this_processs_record_and_registers_one_exit_step(
     persona: Path, exit_steps: list[tuple[Callable[..., object], tuple[object, ...]]]
 ) -> None:
@@ -95,6 +96,7 @@ def test_register_writes_this_processs_record_and_registers_one_exit_step(
     assert exit_steps == [(engine_files._remove_own_command_run, (persona,))]
 
 
+@pytest.mark.real_rebuild_step(reason="calls the real register_command_run, which the conftest otherwise makes a no-op")
 def test_the_exit_step_removes_only_a_record_that_names_this_process(
     persona: Path, live_other: subprocess.Popen, exit_steps: list[tuple[Callable[..., object], tuple[object, ...]]]
 ) -> None:
@@ -123,6 +125,7 @@ def test_the_exit_step_with_no_record_does_nothing_and_never_raises(persona: Pat
     assert not engine_files.command_runs_dir(persona).exists()
 
 
+@pytest.mark.real_rebuild_step(reason="calls the real register_command_run, which the conftest otherwise makes a no-op")
 def test_a_failed_register_goes_on_unregistered_and_is_logged_once(
     persona: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -149,6 +152,7 @@ def test_a_missing_folder_reads_as_no_records_and_is_not_created(persona: Path) 
     assert not engine_files.command_runs_dir(persona).exists()
 
 
+@pytest.mark.real_rebuild_step(reason="calls the real register_command_run, which the conftest otherwise makes a no-op")
 def test_a_live_other_command_is_listed_and_this_processs_own_record_is_left_out(
     persona: Path, live_other: subprocess.Popen, exit_steps: list[tuple[Callable[..., object], tuple[object, ...]]]
 ) -> None:
