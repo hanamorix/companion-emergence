@@ -107,6 +107,21 @@ def test_a_lock_timeout_raised_inside_the_rebuild_is_not_waited_for(persona: Pat
     assert calls == [1]  # one rebuild, never retried
 
 
+@pytest.mark.no_base_failure(reason="a retention pin: a lock file that cannot be opened (not a lock that did not come) stops start-up with the lock named, before and after the wait moved to a flag")
+def test_a_lock_file_that_cannot_be_opened_is_not_waited_for_and_stops_start_up_naming_the_lock(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unopenable(persona_dir: Path) -> None:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(engine_files, "state_lock", unopenable)
+    WaitLog(monkeypatch, fail_on_wait=True)  # only a lock that did not come is waited for, never a lock that cannot be opened
+    with pytest.raises(EngineStartupError) as failed:
+        ensure_engine_ready(persona)
+    assert failed.value.what == "the engine lock"
+    assert isinstance(failed.value.cause, PermissionError)
+
+
 # --- a command's rebuild step (HS7) ------------------------------------------------------------------------------------
 
 
