@@ -58,6 +58,103 @@ def test_a_handle_that_resolves_anywhere_but_the_approved_path_is_refused_and_th
     assert pending.get(env["persona"], rid)["status"] == "refused"
 
 
+def _last_audit_event(env):
+    import json
+
+    log = env["persona"] / "write_audit.jsonl"
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()][-1]["event"]
+
+
+@pytest.mark.parametrize("where", ["at_the_recorded_path", "under_the_handles_real_location"])
+def test_a_refused_create_on_windows_removes_the_folders_it_made_703(env, monkeypatch, where):
+    # Windows path, any OS (#703): the missing folders were made by path and left after the handle check
+    # refused. They are removed where they are: at the path they were made at, or, when the folders were moved
+    # (a junction swapped in), under the location the handle really reports.
+    from brain.files import commit as commit_mod
+
+    notes, ssh, other = env["home"] / "Notes", env["home"] / ".ssh", env["home"] / "Other"
+    other.mkdir()
+    target = notes / "a" / "b" / "rc"
+    rid = propose_write(path=str(target), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    landed = ssh / "rc" if where == "at_the_recorded_path" else other / "a" / "b" / "rc"
+    real_open_final = commit_mod._open_final
+
+    def redirected_open(name, op, dir_fd):
+        if where == "under_the_handles_real_location":
+            (notes / "a").rename(other / "a")  # the folders now really sit under Other
+        return real_open_final(str(landed), op, dir_fd)
+
+    monkeypatch.setattr("brain.files.write_guard._is_windows", lambda: True)
+    monkeypatch.setattr(commit_mod, "_open_final", redirected_open)
+    monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: str(landed))
+    done = _commit(env, rid)
+    assert done["ok"] is False and done["error"].startswith("refused:"), done
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+    assert _last_audit_event(env) == "commit_refused"
+    assert list(notes.iterdir()) == [] and list(other.iterdir()) == []
+    assert sorted(p.name for p in ssh.iterdir()) == []
+
+
+@pytest.mark.no_base_failure(reason="#703 identity rule on the Windows path: the cleanup must not remove what this call did not make, or what it cannot identify; the base removes nothing. Shown able to fail by mutations recorded in the run's harness")
+@pytest.mark.parametrize("case", ["made_by_another_writer", "same_name_swapped_in", "no_file_index"])
+def test_the_windows_cleanup_removes_only_folders_it_can_identify_as_its_own_703(env, monkeypatch, case):
+    import os
+
+    from brain.files import commit as commit_mod
+
+    notes, ssh = env["home"] / "Notes", env["home"] / ".ssh"
+    a, b = notes / "a", notes / "a" / "b"
+    rid = propose_write(path=str(b / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    real_mkdir, real_stat, real_open_final = os.mkdir, os.stat, commit_mod._open_final
+    if case == "made_by_another_writer":  # our mkdir of 'a' then raises FileExistsError: 'a' is not ours
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            if dir_fd is None and Path(path) == a and not a.exists():
+                real_mkdir(path, mode)
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", mkdir)
+    if case == "no_file_index":  # a volume with no file index reports st_ino 0
+        def stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            if isinstance(path, (str, Path)) and str(path).startswith(str(notes)):
+                fields = list(st)[:10]
+                fields[1] = 0
+                return os.stat_result(fields)
+            return st
+
+        monkeypatch.setattr(os, "stat", stat)
+
+    def redirected_open(name, op, dir_fd):
+        if case == "same_name_swapped_in":
+            b.rename(a / "b.ours")
+            b.mkdir()  # someone else's empty folder under our folder's name
+        return real_open_final(str(ssh / "rc"), op, dir_fd)
+
+    monkeypatch.setattr("brain.files.write_guard._is_windows", lambda: True)
+    monkeypatch.setattr(commit_mod, "_open_final", redirected_open)
+    monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: str(ssh / "rc"))
+    assert _commit(env, rid)["ok"] is False
+    if case == "made_by_another_writer":
+        assert a.is_dir() and list(a.iterdir()) == []  # theirs kept; ours ('b') removed
+    elif case == "same_name_swapped_in":
+        assert b.is_dir() and list(b.iterdir()) == []  # theirs kept (ours, moved, stays: accepted on #703)
+    else:
+        assert b.is_dir() and a.is_dir()  # no identity, no removal
+
+
+@pytest.mark.timeout(5)
+def test_the_walk_up_to_the_first_existing_folder_stops_at_a_missing_root_703():
+    # #703: Windows makes each missing folder itself now. Under a drive that is gone (a card can wait 24 h),
+    # a walk up while the folder does not exist must end at the root, whose parent is itself, not loop.
+    from pathlib import PureWindowsPath
+
+    from brain.files.commit import _missing_folders
+
+    missing = _missing_folders(PureWindowsPath("Z:\\a\\b"), exists=lambda p: False)
+    assert missing == [PureWindowsPath("Z:\\a"), PureWindowsPath("Z:\\a\\b")]
+    assert _missing_folders(PureWindowsPath("Z:\\a\\b"), exists=lambda p: str(p) in ("Z:\\", "Z:\\a")) == [PureWindowsPath("Z:\\a\\b")]
+
+
 @pytest.mark.no_base_failure(reason="Windows-only (junctions); the base-code check runs on Linux. The seam test above bites there")
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
 def test_a_folder_swapped_for_a_junction_is_refused_on_windows(env, monkeypatch):

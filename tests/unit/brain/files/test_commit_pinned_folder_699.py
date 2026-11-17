@@ -121,6 +121,208 @@ def test_a_folder_moved_into_a_protected_one_while_the_file_opens_is_caught_and_
     assert pending.get(env["persona"], rid)["status"] == "refused"
 
 
+def _last_audit_event(env):
+    import json
+
+    log = env["persona"] / "write_audit.jsonl"
+    lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return lines[-1]["event"]
+
+
+@pytest.mark.parametrize("moved", ["b", "a", "Notes"])
+def test_a_refused_create_leaves_no_folder_it_made_wherever_it_was_moved_703(env, monkeypatch, moved):
+    # #703: the file was removed after the post-open check refused, the folders this call made were not.
+    # The racer moves one folder on the path into ~/.ssh while the file opens: one we made (b or a), or
+    # Notes, which existed before (its move stays: it is the racer's own act on a folder we did not make).
+    from brain.files import commit as commit_mod
+
+    home, notes, ssh = env["home"], env["home"] / "Notes", env["home"] / ".ssh"
+    rid = propose_write(path=str(notes / "a" / "b" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    source = {"b": notes / "a" / "b", "a": notes / "a", "Notes": notes}[moved]
+    real_open_final = commit_mod._open_final
+
+    def open_then_move(name, op, dir_fd):
+        fd = real_open_final(name, op, dir_fd)
+        source.rename(ssh / source.name)
+        return fd
+
+    monkeypatch.setattr(commit_mod, "_open_final", open_then_move)
+    done = _commit(env, rid)
+    assert done["ok"] is False and done["error"].endswith("moved into a protected location while it was opened"), done
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+    assert _last_audit_event(env) == "commit_refused"
+    if moved == "Notes":
+        assert sorted(p.name for p in ssh.iterdir()) == ["Notes", "authorized_keys"]
+        assert list((ssh / "Notes").iterdir()) == []
+    else:
+        assert sorted(p.name for p in ssh.iterdir()) == ["authorized_keys"]
+        assert list(notes.iterdir()) == []
+    assert not (home / "a").exists()
+
+
+@pytest.mark.parametrize("raised, status", [(PermissionError(13, "Permission denied"), "error"), ("changed", "refused")])
+def test_a_create_whose_open_fails_after_making_folders_leaves_none_of_them_703(env, monkeypatch, raised, status):
+    # #703: an OSError at the open (P3), and the refusal type itself, left the folders made for it
+    from brain.files import commit as commit_mod
+
+    notes = env["home"] / "Notes"
+    rid = propose_write(path=str(notes / "a" / "b" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    exc = commit_mod._TargetChangedError("refused: rc appeared after it was checked") if raised == "changed" else raised
+
+    def failing_open(name, op, dir_fd):
+        raise exc
+
+    monkeypatch.setattr(commit_mod, "_open_final", failing_open)
+    done = _commit(env, rid)
+    assert done["ok"] is False and done["error"] == str(exc), done
+    assert pending.get(env["persona"], rid)["status"] == status
+    assert list(notes.iterdir()) == []
+
+
+def _plant_before_mkdir(monkeypatch, name, plant):
+    """Run `plant(dir_fd)` just before commit's ``os.mkdir(name, dir_fd=...)``, then the real mkdir."""
+    import os
+
+    real_mkdir = os.mkdir
+    planting = []
+
+    def mkdir(path, mode=0o777, *, dir_fd=None):
+        if path == name and dir_fd is not None and not planting:
+            planting.append(True)  # the racer's own os.mkdir must not plant again
+            try:
+                plant(dir_fd)
+            finally:
+                planting.clear()
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", mkdir)
+
+
+@pytest.mark.no_base_failure(reason="#703 ratified residue: a made folder holding a racer's own entry stays; the base leaves it too. Shown able to fail with an rmtree cleanup")
+def test_a_made_folder_holding_a_racers_link_stays_with_the_link_703(env, monkeypatch):
+    # The racer plants a link where the next folder goes: refused (#699). Our 'new' now holds the racer's
+    # link, so it stays: the cleanup never deletes an entry it did not make (owner decision on #703).
+    import os
+
+    notes, ssh = env["home"] / "Notes", env["home"] / ".ssh"
+    rid = propose_write(path=str(notes / "new" / "sub" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    _plant_before_mkdir(monkeypatch, "sub", lambda dir_fd: os.symlink(str(ssh), "sub", dir_fd=dir_fd))
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+    assert [p.name for p in (notes / "new").iterdir()] == ["sub"] and (notes / "new" / "sub").is_symlink()
+    assert sorted(p.name for p in ssh.iterdir()) == ["authorized_keys"]
+    assert (ssh / "authorized_keys").read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.no_base_failure(reason="#703 identity rule: the cleanup must not remove what this call did not make; the base removes nothing. Shown able to fail by mutations recorded in the run's harness")
+@pytest.mark.parametrize("case", ["made_by_another_writer", "same_name_swapped_in", "holds_a_file"])
+def test_the_cleanup_removes_only_empty_folders_this_call_made_703(env, monkeypatch, case):
+    import os
+
+    from brain.files import commit as commit_mod
+
+    notes = env["home"] / "Notes"
+    a, b = notes / "a", notes / "a" / "b"
+    rid = propose_write(path=str(b / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    if case == "made_by_another_writer":  # our mkdir of 'a' then raises FileExistsError: 'a' is not ours
+        _plant_before_mkdir(monkeypatch, "a", lambda dir_fd: os.mkdir("a", dir_fd=dir_fd))
+
+    def failing_open(name, op, dir_fd):
+        if case == "same_name_swapped_in":
+            b.rename(a / "b.ours")
+            b.mkdir()  # someone else's empty folder under our folder's name
+        elif case == "holds_a_file":
+            (b / "theirs.txt").write_text("keep me", encoding="utf-8")
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(commit_mod, "_open_final", failing_open)
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    if case == "made_by_another_writer":
+        assert a.is_dir() and list(a.iterdir()) == []  # theirs kept; ours ('b') removed
+    elif case == "same_name_swapped_in":
+        assert [p.name for p in a.iterdir()] == ["b"] and list(b.iterdir()) == []  # theirs kept, ours removed
+    else:
+        assert (b / "theirs.txt").read_text(encoding="utf-8") == "keep me"
+
+
+@pytest.mark.no_base_failure(reason="#703: the cleanup follows no link; the base removes nothing. Shown able to fail by a cleanup that removes the resolved path")
+def test_the_cleanup_does_not_follow_a_link_swapped_in_for_a_made_folder_703(env, monkeypatch):
+    # The target is EMPTY, so an rmdir that followed the link would remove it: only a cleanup by descriptor
+    # and identity keeps it.
+    from brain.files import commit as commit_mod
+
+    notes, other = env["home"] / "Notes", env["home"] / "Other"
+    other.mkdir()
+    a, b = notes / "a", notes / "a" / "b"
+    rid = propose_write(path=str(b / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+
+    def failing_open(name, op, dir_fd):
+        b.rename(a / "b.ours")
+        b.symlink_to(other, target_is_directory=True)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(commit_mod, "_open_final", failing_open)
+    assert _commit(env, rid)["ok"] is False
+    assert other.is_dir() and list(other.iterdir()) == []
+    assert b.is_symlink() and [p.name for p in a.iterdir()] == ["b"]  # the link stays; ours (b.ours) is gone
+
+
+@pytest.mark.skipif(hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0, reason="root ignores folder modes")
+def test_a_refused_create_under_a_folder_you_can_enter_but_not_list_leaves_no_folder_703(env, monkeypatch):
+    # Notes is enter-only (0o300). The made 'a' is removed by name in its parent's descriptor, which needs no
+    # read permission; finding it through '..' and a listing would not work here.
+    from brain.files import commit as commit_mod
+
+    notes = env["home"] / "Notes"
+    rid = propose_write(path=str(notes / "a" / "b" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    monkeypatch.setattr(commit_mod, "dir_fd_denied", lambda *a, **k: True)
+    notes.chmod(0o300)
+    try:
+        done = _commit(env, rid)
+    finally:
+        notes.chmod(0o755)
+    assert done["ok"] is False and pending.get(env["persona"], rid)["status"] == "refused", done
+    assert list(notes.iterdir()) == []
+
+
+def _open_fds() -> int:
+    import os
+
+    return len(os.listdir("/dev/fd"))
+
+
+@pytest.mark.no_base_failure(reason="#703 holds descriptors for the cleanup; the base holds none past the call. Shown able to fail with one close dropped")
+@pytest.mark.parametrize("case", ["no_leak_over_refusals", "deep_create_under_a_low_limit"])
+def test_the_cleanup_leaks_no_descriptor_and_a_deep_create_still_succeeds_703(env, monkeypatch, case):
+    import os
+
+    from brain.files import commit as commit_mod
+
+    notes = env["home"] / "Notes"
+    if case == "no_leak_over_refusals":
+        monkeypatch.setattr(commit_mod, "dir_fd_denied", lambda *a, **k: True)
+        before = _open_fds()
+        for i in range(200):
+            with pytest.raises(commit_mod._TargetChangedError):
+                commit_mod._open_pinned(notes / f"a{i}" / "b" / "rc", "create", env["persona"])
+        assert _open_fds() == before
+        assert list(notes.iterdir()) == []
+    else:
+        import resource
+
+        target = notes.joinpath(*["d"] * 300) / "rc"
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+        try:
+            fd = commit_mod._open_pinned(target, "create", env["persona"])
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        os.close(fd)
+        assert target.exists()
+
+
 @pytest.mark.no_base_failure(reason="regression guard: creating missing parent folders already worked on the base; pins it against the #699 pinned mkdir")
 def test_missing_parent_folders_are_still_created(env):
     target = env["home"] / "Notes" / "a" / "b" / "x.md"
