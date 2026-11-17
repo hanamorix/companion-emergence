@@ -1113,7 +1113,7 @@ describe("useRestartBridge: the app's /health waits pause while engine progress 
     await expect(run.done()).resolves.toBe(false);
   });
 
-  it("the wait after a forced restart pauses too, and a timed-out status read keeps the paused reading", async () => {
+  it("the wait after a forced restart pauses too, and a timed-out status read keeps the paused reading for under 30 s", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     w.health = false;
@@ -1126,7 +1126,9 @@ describe("useRestartBridge: the app's /health waits pause while engine progress 
     const run = startRestart(() => result.current.restart());
     void run.done().then(settled, settled);
     await advance(TIMEOUT_HEALTH_MS / 2);
-    w.statusUnknown = true; // every later status read times out: the previous reading stays
+    // every later status read times out: the previous reading stays for under 30 s after the last real answer (about 15 s),
+    // so the credit runs to about 45 s and the wait is still going at the 65 s this test ends at; it gives up after that
+    w.statusUnknown = true;
     await advance(TIMEOUT_HEALTH_MS + 20_000);
     expect(settled).not.toHaveBeenCalled();
   });
