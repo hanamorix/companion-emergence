@@ -1280,6 +1280,24 @@ def ensure_engine_ready(persona_dir: Path, *, stop_requested: Callable[[], bool]
         engine_for(persona_dir).ensure_ready(stop_requested=stop_requested)
 
 
+def start_rebuild_needed(persona_dir: Path) -> bool:
+    """Whether a start must run the rebuild process first (S107, HS2 of #633): the persona is not switched over, or a roll-forward is due.
+
+    True when the engine is not live (`is_live`: not switched, no state, an unreadable state; lock-free), otherwise
+    `engine_rebuild.rolled_forward` on a fresh read of the state at the engine's own clock. It takes no lock and writes nothing.
+    It repeats the two checks `ensure_ready` makes (its switched test and `_roll_forward`); `ensure_ready`'s own branch stays and
+    `test_start_rebuild_needed.py` keeps the two in step. `ensure_ready` decides from the engine's state cache and this reads the
+    file, as `_roll_forward_needed` does under the lock: in a starter or a fresh child the two cannot differ.
+
+    A failed read of the roll-forward check raises (`engine_rebuild.rolled_forward`'s own contract); the caller logs it.
+    The rebuild itself runs in `nell supervisor rebuild` (`cli._supervisor_rebuild_handler`), which calls `ensure_engine_ready`.
+    """
+    instance = engine_for(persona_dir)
+    if not instance.is_live():
+        return True
+    return engine_rebuild.rolled_forward(persona_dir, engine_files.read_state(persona_dir), instance._now())
+
+
 def recovery_job_run(persona_dir: Path) -> bool:
     """The body of the supervisor's `emotion_recovery_rebuild` job: `engine_for(persona_dir).recovery_rebuild()`, never raising.
 

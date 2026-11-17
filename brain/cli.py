@@ -168,6 +168,32 @@ def _supervisor_status_handler(args: argparse.Namespace) -> int:
     return daemon.cmd_status(args)
 
 
+def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor rebuild`: the one-shot rebuild as its own process (S107, HS1 of #633). Internal: the start spawns it.
+
+    In order: (1) the first progress record ("rebuilding") before anything slow, removed in a `finally`, so a waiting start and the
+    window show the child at once; (2) the runtime log, as `cmd_run` sets it up (its bridge-stack import comes after the record);
+    (3) no store and no vocabulary are opened here: `ensure_engine_ready` opens its own and the rebuild reads half-lives from the
+    persona's vocabulary file; (4) `ensure_engine_ready`, which is the x10 step and the first rebuild, or a switched persona's
+    roll-forward check and rebuild. Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
+    success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
+
+    The persona directory is not checked: only the start spawns this, on a persona it has checked. A hand-run on a mistyped name
+    would make the folder and switch an empty persona over (accepted edge, P4).
+    """
+    persona_dir = get_persona_dir(args.persona)
+    progress = engine_files.EngineProgress(persona_dir, "rebuilding")
+    progress.write()
+    try:
+        from brain.bridge import runner
+
+        runner._setup_runtime_logging(persona_dir)
+        emotion_engine.ensure_engine_ready(persona_dir)
+    finally:
+        progress.remove()
+    return 0
+
+
 def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path) -> None:
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
@@ -3397,6 +3423,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "used by the desktop app",
     )
     s_status.set_defaults(func=_supervisor_status_handler)
+
+    s_rebuild = s_actions.add_parser(
+        "rebuild",
+        help="Internal: run the one-shot emotion rebuild for a persona (the start runs it before the bridge).",
+    )
+    _add_persona_arg(s_rebuild)
+    s_rebuild.set_defaults(func=_supervisor_rebuild_handler)
 
     s_restart = s_actions.add_parser(
         "restart",
