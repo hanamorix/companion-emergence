@@ -147,13 +147,19 @@ def extract_felt_lines(raw: str) -> tuple[str, dict[str, float] | None, float | 
 
 
 def _unwrap(value: str) -> str:
-    """A value set in bold or underscores, whole or in part (``**7**/10``), without the markers (#709)."""
+    """A value set in bold or underscores, whole or in part (``**7**/10``), without the markers (#709).
+
+    A value that ends with a closing marker it has no opening one for loses it: the line pattern already took the opening
+    marker, which sat right after the colon (``EMOTIONS:**{...}**``) or before the name (``**EMOTIONS: {...}**``) (#748).
+    """
     for mark in ("**", "__"):
         if value.startswith(mark):
             inner = value[len(mark):]
             end = inner.find(mark)
             if end != -1:
                 return (inner[:end] + inner[end + len(mark):]).strip()
+        if value.endswith(mark) and mark not in value[: -len(mark)]:
+            return value[: -len(mark)].strip()
     return value
 
 
