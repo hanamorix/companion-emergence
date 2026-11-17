@@ -357,12 +357,12 @@ def _end_tree(
     return survivors
 
 
-def _release_tree(suspended: list, remembered: dict[int, object], root_killed: bool) -> None:
+def _release_tree(suspended: list, remembered: dict[int, object], root_kill_started: bool) -> None:
     """The one place a frozen tree is let go. The root's kill has not been started (``on_root_killed`` has not run): resume
     everything suspended. It has: finish the kill of everything frozen and the remembered ones still alive. The root is
     ``suspended[0]`` whenever it was frozen, so it is killed here too: ``_kill_proc`` swallows every exception, so a root already
     gone is a no-op, and an interrupt before its kill call acted still ends it with its descendants instead of leaving it frozen."""
-    if not root_killed:
+    if not root_kill_started:
         for p in suspended:
             try:
                 p.resume()
@@ -444,7 +444,7 @@ def kill_bridge(
 
     remembered: dict[int, object] = {}
     suspended: list = []
-    kill_returned = False  # set by ``_end_tree`` immediately before the bridge's kill call: "the kill was started"
+    root_kill_started = False  # set by ``_end_tree`` immediately before the bridge's kill call (also when the root was already gone)
     request_written = False
 
     def _remember(procs) -> None:
@@ -506,8 +506,8 @@ def kill_bridge(
         _hook("committed")
 
         def _root_killed() -> None:
-            nonlocal kill_returned
-            kill_returned = True
+            nonlocal root_kill_started
+            root_kill_started = True
 
         survivors = _end_tree(bridge, suspended, remembered, timeout, hook=_hook, on_root_killed=_root_killed)
         if survivors:
@@ -523,8 +523,8 @@ def kill_bridge(
                     pass
         try:
             _hook("finally_start")
-            _release_tree(suspended, remembered, kill_returned)
-            if not kill_returned:
+            _release_tree(suspended, remembered, root_kill_started)
+            if not root_kill_started:
                 _cas_intent(persona_dir, nonce, lambda _cur: None)
                 # A kill called off before it killed withdraws its hard-exit request too (review of #458): the bridge
                 # still runs and would act on it later, after the user cancelled.
@@ -581,16 +581,16 @@ def kill_command(pid: int, token: str | None, *, timeout: float = DEFAULT_TIMEOU
 
     remembered: dict[int, object] = {p.pid: p for p in _children(proc)}
     suspended: list = []
-    root_killed = False
+    root_kill_started = False
 
     def _root_killed() -> None:
-        nonlocal root_killed
-        root_killed = True
+        nonlocal root_kill_started
+        root_kill_started = True
 
     try:
         survivors = _end_tree(proc, suspended, remembered, timeout, on_root_killed=_root_killed)
     finally:
-        _release_tree(suspended, remembered, root_killed)
+        _release_tree(suspended, remembered, root_kill_started)
     if survivors:
         return KillResult("killed", f"processes still running after the kill: {survivors}", survivors, True)
     return KillResult("killed", "command killed", [], True)

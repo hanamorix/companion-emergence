@@ -309,6 +309,18 @@ def test_a_record_of_a_gone_process_or_of_no_process_is_replaced(tmp_path: Path,
     assert not engine_files.progress_path(persona).exists()
 
 
+def test_a_record_naming_a_pid_the_platform_cannot_hold_is_replaced(tmp_path: Path, writes: list[dict]) -> None:
+    """Such a record names no process: the step writes over it (on base the failed liveness check made the write skip)."""
+    persona = make_persona(tmp_path, _joy_rows(3))
+    install(persona, NOW)
+    engine_files.progress_path(persona).write_text(
+        json.dumps({"pid": 99999999999999999999, "pid_token": None, "phase": "rescaling"}), encoding="utf-8"
+    )
+    ensure_engine_ready(persona)
+    assert writes and writes[0]["pid"] == os.getpid()
+    assert not engine_files.progress_path(persona).exists()
+
+
 def test_a_rebuild_that_skipped_its_write_over_a_live_x10_record_writes_again_once_that_record_is_removed(
     tmp_path: Path, live_other: subprocess.Popen, writes: list[dict], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -468,6 +480,12 @@ def test_the_reader_returns_none_for_a_gone_writer_and_for_a_record_that_names_n
         assert engine_files.read_engine_progress(tmp_path) is None
     engine_files.progress_path(tmp_path).write_text(json.dumps([1, 2]), encoding="utf-8")
     assert engine_files.read_engine_progress(tmp_path) is None  # not a mapping
+
+
+@pytest.mark.no_base_failure(reason="pins behaviour the shared liveness test must keep: on base the failed pid check read as no record")
+def test_the_reader_returns_none_for_a_record_naming_a_pid_the_platform_cannot_hold(tmp_path: Path) -> None:
+    _own_record(tmp_path, pid=99999999999999999999, pid_token=None)
+    assert engine_files.read_engine_progress(tmp_path) is None
 
 
 def test_a_record_cannot_name_another_bridge_as_its_own(tmp_path: Path) -> None:

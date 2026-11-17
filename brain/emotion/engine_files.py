@@ -319,16 +319,39 @@ def read_progress(persona_dir: Path) -> dict[str, Any] | None:
 
 
 def _pid_of(record: dict[str, Any] | None) -> int | None:
-    """The record's pid when it is a real process number (a positive int that is not a bool), else None."""
+    """The record's pid when it is a real process number (an int, not a bool, that the platform can hold as a pid), else None.
+
+    A number beyond the platform's range names no process and makes the OS pid check raise; it is "no usable pid" here, so the
+    one liveness test below never has to read that failure as alive (B59 HQD bycatch).
+    """
     pid = record.get("pid") if isinstance(record, dict) else None
-    return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) and process_identity.is_pid_number(pid) else None
 
 
-def _writer_alive(record: dict[str, Any]) -> bool:
-    """Is the process that wrote ``record`` still alive (``holder_alive``: an unknown answer is alive; no token: a pid check)?"""
+def _may_be_alive(pid: int, token: str | None, path: Path) -> bool:
+    """The one liveness test for the records of this module (progress records and command run records): is the writer of the
+    record at ``path`` alive (``holder_alive``: an unknown answer is alive; no token: a pid check)? A check that itself fails
+    counts as alive: a record that may name a live process is never dropped."""
+    try:
+        return process_identity.holder_alive(pid, token)
+    except Exception as exc:  # noqa: BLE001 - undecidable means "may be alive"
+        warn_throttled(
+            logger,
+            f"record-writer:alive:{path}",
+            "emotion engine: could not tell whether the writer of the record %s is alive (%s: %s); read as alive",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+        return True
+
+
+def _writer_alive(record: dict[str, Any], path: Path) -> bool:
+    """Is the process that wrote the progress ``record`` (read from ``path``) alive? No usable pid: not alive."""
     pid = _pid_of(record)
     token = record.get("pid_token")
-    return pid is not None and process_identity.holder_alive(pid, token if isinstance(token, str) else None)
+    return pid is not None and _may_be_alive(pid, token if isinstance(token, str) else None, path)
 
 
 def read_engine_progress(persona_dir: Path) -> dict[str, Any] | None:
@@ -336,7 +359,7 @@ def read_engine_progress(persona_dir: Path) -> dict[str, Any] | None:
     pid, and a writer that is gone (a record a crashed or killed process left behind). Feeds ``daemon.status_dict``."""
     try:
         record = read_progress(persona_dir)
-        return record if record is not None and _writer_alive(record) else None
+        return record if record is not None and _writer_alive(record, progress_path(persona_dir)) else None
     except Exception:  # noqa: BLE001 - a status read must not fail on a display record
         return None
 
@@ -395,7 +418,7 @@ class EngineProgress:
 
     def _put(self, done: int | None, total: int | None) -> None:
         existing = read_progress(self._persona_dir)
-        if existing is not None and _pid_of(existing) != process_identity.own_pid() and _writer_alive(existing):
+        if existing is not None and _pid_of(existing) != process_identity.own_pid() and _writer_alive(existing, progress_path(self._persona_dir)):
             return  # another live process's record (a second start's x10 step): never replaced
         record = progress_record(
             pid=process_identity.own_pid(),
@@ -497,37 +520,21 @@ def _remove_own_command_run(persona_dir: Path) -> None:
 
 
 def _run_record_pid(name: str) -> int | None:
-    """The pid a record's file name gives: ``<pid>.json`` with ASCII digits that parse as a number, else None (not a record)."""
+    """The pid a record's file name gives: ``<pid>.json`` with ASCII digits that parse as a number the platform can hold as a pid,
+    else None (not a record: a name with more digits than Python converts or a number beyond the pid range is ignored, B58 HQB)."""
     stem, dot, suffix = name.rpartition(".")
     if dot != "." or suffix != "json" or not stem.isascii() or not stem.isdigit():
         return None
     try:
-        return int(stem)
+        pid = int(stem)
     except ValueError:  # more digits than Python converts: not a pid
         return None
+    return pid if process_identity.is_pid_number(pid) else None
 
 
 def _unreadable_run(pid: int, path: Path) -> dict[str, Any]:
     """The entry ``live_command_runs`` returns for a record it cannot read whose file-name pid is (or may be) alive."""
     return {UNREADABLE_RUN_KEY: True, "pid": pid, "path": str(path)}
-
-
-def _may_be_alive(pid: int, token: str | None, path: Path) -> bool:
-    """Is the writer of the record at ``path`` alive (``holder_alive``)? A check that itself fails counts as alive: a record that
-    may name a live command is never dropped."""
-    try:
-        return process_identity.holder_alive(pid, token)
-    except Exception as exc:  # noqa: BLE001 - undecidable means "may be alive"
-        warn_throttled(
-            logger,
-            f"command-run:alive:{path}",
-            "emotion engine: could not tell whether the writer of the command run record %s is alive (%s: %s); read as alive",
-            path,
-            type(exc).__name__,
-            exc,
-            exc_info=False,
-        )
-        return True
 
 
 def _delete_dead_run(path: Path) -> None:

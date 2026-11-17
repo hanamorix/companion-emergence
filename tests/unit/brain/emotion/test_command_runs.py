@@ -266,6 +266,27 @@ def test_a_name_whose_digits_do_not_parse_as_a_pid_is_ignored() -> None:
     assert engine_files._run_record_pid("٣.json") is None  # not ASCII digits
 
 
+def test_a_name_whose_number_the_platform_cannot_hold_as_a_pid_is_ignored() -> None:
+    """B58 HQB: a name whose digits do not parse as a pid is ignored; a number beyond the platform's pid range is not a pid either."""
+    assert engine_files._run_record_pid("99999999999999999999.json") is None
+    assert engine_files._run_record_pid("0.json") is None
+    assert engine_files._run_record_pid("4242.json") == 4242
+
+
+def test_a_record_named_for_a_pid_the_platform_cannot_hold_is_not_listed_and_is_left_alone(persona: Path) -> None:
+    """On base it read as alive (the liveness check raised, which counts as alive) and blocked every start."""
+    path = _put(persona, 0, "this is not json {", name="99999999999999999999.json")
+    assert engine_files.live_command_runs(persona) == []
+    assert path.exists()
+
+
+def test_a_record_that_holds_a_pid_the_platform_cannot_hold_is_decided_by_its_file_name(
+    persona: Path, live_other: subprocess.Popen
+) -> None:
+    path = _put(persona, live_other.pid, {"version": 1, "pid": 99999999999999999999, "pid_token": None})
+    assert engine_files.live_command_runs(persona) == [{engine_files.UNREADABLE_RUN_KEY: True, "pid": live_other.pid, "path": str(path)}]
+
+
 def test_only_names_of_the_form_pid_dot_json_are_records_and_other_entries_are_left_alone(
     persona: Path, live_other: subprocess.Popen
 ) -> None:

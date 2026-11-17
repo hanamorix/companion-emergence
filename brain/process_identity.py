@@ -25,6 +25,7 @@ wait keeps waiting, a kill treats it as "not this process".
 from __future__ import annotations
 
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,18 @@ def token_of(pid: int | None) -> str:
 
 def is_token(value: str | None) -> bool:
     return bool(value) and value not in (GONE, UNKNOWN)
+
+
+def is_pid_number(value: int) -> bool:
+    """Can ``value`` be a process id on this platform? A POSIX ``pid_t`` is a signed C int and a Windows process id is an
+    unsigned 32-bit value (both sizes from ``struct``, no literal); 0 and below name no process. A larger number can name no
+    process either, and the OS calls that take a pid refuse it with ``OverflowError`` (``os.kill``), which no liveness check
+    expects: a pid read from a record or a file name goes through here first."""
+    if sys.platform == "win32":
+        limit = 1 << (8 * struct.calcsize("I"))
+    else:
+        limit = 1 << (8 * struct.calcsize("i") - 1)
+    return 0 < value < limit
 
 
 def own_pid() -> int:

@@ -214,6 +214,16 @@ def test_a_test_that_fakes_the_platform_cannot_leave_later_tests_without_a_token
     assert result.returncode == 0, result.stdout[-2000:]
 
 
+def test_is_pid_number_holds_what_the_platform_can_hold_as_a_pid_and_nothing_beyond():
+    limit = (1 << 32) if sys.platform == "win32" else (1 << 31)  # a Windows id is an unsigned 32-bit value, a POSIX pid_t a signed C int
+    assert pi.is_pid_number(1)
+    assert pi.is_pid_number(limit - 1)
+    assert not pi.is_pid_number(0)
+    assert not pi.is_pid_number(-1)
+    assert not pi.is_pid_number(limit)
+    assert not pi.is_pid_number(99999999999999999999)
+
+
 def test_names_this_bridge_needs_the_pid_and_the_token_to_match():
     """The own-record test of the bridge's watcher files and of the engine's progress record (moved here from shutdown_progress)."""
     token = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456"
