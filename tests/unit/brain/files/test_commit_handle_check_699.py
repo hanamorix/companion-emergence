@@ -78,3 +78,28 @@ def test_a_folder_swapped_for_a_junction_is_refused_on_windows(env, monkeypatch)
     done = _commit(env, rid)
     assert done["ok"] is False, done
     assert not (env["home"] / ".ssh" / "rc").exists()
+
+
+@pytest.mark.no_base_failure(reason="Windows-only (junctions); the base-code check runs on Linux. Shown red on windows-latest before the #703 fix")
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+def test_a_refused_create_through_a_junction_leaves_no_folder_in_its_target_703(env, monkeypatch):
+    # #703: the missing folders were made by path, so through the junction, inside ~/.ssh; the refusal
+    # removed the file but left them there
+    from brain.files import commit as commit_mod
+
+    notes, ssh = env["home"] / "Notes", env["home"] / ".ssh"
+    before = sorted(p.name for p in ssh.iterdir())
+    rid = propose_write(path=str(notes / "a" / "b" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    real_mark = commit_mod.pending.mark
+
+    def mark(persona_dir, record_id, *, status, **kw):
+        ok = real_mark(persona_dir, record_id, status=status, **kw)
+        if status == "committing":
+            notes.rename(notes.with_name("Notes.moved"))
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(notes), str(ssh)], check=True, capture_output=True)
+        return ok
+
+    monkeypatch.setattr(commit_mod.pending, "mark", mark)
+    done = _commit(env, rid)
+    assert done["ok"] is False, done
+    assert sorted(p.name for p in ssh.iterdir()) == before
