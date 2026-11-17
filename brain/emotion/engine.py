@@ -36,7 +36,8 @@ The switch-over and the live engine (Engine 6, #584):
   the next start, when `memories.db` cannot be read either, or when the rebuild's own state write fails with an I/O error on
   such a state. Any other failure raises `EngineStartupError`. An engine lock held by another process (its first rebuild) is
   waited for by the bridge's start-up (it passes `stop_requested`) until the lock comes or a stop is asked for; a command
-  waits one `EMOTION_LOCK_WAIT_S` and fails.
+  waits one `EMOTION_LOCK_WAIT_S` and `ensure_engine_ready` raises (the command's `_engine_ready_or_refuse` turns a lock that did
+  not come into a refusal).
 - `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
   time when that is later (before the switch it does not fade), and holds the result to 0-10 (a stored negative reads as 0).
   It raises `KeyError`, naming the memory id and the emotion, when the memory has no such emotion: "absent" is for the caller
@@ -94,6 +95,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _UNSET = object()  # no clean drain yet: the early-out may not fire
+
+# The `what` of an `EngineStartupError` raised when the engine lock does not come (or a stop is asked for while waiting for it).
+# A command's `_engine_ready_or_refuse` (cli.py) reads it, with the cause, to tell a busy lock from every other start-up failure.
+ENGINE_LOCK_STEP = "the engine lock"
 
 
 class Reading(NamedTuple):
@@ -1100,7 +1105,8 @@ class EmotionEngine:
         `warn_throttled`, until it comes or `stop_requested()` is true between two steps (then the start stops with an
         `EngineStartupError` whose cause says "stopped while waiting for the rebuild", logged at INFO). Only a lock that did
         not come is waited for, never a `LockTimeoutError` raised inside `needed()` or the rebuild. A caller that passes none
-        (the command-line commands) gets the one wait and the failure.
+        (the command-line commands) gets the one wait and the failure, which the command's `_engine_ready_or_refuse` turns into a
+        refusal when it is a lock that did not come.
 
         One exception to that: `found_unreadable` is True when `ensure_ready` found the state unreadable. Then, in first mode
         only, a `RebuildStateWriteError` (the rebuild's own state write failed with an `OSError`) skips the switch-over for this
@@ -1176,7 +1182,7 @@ class EmotionEngine:
                     # start, which at launch on an unconfirmed overlay reaches `recoverUnhealthyBrain` (brainRecovery.ts) and
                     # undoes the update.
                     if stop_requested():
-                        self._start_failed("the engine lock", _StoppedWhileWaitingError())
+                        self._start_failed(ENGINE_LOCK_STEP, _StoppedWhileWaitingError())
                     warn_throttled(
                         logger,
                         f"engine:lock-wait:{self.persona_dir}",
@@ -1198,7 +1204,7 @@ class EmotionEngine:
                 if roll_forward and held and isinstance(exc, engine_rebuild.RebuildCheckError | engine_rebuild.RebuildStateWriteError | OSError):
                     self._roll_forward_failed(exc)
                     return
-                what = ("the roll-forward rebuild" if roll_forward else f"the {mode} rebuild") if held else "the engine lock"
+                what = ("the roll-forward rebuild" if roll_forward else f"the {mode} rebuild") if held else ENGINE_LOCK_STEP
                 if mode == "recovery" and not roll_forward:
                     # Not a start-up: the recovery job (`recovery_job_run`) logs the failure once per active day, so a rebuild that
                     # keeps failing does not write an error line, with a traceback, on every quiet pass.
@@ -1265,7 +1271,8 @@ def ensure_engine_ready(persona_dir: Path, *, stop_requested: Callable[[], bool]
     Raises `EngineStartupError(what, cause)` when the switch-over fails; a failure stops start-up. `stop_requested` is given
     only by the bridge's lifespan and is passed on only when given: with it a start-up whose engine lock is held by another
     process's rebuild waits for the lock until a stop is asked for (an `EngineStartupError` saying it stopped while waiting);
-    the command-line callers pass none and keep the one 5 s wait and the failure.
+    the command-line callers pass none and keep the one 5 s wait and the failure (the commands refuse on a lock that did not come:
+    `_engine_ready_or_refuse`).
     """
     if stop_requested is None:
         engine_for(persona_dir).ensure_ready()

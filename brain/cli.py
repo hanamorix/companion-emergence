@@ -47,6 +47,7 @@ from brain.setup import (
     validate_persona_name,
     write_persona_config,
 )
+from brain.utils.file_lock import LockTimeoutError
 from brain.utils.time import iso_utc
 
 # Text externalized to prompt_strings.toml [cli] (issue #129 stage 2b).
@@ -1009,13 +1010,20 @@ def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
 
     Called by the six commands that touch the engine, right after their own vocabulary load. A real run calls
     `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and a failure raises `EngineStartupError`
-    out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    out of the handler (the crash log gets it), except an engine lock that did not come within the one wait (another process holds
+    it: a rebuild, a hook or a drain): that is refused like the dry run's reasons, one line on stderr and 2. A dry run writes nothing, so it cannot do the switch-over: on a persona that is
     not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
     plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
     on a switched persona it goes on as today.
     """
     if not dry_run:
-        emotion_engine.ensure_engine_ready(persona_dir)
+        try:
+            emotion_engine.ensure_engine_ready(persona_dir)
+        except emotion_engine.EngineStartupError as exc:
+            if exc.what != emotion_engine.ENGINE_LOCK_STEP or not isinstance(exc.cause, LockTimeoutError):
+                raise
+            print("The emotion engine is busy with another job. Try again when it finishes.", file=sys.stderr)
+            return 2
         return None
     if emotion_engine.engine_for(persona_dir).is_live():
         return None
@@ -2224,7 +2232,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        _engine_ready_or_refuse(persona_dir, False)  # `nell chat` has no dry run, so this never refuses
+        refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but a busy engine lock still refuses
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)

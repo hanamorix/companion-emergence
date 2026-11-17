@@ -17,6 +17,7 @@ import logging
 from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,9 +175,11 @@ def test_a_lock_timeout_raised_inside_the_rebuild_is_not_waited_for(persona: Pat
     assert calls == [1] and asked == []  # one rebuild, never retried, the stop check never asked
 
 
-@pytest.mark.no_base_failure(reason="a retention pin: the command-line callers' one 5 s wait and refusal is today's behaviour, unchanged by the bridge's wait")
+BUSY_LINE = "The emotion engine is busy with another job. Try again when it finishes."
+
+
 def test_a_command_line_caller_still_waits_one_step_and_refuses_and_passes_no_stop_check(
-    persona: Path, monkeypatch: pytest.MonkeyPatch
+    persona: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     seen: list[dict[str, object]] = []
     real = engine.ensure_engine_ready
@@ -187,8 +190,55 @@ def test_a_command_line_caller_still_waits_one_step_and_refuses_and_passes_no_st
 
     monkeypatch.setattr(brain_cli.emotion_engine, "ensure_engine_ready", recording)
     rebuilt = _RebuildSpy(monkeypatch)
-    with engine_files.state_lock(persona), pytest.raises(EngineStartupError) as refused:
-        brain_cli._engine_ready_or_refuse(persona, False)
-    assert refused.value.what == "the engine lock"
+    with engine_files.state_lock(persona):
+        refused = brain_cli._engine_ready_or_refuse(persona, False)
+    assert refused == 2  # Hana's point 4 of #633: a lock that does not come is a refusal, not a crash
+    assert capsys.readouterr().err == BUSY_LINE + "\n"
     assert seen == [{}]  # no stop_requested argument
     assert rebuilt.calls == 0
+
+
+@pytest.mark.no_base_failure(reason="the positive control of the refusal tests: with the lock free the command goes on, as on the base code")
+def test_a_command_goes_on_when_the_lock_comes(persona: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert brain_cli._engine_ready_or_refuse(persona, False) is None  # the same persona, nobody holds the lock: the first rebuild runs
+    assert capsys.readouterr().err == ""
+    assert engine_files.read_state(persona) is not None
+
+
+def test_nell_chat_stops_on_a_refusal_and_goes_no_further(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(brain_cli, "get_persona_dir", lambda name: persona)
+    monkeypatch.setattr(brain_cli, "_resolve_routing", lambda persona_dir, args: ("fake", "fake"))
+    monkeypatch.setattr(brain_cli, "_start_floor_bootstrap_for_direct_chat", lambda persona_dir, *, blocking: None)
+    reached: list[str] = []
+    monkeypatch.setattr(brain_cli, "get_provider", lambda name: reached.append("provider") or pytest.fail("the provider was fetched"))
+    args = SimpleNamespace(persona="p", message="hello", close=False, provider=None, model=None, dry_run=False)
+    with engine_files.state_lock(persona):
+        result = brain_cli._chat_direct_mode(args)
+    assert result == 2
+    assert capsys.readouterr().err == BUSY_LINE + "\n"
+    assert reached == []
+
+
+@pytest.mark.no_base_failure(reason="a retention pin: a start-up failure that is not a lock timeout raises out of the helper today and still does")
+def test_another_start_up_failure_still_raises_out_of_the_helper(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing(*args: object, **kwargs: object) -> None:
+        raise engine_rebuild.RebuildCheckError("boom")
+
+    monkeypatch.setattr(engine_rebuild, "rebuild", failing)
+    with pytest.raises(EngineStartupError) as failed:
+        brain_cli._engine_ready_or_refuse(persona, False)
+    assert failed.value.what == "the first rebuild"
+
+
+@pytest.mark.no_base_failure(reason="a retention pin: a lock file that cannot be opened raises out of the helper today and still does")
+def test_a_lock_file_that_cannot_be_opened_still_raises_out_of_the_helper(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def unopenable(persona_dir: Path) -> None:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(engine_files, "state_lock", unopenable)
+    with pytest.raises(EngineStartupError) as failed:
+        brain_cli._engine_ready_or_refuse(persona, False)
+    assert failed.value.what == "the engine lock"
+    assert isinstance(failed.value.cause, PermissionError)
