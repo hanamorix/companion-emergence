@@ -7,3 +7,7 @@ export const REQUEST_TIMEOUT_MS = 3000;
  *  found another start already under way, #456 review R2-M1). */
 export const HEALTH_WAIT_MS = 30000;
 export const HEALTH_POLL_INTERVAL_MS = 500;
+
+/** How often the app reads `nell supervisor status --json` while it follows a bridge (a stop, a start). Mirrors
+ *  `START_STATUS_POLL_MS` in src-tauri/src/lib.rs (the Rust start wait reads the same status at the same pace). */
+export const STATUS_POLL_MS = 5000;

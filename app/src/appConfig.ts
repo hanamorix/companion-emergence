@@ -9,6 +9,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { fetchHealth, resetBridgeCredentialCache } from "./bridge";
+import type { EngineProgress } from "./bridge";
 import { HEALTH_POLL_INTERVAL_MS, HEALTH_WAIT_MS } from "./lib/requestTimeout";
 import { errString } from "./lib/errString";
 
@@ -125,7 +126,7 @@ async function awaitStartedBridge(persona: string): Promise<boolean> {
   return false;
 }
 
-export async function ensureBridgeRunning(persona: string): Promise<void> {
+export async function ensureBridgeRunning(persona: string, _onProgress?: (reading: EngineProgress | null) => void): Promise<void> {
   try {
     await invoke("ensure_bridge_running", { persona });
   } catch (e) {

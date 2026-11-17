@@ -19,7 +19,7 @@
  */
 
 import { useCallback, useEffect, useSyncExternalStore } from "react";
-import type { BridgeShutdown, BridgeStatus, PersonaState } from "../bridge";
+import type { BridgeShutdown, BridgeStatus, EngineProgress, PersonaState } from "../bridge";
 import {
   bridgeStatus,
   fetchHealth,
@@ -179,6 +179,13 @@ function subscribe(listener: () => void): () => void {
 function transition(next: RestartState): void {
   setShared({ state: next });
 }
+
+// TESTS-ONLY COMMIT STUBS (replaced by the real display in the next commit).
+export function engineProgressLine(_reading: EngineProgress): string {
+  return "";
+}
+export function showEngineProgress(_reading: EngineProgress | null): void {}
+export function endEngineProgress(): void {}
 
 /** True while a restart (or a launch-time wait for a stopping bridge) runs. The crash watchdog stays out of it. */
 export function restartInFlight(): boolean {
