@@ -541,9 +541,9 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
     small-file read plus arithmetic. silence_days is the exception beside
     ignore_streak: it is read on every call from the conversation files
     through ``brain.ingest.buffer.last_user_turn_ts``, the same function
-    ``days_since_human`` uses (the active files hold about the newest
-    forty raw turns each; the archive is read only when none holds a user
-    turn); no user turn means 0.0 days. ignore_streak always uses its own
+    ``days_since_human`` uses (the later of the active files' newest user
+    turn, each holding about the newest forty raw turns, and the newest
+    archived session's); no user turn means 0.0 days. ignore_streak always uses its own
     bounded (never full-file) tail read (`_compute_ignore_streak_bounded`),
     independent of the daily cadence and of PresenceState entirely.
     """
