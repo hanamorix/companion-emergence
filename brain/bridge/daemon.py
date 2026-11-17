@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -360,6 +361,23 @@ def _rebuild_progress_line(record: dict | None) -> str | None:
     return f"Updating your memories: {counted} of {total} ({counted * 100 // total}%)."
 
 
+def _attach_runtime_log(persona_dir: Path) -> Callable[[], None]:
+    """Let the log lines of a rebuild step or need check reach the runtime log; returns the call that undoes it (HS4, HS5 of #633).
+
+    The transient handler (no file held open) is attached only when no persistent handler for the log is attached. ``runner`` is
+    imported here, not at module level, so a start with no rebuild never loads the bridge stack. The lines are best effort: when
+    the import (or the attach) fails nothing is attached, the lines go unlogged and the step goes on; the returned call is then a
+    no-op.
+    """
+    try:
+        from brain.bridge import runner
+
+        transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - a log line must never stop a start or a rebuild step
+        return lambda: None
+    return lambda: runner._detach_runtime_log(transient)  # noqa: SLF001
+
+
 def _rebuild_under_lock(persona_dir: Path) -> int | None:
     """The start's rebuild step (S107, HS5 of #633), run with the start lock held. Returns None to go on, or the exit code to
     return: 1 when another running command could not be ended (nothing else ran).
@@ -373,8 +391,8 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). Any
     BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
 
-    The runtime log is attached for the step (transient, only when no persistent handler for the log is attached), so the lines
-    logged here reach it; ``runner`` is imported here, not at module level, so a start with no rebuild never loads the bridge stack.
+    The runtime log is attached for the step (``_attach_runtime_log``: transient, only when no persistent handler for the log is
+    attached, best effort), so the lines logged here reach it.
 
     Accepted edges (P4, R2): a persona whose rebuild keeps failing or skipping (S61's unreadable state with a failing integrity
     check) is needed at every start, so each start with no bridge running repeats the child (twice for a service-managed persona: the
@@ -386,10 +404,10 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     Windows (the real-child test runs on every leg). A command that goes on after a failed rebuild runs on an engine state that may
     lag until the next start retries (REVIEW, as the bridge does).
     """
-    from brain.bridge import kill, runner
+    from brain.bridge import kill
     from brain.emotion import engine_files
 
-    transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+    detach_log = _attach_runtime_log(persona_dir)
     try:
         for record in engine_files.live_command_runs(persona_dir):
             pid, token = record.get("pid"), record.get("pid_token")
@@ -410,7 +428,7 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
         _run_rebuild_child(persona_dir)
         return None
     finally:
-        runner._detach_runtime_log(transient)  # noqa: SLF001
+        detach_log()
 
 
 def _run_rebuild_child(persona_dir: Path) -> None:
@@ -470,8 +488,8 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
     would stop and restart a healthy bridge, losing its in-flight work, whenever a start is typed over it inside that window.
 
     A check that raises is logged (type and reason, to the runtime log) and answers False: the start goes on. The bridge stack is
-    imported only in that branch, so the no-rebuild path never loads it; its transient log handler is attached only when no persistent
-    one is, and always detached again.
+    imported only in that branch (``_attach_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
+    only when no persistent one is, and always detached again. A log line that cannot be set up is skipped: the answer stays False.
     """
     try:
         from brain.emotion import engine
@@ -480,9 +498,7 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
             return engine.start_rebuild_needed(persona_dir)
         return not engine.engine_for(persona_dir).is_live()
     except Exception as exc:  # noqa: BLE001 - a failed check never stops a start
-        from brain.bridge import runner
-
-        transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+        detach_log = _attach_runtime_log(persona_dir)
         try:
             logger.warning(
                 "could not check whether the emotion engine needs a rebuild for %s (%s: %s); going on with the saved state",
@@ -491,7 +507,7 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
                 exc,
             )
         finally:
-            runner._detach_runtime_log(transient)  # noqa: SLF001
+            detach_log()
         return False
 
 
@@ -835,7 +851,8 @@ def cmd_run(args) -> int:
     the lock, right before the bridge runs.
 
     With the lock held and the guard checks passed, a run for a persona that needs the rebuild runs it first
-    (``_rebuild_under_lock``, S107); a step that fails returns its code, noting a start when guarded.
+    (``_rebuild_under_lock``, S107); a step that fails returns its code, and a step that raises propagates, each noting a start
+    when guarded.
     """
     from brain.paths import get_persona_dir
 
@@ -912,7 +929,17 @@ def cmd_run(args) -> int:
             # The rebuild step (S107, HS6 (b)), the one a service start makes because it does not pass through cmd_start. A failed
             # step counts as a start the back-off must see: start_backoff counts only noted starts, and without this systemd's
             # RestartSec=2 would trip its start limit on a step that fails at once. The lock is released by the finally below.
-            step_rc = _rebuild_under_lock(persona_dir)
+            try:
+                step_rc = _rebuild_under_lock(persona_dir)
+            except Exception:
+                # An exception out of the step (only an unforeseen bug raises; every expected failure is a returned code) is a failed
+                # start for the back-off too. A note that itself fails is logged and never hides the step's exception.
+                if guarded:
+                    try:
+                        start_backoff.note_start(persona_dir)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("could not note the failed start for the back-off", exc_info=True)
+                raise
             if step_rc is not None:
                 if guarded:
                     start_backoff.note_start(persona_dir)

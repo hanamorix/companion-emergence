@@ -519,6 +519,23 @@ def test_the_transient_handler_is_attached_once_at_the_entry_and_only_when_none_
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_runtime_log_that_cannot_be_set_up_does_not_stop_the_step(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log lines are best effort: when the bridge stack cannot be imported the command is still ended and the child still runs."""
+    import brain.bridge as bridge_package
+
+    _runs(monkeypatch, [{"pid": 31337, "pid_token": "tok"}])
+    asked = _kills(monkeypatch, {31337: KillResult("killed", "command killed", [], True)})
+    monkeypatch.delattr(bridge_package, "runner", raising=False)
+    monkeypatch.setitem(sys.modules, "brain.bridge.runner", None)
+    assert daemon._rebuild_under_lock(persona) is None
+    assert asked == [(31337, "tok")]
+    assert len(rebuild_spawns.calls) == 1
+    assert sys.modules["brain.bridge.runner"] is None  # nothing in the step imported it behind the guard
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
 @pytest.mark.parametrize("scenario", ["success", "failed child", "failed kill step", "interrupt"])
 def test_after_the_step_the_root_loggers_handlers_are_the_list_before(
     persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch, clock: _Clock, scenario: str

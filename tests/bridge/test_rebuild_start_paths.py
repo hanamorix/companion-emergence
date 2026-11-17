@@ -161,6 +161,29 @@ def test_a_raising_check_logs_once_when_the_persistent_runtime_log_is_attached(p
     assert runtime_log_path("nell").read_text(encoding="utf-8").count("a state that cannot be read") == 1
 
 
+def _break_runner_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`from brain.bridge import runner` now raises ImportError (the module entry is None and the package attribute is gone)."""
+    import brain.bridge as bridge_package
+
+    monkeypatch.delattr(bridge_package, "runner", raising=False)
+    monkeypatch.setitem(sys.modules, "brain.bridge.runner", None)
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+def test_a_check_that_raises_still_answers_false_when_the_runtime_log_cannot_be_imported(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log line is best effort: an import failure of the bridge stack must not turn a need check that never stops a start into
+    one that does."""
+
+    def boom(persona_dir: Path) -> bool:
+        raise ValueError("a state that cannot be read")
+
+    monkeypatch.setattr(engine, "start_rebuild_needed", boom)
+    _break_runner_import(monkeypatch)
+    assert daemon._rebuild_needed(persona, False) is False
+
+
 @pytest.mark.no_base_failure(reason="the lifted helper exists on base (HS5, 00f7ab7d); the need check's logging relies on it")
 def test_runtime_log_attached_finds_the_persistent_handler_only(persona: Path) -> None:
     assert runner._runtime_log_attached(persona) is False
@@ -549,6 +572,43 @@ def test_a_failed_run_step_returns_its_code_releases_the_lock_and_notes_a_start_
     assert daemon.cmd_run(_run_args(origin)) == 1
     assert ("note_start" in run_calls.order) is (origin == "task-scheduler")
     assert "bridge" not in run_calls.order
+    assert _lock_is_free(persona)
+
+
+@pytest.mark.parametrize("origin", ["task-scheduler", "cli"])
+def test_a_run_step_that_raises_notes_a_start_only_when_guarded_and_the_exception_still_propagates(
+    persona: Path, run_calls: _Calls, monkeypatch: pytest.MonkeyPatch, origin: str
+) -> None:
+    """An exception (not a returned code) out of the step is a failed start for the back-off too: systemd restarts the run at
+    RestartSec=2, and without the noted start its restart limit is the only brake."""
+
+    def unforeseen(pd: Path) -> int | None:
+        raise RuntimeError("an unforeseen bug in the step")
+
+    monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
+    monkeypatch.setattr(daemon, "_rebuild_under_lock", unforeseen)
+    with pytest.raises(RuntimeError, match="an unforeseen bug in the step"):
+        daemon.cmd_run(_run_args(origin))
+    assert ("note_start" in run_calls.order) is (origin == "task-scheduler")
+    assert "bridge" not in run_calls.order
+    assert _lock_is_free(persona)
+
+
+@pytest.mark.no_base_failure(reason="pins the new path's guard; on base the exception path calls no note_start, so nothing can mask")
+def test_a_note_start_that_fails_on_the_exception_path_does_not_hide_the_steps_exception(
+    persona: Path, run_calls: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unforeseen(pd: Path) -> int | None:
+        raise RuntimeError("an unforeseen bug in the step")
+
+    def broken_note(pd: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
+    monkeypatch.setattr(daemon, "_rebuild_under_lock", unforeseen)
+    monkeypatch.setattr(start_backoff, "note_start", broken_note)
+    with pytest.raises(RuntimeError, match="an unforeseen bug in the step"):
+        daemon.cmd_run(_run_args("task-scheduler"))
     assert _lock_is_free(persona)
 
 
