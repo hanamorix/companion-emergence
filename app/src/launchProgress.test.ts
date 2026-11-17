@@ -38,6 +38,7 @@ function fakeTauri() {
 
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.stubEnv("DEV", false); // in dev mode ensureBridgeRunning treats a failed start as "an external bridge" and returns
   _resetRestartBridgeForTests();
   record = { phase: "rebuilding", done: 3, total: 9 };
   mockInvoke.mockReset();
@@ -45,6 +46,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.useRealTimers();
   cleanup();
 });
