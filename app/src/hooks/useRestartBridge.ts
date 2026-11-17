@@ -205,8 +205,9 @@ let releaseHold: ((ok: boolean) => void) | null = null;
  * Show the engine's start-up progress on the start-up and restart screens (StopProgress renders it while the state is
  * "starting"): the line, state "starting", no stop-only offers. A null reading (the record is gone) takes the line down.
  * Where no restart run() holds `inFlight` (the launch), it holds it with its own promise so the crash watchdog stays out;
- * a `restartBridge` asked for meanwhile joins that hold and gets true once it ends, without a restart of its own (the
- * launch screen blocks every path that could ask). Call `endEngineProgress` in a finally.
+ * a `restartBridge` asked for meanwhile joins that hold and gets the start's outcome once it ends (true if it came up,
+ * false if it failed), without a restart of its own (the launch screen blocks every path that could ask). Call
+ * `endEngineProgress` in a finally.
  */
 export function showEngineProgress(reading: EngineProgress | null): void {
   if (reading === null) {
@@ -226,18 +227,20 @@ export function showEngineProgress(reading: EngineProgress | null): void {
 }
 
 /**
- * The start is over, whatever its outcome. Where `showEngineProgress` took the hold: release it (the hold's promise
- * resolves true) and reset to idle. Inside a restart run(): clear only the progress it showed, because a full reset would
- * clear `errorDetail`, which `stopBridgeThen` reads. Safe to call with nothing shown.
+ * The start is over, whatever its outcome; `ok` is that outcome (true when the start came up). Where `showEngineProgress`
+ * took the hold: release it (the hold's promise resolves with `ok`, so a restart that joined it is told the real result)
+ * and reset to idle. Inside a restart run(): clear only the progress it showed, because a full reset would clear
+ * `errorDetail`, which `stopBridgeThen` reads; there `ok` changes nothing, the run's own result is what a joiner gets.
+ * Safe to call with nothing shown.
  */
-export function endEngineProgress(_ok?: boolean): void {
+export function endEngineProgress(ok: boolean): void {
   const release = releaseHold;
   const shown = engineShown;
   releaseHold = null;
   engineShown = false;
   if (release) {
     inFlight = null;
-    release(true);
+    release(ok);
     setShared({ ...IDLE });
   } else if (shown) {
     setShared({ progress: null });
@@ -389,10 +392,12 @@ async function forced(persona: string, skipHardExitRequest: boolean, start = tru
     // With a start, the one blocking call includes the new bridge's start, its first rebuild too (Rust ends
     // force_restart_bridge in ensure_bridge_running), so the engine's progress is shown while it runs (HR5b (a)).
     // Without one (a service install) nothing starts here.
+    let started = false;
     try {
       await alongside(persona, start ? showEngineProgress : undefined, kill);
+      started = true;
     } finally {
-      if (start) endEngineProgress();
+      if (start) endEngineProgress(started);
     }
   } catch (e) {
     if (errString(e).includes("bridge_changed")) {
@@ -417,26 +422,30 @@ async function forced(persona: string, skipHardExitRequest: boolean, start = tru
  *  engine's start-up progress meanwhile. */
 async function awaitHealth(persona: string): Promise<boolean> {
   transition("waiting_for_health");
+  let healthy = false;
   try {
     await pollHealth(persona, showEngineProgress);
+    healthy = true;
   } catch {
     setShared({ errorDetail: FAILED_USER_MESSAGE });
     return false;
   } finally {
-    endEngineProgress();
+    endEngineProgress(healthy);
   }
   return true;
 }
 
 async function startFresh(persona: string): Promise<boolean> {
   transition("starting");
+  let started = false;
   try {
     await ensureBridgeRunning(persona, showEngineProgress);
+    started = true;
   } catch (e) {
     setShared({ errorDetail: errString(e) || FAILED_USER_MESSAGE });
     return false;
   } finally {
-    endEngineProgress();
+    endEngineProgress(started);
   }
   transition("waiting_for_health");
   try {
