@@ -2521,6 +2521,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a bridge that appears after the check above is refused, never stopped for a rebuild (S107)
 
         rc = daemon.cmd_start(_StartArgs(), out=readiness_out)
         if rc != 0:

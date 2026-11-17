@@ -28,7 +28,8 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -361,21 +362,28 @@ def _rebuild_progress_line(record: dict | None) -> str | None:
     return f"Updating your memories: {counted} of {total} ({counted * 100 // total}%)."
 
 
-def _attach_runtime_log(persona_dir: Path) -> Callable[[], None]:
-    """Let the log lines of a rebuild step or need check reach the runtime log; returns the call that undoes it (HS4, HS5 of #633).
+@contextmanager
+def _runtime_log(persona_dir: Path) -> Iterator[None]:
+    """Let the log lines written inside the ``with`` reach the runtime log (HS4, HS5 of #633, B59 HQD (iii)): the one place a start
+    attaches and detaches the transient handler. Used by the rebuild step, the need check's failure line and the failed-stop line.
 
-    The transient handler (no file held open) is attached only when no persistent handler for the log is attached. ``runner`` is
-    imported here, not at module level, so a start with no rebuild never loads the bridge stack. The lines are best effort: when
-    the import (or the attach) fails nothing is attached, the lines go unlogged and the step goes on; the returned call is then a
-    no-op.
+    The transient handler (no file held open) is attached only when no persistent handler for the log is attached, and removed
+    again on the way out, an exception included. ``runner`` is imported here, not at module level, so a start with no rebuild never
+    loads the bridge stack. The lines are best effort: when the import (or the attach) fails nothing is attached, the lines go
+    unlogged and the body runs as if the log were not there.
     """
     try:
         from brain.bridge import runner
 
         transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+        attached = True
     except Exception:  # noqa: BLE001 - a log line must never stop a start or a rebuild step
-        return lambda: None
-    return lambda: runner._detach_runtime_log(transient)  # noqa: SLF001
+        attached = False
+    try:
+        yield
+    finally:
+        if attached:
+            runner._detach_runtime_log(transient)  # noqa: SLF001
 
 
 def _rebuild_under_lock(persona_dir: Path) -> int | None:
@@ -393,7 +401,7 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). Any
     BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
 
-    The runtime log is attached for the step (``_attach_runtime_log``: transient, only when no persistent handler for the log is
+    The runtime log is attached for the step (``_runtime_log``: transient, only when no persistent handler for the log is
     attached, best effort), so the lines logged here reach it.
 
     Accepted edges (P4, R2): a persona whose rebuild keeps failing or skipping (S61's unreadable state with a failing integrity
@@ -409,8 +417,7 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     from brain.bridge import kill
     from brain.emotion import engine_files
 
-    detach_log = _attach_runtime_log(persona_dir)
-    try:
+    with _runtime_log(persona_dir):
         try:
             records = engine_files.live_command_runs(persona_dir)
         except OSError as exc:
@@ -450,8 +457,6 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
                 return 1
         _run_rebuild_child(persona_dir)
         return None
-    finally:
-        detach_log()
 
 
 def _run_rebuild_child(persona_dir: Path) -> None:
@@ -511,7 +516,7 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
     would stop and restart a healthy bridge, losing its in-flight work, whenever a start is typed over it inside that window.
 
     A check that raises is logged (type and reason, to the runtime log) and answers False: the start goes on. The bridge stack is
-    imported only in that branch (``_attach_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
+    imported only in that branch (``_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
     only when no persistent one is, and always detached again. A log line that cannot be set up is skipped: the answer stays False.
     """
     try:
@@ -521,16 +526,13 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
             return engine.start_rebuild_needed(persona_dir)
         return not engine.engine_for(persona_dir).is_live()
     except Exception as exc:  # noqa: BLE001 - a failed check never stops a start
-        detach_log = _attach_runtime_log(persona_dir)
-        try:
+        with _runtime_log(persona_dir):
             logger.warning(
                 "could not check whether the emotion engine needs a rebuild for %s (%s: %s); going on with the saved state",
                 persona_dir.name,
                 type(exc).__name__,
                 exc,
             )
-        finally:
-            detach_log()
         return False
 
 
@@ -538,7 +540,7 @@ def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
     """Stop the running bridge so the rebuild can run (S107, HS4): the restart's stop (``cmd_restart``; reason None, so a queued
     service run is not held back), with ``kill_pre_pr=False``: a bridge with no identity token is asked and waited for, but never
     hard-killed (S110: no automatic hard kill; the app keeps its own hard-exit offer). A non-zero result ends the start before any
-    rebuild: one plain line, and the start returns the code. Nothing is hard-killed here: a failed request falls back to SIGTERM on
+    rebuild: one plain line on stderr and one line in the runtime log (``_runtime_log``), and the start returns the code. Nothing is hard-killed here: a failed request falls back to SIGTERM on
     POSIX, the wait is the stop watch (which offers the hard exit after 180 s in a terminal and kills only on the user's "y"), and
     on Windows an unreachable endpoint is refused unless the user runs ``nell supervisor stop --kill``.
 
@@ -551,6 +553,12 @@ def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
     """
     rc = cmd_stop(args, reason=None, kill_pre_pr=False)
     if rc != 0:
+        with _runtime_log(persona_dir):
+            logger.warning(
+                "the running bridge for %s did not stop before the rebuild (stop exit code %s); nothing was updated and no new bridge was started",
+                persona_dir.name,
+                rc,
+            )
         _say(
             "The running bridge did not stop, so nothing was updated and no new bridge was started. "
             "A bridge from a previous version may still be stopping. "
@@ -566,7 +574,8 @@ def run_rebuild_step(persona_dir: Path) -> int | None:
     it takes the start lock WITHOUT waiting: a start or another rebuild holds it, so the command is refused at once with exit 2 and
     one plain line (REVIEW, the reading: S102's "everything else waits" and S36's 5 s wait become "refused at once, retry"; a
     blocking acquire would also wait for a bridge's whole life, because the runner holds this lock from before its state file
-    shows it). It runs ``_rebuild_under_lock`` with the lock held and releases it; it starts no bridge.
+    shows it). With the lock held it asks the need again (HQD (4), as ``cmd_start`` and ``cmd_run`` do) and runs
+    ``_rebuild_under_lock`` only if it still stands; it releases the lock and starts no bridge.
     """
     if state_file.is_running(persona_dir):
         return None
@@ -577,6 +586,8 @@ def run_rebuild_step(persona_dir: Path) -> int | None:
         _say("A start or an update of your memories is under way. Try again when it has finished.")
         return 2
     try:
+        if not _rebuild_needed(persona_dir, False):
+            return None  # the need went away while this command reached the lock (HQD (4)): end no other command for nothing
         return _rebuild_under_lock(persona_dir)
     finally:
         release_lock(persona_dir, fd)
@@ -623,7 +634,8 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
     The one-shot rebuild (S107, HS6 (a) of #633) runs here, before the bridge: a bridge recorded running is first stopped when a
     rebuild is needed (``_stop_for_rebuild``; a stop that does not finish returns its code and starts nothing), then, under the start
-    lock, ``_rebuild_under_lock``; a step that returns a code releases the lock and returns it. A start over a running bridge with no
+    lock and after asking the need again there, ``_rebuild_under_lock``; a step that returns a code releases the lock and returns it
+    (the lock has one release, in a ``finally`` that also covers a raise from any start-up step). A start over a running bridge with no
     rebuild needed, and an ``attach`` start (``nell chat``'s already-running branch: ``args.attach``) over a running bridge, are
     refused with exit 2 as before, an attach start before any need check.
     """
@@ -657,43 +669,47 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         print(_LOCK_HELD_MSG, file=sys.stderr)
         return 2
 
-    if needed:
-        # The rebuild runs as its own process under this lock, before the bridge (S107). It comes before the stop intent is cleared
-        # and the start back-off is reset below: a start that fails here never got going, so a kill's intent and the back-off stay.
-        try:
+    # ONE release of the lock, whichever way this block ends (HQD (i)): a step's code, an exception (Ctrl-C in the chat REPL's
+    # in-process start included) or one from the clean-up below. On the normal path it runs right after the log rotation, which is
+    # the hand-off to the child runner (the spawn and the service start come after it). release_lock is not idempotent: no other
+    # release exists in this function.
+    try:
+        # The need is asked again under the lock (HQD (4), as cmd_run does): another starter's rebuild may have finished while this
+        # one reached the lock, and a step for nothing would end other commands (a nell chat --no-bridge session) first.
+        if needed and _rebuild_needed(persona_dir, False):
+            # The rebuild runs as its own process under this lock, before the bridge (S107). It comes before the stop intent is
+            # cleared and the start back-off is reset below: a start that fails here never got going, so a kill's intent and the
+            # back-off stay.
             step_rc = _rebuild_under_lock(persona_dir)
-        except BaseException:
-            release_lock(persona_dir, fd)  # Ctrl-C in the chat REPL's in-process start must not leave the lock held
-            raise
-        if step_rc is not None:
-            release_lock(persona_dir, fd)
-            return step_rc
+            if step_rc is not None:
+                return step_rc
 
-    client_origin = getattr(args, "client_origin", "cli")
-    if client_origin == "launchd":
-        try:
-            from brain.service.launchd import truncate_launchd_logs_if_large
+        client_origin = getattr(args, "client_origin", "cli")
+        if client_origin == "launchd":
+            try:
+                from brain.service.launchd import truncate_launchd_logs_if_large
 
-            truncate_launchd_logs_if_large(args.persona)
-        except Exception:
-            logger.debug("launchd log truncation skipped", exc_info=True)
+                truncate_launchd_logs_if_large(args.persona)
+            except Exception:
+                logger.debug("launchd log truncation skipped", exc_info=True)
 
-    # #456 (D12, Q-B): no synchronous recovery here. The bridge's first idle pass saves every open session through
-    # the gated job session_snapshot_prune (inside the background slot), whatever ended the last bridge.
+        # #456 (D12, Q-B): no synchronous recovery here. The bridge's first idle pass saves every open session through
+        # the gated job session_snapshot_prune (inside the background slot), whatever ended the last bridge.
 
-    # #456 (D25, S6-f): an explicit start clears a kill's stop intent, only now (after the already-running refusal or
-    # the stop above, so a launch check during an in-flight kill leaves it alone).
-    from brain.bridge import shutdown_progress
+        # #456 (D25, S6-f): an explicit start clears a kill's stop intent, only now (after the already-running refusal or
+        # the stop above, so a launch check during an in-flight kill leaves it alone).
+        from brain.bridge import shutdown_progress
 
-    shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
-    # D26: an explicit start does not wait and starts the start back-off over (a service run already waiting ends its
-    # wait at once, and the service run this start causes is the first of a new series).
-    start_backoff.reset(persona_dir)
+        shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
+        # D26: an explicit start does not wait and starts the start back-off over (a service run already waiting ends its
+        # wait at once, and the service run this start causes is the first of a new series).
+        start_backoff.reset(persona_dir)
 
-    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
-    idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
-    _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
-    release_lock(persona_dir, fd)  # hand the lock to the child runner
+        log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+        idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+        _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
+    finally:
+        release_lock(persona_dir, fd)  # hand the lock to the child runner on the normal path
     # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
     # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
     if _service_installed(args.persona):

@@ -53,11 +53,14 @@ def _root_logger_is_left_as_found() -> Any:
     root.setLevel(level)
 
 
+_REAL_RELEASE_LOCK = daemon.release_lock  # the probe below must not be counted by a test that wraps `daemon.release_lock`
+
+
 def _lock_is_free(persona: Path) -> bool:
     fd = daemon.acquire_lock(persona)
     if fd is None:
         return False
-    daemon.release_lock(persona, fd)
+    _REAL_RELEASE_LOCK(persona, fd)
     return True
 
 
@@ -352,10 +355,27 @@ def test_chats_already_running_start_carries_the_attach_flag(monkeypatch: pytest
     assert getattr(args, "attach", False) is True
 
 
-@pytest.mark.no_base_failure(reason="pins existing behaviour: the auto-spawn start is a plain start, not an attach")
-def test_chats_auto_spawn_start_is_not_an_attach(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_chats_auto_spawn_start_carries_the_attach_flag_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HQD (3): attach is read only when a bridge is running, so it changes nothing for a start that finds none."""
     (args,) = _chat_start_args(monkeypatch, running=False)
-    assert getattr(args, "attach", False) is False
+    assert getattr(args, "attach", False) is True
+
+
+def test_a_bridge_that_appears_between_chats_check_and_the_start_is_not_stopped(
+    persona: Path, start_calls: _Calls, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """HQD (3): chat saw no bridge, cmd_start's own look finds one and a rebuild is needed: the start refuses with 2 and stops nothing."""
+    from brain import cli
+
+    _write_running_record(persona)
+    looks = iter([False, True])
+    monkeypatch.setattr(state_file, "is_running", lambda pd: next(looks))
+    monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
+    monkeypatch.setattr(cli, "_chat_via_bridge", lambda *a, **k: 0)
+    rc = cli._chat_handler(SimpleNamespace(persona="nell", no_bridge=False, bridge_only=False))
+    assert rc == 2
+    assert start_calls.order == []  # no stop, no step, no spawn
+    assert "bridge already running on port 51999 (pid 4242)" in capsys.readouterr().err
 
 
 # --- HS6 (a): cmd_start -------------------------------------------------------------------------------------------------------
@@ -370,7 +390,7 @@ def test_a_start_that_needs_a_rebuild_runs_the_step_under_the_lock_then_starts_t
     assert start_calls.order == ["step", "spawn", "ready"]
     assert start_calls.lock_free_at["step"] is False  # held during the step
     assert start_calls.lock_free_at["spawn"] is True  # handed to the child runner, as before
-    assert needed_calls == [(persona, False)]
+    assert needed_calls == [(persona, False), (persona, False)]  # the second is the re-check under the lock (HQD (4))
 
 
 @pytest.mark.no_base_failure(reason="pins existing behaviour: a start that needs no rebuild runs no step")
@@ -450,7 +470,7 @@ def test_a_running_bridge_with_a_rebuild_needed_is_stopped_first_then_the_step_r
     assert daemon.cmd_start(args) == 0
     assert start_calls.order == ["stop", "step", "spawn", "ready"]
     assert stops == [(args, {"reason": None, "kill_pre_pr": False})]
-    assert needed_calls == [(persona, True)]
+    assert needed_calls == [(persona, True), (persona, False)]  # the second is the re-check under the lock (HQD (4))
 
 
 def test_a_stop_that_fails_starts_nothing_kills_nothing_and_takes_no_lock(
@@ -696,7 +716,7 @@ def test_a_command_that_needs_a_rebuild_runs_the_step_under_the_start_lock_and_r
     assert daemon.run_rebuild_step(persona) == answer
     assert step_calls.order == ["step"]  # and it starts no bridge
     assert step_calls.lock_free_at["step"] is False
-    assert needed_calls == [(persona, False)]
+    assert needed_calls == [(persona, False), (persona, False)]  # the second is the re-check under the lock (HQD (4))
     assert _lock_is_free(persona)
 
 
@@ -736,4 +756,234 @@ def test_a_command_on_an_unswitched_persona_runs_the_rebuild_child_once_and_goes
     assert len(rebuild_spawns.calls) == 1
     assert rebuild_spawns.calls[0][0][-6:] == ["-m", "brain.cli", "supervisor", "rebuild", "--persona", "nell"]
     assert list(logging.getLogger().handlers) == before
+    assert _lock_is_free(persona)
+
+
+# --- HQD (i): cmd_start releases the start lock in one place ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def released(start_calls: _Calls, monkeypatch: pytest.MonkeyPatch) -> _Calls:
+    """`start_calls`, with every `release_lock` of the module written into the same order list as "release"."""
+    real = daemon.release_lock
+
+    def counting(persona_dir: Path, fd: int) -> None:
+        start_calls.order.append("release")
+        real(persona_dir, fd)
+
+    monkeypatch.setattr(daemon, "release_lock", counting)
+    return start_calls
+
+
+@pytest.mark.parametrize("target", ["delete_record", "reset", "rotate"])
+def test_a_raise_between_the_lock_and_the_hand_off_leaves_the_lock_free(
+    persona: Path, start_calls: _Calls, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("disk trouble")
+
+    if target == "delete_record":
+        monkeypatch.setattr(shutdown_progress, "delete_record", boom)
+    elif target == "reset":
+        monkeypatch.setattr(start_backoff, "reset", boom)
+    else:
+        monkeypatch.setattr(daemon, "_rotate_bridge_log", boom)
+    with pytest.raises(RuntimeError, match="disk trouble"):
+        daemon.cmd_start(_start_args())
+    assert start_calls.order == []  # nothing was spawned
+    assert _lock_is_free(persona)
+
+
+@pytest.mark.no_base_failure(reason="pins existing behaviour: one release, before the spawn")
+def test_a_normal_start_releases_the_lock_once_before_the_spawn(persona: Path, released: _Calls) -> None:
+    assert daemon.cmd_start(_start_args()) == 0
+    assert released.order == ["release", "spawn", "ready"]
+
+
+@pytest.mark.no_base_failure(reason="pins existing behaviour: a service-installed start releases the lock before the manager's start")
+def test_a_service_installed_start_releases_the_lock_once_before_the_service_start(
+    persona: Path, released: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(daemon, "_service_installed", lambda name: True)
+    monkeypatch.setattr(daemon, "_start_service", lambda name: released.order.append("service_start"))
+    monkeypatch.setattr(daemon, "_await_service_readiness", lambda *a, **k: 0)
+    assert daemon.cmd_start(_start_args()) == 0
+    assert released.order == ["release", "service_start"]
+
+
+@pytest.mark.no_base_failure(reason="pins existing behaviour: a failed step and an interrupted step each release once")
+@pytest.mark.parametrize("outcome", ["code", "interrupt"])
+def test_a_step_that_ends_the_start_releases_the_lock_exactly_once(
+    persona: Path, released: _Calls, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    def step(pd: Path) -> int | None:
+        if outcome == "interrupt":
+            raise KeyboardInterrupt
+        return 1
+
+    monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
+    monkeypatch.setattr(daemon, "_rebuild_under_lock", step)
+    if outcome == "interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            daemon.cmd_start(_start_args())
+    else:
+        assert daemon.cmd_start(_start_args()) == 1
+    assert released.order == ["release"]
+
+
+# --- HQD (iii): the runtime-log context manager -------------------------------------------------------------------------------
+
+
+def test_runtime_log_attaches_a_transient_handler_for_its_body_and_removes_it(persona: Path) -> None:
+    before = list(logging.getLogger().handlers)
+    with daemon._runtime_log(persona):
+        assert len(logging.getLogger().handlers) == len(before) + 1
+        logging.getLogger("brain.bridge.daemon").warning("a line from inside the bracket")
+    assert list(logging.getLogger().handlers) == before
+    assert "a line from inside the bracket" in runtime_log_path("nell").read_text(encoding="utf-8")
+
+
+def test_runtime_log_removes_its_handler_when_the_body_raises(persona: Path) -> None:
+    before = list(logging.getLogger().handlers)
+    with pytest.raises(ValueError, match="in the body"):
+        with daemon._runtime_log(persona):
+            raise ValueError("in the body")
+    assert list(logging.getLogger().handlers) == before
+
+
+def test_runtime_log_adds_nothing_when_the_persistent_handler_is_attached(persona: Path) -> None:
+    runner._setup_runtime_logging(persona)
+    before = list(logging.getLogger().handlers)
+    with daemon._runtime_log(persona):
+        assert list(logging.getLogger().handlers) == before
+    assert list(logging.getLogger().handlers) == before
+
+
+def test_runtime_log_runs_its_body_when_the_runner_cannot_be_imported(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _break_runner_import(monkeypatch)
+    ran: list[str] = []
+    with daemon._runtime_log(persona):
+        ran.append("body")
+    assert ran == ["body"]
+
+
+def test_a_failed_stop_writes_one_line_to_the_runtime_log_and_restores_the_handlers(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daemon, "cmd_stop", lambda args, **kwargs: 1)
+    before = list(logging.getLogger().handlers)
+    assert daemon._stop_for_rebuild(persona, _start_args()) == 1
+    assert list(logging.getLogger().handlers) == before
+    text = runtime_log_path("nell").read_text(encoding="utf-8")
+    assert text.count("did not stop before the rebuild") == 1
+    assert "nell" in text and "exit code 1" in text
+
+
+def test_a_failed_stop_logs_once_when_the_persistent_runtime_log_is_attached(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daemon, "cmd_stop", lambda args, **kwargs: 1)
+    runner._setup_runtime_logging(persona)
+    before = list(logging.getLogger().handlers)
+    assert daemon._stop_for_rebuild(persona, _start_args()) == 1
+    assert list(logging.getLogger().handlers) == before
+    assert runtime_log_path("nell").read_text(encoding="utf-8").count("did not stop before the rebuild") == 1
+
+
+_STOP_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    from types import SimpleNamespace
+
+    from brain.bridge import daemon
+    from brain.paths import get_persona_dir
+
+    persona = get_persona_dir("nell")
+    persona.mkdir(parents=True)
+    daemon.cmd_stop = lambda args, **kwargs: 0
+    assert daemon._stop_for_rebuild(persona, SimpleNamespace(persona="nell")) == 0
+    assert "brain.bridge.runner" not in sys.modules, "a stop that worked imported the runner"
+    print("ok")
+    """
+)
+
+
+@pytest.mark.no_base_failure(reason="pins existing behaviour: a stop that works logs nothing and imports nothing")
+def test_a_stop_that_works_never_imports_the_bridge_runner(tmp_path: Path) -> None:
+    import os
+
+    env = dict(os.environ, KINDLED_HOME=str(tmp_path / "home"), PYTHONPATH=str(REPO))
+    done = subprocess.run([sys.executable, "-c", _STOP_SCRIPT], env=env, capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
+# --- HQD (4): the need is asked again under the lock --------------------------------------------------------------------------
+
+
+def _need_that_goes_away(calls: list[tuple[bool, bool]], persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_rebuild_needed` answers True, then False; each call records (bridge_running, whether the start lock was free)."""
+    answers = iter([True, False])
+
+    def needed(pd: Path, running: bool) -> bool:
+        calls.append((running, _lock_is_free(persona)))
+        return next(answers)
+
+    monkeypatch.setattr(daemon, "_rebuild_needed", needed)
+
+
+def test_a_start_whose_need_is_gone_under_the_lock_runs_no_step_and_still_starts_the_bridge(
+    persona: Path, start_calls: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[bool, bool]] = []
+    _need_that_goes_away(calls, persona, monkeypatch)
+    ended: list[Any] = []
+    monkeypatch.setattr(kill, "kill_command", lambda *a, **k: ended.append(a))
+    assert daemon.cmd_start(_start_args()) == 0
+    assert start_calls.order == ["spawn", "ready"]  # no step
+    assert ended == []
+    assert calls == [(False, True), (False, False)]  # the second look is under the lock, with no bridge running
+
+
+@pytest.mark.real_rebuild_step(reason="the real step must not run: no command ended, no child spawned")
+def test_a_start_whose_need_is_gone_under_the_lock_ends_no_command_and_spawns_no_child(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[bool, bool]] = []
+    _need_that_goes_away(calls, persona, monkeypatch)
+    ended: list[Any] = []
+    monkeypatch.setattr(kill, "kill_command", lambda *a, **k: ended.append(a))
+    monkeypatch.setattr(daemon, "spawn_detached", lambda *a, **k: 4242)
+    monkeypatch.setattr(daemon, "_await_readiness", lambda *a, **k: 0)
+    monkeypatch.setattr(state_file, "is_running", lambda pd: False)
+    assert daemon.cmd_start(_start_args()) == 0
+    assert rebuild_spawns.calls == []
+    assert ended == []
+
+
+@pytest.mark.real_rebuild_step(reason="the real need check: its answer is made to raise on the second look")
+def test_a_second_look_that_raises_skips_the_step_logs_the_reason_and_the_start_goes_on(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers = [True]
+
+    def check(persona_dir: Path) -> bool:
+        if answers:
+            return answers.pop()
+        raise ValueError("a state that cannot be read")
+
+    monkeypatch.setattr(engine, "start_rebuild_needed", check)
+    monkeypatch.setattr(daemon, "spawn_detached", lambda *a, **k: 4242)
+    monkeypatch.setattr(daemon, "_await_readiness", lambda *a, **k: 0)
+    monkeypatch.setattr(state_file, "is_running", lambda pd: False)
+    assert daemon.cmd_start(_start_args()) == 0
+    assert rebuild_spawns.calls == []
+    assert "a state that cannot be read" in runtime_log_path("nell").read_text(encoding="utf-8")
+    assert _lock_is_free(persona)
+
+
+def test_a_command_whose_need_is_gone_under_the_lock_runs_no_step_and_releases_the_lock(
+    persona: Path, step_calls: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[bool, bool]] = []
+    _need_that_goes_away(calls, persona, monkeypatch)
+    assert daemon.run_rebuild_step(persona) is None
+    assert step_calls.order == []
+    assert calls == [(False, True), (False, False)]
     assert _lock_is_free(persona)
