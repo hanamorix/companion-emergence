@@ -634,3 +634,25 @@ def test_setting_up_the_runtime_log_twice_adds_one_handler(pd, monkeypatch, tmp_
     real_setup_runtime_logging(pd)
     real_setup_runtime_logging(pd)
     assert sum(isinstance(h, RotatingFileHandler) for h in root_handlers.handlers) == n0 + 1
+
+
+def test_a_failed_path_lookup_attaches_no_runtime_handler_and_prints_the_breadcrumb(
+    pd, monkeypatch, tmp_path, root_handlers, capsys
+):
+    """The already-attached lookup resolves the log path; when that fails, setup logs a breadcrumb to stderr and attaches
+    nothing (it must not carry on and attach a handler it could not look for)."""
+    import os
+
+    class _UnresolvablePath:
+        def resolve(self):
+            raise OSError("cannot resolve")
+
+        def __fspath__(self):
+            return os.fspath(tmp_path / "logs" / "runtime-unresolvable.log")
+
+    monkeypatch.setattr("brain.paths.get_log_dir", lambda: tmp_path / "logs")
+    monkeypatch.setattr("brain.paths.runtime_log_path", lambda _name: _UnresolvablePath())
+    before = list(root_handlers.handlers)
+    real_setup_runtime_logging(pd)
+    assert list(root_handlers.handlers) == before
+    assert "runtime logging setup failed: cannot resolve" in capsys.readouterr().err
