@@ -391,10 +391,13 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     return: 1 when another running command could not be ended (nothing else ran).
 
     (1) Every other running command (``engine_files.live_command_runs``) is ended with ``kill.kill_command``, which asks the
-    process for its identity first; a command that is not ended (survivors, an identity that could not be confirmed, no token, an
-    exception) ends the step with one plain line naming its pid. So does a record that cannot be read while the pid in its file
-    name may be alive (no ``kill_command`` call; the line gives the file) and a folder of records that cannot be listed (the line
-    names the folder): either may hide a live command (B58 HQB Q1). This is the one place a start acts on a running command.
+    process for its identity first; a command that is not ended (survivors, an identity that could not be confirmed, an exception)
+    ends the step with one plain line naming its pid. The one case whose line also gives the record's path is a record with no token
+    that ``kill_command`` answers ``unknown_identity`` (a command that could not read its own identity left it, and its pid may have
+    been reused by an unrelated process): the line adds the file and the advice to delete it if that process is not a nell command
+    (B60 HQT). The step also ends for a record that cannot be read while the pid in its file name may be alive (no ``kill_command``
+    call; the line gives the file) and for a folder of records that cannot be listed (the line names the folder): either may hide a
+    live command (B58 HQB Q1). This is the one place a start acts on a running command.
     (2) The rebuild is its own process, ``nell supervisor rebuild``, waited for with no limit (S101: the startup waits until the
     rebuild is finished). It prints the lines below to stderr only when stderr is a terminal; the loop sleeps through
     ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
@@ -441,6 +444,7 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
                     "Nothing was updated. If it is not running, delete that file and try again."
                 )
                 return 1
+            result = None
             try:
                 result = kill.kill_command(pid, token if isinstance(token, str) else None)
                 ended = result.succeeded
@@ -453,7 +457,17 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
                 elif not ended:
                     logger.warning("could not end the running command %s: %s", pid, result.message)
             if not ended:
-                _say(f"Another command (process {pid}) is still running and could not be stopped. Nothing was updated. Try again when it has finished.")
+                if result is not None and result.outcome == "unknown_identity" and not (isinstance(token, str) and token):
+                    # A readable record with no token (written by a command that could not read its own identity, B60 HQT): its
+                    # identity cannot be checked, so it is not ended, and its pid may have been reused by an unrelated process. The
+                    # line gives the record so the user can clear it; every other failed stop keeps the plain line below.
+                    path = engine_files.command_run_path(persona_dir, pid)
+                    _say(
+                        f"Another command (process {pid}) is still running and could not be stopped: {path}. Nothing was updated. "
+                        "Try again when it has finished, or, if that process is not a nell command, delete that file and try again."
+                    )
+                else:
+                    _say(f"Another command (process {pid}) is still running and could not be stopped. Nothing was updated. Try again when it has finished.")
                 return 1
         _run_rebuild_child(persona_dir)
         return None

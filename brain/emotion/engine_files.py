@@ -568,8 +568,9 @@ def live_command_runs(persona_dir: Path) -> list[dict[str, Any]]:
     Raises ``OSError`` when the folder cannot be listed (a missing folder is no records): the folder may hide a live command, so
     the caller fails the step naming it. Nothing else raises.
 
-    Accepted edge (P4, B58 HQB Q1): an unreadable record whose pid was reused by an unrelated live process blocks starts until that
-    process exits or the user removes the file the caller's line names.
+    Accepted edge (P4, B58 HQB Q1, B60 HQT): an unreadable record, or a readable one with no token (a command that could not read
+    its own identity), whose pid was reused by an unrelated live process blocks starts until that process exits or the user removes
+    the file the caller's line names.
 
     Accepted edge (P4, B58 HQB Q2): a person runs one of the six commands by hand inside a shell spawned from another registered
     command. The step's ``kill.kill_command`` then suspends every descendant of the outer command, the inner command included, so

@@ -438,11 +438,64 @@ def test_a_record_with_no_token_is_not_killed_by_the_real_kill_command_and_stops
         path.write_text(json.dumps({"version": 1, "pid": other.pid, "pid_token": None, "persona": "nell"}), encoding="utf-8")
         assert daemon._rebuild_under_lock(persona) == 1
         assert other.poll() is None  # still running: nothing was killed without an identity to check
-        assert capsys.readouterr().err == _could_not_end(other.pid) + "\n"
+        assert capsys.readouterr().err == _token_less_line(other.pid, path) + "\n"
         assert rebuild_spawns.calls == []
     finally:
         other.kill()
         other.wait()
+
+
+def _token_less_line(pid: int, path: Path) -> str:
+    """B60 HQT: the not-ended line of a record with no token that `kill_command` answers `unknown_identity`."""
+    return (
+        f"Another command (process {pid}) is still running and could not be stopped: {path}. Nothing was updated. "
+        "Try again when it has finished, or, if that process is not a nell command, delete that file and try again."
+    )
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+@pytest.mark.parametrize("token", [None, "", 7], ids=["none", "empty", "not a string"])
+def test_a_record_with_no_usable_token_that_cannot_be_confirmed_gives_its_path_and_the_delete_advice(
+    persona: Path,
+    rebuild_spawns: RebuildPopenRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    token: Any,
+) -> None:
+    _runs(monkeypatch, [{"pid": 77, "pid_token": token}, {"pid": 78, "pid_token": "tok"}])
+    asked = _kills(monkeypatch, {77: KillResult("unknown_identity", "identity of command 77 could not be confirmed; not killing")})
+    assert daemon._rebuild_under_lock(persona) == 1
+    assert capsys.readouterr().err == _token_less_line(77, engine_files.command_run_path(persona, 77)) + "\n"
+    assert [pid for pid, _ in asked] == [77]  # the next record was never reached
+    assert rebuild_spawns.calls == []
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+@pytest.mark.no_base_failure(reason="pins the unchanged plain line: only a token-less record that cannot be confirmed gets the path")
+def test_a_record_with_no_token_whose_kill_raises_keeps_the_plain_line(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _runs(monkeypatch, [{"pid": 77, "pid_token": None}])
+    _kills(monkeypatch, {77: RuntimeError("psutil fell over")})
+    assert daemon._rebuild_under_lock(persona) == 1
+    assert capsys.readouterr().err == _could_not_end(77) + "\n"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+@pytest.mark.no_base_failure(reason="pins the unchanged plain line: a real token that cannot be confirmed keeps it, also after a token-less record was ended")
+def test_a_real_token_that_cannot_be_confirmed_keeps_the_plain_line_after_an_earlier_token_less_command_was_gone(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _runs(monkeypatch, [{"pid": 76, "pid_token": None}, {"pid": 77, "pid_token": "tok"}])
+    _kills(
+        monkeypatch,
+        {
+            76: KillResult("not_running", "command not running"),
+            77: KillResult("unknown_identity", "identity of command 77 could not be confirmed; not killing"),
+        },
+    )
+    assert daemon._rebuild_under_lock(persona) == 1
+    assert capsys.readouterr().err == _could_not_end(77) + "\n"
 
 
 def _unreadable_line(pid: int, path: Path) -> str:
