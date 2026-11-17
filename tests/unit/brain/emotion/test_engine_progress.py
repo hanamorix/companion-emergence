@@ -351,7 +351,7 @@ def test_a_removal_leaves_another_processes_record(tmp_path: Path, live_other: s
     assert engine_files.progress_path(tmp_path).read_bytes() == before
 
 
-def test_a_writer_with_no_token_cannot_remove_its_record_and_the_reader_still_sees_it_while_it_runs(
+def test_a_writer_with_no_token_removes_its_own_record_and_the_reader_sees_it_only_while_it_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(process_identity, "own_token", lambda: None)
@@ -359,9 +359,24 @@ def test_a_writer_with_no_token_cannot_remove_its_record_and_the_reader_still_se
     progress.write()
     progress.report(1, 2)
     assert engine_files.read_progress(tmp_path)["pid_token"] is None
+    running = engine_files.read_engine_progress(tmp_path)  # this process is alive: a pid check answers alive
+    assert running is not None and running["pid"] == os.getpid() and running["done"] == 1
     progress.remove()
-    leftover = engine_files.read_engine_progress(tmp_path)  # this process is alive: a pid check answers alive
-    assert leftover is not None and leftover["pid"] == os.getpid() and leftover["done"] == 1
+    assert not engine_files.progress_path(tmp_path).exists()
+    assert engine_files.read_engine_progress(tmp_path) is None
+
+
+@pytest.mark.no_base_failure(reason="a data-safety pin: the old removal also kept a record that names a token, and the new one must keep doing so")
+def test_a_writer_with_no_token_leaves_a_record_that_names_a_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A record with a token is not this token-less writer's: keep it (data safety)."""
+    own = process_identity.own_token()
+    assert own is not None, "this test needs a platform where the token can be read"
+    progress = engine_files.EngineProgress(tmp_path, "rebuilding")
+    progress.write()
+    before = engine_files.progress_path(tmp_path).read_bytes()
+    monkeypatch.setattr(process_identity, "own_token", lambda: None)
+    progress.remove()
+    assert engine_files.progress_path(tmp_path).read_bytes() == before
 
 
 def test_a_failed_write_does_not_fail_the_start_and_is_logged_without_a_traceback(
@@ -455,6 +470,7 @@ def test_the_reader_returns_none_for_a_gone_writer_and_for_a_record_that_names_n
 
 
 def test_a_record_cannot_name_another_bridge_as_its_own(tmp_path: Path) -> None:
-    """`names_this_bridge`, the own-record test the writers use, needs the pid AND the token to match."""
+    """`is_own_identity`, the own-record test the writer's removal uses, needs the pid AND the token to match."""
     _own_record(tmp_path, pid_token="linux:other:1:1")
-    assert not process_identity.names_this_bridge(engine_files.read_progress(tmp_path), os.getpid(), process_identity.own_token())
+    record = engine_files.read_progress(tmp_path)
+    assert not process_identity.is_own_identity(record["pid"], record["pid_token"])

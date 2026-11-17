@@ -735,7 +735,7 @@ REMOVED: tuple[Removed, ...] = (
     # --- the own-record test moved to process_identity (Engine 6 HR5, Hana's review of #633 point 5) ---------------------------
     Removed(
         names=("shutdown_progress.names_this_bridge",),
-        why="`names_this_bridge` moved to `brain/process_identity.py`, the neutral module `brain/emotion` may import, because the engine's progress record uses the same own-record test as the bridge's watcher files; its five callers were re-pointed and no alias was left behind",
+        why="`names_this_bridge` moved to `brain/process_identity.py`, the neutral module `brain/emotion` may import, because the engine's progress record used the same test as the bridge's watcher files (it now uses `is_own_identity`); its five callers were re-pointed and no alias was left behind",
         ref="Engine 6 HR5 (#584, draft PR #633)",
         kind="text",
     ),

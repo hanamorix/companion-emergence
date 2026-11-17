@@ -346,9 +346,9 @@ class EngineProgress:
     ``finally``). Every write first reads the record there: one that names ANOTHER live process (the x10 step of a second
     start) is not replaced, and the next write goes through once that record is gone (B47b HR5b (d)). A percentage counts as
     tried when it is attempted, so a blocked writer does not read the file again for every row. ``remove()`` deletes only a record
-    that names this process's pid and token (``process_identity.names_this_bridge``); with no token to match (``own_token()`` is
-    None) it leaves its record, which then names a process that is gone once this one exits (``read_engine_progress`` ignores
-    it).
+    that names this process's pid and token (``process_identity.is_own_identity``); with no token to read (``own_token()`` is
+    None) the record carries none and is still removed, so a bridge that cannot read its own token does not leave a record
+    that reads as live for as long as it runs.
     """
 
     def __init__(self, persona_dir: Path, phase: str) -> None:
@@ -406,8 +406,10 @@ class EngineProgress:
         write_json(progress_path(self._persona_dir), record, indent=2, sort_keys=True, fsync=False, mode=0o600)
 
     def _remove(self) -> None:
-        own = (process_identity.own_pid(), process_identity.own_token())
-        if process_identity.names_this_bridge(read_progress(self._persona_dir), *own):
+        record = read_progress(self._persona_dir)
+        if isinstance(record, dict) and process_identity.is_own_identity(
+            record.get("pid"), record.get("pid_token")
+        ):
             file_ops.delete_file(progress_path(self._persona_dir))
 
 

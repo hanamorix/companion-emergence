@@ -161,7 +161,7 @@ def own_token() -> str | None:
     """This process's token, or None when it cannot be read here.
 
     The first answer stands for the life of the process, a failed read included: a bridge that recorded no token
-    (runner.py, identity "unavailable") must keep matching its own record in ``state_file.update``.
+    (runner.py, identity "unavailable") must keep matching its own record in ``is_own_identity``.
     """
     global _OWN
     if _OWN is None:
@@ -202,12 +202,25 @@ def holder_alive(pid: int | None, recorded: str | None) -> bool:
 def names_this_bridge(record: dict[str, Any] | None, pid: int | None, token: str | None) -> bool:
     """True when ``record`` names exactly ``pid`` + ``token`` (C43 a: anything else is ignored).
 
-    A comparison against an expected identity only, no liveness (that is ``holder_alive``). The bridge's watcher files and the
-    engine's progress record both use it for "is this record mine".
+    A comparison against an expected identity only, no liveness (that is ``holder_alive``). The bridge's watcher files use it
+    for "is this record the bridge's": a record with no token never matches. A process asking whether a record is its OWN uses
+    ``is_own_identity``, which lets a missing token match a missing token.
     """
     if not isinstance(record, dict) or pid is None or not token:
         return False
     return record.get("pid") == pid and record.get("pid_token") == token
+
+
+def is_own_identity(pid: int | None, token: str | None) -> bool:
+    """Do ``pid`` and ``token`` name this process: the pid is this process's and the token equals ``own_token()``?
+
+    Both tokens None count as equal: a process that cannot read its own token records none, and that record is still
+    its own (the engine's progress record, bridge.json). A real token against a missing one, or the reverse, does not match.
+    A bool is not a pid.
+    """
+    if isinstance(pid, bool) or pid != own_pid():
+        return False
+    return token == own_token()
 
 
 def token_digest(token: str) -> str:

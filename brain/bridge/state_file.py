@@ -123,7 +123,7 @@ def update(persona_dir: Path, fn: Callable[[BridgeState], None]) -> bool:
 
     with _update_lock:
         cur = read(persona_dir)
-        if cur is None or cur.pid != os.getpid() or cur.pid_token != process_identity.own_token():
+        if cur is None or not process_identity.is_own_identity(cur.pid, cur.pid_token):
             return False
         if _update_between is not None:
             _update_between()

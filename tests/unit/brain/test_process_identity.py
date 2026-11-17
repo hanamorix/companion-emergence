@@ -228,6 +228,38 @@ def test_names_this_bridge_needs_the_pid_and_the_token_to_match():
     assert not pi.names_this_bridge(record, None, token)
 
 
+_A_TOKEN = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456"
+
+
+def test_is_own_identity_is_true_for_this_pid_and_this_token(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: _A_TOKEN)
+    assert pi.is_own_identity(os.getpid(), _A_TOKEN)
+
+
+def test_is_own_identity_counts_two_missing_tokens_as_equal(monkeypatch):
+    """A machine that cannot read its own token records none: that record still names this process (HN2)."""
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    assert pi.is_own_identity(os.getpid(), None)
+
+
+def test_is_own_identity_is_false_when_only_one_token_is_missing(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: _A_TOKEN)
+    assert not pi.is_own_identity(os.getpid(), None)
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    assert not pi.is_own_identity(os.getpid(), _A_TOKEN)
+
+
+def test_is_own_identity_is_false_for_another_token(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: _A_TOKEN)
+    assert not pi.is_own_identity(os.getpid(), "linux:other:4242:9")
+
+
+def test_is_own_identity_is_false_for_another_pid_or_none(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    assert not pi.is_own_identity(os.getpid() + 1, None)
+    assert not pi.is_own_identity(None, None)
+
+
 def test_names_this_bridge_lives_only_in_process_identity():
     from brain.bridge import shutdown_progress
 
