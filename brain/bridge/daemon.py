@@ -421,11 +421,37 @@ def cmd_start(args, *, out: dict | None = None) -> int:
 
 
 # Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
-# killed a healthy-but-slow bridge. 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
-# The bridge's start-up can outlast both: a first start waits for the engine lock while another process's emotion rebuild
-# holds it (Engine 6, HR5a, owner S101), and nothing here pauses for that wait yet, so a wait past 50 s is killed as a
-# failed start (the timers learn about the wait in a later part of HR5).
+# killed a healthy-but-slow bridge. (Bug 2b, v0.0.36.)
+# The bridge's start-up can outlast it: a first start waits for the engine lock while another process's emotion rebuild
+# holds it (Engine 6, HR5a, owner S101). The budget therefore pauses while an engine progress record names a live
+# writer (``_ReadinessBudget``); with no record it is this plain 50 s. The Rust caller's wait for ``nell supervisor start``
+# (lib.rs ``wait_for_start``) pauses on the same record.
 _READINESS_BUDGET_S = 50.0
+
+
+class _ReadinessBudget:
+    """A readiness wait's deadline, paused while an engine progress record names a live writer (Engine 6, HR5 part 4).
+
+    ``expired()`` is asked once per 0.1 s poll. It reads the record through ``engine_files.read_engine_progress`` (liveness
+    by ``holder_alive``; the reader never raises, and a missing or unreadable record counts as absent for that poll). A poll
+    that finds a record pushes the deadline out by the time since the previous poll, so the clock stands still while the
+    record shows; time before the record appears, and after it is gone, counts as ordinary budget. With no record ever it is
+    exactly ``start + budget_s``.
+    """
+
+    def __init__(self, persona_dir: Path, budget_s: float) -> None:
+        self._persona_dir = persona_dir
+        self._last = time.time()
+        self._deadline = self._last + max(0.0, budget_s)
+
+    def expired(self) -> bool:
+        from brain.emotion import engine_files
+
+        now = time.time()
+        if engine_files.read_engine_progress(self._persona_dir) is not None:
+            self._deadline += now - self._last
+        self._last = now
+        return now >= self._deadline
 
 
 def _service_installed(persona: str) -> bool:
@@ -444,8 +470,8 @@ def _start_service(persona: str) -> subprocess.CompletedProcess[str] | None:
 def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | None) -> int:
     """Readiness of a bridge the service manager started (#456 D20): a record of a live bridge (by its token) whose
     /health answers, within what is left of the 50 s budget."""
-    deadline = time.time() + max(0.0, budget_s)
-    while time.time() < deadline:
+    budget = _ReadinessBudget(persona_dir, budget_s)
+    while not budget.expired():
         time.sleep(0.1)
         s = state_file.read(persona_dir)
         if s is None or not s.port or state_file.bridge_liveness(s, persona_dir) != state_file.ALIVE:
@@ -473,8 +499,8 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     """cmd_start's readiness wait for the child it just spawned (see cmd_start)."""
     proc = _spawned_children.get(pid)
 
-    deadline = time.time() + _READINESS_BUDGET_S
-    while time.time() < deadline:
+    budget = _ReadinessBudget(persona_dir, _READINESS_BUDGET_S)
+    while not budget.expired():
         time.sleep(0.1)
         s = state_file.read(persona_dir)
         if s is not None and s.pid == pid and s.port:
@@ -519,7 +545,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     # Readiness failed — kill the orphan child and tell the user where to look.
     _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
-        f"bridge spawned (pid {pid}) but /health did not respond in 50s — "
+        f"bridge spawned (pid {pid}) but /health did not respond within its 50s budget (time spent on a rebuild not counted) — "
         f"killed orphan child. Inspect log at {log_path}",
         file=sys.stderr,
     )
