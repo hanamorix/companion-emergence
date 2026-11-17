@@ -506,8 +506,8 @@ def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
     Accepted edges (P4, R2): the app drops a start after 60 s with no rebuild record (lib.rs ``wait_for_start``, ``kill_on_drop``),
     which ends the start command, not the stop; no data is lost, and at launch on an unconfirmed overlay a failed start reaches
     ``recoverUnhealthyBrain`` and undoes the update (brainRecovery.ts), as HR5 (6) and (7) recorded. A stop that answers 0 while a
-    bridge is still there (an UNKNOWN identity) is not caught here: a live bridge holds the start lock, so ``cmd_start``'s lock
-    refuses with exit 2. A queued service run that wakes between the stop and ``cmd_start``'s lock takes it: this start then
+    bridge is somehow still there is not caught here: a live bridge holds the start lock, so ``cmd_start``'s lock refuses with
+    exit 2. A failed stop can print two lines (the pre-PR stop's, then this one), accepted. A queued service run that wakes between the stop and ``cmd_start``'s lock takes it: this start then
     returns 2 and that run does the rebuild (``cmd_run``).
     """
     rc = cmd_stop(args, reason=None, kill_pre_pr=False)
@@ -642,8 +642,8 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     # #456 (D12, Q-B): no synchronous recovery here. The bridge's first idle pass saves every open session through
     # the gated job session_snapshot_prune (inside the background slot), whatever ended the last bridge.
 
-    # #456 (D25, S6-f): an explicit start clears a kill's stop intent, only now (after the ALIVE refusal above, so a
-    # launch check during an in-flight kill leaves it alone).
+    # #456 (D25, S6-f): an explicit start clears a kill's stop intent, only now (after the already-running refusal or
+    # the stop above, so a launch check during an in-flight kill leaves it alone).
     from brain.bridge import shutdown_progress
 
     shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)

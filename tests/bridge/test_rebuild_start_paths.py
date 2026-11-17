@@ -479,7 +479,7 @@ def test_an_attach_start_over_a_running_bridge_is_refused_before_any_need_check(
 def test_a_bridge_that_a_zero_stop_left_behind_is_refused_by_the_lock(
     persona: Path, start_calls: _Calls, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """cmd_stop answers 0 when the bridge's identity is UNKNOWN; a bridge that is really there holds the start lock, so this start gets 2
+    """A stop that answers 0 while a bridge is somehow still there (stubbed here): a live bridge holds the start lock, so this start gets 2
     and runs no step."""
     _write_running_record(persona)
     monkeypatch.setattr(state_file, "is_running", lambda pd: True)
@@ -550,6 +550,17 @@ def test_a_failed_run_step_returns_its_code_releases_the_lock_and_notes_a_start_
     assert ("note_start" in run_calls.order) is (origin == "task-scheduler")
     assert "bridge" not in run_calls.order
     assert _lock_is_free(persona)
+
+
+@pytest.mark.no_base_failure(reason="pins that the step sits after the guard checks; on base there is no step to place")
+def test_a_run_the_guard_stops_runs_no_step(persona: Path, run_calls: _Calls, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The step comes after the guard checks: a service run that is not starting (a user's kill of this boot) rebuilds nothing."""
+    from brain.bridge import respawn_guard
+
+    monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
+    monkeypatch.setattr(respawn_guard, "guard_fires", lambda pd: True)
+    assert daemon.cmd_run(_run_args("task-scheduler")) == 0
+    assert run_calls.order == []
 
 
 @pytest.mark.no_base_failure(reason="pins existing behaviour: a service run that needs no rebuild runs no step")
