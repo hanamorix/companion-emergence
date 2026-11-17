@@ -160,6 +160,29 @@ def test_a_refused_create_leaves_no_folder_it_made_wherever_it_was_moved_703(env
     assert not (home / "a").exists()
 
 
+def test_a_made_folder_is_found_when_its_parent_was_not_ours_and_was_moved_703(env, monkeypatch):
+    # Another writer made 'a', so it is not ours and its descriptor is not held; ours is 'b' inside it. The
+    # racer moves 'a' into ~/.ssh: 'b' can no longer be reached by name from Notes, but its own descriptor finds it.
+    import os
+
+    from brain.files import commit as commit_mod
+
+    notes, ssh = env["home"] / "Notes", env["home"] / ".ssh"
+    rid = propose_write(path=str(notes / "a" / "b" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    _plant_before_mkdir(monkeypatch, "a", lambda dir_fd: os.mkdir("a", dir_fd=dir_fd))
+    real_open_final = commit_mod._open_final
+
+    def open_then_move(name, op, dir_fd):
+        fd = real_open_final(name, op, dir_fd)
+        (notes / "a").rename(ssh / "a")
+        return fd
+
+    monkeypatch.setattr(commit_mod, "_open_final", open_then_move)
+    done = _commit(env, rid)
+    assert done["ok"] is False and pending.get(env["persona"], rid)["status"] == "refused", done
+    assert (ssh / "a").is_dir() and list((ssh / "a").iterdir()) == []  # theirs stays where the racer put it; ours is gone
+
+
 @pytest.mark.parametrize("raised, status", [(PermissionError(13, "Permission denied"), "error"), ("changed", "refused")])
 def test_a_create_whose_open_fails_after_making_folders_leaves_none_of_them_703(env, monkeypatch, raised, status):
     # #703: an OSError at the open (P3), and the refusal type itself, left the folders made for it
@@ -176,6 +199,7 @@ def test_a_create_whose_open_fails_after_making_folders_leaves_none_of_them_703(
     done = _commit(env, rid)
     assert done["ok"] is False and done["error"] == str(exc), done
     assert pending.get(env["persona"], rid)["status"] == status
+    assert _last_audit_event(env) == {"error": "error", "refused": "commit_refused"}[status]
     assert list(notes.iterdir()) == []
 
 

@@ -88,7 +88,7 @@ def test_a_refused_create_on_windows_removes_the_folders_it_made_703(env, monkey
     monkeypatch.setattr(commit_mod, "_open_final", redirected_open)
     monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: str(landed))
     done = _commit(env, rid)
-    assert done["ok"] is False and done["error"].startswith("refused:"), done
+    assert done["ok"] is False and done["error"] == f"refused: {target} leads to {landed} now", done
     assert pending.get(env["persona"], rid)["status"] == "refused"
     assert _last_audit_event(env) == "commit_refused"
     assert list(notes.iterdir()) == [] and list(other.iterdir()) == []
@@ -140,6 +140,25 @@ def test_the_windows_cleanup_removes_only_folders_it_can_identify_as_its_own_703
         assert b.is_dir() and list(b.iterdir()) == []  # theirs kept (ours, moved, stays: accepted on #703)
     else:
         assert b.is_dir() and a.is_dir()  # no identity, no removal
+
+
+def test_a_handle_at_a_drive_root_still_refuses_cleanly_and_removes_the_folders_703(env, monkeypatch):
+    # A junction to a drive or share root makes the real location shallower than the folders made for the file:
+    # looking for them under it must not raise past the refusal (the record would stay 'committing', with no
+    # refusal recorded and an unhandled error at the approval).
+    from brain.files import commit as commit_mod
+
+    notes, ssh = env["home"] / "Notes", env["home"] / ".ssh"
+    rid = propose_write(path=str(notes / "a" / "b" / "rc"), content="PLANTED", op="create", persona_dir=env["persona"])["id"]
+    real_open_final = commit_mod._open_final
+    monkeypatch.setattr("brain.files.write_guard._is_windows", lambda: True)
+    monkeypatch.setattr(commit_mod, "_open_final", lambda name, op, dir_fd: real_open_final(str(ssh / "rc"), op, dir_fd))
+    monkeypatch.setattr(commit_mod, "_handle_path", lambda fd: str(Path(Path.cwd().anchor) / "rc"))
+    done = _commit(env, rid)
+    assert done["ok"] is False and done["error"].startswith("refused:"), done
+    assert pending.get(env["persona"], rid)["status"] == "refused"
+    assert _last_audit_event(env) == "commit_refused"
+    assert list(notes.iterdir()) == []
 
 
 @pytest.mark.timeout(5)

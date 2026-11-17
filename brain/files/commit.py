@@ -120,21 +120,32 @@ def _remove_made_posix(made: list[_Made], names: list[str], fds: dict[int, int])
     folder's own descriptor, wherever it was moved.
     """
     for m in reversed(made):
-        with contextlib.suppress(OSError):
-            pfd, opened = _parent_descriptor(m.level, names, fds)
-            try:
-                found = False
-                with contextlib.suppress(FileNotFoundError):
-                    found = _is_ours(os.stat(m.name, dir_fd=pfd, follow_symlinks=False), m)
-                if found:
-                    os.rmdir(m.name, dir_fd=pfd)
-                    continue
-            finally:
-                for extra in opened:
-                    os.close(extra)
-            own = fds.get(m.level)
-            if own is not None:
+        found = False
+        with contextlib.suppress(OSError):  # its parent can't be reached by name (moved, gone): search for it instead
+            found = _rmdir_by_name(m, names, fds)
+        own = fds.get(m.level)
+        if not found and own is not None:
+            with contextlib.suppress(OSError):
                 _rmdir_moved(own, m)
+
+
+def _rmdir_by_name(m: _Made, names: list[str], fds: dict[int, int]) -> bool:
+    """True when the entry at the made folder's name, in the parent it was made in, is ours; it is then removed
+    while empty (a non-empty one stays, and is not searched for elsewhere: it is right here)."""
+    pfd, opened = _parent_descriptor(m.level, names, fds)
+    try:
+        try:
+            st = os.stat(m.name, dir_fd=pfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not _is_ours(st, m):
+            return False
+        with contextlib.suppress(OSError):
+            os.rmdir(m.name, dir_fd=pfd)
+        return True
+    finally:
+        for extra in opened:
+            os.close(extra)
 
 
 def _parent_descriptor(level: int, names: list[str], fds: dict[int, int]) -> tuple[int, list[int]]:
@@ -265,7 +276,11 @@ def _remove_made_windows(made: list[_MadeAt], real: str | None) -> None:
     for m in reversed(made):
         if m.ino == 0:
             continue
-        candidates = [m.path] + ([Path(real).parents[m.depth - 1]] if real else [])
+        candidates = [m.path]
+        if real:
+            ancestors = Path(real).parents
+            if m.depth <= len(ancestors) - 1:  # a real location at a drive or share root is shallower: no candidate
+                candidates.append(ancestors[m.depth - 1])
         for candidate in candidates:
             with contextlib.suppress(OSError):
                 st = os.stat(candidate, follow_symlinks=False)
