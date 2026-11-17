@@ -5,7 +5,8 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
 
 * ``emotion_state.json`` (+ ``.bak1``-``.bak3``): the averages, the weights and a 30-day snapshot per emotion, and the
   persona's one switch-over time, ``switch_over_at`` (the only record that the persona was switched over; there is no separate
-  switch file: ``switch_over_state`` reads "switched" off a loaded state). Written with
+  switch file: ``switch_over_state`` reads "switched" off a loaded state), and ``rows_through``, the highest ``memories``
+  rowid the engine has seen (``EngineState.rows_through``; null when none). Written with
   ``write_json(backups=3, indent=None)``. Read through ``json_io.read_json_walk``, the read-only walk with the validator
   below: a read never heals, quarantines, rotates or rewrites anything, and says which copy it loaded. ``read_state`` reads
   fresh objects (what a drain mutates); ``StateCache`` keeps the parsed state for readers by a stat key.
@@ -488,7 +489,8 @@ def validate_state(data: object) -> None:
     emotion that is not an object or lacks `short`, `long` or `last_entry_day`; a non-finite number, a bool, or a negative
     weight in an average; a `last_entry_day` that is not a real day or is later than `active_day`. An average outside 0-10 is
     NOT a rejection (`state_from_json` holds it), and neither is anything wrong with a snapshot or a repeat record (those are
-    dropped one at a time, never the whole state). Every refusal is a ValueError.
+    dropped one at a time, never the whole state), a `queue_line`, or a `rows_through` (both read as their default). Every
+    refusal is a ValueError.
     """
     if not isinstance(data, dict):
         raise ValueError(f"the state must be an object, found {type(data).__name__}")
@@ -635,12 +637,37 @@ def _queue_line_from(data: Mapping, label: str) -> int:
     return 0
 
 
+def _rows_through_from(data: Mapping, label: str) -> int | None:
+    """The stored `rows_through`: a whole number of 0 or more (a bool is not one), else None (never an unreadable state).
+
+    A missing or null key reads as None without a line (a state written before the field existed, or one with no row seen).
+    Any other value is logged (throttled per label and kind of fault; the key never holds the value, the text carries a short,
+    capped form of it) and read as None. `validate_state` never refuses a state for this key.
+    """
+    value = data.get("rows_through")
+    if value is None:
+        return None
+    if type(value) is int and value >= 0:
+        return value
+    found = type(value).__name__
+    count_throttled(
+        logger,
+        f"engine_files:rows_through:{label}:{found}",
+        logging.ERROR,
+        "emotion state %s: rows_through is %s, read as unset (it must be a whole number, 0 or more)",
+        label,
+        _VALUE_REPR.repr(value),
+    )
+    return None
+
+
 def state_from_json(data: dict, *, label: str = "state") -> EngineState:
     """The `EngineState` of a state that passed `validate_state`.
 
     Averages (the state's and the snapshot's) are held to 0-10. A bad snapshot day is dropped as a missing day and a bad
     repeat record is dropped, each with an error log line naming the emotion or the memory; the state stays valid. A missing
-    or unusable `queue_line` reads as 0, with a log line. `label` names the file in those lines.
+    or unusable `queue_line` reads as 0, with a log line; a missing, null or unusable `rows_through` reads as None (a log
+    line for an unusable one). `label` names the file in those lines.
     """
     repeats: dict[str, RepeatEntry] = {}
     for memory_id, record in data.get("repeats", {}).items():
@@ -676,6 +703,7 @@ def state_from_json(data: dict, *, label: str = "state") -> EngineState:
         emotions=emotions,
         queue_line=_queue_line_from(data, label),
         switch_over_at=optional("switch_over_at"),
+        rows_through=_rows_through_from(data, label),
     )
 
 
@@ -720,6 +748,7 @@ def state_to_json(state: EngineState) -> dict:
         "persona_start_at": _optional_iso(state.persona_start_at, "persona_start_at"),
         "switch_over_at": _optional_iso(state.switch_over_at, "switch_over_at"),
         "queue_line": state.queue_line,
+        "rows_through": state.rows_through,
         "repeats": {
             memory_id: {"first_at": _iso(entry.first_at, "first_at"), "count": entry.count}
             for memory_id, entry in state.repeats.items()

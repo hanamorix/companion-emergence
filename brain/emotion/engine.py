@@ -57,6 +57,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NoReturn
@@ -75,6 +76,7 @@ from brain.emotion.engine_utils import (
     feels_high_from,
     fold_event,
     fold_guarded,
+    larger_rowid,
     memory_feelings,
     resolve_emotions,
     shift_for,
@@ -222,6 +224,7 @@ class EmotionEngine:
                 emotions=emotions,
                 modifier=self._modifier(memory, kind),
                 climax=self._stored_climax(memory),
+                rowid=memory.rowid,
             )
         )
 
@@ -240,6 +243,7 @@ class EmotionEngine:
                 memory_id=memory.id,
                 emotions=emotions,
                 modifier=self._modifier(memory, kind),
+                rowid=memory.rowid,
             )
         )
 
@@ -484,15 +488,15 @@ class EmotionEngine:
 
         return modifier_of
 
-    def _fold_events(self, state: EngineState, events: list[Event], now: datetime, skip_ids: frozenset[str]) -> bool:
-        """Fold `events` in time order, each with the days closing first; True when at least one event folded.
+    def _fold_events(self, state: EngineState, events: list[Event], now: datetime, skip_ids: frozenset[str]) -> list[Event]:
+        """Fold `events` in time order, each with the days closing first; the events that folded (empty: none did).
 
         A commit or assigned event of a memory the recovery already counted (`skip_ids`), or already folded in this same
         apply (E6.7: two events for one id in a batch), folds once at most; a showing is never skipped, and a start-only
         event has no memory id, so it is never skipped (its min-fold is idempotent). An event that raises is put back and
         skipped (`fold_guarded`), and the others still fold.
         """
-        applied = False
+        applied: list[Event] = []
         folded_ids: set[str] = set()
         for event in sorted(events, key=lambda e: e.at):
             memory_id = event.memory_id if event.kind in ("commit", "assigned") else None
@@ -504,7 +508,7 @@ class EmotionEngine:
                 fold_event(state, event, now)
 
             if fold_guarded(state, step, f"{event.kind} event at {event.at}", key=f"engine:fold:{self.persona_dir}"):
-                applied = True
+                applied.append(event)
                 if memory_id is not None:
                     folded_ids.add(memory_id)
         return applied
@@ -514,7 +518,9 @@ class EmotionEngine:
 
         Steps (spec 3.1 S4): (2) read the state, recovery first when it came from a backup copy, then (for the drain) read the
         queue by position; (3-5) fold the events in time order with `close_days` before each and once at `now`, prune the
-        change-log files and the repeat list; (6) one `save_state`, with the queue position, when anything was read, folded or
+        change-log files and the repeat list. `rows_through` rises to the highest rowid among the events that folded (an event
+        with no row leaves it; the rowid comes from the original event, because the queue form has none); (6) one `save_state`,
+        with the queue position, when anything was read, folded or
         closed, when a catch-up ran, or (the drain) when the stored position is above 0 over a queue with no lines (a stale
         position, saved as 0); (7) the drain then empties the queue file and saves position 0. A state that exists but cannot be
         read, or a backup whose catch-up failed, is never replaced here: a persona this instance has seen switched over is marked
@@ -599,7 +605,8 @@ class EmotionEngine:
             to_fold = []
             for event in events:
                 try:  # the check every queued line already passed: UTC time, a day `day_of` can convert, a held modifier
-                    to_fold.append(engine_files.event_from_json(engine_files.event_to_json(event)))
+                    # The queue form carries no rowid, so the copy that is folded gets its original's (HR1 of #633).
+                    to_fold.append(replace(engine_files.event_from_json(engine_files.event_to_json(event)), rowid=event.rowid))
                 except (ValueError, OverflowError, OSError, TypeError) as exc:
                     logger.warning("emotion engine: a %s event was dropped (%s: %s)", event.kind, type(exc).__name__, exc)
         applied = self._fold_events(state, to_fold, now, skip_ids)
@@ -620,6 +627,8 @@ class EmotionEngine:
                 self._remember_queue_key()
             return
         state.saved_at = now
+        for event in applied:  # the rows the folded events came from; an event with no row (rowid None) leaves it as it is
+            state.rows_through = larger_rowid(state.rows_through, event.rowid)
         if caught_up:
             state.reset_at = now
         if drain:

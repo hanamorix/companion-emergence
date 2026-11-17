@@ -31,6 +31,7 @@ from brain.emotion.engine_utils import (
     fold_entry,
     fold_event,
     fold_guarded,
+    larger_rowid,
     resolve_emotions,
 )
 from brain.memory.store import Memory, MemoryStore
@@ -204,6 +205,11 @@ def _read_window(persona_dir: Path, since: datetime) -> _Window:
         store.close()
 
 
+def _highest_rowid(rows: Sequence[Memory]) -> int | None:
+    """The highest rowid among `rows` (None when none has one): what a read of the window has seen of `memories`."""
+    return max((m.rowid for m in rows if m.rowid is not None), default=None)
+
+
 def catch_up(
     persona_dir: Path,
     state: EngineState,
@@ -221,7 +227,8 @@ def catch_up(
     OLDEST event among `queued`, all the lines of the queue file, which the drain folds after this once each. The queue
     position is set to 0, so that drain folds every line in the file (a backup's own position can name a line of an older
     queue). Writes nothing itself: the caller stamps `saved_at` and `reset_at` and saves. The returned ids are what the caller
-    tests its commit and assigned events against: those memories are already counted.
+    tests its commit and assigned events against: those memories are already counted. `state.rows_through` rises to the highest
+    rowid among the rows read (never down).
 
     Raises `CatchUpError` when `saved_at` is missing, more than `EMOTION_LONG_HALF_LIFE_D` days before now (a replay cannot
     stand in for a backup that old), or `memories.db` is missing (opening a store on a missing path would create an empty
@@ -257,6 +264,7 @@ def catch_up(
         modifier_of=modifier_of,
     )
     state.queue_line = 0
+    state.rows_through = larger_rowid(state.rows_through, _highest_rowid(window.rows))
     return folded
 
 
@@ -332,7 +340,8 @@ def rebuild(
     the creation stamps of every row of any type, one extra stamp at the access time of each counted row that is opened in the
     window and has no feelings to fold (`replay` folds a row with feelings at its access time; an emotion-less counted row would
     otherwise leave its access day unmarked), and the change-log lines. `persona_start_at` is the earliest of the oldest row of
-    any type, the replay's own and (recovery) the old state's.
+    any type, the replay's own and (recovery) the old state's. `rows_through` is the highest rowid the window read saw (recovery:
+    or the old state's, when that is higher).
 
     The order is fixed. (1) The check (`_check_rebuilt`). (2) The queue step: `empty_queue`, then the new state's `queue_line` is 0;
     if the emptying fails, `queue_line` is the queue's end line, so no line is folded on top of the rebuild. (3) ONE
@@ -364,6 +373,7 @@ def rebuild(
     # change log is only written once the persona is live.
     changes = engine_files.read_changes(persona_dir, after)
 
+    previous: EngineState | None = None
     previous_start: datetime | None = None
     carried_switch: datetime | None = None
     if mode == "recovery":
@@ -427,6 +437,9 @@ def rebuild(
     state.persona_start_at = min(starts, default=None)
     state.saved_at = state.reset_at = now
     state.switch_over_at = now if mode == "first" else carried_switch
+    # The highest rowid the window read saw. A row outside the 30-day window can have a higher rowid (an old-dated import):
+    # it is not read here, so it does not raise `rows_through`.
+    state.rows_through = larger_rowid(None if previous is None else previous.rows_through, _highest_rowid(window.rows))
     _check_rebuilt(state)
 
     # E7.18 (accepted): a change still queued at a rebuild with no change-log line (a failed append, or phase B, which writes no
