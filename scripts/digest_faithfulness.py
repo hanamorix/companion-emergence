@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from collections.abc import Callable
@@ -167,6 +168,19 @@ def haiku_judge() -> Generate:
     return lambda prompt, system: provider.generate(prompt, system=system)
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` readable by its owner only, from the first byte.
+
+    Created with mode 600, and an existing file is set to 600 through the open handle before anything is written,
+    so the private texts never sit in a file with the umask's mode (often 644). Windows has no such modes.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)
+
+
 def main(argv: list[str] | None = None, *, generate: Generate | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--self-test", action="store_true", help="judge the 12 built-in synthetic pairs")
@@ -191,8 +205,7 @@ def main(argv: list[str] | None = None, *, generate: Generate | None = None) -> 
                          "monologue": pair.monologue, "digest": pair.digest})
         if index % 20 == 0:
             print(f"judged {index}/{len(pairs)}", file=sys.stderr, flush=True)
-    args.out.write_text(json.dumps({"log": str(args.log), "verdicts": verdicts}, indent=1), encoding="utf-8")
-    args.out.chmod(0o600)
+    _write_private(args.out, json.dumps({"log": str(args.log), "verdicts": verdicts}, indent=1))
     counts = Counter(v["verdict"] for v in verdicts)
     summary = {"pairs": len(pairs), **{name: counts.get(name, 0) for name in VERDICTS}, "excluded": excluded}
     print(json.dumps(summary))
