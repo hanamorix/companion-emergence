@@ -575,9 +575,8 @@ def test_a_failed_run_step_returns_its_code_releases_the_lock_and_notes_a_start_
     assert _lock_is_free(persona)
 
 
-@pytest.mark.parametrize("origin", ["task-scheduler", "cli"])
-def test_a_run_step_that_raises_notes_a_start_only_when_guarded_and_the_exception_still_propagates(
-    persona: Path, run_calls: _Calls, monkeypatch: pytest.MonkeyPatch, origin: str
+def test_a_guarded_run_whose_step_raises_notes_a_start_and_the_exception_still_propagates(
+    persona: Path, run_calls: _Calls, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An exception (not a returned code) out of the step is a failed start for the back-off too: systemd restarts the run at
     RestartSec=2, and without the noted start its restart limit is the only brake."""
@@ -588,9 +587,23 @@ def test_a_run_step_that_raises_notes_a_start_only_when_guarded_and_the_exceptio
     monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
     monkeypatch.setattr(daemon, "_rebuild_under_lock", unforeseen)
     with pytest.raises(RuntimeError, match="an unforeseen bug in the step"):
-        daemon.cmd_run(_run_args(origin))
-    assert ("note_start" in run_calls.order) is (origin == "task-scheduler")
-    assert "bridge" not in run_calls.order
+        daemon.cmd_run(_run_args("task-scheduler"))
+    assert run_calls.order == ["note_start"]
+    assert _lock_is_free(persona)
+
+
+@pytest.mark.no_base_failure(reason="pins that an app or CLI run (not guarded) notes no start on the exception path; base notes none either")
+def test_an_unguarded_run_whose_step_raises_notes_no_start_and_the_exception_still_propagates(
+    persona: Path, run_calls: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unforeseen(pd: Path) -> int | None:
+        raise RuntimeError("an unforeseen bug in the step")
+
+    monkeypatch.setattr(daemon, "_rebuild_needed", lambda pd, running: True)
+    monkeypatch.setattr(daemon, "_rebuild_under_lock", unforeseen)
+    with pytest.raises(RuntimeError, match="an unforeseen bug in the step"):
+        daemon.cmd_run(_run_args("cli"))
+    assert run_calls.order == []
     assert _lock_is_free(persona)
 
 

@@ -197,6 +197,9 @@ def test_a_record_whose_pid_now_carries_another_token_is_deleted(persona: Path, 
         {"version": 1, "pid": None},
     ],
 )
+@pytest.mark.no_base_failure(
+    reason="the old test of this behaviour (deleted whatever the writer) is renamed because only the dead-writer half survives; base deletes these too"
+)
 def test_an_unreadable_record_or_one_with_no_usable_pid_of_a_dead_writer_is_deleted(persona: Path, content: object) -> None:
     """Decided by the pid in the FILE NAME: a gone pid, so the record is deleted."""
     path = _put(persona, _gone_pid(), content)
@@ -237,6 +240,7 @@ def test_a_record_named_for_this_process_is_left_out_by_its_name_before_it_is_re
     assert asked == [] and own.exists()  # not read, not deleted, not returned as unreadable
 
 
+@pytest.mark.no_base_failure(reason="pins that HQB's 'no usable token' does not make a token-less record unreadable; base returns it as written too")
 def test_a_record_with_no_token_is_a_valid_record_and_is_returned_as_written(persona: Path, live_other: subprocess.Popen) -> None:
     record = engine_files.command_run_record(pid=live_other.pid, pid_token=None, persona="nell")
     _put(persona, live_other.pid, record)
