@@ -421,9 +421,15 @@ class EngineProgress:
 # One record per command process that touches the engine, ``<persona_dir>/command_runs/<pid>.json``, written when the command
 # starts (``register_command_run``) and removed when it exits. A start that must rebuild reads them (``live_command_runs``) and
 # ends each command named there (``kill.kill_command``), because no other mechanism finds a running command. Like the progress
-# record these are outside the engine lock and are not memory: a failed write or delete is logged and the step goes on.
+# record these are outside the engine lock and are not memory: a failed write or delete is logged and the step goes on. A record that
+# cannot be read is never dropped while the pid in its file name may be alive: the reader returns it marked ``UNREADABLE_RUN_KEY``
+# and the start fails naming its path (B58 HQB Q1).
 
 _COMMAND_RUN_FORMAT_VERSION = 1
+
+# The key of an entry ``live_command_runs`` returns for a record it cannot read whose file-name pid may be alive; the entry has
+# the keys ``pid`` (from the file name) and ``path`` and no token.
+UNREADABLE_RUN_KEY = "unreadable"
 
 
 def command_runs_dir(persona_dir: Path) -> Path:
@@ -467,7 +473,7 @@ def register_command_run(persona_dir: Path) -> None:
 
 
 def _read_command_run(path: Path) -> dict[str, Any] | None:
-    """The record as written; None when its content is not a JSON object. An I/O fault raises (the caller keeps the file)."""
+    """The record as written; None when its content is not a JSON object (or the file is gone). An I/O fault raises."""
     return read_json(path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
 
 
@@ -490,58 +496,130 @@ def _remove_own_command_run(persona_dir: Path) -> None:
         )
 
 
-def _is_run_record_name(name: str) -> bool:
+def _run_record_pid(name: str) -> int | None:
+    """The pid a record's file name gives: ``<pid>.json`` with ASCII digits that parse as a number, else None (not a record)."""
     stem, dot, suffix = name.rpartition(".")
-    return dot == "." and suffix == "json" and stem.isascii() and stem.isdigit()
-
-
-def live_command_runs(persona_dir: Path) -> list[dict[str, Any]]:
-    """The run records of the other commands that are alive, in file-name order; this process's own record is left out.
-
-    Only names of the form ``<pid>.json`` are records. A record whose content is not a JSON object, that has no usable pid or
-    whose writer is dead (``holder_alive``) is deleted. A delete that fails is logged and that record skipped; a record that
-    cannot be read because of an I/O fault is logged, skipped and kept (it may name a live command). A folder that cannot be
-    listed is logged and read as no records. Never raises.
-    """
-    persona_dir = Path(persona_dir)
-    folder = command_runs_dir(persona_dir)
+    if dot != "." or suffix != "json" or not stem.isascii() or not stem.isdigit():
+        return None
     try:
-        names = file_ops.list_dir(folder)
-    except OSError as exc:
+        return int(stem)
+    except ValueError:  # more digits than Python converts: not a pid
+        return None
+
+
+def _unreadable_run(pid: int, path: Path) -> dict[str, Any]:
+    """The entry ``live_command_runs`` returns for a record it cannot read whose file-name pid is (or may be) alive."""
+    return {UNREADABLE_RUN_KEY: True, "pid": pid, "path": str(path)}
+
+
+def _may_be_alive(pid: int, token: str | None, path: Path) -> bool:
+    """Is the writer of the record at ``path`` alive (``holder_alive``)? A check that itself fails counts as alive: a record that
+    may name a live command is never dropped."""
+    try:
+        return process_identity.holder_alive(pid, token)
+    except Exception as exc:  # noqa: BLE001 - undecidable means "may be alive"
         warn_throttled(
             logger,
-            f"command-run:list:{persona_dir}",
-            "emotion engine: could not list the command run records in %s (%s: %s); read as none",
-            folder,
+            f"command-run:alive:{path}",
+            "emotion engine: could not tell whether the writer of the command run record %s is alive (%s: %s); read as alive",
+            path,
             type(exc).__name__,
             exc,
             exc_info=False,
         )
-        return []
+        return True
+
+
+def _delete_dead_run(path: Path) -> None:
+    """Delete the record of a dead writer; a delete that fails is logged and the record skipped (it names nothing alive)."""
+    try:
+        file_ops.delete_file(path)
+    except Exception as exc:  # noqa: BLE001 - one record that cannot be deleted must not stop the others
+        warn_throttled(
+            logger,
+            f"command-run:delete:{path}",
+            "emotion engine: could not delete the command run record %s of a command that has ended (%s: %s); skipped",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def live_command_runs(persona_dir: Path) -> list[dict[str, Any]]:
+    """The run records of the other commands that may be alive, in file-name order.
+
+    Only names of the form ``<pid>.json`` are records. A record named for this process's own pid is left out by its name, before
+    it is read, so a command never refuses against its own record. A record that reads as a JSON object with a usable pid is
+    decided by that pid: a dead writer (``holder_alive``) has the record deleted, a live one is returned as written (this process's
+    own identity is left out here too). Any other record, one that cannot be read (an I/O fault, a folder with the name), is not a JSON
+    object, or has no usable pid, is decided by the pid in its FILE NAME: dead, it is deleted; alive, or undecidable, it is kept
+    and returned as ``{UNREADABLE_RUN_KEY: True, "pid", "path"}``, which the caller treats as a command that could not be ended. A
+    read that answers "not a JSON object" for a file that is gone by the time it is checked (``file_ops.stat_path``: its own command
+    removed it at exit) is skipped. A delete that fails is logged and that record skipped.
+
+    Raises ``OSError`` when the folder cannot be listed (a missing folder is no records): the folder may hide a live command, so
+    the caller fails the step naming it. Nothing else raises.
+
+    Accepted edge (P4, B58 HQB Q1): an unreadable record whose pid was reused by an unrelated live process blocks starts until that
+    process exits or the user removes the file the caller's line names.
+
+    Accepted edge (P4, B58 HQB Q2): a person runs one of the six commands by hand inside a shell spawned from another registered
+    command. The step's ``kill.kill_command`` then suspends every descendant of the outer command, the inner command included, so
+    the inner command freezes before it can end anything and both stay stopped until ended by hand. Nothing is lost beyond the
+    in-flight work. No code path of the product starts one of the six from inside another. A walk of the caller's ancestors to
+    leave them out is rejected (P17): new code for a case the product does not create.
+    """
+    persona_dir = Path(persona_dir)
+    folder = command_runs_dir(persona_dir)
+    names = file_ops.list_dir(folder)
+    own_pid = process_identity.own_pid()
     runs: list[dict[str, Any]] = []
     for name in names:
-        if not _is_run_record_name(name):
+        name_pid = _run_record_pid(name)
+        if name_pid is None or name_pid == own_pid:
             continue
         path = folder / name
         try:
             record = _read_command_run(path)
-            if record is None or _pid_of(record) is None or not _writer_alive(record):
-                file_ops.delete_file(path)
-                continue
-        except Exception as exc:  # noqa: BLE001 - one bad record must not stop the others
+        except Exception as exc:  # noqa: BLE001 - an I/O fault: the record may name a live command, so the name pid decides
             warn_throttled(
                 logger,
                 f"command-run:read:{path}",
-                "emotion engine: could not read or delete the command run record %s (%s: %s); skipped",
+                "emotion engine: could not read the command run record %s (%s: %s); decided by the pid in its name",
                 path,
                 type(exc).__name__,
                 exc,
                 exc_info=False,
             )
+            record = None
+        else:
+            if record is None:
+                try:
+                    if file_ops.stat_path(path) is None:
+                        continue  # gone: its own command removed it at exit
+                except Exception as exc:  # noqa: BLE001 - cannot tell if it is gone: the name pid decides
+                    warn_throttled(
+                        logger,
+                        f"command-run:stat:{path}",
+                        "emotion engine: could not look at the command run record %s (%s: %s); decided by the pid in its name",
+                        path,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=False,
+                    )
+        record_pid = _pid_of(record)
+        if record is not None and record_pid is not None:
+            token = record.get("pid_token")
+            if not _may_be_alive(record_pid, token if isinstance(token, str) else None, path):
+                _delete_dead_run(path)
+            elif not process_identity.is_own_identity(record_pid, token):
+                runs.append(record)
             continue
-        if process_identity.is_own_identity(record.get("pid"), record.get("pid_token")):
-            continue
-        runs.append(record)
+        if _may_be_alive(name_pid, None, path):
+            runs.append(_unreadable_run(name_pid, path))
+        else:
+            _delete_dead_run(path)
     return runs
 
 

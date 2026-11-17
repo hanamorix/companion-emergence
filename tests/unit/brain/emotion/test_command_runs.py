@@ -2,9 +2,11 @@
 
 `register_command_run(persona_dir)` writes `<persona_dir>/command_runs/<pid>.json` and removes it at exit with `atexit`, only
 when the record names this process; a failed write is logged and the command goes on. `live_command_runs(persona_dir)` lists the
-records of other live commands: only `<pid>.json` names count, a record that is unreadable, has no usable pid or has a dead
-writer is deleted, this process's own record is left out, a failed delete is logged and that record skipped, and an unlistable
-folder reads as no records. Nothing calls either function in production yet (the caller is a later step). Synthetic personas only.
+records of other commands that may be alive: only `<pid>.json` names count (digits that parse as a pid), a record named for this
+process is left out by its name before it is read, a readable record with a dead writer is deleted, a record that cannot be read
+(an I/O fault, not a JSON object, no usable pid) is decided by the pid in its file name (dead: deleted; alive or undecidable: kept
+and returned marked unreadable with pid and path), a failed delete is logged and that record skipped, and an unlistable folder
+raises (B58 HQB Q1). Nothing calls `register_command_run` in production yet (a later step). Synthetic personas only.
 """
 
 from __future__ import annotations
@@ -195,10 +197,69 @@ def test_a_record_whose_pid_now_carries_another_token_is_deleted(persona: Path, 
         {"version": 1, "pid": None},
     ],
 )
-def test_an_unreadable_record_or_one_with_no_usable_pid_is_deleted(persona: Path, content: object) -> None:
-    path = _put(persona, 4001, content)
+def test_an_unreadable_record_or_one_with_no_usable_pid_of_a_dead_writer_is_deleted(persona: Path, content: object) -> None:
+    """Decided by the pid in the FILE NAME: a gone pid, so the record is deleted."""
+    path = _put(persona, _gone_pid(), content)
     assert engine_files.live_command_runs(persona) == []
     assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "this is not json {",
+        "",
+        "[1, 2, 3]",
+        '"a string"',
+        {"version": 1, "pid_token": "t", "persona": "nell"},
+        {"version": 1, "pid": "123", "pid_token": "t"},
+        {"version": 1, "pid": True, "pid_token": "t"},
+        {"version": 1, "pid": 0, "pid_token": "t"},
+        {"version": 1, "pid": None},
+    ],
+)
+def test_an_unreadable_record_or_one_with_no_usable_pid_whose_file_name_pid_is_alive_is_kept_and_returned_marked_unreadable(
+    persona: Path, live_other: subprocess.Popen, content: object
+) -> None:
+    path = _put(persona, live_other.pid, content)
+    assert engine_files.live_command_runs(persona) == [{engine_files.UNREADABLE_RUN_KEY: True, "pid": live_other.pid, "path": str(path)}]
+    assert path.exists()  # it may name a live command: never deleted
+
+
+def test_a_record_named_for_this_process_is_left_out_by_its_name_before_it_is_read(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own = _put(persona, os.getpid(), "this is not json {")
+    asked: list[Path] = []
+    real = engine_files._read_command_run
+    monkeypatch.setattr(engine_files, "_read_command_run", lambda path: asked.append(path) or real(path))
+    assert engine_files.live_command_runs(persona) == []
+    assert asked == [] and own.exists()  # not read, not deleted, not returned as unreadable
+
+
+def test_a_record_with_no_token_is_a_valid_record_and_is_returned_as_written(persona: Path, live_other: subprocess.Popen) -> None:
+    record = engine_files.command_run_record(pid=live_other.pid, pid_token=None, persona="nell")
+    _put(persona, live_other.pid, record)
+    assert engine_files.live_command_runs(persona) == [record]  # kill_command answers unknown_identity for it (HS3 (c))
+
+
+def test_a_folder_with_a_records_name_is_an_unreadable_record_decided_by_its_name_pid(
+    persona: Path, live_other: subprocess.Popen
+) -> None:
+    folder = engine_files.command_runs_dir(persona) / f"{live_other.pid}.json"
+    folder.mkdir(parents=True)
+    assert engine_files.live_command_runs(persona) == [
+        {engine_files.UNREADABLE_RUN_KEY: True, "pid": live_other.pid, "path": str(folder)}
+    ]
+    assert folder.is_dir()
+
+
+def test_a_name_whose_digits_do_not_parse_as_a_pid_is_ignored() -> None:
+    assert engine_files._run_record_pid("123.json") == 123
+    assert engine_files._run_record_pid(("9" * 5000) + ".json") is None  # more digits than Python converts
+    assert engine_files._run_record_pid("12a.json") is None
+    assert engine_files._run_record_pid("12.json.tmp") is None
+    assert engine_files._run_record_pid("٣.json") is None  # not ASCII digits
 
 
 def test_only_names_of_the_form_pid_dot_json_are_records_and_other_entries_are_left_alone(
@@ -214,16 +275,17 @@ def test_only_names_of_the_form_pid_dot_json_are_records_and_other_entries_are_l
         _put(persona, 0, "garbage", name=".json"),
         _put(persona, 0, "garbage", name="1.2.json"),
     ]
-    (engine_files.command_runs_dir(persona) / "5.json").mkdir()  # a folder with a record's name
-    assert engine_files.live_command_runs(persona) == []
+    folder = engine_files.command_runs_dir(persona) / f"{_gone_pid()}.json"  # a folder with a dead writer's record name
+    folder.mkdir()
+    assert engine_files.live_command_runs(persona) == []  # not deletable as a file: logged and left, naming nothing alive
     assert all(path.exists() for path in kept)
-    assert (engine_files.command_runs_dir(persona) / "5.json").is_dir()
+    assert folder.is_dir()
 
 
 def test_a_failed_delete_is_logged_and_that_record_skipped_without_failing_the_read(
     persona: Path, live_other: subprocess.Popen, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    dead = _put(persona, _gone_pid(), "this is not json {", name="4002.json")
+    dead = _put(persona, _gone_pid(), "this is not json {")
     live = _record_of(live_other, persona)
     _put(persona, live_other.pid, live)
 
@@ -235,10 +297,10 @@ def test_a_failed_delete_is_logged_and_that_record_skipped_without_failing_the_r
         runs = engine_files.live_command_runs(persona)
     assert runs == [live]  # the live record is still returned
     assert dead.exists()
-    assert len(_logged(caplog, "could not read or delete the command run record")) == 1
+    assert len(_logged(caplog, "could not delete the command run record")) == 1
 
 
-def test_a_record_that_cannot_be_read_because_of_an_io_fault_is_skipped_logged_and_kept(
+def test_a_record_that_cannot_be_read_because_of_an_io_fault_is_decided_by_its_name_pid_and_returned_unreadable_when_alive(
     persona: Path, live_other: subprocess.Popen, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = _put(persona, live_other.pid, _record_of(live_other, persona))
@@ -248,13 +310,71 @@ def test_a_record_that_cannot_be_read_because_of_an_io_fault_is_skipped_logged_a
 
     monkeypatch.setattr(engine_files, "read_json", broken)
     with caplog.at_level(logging.WARNING, logger=engine_files.logger.name):
-        assert engine_files.live_command_runs(persona) == []
+        runs = engine_files.live_command_runs(persona)
+    assert runs == [{engine_files.UNREADABLE_RUN_KEY: True, "pid": live_other.pid, "path": str(path)}]
     assert path.exists()  # it may name a live command: never deleted for a read fault
-    assert len(_logged(caplog, "could not read or delete the command run record")) == 1
+    assert len(_logged(caplog, "could not read the command run record")) == 1
 
 
-def test_a_list_dir_error_is_logged_and_read_as_no_records(
-    persona: Path, live_other: subprocess.Popen, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_record_that_cannot_be_read_because_of_an_io_fault_is_deleted_when_its_name_pid_is_dead(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid = _gone_pid()
+    path = _put(persona, pid, engine_files.command_run_record(pid=pid, pid_token=None, persona="nell"))
+
+    def broken(*args: object, **kwargs: object) -> object:
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(engine_files, "read_json", broken)
+    assert engine_files.live_command_runs(persona) == []
+    assert not path.exists()
+
+
+@pytest.mark.no_base_failure(reason="pins the gone-file skip: base reaches the same answer by deleting a file that is not there")
+def test_a_record_that_is_gone_when_it_is_checked_is_skipped_not_returned_as_unreadable(
+    persona: Path, live_other: subprocess.Popen, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _put(persona, live_other.pid, "this is not json {")
+
+    def removed_by_its_own_command(p: Path) -> None:
+        p.unlink()  # the command ended and removed its record between the listing and the read
+        return None
+
+    monkeypatch.setattr(engine_files, "_read_command_run", removed_by_its_own_command)
+    assert engine_files.live_command_runs(persona) == []
+    assert not path.exists()
+
+
+def test_a_record_whose_existence_cannot_be_checked_is_decided_by_its_name_pid(
+    persona: Path, live_other: subprocess.Popen, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _put(persona, live_other.pid, "this is not json {")
+
+    def broken(p: object) -> object:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(file_ops, "stat_path", broken)
+    assert engine_files.live_command_runs(persona) == [{engine_files.UNREADABLE_RUN_KEY: True, "pid": live_other.pid, "path": str(path)}]
+    assert path.exists()
+
+
+def test_a_liveness_check_that_fails_reads_as_alive_and_the_record_is_kept(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _put(persona, 987654, "this is not json {")
+
+    def broken(pid: object, recorded: object) -> bool:
+        raise OverflowError("Python int too large to convert to C int")
+
+    monkeypatch.setattr(process_identity, "holder_alive", broken)
+    with caplog.at_level(logging.WARNING, logger=engine_files.logger.name):
+        assert engine_files.live_command_runs(persona) == [{engine_files.UNREADABLE_RUN_KEY: True, "pid": 987654, "path": str(path)}]
+    assert path.exists()
+    assert len(_logged(caplog, "read as alive")) == 1
+
+
+def test_a_list_dir_error_is_raised_out_of_the_reader_and_nothing_is_deleted(
+    persona: Path, live_other: subprocess.Popen, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _put(persona, live_other.pid, _record_of(live_other, persona))
 
@@ -262,10 +382,9 @@ def test_a_list_dir_error_is_logged_and_read_as_no_records(
         raise PermissionError("no access")
 
     monkeypatch.setattr(file_ops, "list_dir", refuse)
-    with caplog.at_level(logging.WARNING, logger=engine_files.logger.name):
-        assert engine_files.live_command_runs(persona) == []
+    with pytest.raises(PermissionError):
+        engine_files.live_command_runs(persona)
     assert path.exists()
-    assert len(_logged(caplog, "could not list the command run records")) == 1
 
 
 def test_records_come_back_in_file_name_order(persona: Path, live_other: subprocess.Popen) -> None:

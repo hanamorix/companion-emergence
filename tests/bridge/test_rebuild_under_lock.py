@@ -26,6 +26,7 @@ from brain.bridge import daemon, kill, runner, stop_watch
 from brain.bridge.kill import KillResult
 from brain.emotion import engine_files
 from brain.paths import get_log_dir, get_persona_dir
+from brain.utils import file_ops
 from tests.conftest import FakeRebuildChild, RebuildPopenRecorder
 
 STARTED = "Updating your memories. This can take a few minutes."
@@ -438,6 +439,73 @@ def test_a_record_with_no_token_is_not_killed_by_the_real_kill_command_and_stops
         assert daemon._rebuild_under_lock(persona) == 1
         assert other.poll() is None  # still running: nothing was killed without an identity to check
         assert capsys.readouterr().err == _could_not_end(other.pid) + "\n"
+        assert rebuild_spawns.calls == []
+    finally:
+        other.kill()
+        other.wait()
+
+
+def _unreadable_line(pid: int, path: Path) -> str:
+    return (
+        f"The record of another command (process {pid}) is unreadable, so that command was not stopped: {path}. "
+        "Nothing was updated. If it is not running, delete that file and try again."
+    )
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_an_unreadable_record_of_a_live_process_stops_the_step_without_asking_kill_command_and_the_line_gives_its_path(
+    persona: Path,
+    rebuild_spawns: RebuildPopenRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = engine_files.command_run_path(persona, 77)
+    _runs(monkeypatch, [{engine_files.UNREADABLE_RUN_KEY: True, "pid": 77, "path": str(path)}, {"pid": 78, "pid_token": "tok"}])
+    asked = _kills(monkeypatch, {78: KillResult("killed", "command killed", [], True)})
+    with caplog.at_level(logging.WARNING, logger="brain.bridge.daemon"):
+        assert daemon._rebuild_under_lock(persona) == 1
+    assert capsys.readouterr().err == _unreadable_line(77, path) + "\n"
+    assert asked == []  # nothing is asked of kill_command for it, and the next record was never reached
+    assert rebuild_spawns.calls == []
+    assert any(str(path) in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_folder_of_records_that_cannot_be_listed_stops_the_step_with_a_line_naming_the_folder(
+    persona: Path,
+    rebuild_spawns: RebuildPopenRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def refuse(folder: object) -> list[str]:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(file_ops, "list_dir", refuse)
+    folder = engine_files.command_runs_dir(persona)
+    with caplog.at_level(logging.WARNING, logger="brain.bridge.daemon"):
+        assert daemon._rebuild_under_lock(persona) == 1
+    assert capsys.readouterr().err == (
+        f"The commands that may be running could not be checked: the folder {folder} cannot be listed (PermissionError: no access). "
+        "Nothing was updated. Check that folder and try again.\n"
+    )
+    assert rebuild_spawns.calls == []
+    assert any(str(folder) in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_real_unreadable_record_of_a_live_process_stops_the_step_and_the_process_is_untouched(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        path = engine_files.command_run_path(persona, other.pid)
+        path.parent.mkdir(parents=True)
+        path.write_text("this is not json {", encoding="utf-8")
+        assert daemon._rebuild_under_lock(persona) == 1
+        assert other.poll() is None and path.exists()  # nothing killed, the record kept
+        assert capsys.readouterr().err == _unreadable_line(other.pid, path) + "\n"
         assert rebuild_spawns.calls == []
     finally:
         other.kill()

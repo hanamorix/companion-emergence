@@ -384,7 +384,9 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
 
     (1) Every other running command (``engine_files.live_command_runs``) is ended with ``kill.kill_command``, which asks the
     process for its identity first; a command that is not ended (survivors, an identity that could not be confirmed, no token, an
-    exception) ends the step with one plain line naming its pid. This is the one place a start acts on a running command.
+    exception) ends the step with one plain line naming its pid. So does a record that cannot be read while the pid in its file
+    name may be alive (no ``kill_command`` call; the line gives the file) and a folder of records that cannot be listed (the line
+    names the folder): either may hide a live command (B58 HQB Q1). This is the one place a start acts on a running command.
     (2) The rebuild is its own process, ``nell supervisor rebuild``, waited for with no limit (S101: the startup waits until the
     rebuild is finished). It prints the lines below to stderr only when stderr is a terminal; the loop sleeps through
     ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
@@ -409,8 +411,29 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
 
     detach_log = _attach_runtime_log(persona_dir)
     try:
-        for record in engine_files.live_command_runs(persona_dir):
+        try:
+            records = engine_files.live_command_runs(persona_dir)
+        except OSError as exc:
+            folder = engine_files.command_runs_dir(persona_dir)
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning("could not list the command run records in %s (%s); the step ends: a command may be running", folder, reason)
+            _say(
+                f"The commands that may be running could not be checked: the folder {folder} cannot be listed ({reason}). "
+                "Nothing was updated. Check that folder and try again."
+            )
+            return 1
+        for record in records:
             pid, token = record.get("pid"), record.get("pid_token")
+            if record.get(engine_files.UNREADABLE_RUN_KEY):
+                # The record cannot be read and the process named by its file name may be alive: it is a command that was not ended
+                # (nothing is asked of kill_command, which needs a token), and the line gives the file so the user can remove a stale one.
+                path = record.get("path")
+                logger.warning("the run record %s of command %s is unreadable and that process may be alive; the step ends", path, pid)
+                _say(
+                    f"The record of another command (process {pid}) is unreadable, so that command was not stopped: {path}. "
+                    "Nothing was updated. If it is not running, delete that file and try again."
+                )
+                return 1
             try:
                 result = kill.kill_command(pid, token if isinstance(token, str) else None)
                 ended = result.succeeded

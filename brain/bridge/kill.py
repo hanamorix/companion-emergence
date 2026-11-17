@@ -18,9 +18,10 @@ The sequence (plan I5 steps 1-7):
    before the first suspend or kill; then freeze the bridge and its tree, kill the bridge first, then the frozen tree.
 7. Poll "gone" over the bridge and everything remembered for ``timeout``; kill any survivor once more; report.
 
-The ``finally``: while the bridge's kill call has not returned, resume everything suspended, delete the intent
+The ``finally``: while the bridge's kill call has not been started, resume everything suspended, delete the intent
 (only if it still holds this nonce) and withdraw the hard-exit request this call wrote (only if it names this bridge),
-so an interrupted kill leaves nothing that could still end the bridge; after it has returned, kill the frozen and
+so an interrupted kill leaves nothing that could still end the bridge; once it has been started (the flag is set
+immediately before the call, so an interrupt inside the call counts), kill everything frozen, the bridge included, and the
 remembered descendants and keep the committed intent (the respawn guard honours it). Stop signals are ignored while
 the ``finally`` runs.
 
@@ -293,8 +294,9 @@ def _end_tree(
     ``suspended`` and ``remembered`` belong to the caller and are filled in place, so that its ``finally`` sees what was
     frozen even when this call is interrupted; ``_release_tree`` is the one place that resumes or finishes the kill. This
     function never resumes. ``hook`` is called with a step name (``after_bridge_suspend``, ``before_bridge_kill``,
-    ``after_bridge_kill``); ``on_root_killed`` is called once the root's kill call has returned, before the hook
-    ``after_bridge_kill``, and also when the root was already gone at the suspend.
+    ``after_bridge_kill``); ``on_root_killed`` is called immediately before the root's kill call (so a caller interrupted inside
+    that call already reads "root killed" and ``_release_tree`` ends the tree instead of resuming it), before the hook
+    ``after_bridge_kill`` follows the call, and also when the root was already gone at the suspend.
     """
     import psutil
 
@@ -332,8 +334,8 @@ def _end_tree(
                     pass
                 remembered.setdefault(p.pid, p)
         _hook("before_bridge_kill")
+        _root_killed()  # before the call, so an interrupt inside it already reads "root killed" (``_release_tree`` then ends the tree)
         _kill_proc(root)
-        _root_killed()
         _hook("after_bridge_kill")
         for p in suspended[1:]:
             _kill_proc(p)
@@ -356,8 +358,10 @@ def _end_tree(
 
 
 def _release_tree(suspended: list, remembered: dict[int, object], root_killed: bool) -> None:
-    """The one place a frozen tree is let go. The root's kill has not returned: resume everything suspended. It has: finish the
-    kill of the frozen descendants and the remembered ones still alive (the root is ``suspended[0]``)."""
+    """The one place a frozen tree is let go. The root's kill has not been started (``on_root_killed`` has not run): resume
+    everything suspended. It has: finish the kill of everything frozen and the remembered ones still alive. The root is
+    ``suspended[0]`` whenever it was frozen, so it is killed here too: ``_kill_proc`` swallows every exception, so a root already
+    gone is a no-op, and an interrupt before its kill call acted still ends it with its descendants instead of leaving it frozen."""
     if not root_killed:
         for p in suspended:
             try:
@@ -365,7 +369,7 @@ def _release_tree(suspended: list, remembered: dict[int, object], root_killed: b
             except Exception:  # noqa: BLE001
                 pass
         return
-    for p in [*suspended[1:], *remembered.values()]:
+    for p in [*suspended, *remembered.values()]:
         if _alive(p):
             _kill_proc(p)
 
@@ -440,7 +444,7 @@ def kill_bridge(
 
     remembered: dict[int, object] = {}
     suspended: list = []
-    kill_returned = False
+    kill_returned = False  # set by ``_end_tree`` immediately before the bridge's kill call: "the kill was started"
     request_written = False
 
     def _remember(procs) -> None:
@@ -548,8 +552,9 @@ def kill_command(pid: int, token: str | None, *, timeout: float = DEFAULT_TIMEOU
     ``finally`` calls ``_release_tree``. No intent, hard-exit request or service manager is involved: a command has no graceful
     stop to wait for (S107: "whatever is running gets shut down"; S110's no-automatic-hard-kill is about a bridge told to stop).
 
-    Accepted edge (P4): no signal handler is installed here. Ctrl-C raises ``KeyboardInterrupt`` and the ``finally`` resumes or
-    finishes the tree. SIGTERM or SIGHUP end the starting process at once and leave a tree that was already frozen stopped
+    Accepted edge (P4): no signal handler is installed here. Ctrl-C raises ``KeyboardInterrupt`` and the ``finally`` resumes the
+    tree (before the root's kill was started) or finishes it (from then on, an interrupt inside the root's kill call included: the
+    root is killed with its descendants). SIGTERM or SIGHUP end the starting process at once and leave a tree that was already frozen stopped
     until the next start's ``kill_command`` ends it; nothing is lost, the frozen processes only wait. On Windows the end code is 0
     (``_terminate_exit_0``).
 
