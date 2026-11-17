@@ -732,3 +732,160 @@ def test_windows_kill_ends_the_remembered_process_with_exit_code_0(monkeypatch):
 
     kill._kill_proc(_Same())
     assert k32.terminated == [(7, 0)]
+
+
+# --- the shared tree steps and kill_command (HS3 of #633) -----------------------------------------------------------------
+
+
+def _wait_for(condition, seconds: float = 10.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
+
+
+def _root_of(b: FakeBridge):
+    root = psutil.Process(b.pid)
+    return root, {p.pid: p for p in kill._children(root)}
+
+
+def test_end_tree_freezes_and_ends_the_root_and_every_descendant_and_names_no_survivor(tmp_path, fake):
+    b = fake()
+    root, remembered = _root_of(b)
+    suspended: list = []
+    assert kill._end_tree(root, suspended, remembered, 10) == []
+    assert b.all_gone()
+    assert [p.pid for p in suspended][0] == b.pid and {p.pid for p in suspended} == set(b.pids)  # the root first
+
+
+def test_end_tree_with_a_root_gone_before_the_suspend_raises_nothing_and_still_calls_on_root_killed(tmp_path, fake):
+    b = fake()
+    root, remembered = _root_of(b)
+
+    class _GoneAtSuspend:
+        """The root ends between the liveness check and the suspend."""
+
+        def __init__(self, proc):
+            self._proc = proc
+            self.pid = proc.pid
+
+        def suspend(self):
+            self._proc.kill()
+            self._proc.wait(5)
+            raise psutil.NoSuchProcess(self.pid)
+
+        def __getattr__(self, name):
+            return getattr(self._proc, name)
+
+    calls: list[str] = []
+    survivors = kill._end_tree(
+        _GoneAtSuspend(root), [], remembered, 10, hook=calls.append, on_root_killed=lambda: calls.append("root_killed")
+    )
+    assert survivors == []
+    assert calls == ["root_killed"]  # no suspend happened, so no step hooks; the root counts as killed
+    assert _wait_for(b.all_gone)  # the remembered descendants were killed anyway
+
+
+def test_end_tree_calls_on_root_killed_after_the_root_kill_and_before_the_after_bridge_kill_hook(tmp_path, fake):
+    b = fake()
+    root, remembered = _root_of(b)
+    calls: list[str] = []
+    kill._end_tree(root, [], remembered, 10, hook=calls.append, on_root_killed=lambda: calls.append("root_killed"))
+    assert calls == ["after_bridge_suspend", "before_bridge_kill", "root_killed", "after_bridge_kill"]
+
+
+def test_end_tree_kills_a_survivor_once_more_and_names_it(tmp_path, fake, monkeypatch):
+    b = fake()
+    root, remembered = _root_of(b)
+    real = kill._kill_proc
+    refused: list[int] = []
+
+    def stubborn(proc) -> None:
+        if proc.pid == b.grand and len(refused) < 2:  # the two kills before the poll do not take
+            refused.append(proc.pid)
+            return
+        real(proc)
+
+    monkeypatch.setattr(kill, "_kill_proc", stubborn)
+    survivors = kill._end_tree(root, [], remembered, 0.5)
+    assert survivors == [b.grand]
+    assert _wait_for(b.all_gone)  # the second kill, after the poll, did take
+
+
+def test_release_tree_resumes_everything_when_the_root_was_not_killed(tmp_path, fake):
+    b = fake()
+    root, remembered = _root_of(b)
+    suspended = [root, *remembered.values()]
+    for p in suspended:
+        p.suspend()
+    kill._release_tree(suspended, remembered, False)
+    assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())  # running again, nothing killed
+
+
+def test_release_tree_kills_the_frozen_descendants_and_the_remembered_ones_after_the_root_kill(tmp_path, fake):
+    b = fake()
+    root, remembered = _root_of(b)
+    child = psutil.Process(b.child)
+    child.suspend()
+    kill._release_tree([root, child], remembered, True)  # the root is suspended[0], already dealt with by the caller
+    assert _wait_for(lambda: b.statuses()[b.child] in ("gone", psutil.STATUS_ZOMBIE))
+    assert _wait_for(lambda: b.statuses()[b.grand] in ("gone", psutil.STATUS_ZOMBIE))  # remembered, still alive: killed
+    assert b.statuses()[b.pid] not in ("gone", psutil.STATUS_ZOMBIE)  # the root itself is not touched here
+
+
+def test_kill_command_ends_a_running_command_and_its_descendants(tmp_path, fake):
+    b = fake()
+    result = kill.kill_command(b.pid, pi.token_of(b.pid), timeout=10)
+    assert result.outcome == "killed" and result.succeeded and result.survivors == []
+    assert b.all_gone()
+
+
+def test_kill_command_with_no_token_kills_nothing_and_answers_unknown_identity(tmp_path, fake):
+    b = fake()
+    for token in (None, ""):
+        result = kill.kill_command(b.pid, token, timeout=2)
+        assert result.outcome == "unknown_identity" and not result.succeeded
+    assert all(s != "gone" for s in b.statuses().values()) and psutil.Process(b.pid).status() != psutil.STATUS_STOPPED
+
+
+def test_kill_command_with_another_processes_token_kills_nothing(tmp_path, fake):
+    b = fake()
+    result = kill.kill_command(b.pid, f"linux:other:{b.pid}:1", timeout=2)
+    assert result.outcome == "not_running"
+    assert all(s != "gone" for s in b.statuses().values()) and psutil.Process(b.pid).status() != psutil.STATUS_STOPPED
+
+
+def test_kill_command_with_an_unreadable_identity_kills_nothing(tmp_path, fake, monkeypatch):
+    b = fake()
+    monkeypatch.setattr(pi, "token_of", lambda pid: pi.UNKNOWN)
+    result = kill.kill_command(b.pid, "linux:some:1:1", timeout=2)
+    assert result.outcome == "unknown_identity" and not result.succeeded
+    assert all(s != "gone" for s in b.statuses().values())
+
+
+def test_kill_command_for_a_pid_that_is_not_running_is_not_running(tmp_path):
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    done.wait()
+    assert kill.kill_command(done.pid, None).outcome == "not_running"  # the process is looked up before the token is asked
+
+
+def test_kill_command_interrupted_before_the_root_kill_resumes_the_tree_through_release_tree(tmp_path, fake, monkeypatch):
+    b = fake()
+    released: list[bool] = []
+    real_release = kill._release_tree
+
+    def spy(suspended, remembered, root_killed):
+        released.append(root_killed)
+        real_release(suspended, remembered, root_killed)
+
+    def ctrl_c(proc) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(kill, "_release_tree", spy)
+    monkeypatch.setattr(kill, "_kill_proc", ctrl_c)
+    with pytest.raises(KeyboardInterrupt):
+        kill.kill_command(b.pid, pi.token_of(b.pid), timeout=2)
+    assert released == [False]
+    assert all(s not in ("gone", psutil.STATUS_STOPPED) for s in b.statuses().values())  # nothing left frozen or killed

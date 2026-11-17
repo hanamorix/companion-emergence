@@ -24,6 +24,8 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
 * ``<persona_dir>/engine_progress.json`` (NOT under ``state/``, and outside the engine lock): the progress record the x10 fix
   and the first rebuild write while they run, so the app can show the wait (``EngineProgress`` writes it, ``read_engine_progress``
   returns it while its writer is alive; see the section after ``state_lock``).
+* ``<persona_dir>/command_runs/<pid>.json`` (also outside the lock): the run record of each command process that touches the
+  engine, so a start that rebuilds can find and end it (``register_command_run``, ``live_command_runs``).
 
 The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a non-re-entrant ``file_lock`` of the state file that
 waits at most ``dev_constants.EMOTION_LOCK_WAIT_S`` (``file_lock.locked_within``) and raises ``LockTimeoutError`` when the wait
@@ -53,6 +55,7 @@ interval).
 
 from __future__ import annotations
 
+import atexit
 import logging
 import math
 import reprlib
@@ -411,6 +414,135 @@ class EngineProgress:
             record.get("pid"), record.get("pid_token")
         ):
             file_ops.delete_file(progress_path(self._persona_dir))
+
+
+# --- the run records of commands (HS3 of #633) ----------------------------------------------------------------------------------
+#
+# One record per command process that touches the engine, ``<persona_dir>/command_runs/<pid>.json``, written when the command
+# starts (``register_command_run``) and removed when it exits. A start that must rebuild reads them (``live_command_runs``) and
+# ends each command named there (``kill.kill_command``), because no other mechanism finds a running command. Like the progress
+# record these are outside the engine lock and are not memory: a failed write or delete is logged and the step goes on.
+
+_COMMAND_RUN_FORMAT_VERSION = 1
+
+
+def command_runs_dir(persona_dir: Path) -> Path:
+    return Path(persona_dir) / dev_constants.COMMAND_RUNS_DIRNAME
+
+
+def command_run_path(persona_dir: Path, pid: int) -> Path:
+    return command_runs_dir(persona_dir) / f"{pid}.json"
+
+
+def command_run_record(*, pid: int, pid_token: str | None, persona: str) -> dict[str, Any]:
+    """The run record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/command_run.json)."""
+    return {"version": _COMMAND_RUN_FORMAT_VERSION, "pid": pid, "pid_token": pid_token, "persona": persona}
+
+
+def register_command_run(persona_dir: Path) -> None:
+    """Write this process's run record and remove it at exit (``atexit``), only if it still names this process.
+
+    A failed write is logged once and the command goes on unregistered: a start cannot then find it. A process that is killed
+    leaves its record; the next ``live_command_runs`` finds the writer dead and deletes it. ``atexit`` does not run on SIGKILL,
+    and not on a signal that ends the process without Python's own exit (SIGTERM with no handler).
+    """
+    persona_dir = Path(persona_dir)
+    record = command_run_record(
+        pid=process_identity.own_pid(), pid_token=process_identity.own_token(), persona=persona_dir.name
+    )
+    try:
+        write_json(command_run_path(persona_dir, record["pid"]), record, indent=2, sort_keys=True, fsync=False, mode=0o600)
+    except Exception as exc:  # noqa: BLE001 - a run record must never fail the command it describes
+        warn_throttled(
+            logger,
+            f"command-run:write:{persona_dir}",
+            "emotion engine: could not write this command's run record in %s (%s: %s); the command goes on unregistered",
+            persona_dir,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+        return
+    atexit.register(_remove_own_command_run, persona_dir)
+
+
+def _read_command_run(path: Path) -> dict[str, Any] | None:
+    """The record as written; None when its content is not a JSON object. An I/O fault raises (the caller keeps the file)."""
+    return read_json(path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+
+
+def _remove_own_command_run(persona_dir: Path) -> None:
+    """The ``atexit`` step: delete this process's record, and only a record that names this process (pid and token)."""
+    path = command_run_path(persona_dir, process_identity.own_pid())
+    try:
+        record = _read_command_run(path)
+        if isinstance(record, dict) and process_identity.is_own_identity(record.get("pid"), record.get("pid_token")):
+            file_ops.delete_file(path)
+    except Exception as exc:  # noqa: BLE001 - nothing may raise at interpreter exit
+        warn_throttled(
+            logger,
+            f"command-run:remove:{persona_dir}",
+            "emotion engine: could not remove this command's run record in %s (%s: %s)",
+            persona_dir,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def _is_run_record_name(name: str) -> bool:
+    stem, dot, suffix = name.rpartition(".")
+    return dot == "." and suffix == "json" and stem.isascii() and stem.isdigit()
+
+
+def live_command_runs(persona_dir: Path) -> list[dict[str, Any]]:
+    """The run records of the other commands that are alive, in file-name order; this process's own record is left out.
+
+    Only names of the form ``<pid>.json`` are records. A record whose content is not a JSON object, that has no usable pid or
+    whose writer is dead (``holder_alive``) is deleted. A delete that fails is logged and that record skipped; a record that
+    cannot be read because of an I/O fault is logged, skipped and kept (it may name a live command). A folder that cannot be
+    listed is logged and read as no records. Never raises.
+    """
+    persona_dir = Path(persona_dir)
+    folder = command_runs_dir(persona_dir)
+    try:
+        names = file_ops.list_dir(folder)
+    except OSError as exc:
+        warn_throttled(
+            logger,
+            f"command-run:list:{persona_dir}",
+            "emotion engine: could not list the command run records in %s (%s: %s); read as none",
+            folder,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+        return []
+    runs: list[dict[str, Any]] = []
+    for name in names:
+        if not _is_run_record_name(name):
+            continue
+        path = folder / name
+        try:
+            record = _read_command_run(path)
+            if record is None or _pid_of(record) is None or not _writer_alive(record):
+                file_ops.delete_file(path)
+                continue
+        except Exception as exc:  # noqa: BLE001 - one bad record must not stop the others
+            warn_throttled(
+                logger,
+                f"command-run:read:{path}",
+                "emotion engine: could not read or delete the command run record %s (%s: %s); skipped",
+                path,
+                type(exc).__name__,
+                exc,
+                exc_info=False,
+            )
+            continue
+        if process_identity.is_own_identity(record.get("pid"), record.get("pid_token")):
+            continue
+        runs.append(record)
+    return runs
 
 
 def peer_trust(persona_dir: Path, peer_id: str) -> float:

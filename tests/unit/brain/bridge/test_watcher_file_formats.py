@@ -79,6 +79,20 @@ def test_engine_progress_record_matches_the_fixture(tmp_path):
     assert engine_files.read_progress(tmp_path) == _fixture("engine_progress.json")
 
 
+def test_command_run_record_matches_the_fixture(tmp_path, monkeypatch):
+    """HS3: the run record of a command (`<persona>/command_runs/<pid>.json`), as `register_command_run` writes it."""
+    rec = engine_files.command_run_record(pid=4242, pid_token=TOKEN, persona="nell")
+    assert rec == _fixture("command_run.json")
+    assert engine_files.command_run_path(tmp_path, 4242) == tmp_path / "command_runs" / "4242.json"
+    monkeypatch.setattr(process_identity, "own_pid", lambda: 4242)
+    monkeypatch.setattr(process_identity, "own_token", lambda: TOKEN)
+    monkeypatch.setattr(engine_files.atexit, "register", lambda *a, **k: None)  # no exit step left behind for the test run
+    persona = tmp_path / "nell"
+    persona.mkdir()
+    engine_files.register_command_run(persona)
+    assert json.loads((persona / "command_runs" / "4242.json").read_text(encoding="utf-8")) == _fixture("command_run.json")
+
+
 def test_status_has_no_engine_progress_without_a_record(tmp_path, monkeypatch):
     pd = tmp_path / "nell"
     pd.mkdir()
