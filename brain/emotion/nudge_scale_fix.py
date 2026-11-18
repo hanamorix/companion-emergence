@@ -113,7 +113,8 @@ def scale_up_small_feelings(persona_dir: Path) -> int | None:
     # start's child begins. If both find no live record inside the same few milliseconds, both write, the later replacing the
     # earlier. No crash, freeze or data loss, and no kill by the daemon (its readiness wait begins only after the rebuild, and the
     # starter waits for its child with no limit). If the record's writer ends first, the other child shows no record until its next
-    # write; the app's start wait (lib.rs `wait_for_start`) drops the start only after 60 s with none, which ends the start command,
+    # write (once this step ends, `_locked_rebuild` writes one at the top of every pass of its lock wait, HRV of #633, so the gap is
+    # this step's length); the app's start wait (lib.rs `wait_for_start`) drops the start only after 60 s with none, which ends the start command,
     # not the child, and at launch on an unconfirmed overlay a failed start reaches recoverUnhealthyBrain (brainRecovery.ts) and
     # undoes the update. It needs an orphaned child and a new one inside the same milliseconds on the first start after the update
     # that brings Engine 6 (well under 1 in 10,000 starts, not measured); closing it needs a lock around the record

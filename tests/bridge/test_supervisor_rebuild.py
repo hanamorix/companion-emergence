@@ -4,7 +4,7 @@ The subcommand is internal (a later step has the supervisor's start spawn it bef
 progress record (phase "rebuilding") before anything slow, including the import of the bridge stack; sets up the runtime log;
 opens no store and loads no vocabulary itself; and calls `ensure_engine_ready(persona_dir)`, whose failures nothing catches
 (`main()` logs the crash and the process exits 1). The record is removed in a `finally`. Success, S61's skip and a logged
-roll-forward failure all exit 0. The bridge conftest points `KINDLED_HOME` at a tmp home; personas are synthetic.
+roll-forward failure all exit 0. A bridge recorded running is refused first (exit 2, one stderr line, nothing written or run). The bridge conftest points `KINDLED_HOME` at a tmp home; personas are synthetic.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from brain import cli as brain_cli
-from brain.bridge import runner
+from brain.bridge import runner, state_file
 from brain.cli import main
 from brain.emotion import engine, engine_files, engine_rebuild, nudge_scale_fix
 from brain.emotion.engine import EngineStartupError
@@ -218,6 +218,38 @@ def test_a_persona_that_does_not_exist_is_refused_and_nothing_is_made_or_run(
     assert f"persona directory not found: {missing}" in capsys.readouterr().err
     assert not missing.exists()  # no folder was made, so no record and no empty persona
     assert recorder.events == []  # neither the runtime log nor the engine was reached
+
+
+RUNNING_BRIDGE_LINE = "A bridge is running for this persona, so the rebuild was not run."
+
+
+def _tree(root: Path) -> list[tuple[str, int]]:
+    return sorted((str(p.relative_to(root)), p.stat().st_size if p.is_file() else -1) for p in root.rglob("*"))
+
+
+def test_a_hand_run_beside_a_running_bridge_is_refused_with_one_line_and_runs_and_writes_nothing(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Hana's 11-18 review of #633, point 3 (Planning's HRV answer): the bridge's committed-but-unapplied rows would read as a roll-forward."""
+    recorder = _Recorder(persona, monkeypatch)
+    monkeypatch.setattr(state_file, "is_running", lambda persona_dir: True)
+    before = _tree(persona)
+    assert main(ARGV) == 2
+    assert capsys.readouterr().err == RUNNING_BRIDGE_LINE + "\n"
+    assert recorder.events == []  # neither the runtime log nor the engine was reached, and no record was written before the refusal
+    assert _record(persona) is None
+    assert _tree(persona) == before  # nothing was written anywhere under the persona
+
+
+@pytest.mark.no_base_failure(reason="a control: with no bridge recorded running the child runs as it always did, on base too")
+def test_with_no_bridge_running_the_same_hand_run_goes_on_to_the_engine(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    recorder = _Recorder(persona, monkeypatch)
+    monkeypatch.setattr(state_file, "is_running", lambda persona_dir: False)
+    assert main(ARGV) == 0
+    assert [name for name, _ in recorder.events] == ["logging", "ensure"]
+    assert RUNNING_BRIDGE_LINE not in capsys.readouterr().err
 
 
 # --- the real process: the entry point and the exit code ------------------------------------------------------------------

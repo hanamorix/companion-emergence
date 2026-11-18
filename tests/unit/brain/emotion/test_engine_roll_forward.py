@@ -443,6 +443,25 @@ def test_a_lock_that_frees_during_the_wait_lets_the_roll_forward_run(tmp_path: P
     assert waits.steps == 2 and len(spy.calls) == 1
 
 
+def test_a_roll_forward_shows_its_rebuilding_record_while_it_waits_for_the_lock_and_leaves_none_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Planning's HRV answer (Hana's 11-18 point 1): the record is written before each wait step, not only inside the lock hold."""
+    persona = _persona(tmp_path)
+    _new_counted_row(persona)
+    spy = _RebuildSpy(monkeypatch, persona)
+    holder = OtherHolder(persona)
+    seen: list[dict | None] = []
+    WaitLog(monkeypatch, on_step={1: lambda: seen.append(engine_files.read_progress(persona)), 2: holder.release})
+    try:
+        ensure_engine_ready(persona)
+    finally:
+        holder.release()
+    assert len(seen) == 1 and seen[0] is not None and seen[0]["phase"] == "rebuilding"
+    assert len(spy.calls) == 1
+    assert engine_files.read_progress(persona) is None
+
+
 @pytest.mark.no_base_failure(reason="a retention pin: the supervisor job's recovery rebuild keeps its one wait and its failure, as on the base code (it never had a stop check)")
 def test_the_recovery_rebuild_waits_one_step_and_fails_when_the_lock_is_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _persona(tmp_path)
