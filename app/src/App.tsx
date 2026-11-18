@@ -623,7 +623,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           <NoticeBox testId="tunables-notice">{tunablesNoticeMessage(state.tunables_notice)}</NoticeBox>
         )}
         {/* Shown while the persona state carries the notice and refreshed by the poll above. No way to close it: it goes when
-            a later attempt clears the brain's record (the owner's ruling on Hana's 11-18 point 5). */}
+            a later attempt clears the brain's record. */}
         {state?.rebuild_notice && (
           <NoticeBox testId="rebuild-notice">{rebuildNoticeMessage(state.rebuild_notice)}</NoticeBox>
         )}

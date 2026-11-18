@@ -422,7 +422,7 @@ describe("App rebuild notice (HRF)", () => {
     fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice === undefined ? {} : { rebuild_notice: notice }));
     render(<App />);
 
-    await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
+    await screen.findByTestId("chat-panel"); // the ready screen has rendered
     expect(screen.queryByTestId("rebuild-notice")).toBeNull();
   });
 
