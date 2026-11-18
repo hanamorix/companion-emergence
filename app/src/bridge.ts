@@ -209,6 +209,11 @@ export interface PersonaState {
    *  until the user fixes the file (#462). Null/absent when there is nothing to say. Optional so older bridge builds degrade to
    *  no notice. */
   tunables_notice?: TunablesNotice | null;
+  /** The persona's switch-over did not complete and the bridge started anyway on the feelings saved before: the one-line
+   *  `reason`, and `log_path`, the runtime log that holds the full error (null when the brain could not name it). The brain
+   *  keeps it until a later attempt clears the record, so the window shows it while it is non-null and cannot close it.
+   *  Null/absent when there is nothing to say. Optional so older bridge builds degrade to no notice. */
+  rebuild_notice?: RebuildNotice | null;
   /** #456 (Q6): the supervisor's state ("restarted" with its error, or "failed"); absent on older bridges. */
   supervisor?: SupervisorInfo | null;
 }
@@ -219,6 +224,12 @@ export interface TunablesNotice {
   line: number | null;
   column: number | null;
   reason: string | null;
+}
+
+/** See `PersonaState.rebuild_notice`. */
+export interface RebuildNotice {
+  reason: string | null;
+  log_path: string | null;
 }
 
 /** One entry in `PersonaState.background_jobs` (ram-spike-fix INC-11). */
