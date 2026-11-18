@@ -177,6 +177,10 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
     roll-forward check and rebuild, which waits for an engine lock another process holds until it comes (no stop check, no
     limit: S101). Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
     success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
+    Each way the switch-over does not complete (the exit-1 failures and the skips that exit 0) also leaves the rebuild notice
+    (`engine_files.settle_rebuild_notice`) while the persona is not switched over, so the window can say so (Hana's point 5 on #633);
+    a failed roll-forward of a switched persona leaves none. A hand run that completes does not clear it: the next start's or
+    command's need check does.
 
     A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
     `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing. A bridge recorded running

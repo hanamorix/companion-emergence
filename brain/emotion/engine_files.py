@@ -24,6 +24,9 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
 * ``<persona_dir>/engine_progress.json`` (NOT under ``state/``, and outside the engine lock): the progress record the x10 fix
   and the first rebuild write while they run, so the app can show the wait (``EngineProgress`` writes it, ``read_engine_progress``
   returns it while its writer is alive; see the section after ``state_lock``).
+* ``<persona_dir>/rebuild_notice.json`` (also outside the lock): why a switch-over did not complete, while the persona is not
+  switched over, so the window can say so (``settle_rebuild_notice`` writes and clears it, ``read_rebuild_notice`` reads it; see
+  the section after ``EngineProgress``). Unlike the progress record it is not a live writer's: it outlives the process that wrote it.
 * ``<persona_dir>/command_runs/<pid>.json`` (also outside the lock): the run record of each command process that touches the
   engine, so a start that rebuilds can find and end it (``register_command_run``, ``live_command_runs``).
 
@@ -281,7 +284,8 @@ def state_lock(persona_dir: Path) -> AbstractContextManager[None]:
 # each only when it is running: the x10 fix ("rescaling", no count) and the first rebuild ("rebuilding", with a count). The
 # reader returns it only while its writer is alive (``process_identity.holder_alive``): no age test, no heartbeat, so a live writer
 # counts however long a phase between writes takes. It calls ``json_io`` directly (``brain.emotion`` does not import
-# ``brain.bridge``).
+# ``brain.bridge``). It is a LIVE writer's record and says nothing about a step that failed: a switch-over that did not complete
+# is remembered by the rebuild notice (the section after ``EngineProgress``), which outlives its writer.
 
 _PROGRESS_FORMAT_VERSION = 1
 
@@ -437,6 +441,108 @@ class EngineProgress:
             record.get("pid"), record.get("pid_token")
         ):
             file_ops.delete_file(progress_path(self._persona_dir))
+
+
+# --- the rebuild notice: a switch-over that did not complete (Hana's 11-18 review of #633, point 5; owner S112) ---------------------
+#
+# ``rebuild_notice.json`` in the PERSONA directory holds why the persona's switch-over did not complete and the bridge started anyway
+# on the state saved before: ``{"at": <iso_utc>, "reason": <one line>}``. It exists exactly while, after an attempt, the persona is NOT
+# switched over (``switch_over_state(read_state(...)) is True`` is the test; an unreadable state is not switched), so a switched
+# persona whose roll-forward fails never gets one (that failure stays in the runtime log). ``build_persona_state`` reads it into the
+# window's state; the full error is in the runtime log. ONE writer, ``settle_rebuild_notice``, is called by the engine (the failure
+# points inside the rebuild process) and by the start process (``daemon``: a rebuild child that could not be started or ended
+# non-zero, a need check that failed). Not reused: ``shutdown_progress.write_record/read_record`` live in ``brain.bridge``, which the
+# engine may not import, and a daemon-only use would make two writers; ``EngineProgress`` is for a LIVE writer (it refuses another live
+# process's record, removes by pid, is read only while the writer lives), and a failure record must outlive its writer. Also not
+# chosen: a flag derived from ``is_live`` the way ``recovering`` is derived (no file), which cannot say what happened (S112: "saying
+# what happened"; P9b), and the start's stderr line, which the app drops for a start that exits 0. No lock: the
+# write replaces the file atomically, and each writer states a real failure of a not-switched persona, so the last stands.
+
+
+def rebuild_notice_path(persona_dir: Path) -> Path:
+    return Path(persona_dir) / dev_constants.REBUILD_NOTICE_FILENAME
+
+
+def rebuild_notice_record(*, at: str, reason: str) -> dict[str, Any]:
+    """The record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/rebuild_notice.json)."""
+    return {"at": at, "reason": reason}
+
+
+def read_rebuild_notice(persona_dir: Path) -> dict[str, Any] | None:
+    """The notice as written, or None when missing, unreadable as a JSON object, or without a text ``reason``. Never raises."""
+    try:
+        record = read_json(rebuild_notice_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    except Exception:  # noqa: BLE001 - an unreadable display record is "no notice"
+        return None
+    reason = record.get("reason") if isinstance(record, dict) else None
+    return record if isinstance(reason, str) and reason else None
+
+
+def settle_rebuild_notice(persona_dir: Path, reason: str | None, *, since: datetime | None = None) -> None:
+    """Record, keep or clear the rebuild notice after an attempt. The one writer; never raises.
+
+    ``reason`` is why the switch-over did not complete (made one line here), or None for an attempt that completed or a check that
+    found nothing to do. In order:
+    1. No notice file and ``reason`` None: return (the healthy path costs one stat; a stat that raises is logged and read as "a
+       notice exists", and a notice that cannot be read still counts as existing).
+    2. The persona is switched over: delete the notice and return (a switched persona never has one).
+    3. ``reason`` None: return (the persona is not switched, so what the notice says still holds).
+    4. ``since`` given and the notice's ``at`` is not before it: return, that attempt's own, more exact notice stands (the start
+       process passes the time it spawned the rebuild child). A notice with no usable ``at``, or one that cannot be read, is replaced.
+    5. Write the notice, only when the persona folder exists (the writer never creates one).
+
+    A failure of any step is logged by ``warn_throttled`` and the function returns. Accepted edge (P4, HRF red-team G2): a delete that
+    fails (step 2, after the file layer's own retry) leaves a notice on a persona that is now switched over; the window then shows
+    "not brought up to date" until the next start's or command's need check clears it (the reader is a pure read and does not test
+    the state), and the failure is logged. Accepted edge (P4, Hana's point 5): a notice that
+    cannot be written leaves the window showing nothing; the original error is in the runtime log. The notice sits in the persona
+    folder where the bridge's own state file is written, so an unwritable folder mostly stops the bridge too (and the error screen
+    shows); the invisible case needs an incomplete switch-over and only this small write failing, read as well under 1 in 10,000
+    starts (not measured).
+    """
+    stage = "check"
+    try:
+        path = rebuild_notice_path(persona_dir)
+        try:
+            exists = file_ops.stat_path(path) is not None
+        except Exception as exc:  # noqa: BLE001 - read as "a notice exists": the next steps decide
+            _notice_failed(persona_dir, "check", exc)
+            exists = True
+        if not exists and reason is None:
+            return
+        if switch_over_state(read_state(persona_dir)) is True:
+            stage = "delete"
+            file_ops.delete_file(path)
+            return
+        if reason is None:
+            return
+        stage = "read"
+        if since is not None:
+            existing = read_rebuild_notice(persona_dir)
+            at = lenient_utc(existing.get("at")) if existing is not None else None
+            if at is not None and at >= since:
+                return
+        stage = "write"
+        folder = file_ops.stat_path(persona_dir)
+        if folder is None or not folder.is_dir:
+            return
+        record = rebuild_notice_record(at=iso_utc(datetime.now(UTC)), reason=" ".join(str(reason).split()))
+        write_json(path, record, indent=2, sort_keys=True, fsync=False, mode=0o600)
+    except Exception as exc:  # noqa: BLE001 - a display record must never fail the step it describes
+        _notice_failed(persona_dir, stage, exc)
+
+
+def _notice_failed(persona_dir: Path, stage: str, exc: BaseException) -> None:
+    warn_throttled(
+        logger,
+        f"rebuild-notice:{stage}:{persona_dir}",
+        "emotion engine: could not %s the rebuild notice in %s (%s: %s); the window will not show it",
+        stage,
+        persona_dir,
+        type(exc).__name__,
+        exc,
+        exc_info=False,
+    )
 
 
 # --- the run records of commands (HS3 of #633) ----------------------------------------------------------------------------------

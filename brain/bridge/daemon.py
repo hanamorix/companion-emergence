@@ -31,6 +31,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -401,7 +402,10 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     (2) The rebuild is its own process, ``nell supervisor rebuild``, waited for with no limit (S101: the startup waits until the
     rebuild is finished). It prints the lines below to stderr only when stderr is a terminal; the loop sleeps through
     ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
-    from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). Any
+    from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). It
+    also records why in the rebuild notice (``engine_files.settle_rebuild_notice``, Hana's point 5 on #633), which the window shows while
+    the persona is not switched over: the OSError text, or "the update of your memories stopped (exit code N)" unless the child wrote
+    its own, more exact notice; a child that exits 0 clears a notice once the persona is switched over. Any
     BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
 
     The runtime log is attached for the step (``_runtime_log``: transient, only when no persistent handler for the log is
@@ -482,6 +486,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
     # "-P" as _runner_argv has it; the persona by name, from the same home as ours (the environment is inherited).
     argv = [python, "-P", "-m", "brain.cli", "supervisor", "rebuild", "--persona", persona_dir.name]
     show = _stderr_is_terminal()
+    since = datetime.now(UTC)  # the child's own notice (written at a failure inside it) is newer than this and stands
     try:
         child = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
@@ -490,6 +495,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         reason = f"{type(exc).__name__}: {exc}"
         logger.warning("the rebuild child for %s could not be started (%s); going on with the saved state", persona_dir.name, reason)
         _say(f"Updating your memories could not be started ({reason}). Going on with your memories as they were saved.")
+        _settle_rebuild_notice(persona_dir, reason)
         return
     try:
         if show:
@@ -516,6 +522,27 @@ def _run_rebuild_child(persona_dir: Path) -> None:
     if code != 0:
         logger.warning("the rebuild child for %s exited with code %s; going on with the saved state", persona_dir.name, code)
         _say(f"Updating your memories did not finish (exit code {code}). Going on with your memories as they were saved.")
+        # Also a child killed by a signal or for memory, or one that crashed before the engine ran: no notice of its own exists, so
+        # this one tells the window; a notice the child wrote itself (newer than `since`) is more exact and stands.
+        _settle_rebuild_notice(persona_dir, f"the update of your memories stopped (exit code {code})", since=since)
+    else:
+        # A completed child: the persona is switched over, so the writer deletes a notice an earlier attempt left.
+        _settle_rebuild_notice(persona_dir, None, since=since)
+
+
+def _settle_rebuild_notice(persona_dir: Path, reason: str | None, *, since: datetime | None = None) -> None:
+    """Call the one writer of the rebuild notice (`engine_files.settle_rebuild_notice`, Hana's 11-18 point 5 on #633).
+
+    The only reason this is a function and not a direct call: `engine_files` is imported here, at call time, and `_rebuild_needed`'s
+    failure branch runs when the engine stack itself failed to import, where a start must still go on. A failed import is logged
+    and ends the call; the writer itself never raises.
+    """
+    try:
+        from brain.emotion import engine_files
+
+        engine_files.settle_rebuild_notice(persona_dir, reason, since=since)
+    except Exception:  # noqa: BLE001 - a display record never stops a start
+        logger.warning("could not record the rebuild notice for %s", persona_dir.name, exc_info=True)
 
 
 def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
@@ -529,16 +556,20 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
     departs from S107's words in one case, a roll-forward need under a running bridge; the alternative (stop the bridge on it too)
     would stop and restart a healthy bridge, losing its in-flight work, whenever a start is typed over it inside that window.
 
-    A check that raises is logged (type and reason, to the runtime log) and answers False: the start goes on. The bridge stack is
-    imported only in that branch (``_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
+    A check that raises is logged (type and reason, to the runtime log), recorded in the rebuild notice (no child runs, so nothing else
+    would say it; Hana's point 5 on #633), and answers False: the start goes on. A check that answers "no rebuild needed" settles the
+    notice with no reason (``engine_files.settle_rebuild_notice``): a switched persona's old notice is deleted, one stat when there is
+    none; that runs after the try, on the normal path only, so the failure branch never clears. The bridge stack is
+    imported only in the failure branch (``_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
     only when no persistent one is, and always detached again. A log line that cannot be set up is skipped: the answer stays False.
     """
     try:
         from brain.emotion import engine
 
         if not bridge_running:
-            return engine.start_rebuild_needed(persona_dir)
-        return not engine.engine_for(persona_dir).is_live()
+            needed = engine.start_rebuild_needed(persona_dir)
+        else:
+            needed = not engine.engine_for(persona_dir).is_live()
     except Exception as exc:  # noqa: BLE001 - a failed check never stops a start
         with _runtime_log(persona_dir):
             logger.warning(
@@ -547,7 +578,11 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
                 type(exc).__name__,
                 exc,
             )
+        _settle_rebuild_notice(persona_dir, f"{type(exc).__name__}: {exc}")  # case 5: no child runs, so nothing else records it
         return False
+    if not needed:
+        _settle_rebuild_notice(persona_dir, None)  # after the try, so the except above cannot catch it; the normal path only
+    return needed
 
 
 def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001

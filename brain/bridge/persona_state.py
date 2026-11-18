@@ -67,6 +67,10 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
         currently-running gated job/heartbeat names (ram-spike-fix INC-11),
         ordered LONGEST-RUNNING FIRST; [] when none are running
+      - rebuild_notice: {"reason", "log_path"} | None, why the persona's
+        switch-over did not complete and the bridge started on the state
+        saved before, while the persona is not switched over (Hana's point 5
+        on #633); `log_path` is the runtime log holding the error
       - tunables_notice: {"kind", "line", "column", "reason"} | None — a
         tunables.toml that could not be read and was left as it is, until the
         user fixes it (#462)
@@ -117,10 +121,41 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             {"name": name, "running_for_seconds": round(elapsed, 3)}
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
+        # Hana's point 5 on #633: a switch-over that did not complete, persisted in the persona folder (`rebuild_notice.json`) by
+        # whichever process found it, so the window shows it until the persona is switched over: {"reason": <one line>,
+        # "log_path": <the runtime log holding the error>}, else None. A pure read; the notice is cleared by its writer, never here.
+        "rebuild_notice": _build_rebuild_notice(persona_dir),
         # #462: a tunables.toml that could not be read, left as it is and persisted beside the file so EVERY bridge reports
         # it until the user fixes it: {"kind": "unreadable", "line": <int | None>, "column": <int | None>, "reason": <text>}, else None.
         "tunables_notice": tunables.current_notice(),
     }
+
+
+def _build_rebuild_notice(persona_dir: Path) -> dict[str, str | None] | None:
+    """The rebuild notice (`engine_files.read_rebuild_notice`) as `{"reason", "log_path"}`, or None when there is none.
+
+    `log_path` is the runtime log every start-process and engine line about the failure went to (`paths.runtime_log_path`); it is
+    None only if that path cannot be worked out (a failure of the home or log-folder lookup), and the reason is still sent, because a
+    reason without a path says more than nothing (HRF red-team G1). The notice's `at` stays in the file (only the writer reads it).
+    Never raises: a failed read is None, with a warning.
+    """
+    try:
+        from brain.emotion import engine_files
+
+        notice = engine_files.read_rebuild_notice(persona_dir)
+        if notice is None:
+            return None
+        try:
+            from brain import paths
+
+            log_path: str | None = str(paths.runtime_log_path(persona_dir.name))
+        except Exception:  # noqa: BLE001
+            logger.warning("persona_state: runtime log path unavailable for the rebuild notice", exc_info=True)
+            log_path = None
+        return {"reason": notice["reason"], "log_path": log_path}
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: rebuild notice read failed", exc_info=True)
+        return None
 
 
 def _model_rejections() -> list[dict]:

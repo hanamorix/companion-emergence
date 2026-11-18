@@ -359,6 +359,89 @@ def test_any_baseexception_while_the_child_runs_kills_and_waits_for_it_and_propa
     assert _handlers() == before
 
 
+# --- the rebuild notice (Hana's 11-18 review of #633, point 5; owner S112) --------------------------------------------------
+
+
+def _notice(persona: Path) -> str | None:
+    record = engine_files.read_rebuild_notice(persona)
+    return None if record is None else record["reason"]
+
+
+def _plant(persona: Path, at: str, reason: str = "an earlier attempt's") -> None:
+    engine_files.rebuild_notice_path(persona).write_text(json.dumps({"at": at, "reason": reason}), encoding="utf-8")
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_case_6_a_child_that_cannot_be_started_leaves_a_notice_with_the_error(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+    rebuild_spawns.error = FileNotFoundError("no such interpreter")
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "FileNotFoundError: no such interpreter"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_child_that_exits_non_zero_with_no_notice_of_its_own_leaves_one_with_the_exit_code(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder
+) -> None:
+    rebuild_spawns.exit_code = 3
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "the update of your memories stopped (exit code 3)"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_child_that_exits_non_zero_after_writing_its_own_notice_keeps_it(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    rebuild_spawns.running_polls = 1
+    rebuild_spawns.exit_code = 1
+    monkeypatch.setattr(clock, "sleep", lambda dt: engine_files.settle_rebuild_notice(persona, "the first rebuild failed (OSError: its own)"))
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "the first rebuild failed (OSError: its own)"  # the child's, written after the spawn, is more exact
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_notice_older_than_the_spawn_is_replaced_by_a_non_zero_exit(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+    _plant(persona, "2020-01-01T00:00:00Z")
+    rebuild_spawns.exit_code = 9
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "the update of your memories stopped (exit code 9)"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_child_that_completes_clears_the_notice_once_the_persona_is_switched_over(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+    from datetime import UTC, datetime
+
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))  # what the real child's completed switch-over leaves
+    _plant(persona, "2020-01-01T00:00:00Z")
+    assert daemon._rebuild_under_lock(persona) is None
+    assert not engine_files.rebuild_notice_path(persona).exists()
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+@pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base nothing writes or deletes the notice, so it trivially stays")
+def test_a_child_that_exits_zero_on_a_persona_still_not_switched_keeps_the_notice(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+    _plant(persona, "2020-01-01T00:00:00Z")  # an exit-0 skip (S61): the persona stays unswitched, so what the notice says still holds
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "an earlier attempt's"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+@pytest.mark.no_base_failure(reason="a pin of a negative: on base nothing writes the notice, so an interrupted step trivially writes none")
+def test_a_step_interrupted_while_the_child_runs_writes_no_notice(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch, clock: _Clock
+) -> None:
+    rebuild_spawns.running_polls = 5
+
+    def boom(dt: float) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(clock, "sleep", boom)
+    with pytest.raises(KeyboardInterrupt):
+        daemon._rebuild_under_lock(persona)
+    assert not engine_files.rebuild_notice_path(persona).exists()
+
+
 # --- ending the other commands first ---------------------------------------------------------------------------------------
 
 

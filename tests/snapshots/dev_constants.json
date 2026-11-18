@@ -78,6 +78,7 @@
   "PASS2_NOBRIDGE_DRAIN_BUDGET_S": "20.0",
   "RAM_FIT_LARGEST_UNDERESTIMATE": "0.14227",
   "RAM_FIT_SAFETY_FACTOR": "1.1658680470544345",
+  "REBUILD_NOTICE_FILENAME": "'rebuild_notice.json'",
   "RECALL_DIAGNOSTICS_LOG_FILENAME": "'recall_diagnostics.log.jsonl'",
   "RECALL_RESULT_GROUP_ORDER": "('reranked_genuine', 'reranked_family', 'cosine_genuine', 'keyword_genuine', 'cosine_family', 'keyword_family')",
   "RECENT_LIVED_HOURS": "720.0",
