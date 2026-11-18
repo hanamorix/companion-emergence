@@ -4,7 +4,7 @@ A persona rolled back to an older brain after the switch-over and then rolled fo
 saw. At start-up a SWITCHED persona whose state came from the main file and holds `rows_through`, `saved_at` and
 `switch_over_at` is checked: a row above `rows_through` whose `created_at` is after `saved_at` and whose stored feelings count
 means a roll-forward, and the existing locked rebuild runs in its "recovery" mode (30-day window, faded values, the original
-`switch_over_at` carried) with the first rebuild's lock wait, stop handling and progress record. Every database here is a real
+`switch_over_at` carried) with the first rebuild's lock wait (no stop check, no limit) and progress record. Every database here is a real
 `memories.db` in a tmp directory; the rebuild itself is the real one except where a test makes it fail.
 """
 
@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
-from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,6 +26,8 @@ from brain.memory.store import Memory, MemoryStore
 from brain.utils.file_lock import LockTimeoutError
 from tests.unit.brain.emotion._engine_support import (
     NOW,
+    OtherHolder,
+    WaitLog,
     install,
     local_day,
     local_noon,
@@ -141,28 +142,6 @@ class _Logged:
 
     def roll_forward(self) -> list[str]:
         return [line for line in self.lines if "roll-forward" in line]
-
-
-class _OtherHolder:
-    """The engine lock held the way another process's rebuild holds it; a stop check that records every ask."""
-
-    def __init__(self, persona: Path, *, answers: list[bool] | None = None, on_ask: dict[int, Callable[[], None]] | None = None) -> None:
-        self.asks = 0
-        self._answers = list(answers or [])
-        self._on_ask = on_ask or {}
-        self._stack = ExitStack()
-        self._stack.enter_context(engine_files.state_lock(persona))
-
-    def release(self) -> None:
-        self._stack.close()
-
-    def __call__(self) -> bool:
-        self.asks += 1
-        assert self.asks < 50, "the wait loop never ended"  # a bounded fallback: a broken loop fails instead of hanging
-        action = self._on_ask.get(self.asks)
-        if action is not None:
-            action()
-        return self._answers.pop(0) if self._answers else False
 
 
 def _loaded(persona: Path) -> engine_files.LoadedState:
@@ -358,9 +337,9 @@ def test_an_error_of_the_rebuilds_own_work_logs_and_start_up_goes_on_with_the_lo
 
     monkeypatch.setattr(engine_rebuild, "rebuild", failing)
     logged = _Logged(monkeypatch)
-    asked: list[int] = []
-    ensure_engine_ready(persona, stop_requested=lambda: asked.append(1) or True)  # never retried, never waited for
-    assert calls == [1] and asked == []
+    WaitLog(monkeypatch, fail_on_wait=True)  # code that waited for it would loop for ever: the first wait step fails the test
+    ensure_engine_ready(persona)  # never retried, never waited for
+    assert calls == [1]
     (line,) = logged.roll_forward()
     assert "failed" in line and "next start tries again" in line
     assert engine_files.state_path(persona).read_bytes() == before
@@ -426,9 +405,13 @@ def test_the_recheck_under_the_lock_drops_a_row_applied_while_this_start_waited(
         save(persona, later)
         holder.release()
 
-    holder = _OtherHolder(persona, on_ask={1: another_process_applied_it})
-    ensure_engine_ready(persona, stop_requested=holder)
-    assert holder.asks == 1
+    holder = OtherHolder(persona)
+    waits = WaitLog(monkeypatch, on_step={1: another_process_applied_it})
+    try:
+        ensure_engine_ready(persona)
+    finally:
+        holder.release()
+    assert waits.steps == 1
     assert spy.calls == []  # the pre-lock check said yes, the re-check under the lock said no
     assert state_of(persona).rows_through == rowid
 
@@ -444,44 +427,32 @@ def test_a_failing_recheck_read_under_the_lock_logs_and_runs_no_rebuild(tmp_path
     assert len(logged.roll_forward()) == 1
 
 
-# --- the lock wait and the stop --------------------------------------------------------------------------------------
-
-
-def test_a_stop_asked_for_during_the_roll_forward_lock_wait_takes_the_normal_stop_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    persona = _persona(tmp_path)
-    _new_counted_row(persona)
-    spy = _RebuildSpy(monkeypatch, persona)
-    holder = _OtherHolder(persona, answers=[False, True])
-    try:
-        with caplog.at_level(logging.INFO, logger="brain.emotion.engine"), pytest.raises(EngineStartupError) as stopped:
-            ensure_engine_ready(persona, stop_requested=holder)
-    finally:
-        holder.release()
-    assert stopped.value.what == "the engine lock"
-    assert "stopped while waiting for the rebuild" in str(stopped.value)
-    assert holder.asks == 2
-    assert spy.calls == []
-    engine_records = [r for r in caplog.records if r.name == "brain.emotion.engine"]
-    assert not [r for r in engine_records if r.levelno >= logging.ERROR]  # a stop is not a failure
+# --- the lock wait ---------------------------------------------------------------------------------------------------
 
 
 def test_a_lock_that_frees_during_the_wait_lets_the_roll_forward_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _persona(tmp_path)
     _new_counted_row(persona)
     spy = _RebuildSpy(monkeypatch, persona)
-    holder = _OtherHolder(persona, on_ask={2: lambda: holder.release()})
-    ensure_engine_ready(persona, stop_requested=holder)
-    assert holder.asks == 2 and len(spy.calls) == 1
+    holder = OtherHolder(persona)
+    waits = WaitLog(monkeypatch, on_step={2: holder.release})
+    try:
+        ensure_engine_ready(persona)
+    finally:
+        holder.release()
+    assert waits.steps == 2 and len(spy.calls) == 1
 
 
-def test_a_command_line_caller_refuses_after_the_one_wait_when_the_lock_is_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.no_base_failure(reason="a retention pin: the supervisor job's recovery rebuild keeps its one wait and its failure, as on the base code (it never had a stop check)")
+def test_the_recovery_rebuild_waits_one_step_and_fails_when_the_lock_is_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _persona(tmp_path)
-    _new_counted_row(persona)
+    instance = install(persona, NOW)
+    assert isinstance(instance, EmotionEngine) and instance.is_live()
+    lose_the_state(persona)
     spy = _RebuildSpy(monkeypatch, persona)
+    WaitLog(monkeypatch, fail_on_wait=True)  # only the start-up rebuilds keep waiting: a wait step here fails the test
     with engine_files.state_lock(persona), pytest.raises(EngineStartupError) as refused:
-        ensure_engine_ready(persona)  # no stop_requested: the command line's one wait, then the refusal
+        instance.recovery_rebuild()
     assert refused.value.what == "the engine lock"
     assert spy.calls == []
 

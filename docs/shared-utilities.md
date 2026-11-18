@@ -238,11 +238,13 @@ Storage is UTC everywhere; local time is for display only.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `token_of` | brain/process_identity.py:135 | Identity token of a pid that tells a reused pid apart from the original process (per platform), or GONE or UNKNOWN. |
-| `own_pid` | brain/process_identity.py:155 | This process's pid, for code that makes no raw `os` call (engine_files). |
-| `own_token` | brain/process_identity.py:160 | This process's identity token (cached), or None if unreadable. |
-| `holder_alive` | brain/process_identity.py:184 | Is the process recorded in a lock or marker file still alive? Uses the recorded token if present, else pid only; UNKNOWN counts as alive. |
-| `names_this_bridge` | brain/process_identity.py:202 | Does a record's pid and pid_token equal the expected pid and token (a comparison only, no liveness; no token never matches)? The own-record test of the bridge's watcher files and the engine's progress record. |
+| `token_of` | brain/process_identity.py:136 | Identity token of a pid that tells a reused pid apart from the original process (per platform), or GONE or UNKNOWN. |
+| `is_pid_number` | brain/process_identity.py:156 | Can a number be a process id on this platform (a signed C int on POSIX, an unsigned 32-bit value on Windows, above 0)? A pid read from a record or a file name goes through it before any OS pid call, which raises `OverflowError` for a larger one. |
+| `own_pid` | brain/process_identity.py:168 | This process's pid, for code that makes no raw `os` call (engine_files). |
+| `own_token` | brain/process_identity.py:173 | This process's identity token (cached), or None if unreadable. |
+| `holder_alive` | brain/process_identity.py:198 | Is the process recorded in a lock or marker file still alive? Uses the recorded token if present, else pid only; UNKNOWN counts as alive. |
+| `names_this_bridge` | brain/process_identity.py:216 | Does a record's pid and pid_token equal the expected pid and token (a comparison only, no liveness; no token never matches)? The own-record test of the bridge's watcher files. |
+| `is_own_identity` | brain/process_identity.py:228 | Do a pid and a token name this process (own pid, token equal to `own_token()`, two missing tokens equal)? The test a process makes of a record it wrote itself: the engine's progress record removal and `state_file.update`. |
 
 ### `brain/bridge/state_file.py`
 

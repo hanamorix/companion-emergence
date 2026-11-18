@@ -33,6 +33,8 @@ class GuardResult:
     ok: bool
     resolved: Path | None = None
     error: str | None = None
+    # an append's target as the guard judged it (one link): commit must open this exact file (#694)
+    stat: os.stat_result | None = None
 
 
 def _real(p: Path) -> Path | None:
@@ -56,6 +58,14 @@ def _fold(name: str) -> str:
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
 
 
+def _split_at_existing(p: Path) -> tuple[os.stat_result | None, tuple[str, ...]]:
+    """`p` as (identity of its nearest existing ancestor, the names below it that don't exist yet)."""
+    anchor, tail = p, ()
+    while stat_or_none(anchor) is None and anchor != anchor.parent:
+        anchor, tail = anchor.parent, (anchor.name, *tail)
+    return stat_or_none(anchor), tail
+
+
 def _is_within(child: Path, parent: Path) -> bool:
     """Deny-list test: True if child is parent or under it (#607).
 
@@ -71,10 +81,7 @@ def _is_within(child: Path, parent: Path) -> bool:
     c, p = _real(child), _real(parent)
     if c is None or p is None:
         return False
-    anchor, tail = p, ()
-    while stat_or_none(anchor) is None and anchor != anchor.parent:
-        anchor, tail = anchor.parent, (anchor.name, *tail)
-    st = stat_or_none(anchor)
+    st, tail = _split_at_existing(p)
     if st is None:
         return False
     for anc in (c, *c.parents):
@@ -98,19 +105,49 @@ def is_within_authorized(resolved: Path, folder: Path | None) -> bool:
     return c is not None and st is not None and under_any(c, [st])
 
 
-def _denied(resolved: Path, persona_dir: Path) -> bool:
+def _protected(persona_dir: Path) -> list[Path]:
     home = Path.home()
-    for rel in _HOME_DENY:
-        if _is_within(resolved, home / rel):
-            return True
-    for ab in _ABS_DENY:
-        if _is_within(resolved, Path(ab)):
-            return True
-    # her own substrate — never writable through this tool
-    if _is_within(resolved, persona_dir):
-        return True
-    return False
+    # her own substrate is in it too: never writable through this tool
+    return [*(home / rel for rel in _HOME_DENY), *(Path(ab) for ab in _ABS_DENY), persona_dir]
 
+
+def _denied(resolved: Path, persona_dir: Path) -> bool:
+    return any(_is_within(resolved, p) for p in _protected(persona_dir))
+
+
+_DIR_OPEN = (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0)
+_MAX_DEPTH = 4096
+
+
+def _fd_chain(dir_fd: int) -> list[os.stat_result]:
+    """The identities of an open directory and each of its ancestors, walked through
+    ``..`` from the descriptor, so no path is looked up again (#699)."""
+    chain, cur = [], os.dup(dir_fd)
+    try:
+        for _ in range(_MAX_DEPTH):
+            st = os.fstat(cur)
+            chain.append(st)
+            up = os.open("..", _DIR_OPEN, dir_fd=cur)
+            os.close(cur)
+            cur = up
+            if os.path.samestat(os.fstat(cur), st):  # ".." of the root is the root
+                return chain
+        raise OSError(f"directory chain deeper than {_MAX_DEPTH}")
+    finally:
+        os.close(cur)
+
+
+def dir_fd_denied(dir_fd: int, persona_dir: Path) -> bool:
+    """POSIX. True if the open directory `dir_fd`, or any ancestor of it, is a protected
+    location, judged on the descriptor's real ancestry (#699).
+
+    The protected locations are looked up after the chain is walked, so a folder
+    swapped in meanwhile counts. Only existing ones can match: a file the caller
+    creates can't turn a not-yet-existing protected name into this folder.
+    """
+    chain = _fd_chain(dir_fd)
+    protected = [st for st in (stat_or_none(p) for p in _protected(persona_dir)) if st is not None]
+    return any(os.path.samestat(c, st) for c in chain for st in protected)
 
 def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardResult:
     try:
@@ -136,6 +173,17 @@ def check_write_target(raw_path: str, *, op: str, persona_dir: Path) -> GuardRes
     elif op == "append":
         if not resolved.exists() or not resolved.is_file():
             return GuardResult(ok=False, error=f"append target must exist as a file: {resolved}")
+        # #694: a hard link has no path back to the directory it came from, so neither comparison above can
+        # tell ~/Notes/ak from ~/.ssh/authorized_keys. Nothing can say where the other links are: refuse.
+        try:
+            judged = resolved.stat()
+        except OSError as exc:
+            return GuardResult(ok=False, error=f"append target must exist as a file: {resolved} ({exc.strerror})")
+        if judged.st_nlink > 1:
+            return GuardResult(ok=False, error=(
+                f"refused: {resolved} has more than one hard link, so it can't be checked against the protected locations"
+            ))
+        return GuardResult(ok=True, resolved=resolved, stat=judged)
     else:
         return GuardResult(ok=False, error=f"unknown op: {op!r}")
     return GuardResult(ok=True, resolved=resolved)

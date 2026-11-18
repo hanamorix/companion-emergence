@@ -167,6 +167,36 @@ def _supervisor_status_handler(args: argparse.Namespace) -> int:
     return daemon.cmd_status(args)
 
 
+def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor rebuild`: the one-shot rebuild as its own process (S107, HS1 of #633). Internal: the start spawns it.
+
+    In order: (1) the first progress record ("rebuilding") before anything slow, removed in a `finally`, so a waiting start and the
+    window show the child at once; (2) the runtime log, as `cmd_run` sets it up (its bridge-stack import comes after the record);
+    (3) no store and no vocabulary are opened here: `ensure_engine_ready` opens its own and the rebuild reads half-lives from the
+    persona's vocabulary file; (4) `ensure_engine_ready`, which is the x10 step and the first rebuild, or a switched persona's
+    roll-forward check and rebuild, which waits for an engine lock another process holds until it comes (no stop check, no
+    limit: S101). Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
+    success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
+
+    A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
+    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing.
+    """
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"persona directory not found: {persona_dir}", file=sys.stderr)
+        return 1
+    progress = engine_files.EngineProgress(persona_dir, "rebuilding")
+    progress.write()
+    try:
+        from brain.bridge import runner
+
+        runner._setup_runtime_logging(persona_dir)
+        emotion_engine.ensure_engine_ready(persona_dir)
+    finally:
+        progress.remove()
+    return 0
+
+
 def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path) -> None:
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
@@ -1005,18 +1035,22 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
 
 
 def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
-    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6): None to go on, or an exit code to return.
+    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
 
-    Called by the six commands that touch the engine, right after their own vocabulary load. A real run calls
-    `engine.ensure_engine_ready`: a persona's first start does its switch-over there, and a failure raises `EngineStartupError`
-    out of the handler (the crash log gets it). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run no longer rebuilds
+    in-process: it registers the command (`engine_files.register_command_run`, so a start that needs a rebuild can end it) and runs
+    the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a rebuild needed it takes the start lock, ends every
+    other running command and runs the rebuild as its own process (`nell supervisor rebuild`), then goes on. Its code is returned:
+    1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
     not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
     plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
     on a switched persona it goes on as today.
     """
     if not dry_run:
-        emotion_engine.ensure_engine_ready(persona_dir)
-        return None
+        from brain.bridge import daemon
+
+        engine_files.register_command_run(persona_dir)  # through the module: the tests' fixture replaces the name
+        return daemon.run_rebuild_step(persona_dir)
     if emotion_engine.engine_for(persona_dir).is_live():
         return None
     if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is None:
@@ -2224,7 +2258,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
-        _engine_ready_or_refuse(persona_dir, False)  # `nell chat` has no dry run, so this never refuses
+        refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but the rebuild step can still refuse (1 or 2)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)
@@ -2482,6 +2518,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a bridge that appears after the check above is refused, never stopped for a rebuild (S107)
 
         rc = daemon.cmd_start(_StartArgs(), out=readiness_out)
         if rc != 0:
@@ -2494,6 +2531,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a start over a running bridge only fetches its readiness: never stops it for a rebuild (S107)
 
         daemon.cmd_start(_NoOpStartArgs(), out=readiness_out)
 
@@ -3387,6 +3425,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "used by the desktop app",
     )
     s_status.set_defaults(func=_supervisor_status_handler)
+
+    s_rebuild = s_actions.add_parser(
+        "rebuild",
+        help="Internal: run the one-shot emotion rebuild for a persona (the start runs it before the bridge).",
+    )
+    _add_persona_arg(s_rebuild)
+    s_rebuild.set_defaults(func=_supervisor_rebuild_handler)
 
     s_restart = s_actions.add_parser(
         "restart",

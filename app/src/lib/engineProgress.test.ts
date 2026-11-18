@@ -69,13 +69,60 @@ describe("waitForHealth", () => {
     await expect(p).resolves.toBe(false);
   });
 
-  it("a status read that times out keeps the previous reading for that poll", async () => {
+  it("a status read that times out keeps the previous reading for under 30 s after the last real answer, then the wait gives up", async () => {
+    // Real reads at 0, 5 and 10 s (the last real answer is at 10 s); every read from 12 s on times out. The pause holds
+    // while the reading is under 30 s old (the last credited tick is 39.5 s, so the deadline stops at 30 + 39.5 = 69.5 s
+    // and the wait gives up at the tick that lands on it, 69.5 s).
     next = SHOWN;
     const { settled } = startWait();
-    await vi.advanceTimersByTimeAsync(HEALTH_WAIT_MS / 2);
+    await vi.advanceTimersByTimeAsync(12_000);
     next = TIMED_OUT;
-    await vi.advanceTimersByTimeAsync(HEALTH_WAIT_MS * 2);
-    expect(settled).not.toHaveBeenCalled(); // shown stays shown
+    await vi.advanceTimersByTimeAsync(27_000); // 39 s
+    expect(settled).not.toHaveBeenCalled(); // under 30 s after the last real answer: still paused
+    await vi.advanceTimersByTimeAsync(21_000); // 60 s
+    expect(settled).not.toHaveBeenCalled(); // the deadline has stopped moving, what is left of its limit is not yet used up
+    await vi.advanceTimersByTimeAsync(15_000); // 75 s
+    expect(settled).toHaveBeenCalledWith(false);
+  });
+
+  it("a real reading that takes 4 s ages from its answer, and later timed-out reads do not move it", async () => {
+    // The first read is asked at 0 s and answers at 4 s with a record; every later read times out at once. The age runs
+    // from 4 s: the last credited tick is 33.5 s, the deadline stops at 63.5 s. Aged from the read's start (0 s) the wait
+    // would give up at about 60 s; if a timed-out read moved the age it would never give up.
+    let calls = 0;
+    status.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await sleep(4000);
+        return SHOWN as never;
+      }
+      return TIMED_OUT as never;
+    });
+    const { settled } = startWait();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(calls).toBeGreaterThan(5); // later reads did happen and timed out
+    expect(settled).not.toHaveBeenCalled(); // not aged from the read's start
+    await vi.advanceTimersByTimeAsync(4000); // 65 s
+    expect(settled).toHaveBeenCalledWith(false); // and not kept alive by the timed-out reads
+  });
+
+  it("a fresh real reading restores a lapsed pause", async () => {
+    // Real to 12 s, timed out from 12 s: the pause lapses at the 40 s tick and the deadline stops at 69.5 s. A record is
+    // read again at 55 s (set at 54 s) while the wait is still alive; reads time out again from 57 s. The last real answer
+    // is then 55 s, the credit runs to 84.5 s and the wait gives up at 99.5 s (without the restore, at 69.5 s).
+    next = SHOWN;
+    const { settled } = startWait();
+    await vi.advanceTimersByTimeAsync(12_000);
+    next = TIMED_OUT;
+    await vi.advanceTimersByTimeAsync(42_000); // 54 s
+    expect(settled).not.toHaveBeenCalled();
+    next = SHOWN;
+    await vi.advanceTimersByTimeAsync(3000); // 57 s: the read at 55 s was real
+    next = TIMED_OUT;
+    await vi.advanceTimersByTimeAsync(33_000); // 90 s
+    expect(settled).not.toHaveBeenCalled(); // the restored pause is still holding past the 70 s of the lapsed one
+    await vi.advanceTimersByTimeAsync(15_000); // 105 s
+    expect(settled).toHaveBeenCalledWith(false);
   });
 
   it("a timed-out read after an absent one stays absent: the wait still ends at its budget", async () => {
