@@ -628,6 +628,16 @@ def run_rebuild_step(persona_dir: Path) -> int | None:
     blocking acquire would also wait for a bridge's whole life, because the runner holds this lock from before its state file
     shows it). With the lock held it asks the need again (HQD (4), as ``cmd_start`` and ``cmd_run`` do) and runs
     ``_rebuild_under_lock`` only if it still stands; it releases the lock and starts no bridge.
+
+    Accepted edge (P4, Hana's 11-18 point 4 on #633; trio 3-0; also a commit-log note): in the gap between ``cmd_start`` releasing
+    the lock (the comment there) and the new runner taking it, no bridge is recorded and the lock is free, so a command that still
+    needs the rebuild (an earlier one failed or was skipped) takes the lock, ends the other commands and runs a rebuild child. On
+    the ``spawn_detached`` path the runner then loses the lock, returns 2 and the start reports a failed bridge; at app launch on an
+    unconfirmed overlay that failed start reaches the undo (``recoverUnhealthyBrain``), a visible reversal the user can redo; no data
+    is lost. A service-managed start waits on ``cmd_run``'s blocking lock and does not fail. Accepted because it needs a failed or
+    skipped earlier rebuild and one of the six commands inside a gap the width of a process start (not measured; far below 1 in
+    10,000 starts; the product does not fire a command at a start), and the only fix, skipping here while the rebuild notice stands,
+    would stop every command retrying (S111, HSR item 4).
     """
     if state_file.is_running(persona_dir):
         return None
@@ -761,7 +771,21 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
         _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
     finally:
-        release_lock(persona_dir, fd)  # hand the lock to the child runner on the normal path
+        # Hand the lock to the child runner on the normal path. Accepted edge (P4, Hana's 11-18 point 4 on #633; trio 3-0): between
+        # this release and the runner's non-blocking take (`runner.main`) nothing records that a start is under way (no "starting"
+        # phase in bridge.json, no file), so one of the six commands (`run_rebuild_step`) that still needs the rebuild, after one that
+        # failed or was skipped, finds no bridge and a free lock, takes it and runs a rebuild child. On the `spawn_detached` path the
+        # runner then loses the lock and returns 2, the readiness wait reports a failed bridge, and at app launch on an unconfirmed
+        # overlay that failed start reaches the undo (`recoverUnhealthyBrain`): a visible reversal the user can redo; no data is
+        # lost (the child runs under the engine lock). The service path (`_start_service`) waits on `cmd_run`'s blocking lock and
+        # does not fail. Why it is accepted: it needs an earlier failed or skipped rebuild AND one of the six commands inside a
+        # gap the width of a process start (not measured; far below 1 in 10,000 starts). A persona whose rebuild keeps failing has
+        # the gap at every start, so the rarity rests on the product never firing one of the six commands at a start (they are typed
+        # or run by the user's own scheduler); the only fix, reading the rebuild notice in `run_rebuild_step`, would stop every
+        # command retrying while it stands (departing from HSR item 4, S111), and holding the lock across the spawn is ruled out
+        # by the comment above (the runner could not take it). The same gap already exists for a second `cmd_start`
+        # (`_rotate_bridge_log`).
+        release_lock(persona_dir, fd)
     # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
     # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
     if _service_installed(args.persona):
