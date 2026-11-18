@@ -8,8 +8,9 @@
  *
  * One reader serves every wait here. It asks `bridgeStatus` at most once per STATUS_POLL_MS (not on the 500 ms health
  * loop), uses that one reading for the deadline, and hands it to an optional `onProgress` callback for the display.
- * A status read that timed out (`alive: "unknown"`, or no status at all) keeps the previous reading for that poll; a
- * status without the field counts as absent. Time before the record appears counts against the budget.
+ * A status read that timed out (`alive: "unknown"`, or no status at all) keeps the previous reading on screen, and keeps
+ * the pause for less than the wait's own budget after the last real answer arrived; then the budget runs again with what
+ * is left of it. A status without the field counts as absent. Time before the record appears counts against the budget.
  *
  * Imports only `bridgeStatus` (and a type) from `../bridge`, so appConfig.ts and useRestartBridge.ts can both import it
  * without a cycle.
@@ -23,8 +24,12 @@ import { HEALTH_POLL_INTERVAL_MS, STATUS_POLL_MS } from "./requestTimeout";
 export type EngineProgressCallback = (reading: EngineProgress | null) => void;
 
 interface Reader {
-  /** The latest reading (the previous one after a timed-out read). */
+  /** The latest reading (the previous one after a timed-out read, which the display keeps showing). */
   reading: EngineProgress | null;
+  /** True while the latest read was a real answer (not timed out). */
+  real: boolean;
+  /** When the last real answer ARRIVED (not when its read started); never moved by a timed-out read. */
+  lastRealAt: number;
   /** True once STATUS_POLL_MS has passed since the last read started. */
   due(): boolean;
   /** Asks for the status and passes the reading to the callback (not after `stop`). */
@@ -38,13 +43,22 @@ function statusReader(persona: string, onProgress: EngineProgressCallback | unde
   let stopped = false;
   const reader: Reader = {
     reading: null,
+    real: false,
+    lastRealAt: Number.NEGATIVE_INFINITY,
     due: () => Date.now() - lastReadAt >= STATUS_POLL_MS,
     async read() {
       lastReadAt = Date.now();
       const status = await bridgeStatus(persona);
       if (stopped) return;
-      // `alive: "unknown"` is a read that timed out or failed; a missing status is the same. Either keeps the reading.
-      if (status && status.alive !== "unknown") reader.reading = status.engine_progress ?? null;
+      // `alive: "unknown"` is a read that timed out or failed; a missing status is the same. Either keeps the reading
+      // on screen, but it is not a new answer: `lastRealAt` is the time of the last real one, taken now that it came back.
+      if (status && status.alive !== "unknown") {
+        reader.reading = status.engine_progress ?? null;
+        reader.real = true;
+        reader.lastRealAt = Date.now();
+      } else {
+        reader.real = false;
+      }
       onProgress?.(reader.reading);
     },
     stop() {
@@ -56,8 +70,9 @@ function statusReader(persona: string, onProgress: EngineProgressCallback | unde
 
 /**
  * Wait for `probe` (a /health request) to succeed, trying every HEALTH_POLL_INTERVAL_MS. True when it does; false once
- * `budgetMs` has passed with no engine progress showing. While a reading shows progress the deadline moves out by the
- * time that passes, so the wait ends only after the record is gone and the budget has run out. The first status read
+ * `budgetMs` has passed with no engine progress showing. While a real reading shows progress (or a timed-out read keeps
+ * one for less than `budgetMs` after the last real answer) the deadline moves out by the time that passes, so the wait
+ * ends only after the record is gone or the readings stopped arriving, and the budget has run out. The first status read
  * comes with the first failed probe (a start that answers at once reads nothing); before giving up it reads once more,
  * so a record that appeared since the last read is seen.
  */
@@ -87,7 +102,12 @@ export async function waitForHealth(
       await reader.read();
       now = Date.now();
     }
-    if (reader.reading !== null) deadline += now - lastTickAt;
+    // Pause while the reading is a real one, or was kept from a timed-out read for less than this wait's own budget after
+    // the last real answer arrived; past that the deadline stops moving and the give-up clock runs with what is left of it.
+    // Accepted edge (P4, S109): a real rebuild whose status reads time out for over 30 s can end the wait early. Owner:
+    // "most status displays I've seen just keep the last reading until the next one is available or the thing crashes. so
+    // go with the 30 seconds option." The display still shows the last reading.
+    if (reader.reading !== null && (reader.real || now - reader.lastRealAt < budgetMs)) deadline += now - lastTickAt;
     lastTickAt = now;
     if (now >= deadline) return false;
     await new Promise<void>((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS));
