@@ -72,7 +72,7 @@ describe("waitForHealth", () => {
   it("a status read that times out keeps the previous reading for under 30 s after the last real answer, then the wait gives up", async () => {
     // Real reads at 0, 5 and 10 s (the last real answer is at 10 s); every read from 12 s on times out. The pause holds
     // while the reading is under 30 s old (the last credited tick is 39.5 s, so the deadline stops at 30 + 39.5 = 69.5 s
-    // and the wait gives up at the 70 s tick).
+    // and the wait gives up at the tick that lands on it, 69.5 s).
     next = SHOWN;
     const { settled } = startWait();
     await vi.advanceTimersByTimeAsync(12_000);
@@ -109,7 +109,7 @@ describe("waitForHealth", () => {
   it("a fresh real reading restores a lapsed pause", async () => {
     // Real to 12 s, timed out from 12 s: the pause lapses at the 40 s tick and the deadline stops at 69.5 s. A record is
     // read again at 55 s (set at 54 s) while the wait is still alive; reads time out again from 57 s. The last real answer
-    // is then 55 s, the credit runs to 84.5 s and the wait gives up at the 100 s tick (without the restore, at about 70 s).
+    // is then 55 s, the credit runs to 84.5 s and the wait gives up at 99.5 s (without the restore, at 69.5 s).
     next = SHOWN;
     const { settled } = startWait();
     await vi.advanceTimersByTimeAsync(12_000);
