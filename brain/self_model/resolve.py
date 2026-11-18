@@ -39,6 +39,8 @@ from pathlib import Path
 
 from brain.health.json_io import read_json, write_json
 from brain.self_model.gap import Gap
+from brain.utils.file_lock import LockTimeoutError, locked_within
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -79,18 +81,33 @@ def _save_audit(persona_dir: Path, audit: dict) -> None:
     write_json(_audit_path(persona_dir), audit, indent=None, fsync=False, on_error="log")
 
 
+def _increment(persona_dir: Path, key: str) -> None:
+    """Add one to `key` under the counter file's own lock (#736): the cadence tick and the reconcile tool both bump
+    it, and without the lock an increment read before the other's save is lost.
+
+    The lock is the file's own sidecar, not the self-model state's, so the reconcile tool (which holds the state lock
+    here) never nests one lock path inside itself. The wait is bounded like the state's (``SELF_MODEL_LOCK_WAIT_S``):
+    a counter must never hang a chat turn, so a lock that does not come drops this one count, with a throttled warning.
+    """
+    from brain import dev_constants
+
+    try:
+        with locked_within(_audit_path(persona_dir), dev_constants.SELF_MODEL_LOCK_WAIT_S):
+            audit = load_audit(persona_dir)
+            audit[key] = audit[key] + 1
+            _save_audit(persona_dir, audit)
+    except LockTimeoutError as exc:
+        warn_throttled(logger, f"self-model-audit:lock:{persona_dir}", "self_model audit: %s; %s not counted", exc, key)
+
+
 def increment_gaps_surfaced(persona_dir: Path) -> None:
     """Increment the gaps_surfaced counter.  Called by the cadence tick."""
-    audit = load_audit(persona_dir)
-    audit["gaps_surfaced"] = audit["gaps_surfaced"] + 1
-    _save_audit(persona_dir, audit)
+    _increment(persona_dir, "gaps_surfaced")
 
 
 def increment_reconciles(persona_dir: Path) -> None:
     """Increment the reconciles_called counter.  Called by reconcile_self_read."""
-    audit = load_audit(persona_dir)
-    audit["reconciles_called"] = audit["reconciles_called"] + 1
-    _save_audit(persona_dir, audit)
+    _increment(persona_dir, "reconciles_called")
 
 
 # ---------------------------------------------------------------------------
