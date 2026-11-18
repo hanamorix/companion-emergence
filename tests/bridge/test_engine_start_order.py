@@ -236,6 +236,7 @@ def _supervisor_spawns(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return ran
 
 
+@pytest.mark.no_base_failure(reason="pins that the bridge lifespan does not switch over; main's lifespan never did, so it passes there by design")
 def test_lifespan_runs_the_start_up_drain_after_the_vocabulary_load_and_no_switch_over(
     persona_dir: Path, emotion_engine_stub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -251,6 +252,7 @@ def test_lifespan_runs_the_start_up_drain_after_the_vocabulary_load_and_no_switc
     assert order == ["vocabulary", "drain"]  # the bridge no longer calls ensure (S107: the starter's rebuild process does)
 
 
+@pytest.mark.no_base_failure(reason="pins that the bridge lifespan does not switch over; main's lifespan never did, so it passes there by design")
 def test_a_bridge_on_a_persona_that_is_not_switched_starts_and_does_not_switch_it_over(
     persona_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
