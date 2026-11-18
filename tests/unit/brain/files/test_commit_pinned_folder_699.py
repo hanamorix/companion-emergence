@@ -314,10 +314,12 @@ def test_a_refused_create_under_a_folder_you_can_enter_but_not_list_leaves_no_fo
     assert list(notes.iterdir()) == []
 
 
-def _open_fds() -> int:
+def _open_fds() -> set[int]:
+    # The numbers, not a count: other code in the worker (an earlier test's object collected, a log handler) can close a
+    # descriptor while the test runs, which a count reads as a negative leak. A leak is a number open now that was not before.
     import os
 
-    return len(os.listdir("/dev/fd"))
+    return {int(n) for n in os.listdir("/dev/fd")}
 
 
 @pytest.mark.no_base_failure(reason="#703 holds descriptors for the cleanup; the base holds none past the call. Shown able to fail with one close dropped")
@@ -334,7 +336,7 @@ def test_the_cleanup_leaks_no_descriptor_and_a_deep_create_still_succeeds_703(en
         for i in range(200):
             with pytest.raises(commit_mod._TargetChangedError):
                 commit_mod._open_pinned(notes / f"a{i}" / "b" / "rc", "create", env["persona"])
-        assert _open_fds() == before
+        assert _open_fds() - before == set()
         assert list(notes.iterdir()) == []
     else:
         import resource
