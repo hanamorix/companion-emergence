@@ -107,6 +107,17 @@ describe("launchBrain (#335)", () => {
     expect(restartModule.endEngineProgress).toHaveBeenCalledTimes(1);
   });
 
+  it("(HN7) the launch ends the display with the start's real outcome: true when it came up, false when it threw", async () => {
+    status(NONE);
+    expect((await launchBrain(P)).kind).toBe("ready");
+    expect(vi.mocked(restartModule.endEngineProgress).mock.calls).toEqual([[true]]);
+    vi.mocked(restartModule.endEngineProgress).mockClear();
+    status(NONE);
+    starts(false);
+    await launchBrain(P);
+    expect(vi.mocked(restartModule.endEngineProgress).mock.calls).toEqual([[false]]);
+  });
+
   it("(HR5) the recovery's own starts have no screen to show progress on and pass no callback", async () => {
     status({ active_commit: NEW, confirmed: false, undo: "rollback" }, { active_commit: OLD, confirmed: true, undo: "revert" });
     rollsBackTo(OLD);

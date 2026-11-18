@@ -15,12 +15,14 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
 
 from brain.bridge import shutdown_progress, state_file
+from tests.unit.brain.emotion._engine_support import make_live
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and flock; Windows legs run in CI")
 
@@ -281,7 +283,10 @@ def test_watcher_files_are_deleted_only_by_the_lock_holder(tmp_path, bridges):
 def test_a_waiting_cmd_run_keeps_its_fresh_record(tmp_path, bridges):
     """C42 (a, b): the old bridge writes nothing after it releases the lock, so a `nell supervisor run` waiting for the
     lock keeps the record it writes when it takes over."""
-    b = Bridge(tmp_path, tasks=1)
+    # The waiting `cmd_run` child checks whether the persona needs the rebuild step once it holds the lock (S107); a switched persona
+    # needs none, so no rebuild child is spawned (the conftest fixture that stops that does not reach a child). Switched before the
+    # first bridge starts, so nothing else writes its state meanwhile.
+    b = Bridge(tmp_path, tasks=1, prepare=lambda pd: make_live(pd, datetime(2030, 1, 1, tzinfo=UTC)))
     bridges.append(b)
     env = dict(os.environ, KINDLED_HOME=str(b.home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
     waiter_err = tmp_path / "waiter-stderr.txt"

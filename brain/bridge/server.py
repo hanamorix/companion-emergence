@@ -1422,19 +1422,14 @@ def build_app(
         finally:
             _vocab_store.close()
 
-        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648), right before the
-        # engine's first rebuild so that rebuild already uses the swapped half-lives. Fail-soft: it logs and never raises.
+        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648). A start that needs a
+        # rebuild has already run it in the rebuild child (`_supervisor_rebuild_handler`), right before that rebuild; this call covers
+        # a start that needs none and a bridge started around the supervisor. The marker makes the second run a no-op. Fail-soft: it
+        # logs and never raises.
         vocabulary_swap.run_vocabulary_swap_648(persona_dir)
 
-        # The emotion engine's switch-over (Engine 6, spec 3.1 S6): a persona's first start does its x10 fix and first rebuild
-        # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so
-        # start-up stops before the supervisor thread is spawned (an emotion state that exists but cannot be read is not a
-        # failure: `ensure` decides from the database's x10 record, rebuilds the state and replaces the unreadable one; only
-        # when `memories.db` cannot be read either does it skip this start and log why). An engine lock held by another
-        # process's rebuild is waited for, not a failure (Hana's #633 review point 5, owner S101): `stop_requested` ends the
-        # wait when the bridge is asked to stop, and the `EngineStartupError` that raises is then a stop, not a crash (the
-        # signal is already noted, so `runner._after_run` takes its normal stop path).
-        emotion_engine.ensure_engine_ready(persona_dir, stop_requested=lambda: controller.requested)
+        # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
+        # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.
 
         # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
         # own failures and never raises.

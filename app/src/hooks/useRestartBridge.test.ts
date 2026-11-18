@@ -1041,8 +1041,22 @@ describe("useRestartBridge: the start-up progress on the screens (HR5 part 5)", 
     act(() => {
       joined = restartBridge(PERSONA); // a restart asked for while a launch holds the start joins it
     });
-    act(() => endEngineProgress());
+    act(() => endEngineProgress(true)); // the start succeeded
     await expect(joined).resolves.toBe(true);
+    expect(restartInFlight()).toBe(false);
+    expect(result.current.state).toBe("idle");
+    expect(result.current.progress).toBeNull();
+  });
+
+  it("(HN7) a restart that joined the launch's hold is told the start's real outcome: false when the start failed", async () => {
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => showEngineProgress(REC));
+    let joined: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      joined = restartBridge(PERSONA);
+    });
+    act(() => endEngineProgress(false)); // the start threw
+    await expect(joined).resolves.toBe(false);
     expect(restartInFlight()).toBe(false);
     expect(result.current.state).toBe("idle");
     expect(result.current.progress).toBeNull();
@@ -1050,14 +1064,14 @@ describe("useRestartBridge: the start-up progress on the screens (HR5 part 5)", 
 
   it("a reading that goes absent takes the line down, and endEngineProgress with nothing shown does nothing", () => {
     const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
-    act(() => endEngineProgress());
+    act(() => endEngineProgress(true));
     expect(result.current.state).toBe("idle");
     expect(restartInFlight()).toBe(false);
     act(() => showEngineProgress(REC));
     expect(result.current.progress).toBe(REC_LINE);
     act(() => showEngineProgress(null));
     expect(result.current.progress).toBeNull();
-    act(() => endEngineProgress());
+    act(() => endEngineProgress(true));
     expect(restartInFlight()).toBe(false);
     expect(result.current.state).toBe("idle");
   });
@@ -1099,7 +1113,7 @@ describe("useRestartBridge: the app's /health waits pause while engine progress 
     await expect(run.done()).resolves.toBe(false);
   });
 
-  it("the wait after a forced restart pauses too, and a timed-out status read keeps the paused reading", async () => {
+  it("the wait after a forced restart pauses too, and a timed-out status read keeps the paused reading for under 30 s", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     w.health = false;
@@ -1112,7 +1126,9 @@ describe("useRestartBridge: the app's /health waits pause while engine progress 
     const run = startRestart(() => result.current.restart());
     void run.done().then(settled, settled);
     await advance(TIMEOUT_HEALTH_MS / 2);
-    w.statusUnknown = true; // every later status read times out: the previous reading stays
+    // every later status read times out: the previous reading stays for under 30 s after the last real answer (about 15 s),
+    // so the credit runs to about 45 s and the wait is still going at the 65 s this test ends at; it gives up after that
+    w.statusUnknown = true;
     await advance(TIMEOUT_HEALTH_MS + 20_000);
     expect(settled).not.toHaveBeenCalled();
   });
