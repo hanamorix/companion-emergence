@@ -6,7 +6,7 @@
 //   4. no selection, ≥2 personas → picker shown
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 // ── Heavy Tauri / Tauri-window deps ──────────────────────────────────────────
@@ -64,7 +64,7 @@ vi.mock("./appConfig", () => ({
 }));
 
 // ── bridge ────────────────────────────────────────────────────────────────────
-import type { PersonaState, TunablesNotice } from "./bridge";
+import type { PersonaState, RebuildNotice, TunablesNotice } from "./bridge";
 
 const { fetchPersonaState, approvePendingWrite, declinePendingWrite } = vi.hoisted(() => {
   const baseState = (): PersonaState => ({
@@ -360,6 +360,109 @@ describe("App tunables notice (#462)", () => {
 
     await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
     expect(screen.queryByTestId("tunables-notice")).toBeNull();
+  });
+});
+
+describe("App rebuild notice (HRF)", () => {
+  // Typed as PersonaState (fetchPersonaState resolves to one), as the tunables describe does, so `tsc` checks the field.
+  // A local helper on purpose: the tunables describe above stays untouched.
+  const stateWith = (extra: Partial<PersonaState> = {}): PersonaState => ({
+    persona: "nell",
+    emotions: {},
+    body: null,
+    interior: { dream: null, research: null, heartbeat: null, reflex: null },
+    soul_highlight: null,
+    connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+    mode: "live",
+    recovering: false,
+    felt_time_recovered: false,
+    ...extra,
+  });
+
+  const tunables: TunablesNotice = { kind: "unreadable", line: 7, column: 12, reason: "Invalid statement" };
+
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    writeAppConfig.mockReset().mockResolvedValue(undefined);
+    listPersonas.mockReset();
+    ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
+  });
+
+  afterEach(cleanup);
+
+  it("shows the reason, that the saved feelings are in use, and the log path", async () => {
+    const notice: RebuildNotice = { reason: "the first rebuild failed (OSError: disk full)", log_path: "/logs/runtime-nell.log" };
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith({ rebuild_notice: notice }));
+    render(<App />);
+
+    const el = await screen.findByTestId("rebuild-notice");
+    expect(el).toHaveAttribute("role", "status");
+    expect(el.textContent).toBe(
+      "Your feelings could not be brought up to date: the first rebuild failed (OSError: disk full). " +
+        "The app is using the ones saved before. Details are in the log: /logs/runtime-nell.log.",
+    );
+  });
+
+  it("shows the message without a path when log_path is null", async () => {
+    fetchPersonaState
+      .mockReset()
+      .mockResolvedValue(stateWith({ rebuild_notice: { reason: "the update stopped", log_path: null } }));
+    render(<App />);
+
+    const el = await screen.findByTestId("rebuild-notice");
+    expect(el.textContent).toBe(
+      "Your feelings could not be brought up to date: the update stopped. The app is using the ones saved before.",
+    );
+  });
+
+  it.each<[RebuildNotice | null | undefined]>([[null], [undefined]])("shows no notice when the field is %s", async (notice) => {
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith(notice === undefined ? {} : { rebuild_notice: notice }));
+    render(<App />);
+
+    await waitFor(() => expect(fetchPersonaState).toHaveBeenCalled());
+    expect(screen.queryByTestId("rebuild-notice")).toBeNull();
+  });
+
+  it("shows both notices, the tunables one first and as before, the rebuild one after it", async () => {
+    fetchPersonaState.mockReset().mockResolvedValue(
+      stateWith({ tunables_notice: tunables, rebuild_notice: { reason: "x", log_path: "/p" } }),
+    );
+    render(<App />);
+
+    const rebuild = await screen.findByTestId("rebuild-notice");
+    const tun = screen.getByTestId("tunables-notice");
+    expect(tun).toHaveAttribute("role", "status");
+    expect(tun).toHaveTextContent(/tunables\.toml could not be read at line 7, column 12 \(Invalid statement\)/);
+    expect(tun.compareDocumentPosition(rebuild) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("goes when a later poll no longer carries the notice", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      fetchPersonaState
+        .mockReset()
+        .mockResolvedValueOnce(stateWith({ rebuild_notice: { reason: "x", log_path: "/p" } })) // poll 1: shown
+        .mockResolvedValue(stateWith({ rebuild_notice: null })); // poll 2+: cleared
+
+      render(<App />);
+      await screen.findByTestId("rebuild-notice");
+
+      await vi.advanceTimersByTimeAsync(5000); // poll 2
+      await waitFor(() => expect(screen.queryByTestId("rebuild-notice")).toBeNull());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cannot be closed: the block holds no button", async () => {
+    fetchPersonaState.mockReset().mockResolvedValue(stateWith({ rebuild_notice: { reason: "x", log_path: "/p" } }));
+    render(<App />);
+
+    const el = await screen.findByTestId("rebuild-notice");
+    expect(within(el).queryAllByRole("button")).toHaveLength(0);
   });
 });
 
