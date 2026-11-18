@@ -31,6 +31,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -401,7 +402,10 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     (2) The rebuild is its own process, ``nell supervisor rebuild``, waited for with no limit (S101: the startup waits until the
     rebuild is finished). It prints the lines below to stderr only when stderr is a terminal; the loop sleeps through
     ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
-    from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). Any
+    from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). It
+    also records why in the rebuild notice (``engine_files.settle_rebuild_notice``, Hana's point 5 on #633), which the window shows while
+    the persona is not switched over: the OSError text, or "the update of your memories stopped (exit code N)" unless the child wrote
+    its own, more exact notice; a child that exits 0 clears a notice once the persona is switched over. Any
     BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
 
     The runtime log is attached for the step (``_runtime_log``: transient, only when no persistent handler for the log is
@@ -482,6 +486,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
     # "-P" as _runner_argv has it; the persona by name, from the same home as ours (the environment is inherited).
     argv = [python, "-P", "-m", "brain.cli", "supervisor", "rebuild", "--persona", persona_dir.name]
     show = _stderr_is_terminal()
+    since = datetime.now(UTC)  # the child's own notice (written at a failure inside it) is newer than this and stands
     try:
         child = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
@@ -490,6 +495,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         reason = f"{type(exc).__name__}: {exc}"
         logger.warning("the rebuild child for %s could not be started (%s); going on with the saved state", persona_dir.name, reason)
         _say(f"Updating your memories could not be started ({reason}). Going on with your memories as they were saved.")
+        _settle_rebuild_notice(persona_dir, reason)
         return
     try:
         if show:
@@ -516,6 +522,27 @@ def _run_rebuild_child(persona_dir: Path) -> None:
     if code != 0:
         logger.warning("the rebuild child for %s exited with code %s; going on with the saved state", persona_dir.name, code)
         _say(f"Updating your memories did not finish (exit code {code}). Going on with your memories as they were saved.")
+        # Also a child killed by a signal or for memory, or one that crashed before the engine ran: no notice of its own exists, so
+        # this one tells the window; a notice the child wrote itself (newer than `since`) is more exact and stands.
+        _settle_rebuild_notice(persona_dir, f"the update of your memories stopped (exit code {code})", since=since)
+    else:
+        # A completed child: the persona is switched over, so the writer deletes a notice an earlier attempt left.
+        _settle_rebuild_notice(persona_dir, None, since=since)
+
+
+def _settle_rebuild_notice(persona_dir: Path, reason: str | None, *, since: datetime | None = None) -> None:
+    """Call the one writer of the rebuild notice (`engine_files.settle_rebuild_notice`, Hana's 11-18 point 5 on #633).
+
+    The only reason this is a function and not a direct call: `engine_files` is imported here, at call time, and `_rebuild_needed`'s
+    failure branch runs when the engine stack itself failed to import, where a start must still go on. A failed import is logged
+    and ends the call; the writer itself never raises.
+    """
+    try:
+        from brain.emotion import engine_files
+
+        engine_files.settle_rebuild_notice(persona_dir, reason, since=since)
+    except Exception:  # noqa: BLE001 - a display record never stops a start
+        logger.warning("could not record the rebuild notice for %s", persona_dir.name, exc_info=True)
 
 
 def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
@@ -529,16 +556,20 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
     departs from S107's words in one case, a roll-forward need under a running bridge; the alternative (stop the bridge on it too)
     would stop and restart a healthy bridge, losing its in-flight work, whenever a start is typed over it inside that window.
 
-    A check that raises is logged (type and reason, to the runtime log) and answers False: the start goes on. The bridge stack is
-    imported only in that branch (``_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
+    A check that raises is logged (type and reason, to the runtime log), recorded in the rebuild notice (no child runs, so nothing else
+    would say it; Hana's point 5 on #633), and answers False: the start goes on. A check that answers "no rebuild needed" settles the
+    notice with no reason (``engine_files.settle_rebuild_notice``): a switched persona's old notice is deleted, one stat when there is
+    none; that runs after the try, on the normal path only, so the failure branch never clears. The bridge stack is
+    imported only in the failure branch (``_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
     only when no persistent one is, and always detached again. A log line that cannot be set up is skipped: the answer stays False.
     """
     try:
         from brain.emotion import engine
 
         if not bridge_running:
-            return engine.start_rebuild_needed(persona_dir)
-        return not engine.engine_for(persona_dir).is_live()
+            needed = engine.start_rebuild_needed(persona_dir)
+        else:
+            needed = not engine.engine_for(persona_dir).is_live()
     except Exception as exc:  # noqa: BLE001 - a failed check never stops a start
         with _runtime_log(persona_dir):
             logger.warning(
@@ -547,7 +578,11 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
                 type(exc).__name__,
                 exc,
             )
+        _settle_rebuild_notice(persona_dir, f"{type(exc).__name__}: {exc}")  # case 5: no child runs, so nothing else records it
         return False
+    if not needed:
+        _settle_rebuild_notice(persona_dir, None)  # after the try, so the except above cannot catch it; the normal path only
+    return needed
 
 
 def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
@@ -559,8 +594,11 @@ def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
     on Windows an unreachable endpoint is refused unless the user runs ``nell supervisor stop --kill``.
 
     Accepted edges (P4, R2): the app drops a start after 60 s with no rebuild record (lib.rs ``wait_for_start``, ``kill_on_drop``),
-    which ends the start command, not the stop; no data is lost, and at launch on an unconfirmed overlay a failed start reaches
-    ``recoverUnhealthyBrain`` and undoes the update (brainRecovery.ts), as HR5 (6) and (7) recorded. A stop that answers 0 while a
+    which ends this stop's watch too, because the stop runs inside the same ``nell supervisor start`` that ``kill_on_drop`` ends (the
+    stop writes no progress record, so the stop itself does not pause the 60 s; another live progress record, such as one a rebuild
+    child left by an earlier dropped start still shows, would pause it); a pre-PR or unhealthy bridge can be left half-stopped, with no
+    rebuild and no new bridge, until the next start repeats the stop. No data is lost, and at launch on an unconfirmed overlay a
+    failed start reaches ``recoverUnhealthyBrain`` and undoes the update (brainRecovery.ts), as HR5 (6) and (7) recorded. A stop that answers 0 while a
     bridge is somehow still there is not caught here: a live bridge holds the start lock, so ``cmd_start``'s lock refuses with
     exit 2. A failed stop can print two lines (the pre-PR stop's, then this one), accepted. A queued service run that wakes between the stop and ``cmd_start``'s lock takes it: this start then
     returns 2 and that run does the rebuild (``cmd_run``).
@@ -590,6 +628,16 @@ def run_rebuild_step(persona_dir: Path) -> int | None:
     blocking acquire would also wait for a bridge's whole life, because the runner holds this lock from before its state file
     shows it). With the lock held it asks the need again (HQD (4), as ``cmd_start`` and ``cmd_run`` do) and runs
     ``_rebuild_under_lock`` only if it still stands; it releases the lock and starts no bridge.
+
+    Accepted edge (P4, Hana's 11-18 point 4 on #633; trio 3-0; also a commit-log note): in the gap between ``cmd_start`` releasing
+    the lock (the comment there) and the new runner taking it, no bridge is recorded and the lock is free, so a command that still
+    needs the rebuild (an earlier one failed or was skipped) takes the lock, ends the other commands and runs a rebuild child. On
+    the ``spawn_detached`` path the runner then loses the lock, returns 2 and the start reports a failed bridge; at app launch on an
+    unconfirmed overlay that failed start reaches the undo (``recoverUnhealthyBrain``), a visible reversal the user can redo; no data
+    is lost. A service-managed start waits on ``cmd_run``'s blocking lock and does not fail. Accepted because it needs a failed or
+    skipped earlier rebuild and one of the six commands inside a gap the width of a process start (not measured; far below 1 in
+    10,000 starts; the product does not fire a command at a start), and the only fix, skipping here while the rebuild notice stands,
+    would stop every command retrying (S111, HSR item 4).
     """
     if state_file.is_running(persona_dir):
         return None
@@ -723,7 +771,21 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
         _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
     finally:
-        release_lock(persona_dir, fd)  # hand the lock to the child runner on the normal path
+        # Hand the lock to the child runner on the normal path. Accepted edge (P4, Hana's 11-18 point 4 on #633; trio 3-0): between
+        # this release and the runner's non-blocking take (`runner.main`) nothing records that a start is under way (no "starting"
+        # phase in bridge.json, no file), so one of the six commands (`run_rebuild_step`) that still needs the rebuild, after one that
+        # failed or was skipped, finds no bridge and a free lock, takes it and runs a rebuild child. On the `spawn_detached` path the
+        # runner then loses the lock and returns 2, the readiness wait reports a failed bridge, and at app launch on an unconfirmed
+        # overlay that failed start reaches the undo (`recoverUnhealthyBrain`): a visible reversal the user can redo; no data is
+        # lost (the child runs under the engine lock). The service path (`_start_service`) waits on `cmd_run`'s blocking lock and
+        # does not fail. Why it is accepted: it needs an earlier failed or skipped rebuild AND one of the six commands inside a
+        # gap the width of a process start (not measured; far below 1 in 10,000 starts). A persona whose rebuild keeps failing has
+        # the gap at every start, so the rarity rests on the product never firing one of the six commands at a start (they are typed
+        # or run by the user's own scheduler); the only fix, reading the rebuild notice in `run_rebuild_step`, would stop every
+        # command retrying while it stands (departing from HSR item 4, S111), and holding the lock across the spawn is ruled out
+        # by the comment above (the runner could not take it). The same gap already exists for a second `cmd_start`
+        # (`_rotate_bridge_log`).
+        release_lock(persona_dir, fd)
     # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
     # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
     if _service_installed(args.persona):

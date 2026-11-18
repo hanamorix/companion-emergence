@@ -94,6 +94,19 @@ def test_command_run_record_matches_the_fixture(tmp_path, monkeypatch):
     assert json.loads((persona / "command_runs" / "4242.json").read_text(encoding="utf-8")) == _fixture("command_run.json")
 
 
+def test_rebuild_notice_record_matches_the_fixture(tmp_path):
+    """Point 5 of Hana's 11-18 review of #633: the notice of a switch-over that did not complete, as the one writer leaves it."""
+    rec = engine_files.rebuild_notice_record(
+        at="2026-11-18T12:00:00.000000Z", reason="the update of your memories stopped (exit code 1)"
+    )
+    assert rec == _fixture("rebuild_notice.json")
+    assert engine_files.rebuild_notice_path(tmp_path) == tmp_path / "rebuild_notice.json"
+    shutdown_progress.write_record(tmp_path, "rebuild_notice.json", rec)
+    assert engine_files.read_rebuild_notice(tmp_path) == _fixture("rebuild_notice.json")
+    engine_files.settle_rebuild_notice(tmp_path, "the update of your memories stopped (exit code 1)")
+    assert set(json.loads(engine_files.rebuild_notice_path(tmp_path).read_text(encoding="utf-8"))) == set(_fixture("rebuild_notice.json"))
+
+
 def test_status_has_no_engine_progress_without_a_record(tmp_path, monkeypatch):
     pd = tmp_path / "nell"
     pd.mkdir()

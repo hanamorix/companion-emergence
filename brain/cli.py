@@ -177,14 +177,31 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
     roll-forward check and rebuild, which waits for an engine lock another process holds until it comes (no stop check, no
     limit: S101). Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
     success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
+    Each way the switch-over does not complete (the exit-1 failures and the skips that exit 0) also leaves the rebuild notice
+    (`engine_files.settle_rebuild_notice`) while the persona is not switched over, so the window can say so (Hana's point 5 on #633);
+    a failed roll-forward of a switched persona leaves none. A hand run that completes does not clear it: the next start's or
+    command's need check does.
 
     A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
-    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing.
+    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing. A bridge recorded running
+    (`state_file.is_running`) is refused next, still before the first record and any engine call: one plain line on stderr, nothing
+    written, exit 2 (a hand run only; the product never spawns this process beside a bridge).
     """
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
+    # Hana's 11-18 review of #633, point 3 (Planning's HRV answer): a hand run beside a live bridge would read the bridge's
+    # committed-but-unapplied rows as a roll-forward and rebuild under it. The product spawns this process from `cmd_start`,
+    # `cmd_run` and `run_rebuild_step` only when no bridge runs (each holds the start lock, which a live bridge holds too), so
+    # only a hand run reaches this refusal. The start lock cannot be the check here: the parent holds it while its child runs.
+    # Accepted edge (P4, R2): `is_running` answers False for a bridge whose identity cannot be read and for a bridge that is
+    # still starting (the runner takes the lock before it writes the state file), so a hand run in either case is not refused and
+    # runs beside the bridge as it did before, with edge (i) of `engine.EmotionEngine._roll_forward`'s losses. It needs a hand run
+    # and one of those two states at once.
+    if state_file.is_running(persona_dir):
+        print("A bridge is running for this persona, so the rebuild was not run.", file=sys.stderr)
+        return 2
     progress = engine_files.EngineProgress(persona_dir, "rebuilding")
     progress.write()
     try:

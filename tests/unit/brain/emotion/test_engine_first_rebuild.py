@@ -1213,3 +1213,123 @@ def test_ensure_engine_ready_calls_ensure_ready_through_engine_for(tmp_path: Pat
     assert engine.engine_for(tmp_path) is emotion_engine_stub
     ensure_engine_ready(tmp_path)
     assert emotion_engine_stub.recorded_calls == [("ensure_ready",)]
+
+
+# ================================================================================================
+# The rebuild notice: every way the switch-over does not complete (Hana's 11-18 review of #633, point 5; owner S112)
+# ================================================================================================
+
+
+def _notice(persona: Path) -> str | None:
+    record = engine_files.read_rebuild_notice(persona)
+    return None if record is None else record["reason"]
+
+
+def test_case_1_a_failed_rebuild_leaves_a_notice_naming_the_step_and_the_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    install(persona, NOW)
+    monkeypatch.setattr(engine_files, "state_to_json", lambda state: (_ for _ in ()).throw(ValueError("forced")))
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    reason = _notice(persona)
+    assert reason is not None and reason.startswith("the first rebuild failed (RebuildCheckError: ")
+    monkeypatch.undo()
+    ensure_engine_ready(persona)  # the fault is gone: the start completes, and the start process's next check clears the notice
+    engine_files.settle_rebuild_notice(persona, None)
+    assert _notice(persona) is None
+
+
+def test_case_2_an_x10_error_and_an_integrity_failure_on_a_readable_state_leave_a_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path / "x10")
+    install(persona, NOW)
+    monkeypatch.setattr(_x10(), "scale_up_small_feelings", lambda p: (_ for _ in ()).throw(RuntimeError("rolled back")))
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert _notice(persona) == "the x10 fix of small feelings failed (RuntimeError: rolled back)"
+    monkeypatch.undo()
+
+    other = _standard_persona(tmp_path / "integrity")
+    install(other, NOW)
+
+    def refuse(*args: object, **kwargs: object):
+        raise BrainIntegrityError("memories.db", "page 3 is damaged")
+
+    monkeypatch.setattr(_x10(), "MemoryStore", refuse)
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(other)
+    reason = _notice(other)
+    assert reason is not None and reason.startswith("the memories.db integrity check failed (BrainIntegrityError: ")
+    assert "page 3 is damaged" in reason and "\n" not in reason
+
+
+def test_a_lock_file_that_cannot_be_opened_leaves_a_notice_naming_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    install(persona, NOW)
+
+    def unopenable(persona_dir: Path) -> None:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(engine_files, "state_lock", unopenable)
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert _notice(persona) == "the engine lock failed (PermissionError: no access)"  # written before the raise: it is there once it propagated
+
+
+def test_case_3_a_state_and_a_database_that_both_cannot_be_read_skip_the_start_and_leave_a_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona = _standard_persona(tmp_path)
+    save(persona, simple_state(saved_at=T[39]))
+    ruin_the_state(persona)
+    install(persona, NOW)
+
+    def broken(*args: object, **kwargs: object):
+        raise BrainIntegrityError("memories.db", "page 7 is damaged")
+
+    monkeypatch.setattr(_x10(), "MemoryStore", broken)
+    ensure_engine_ready(persona)  # returns: the start is skipped, not failed
+    reason = _notice(persona)
+    assert reason is not None and reason.startswith("the saved feelings and memories.db could not be read (") and "page 7 is damaged" in reason
+    monkeypatch.undo()
+    ensure_engine_ready(persona)  # the next start completes; the start process's check then clears the notice
+    engine_files.settle_rebuild_notice(persona, None)
+    assert _notice(persona) is None
+
+
+def test_case_4_a_state_write_that_fails_on_an_unreadable_state_skips_the_start_and_leaves_a_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona = _standard_persona(tmp_path)
+    save(persona, simple_state(saved_at=T[39]))
+    ruin_the_state(persona)
+    install(persona, NOW)
+
+    def crash(*args: object, **kwargs: object) -> bool:
+        raise OSError("disk fault on the state write")
+
+    monkeypatch.setattr(engine_files, "save_state", crash)
+    ensure_engine_ready(persona)  # returns: the start is skipped, not failed
+    reason = _notice(persona)
+    assert reason == f"the rebuilt state could not be written to {engine_files.state_path(persona)} (OSError: disk fault on the state write)"
+
+
+@pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base no notice is ever written, so a switched persona trivially has none")
+def test_a_roll_forward_failure_of_a_switched_persona_stops_start_up_and_leaves_no_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    make_live(persona, T[39])
+    install(persona, NOW)
+    monkeypatch.setattr(engine_rebuild, "rolled_forward", lambda *args, **kwargs: True)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ValueError("the rebuild broke")  # not one of the three errors a roll-forward goes on after: it stops start-up
+
+    monkeypatch.setattr(engine_rebuild, "rebuild", boom)
+    with pytest.raises(EngineStartupError) as failure:
+        ensure_engine_ready(persona)
+    assert failure.value.what == "the roll-forward rebuild"
+    assert not engine_files.rebuild_notice_path(persona).exists()  # a switched persona is never given a notice
+    # and a notice an earlier attempt left on the persona is deleted by the same call
+    engine_files.rebuild_notice_path(persona).write_text('{"at": "2020-01-01T00:00:00Z", "reason": "old"}', encoding="utf-8")
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert not engine_files.rebuild_notice_path(persona).exists()

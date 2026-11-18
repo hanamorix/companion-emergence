@@ -187,6 +187,107 @@ def test_a_check_that_raises_still_answers_false_when_the_runtime_log_cannot_be_
     assert daemon._rebuild_needed(persona, False) is False
 
 
+# --- the rebuild notice at the need check (Hana's 11-18 review of #633, point 5; owner S112) ---------------------------------
+
+
+def _notice(persona: Path) -> str | None:
+    from brain.emotion import engine_files
+
+    record = engine_files.read_rebuild_notice(persona)
+    return None if record is None else record["reason"]
+
+
+def _plant(persona: Path, reason: str = "an earlier attempt's") -> None:
+    from brain.emotion import engine_files
+
+    engine_files.rebuild_notice_path(persona).write_text(f'{{"at": "2020-01-01T00:00:00Z", "reason": "{reason}"}}', encoding="utf-8")
+
+
+def _check_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(persona_dir: Path) -> bool:
+        raise ValueError("a state that cannot be read")
+
+    monkeypatch.setattr(engine, "start_rebuild_needed", boom)
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+def test_case_5_a_check_that_raises_leaves_a_notice_with_its_type_and_reason_and_still_answers_false(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _check_raises(monkeypatch)
+    assert daemon._rebuild_needed(persona, False) is False
+    assert _notice(persona) == "ValueError: a state that cannot be read"
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+@pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base nothing writes the notice, so a switched persona trivially has none")
+def test_case_5_on_a_switched_persona_writes_nothing(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))
+    _check_raises(monkeypatch)
+    assert daemon._rebuild_needed(persona, False) is False
+    assert _notice(persona) is None
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+def test_a_failed_check_replaces_an_older_notice_and_never_clears_it(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _plant(persona)
+    _check_raises(monkeypatch)
+    assert daemon._rebuild_needed(persona, False) is False
+    assert _notice(persona) == "ValueError: a state that cannot be read"
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+@pytest.mark.parametrize("bridge_running", [False, True])
+def test_a_check_that_answers_no_rebuild_needed_clears_a_notice_the_switched_persona_still_had(persona: Path, bridge_running: bool) -> None:
+    from datetime import UTC, datetime
+
+    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))
+    _plant(persona)
+    assert daemon._rebuild_needed(persona, bridge_running) is False
+    assert _notice(persona) is None
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+@pytest.mark.no_base_failure(reason="a pin of a negative: on base nothing deletes the notice, so an answer of 'needed' trivially keeps it")
+def test_a_check_that_answers_a_rebuild_is_needed_keeps_the_notice(persona: Path) -> None:
+    _plant(persona)
+    assert daemon._rebuild_needed(persona, False) is True
+    assert _notice(persona) == "an earlier attempt's"
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+@pytest.mark.parametrize("raises", [True, False])
+def test_a_writer_that_fails_never_changes_the_answer_or_stops_a_start(persona: Path, monkeypatch: pytest.MonkeyPatch, raises: bool) -> None:
+    from datetime import UTC, datetime
+
+    from brain.emotion import engine_files
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("the writer broke")
+
+    monkeypatch.setattr(engine_files, "settle_rebuild_notice", boom)
+    if raises:
+        _check_raises(monkeypatch)
+    else:
+        make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))
+    assert daemon._rebuild_needed(persona, False) is False
+
+
+@pytest.mark.real_rebuild_step(reason="the need check under test")
+@pytest.mark.no_base_failure(reason="a pin of the need check's contract: on base nothing imports the writer, so its import cannot fail there")
+def test_a_check_that_raises_still_answers_false_when_engine_files_cannot_be_imported_for_the_notice(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import brain.emotion as emotion_package
+
+    _check_raises(monkeypatch)
+    monkeypatch.delattr(emotion_package, "engine_files", raising=False)
+    monkeypatch.setitem(sys.modules, "brain.emotion.engine_files", None)
+    assert daemon._rebuild_needed(persona, False) is False
+
+
 @pytest.mark.no_base_failure(reason="the lifted helper exists on base (HS5, 00f7ab7d); the need check's logging relies on it")
 def test_runtime_log_attached_finds_the_persistent_handler_only(persona: Path) -> None:
     assert runner._runtime_log_attached(persona) is False
