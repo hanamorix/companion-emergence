@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
 import inspect
 import os
 import subprocess
@@ -498,8 +499,8 @@ def _no_real_rebuild_child(request: pytest.FixtureRequest, monkeypatch: pytest.M
 
     Unless the test carries `@pytest.mark.real_rebuild_step(reason=...)`, `brain.bridge.daemon._rebuild_needed` answers False
     (so a start, a run or a command on a temp persona has no rebuild to run) and `engine_files.register_command_run` does nothing
-    (the commands call it through the module). A lazy import of engine_files after this setup gets the real
-    `register_command_run`: harmless, the record is removed at exit (P4).
+    (the commands call it through the module). The patch imports `brain.emotion.engine_files` at setup, so a command that
+    imports it lazily later gets the no-op too and writes no record and registers no `atexit` hook.
 
     For a test with the marker, the daemon module's `subprocess` name is replaced by a copy of the module (a
     `types.SimpleNamespace` of `vars(subprocess)`) whose `Popen` alone differs, so no other module's spawn is touched: a
@@ -509,12 +510,15 @@ def _no_real_rebuild_child(request: pytest.FixtureRequest, monkeypatch: pytest.M
 
     Every patch is `raising=False` and string-path, so a base without these names only sets an attribute nothing reads (the
     new-tests-fail-on-base check runs this conftest against old product code). The `daemon` patches import
-    `brain.bridge.daemon` in every test (a `sys.modules` guard would miss a lazy first import); the `engine_files` one acts only when
-    `brain.emotion.engine_files` is already imported, as `_reset_emotion_engine_registry` does.
+    `brain.bridge.daemon` in every test (a `sys.modules` guard would miss a lazy first import), and the `engine_files` one imports
+    `brain.emotion.engine_files` for the same reason, unless a base has no such module (`importlib.util.find_spec`).
+    (`_reset_emotion_engine_registry` keeps its own `sys.modules` guard on purpose: it must not import the engine.)
     """
     if request.node.get_closest_marker("real_rebuild_step") is None and request.node.get_closest_marker("real_rebuild_child") is None:
         monkeypatch.setattr("brain.bridge.daemon._rebuild_needed", lambda *args, **kwargs: False, raising=False)
-        if "brain.emotion.engine_files" in sys.modules:
+        # The string path imports the module here, so a command that imports it later gets this no-op. A base without the module
+        # (the new-tests-fail-on-base check runs this conftest against old product code) has nothing to patch.
+        if importlib.util.find_spec("brain.emotion.engine_files") is not None:
             monkeypatch.setattr("brain.emotion.engine_files.register_command_run", lambda persona_dir: None, raising=False)
         return None
     import types
