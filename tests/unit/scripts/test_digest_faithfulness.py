@@ -37,6 +37,35 @@ def _write_log(path: Path, rows) -> Path:
     return path
 
 
+def _passing_self_test(judge):
+    """A fake judge that answers the 12 built-in pairs correctly (a --log run judges them first) and the log's pairs
+    with `judge`."""
+
+    def generate(prompt, system):
+        for pair in df.SELF_TEST_PAIRS:
+            if prompt == df.judge_prompt(pair.monologue, pair.digest):
+                return json.dumps({"verdict": pair.expected, "why": "fixture"})
+        return judge(prompt, system)
+
+    return generate
+
+
+def test_a_log_run_judges_the_self_test_first_and_stops_unmeasured_when_it_fails(tmp_path, capsys):
+    # A judge that cannot tell the built-in pairs apart measures nothing: the run stops before reading the log.
+    log = _write_log(tmp_path / "tool_invocations.log.jsonl", [_row()])
+    out = tmp_path / "verdicts.json"
+    calls = []
+
+    def always_agree(prompt, system):
+        calls.append(prompt)
+        return '{"verdict": "agree", "why": "fine"}'
+
+    code = df.main(["--log", str(log), "--out", str(out)], generate=always_agree)
+    assert code == df.EXIT_UNMEASURED
+    assert json.loads(capsys.readouterr().out) == {"self_test": "FAIL", "score": 6, "total": 12}
+    assert len(calls) == 12 and not out.exists()
+
+
 def test_pairs_keep_real_captures_and_count_what_they_leave_out(tmp_path):
     log = _write_log(
         tmp_path / "tool_invocations.log.jsonl",
@@ -55,6 +84,88 @@ def test_pairs_keep_real_captures_and_count_what_they_leave_out(tmp_path):
     assert pairs[0].monologue == "the kettle and the rain"
     assert pairs[0].digest == "she listened to the rain"
     assert excluded == {"deduped": 1, "refused": 1, "error": 1, "missing_argument": 1}
+
+
+def test_the_out_file_is_rewritten_every_20_pairs_and_marked_complete_at_the_end(tmp_path):
+    # A crash late in a long run keeps what was judged up to the last checkpoint (ToT's review of #751).
+    rows = [_row(timestamp=f"2026-11-01T10:{i:02d}:00Z", arguments={"monologue": f"thought {i}", "feed_digest": f"digest {i}"})
+            for i in range(45)]
+    log = _write_log(tmp_path / "tool_invocations.log.jsonl", rows)
+    out = tmp_path / "verdicts.json"
+    seen = []
+
+    def judge(prompt, system):
+        seen.append(prompt)
+        if len(seen) == 41:
+            raise KeyboardInterrupt  # the run dies on the 41st pair
+        return '{"verdict": "agree", "why": "x"}'
+
+    with pytest.raises(KeyboardInterrupt):
+        df.main(["--log", str(log), "--out", str(out)], generate=_passing_self_test(judge))
+    stored = json.loads(out.read_text(encoding="utf-8"))
+    assert stored["complete"] is False and len(stored["verdicts"]) == 40
+
+    df.main(["--log", str(log), "--out", str(out)], generate=_passing_self_test(lambda p, s: '{"verdict": "agree", "why": "x"}'))
+    stored = json.loads(out.read_text(encoding="utf-8"))
+    assert stored["complete"] is True and len(stored["verdicts"]) == 45
+
+
+def test_since_compares_times_not_strings_and_counts_rows_whose_time_cannot_be_read(tmp_path, capsys):
+    # The log writes UTC with a Z; a --since with an offset names the same instant (ToT's review of #751).
+    log = _write_log(
+        tmp_path / "tool_invocations.log.jsonl",
+        [_row(timestamp="2026-11-01T09:59:59Z"), _row(timestamp="2026-11-01T10:00:00Z"), _row(timestamp="yesterday")],
+    )
+    pairs, excluded = df.pairs_from_log(log, since="2026-11-01T11:00:00+01:00")
+    assert [p.timestamp for p in pairs] == ["2026-11-01T10:00:00Z"]
+    assert excluded == {"bad_timestamp": 1}
+    with pytest.raises(SystemExit) as refused:
+        df.main(["--log", str(log), "--out", str(tmp_path / "v.json"), "--since", "last week"], generate=lambda p, s: "")
+    assert refused.value.code == 2 and "--since" in capsys.readouterr().err
+
+
+def test_the_out_file_records_which_judge_ran_and_when(tmp_path):
+    # The haiku alias moves over time: the alias and the CLI version say whether two runs used the same model.
+    from brain.utils.time import lenient_utc
+
+    log = _write_log(tmp_path / "tool_invocations.log.jsonl", [_row()])
+    out = tmp_path / "verdicts.json"
+    df.main(["--log", str(log), "--out", str(out)], generate=_passing_self_test(lambda p, s: '{"verdict": "agree", "why": "x"}'),
+            judge={"model": "haiku", "claude_version": "9.9.9 (Claude Code)"})
+    recorded = json.loads(out.read_text(encoding="utf-8"))["judge"]
+    assert recorded["model"] == "haiku" and recorded["claude_version"] == "9.9.9 (Claude Code)"
+    assert lenient_utc(recorded["run_at"]) is not None
+
+
+def test_the_claude_version_is_read_from_the_cli_and_is_unknown_when_it_cannot_be(monkeypatch):
+    import subprocess
+
+    calls = []
+
+    def answers(stdout, code=0):
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr="")
+        return run
+
+    monkeypatch.setattr(df.subprocess, "run", answers("2.1.200 (Claude Code)\n"))
+    assert df.claude_version() == "2.1.200 (Claude Code)"
+    assert calls[0][0] == ["claude", "--version"] and calls[0][1]["encoding"] == "utf-8"
+    monkeypatch.setattr(df.subprocess, "run", answers("", code=1))
+    assert df.claude_version() == "unknown"
+
+    def missing(argv, **kwargs):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(df.subprocess, "run", missing)
+    assert df.claude_version() == "unknown"
+
+
+def test_self_test_through_main_prints_its_score_and_exits_by_the_result(capsys):
+    assert df.main(["--self-test"], generate=_passing_self_test(lambda p, s: "")) == df.EXIT_CLEAN
+    assert json.loads(capsys.readouterr().out) == {"self_test": "PASS", "score": 12, "total": 12}
+    assert df.main(["--self-test"], generate=lambda p, s: '{"verdict": "agree", "why": "x"}') == df.EXIT_UNMEASURED
+    assert json.loads(capsys.readouterr().out) == {"self_test": "FAIL", "score": 6, "total": 12}
 
 
 def test_verdicts_are_read_strictly_and_anything_else_is_unclear():
@@ -91,7 +202,7 @@ def test_the_out_file_is_created_private_not_made_private_after_the_write(tmp_pa
     old = os.umask(0o022)
     try:
         df.main(["--log", str(log), "--out", str(tmp_path / "verdicts.json")],
-                generate=lambda p, s: '{"verdict": "agree", "why": "x"}')
+                generate=_passing_self_test(lambda p, s: '{"verdict": "agree", "why": "x"}'))
     finally:
         os.umask(old)
     assert (tmp_path / "verdicts.json").stat().st_mode & 0o777 == 0o600
@@ -105,7 +216,7 @@ def test_an_existing_out_file_with_a_looser_mode_is_made_private_before_the_writ
     out.write_text("old", encoding="utf-8")
     out.chmod(0o644)
     monkeypatch.setattr(Path, "chmod", lambda self, mode: None)
-    df.main(["--log", str(log), "--out", str(out)], generate=lambda p, s: '{"verdict": "agree", "why": "x"}')
+    df.main(["--log", str(log), "--out", str(out)], generate=_passing_self_test(lambda p, s: '{"verdict": "agree", "why": "x"}'))
     assert out.stat().st_mode & 0o777 == 0o600
     assert json.loads(out.read_text(encoding="utf-8"))["verdicts"][0]["verdict"] == "agree"
 
@@ -125,7 +236,7 @@ def test_log_run_prints_counts_only_and_writes_verdicts_to_the_out_file(tmp_path
         return json.dumps({"verdict": verdict, "why": "x"})
 
     out = tmp_path / "verdicts.json"
-    code = df.main(["--log", str(log), "--out", str(out)], generate=judge)
+    code = df.main(["--log", str(log), "--out", str(out)], generate=_passing_self_test(judge))
     printed = capsys.readouterr().out
     assert code == 10
     summary = json.loads(printed)
