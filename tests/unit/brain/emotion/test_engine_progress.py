@@ -99,8 +99,10 @@ def test_the_first_rebuild_writes_at_entry_with_the_total_and_on_each_percentage
     persona = make_persona(tmp_path, [row(T[35], emotions={"joy": 6.0}, mid="a"), row(T[36], mid="b"), row(T[37], mid="c")])
     install(persona, NOW)
     ensure_engine_ready(persona)
-    assert _counts(writes) == [(None, None), (0, 3), (1, 3), (2, 3), (3, 3)]
-    assert [w["phase"] for w in writes] == ["rescaling"] + ["rebuilding"] * 5  # the x10 step first, then the rebuild
+    # The x10 step first, then the rebuild: its wait record (no count, written before the lock is tried), then the in-lock entry
+    # write (no count), the total, and each percentage (Planning's HRV answer to Hana's 11-18 point 1).
+    assert _counts(writes) == [(None, None), (None, None), (0, 3), (1, 3), (2, 3), (3, 3)]
+    assert [w["phase"] for w in writes] == ["rescaling"] + ["rebuilding"] * 6
     assert all(w["pid"] == os.getpid() and w["persona"] == persona.name and w["version"] == 1 for w in writes)
     assert not engine_files.progress_path(persona).exists()
     assert state_of(persona).switch_over_at == NOW
@@ -111,9 +113,9 @@ def test_a_large_window_writes_at_most_one_record_per_whole_percent_and_one_at_e
     install(persona, NOW)
     ensure_engine_ready(persona)
     rebuilding = [w for w in writes if w["phase"] == "rebuilding"]
-    assert 60 <= len(rebuilding) <= 102  # 150 rows cross 101 percentages at most, plus the entry write
-    assert _counts(writes)[0] == (None, None) and _counts(writes)[-1] == (150, 150)
-    percents = [w["done"] * 100 // w["total"] for w in rebuilding[1:]]
+    assert 60 <= len(rebuilding) <= 103  # 150 rows cross 101 percentages at most, plus the wait's record and the entry write
+    assert _counts(writes)[:2] == [(None, None), (None, None)] and _counts(writes)[-1] == (150, 150)
+    percents = [w["done"] * 100 // w["total"] for w in rebuilding[2:]]
     assert percents == sorted(set(percents))  # strictly rising: a write only when the percentage changed
 
 
@@ -135,14 +137,14 @@ def test_done_reaches_total_with_a_skipped_row_a_failed_fold_stamp_points_and_a_
     monkeypatch.setattr(engine_rebuild, "fold_entry", failing)
     ensure_engine_ready(persona)
     # 4 rows: one skipped (no feelings) is added when the points are built; three row points then fold, the failing one counted too.
-    assert _counts(writes) == [(None, None), (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]
+    assert _counts(writes) == [(None, None), (None, None), (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]  # wait record, entry write, counts
 
 
 def test_an_empty_window_writes_no_counted_record_and_still_removes_the_entry_record(tmp_path: Path, writes: list[dict]) -> None:
     persona = make_persona(tmp_path, [])
     install(persona, NOW)
     ensure_engine_ready(persona)
-    assert _counts(writes) == [(None, None)]
+    assert _counts(writes) == [(None, None), (None, None)]  # the wait's record and the in-lock entry record
     assert not engine_files.progress_path(persona).exists()
 
 
