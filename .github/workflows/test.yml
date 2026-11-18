@@ -262,9 +262,35 @@ jobs:
   # nell_command resolution, subprocess timeouts) are mostly Rust;
   # without a CI gate, regressions only surface at release-build
   # time or on first user double-click.
+  #
+  # #758: GitHub's macOS arm64 pool is short of runners, so on a PR this job runs only when the PR changes
+  # something the Rust build or its tests read (scripts/ci_touches_rust.py lists them). Every push to main
+  # runs it, and tauri-linux-windows still builds and tests the workspace on every PR. It fails open: a
+  # failed or skipped rust-changes job runs cargo.
+  rust-changes:
+    name: rust changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      # A PR checks out its merge commit; the first parent is the base tip, so HEAD^1..HEAD is the PR's diff.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Does the PR change what the Rust build reads?
+        id: diff
+        shell: bash
+        run: git diff --name-only HEAD^1 HEAD | python3 scripts/ci_touches_rust.py >> "$GITHUB_OUTPUT"
+
   tauri:
     name: tauri (cargo check + test)
-    if: github.event_name != 'workflow_dispatch'
+    needs: rust-changes
+    if: >-
+      !cancelled() && github.event_name != 'workflow_dispatch'
+      && (needs.rust-changes.result != 'success' || needs.rust-changes.outputs.rust == 'true')
     runs-on: macos-latest
     steps:
       - name: Checkout
