@@ -131,6 +131,10 @@ EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
 # The progress record of a start-up step that can take long (the x10 fix, the first rebuild; HR5 of #633). It lives in the
 # PERSONA directory beside `bridge.json` and the bridge's watcher files, not under `state/`, and is outside the engine lock.
 ENGINE_PROGRESS_FILENAME: str = "engine_progress.json"
+# The record of a switch-over that did not complete (Hana's 11-18 review of #633, point 5): why, per persona, while the persona is NOT switched
+# over. It lives in the PERSONA directory beside `engine_progress.json` (not under `state/`), is outside the engine lock, and is read into
+# `/persona/state` (`engine_files.settle_rebuild_notice`, `read_rebuild_notice`).
+REBUILD_NOTICE_FILENAME: str = "rebuild_notice.json"
 # The run records of commands (HS3 of #633): one `<pid>.json` per command process that touches the engine, in this folder of
 # the PERSONA directory, written at the command's start and removed at its exit, so a start can find and end a command that
 # runs (`engine_files.register_command_run`, `live_command_runs`, `kill.kill_command`).

@@ -13,6 +13,7 @@ cut to 0.05 s and nothing runs in a thread.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ from brain import cli as brain_cli
 from brain import dev_constants
 from brain.bridge import daemon
 from brain.emotion import engine_files, engine_rebuild
-from brain.emotion.engine import EngineStartupError, ensure_engine_ready
+from brain.emotion.engine import EmotionEngine, EngineStartupError, ensure_engine_ready
 from tests.unit.brain.emotion._engine_support import (
     NOW,
     OtherHolder,
@@ -30,6 +31,7 @@ from tests.unit.brain.emotion._engine_support import (
     install,
     local_day,
     local_noon,
+    lose_the_state,
     make_live,
     make_persona,
     row,
@@ -120,6 +122,119 @@ def test_a_lock_file_that_cannot_be_opened_is_not_waited_for_and_stops_start_up_
         ensure_engine_ready(persona)
     assert failed.value.what == "the engine lock"
     assert isinstance(failed.value.cause, PermissionError)
+
+
+# --- the progress record while the rebuild waits for the lock (Hana's 11-18 review of #633, point 1; Planning's HRV answer) --
+
+
+def _record(persona_dir: Path) -> dict | None:
+    return engine_files.read_progress(persona_dir)
+
+
+def _shows_this_process_rebuilding(record: dict | None) -> bool:
+    return record is not None and record["phase"] == "rebuilding" and record["pid"] == os.getpid()
+
+
+def test_a_first_start_shows_its_rebuilding_record_while_it_waits_for_the_lock_and_writes_it_again_at_the_next_step(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On an unswitched persona the x10 step removes the child's first record, and the lock is held by another process: the wait must show one."""
+    rebuilt = _RebuildSpy(monkeypatch)
+    holder = OtherHolder(persona)
+    seen: dict[int, dict | None] = {}
+
+    def first_step() -> None:
+        seen[1] = _record(persona)
+        engine_files.progress_path(persona).unlink()  # removed in the middle of the wait
+
+    def second_step() -> None:
+        seen[2] = _record(persona)
+        make_live(persona, SWITCHED_BY_THE_HOLDER)
+        holder.release()
+
+    waits = WaitLog(monkeypatch, on_step={1: first_step, 2: second_step})
+    try:
+        ensure_engine_ready(persona)
+    finally:
+        holder.release()
+    assert waits.steps == 2
+    assert _shows_this_process_rebuilding(seen[1])
+    assert _shows_this_process_rebuilding(seen[2])  # written again at the top of the next pass
+    assert rebuilt.calls == 0  # needed() answered False under the lock
+    assert _record(persona) is None  # and the record is gone with the function's exit
+
+
+def test_a_first_start_that_waited_leaves_no_record_after_its_rebuild_ends(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rebuilt = _RebuildSpy(monkeypatch)
+    holder = OtherHolder(persona)
+    seen: list[dict | None] = []
+    WaitLog(monkeypatch, on_step={1: lambda: seen.append(_record(persona)), 2: holder.release})
+    try:
+        ensure_engine_ready(persona)
+    finally:
+        holder.release()
+    assert len(seen) == 1 and _shows_this_process_rebuilding(seen[0])
+    assert rebuilt.calls == 1 and state_of(persona).switch_over_at == NOW
+    assert _record(persona) is None
+
+
+def test_a_first_start_whose_needed_check_raises_after_the_wait_leaves_no_record(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exit only the outer `finally` covers: `needed()` runs before the in-lock record is written."""
+    holder = OtherHolder(persona)
+    seen: list[dict | None] = []
+
+    def needed_that_fails(self: object) -> bool:
+        raise RuntimeError("the re-check failed")
+
+    monkeypatch.setattr(EmotionEngine, "_first_rebuild_needed", needed_that_fails)
+    WaitLog(monkeypatch, on_step={1: lambda: (seen.append(_record(persona)), holder.release())})
+    try:
+        with pytest.raises(EngineStartupError):
+            ensure_engine_ready(persona)
+    finally:
+        holder.release()
+    assert len(seen) == 1 and _shows_this_process_rebuilding(seen[0])
+    assert _record(persona) is None
+
+
+@pytest.mark.no_base_failure(reason="a retention pin: the supervisor job's recovery rebuild never writes a record, at its wait or otherwise; it passes on the base code by design")
+def test_the_recovery_rebuild_shows_no_record_when_it_tries_the_lock(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_live(persona, SWITCHED_BY_THE_HOLDER)
+    instance = install(persona, NOW)
+    assert instance.is_live()
+    lose_the_state(persona)
+    real_lock = engine_files.state_lock
+    seen: list[dict | None] = []
+
+    def spying_lock(persona_dir: Path):  # noqa: ANN202
+        seen.append(_record(persona_dir))
+        return real_lock(persona_dir)
+
+    holder = OtherHolder(persona)
+    monkeypatch.setattr(engine_files, "state_lock", spying_lock)
+    try:
+        with pytest.raises(EngineStartupError):
+            instance.recovery_rebuild()
+    finally:
+        holder.release()
+    assert seen == [None]
+
+
+@pytest.mark.no_base_failure(reason="a pin of the written condition: a recovery-mode rebuild that is not a roll-forward has no record even with wait_for_lock; reached only by a direct call of the private method, and it passes on the base code by design")
+def test_a_recovery_mode_rebuild_that_is_not_a_roll_forward_writes_no_record_while_it_waits(
+    persona: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = install(persona, NOW)
+    holder = OtherHolder(persona)
+    seen: list[dict | None] = []
+    WaitLog(monkeypatch, on_step={1: lambda: (seen.append(_record(persona)), holder.release())})
+    try:
+        instance._locked_rebuild("recovery", lambda: False, wait_for_lock=True)
+    finally:
+        holder.release()
+    assert seen == [None]
 
 
 # --- a command's rebuild step (HS7) ------------------------------------------------------------------------------------

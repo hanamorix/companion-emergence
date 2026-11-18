@@ -91,3 +91,62 @@ def test_the_production_step_runs_the_real_child_and_it_exits_zero(
     else:
         assert engine_files.read_state(persona).state is not None
         assert engine.engine_for(persona).is_live()
+
+
+def _run_the_step(persona: Path, rebuild_spawns: RealPopenSpyLog, monkeypatch: pytest.MonkeyPatch) -> int:
+    """Run `daemon._rebuild_under_lock(persona)` with the real child, bounded; return the child's own exit code."""
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(REPO_ROOT), os.environ.get("PYTHONPATH", "")])))
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["result"] = daemon._rebuild_under_lock(persona)
+        except BaseException as exc:  # noqa: BLE001 - stored, re-raised by the test thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(BOUND_S)
+    if worker.is_alive():
+        for child in rebuild_spawns.children:
+            child.kill()
+        pytest.fail(f"the rebuild step did not finish within {BOUND_S} s")
+    if "error" in outcome:
+        raise outcome["error"]
+    assert outcome["result"] is None and len(rebuild_spawns.children) == 1
+    return rebuild_spawns.children[0].returncode
+
+
+@pytest.mark.real_rebuild_step(reason="the production step under test")
+@pytest.mark.real_rebuild_child(reason="the notice is written by the real child and read by the start process")
+def test_a_real_child_that_skips_the_switch_over_leaves_a_notice_with_its_reason(
+    rebuild_spawns: RealPopenSpyLog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona = _persona()
+    save(persona, simple_state(saved_at=T20))
+    ruin_the_state(persona)  # the state cannot be read ...
+    (persona / "memories.db").write_bytes(b"this is not a database" * 100)  # ... and neither can the database (S61's skip, exit 0)
+    assert _run_the_step(persona, rebuild_spawns, monkeypatch) == 0
+    record = engine_files.read_rebuild_notice(persona)
+    assert record is not None and record["reason"].startswith("the saved feelings and memories.db could not be read (")
+    assert not engine.engine_for(persona).is_live()
+
+
+@pytest.mark.real_rebuild_step(reason="the production step under test")
+@pytest.mark.real_rebuild_child(reason="a completing real child clears a notice an earlier attempt left")
+@pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base nothing writes or deletes the notice, so none is left by a completing child")
+def test_a_completing_real_child_leaves_no_notice(rebuild_spawns: RealPopenSpyLog, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _persona()
+    assert _run_the_step(persona, rebuild_spawns, monkeypatch) == 0
+    assert engine.engine_for(persona).is_live()
+    assert not engine_files.rebuild_notice_path(persona).exists()
+
+
+@pytest.mark.real_rebuild_step(reason="the production step under test")
+@pytest.mark.real_rebuild_child(reason="a completing real child clears a notice an earlier attempt left")
+def test_a_completing_real_child_clears_a_notice_an_earlier_attempt_left(rebuild_spawns: RealPopenSpyLog, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _persona()
+    engine_files.rebuild_notice_path(persona).write_text('{"at": "2020-01-01T00:00:00Z", "reason": "an earlier attempt"}', encoding="utf-8")
+    assert _run_the_step(persona, rebuild_spawns, monkeypatch) == 0
+    assert engine.engine_for(persona).is_live()
+    assert not engine_files.rebuild_notice_path(persona).exists()
