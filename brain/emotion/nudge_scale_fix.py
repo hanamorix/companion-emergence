@@ -108,12 +108,16 @@ def scale_up_small_feelings(persona_dir: Path) -> int | None:
     # (a long integrity check or transaction must show it is working), with no store opened for it (the unchecked open writes into
     # a damaged file) and no count (the fix is one transaction). Removed when the step ends, a step with nothing to do included:
     # it ends within moments, so the timers pause for that moment only. Never written over another live process's record.
-    # Accepted edge (P4, B47b HR5 (6)): two starts in this step inside the same few milliseconds both find no live record and
-    # both write, the later replacing the earlier. No crash, freeze or data loss; when it happens, the cost is a failed start, which
-    # at launch on an unconfirmed overlay reaches recoverUnhealthyBrain (brainRecovery.ts) and undoes the update: if the record's
-    # writer ends first, the other start falls back to the daemon's 50 s kill. It needs two starts inside the same milliseconds on
-    # the first start after the update that brings Engine 6 (well under 1 in 10,000 starts, not measured); closing it needs a lock
-    # around the record (disproportionate).
+    # Accepted edge (P4, B47b HR5 (6), as narrowed by S107): the step runs in the rebuild child (`nell supervisor rebuild`), and
+    # starts hold the start lock, so two children overlap only when a child left by a dropped start is still running when the next
+    # start's child begins. If both find no live record inside the same few milliseconds, both write, the later replacing the
+    # earlier. No crash, freeze or data loss, and no kill by the daemon (its readiness wait begins only after the rebuild, and the
+    # starter waits for its child with no limit). If the record's writer ends first, the other child shows no record until its next
+    # write; the app's start wait (lib.rs `wait_for_start`) drops the start only after 60 s with none, which ends the start command,
+    # not the child, and at launch on an unconfirmed overlay a failed start reaches recoverUnhealthyBrain (brainRecovery.ts) and
+    # undoes the update. It needs an orphaned child and a new one inside the same milliseconds on the first start after the update
+    # that brings Engine 6 (well under 1 in 10,000 starts, not measured); closing it needs a lock around the record
+    # (disproportionate).
     progress = engine_files.EngineProgress(persona_dir, "rescaling")
     try:
         progress.write()

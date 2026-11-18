@@ -234,6 +234,9 @@ export function showEngineProgress(reading: EngineProgress | null): void {
  * Safe to call with nothing shown.
  */
 export function endEngineProgress(ok: boolean): void {
+  // Accepted edge (low, HN7 of D-102): a restart that joined the launch hold gets `false` from `release(ok)` but no "failed" state,
+  // because it never ran its own `run()` (the one place that sets "failed"); the reset to IDLE below leaves the shared state idle
+  // and shows it no error. The launch's own caller still reports its failure.
   const release = releaseHold;
   const shown = engineShown;
   releaseHold = null;
