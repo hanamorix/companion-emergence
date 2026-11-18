@@ -223,10 +223,12 @@ jobs:
   # regressions were React/Tauri glue (wizard provider field, persona
   # threading, role-label leaks, stale bubbles); none would have been
   # caught by the python-only matrix.
+  # Ubuntu, not macOS (#758): vitest and the tsc + vite build don't depend on the OS (release.yml's validate job runs
+  # the same gate on Ubuntu), and the macOS arm64 runner pool is short; only jobs that need macOS wait for it.
   frontend:
     name: frontend (vitest + vite build)
     if: github.event_name != 'workflow_dispatch'
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
