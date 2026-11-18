@@ -30,6 +30,8 @@ from brain.memory.store import Memory, MemoryStore
 from brain.utils import file_ops
 from tests.unit.brain.emotion._engine_support import (
     LockSpy,
+    OtherHolder,
+    WaitLog,
     change,
     install,
     local_day,
@@ -288,19 +290,21 @@ def test_a_state_write_that_does_not_verify_is_a_failed_check_and_writes_no_swit
     assert engine_files.read_state(persona).state is None  # nothing was written, so the persona is not switched over
 
 
-def test_a_lock_that_does_not_come_raises_naming_the_lock_and_writes_nothing_after_the_x10_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_lock_that_does_not_come_is_waited_for_and_the_first_rebuild_runs_when_it_frees_after_the_x10_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _standard_persona(tmp_path)
     install(persona, NOW)
     # A real second holder of the engine lock, with the wait cut to 0.05 s: patching the lock to raise would not prove that
-    # the lock `ensure` takes is the one the other holder has (the only real wait in this file).
+    # the lock `ensure` takes is the one the other holder has (the only real wait in this file). The start-up rebuild waits for
+    # it for ever (S101, S107: it runs in the rebuild process), so the holder lets go at the second wait step.
     monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 0.05)
-    with engine_files.state_lock(persona), pytest.raises(EngineStartupError) as failure:
+    holder = OtherHolder(persona)
+    waits = WaitLog(monkeypatch, on_step={2: holder.release})
+    try:
         ensure_engine_ready(persona)
-    assert failure.value.what == "the engine lock"
-    assert not engine_files.state_path(persona).exists()
-    monkeypatch.undo()
-    ensure_engine_ready(persona)  # the x10 progress note is already 2, the rebuild runs: idempotent
-    assert state_of(persona).switch_over_at == NOW
+    finally:
+        holder.release()
+    assert waits.steps == 2
+    assert state_of(persona).switch_over_at == NOW  # the x10 fix ran before the lock; the rebuild ran once the lock came
 
 
 def test_an_x10_error_raises_naming_the_fix_takes_no_lock_and_writes_no_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

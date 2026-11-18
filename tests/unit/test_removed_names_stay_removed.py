@@ -432,10 +432,10 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("O_DIRECTORY",),
-        why="the directory-fsync flag is named only in the shared writer (#465, G3b)",
+        why="the directory-fsync flag is named only in the shared writer (#465, G3b); the write guard opens folders by descriptor to pin a commit's target (#699), never to fsync",
         ref=_ATOMIC_REF,
         kind="code",
-        allow=("brain/utils/atomic_write.py",),
+        allow=("brain/utils/atomic_write.py", "brain/files/write_guard.py"),
     ),
     Removed(
         names=("os.replace", "uuid", ".new"),
@@ -788,9 +788,16 @@ REMOVED: tuple[Removed, ...] = (
     # --- the own-record test moved to process_identity (Engine 6 HR5, Hana's review of #633 point 5) ---------------------------
     Removed(
         names=("shutdown_progress.names_this_bridge",),
-        why="`names_this_bridge` moved to `brain/process_identity.py`, the neutral module `brain/emotion` may import, because the engine's progress record uses the same own-record test as the bridge's watcher files; its five callers were re-pointed and no alias was left behind",
+        why="`names_this_bridge` moved to `brain/process_identity.py`, the neutral module `brain/emotion` may import, because the engine's progress record used the same test as the bridge's watcher files (it now uses `is_own_identity`); its five callers were re-pointed and no alias was left behind",
         ref="Engine 6 HR5 (#584, draft PR #633)",
         kind="text",
+    ),
+    # --- the bridge and the commands stop rebuilding in-process (Engine 6 S107, HS7 and HS8) ----------------------------------
+    Removed(
+        names=("_StoppedWhileWaitingError", "stop_requested", "stop_requested_seen"),
+        why="the stop check of the engine-lock wait: the bridge's start-up no longer rebuilds in-process, the rebuild process (`nell supervisor rebuild`) waits for the lock with no stop check and no limit (`_locked_rebuild(wait_for_lock=True)`), so the `stop_requested` parameters, the stopped-while-waiting error and the test stub's `stop_requested_seen` list went (`stop_requested_at`, the bridge's stop time, is a different name)",
+        ref="Engine 6 S107 HS8 (#633, Planning B55)",
+        kind="code",
     ),
 )
 

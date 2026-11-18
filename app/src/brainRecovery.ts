@@ -185,10 +185,12 @@ export async function launchBrain(persona: string): Promise<LaunchResult> {
       clearRestartState();
     }
     // The start can include the engine's first rebuild: its progress is shown on the boot screen meanwhile (HR5).
+    let started = false;
     try {
       await ensureBridgeRunning(persona, showEngineProgress);
+      started = true;
     } finally {
-      endEngineProgress();
+      endEngineProgress(started); // a restart that joined the launch's hold is told how the start went
     }
   } catch (e) {
     const error = errString(e) || "the bridge didn't start";
