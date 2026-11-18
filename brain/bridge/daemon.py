@@ -560,7 +560,8 @@ def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
 
     Accepted edges (P4, R2): the app drops a start after 60 s with no rebuild record (lib.rs ``wait_for_start``, ``kill_on_drop``),
     which ends this stop's watch too, because the stop runs inside the same ``nell supervisor start`` that ``kill_on_drop`` ends (the
-    stop writes no progress record, so the 60 s are not paused); a pre-PR or unhealthy bridge can be left half-stopped, with no
+    stop writes no progress record, so the stop itself does not pause the 60 s; another live progress record, such as one a rebuild
+    child left by an earlier dropped start still shows, would pause it); a pre-PR or unhealthy bridge can be left half-stopped, with no
     rebuild and no new bridge, until the next start repeats the stop. No data is lost, and at launch on an unconfirmed overlay a
     failed start reaches ``recoverUnhealthyBrain`` and undoes the update (brainRecovery.ts), as HR5 (6) and (7) recorded. A stop that answers 0 while a
     bridge is somehow still there is not caught here: a live bridge holds the start lock, so ``cmd_start``'s lock refuses with

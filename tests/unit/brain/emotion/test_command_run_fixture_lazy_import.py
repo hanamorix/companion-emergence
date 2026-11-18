@@ -22,7 +22,13 @@ MODULE = "brain.emotion.engine_files"
 
 @pytest.fixture
 def _engine_files_not_imported_yet(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make `brain.emotion.engine_files` look never imported; the originals come back at teardown (LIFO undo, one monkeypatch)."""
+    """Make `brain.emotion.engine_files` look never imported.
+
+    Teardown puts back what was there (the `sys.modules` entry and the package attribute, LIFO undo of one monkeypatch), so the
+    original module object comes back only when it had been imported before this test. When it had not, there is nothing to put
+    back: the copy the test imports stays in `sys.modules` and as the package attribute, which is the state an isolated run of
+    this file is in anyway.
+    """
     import brain.emotion
 
     monkeypatch.delitem(sys.modules, MODULE, raising=False)
