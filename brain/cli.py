@@ -179,12 +179,25 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
     success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
 
     A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
-    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing.
+    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing. A bridge recorded running
+    (`state_file.is_running`) is refused next, still before the first record and any engine call: one plain line on stderr, nothing
+    written, exit 2 (a hand run only; the product never spawns this process beside a bridge).
     """
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
+    # Hana's 11-18 review of #633, point 3 (Planning's HRV answer): a hand run beside a live bridge would read the bridge's
+    # committed-but-unapplied rows as a roll-forward and rebuild under it. The product spawns this process from `cmd_start`,
+    # `cmd_run` and `run_rebuild_step` only when no bridge runs (each holds the start lock, which a live bridge holds too), so
+    # only a hand run reaches this refusal. The start lock cannot be the check here: the parent holds it while its child runs.
+    # Accepted edge (P4, R2): `is_running` answers False for a bridge whose identity cannot be read and for a bridge that is
+    # still starting (the runner takes the lock before it writes the state file), so a hand run in either case is not refused and
+    # runs beside the bridge as it did before, with edge (i) of `engine.EmotionEngine._roll_forward`'s losses. It needs a hand run
+    # and one of those two states at once.
+    if state_file.is_running(persona_dir):
+        print("A bridge is running for this persona, so the rebuild was not run.", file=sys.stderr)
+        return 2
     progress = engine_files.EngineProgress(persona_dir, "rebuilding")
     progress.write()
     try:
