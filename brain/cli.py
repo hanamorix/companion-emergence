@@ -193,7 +193,9 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
 
         runner._setup_runtime_logging(persona_dir)
         # The one-time vocabulary swap (#648) comes first, so this rebuild already uses the swapped half-lives (a start has no other
-        # step before the rebuild). It logs and never raises; the marker makes a second run a no-op.
+        # step before the rebuild). It logs and never raises; the marker makes a second run a no-op. If the swap fails here, this
+        # first rebuild runs on the old half-lives and is not redone when a later swap succeeds: the #648 failure rule is "warn,
+        # start-up continues, retry at the next start".
         vocabulary_swap.run_vocabulary_swap_648(persona_dir)
         emotion_engine.ensure_engine_ready(persona_dir)
     finally:
