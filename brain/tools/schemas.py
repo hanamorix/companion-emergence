@@ -171,7 +171,9 @@ SCHEMAS: dict[str, dict] = {
             f"Returns one page, newest first: {_SOUL_DEFAULT_LIMIT} crystallisations by default, fewer "
             "when they are long, with the total and a count per love type. When more remain, the "
             "result has truncated=true and next_after: call again with after set to next_after "
-            "(and the same love_type) for the next page. Pass love_type to read one kind of love."
+            "(and the same love_type) for the next page. Pass love_type to read one kind of love. "
+            "An item too long for a page comes back clipped, with clipped_at giving how much of each cut "
+            "field is shown: read the rest with id, field and char_offset set to that number."
         ),
         "parameters": {
             "type": "object",
@@ -203,6 +205,23 @@ SCHEMAS: dict[str, dict] = {
                     "description": (
                         "Optional: the next_after a previous result gave. The page starts right after that "
                         "crystallisation, so nothing is skipped or repeated if the soul changes between calls."
+                    ),
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Optional, with field: the id of a clipped crystallisation whose text you want in full.",
+                },
+                "field": {
+                    "type": "string",
+                    "enum": ["moment", "why_it_matters", "who_or_what"],
+                    "description": "Optional, with id: which text field to read.",
+                },
+                "char_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional, with id and field: the character to start from. Use the clipped item's "
+                        "clipped_at, then each next_char_offset."
                     ),
                 },
             },

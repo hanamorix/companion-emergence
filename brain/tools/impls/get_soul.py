@@ -75,14 +75,21 @@ def _clip_to_fit(item: dict, budget: int) -> dict:
     """Shorten the item's text fields until it serialises within ``budget`` bytes.
 
     Only an item too large to share a page with anything else reaches here; it
-    is marked ``clipped`` so the model knows the text was cut.
+    is marked ``clipped`` so the model knows the text was cut, and ``clipped_at``
+    gives, for each field it cut, how many characters are shown: the
+    ``char_offset`` that reads on (#734).
     """
     clipped = {**item, "clipped": True}
     lo, hi = 0, max(len(item[f]) for f in _TEXT_FIELDS)
-    best = {**clipped, **dict.fromkeys(_TEXT_FIELDS, _CLIP_MARK)}
+    best = {
+        **clipped,
+        **dict.fromkeys(_TEXT_FIELDS, _CLIP_MARK),
+        "clipped_at": {f: 0 for f in _TEXT_FIELDS if item[f]},
+    }
     while lo <= hi:
         mid = (lo + hi) // 2
         trial = dict(clipped)
+        trial["clipped_at"] = {f: mid for f in _TEXT_FIELDS if len(item[f]) > mid}
         for f in _TEXT_FIELDS:
             if len(item[f]) > mid:
                 trial[f] = item[f][:mid] + _CLIP_MARK
@@ -99,6 +106,9 @@ def get_soul(
     offset: int = 0,
     love_type: str | None = None,
     after: str | None = None,
+    id: str | None = None,  # noqa: A002 -- the tool's argument name
+    field: str | None = None,
+    char_offset: int = 0,
     max_bytes: int | None = None,
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -117,11 +127,25 @@ def get_soul(
     added or revoked between calls can't make the walk skip or repeat one, as
     offset paging can. With ``after`` the result's ``offset`` is null.
 
+    ``id`` with ``field`` and ``char_offset`` (#734) reads one text field of one
+    crystallization from that character, as much as fits the bound, for an item
+    a page showed clipped (its ``clipped_at`` gives the offset to start from).
+
     ``max_bytes`` is not in the tool schema: ``boot`` passes the room left
     beside its other parts. It can only lower the bound, never raise it.
     """
     from brain.soul.love_types import LOVE_TYPES
     from brain.soul.store import SoulStore
+
+    parsed_budget = _as_int(max_bytes)
+    budget = MAX_RESULT_BYTES if parsed_budget is None else min(parsed_budget, MAX_RESULT_BYTES)
+    if id is not None or field is not None:
+        if after is not None or love_type is not None or _as_int(offset) not in (0, None):
+            return {
+                "loaded": False,
+                "error": "id and field read one item's text: leave out after, offset and love_type with them.",
+            }
+        return _read_field(persona_dir, id, field, char_offset, budget)
 
     if love_type is not None and love_type not in LOVE_TYPES:
         return {
@@ -213,9 +237,7 @@ def get_soul(
     longest = max((r.id for r in rows), key=len, default=after)
     reserve = result_bytes(finish([], longest_id=longest)) + 64
     # A caller embedding this page in a larger result (boot) passes what is left
-    # of the bound; never more than the bound itself.
-    parsed_budget = _as_int(max_bytes)
-    budget = MAX_RESULT_BYTES if parsed_budget is None else min(parsed_budget, MAX_RESULT_BYTES)
+    # of the bound (``budget`` above); never more than the bound itself.
     items: list[dict] = []
     for row in rows:
         item = row.to_dict()
@@ -232,3 +254,47 @@ def get_soul(
         break
 
     return finish(items)
+
+
+def _read_field(persona_dir: Path, cid: str | None, field: str | None, char_offset: Any, budget: int) -> dict:
+    """One text field of one active crystallization, from ``char_offset``, as much as fits ``budget`` (#734)."""
+    from brain.soul.store import SoulStore
+
+    if not cid or not isinstance(cid, str):
+        return {"loaded": False, "error": "pass the id of the crystallization whose text you want to read."}
+    if field not in _TEXT_FIELDS:
+        return {"loaded": False, "error": f"field must be one of {', '.join(_TEXT_FIELDS)}, got {field!r}."}
+    start = _as_int(char_offset)
+    if start is None:
+        return {"loaded": False, "error": f"char_offset must be a whole number (0 for the start), got {char_offset!r}."}
+    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        crystal = soul_store.get(cid)
+    finally:
+        soul_store.close()
+    if crystal is None or crystal.revoked_at is not None:
+        return {"loaded": False, "error": f"no active crystallization has id {cid!r}."}
+    text = crystal.to_dict()[field]
+    start = min(max(start, 0), len(text))
+    out: dict[str, Any] = {
+        "loaded": True,
+        "id": cid,
+        "field": field,
+        "char_offset": start,
+        "length": len(text),
+        "text": "",
+        "next_char_offset": None,
+    }
+
+    def with_text(end: int) -> dict:
+        return {**out, "text": text[start:end], "next_char_offset": end if end < len(text) else None}
+
+    # The longest slice from `start` whose result fits the bound.
+    lo, hi = start, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if result_bytes(with_text(mid)) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return with_text(lo)

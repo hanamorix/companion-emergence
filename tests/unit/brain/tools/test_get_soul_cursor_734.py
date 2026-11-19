@@ -110,3 +110,57 @@ def test_the_schema_offers_after():
     params = SCHEMAS["get_soul"]["parameters"]
     assert params["properties"]["after"]["type"] == "string"
     assert "next_after" in SCHEMAS["get_soul"]["description"]
+
+
+# ---- #734 part 2: a clipped item's text can be read in full ----
+def test_a_clipped_item_can_be_read_field_by_field(tmp_path):
+    from brain.tools.impls.get_soul import MAX_RESULT_BYTES, result_bytes
+
+    big = "ł" * 20_000  # 40 KB of UTF-8 per field
+    _add(tmp_path, "huge", minutes=0, moment=big + "m", why_it_matters=big + "w", who_or_what="someone")
+
+    page = get_soul(**_ctx(tmp_path))
+    (item,) = page["crystallizations"]
+    assert item["clipped"] is True
+    assert set(item["clipped_at"]) == {"moment", "why_it_matters"}  # who_or_what fitted whole
+
+    for field, want in (("moment", big + "m"), ("why_it_matters", big + "w")):
+        got, at, reads = "", item["clipped_at"][field], 0
+        assert item[field].removesuffix("…") == want[:at]
+        got = want[:at]
+        while at is not None:
+            part = get_soul(id="huge", field=field, char_offset=at, **_ctx(tmp_path))
+            assert part["loaded"] is True and result_bytes(part) <= MAX_RESULT_BYTES
+            assert part["char_offset"] == at and part["length"] == len(want)
+            got += part["text"]
+            at = part["next_char_offset"]
+            reads += 1
+            assert reads < 20
+        assert got == want, field
+
+
+def test_a_field_read_names_each_mistake(tmp_path):
+    _add(tmp_path, "c1", minutes=0)
+    _add(tmp_path, "gone", minutes=1)
+    _revoke(tmp_path, "gone")
+    cases = {
+        "unknown id": {"id": "nope", "field": "moment"},
+        "revoked id": {"id": "gone", "field": "moment"},
+        "no field": {"id": "c1"},
+        "bad field": {"id": "c1", "field": "love_type"},
+        "with after": {"id": "c1", "field": "moment", "after": "c1"},
+        "with love_type": {"id": "c1", "field": "moment", "love_type": "craft"},
+    }
+    for name, args in cases.items():
+        out = get_soul(**args, **_ctx(tmp_path))
+        assert out["loaded"] is False and out["error"], name
+
+
+def test_the_schema_offers_the_field_read():
+    from brain.tools.schemas import SCHEMAS
+
+    props = SCHEMAS["get_soul"]["parameters"]["properties"]
+    assert props["id"]["type"] == "string"
+    assert set(props["field"]["enum"]) == {"moment", "why_it_matters", "who_or_what"}
+    assert props["char_offset"]["type"] == "integer"
+    assert "clipped_at" in SCHEMAS["get_soul"]["description"]
