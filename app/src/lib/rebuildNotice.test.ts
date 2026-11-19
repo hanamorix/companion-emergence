@@ -40,10 +40,16 @@ describe("rebuildNoticeMessage", () => {
     expect(text).toBe("Mira's feelings could not be brought up to date. The app is using the ones saved before.");
   });
 
-  it.each([[""], ["   "]])("falls back to Your when the name is %j", (name) => {
+  it.each([[""], ["   "]])("falls back to a neutral subject when the name is %j", (name) => {
     const text = rebuildNoticeMessage({ reason: null, log_path: null }, name);
-    expect(text).toBe("Your feelings could not be brought up to date. The app is using the ones saved before.");
+    expect(text).toBe("The feelings could not be brought up to date. The app is using the ones saved before.");
     expect(text).not.toMatch(/^'s/);
+  });
+
+  it("never addresses the user as Your, with or without a name", () => {
+    for (const name of ["Nell", "", "   "]) {
+      expect(rebuildNoticeMessage({ reason: "x", log_path: "/p" }, name)).not.toContain("Your");
+    }
   });
 
   it("removes control characters from the reason and cuts it, but keeps a long path whole", () => {
