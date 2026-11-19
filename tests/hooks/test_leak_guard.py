@@ -334,10 +334,15 @@ def _push_hook(cwd, sha):
     import subprocess
 
     env = {**os.environ, "LEAK_GUARD_FORCE": "1"}
-    return subprocess.run(
+    # Bytes, not text: git writes "\n", and text mode on Windows would send "\r\n", which the hook's `read` keeps as
+    # part of the remote sha (so "0000...\r" is not the new-branch zero and rev-list fails).
+    done = subprocess.run(
         [_shell(), "hooks/pre-push", "origin", "https://example.invalid/scratch.git"],
-        cwd=cwd, input=f"refs/heads/feat {sha} refs/heads/feat {_ZERO}\n",
-        capture_output=True, text=True, env=env,
+        cwd=cwd, input=f"refs/heads/feat {sha} refs/heads/feat {_ZERO}\n".encode("ascii"),
+        capture_output=True, env=env,
+    )
+    return subprocess.CompletedProcess(
+        done.args, done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace")
     )
 
 
@@ -350,7 +355,7 @@ def test_a_push_from_a_worktree_uses_the_main_checkouts_local_rules(tmp_path):
     result = _push_hook(wt, sha)
 
     assert result.returncode == 1, result.stderr
-    assert "REJECTED" in result.stderr
+    assert "LEAK-GUARD [content]" in result.stderr and "Traceback" not in result.stderr, result.stderr
 
 
 @pytest.mark.no_base_failure(reason="pins that a push from the main checkout still uses its own rules (#761); main does too")
@@ -363,6 +368,7 @@ def test_a_push_from_the_main_checkout_still_uses_its_rules(tmp_path):
     result = _push_hook(main, sha)
 
     assert result.returncode == 1, result.stderr
+    assert "LEAK-GUARD [content]" in result.stderr and "Traceback" not in result.stderr, result.stderr
 
 
 def test_no_rules_file_anywhere_warns_and_still_passes_a_clean_push(tmp_path):
@@ -374,3 +380,4 @@ def test_no_rules_file_anywhere_warns_and_still_passes_a_clean_push(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "leak-rules.local" in result.stderr and "not checked" in result.stderr
+    assert "Traceback" not in result.stderr
