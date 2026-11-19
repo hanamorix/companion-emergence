@@ -1421,6 +1421,9 @@ def build_app(
         finally:
             _vocab_store.close()
 
+        # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
+        # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.
+
         # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
         # own failures and never raises.
         emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))

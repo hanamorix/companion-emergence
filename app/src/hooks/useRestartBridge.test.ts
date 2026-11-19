@@ -8,12 +8,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 
 import * as bridge from "../bridge";
+import type { EngineProgress } from "../bridge";
 import * as appConfig from "../appConfig";
 import {
   _resetRestartBridgeForTests,
   awaitStoppingBridge,
   clearRestartState,
+  endEngineProgress,
+  engineProgressLine,
   EVERYTHING_STOPPED,
+  showEngineProgress,
   HARD_EXIT_DONE,
   HARD_EXIT_OFFER_AFTER_MS,
   offerLine,
@@ -53,6 +57,8 @@ interface World {
   unknownReads: number;
   statusUnknown: boolean;
   readError: boolean;
+  /** The start-up record a live engine writer leaves (HR5): shown by `status --json` while the bridge starts. */
+  engineProgress: EngineProgress | null;
 }
 
 function fresh(): World {
@@ -70,6 +76,7 @@ function fresh(): World {
     unknownReads: 0,
     statusUnknown: false,
     readError: false,
+    engineProgress: null,
   };
 }
 
@@ -101,6 +108,7 @@ function mocks() {
         proven: w.proven,
         phase: w.phase,
         stop_requested_at: w.requestedAt,
+        engine_progress: w.engineProgress,
       };
     }),
     read: vi.spyOn(bridge, "readBridgeShutdown").mockImplementation(async () => {
@@ -197,7 +205,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     w.alive = "gone"; // the last task ended and the bridge exited
     await advance(6000);
     expect(result.current.progress).toBe(EVERYTHING_STOPPED);
-    expect(m.start).toHaveBeenCalledWith(PERSONA); // (i) the normal start, after the old bridge is gone
+    expect(m.start).toHaveBeenCalledWith(PERSONA, expect.any(Function)); // (i) the normal start, after the old bridge is gone
     await expect(run.done()).resolves.toBe(true);
     expect(result.current.state).toBe("reconnecting");
 
@@ -283,7 +291,7 @@ describe("useRestartBridge: a new bridge (#456)", () => {
     w.alive = "gone"; // the bridge acted on the request
     await advance(6000);
     expect(result.current.progress).toBe(HARD_EXIT_DONE);
-    expect(m.start).toHaveBeenCalledWith(PERSONA);
+    expect(m.start).toHaveBeenCalledWith(PERSONA, expect.any(Function));
     await expect(run.done()).resolves.toBe(true);
     expect(m.force).not.toHaveBeenCalled();
   });
@@ -603,7 +611,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     await advance(TIMEOUT_SHUTDOWN_MS + 100);
     await expect(run.done()).resolves.toBe(true);
     expect(m.force).not.toHaveBeenCalled();
-    expect(m.start).toHaveBeenCalledWith(PERSONA);
+    expect(m.start).toHaveBeenCalledWith(PERSONA, expect.any(Function));
   });
 
   it("(j) an unproven pre-PR record takes the normal start at once", async () => {
@@ -616,7 +624,7 @@ describe("useRestartBridge: a pre-PR bridge (#456 C17 j, k)", () => {
     const run = startRestart(() => result.current.restart());
     await advance(100);
     await expect(run.done()).resolves.toBe(true);
-    expect(m.start).toHaveBeenCalledWith(PERSONA);
+    expect(m.start).toHaveBeenCalledWith(PERSONA, expect.any(Function));
     expect(m.shutdown).not.toHaveBeenCalled();
     expect(m.force).not.toHaveBeenCalled();
   });
@@ -861,5 +869,318 @@ describe("useRestartBridge: one restart app-wide (#310, #335)", () => {
     await waitFor(() => expect(result.current.state).toBe("idle"));
     const freshHook = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
     expect(freshHook.result.current.state).toBe("idle");
+  });
+});
+
+// HR5 (B47b): the start-up record of the engine's first rebuild, shown on the launch, restart and forced-restart screens,
+// and the app's 30 s /health waits paused while it is shown.
+const REC: EngineProgress = { phase: "rebuilding", done: 5, total: 10 };
+const REC_LINE = "Updating your memories: 5 of 10 (50%).";
+
+/** A promise a test settles by hand (the blocking start the app awaits). */
+function gate(): { promise: Promise<void>; open: () => void; fail: (e: Error) => void } {
+  let open!: () => void;
+  let fail!: (e: Error) => void;
+  const promise = new Promise<void>((res, rej) => {
+    open = res;
+    fail = rej;
+  });
+  return { promise, open, fail };
+}
+
+describe("engineProgressLine: the words (persona-app wording, the owner's I10 list)", () => {
+  it("shows done of total with the percentage while the rebuild counts", () => {
+    expect(engineProgressLine({ phase: "rebuilding", done: 5, total: 10 })).toBe(REC_LINE);
+    expect(engineProgressLine({ phase: "rebuilding", done: 1, total: 3 })).toBe("Updating your memories: 1 of 3 (33%).");
+  });
+
+  it("says it is getting ready before the total is known", () => {
+    const line = "Getting ready to update your memories.";
+    expect(engineProgressLine({ phase: "rebuilding", done: null, total: null })).toBe(line);
+    expect(engineProgressLine({ phase: "rebuilding", done: 0, total: 0 })).toBe(line);
+  });
+
+  it("names the scale update without a count", () => {
+    expect(engineProgressLine({ phase: "rescaling", done: null, total: null })).toBe("Updating the scale of your memories.");
+  });
+
+  it("keeps the percentage within 0 to 100 and falls back to the first line for anything unusable", () => {
+    expect(engineProgressLine({ phase: "rebuilding", done: 12, total: 10 })).toBe("Updating your memories: 10 of 10 (100%).");
+    expect(engineProgressLine({ phase: "rebuilding", done: -3, total: 10 })).toBe("Updating your memories: 0 of 10 (0%).");
+    expect(engineProgressLine({ phase: "rebuilding", done: null, total: 10 })).toBe("Getting ready to update your memories.");
+    expect(engineProgressLine({ phase: "something-new", done: null, total: null })).toBe("Getting ready to update your memories.");
+  });
+});
+
+describe("useRestartBridge: the start-up progress on the screens (HR5 part 5)", () => {
+  it("the restart screen shows the progress during the blocking start, then clears it (progress only)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    const start = gate();
+    m.start.mockImplementation(async (_persona, onProgress) => {
+      onProgress?.(REC);
+      await start.promise;
+      w = fresh();
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(1000);
+    expect(result.current.state).toBe("starting");
+    expect(result.current.progress).toBe(REC_LINE);
+    expect(result.current.offerHardExit).toBe(false);
+    start.open();
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.progress).toBeNull();
+    expect(result.current.state).toBe("reconnecting");
+  });
+
+  it("a failed start inside a restart keeps errorDetail and clears the progress", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    const start = gate();
+    m.start.mockImplementation(async (_persona, onProgress) => {
+      onProgress?.(REC);
+      await start.promise;
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(1000);
+    expect(result.current.progress).toBe(REC_LINE);
+    start.fail(new Error("supervisor_start_timeout"));
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(false);
+    expect(result.current.errorDetail).toBe("supervisor_start_timeout"); // a full reset would have cleared it
+    expect(result.current.progress).toBeNull();
+    expect(result.current.state).toBe("failed");
+  });
+
+  it("the stop's own last line ('Everything has stopped.') is not wiped by a start that showed no progress", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.tasks = ["chat reply"];
+    const m = mocks();
+    const start = gate();
+    m.start.mockImplementation(async () => {
+      await start.promise;
+      w = fresh();
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(1000);
+    w.alive = "gone";
+    await advance(6000);
+    expect(result.current.state).toBe("starting");
+    expect(result.current.progress).toBe(EVERYTHING_STOPPED);
+    start.open();
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.progress).toBe(EVERYTHING_STOPPED); // nothing engine-related was shown, so nothing is cleared
+  });
+
+  it("the forced-restart screen shows the progress during the blocking invokeForceRestart call", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false; // hung: the forced path
+    const m = mocks();
+    const kill = gate();
+    m.force.mockImplementation(async () => {
+      await kill.promise;
+      w = fresh();
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(2000);
+    expect(m.force).toHaveBeenCalledTimes(1);
+    expect(result.current.state).toBe("forcing");
+    await advance(6000); // a status read with no record yet: still the forcing state
+    expect(result.current.state).toBe("forcing");
+    w.engineProgress = REC; // the new bridge's rebuild starts writing its record
+    await advance(5000);
+    expect(result.current.state).toBe("starting");
+    expect(result.current.progress).toBe(REC_LINE);
+    kill.open();
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(true);
+    expect(result.current.progress).toBeNull();
+    expect(result.current.state).toBe("reconnecting");
+  });
+
+  it("the forced restart returns to a clean state when the blocking call fails, keeping errorDetail", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false;
+    w.engineProgress = REC;
+    const m = mocks();
+    const kill = gate();
+    m.force.mockImplementation(async () => {
+      await kill.promise;
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(8000);
+    expect(result.current.progress).toBe(REC_LINE);
+    kill.fail(new Error("kill failed"));
+    await advance(1000);
+    await expect(run.done()).resolves.toBe(false);
+    expect(result.current.errorDetail).toBe("kill failed");
+    expect(result.current.progress).toBeNull();
+  });
+
+  it("showEngineProgress outside a restart holds the app-wide start (the watchdog stays out) and endEngineProgress returns to idle", async () => {
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => showEngineProgress(REC));
+    expect(restartInFlight()).toBe(true);
+    expect(result.current.state).toBe("starting");
+    expect(result.current.progress).toBe(REC_LINE);
+    let joined: Promise<boolean> = Promise.resolve(false);
+    act(() => {
+      joined = restartBridge(PERSONA); // a restart asked for while a launch holds the start joins it
+    });
+    act(() => endEngineProgress(true)); // the start succeeded
+    await expect(joined).resolves.toBe(true);
+    expect(restartInFlight()).toBe(false);
+    expect(result.current.state).toBe("idle");
+    expect(result.current.progress).toBeNull();
+  });
+
+  it("(HN7) a restart that joined the launch's hold is told the start's real outcome: false when the start failed", async () => {
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => showEngineProgress(REC));
+    let joined: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      joined = restartBridge(PERSONA);
+    });
+    act(() => endEngineProgress(false)); // the start threw
+    await expect(joined).resolves.toBe(false);
+    expect(restartInFlight()).toBe(false);
+    expect(result.current.state).toBe("idle");
+    expect(result.current.progress).toBeNull();
+  });
+
+  it("a reading that goes absent takes the line down, and endEngineProgress with nothing shown does nothing", () => {
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    act(() => endEngineProgress(true));
+    expect(result.current.state).toBe("idle");
+    expect(restartInFlight()).toBe(false);
+    act(() => showEngineProgress(REC));
+    expect(result.current.progress).toBe(REC_LINE);
+    act(() => showEngineProgress(null));
+    expect(result.current.progress).toBeNull();
+    act(() => endEngineProgress(true));
+    expect(restartInFlight()).toBe(false);
+    expect(result.current.state).toBe("idle");
+  });
+});
+
+describe("useRestartBridge: the app's /health waits pause while engine progress is shown (HR5 part 4)", () => {
+  it("startFresh's wait goes past 30 s while the record shows, and gives up at its budget once it is gone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    m.start.mockImplementation(async () => {
+      w = { ...fresh(), health: false, engineProgress: REC }; // the bridge runs its first rebuild; /health is closed
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const settled = vi.fn();
+    const run = startRestart(() => result.current.restart());
+    void run.done().then(settled, settled);
+    await advance(TIMEOUT_HEALTH_MS + 20_000);
+    expect(settled).not.toHaveBeenCalled(); // paused, not given up
+    w.engineProgress = null; // the rebuild ended, the bridge still does not answer
+    await advance(TIMEOUT_HEALTH_MS + 10_000);
+    expect(settled).toHaveBeenCalled();
+    await expect(run.done()).resolves.toBe(false);
+    expect(result.current.errorDetail).toMatch(/Restart failed/);
+  });
+
+  it("startFresh's wait with no record gives up at its 30 s budget", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    const m = mocks();
+    m.start.mockImplementation(async () => {
+      w = { ...fresh(), health: false };
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const run = startRestart(() => result.current.restart());
+    await advance(TIMEOUT_HEALTH_MS + 6000);
+    await expect(run.done()).resolves.toBe(false);
+  });
+
+  it("the wait after a forced restart pauses too, and a timed-out status read keeps the paused reading for under 30 s", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.health = false;
+    const m = mocks();
+    m.force.mockImplementation(async () => {
+      w = { ...fresh(), health: false, engineProgress: REC };
+    });
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    const settled = vi.fn();
+    const run = startRestart(() => result.current.restart());
+    void run.done().then(settled, settled);
+    await advance(TIMEOUT_HEALTH_MS / 2);
+    // every later status read times out: the previous reading stays for under 30 s after the last real answer (about 15 s),
+    // so the credit runs to about 45 s and the wait is still going at the 65 s this test ends at; it gives up after that
+    w.statusUnknown = true;
+    await advance(TIMEOUT_HEALTH_MS + 20_000);
+    expect(settled).not.toHaveBeenCalled();
+  });
+
+  it("awaitHealth (after a service install) pauses while the record shows, then gives up at its budget", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    mocks();
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(
+        PERSONA,
+        async () => {
+          w = { ...fresh(), health: false, engineProgress: REC }; // the service's bridge is in its first rebuild
+        },
+        { start: true },
+      );
+    });
+    const settled = vi.fn();
+    void p.then(settled, settled);
+    await advance(TIMEOUT_HEALTH_MS + 20_000);
+    expect(settled).not.toHaveBeenCalled();
+    w.engineProgress = null;
+    await advance(TIMEOUT_HEALTH_MS + 10_000);
+    const result = await p;
+    expect(result.stopped).toBe(true);
+    expect(result.error).toMatch(/Restart failed/);
+  });
+
+  it("awaitHealth shows the progress, and the state returns to a clean one when /health answers", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    w.alive = "gone";
+    mocks();
+    const { result } = renderHook(() => useRestartBridge(PERSONA, "bridge_down"));
+    let p: Promise<{ stopped: boolean; error: string | null }> = Promise.resolve({ stopped: false, error: null });
+    act(() => {
+      p = stopBridgeThen(
+        PERSONA,
+        async () => {
+          w = { ...fresh(), health: false, engineProgress: REC };
+        },
+        { start: true },
+      );
+    });
+    await advance(2000);
+    expect(result.current.progress).toBe(REC_LINE);
+    w.health = true;
+    w.engineProgress = null;
+    await advance(6000);
+    await expect(p).resolves.toEqual({ stopped: true, error: null });
+    expect(result.current.progress).toBeNull();
   });
 });

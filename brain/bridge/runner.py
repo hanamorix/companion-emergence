@@ -122,6 +122,26 @@ _RUNTIME_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _RUNTIME_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 
+def _find_runtime_log_handler(persona_dir: Path) -> bool:
+    """Is the persistent (size-rotating) handler for this persona's runtime log on the root logger? The append-and-close
+    transient handler is not it. A failed path lookup raises."""
+    from logging.handlers import RotatingFileHandler
+
+    from brain.paths import runtime_log_path
+
+    path = str(runtime_log_path(persona_dir.name).resolve())
+    return any(isinstance(h, RotatingFileHandler) and h.baseFilename == path for h in logging.getLogger().handlers)
+
+
+def _runtime_log_attached(persona_dir: Path) -> bool:
+    """Best-effort form of the lookup, like the other runtime-log helpers, for callers that only decide whether to attach
+    a transient handler: a failed lookup answers False. ``_setup_runtime_logging`` uses the raising form."""
+    try:
+        return _find_runtime_log_handler(persona_dir)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _setup_runtime_logging(persona_dir: Path) -> None:
     """Attach a size-rotating handler to the runner's root logger.
 
@@ -152,7 +172,7 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
         log_dir.mkdir(parents=True, exist_ok=True)
         path = runtime_log_path(persona_dir.name)
         root = logging.getLogger()
-        if any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(path.resolve()) for h in root.handlers):
+        if _find_runtime_log_handler(persona_dir):
             return  # already set up (``supervisor run`` sets it up before the start back-off wait, D26)
         handler = RotatingFileHandler(
             path,
