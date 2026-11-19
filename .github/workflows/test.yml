@@ -218,15 +218,45 @@ jobs:
           KINDLED_RUN_STRESS: "1"  # adds the 60s C15(c) write-lock stress test and its stand-in tests (#421, #540)
         run: uv run --python 3.13 pytest tests/bridge tests/unit/brain/bridge -v --tb=short
 
+  # #740: `requires-python` has no upper bound, so a dev machine whose default Python is 3.14 builds its .venv there,
+  # and a break that only shows on 3.14 passed CI twice (#678, #700). The whole suite, on one OS: both breaks were
+  # OS-independent, and the macOS runner pool is short (#758). The CPU budget stays on the main matrix's Ubuntu leg,
+  # so a slow runner can't fail it twice. Tests: tests/unit/scripts/test_ci_python_314.py.
+  python-314:
+    name: python 3.14 (full suite)
+    if: github.event_name != 'workflow_dispatch'
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.14
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --all-extras --python 3.14
+
+      # The main matrix's command (see its comment for -n / --dist / -p), with no path: the whole suite.
+      - name: Run pytest
+        run: uv run --python 3.14 pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short
+
   # Audit 2026-05-07 P2-5: frontend tests + production build now gate
   # PRs the same way Python does. The previous release cycle's biggest
   # regressions were React/Tauri glue (wizard provider field, persona
   # threading, role-label leaks, stale bubbles); none would have been
   # caught by the python-only matrix.
+  # Ubuntu, not macOS (#758): vitest and the tsc + vite build don't depend on the OS (release.yml's validate job runs
+  # the same gate on Ubuntu), and the macOS arm64 runner pool is short; only jobs that need macOS wait for it.
   frontend:
     name: frontend (vitest + vite build)
     if: github.event_name != 'workflow_dispatch'
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -260,9 +290,35 @@ jobs:
   # nell_command resolution, subprocess timeouts) are mostly Rust;
   # without a CI gate, regressions only surface at release-build
   # time or on first user double-click.
+  #
+  # #758: GitHub's macOS arm64 pool is short of runners, so on a PR this job runs only when the PR changes
+  # something the Rust build or its tests read (scripts/ci_touches_rust.py lists them). Every push to main
+  # runs it, and tauri-linux-windows still builds and tests the workspace on every PR. It fails open: a
+  # failed or skipped rust-changes job runs cargo.
+  rust-changes:
+    name: rust changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      # A PR checks out its merge commit; the first parent is the base tip, so HEAD^1..HEAD is the PR's diff.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Does the PR change what the Rust build reads?
+        id: diff
+        shell: bash
+        run: git diff --name-only HEAD^1 HEAD | python3 scripts/ci_touches_rust.py >> "$GITHUB_OUTPUT"
+
   tauri:
     name: tauri (cargo check + test)
-    if: github.event_name != 'workflow_dispatch'
+    needs: rust-changes
+    if: >-
+      !cancelled() && github.event_name != 'workflow_dispatch'
+      && (needs.rust-changes.result != 'success' || needs.rust-changes.outputs.rust == 'true')
     runs-on: macos-latest
     steps:
       - name: Checkout
