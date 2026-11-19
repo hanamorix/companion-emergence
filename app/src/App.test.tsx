@@ -401,9 +401,25 @@ describe("App rebuild notice (HRF)", () => {
     const el = await screen.findByTestId("rebuild-notice");
     expect(el).toHaveAttribute("role", "status");
     expect(el.textContent).toBe(
-      "Your feelings could not be brought up to date: the first rebuild failed (OSError: disk full). " +
+      "Nell's feelings could not be brought up to date: the first rebuild failed (OSError: disk full). " +
         "The app is using the ones saved before. Details are in the log: /logs/runtime-nell.log.",
     );
+  });
+
+  it("names the persona by the capitalized name the window shows, not the folder name raw", async () => {
+    // The config persona ("wes") differs from state.persona ("nell"), so the name can only come from the Ready prop.
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("wes"));
+    fetchPersonaState
+      .mockReset()
+      .mockResolvedValue(stateWith({ rebuild_notice: { reason: "the update stopped", log_path: null } }));
+    render(<App />);
+
+    const el = await screen.findByTestId("rebuild-notice");
+    expect(el.textContent).toBe(
+      "Wes's feelings could not be brought up to date: the update stopped. The app is using the ones saved before.",
+    );
+    expect(el.textContent).not.toContain("wes's");
+    expect(el.textContent).not.toContain("Nell");
   });
 
   it("shows the message without a path when log_path is null", async () => {
@@ -414,7 +430,7 @@ describe("App rebuild notice (HRF)", () => {
 
     const el = await screen.findByTestId("rebuild-notice");
     expect(el.textContent).toBe(
-      "Your feelings could not be brought up to date: the update stopped. The app is using the ones saved before.",
+      "Nell's feelings could not be brought up to date: the update stopped. The app is using the ones saved before.",
     );
   });
 
