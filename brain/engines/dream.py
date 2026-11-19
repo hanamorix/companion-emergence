@@ -201,6 +201,11 @@ class DreamEngine:
         if eng is not None:
             mood = EmotionalState(emotions={name: r.short for name, r in eng.read().items()})
         else:
+            # Accepted edge (ThinkerOfThoughts, #742): this off path is reached by a start that skipped the switch-over,
+            # or by a saved state that cannot be read, which can last the whole bridge session. An empty mood pools every
+            # candidate, as it does on the live path during a rebuild, and grief breadcrumbs are seed candidates by
+            # design, so a grief breadcrumb can win the seed here: a dream seeded from an important memory, nothing lost.
+            # No grief_event filter on either path.
             mood = EmotionalState()
         crystallizations = self.soul_store.list_active() if self.soul_store else []
         recent = self._recent_seed_ids(self.refractory_window)

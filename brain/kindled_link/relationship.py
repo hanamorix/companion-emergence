@@ -218,12 +218,15 @@ def run_relationship_reflection(
       <persona_dir>/kindled_link/reflection_rejections.jsonl (fail-soft).
 
     mem_store: optional MemoryStore (parent §14 wire-back). When provided
-      AND the verdict carries a non-empty `memory_summary`, the capped
-      emotion (via apply_peer_emotion) and a provenance-marked kindled_peer
-      memory (via write_kindled_peer_memory) are written after the
-      relationship state persists. Default None preserves prior behaviour
-      exactly (no write, no new caller obligations). Never fires on the
-      hard_breach early-return path — a breach must not seed warmth.
+      AND the verdict carries a non-empty `memory_summary`, a provenance-marked
+      kindled_peer memory (via write_kindled_peer_memory) is written after the
+      relationship state persists, its feelings one of three ways: live (the
+      engine reads), the model's 0-10 values; on the engine scale but not live,
+      the values put through the peer cap (apply_peer_emotion) at a tenth and
+      stored at 0-10; otherwise, the capped values on the small scale. Default
+      None preserves prior behaviour exactly (no write, no new caller
+      obligations). Never fires on the hard_breach early-return path — a
+      breach must not seed warmth.
     """
     # m9: today must agree with now's date or the cap reads the wrong day
     # (same guard the session engine enforces). Caller bug → fail-soft no-op.
