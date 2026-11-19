@@ -18,7 +18,13 @@ import {
 } from "./appConfig";
 import { fetchHealth } from "./bridge";
 import { ensureBridgeCurrent } from "./bridgeVersionCheck";
-import { awaitStoppingBridge, clearRestartState, restartBridge } from "./hooks/useRestartBridge";
+import {
+  awaitStoppingBridge,
+  clearRestartState,
+  endEngineProgress,
+  restartBridge,
+  showEngineProgress,
+} from "./hooks/useRestartBridge";
 import { errString } from "./lib/errString";
 
 export type UndoKind = BrainOverlayStatus["undo"];
@@ -178,7 +184,14 @@ export async function launchBrain(persona: string): Promise<LaunchResult> {
     } finally {
       clearRestartState();
     }
-    await ensureBridgeRunning(persona);
+    // The start can include the engine's first rebuild: its progress is shown on the boot screen meanwhile (HR5).
+    let started = false;
+    try {
+      await ensureBridgeRunning(persona, showEngineProgress);
+      started = true;
+    } finally {
+      endEngineProgress(started); // a restart that joined the launch's hold is told how the start went
+    }
   } catch (e) {
     const error = errString(e) || "the bridge didn't start";
     const status = (await quickP) ?? (await patientStatus());

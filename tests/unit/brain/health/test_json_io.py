@@ -2824,6 +2824,89 @@ def test_cj4_the_tail_scan_is_linear_in_the_length_of_one_long_line(tmp_path: Pa
     assert big < small * 8 + 0.1, (small, big)
 
 
+# ---- iter_jsonl_reversed (Engine 6 HR3): rows from the last line back, one chunked backward loop ----
+
+
+def test_hr3_reversed_yields_rows_rightmost_first(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"n": 1}\n\n{"n": 2}\r\n   \n{"n": 3}')  # a blank line, a CRLF line, a last line with no newline
+    assert [r["n"] for r in jio.iter_jsonl_reversed(p)] == [3, 2, 1]
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 13, 8192])
+def test_hr3_reversed_matches_the_forward_read_reversed_at_any_chunk_size(tmp_path: Path, monkeypatch, chunk: int) -> None:
+    monkeypatch.setattr(jio, "_TAIL_CHUNK", chunk)
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b"".join(f'{{"n": {i}, "t": "é{"x" * i}"}}\n'.encode() for i in range(40)))
+    assert list(jio.iter_jsonl_reversed(p)) == list(reversed(jio.read_jsonl(p)))
+
+
+def test_hr3_reversed_reads_a_first_line_that_has_a_byte_order_mark(tmp_path: Path) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'\xef\xbb\xbf{"n": 1}\n{"n": 2}\n')
+    assert [r["n"] for r in jio.iter_jsonl_reversed(p)] == [2, 1]
+
+
+def test_hr3_reversed_closes_the_file_when_the_reader_stops_early(tmp_path: Path, monkeypatch) -> None:
+    import brain.health.json_io as real_jio
+
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"n": 1}\n{"n": 2}\n{"n": 3}\n')
+    opened = []
+    real_open = open
+
+    def tracking(path, *args, **kwargs):
+        fh = real_open(path, *args, **kwargs)
+        opened.append(fh)
+        return fh
+
+    monkeypatch.setattr(real_jio, "open", tracking, raising=False)
+    gen = jio.iter_jsonl_reversed(p)
+    assert next(gen)["n"] == 3
+    assert len(opened) == 1 and not opened[0].closed
+    gen.close()
+    assert opened[0].closed
+
+
+def test_hr3_reversed_skips_a_bad_line_and_goes_on_backwards_with_one_warning_naming_file_and_position(
+    tmp_path: Path, caplog
+) -> None:
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"n": 1}\n{"n": 2}\nnot json\n[1, 2]\n{"n": 5}\n\xff\xfe broken\n')
+    with caplog.at_level(logging.DEBUG, logger="brain.health.json_io"):
+        assert [r["n"] for r in jio.iter_jsonl_reversed(p)] == [5, 2, 1]
+    loud = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(loud) == 1  # throttled per path
+    assert caplog.records and all(r.name == "brain.health.json_io" for r in caplog.records)
+    text = loud[0].getMessage()
+    assert str(p) in text
+    assert " 1 " in text  # the first bad line met is the last non-blank line, position 1 from the end
+
+
+def test_hr3_reversed_a_missing_file_yields_nothing(tmp_path: Path) -> None:
+    assert list(jio.iter_jsonl_reversed(tmp_path / "absent.jsonl")) == []
+
+
+def test_hr3_reversed_an_io_error_warns_and_yields_nothing(tmp_path: Path, monkeypatch, caplog) -> None:
+    import brain.health.json_io as real_jio
+
+    p = tmp_path / "log.jsonl"
+    p.write_bytes(b'{"n": 1}\n')
+
+    def refuse(path, *args, **kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(real_jio, "open", refuse, raising=False)
+    with caplog.at_level(logging.WARNING, logger="brain.health.json_io"):
+        assert list(jio.iter_jsonl_reversed(p)) == []
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_hr3_reversed_refuses_a_gz_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        jio.iter_jsonl_reversed(tmp_path / "log.jsonl.gz")
+
+
 # ---- review nits: HEAL validator exceptions and the strict reset-to-default write ----
 
 

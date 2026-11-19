@@ -56,6 +56,7 @@ def test_a_one_shot_chat_drains_after_the_reply_and_again_after_the_pass_two_exi
     assert main(["chat", "--persona", "nell", "--no-bridge", "hello"]) == 0
     assert order == ["drain", "pass2", "drain"]
     assert len(_calls(emotion_engine_stub)) == 2
+    assert ("ensure_ready",) not in emotion_engine_stub.recorded_calls  # the command no longer rebuilds in-process (S107: its step does)
     assert emotion_engine_stub.recorded_calls[0][1].tzinfo is not None  # an aware time
 
 
@@ -91,6 +92,7 @@ def test_the_heartbeat_command_drains_after_the_tick(emotion_engine_stub, heartb
 
 
 def test_the_heartbeat_command_does_not_drain_under_dry_run(emotion_engine_stub, heartbeat_persona: Path) -> None:
+    emotion_engine_stub.live = True  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     assert main(["heartbeat", "--persona", "nell", "--trigger", "manual", "--provider", "fake", "--dry-run"]) == 0
     assert _calls(emotion_engine_stub) == []
     assert main(["heartbeat", "--persona", "nell", "--trigger", "open", "--provider", "fake"]) == 0  # the control

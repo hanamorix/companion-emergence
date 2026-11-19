@@ -59,7 +59,7 @@ def _add(engine: HeartbeatEngine, emotions: dict[str, float]) -> None:
 
 def _summary(engine: HeartbeatEngine, tmp_path: Path) -> tuple[str, int]:
     engine._write_daemon_state_for_heartbeat(
-        tmp_path, elapsed_seconds=900.0, memories_decayed=0, edges_pruned=0, dream_id=None
+        tmp_path, elapsed_seconds=900.0, edges_pruned=0, dream_id=None
     )
     state, anomaly = load_daemon_state(tmp_path)
     assert anomaly is None

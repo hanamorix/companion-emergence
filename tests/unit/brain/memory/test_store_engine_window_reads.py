@@ -180,6 +180,50 @@ def test_the_stamps_compare_parsed_times_and_skip_a_row_that_cannot_be_parsed(
     assert "stamp-bad" in " ".join(r.getMessage() for r in caplog.records)
 
 
+# --- the rowid (HR1 of #633) -------------------------------------------------------------------------
+
+
+def test_a_memory_has_no_rowid_until_a_read_fills_it_and_the_rowid_takes_no_part_in_equality(store: MemoryStore) -> None:
+    made = _put(store, _memory(T0 + timedelta(hours=1), mid="rid"))
+    assert made.rowid is None  # `create` leaves the caller's memory alone
+    [fetched] = store.list_engine_window(T0)
+    assert fetched.rowid == 1
+    assert fetched == made  # compare=False: a fetched and a created memory stay equal
+    assert store.get("rid", bump=False).rowid == 1
+
+
+def test_a_read_that_does_not_select_the_rowid_leaves_it_none(store: MemoryStore) -> None:
+    _put(store, _memory(T0, mid="plain"))
+    assert [m.rowid for m in store.list_by_type("conversation")] == [None]
+
+
+def test_the_window_fills_each_rowid_in_insertion_order(store: MemoryStore) -> None:
+    first = _put(store, _memory(T0 + timedelta(hours=3)))
+    second = _put(store, _memory(T0 + timedelta(hours=1)))
+    found = {m.id: m.rowid for m in store.list_engine_window(T0)}
+    assert found == {first.id: 1, second.id: 2}
+
+
+def test_rowid_above_keeps_only_rows_above_it_and_binds_to_both_time_terms(store: MemoryStore) -> None:
+    _put(store, _memory(T0 + timedelta(hours=1), mid="r1-created"))  # 1
+    _put(store, _memory(T0 - timedelta(days=9), accessed=T0 + timedelta(hours=1), mid="r2-accessed"))  # 2
+    _put(store, _memory(T0 + timedelta(hours=2), mid="r3-created"))  # 3
+    _put(store, _memory(T0 - timedelta(days=9), accessed=T0 + timedelta(hours=2), mid="r4-accessed"))  # 4
+    _put(store, _memory(T0 - timedelta(days=9), mid="r5-outside"))  # 5: above the threshold but not in the window
+    got = store.list_engine_window(T0, rowid_above=2)
+    assert {m.id for m in got} == {"r3-created", "r4-accessed"}
+    assert all(m.rowid is not None and m.rowid > 2 for m in got)
+    assert {m.id for m in store.list_engine_window(T0, rowid_above=0)} == {"r1-created", "r2-accessed", "r3-created", "r4-accessed"}
+    assert store.list_engine_window(T0, rowid_above=4) == []
+    assert {m.id for m in store.list_engine_window(T0, rowid_above=None)} == {"r1-created", "r2-accessed", "r3-created", "r4-accessed"}
+
+
+@pytest.mark.parametrize("bad", [True, "3", 2.5])
+def test_rowid_above_must_be_a_whole_number(store: MemoryStore, bad: object) -> None:
+    with pytest.raises(ValueError, match="rowid_above"):
+        store.list_engine_window(T0, rowid_above=bad)  # type: ignore[arg-type]
+
+
 # --- oldest_created_at -------------------------------------------------------------------------------
 
 

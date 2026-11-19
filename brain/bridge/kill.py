@@ -18,11 +18,15 @@ The sequence (plan I5 steps 1-7):
    before the first suspend or kill; then freeze the bridge and its tree, kill the bridge first, then the frozen tree.
 7. Poll "gone" over the bridge and everything remembered for ``timeout``; kill any survivor once more; report.
 
-The ``finally``: while the bridge's kill call has not returned, resume everything suspended, delete the intent
+The ``finally``: while the bridge's kill call has not been started, resume everything suspended, delete the intent
 (only if it still holds this nonce) and withdraw the hard-exit request this call wrote (only if it names this bridge),
-so an interrupted kill leaves nothing that could still end the bridge; after it has returned, kill the frozen and
+so an interrupted kill leaves nothing that could still end the bridge; once it has been started (the flag is set
+immediately before the call, so an interrupt inside the call counts), kill everything frozen, the bridge included, and the
 remembered descendants and keep the committed intent (the respawn guard honours it). Stop signals are ignored while
 the ``finally`` runs.
+
+``kill_command`` ends one running command (a CLI process the persona's start must not run beside) by the same freeze, kill and
+poll (``_end_tree``, ``_release_tree``), with no intent, request or service step.
 """
 
 from __future__ import annotations
@@ -272,6 +276,104 @@ def _other_live_bridge(persona_dir: Path, target_pid: int) -> bool:
     return state_file.bridge_liveness(st, persona_dir) == state_file.ALIVE
 
 
+# ---------------------------------------------------------------- the tree (shared by kill_bridge and kill_command)
+
+
+def _end_tree(
+    root,  # noqa: ANN001 - a psutil.Process
+    suspended: list,
+    remembered: dict[int, object],
+    timeout: float,
+    *,
+    hook: Callable[[str], None] | None = None,
+    on_root_killed: Callable[[], None] | None = None,
+) -> list[int]:
+    """Freeze ``root`` and its descendants, kill the root first, then the frozen tree, poll for ``timeout`` and return the
+    pids still alive after a second kill. Plan I5 steps 6 (from the freeze) and 7.
+
+    ``suspended`` and ``remembered`` belong to the caller and are filled in place, so that its ``finally`` sees what was
+    frozen even when this call is interrupted; ``_release_tree`` is the one place that resumes or finishes the kill. This
+    function never resumes. ``hook`` is called with a step name (``after_bridge_suspend``, ``before_bridge_kill``,
+    ``after_bridge_kill``); ``on_root_killed`` is called immediately before the root's kill call (so a caller interrupted inside
+    that call already reads "root killed" and ``_release_tree`` ends the tree instead of resuming it), before the hook
+    ``after_bridge_kill`` follows the call, and also when the root was already gone at the suspend.
+    """
+    import psutil
+
+    def _hook(name: str) -> None:
+        if hook is not None:
+            hook(name)
+
+    def _root_killed() -> None:
+        if on_root_killed is not None:
+            on_root_killed()
+
+    frozen = False
+    if _alive(root):
+        try:
+            root.suspend()
+            frozen = True
+        except psutil.NoSuchProcess:
+            pass  # it ended between the check and the suspend (review S4): the "already gone" branch below
+    if frozen:
+        suspended.append(root)
+        _hook("after_bridge_suspend")
+        # Every pid tried is remembered, suspended or not (review M3): a descendant whose suspend() fails and
+        # that stays listed cannot keep this loop going; it is killed with the tree below.
+        tried = {root.pid}
+        while True:
+            new = [p for p in _children(root) if p.pid not in tried]
+            if not new:
+                break
+            for p in new:
+                tried.add(p.pid)
+                try:
+                    p.suspend()
+                    suspended.append(p)
+                except psutil.Error:
+                    pass
+                remembered.setdefault(p.pid, p)
+        _hook("before_bridge_kill")
+        _root_killed()  # before the call, so an interrupt inside it already reads "root killed" (``_release_tree`` then ends the tree)
+        _kill_proc(root)
+        _hook("after_bridge_kill")
+        for p in suspended[1:]:
+            _kill_proc(p)
+    else:
+        _root_killed()
+    for p in remembered.values():
+        if _alive(p):
+            _kill_proc(p)
+
+    # Step 7: poll gone over everything.
+    everyone = [root, *remembered.values()]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and any(_alive(p) for p in everyone):
+        time.sleep(POLL_S)
+    survivors = [p.pid for p in everyone if _alive(p)]
+    for p in everyone:
+        if _alive(p):
+            _kill_proc(p)
+    return survivors
+
+
+def _release_tree(suspended: list, remembered: dict[int, object], root_kill_started: bool) -> None:
+    """The one place a frozen tree is let go. The root's kill has not been started (``on_root_killed`` has not run): resume
+    everything suspended. It has: finish the kill of everything frozen and the remembered ones still alive. The root is
+    ``suspended[0]`` whenever it was frozen, so it is killed here too: ``_kill_proc`` swallows every exception, so a root already
+    gone is a no-op, and an interrupt before its kill call acted still ends it with its descendants instead of leaving it frozen."""
+    if not root_kill_started:
+        for p in suspended:
+            try:
+                p.resume()
+            except Exception:  # noqa: BLE001
+                pass
+        return
+    for p in [*suspended, *remembered.values()]:
+        if _alive(p):
+            _kill_proc(p)
+
+
 # ---------------------------------------------------------------- the helper
 
 
@@ -342,7 +444,7 @@ def kill_bridge(
 
     remembered: dict[int, object] = {}
     suspended: list = []
-    kill_returned = False
+    root_kill_started = False  # set by ``_end_tree`` immediately before the bridge's kill call (also when the root was already gone)
     request_written = False
 
     def _remember(procs) -> None:
@@ -403,52 +505,11 @@ def kill_bridge(
             return KillResult("other_bridge", "another bridge is now running; nothing killed")
         _hook("committed")
 
-        frozen = False
-        if _alive(bridge):
-            try:
-                bridge.suspend()
-                frozen = True
-            except psutil.NoSuchProcess:
-                pass  # it ended between the check and the suspend (review S4): the "already gone" branch below
-        if frozen:
-            suspended.append(bridge)
-            _hook("after_bridge_suspend")
-            # Every pid tried is remembered, suspended or not (review M3): a descendant whose suspend() fails and
-            # that stays listed cannot keep this loop going; it is killed with the tree below.
-            tried = {bridge.pid}
-            while True:
-                new = [p for p in _children(bridge) if p.pid not in tried]
-                if not new:
-                    break
-                for p in new:
-                    tried.add(p.pid)
-                    try:
-                        p.suspend()
-                        suspended.append(p)
-                    except psutil.Error:
-                        pass
-                    remembered.setdefault(p.pid, p)
-            _hook("before_bridge_kill")
-            _kill_proc(bridge)
-            kill_returned = True
-            _hook("after_bridge_kill")
-            for p in suspended[1:]:
-                _kill_proc(p)
-        else:
-            kill_returned = True
-        for p in remembered.values():
-            if _alive(p):
-                _kill_proc(p)
+        def _root_killed() -> None:
+            nonlocal root_kill_started
+            root_kill_started = True
 
-        # Step 7: poll gone over everything.
-        everyone = [bridge, *remembered.values()]
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and any(_alive(p) for p in everyone):
-            time.sleep(POLL_S)
-        survivors = [p.pid for p in everyone if _alive(p)]
-        for p in everyone:
-            if _alive(p):
-                _kill_proc(p)
+        survivors = _end_tree(bridge, suspended, remembered, timeout, hook=_hook, on_root_killed=_root_killed)
         if survivors:
             return KillResult("killed", f"processes still running after the kill: {survivors}", survivors, True)
         return KillResult("killed", "bridge killed", [], True)
@@ -462,23 +523,15 @@ def kill_bridge(
                     pass
         try:
             _hook("finally_start")
-            if not kill_returned:
-                for p in suspended:
-                    try:
-                        p.resume()
-                    except Exception:  # noqa: BLE001
-                        pass
+            _release_tree(suspended, remembered, root_kill_started)
+            if not root_kill_started:
                 _cas_intent(persona_dir, nonce, lambda _cur: None)
                 # A kill called off before it killed withdraws its hard-exit request too (review of #458): the bridge
                 # still runs and would act on it later, after the user cancelled.
-                if request_written and shutdown_progress.names_this_bridge(
+                if request_written and process_identity.names_this_bridge(
                     shutdown_progress.read_record(persona_dir, shutdown_progress.REQUEST_FILENAME), st.pid, st.pid_token
                 ):
                     shutdown_progress.delete_record(persona_dir, shutdown_progress.REQUEST_FILENAME)
-            else:
-                for p in [*suspended[1:], *remembered.values()]:
-                    if _alive(p):
-                        _kill_proc(p)
         finally:
             if on_main:
                 for sig, handler in prev.items():
@@ -486,4 +539,59 @@ def kill_bridge(
                         signal.signal(sig, handler)  # type: ignore[arg-type]
                     except (ValueError, OSError):
                         pass
+
+
+def kill_command(pid: int, token: str | None, *, timeout: float = DEFAULT_TIMEOUT_S) -> KillResult:
+    """End one running command (a CLI process that holds or may take the engine lock) and its descendants (HS3 of #633).
+
+    The record that names it (``engine_files.live_command_runs``) gives ``pid`` and ``token``. The ``psutil.Process`` is created
+    first (``psutil.Error``: not running); nothing is killed unless the process still carries ``token``. A record with no token
+    is not asked: ``process_identity.matches(pid, None)`` answers GONE for a live process, which a caller would count as success,
+    so a falsy token, like an UNKNOWN answer, is ``unknown_identity`` (as ``daemon.cmd_stop`` treats an unconfirmed identity). The
+    descendants are remembered first, then ``_end_tree`` freezes and kills the tree with ``timeout`` as its poll bound, and the
+    ``finally`` calls ``_release_tree``. No intent, hard-exit request or service manager is involved: a command has no graceful
+    stop to wait for (S107: "whatever is running gets shut down"; S110's no-automatic-hard-kill is about a bridge told to stop).
+
+    Accepted edge (P4): no signal handler is installed here. Ctrl-C raises ``KeyboardInterrupt`` and the ``finally`` resumes the
+    tree (before the root's kill was started) or finishes it (from then on, an interrupt inside the root's kill call included: the
+    root is killed with its descendants). SIGTERM or SIGHUP end the starting process at once and leave a tree that was already frozen stopped
+    until the next start's ``kill_command`` ends it; nothing is lost, the frozen processes only wait. On Windows the end code is 0
+    (``_terminate_exit_0``).
+
+    Accepted edge (P4, B57 HSC (5)): a kill of the MCP child (a descendant of a bridge's claude call, so of a command's tree)
+    between its memory commit and its feelings hook leaves that memory saved without its feelings applied. The kill happens before
+    the rebuild child starts, so a rebuild that then succeeds folds the row; one that fails falls under the existing F-DA edge
+    (engine.py:393-396, S39).
+    """
+    import psutil
+
+    from brain import process_identity
+
+    try:
+        proc = psutil.Process(pid)
+    except psutil.Error:
+        return KillResult("not_running", "command not running")
+    if not token:
+        return KillResult("unknown_identity", f"identity of command {pid} could not be confirmed; not killing")
+    live = process_identity.matches(pid, token)
+    if live == process_identity.UNKNOWN:
+        return KillResult("unknown_identity", f"identity of command {pid} could not be confirmed; not killing")
+    if live != "alive":
+        return KillResult("not_running", "command not running")
+
+    remembered: dict[int, object] = {p.pid: p for p in _children(proc)}
+    suspended: list = []
+    root_kill_started = False
+
+    def _root_killed() -> None:
+        nonlocal root_kill_started
+        root_kill_started = True
+
+    try:
+        survivors = _end_tree(proc, suspended, remembered, timeout, on_root_killed=_root_killed)
+    finally:
+        _release_tree(suspended, remembered, root_kill_started)
+    if survivors:
+        return KillResult("killed", f"processes still running after the kill: {survivors}", survivors, True)
+    return KillResult("killed", "command killed", [], True)
 

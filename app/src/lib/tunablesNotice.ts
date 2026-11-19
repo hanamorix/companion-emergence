@@ -1,10 +1,12 @@
 import type { TunablesNotice } from "../bridge";
 
-/** The reason is the TOML parser's short text, cleaned by the brain already. It is still shown defensively:
- *  control characters are removed and it is cut at this many characters. */
+/** A notice's reason (the TOML parser's short text, or the rebuild notice's one line) is cleaned by the brain already. It is
+ *  still shown defensively: control characters are removed and it is cut at this many characters. Shared by both notices. */
 export const TUNABLES_NOTICE_REASON_MAX = 120;
 
-function cleanReason(reason: string | null): string {
+/** A notice's reason made safe to show: control characters removed, cut at `TUNABLES_NOTICE_REASON_MAX`, "" when there is none.
+ *  Shared by `tunablesNoticeMessage` and `rebuildNoticeMessage` (rebuildNotice.ts). */
+export function cleanReason(reason: string | null): string {
   if (!reason) return "";
   const kept = Array.from(reason).filter((ch) => {
     const code = ch.codePointAt(0) ?? 0;
