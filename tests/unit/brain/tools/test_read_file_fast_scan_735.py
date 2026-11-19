@@ -82,7 +82,7 @@ def test_a_cut_line_can_be_read_to_its_end_with_char_offset(tmp_path):
 
     long_line = "".join(chr(ord("a") + i % 26) for i in range(100_000))
     p = tmp_path / "long.txt"
-    p.write_text(long_line + "\nnext\n", encoding="utf-8")
+    p.write_bytes((long_line + "\nnext\n").encode("utf-8"))
 
     got, char_offset, reads = "", 0, 0
     while True:
@@ -101,7 +101,7 @@ def test_a_cut_line_can_be_read_to_its_end_with_char_offset(tmp_path):
 
 def test_a_char_offset_past_the_line_end_gives_its_break_alone(tmp_path):
     p = tmp_path / "f.txt"
-    p.write_text("short\nnext\n", encoding="utf-8")
+    p.write_bytes(b"short\nnext\n")
     out = read_file(str(p), persona_dir=tmp_path / "x", offset=0, max_lines=2, char_offset=999)
     assert out["content"] == "\nnext\n"
     assert "(line 0 from character 999)" in out["note"]
@@ -110,14 +110,14 @@ def test_a_char_offset_past_the_line_end_gives_its_break_alone(tmp_path):
 @pytest.mark.no_base_failure(reason="pins that a negative char_offset reads from the line start, not an error (#735); main ignores char_offset, so it passes there too")
 def test_a_negative_char_offset_acts_as_zero(tmp_path):
     p = tmp_path / "f.txt"
-    p.write_text("whole\n", encoding="utf-8")
+    p.write_bytes(b"whole\n")
     out = read_file(str(p), persona_dir=tmp_path / "x", char_offset=-5)
     assert out["content"] == "whole\n" and "truncated" not in out
 
 
 def test_two_char_offsets_in_one_turn_are_two_reads(tmp_path):
     p = tmp_path / "f.txt"
-    p.write_text("abcdef\n", encoding="utf-8")
+    p.write_bytes(b"abcdef\n")
     _read_cache.reset()
     first = read_file(str(p), persona_dir=tmp_path / "x", char_offset=1)
     second = read_file(str(p), persona_dir=tmp_path / "x", char_offset=3)
