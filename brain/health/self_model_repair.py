@@ -7,7 +7,8 @@ persona. The windowed-peak fix corrects the computation, but a persona that ran
 the old code has a bogus OPEN gap persisted, carrying a confabulated note. This
 clears ``current_gap`` ONCE so the next reflection tick recomputes honestly and
 no false "natural resolution" fires from the collapsing artifact. ``gap_history``
-is preserved. Marker-gated → runs at most once per persona.
+is preserved. Runs at most once per persona: the save that clears the gap also records it in the state file
+(``windowed_peak_cleared``, #752), and the marker file below is a second record.
 """
 
 from __future__ import annotations
@@ -46,7 +47,13 @@ def _failed_attempts(persona_dir: Path) -> int | None:
 
 
 def should_run_self_model_repair(persona_dir: Path) -> bool:
-    """True until the repair has finished, or has failed `_MAX_FAILED_ATTEMPTS` starts in a row."""
+    """True until the repair has finished, or has failed `_MAX_FAILED_ATTEMPTS` starts in a row.
+
+    Finished is the state file's own record first (#752): a repair whose save succeeded is never run again, even when
+    the marker write after it failed. The marker is read only when the state holds no record.
+    """
+    if sm_state.windowed_peak_cleared(persona_dir):
+        return False
     count = _failed_attempts(persona_dir)
     return count is not None and count < _MAX_FAILED_ATTEMPTS
 
@@ -68,24 +75,30 @@ def _record_failure(persona_dir: Path) -> None:
 
 
 def run_self_model_repair(persona_dir: Path) -> None:
-    """Clear any persisted current_gap once, then write the marker. Fail-soft.
+    """Clear any persisted current_gap once, recording it in the same save, then write the marker. Fail-soft.
 
-    The marker says done only when the repair finished (the gap was cleared, or there was none). A lock that did not come
-    is not counted and is retried at the next start; any other failure is counted and retried, up to
+    The clear and its record (`windowed_peak_cleared`) are one atomic save, so a marker write that fails afterwards can't
+    make the next start clear an honest gap (#752). With no gap, the state is saved once just to hold the record, unless
+    it was recovered from a file that only partly loaded: the repair never overwrites that, and the marker is the record
+    there. The marker says done only when the repair finished (the gap was cleared, or there was none). A lock that did
+    not come is not counted and is retried at the next start; any other failure is counted and retried, up to
     `_MAX_FAILED_ATTEMPTS` starts (#737).
     """
     try:
         # Under the state lock (#558): a reconcile in flight would otherwise write the cleared gap back.
         with sm_state.locked(persona_dir):
-            state, _recovered = sm_state.load_or_recover(persona_dir)
+            state, recovered = sm_state.load_or_recover(persona_dir)
             if state.current_gap is not None:
                 sm_state.save(
                     persona_dir,
                     sm_state.SelfModelState(current_gap=None, gap_history=state.gap_history),
+                    windowed_peak_cleared=True,
                 )
                 logger.info(
                     "self_model_repair: cleared a persisted gap (windowed-peak migration)"
                 )
+            elif not recovered:
+                sm_state.save(persona_dir, state, windowed_peak_cleared=True)
     except LockTimeoutError as exc:
         # Another writer kept the state lock for the whole bounded wait: nothing was cleared, so the marker is not
         # written and the next start runs the repair again.
