@@ -507,7 +507,9 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         return
     # The child's identity, read now while it runs (once it has exited its token reads GONE): the notice it writes at a failure
     # inside it names this pid and token, and that is how a notice of its own is told from an older one (no clock is compared).
-    # A token that cannot be read means no notice can be told to be the child's, and the generic reason below is written.
+    # A token that cannot be read means no notice can be told to be the child's, and the generic reason below is written. Accepted
+    # edge (P4): a child already gone at this read, or a launcher process whose pid is not the interpreter's, gets the generic
+    # reason too; only a less specific message, the exact error is in the log.
     child_token = process_identity.token_of(child.pid)
     child_identity = (child.pid, child_token) if process_identity.is_token(child_token) else None
     try:

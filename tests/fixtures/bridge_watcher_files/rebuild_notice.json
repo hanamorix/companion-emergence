@@ -1,5 +1,5 @@
 {
   "pid": 4242,
   "pid_token": "linux:boot:4242:99",
-  "reason": "the update of your memories stopped (exit code 1)"
+  "reason": "the update stopped before it finished"
 }
