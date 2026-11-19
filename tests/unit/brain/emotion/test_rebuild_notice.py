@@ -149,6 +149,7 @@ def test_a_notice_that_cannot_be_read_is_replaced_under_an_identity(persona: Pat
     assert _record(persona)["reason"] == "newer"
 
 
+@pytest.mark.no_base_failure(reason="a pin of the unchanged default: a call with no `since` and no identity replaced the notice on base too")
 def test_without_an_identity_a_later_reason_always_replaces_even_the_childs_notice(persona: Path) -> None:
     _put(persona, "the child's", identity=CHILD)
     engine_files.settle_rebuild_notice(persona, "later")

@@ -319,6 +319,13 @@ def _runner_argv(
 
 # The owner's wording list (S101, S102): the same lines as the app's start-up screen (useRestartBridge.ts engineProgressLine).
 _REBUILD_STARTED_LINE = "Updating your memories. This can take a few minutes."
+
+# The short plain reasons the rebuild notice shows when the start process records a failure (Hana's 11-18b point 2; placeholders on
+# the owner's wording list; the window puts one after "could not be brought up to date: "). The raw error stays in the log line at
+# each site, never in the notice.
+_REASON_NOT_STARTED = "the update could not be started"
+_REASON_STOPPED = "the update stopped before it finished"
+_REASON_CHECK_FAILED = "the check for an update failed"
 _REBUILD_RESCALING_LINE = "Updating the scale of your memories."
 _REBUILD_PREPARING_LINE = "Getting ready to update your memories."
 
@@ -403,9 +410,9 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
     from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). It
     also records why in the rebuild notice (``engine_files.settle_rebuild_notice``, Hana's point 5 on #633), which the window shows while
-    the persona is not switched over: the OSError text, or "the update of your memories stopped (exit code N)" unless the child wrote
-    its own, more exact notice (told by the pid and token the notice names, read from the launched child right after the spawn, not
-    by a clock comparison); a child that ends normally clears the notice itself once the
+    the persona is not switched over: a short plain reason ("the update could not be started", or "the update stopped before it finished"),
+    unless the child wrote its own, more exact notice (told by the pid and token the notice names, read from the launched child
+    right after the spawn, not by a clock comparison); the raw error and the exit code stay in the log; a child that ends normally clears the notice itself once the
     persona is switched over (this process does not). Any
     BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
 
@@ -496,7 +503,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         reason = f"{type(exc).__name__}: {exc}"
         logger.warning("the rebuild child for %s could not be started (%s); going on with the saved state", persona_dir.name, reason)
         _say(f"Updating your memories could not be started ({reason}). Going on with your memories as they were saved.")
-        _settle_rebuild_notice(persona_dir, reason)
+        _settle_rebuild_notice(persona_dir, _REASON_NOT_STARTED)  # the raw text (`reason`) is in the log line and the line above
         return
     # The child's identity, read now while it runs (once it has exited its token reads GONE): the notice it writes at a failure
     # inside it names this pid and token, and that is how a notice of its own is told from an older one (no clock is compared).
@@ -530,9 +537,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         _say(f"Updating your memories did not finish (exit code {code}). Going on with your memories as they were saved.")
         # Also a child killed by a signal or for memory, or one that crashed before the engine ran: no notice of its own exists, so
         # this one tells the window; a notice the launched child wrote itself (it names the child's pid and token) is more exact and stands.
-        _settle_rebuild_notice(
-            persona_dir, f"the update of your memories stopped (exit code {code})", keep_notice_of=child_identity
-        )
+        _settle_rebuild_notice(persona_dir, _REASON_STOPPED, keep_notice_of=child_identity)  # the exit code is in the log line above
     # A child that exited 0 is not settled here: the child clears the notice itself when it ends normally (`cli._supervisor_rebuild_handler`).
 
 
@@ -584,7 +589,7 @@ def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
                 type(exc).__name__,
                 exc,
             )
-        _settle_rebuild_notice(persona_dir, f"{type(exc).__name__}: {exc}")  # case 5: no child runs, so nothing else records it
+        _settle_rebuild_notice(persona_dir, _REASON_CHECK_FAILED)  # case 5: no child runs, so nothing else records it; the error is logged above
         return False
     if not needed:
         _settle_rebuild_notice(persona_dir, None)  # after the try, so the except above cannot catch it; the normal path only

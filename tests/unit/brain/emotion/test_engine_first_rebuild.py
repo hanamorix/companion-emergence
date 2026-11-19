@@ -1232,11 +1232,26 @@ def test_case_1_a_failed_rebuild_leaves_a_notice_naming_the_step_and_the_error(t
     with pytest.raises(EngineStartupError):
         ensure_engine_ready(persona)
     reason = _notice(persona)
-    assert reason is not None and reason.startswith("the first rebuild failed (RebuildCheckError: ")
+    assert reason == "rebuilding the saved feelings failed"  # the error itself (RebuildCheckError and its text) is only in the log
     monkeypatch.undo()
     ensure_engine_ready(persona)  # the fault is gone: the start completes; the rebuild child's own call (the cli handler) then clears the notice
     engine_files.settle_rebuild_notice(persona, None)
     assert _notice(persona) is None
+
+
+def test_the_raw_error_is_in_the_log_and_not_in_the_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hana's 11-18b point 2: the notice holds a short plain reason, the exception text stays in the log line the site already writes."""
+    persona = _standard_persona(tmp_path)
+    install(persona, NOW)
+    monkeypatch.setattr(_x10(), "scale_up_small_feelings", lambda p: (_ for _ in ()).throw(RuntimeError("raw secret detail")))
+    caplog.set_level(logging.ERROR, logger="brain.emotion.engine")
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert any("raw secret detail" in r.getMessage() for r in caplog.records)
+    reason = _notice(persona)
+    assert reason is not None and "raw secret detail" not in reason and "RuntimeError" not in reason
 
 
 def test_case_2_an_x10_error_and_an_integrity_failure_on_a_readable_state_leave_a_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1245,7 +1260,7 @@ def test_case_2_an_x10_error_and_an_integrity_failure_on_a_readable_state_leave_
     monkeypatch.setattr(_x10(), "scale_up_small_feelings", lambda p: (_ for _ in ()).throw(RuntimeError("rolled back")))
     with pytest.raises(EngineStartupError):
         ensure_engine_ready(persona)
-    assert _notice(persona) == "the x10 fix of small feelings failed (RuntimeError: rolled back)"
+    assert _notice(persona) == "rescaling the saved feelings failed"
     monkeypatch.undo()
 
     other = _standard_persona(tmp_path / "integrity")
@@ -1258,8 +1273,8 @@ def test_case_2_an_x10_error_and_an_integrity_failure_on_a_readable_state_leave_
     with pytest.raises(EngineStartupError):
         ensure_engine_ready(other)
     reason = _notice(other)
-    assert reason is not None and reason.startswith("the memories.db integrity check failed (BrainIntegrityError: ")
-    assert "page 3 is damaged" in reason and "\n" not in reason
+    assert reason == "the memory database failed its check"
+    assert "page 3 is damaged" not in reason
 
 
 def test_a_lock_file_that_cannot_be_opened_leaves_a_notice_naming_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1272,7 +1287,7 @@ def test_a_lock_file_that_cannot_be_opened_leaves_a_notice_naming_the_lock(tmp_p
     monkeypatch.setattr(engine_files, "state_lock", unopenable)
     with pytest.raises(EngineStartupError):
         ensure_engine_ready(persona)
-    assert _notice(persona) == "the engine lock failed (PermissionError: no access)"  # written before the raise: it is there once it propagated
+    assert _notice(persona) == "the saved feelings could not be opened for the update"  # written before the raise: it is there once it propagated
 
 
 def test_case_3_a_state_and_a_database_that_both_cannot_be_read_skip_the_start_and_leave_a_notice(
@@ -1289,7 +1304,7 @@ def test_case_3_a_state_and_a_database_that_both_cannot_be_read_skip_the_start_a
     monkeypatch.setattr(_x10(), "MemoryStore", broken)
     ensure_engine_ready(persona)  # returns: the start is skipped, not failed
     reason = _notice(persona)
-    assert reason is not None and reason.startswith("the saved feelings and memories.db could not be read (") and "page 7 is damaged" in reason
+    assert reason == "the saved feelings and the memory database could not be read"  # "page 7 is damaged" is only in the log
     monkeypatch.undo()
     ensure_engine_ready(persona)  # the next start completes; the rebuild child's own call (the cli handler) then clears the notice
     engine_files.settle_rebuild_notice(persona, None)
@@ -1310,7 +1325,7 @@ def test_case_4_a_state_write_that_fails_on_an_unreadable_state_skips_the_start_
     monkeypatch.setattr(engine_files, "save_state", crash)
     ensure_engine_ready(persona)  # returns: the start is skipped, not failed
     reason = _notice(persona)
-    assert reason == f"the rebuilt state could not be written to {engine_files.state_path(persona)} (OSError: disk fault on the state write)"
+    assert reason == "the rebuilt feelings could not be written to disk"  # the path and the OSError are only in the log
 
 
 @pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base no notice is ever written, so a switched persona trivially has none")

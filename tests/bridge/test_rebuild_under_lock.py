@@ -381,19 +381,19 @@ def _child_token(monkeypatch: pytest.MonkeyPatch, answer: str) -> None:
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_case_6_a_child_that_cannot_be_started_leaves_a_notice_with_the_error(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+def test_case_6_a_child_that_cannot_be_started_leaves_a_plain_notice_without_the_raw_error(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
     rebuild_spawns.error = FileNotFoundError("no such interpreter")
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "FileNotFoundError: no such interpreter"
+    assert _notice(persona) == "the update could not be started"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_a_child_that_exits_non_zero_with_no_notice_of_its_own_leaves_one_with_the_exit_code(
+def test_a_child_that_exits_non_zero_with_no_notice_of_its_own_leaves_a_plain_one(
     persona: Path, rebuild_spawns: RebuildPopenRecorder
 ) -> None:
     rebuild_spawns.exit_code = 3
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 3)"
+    assert _notice(persona) == "the update stopped before it finished"  # the exit code is only in the log and the stderr line
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
@@ -418,7 +418,7 @@ def test_a_notice_of_another_process_is_replaced_by_a_non_zero_exit(
     _plant(persona)  # an earlier attempt's: another pid and token
     rebuild_spawns.exit_code = 9
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 9)"
+    assert _notice(persona) == "the update stopped before it finished"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
@@ -429,7 +429,7 @@ def test_a_notice_of_a_recycled_pid_with_another_token_is_replaced(
     _plant(persona, pid=424242, pid_token="linux:boot:424242:1")  # the same pid number, an earlier process
     rebuild_spawns.exit_code = 9
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 9)"
+    assert _notice(persona) == "the update stopped before it finished"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
@@ -438,7 +438,7 @@ def test_a_notice_without_a_writer_identity_is_replaced_by_a_non_zero_exit(perso
     engine_files.rebuild_notice_path(persona).write_text('{"at": "2999-01-01T00:00:00Z", "reason": "from before the identity"}', encoding="utf-8")
     rebuild_spawns.exit_code = 9
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 9)"
+    assert _notice(persona) == "the update stopped before it finished"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
@@ -451,7 +451,7 @@ def test_a_child_token_that_cannot_be_read_means_the_generic_reason_is_written(
     rebuild_spawns.exit_code = 1
     monkeypatch.setattr(clock, "sleep", lambda d: _plant(persona, "its own", pid=424242, pid_token=CHILD_TOKEN))
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 1)"
+    assert _notice(persona) == "the update stopped before it finished"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")

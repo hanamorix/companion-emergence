@@ -128,7 +128,7 @@ def test_a_real_child_that_skips_the_switch_over_leaves_a_notice_with_its_reason
     (persona / "memories.db").write_bytes(b"this is not a database" * 100)  # ... and neither can the database (S61's skip, exit 0)
     assert _run_the_step(persona, rebuild_spawns, monkeypatch) == 0
     record = engine_files.read_rebuild_notice(persona)
-    assert record is not None and record["reason"].startswith("the saved feelings and memories.db could not be read (")
+    assert record is not None and record["reason"] == "the saved feelings and the memory database could not be read"
     assert not engine.engine_for(persona).is_live()
 
 
