@@ -234,6 +234,9 @@ def get_soul(
                 f"{where}. More remain: call {TOOL_PREFIX_SLOT}get_soul "
                 f"with {args} for the next page."
             )
+        notes = [_clip_note(i["id"], i["clipped_at"]) for i in items if i.get("clipped_at")]
+        if notes:  # #734 review: name the read that reaches the rest of a clipped item
+            out["message"] = " ".join([out["message"], *notes] if "message" in out else notes)
         return out
 
     # The envelope with the longest hint this page could carry (the longest id
@@ -252,12 +255,28 @@ def get_soul(
             # Alone it is still too big: cut its text so the page holds it. If
             # even a clipped item cannot fit (a tiny budget), return none: the
             # hint still points at this offset.
-            clipped = _clip_to_fit(item, budget - reserve - 2)  # 2: the list's brackets
-            if reserve + result_bytes([clipped]) <= budget:
-                items.append(clipped)
+            # The note naming the follow-up reads goes into the message, so the clipped item gets the room left after
+            # it. Its size depends on what was cut, so clip, measure the real note, and clip tighter while it doesn't fit.
+            room, note_room = budget - reserve - 2, 0  # 2: the list's brackets
+            for _ in range(4):
+                clipped = _clip_to_fit(item, room - note_room)
+                note = _clip_note(item["id"], clipped["clipped_at"])
+                need = result_bytes(note) + 2 + 16 * note.count(TOOL_PREFIX_SLOT)  # a space, the real tool prefix
+                if result_bytes([clipped]) + need <= room + 2:
+                    items.append(clipped)
+                    break
+                note_room = need
         break
 
     return finish(items)
+
+
+def _clip_note(cid: str, clipped_at: dict[str, int]) -> str:
+    """The sentence that names how to read the rest of a clipped item, one call per cut field (#734)."""
+    calls = "; ".join(
+        f'{TOOL_PREFIX_SLOT}get_soul with id="{cid}", field="{f}", char_offset={n}' for f, n in clipped_at.items()
+    )
+    return f"Read the rest of the clipped crystallization with {calls}."
 
 
 def _read_field(persona_dir: Path, cid: str | None, field: str | None, char_offset: Any, budget: int) -> dict:

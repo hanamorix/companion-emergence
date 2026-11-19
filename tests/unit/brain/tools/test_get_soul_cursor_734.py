@@ -186,3 +186,21 @@ def test_the_schema_lets_any_love_type_through():
 
     prop = SCHEMAS["get_soul"]["parameters"]["properties"]["love_type"]
     assert "enum" not in prop and "by_love_type" in prop["description"]
+
+
+def test_a_page_with_a_clipped_item_names_the_call_that_reads_the_rest(tmp_path):
+    """Review of #734: the spec says the message names the follow-up read; a one-page soul had no message at all."""
+    from brain.tools.impls.get_soul import MAX_RESULT_BYTES, result_bytes
+
+    _add(tmp_path, "huge", minutes=0, moment="ł" * 20_000)
+    page = get_soul(**_ctx(tmp_path))
+    (item,) = page["crystallizations"]
+    n = item["clipped_at"]["moment"]
+    assert page["truncated"] is False
+    assert f'get_soul with id="huge", field="moment", char_offset={n}' in page["message"]
+    assert result_bytes(page) + 64 <= MAX_RESULT_BYTES  # room left for the real tool prefix
+
+    _add(tmp_path, "older", minutes=-1)  # now a second page follows: both hints are given
+    page = get_soul(**_ctx(tmp_path))
+    assert 'id="huge"' in page["message"] and f'after="{page["next_after"]}"' in page["message"]
+    assert result_bytes(page) + 64 <= MAX_RESULT_BYTES
