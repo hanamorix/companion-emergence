@@ -101,6 +101,17 @@ _UNSET = object()  # no clean drain yet: the early-out may not fire
 # supervisor job) or a lock file that cannot be opened. The start-up rebuilds wait for the lock instead (`wait_for_lock`).
 ENGINE_LOCK_STEP = "the engine lock"
 
+# The short plain reasons the rebuild notice shows for each way a start-up step fails (Hana's 11-18b point 2; placeholders on the
+# owner's wording list, one each; the window puts one after "could not be brought up to date: "). The raw error is only in the log
+# line each failing site already writes, never in the notice.
+_REASON_INTEGRITY = "the memory database failed its check"
+_REASON_X10 = "rescaling the saved feelings failed"
+_REASON_FIRST_REBUILD = "rebuilding the saved feelings failed"
+_REASON_ROLL_FORWARD = "bringing the saved feelings up to date failed"  # a switched persona gets no notice, so this is never shown
+_REASON_LOCK = "the saved feelings could not be opened for the update"
+_REASON_UNREADABLE = "the saved feelings and the memory database could not be read"
+_REASON_UNWRITABLE = "the rebuilt feelings could not be written to disk"
+
 
 class Reading(NamedTuple):
     """One feeling as `read()` reports it: the short and long averages, their difference, and the shift."""
@@ -981,7 +992,8 @@ class EmotionEngine:
         not complete (the two skips above, and every failure through `_start_failed`) therefore calls
         `engine_files.settle_rebuild_notice` with a one-line reason, which writes `rebuild_notice.json` while the persona is not
         switched over. A switched persona (a failed roll-forward) gets none and any old one is deleted; a completed switch-over
-        clears it at the start process's next check. The errors themselves are logged as before.
+        clears it when the rebuild process's handler (`cli._supervisor_rebuild_handler`) calls the writer with no reason after this
+        method returns. The errors themselves are logged as before.
         """
         loaded = self._state_cache.get()
         if self._switched(loaded):
@@ -1003,13 +1015,11 @@ class EmotionEngine:
                     exc,
                 )
                 # The one file this skip writes: the rebuild notice (Hana's point 5), since the persona stays not switched over.
-                engine_files.settle_rebuild_notice(
-                    self.persona_dir, f"the saved feelings and memories.db could not be read ({exc})"
-                )
+                engine_files.settle_rebuild_notice(self.persona_dir, _REASON_UNREADABLE)
                 return
-            self._start_failed("the memories.db integrity check", exc)
+            self._start_failed("the memories.db integrity check", exc, _REASON_INTEGRITY)
         except Exception as exc:  # noqa: BLE001 - every failure of the x10 fix stops start-up, named
-            self._start_failed("the x10 fix of small feelings", exc)
+            self._start_failed("the x10 fix of small feelings", exc, _REASON_X10)
         self._locked_rebuild(
             "first", self._first_rebuild_needed, found_unreadable=loaded.problem == "unreadable", wait_for_lock=True
         )
@@ -1083,15 +1093,18 @@ class EmotionEngine:
         """Under the lock: False when the state now holds `switch_over_at` (another process switched over while this one waited). A state that exists but cannot be read is not switched: the rebuild runs."""
         return not self._switched(engine_files.read_state(self.persona_dir))
 
-    def _start_failed(self, what: str, cause: BaseException) -> NoReturn:
+    def _start_failed(self, what: str, cause: BaseException, reason: str) -> NoReturn:
         """Log a failed start-up step with its traceback, record why in the rebuild notice, and raise `EngineStartupError(what, cause)`.
+
+        `reason` is the short plain reason the notice gets (one of the `_REASON_*` constants); the exception itself (`what`, type
+        and text) is only in the log line below and in the raised error, never in the notice (Hana's 11-18b point 2).
 
         The notice (`engine_files.settle_rebuild_notice`, Hana's point 5) is written before the raise, so the window can say the
         switch-over did not complete when the start goes on with the saved state. It is written only while the persona is not
         switched over: a switched persona's failed roll-forward comes through here too and gets none (it stays logged).
         """
         logger.error("emotion engine: %s failed (%s: %s); start-up stops", what, type(cause).__name__, cause, exc_info=cause)
-        engine_files.settle_rebuild_notice(self.persona_dir, f"{what} failed ({type(cause).__name__}: {cause})")
+        engine_files.settle_rebuild_notice(self.persona_dir, reason)
         raise EngineStartupError(what, cause) from cause
 
     def _locked_rebuild(
@@ -1230,20 +1243,21 @@ class EmotionEngine:
                             type(exc.cause).__name__,
                             exc.cause,
                         )
-                        engine_files.settle_rebuild_notice(
-                            self.persona_dir,
-                            f"the rebuilt state could not be written to {exc.path} ({type(exc.cause).__name__}: {exc.cause})",
-                        )
+                        engine_files.settle_rebuild_notice(self.persona_dir, _REASON_UNWRITABLE)
                         return
                     if roll_forward and held and isinstance(exc, engine_rebuild.RebuildCheckError | engine_rebuild.RebuildStateWriteError | OSError):
                         self._roll_forward_failed(exc)
                         return
                     what = ("the roll-forward rebuild" if roll_forward else f"the {mode} rebuild") if held else ENGINE_LOCK_STEP
+                    if not held:
+                        plain = _REASON_LOCK
+                    else:
+                        plain = _REASON_ROLL_FORWARD if roll_forward else _REASON_FIRST_REBUILD
                     if mode == "recovery" and not roll_forward:
                         # Not a start-up: the recovery job (`recovery_job_run`) logs the failure once per active day, so a rebuild
                         # that keeps failing does not write an error line, with a traceback, on every quiet pass.
                         raise EngineStartupError(what, exc) from exc
-                    self._start_failed(what, exc)
+                    self._start_failed(what, exc, plain)
         finally:
             if wait_progress is not None:
                 wait_progress.remove()

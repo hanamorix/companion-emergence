@@ -9,6 +9,7 @@ under the bridge conftest's tmp home.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -200,7 +201,8 @@ def _notice(persona: Path) -> str | None:
 def _plant(persona: Path, reason: str = "an earlier attempt's") -> None:
     from brain.emotion import engine_files
 
-    engine_files.rebuild_notice_path(persona).write_text(f'{{"at": "2020-01-01T00:00:00Z", "reason": "{reason}"}}', encoding="utf-8")
+    record = {"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": reason}
+    engine_files.rebuild_notice_path(persona).write_text(json.dumps(record), encoding="utf-8")
 
 
 def _check_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,12 +213,12 @@ def _check_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.real_rebuild_step(reason="the need check under test")
-def test_case_5_a_check_that_raises_leaves_a_notice_with_its_type_and_reason_and_still_answers_false(
+def test_case_5_a_check_that_raises_leaves_a_plain_notice_without_the_raw_error_and_still_answers_false(
     persona: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _check_raises(monkeypatch)
     assert daemon._rebuild_needed(persona, False) is False
-    assert _notice(persona) == "ValueError: a state that cannot be read"
+    assert _notice(persona) == "the check for an update failed"
 
 
 @pytest.mark.real_rebuild_step(reason="the need check under test")
@@ -235,7 +237,7 @@ def test_a_failed_check_replaces_an_older_notice_and_never_clears_it(persona: Pa
     _plant(persona)
     _check_raises(monkeypatch)
     assert daemon._rebuild_needed(persona, False) is False
-    assert _notice(persona) == "ValueError: a state that cannot be read"
+    assert _notice(persona) == "the check for an update failed"
 
 
 @pytest.mark.real_rebuild_step(reason="the need check under test")
