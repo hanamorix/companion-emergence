@@ -329,6 +329,7 @@ def test_every_start_path_after_a_kill_reaches_a_healthy_bridge(env_pd, launchd_
     # The stub writes bridge.json after its child files, and kill_bridge answers not_running when it reads no record.
     # So the stub holds its record behind a gate that opens only when a read of the record finds it missing: the
     # record is then deterministically absent after the child files exist, and only a wait for it reaches "killed".
+    # (This relies on pd holding no bridge.json before the stub starts: a stale record would keep the gate shut.)
     gate = pd / "stub-record-gate"
     real_read = state_file.read
 
