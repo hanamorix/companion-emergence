@@ -170,7 +170,7 @@ SCHEMAS: dict[str, dict] = {
             "or when grounding yourself in your own continuity. "
             f"Returns one page, newest first: {_SOUL_DEFAULT_LIMIT} crystallisations by default, fewer "
             "when they are long, with the total and a count per love type. When more remain, the "
-            "result has truncated=true and next_offset: call again with offset set to next_offset "
+            "result has truncated=true and next_after: call again with after set to next_after "
             "(and the same love_type) for the next page. Pass love_type to read one kind of love."
         ),
         "parameters": {
@@ -197,6 +197,13 @@ SCHEMAS: dict[str, dict] = {
                     "type": "string",
                     "enum": list(LOVE_TYPES),
                     "description": "Optional: only crystallisations of this love type.",
+                },
+                "after": {
+                    "type": "string",
+                    "description": (
+                        "Optional: the next_after a previous result gave. The page starts right after that "
+                        "crystallisation, so nothing is skipped or repeated if the soul changes between calls."
+                    ),
                 },
             },
             "required": [],

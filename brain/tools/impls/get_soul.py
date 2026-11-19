@@ -98,6 +98,7 @@ def get_soul(
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
     love_type: str | None = None,
+    after: str | None = None,
     max_bytes: int | None = None,
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -110,6 +111,11 @@ def get_soul(
     ``next_offset`` is the offset of the next page, and ``message`` says how to
     call for it. ``next_offset`` counts the items actually returned, so a page
     cut short by the byte bound never skips anything.
+
+    ``after`` (#734) is the id of the last item of the previous page, given as
+    ``next_after``. It continues strictly after that item, so a crystallization
+    added or revoked between calls can't make the walk skip or repeat one, as
+    offset paging can. With ``after`` the result's ``offset`` is null.
 
     ``max_bytes`` is not in the tool schema: ``boot`` passes the room left
     beside its other parts. It can only lower the bound, never raise it.
@@ -141,14 +147,28 @@ def get_soul(
     # limit and offset it actually used.
     limit = min(max(parsed_limit, 1), MAX_LIMIT)
     offset = max(parsed_offset, 0)
+    if after is not None and (not isinstance(after, str) or not after.strip()):
+        return {"loaded": False, "error": f"after must be the id a previous result gave as next_after, got {after!r}."}
+    if after is not None and offset:
+        return {
+            "loaded": False,
+            "error": "pass after (from next_after) or offset, not both: after already says where the page starts.",
+        }
 
     soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
     try:
+        if after is not None and soul_store.get(after) is None:
+            return {
+                "loaded": False,
+                "error": f"no crystallization has id {after!r}: pass the next_after a previous result gave.",
+            }
         total = soul_store.count(love_type)
         # Past the end is past the end: capping at total also keeps a huge
         # offset (10**30, 1e300) inside SQLite's 64-bit INTEGER.
         offset = min(offset, total)
-        rows = soul_store.list_active_page(offset=offset, limit=limit, love_type=love_type)
+        # What is left from where this page starts: the rest after the cursor, or after the offset.
+        remaining = soul_store.count(love_type, after=after) if after is not None else total - offset
+        rows = soul_store.list_active_page(offset=offset, limit=limit, love_type=love_type, after=after)
         by_love_type = soul_store.active_love_type_counts()
     finally:
         soul_store.close()
@@ -161,30 +181,37 @@ def get_soul(
         # The whole soul by type (~25 short entries), so a filter can be chosen
         # without walking every page first.
         "by_love_type": by_love_type,
-        "offset": offset,
+        "offset": None if after is not None else offset,
         "limit": limit,
         "truncated": False,
         "next_offset": None,
+        "next_after": None,
         "crystallizations": [],
     }
 
-    def finish(items: list[dict]) -> dict:
+    def finish(items: list[dict], *, longest_id: str | None = None) -> dict:
         out = {**result, "count": len(items), "crystallizations": items}
-        if offset + len(items) < total:
-            nxt = offset + len(items)
-            args = f'love_type="{love_type}" and offset={nxt}' if love_type else f"offset={nxt}"
+        if len(items) < remaining:
+            # The cursor for the next page; with nothing shown, the page starts where this one did.
+            nxt_after = longest_id or (items[-1]["id"] if items else after)
             out["truncated"] = True
-            out["next_offset"] = nxt
+            if after is None:
+                out["next_offset"] = offset + len(items)
+            out["next_after"] = nxt_after
+            where = f"after {after}" if after is not None else f"from offset {offset}"
+            how = f'after="{nxt_after}"' if nxt_after is not None else "offset=0"
+            args = f'love_type="{love_type}" and {how}' if love_type else how
             out["message"] = (
                 f"Showing {len(items)} of {total} crystallizations, newest first, "
-                f"from offset {offset}. More remain: call {TOOL_PREFIX_SLOT}get_soul "
+                f"{where}. More remain: call {TOOL_PREFIX_SLOT}get_soul "
                 f"with {args} for the next page."
             )
         return out
 
-    # The envelope with the longest hint this page could carry, plus room for
-    # the real tool prefix that later replaces the slot.
-    reserve = result_bytes(finish([])) + 64
+    # The envelope with the longest hint this page could carry (the longest id
+    # it could name), plus room for the real tool prefix that later replaces the slot.
+    longest = max((r.id for r in rows), key=len, default=after)
+    reserve = result_bytes(finish([], longest_id=longest)) + 64
     # A caller embedding this page in a larger result (boot) passes what is left
     # of the bound; never more than the bound itself.
     parsed_budget = _as_int(max_bytes)
