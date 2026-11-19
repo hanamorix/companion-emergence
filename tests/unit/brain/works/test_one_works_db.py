@@ -10,6 +10,7 @@ These tests build the two paths by hand on purpose: they stand in for a persona 
 
 from __future__ import annotations
 
+import gc
 import json
 import re
 from datetime import UTC, datetime
@@ -41,6 +42,14 @@ def _seed(db: Path, persona_dir: Path, wid: str, title: str, content: str, *, or
     )
     assert WorksStore(db).insert(work, content=content)
     write_markdown(persona_dir, work, content=content)
+    _release_handles()
+
+
+def _release_handles() -> None:
+    """A dropped WorksStore keeps its connections open until the cycle collector runs. Live code never opens the old file
+    through a WorksStore, but these tests seed it through one, so collect before anything renames or deletes a file
+    (Windows refuses to while a handle is open)."""
+    gc.collect()
 
 
 def test_list_works_sees_both_files_once_after_start_up(tmp_path):
@@ -55,6 +64,9 @@ def test_list_works_sees_both_files_once_after_start_up(tmp_path):
     assert sorted(ids) == ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
     assert not (tmp_path / "data" / "works.db").exists()
     assert (tmp_path / "data" / "works.db.migrated").is_file()
+    # The old file was closed when it was renamed: its log was folded in, so no -wal travelled with it. (Windows refuses
+    # to rename a file a handle still holds, which is how a leaked handle showed up there.)
+    assert not (tmp_path / "data" / "works.db.migrated-wal").exists()
 
 
 def test_merged_works_stay_searchable_and_readable(tmp_path):
@@ -84,6 +96,7 @@ def _make_one(persona_dir: Path) -> None:
         make_and_wire(persona_dir=persona_dir, store=store, provider=_FakeProvider(), now=None)
     finally:
         store.close()
+    _release_handles()
 
 
 def test_a_making_is_visible_to_the_works_tools(tmp_path):
