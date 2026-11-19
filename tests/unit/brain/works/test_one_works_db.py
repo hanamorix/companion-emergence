@@ -13,11 +13,14 @@ from __future__ import annotations
 import gc
 import json
 import re
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import brain.works.store as store_module
 from brain.maker.charge import MakerCharge, save_charge
 from brain.maker.making_runner import make_and_wire
 from brain.memory.store import MemoryStore
@@ -40,15 +43,29 @@ def _seed(db: Path, persona_dir: Path, wid: str, title: str, content: str, *, or
         summary=None,
         origin=origin,
     )
-    assert WorksStore(db).insert(work, content=content)
+    assert _store(db).insert(work, content=content)
     write_markdown(persona_dir, work, content=content)
-    _release_handles()
+
+
+def _store(db: Path) -> WorksStore:
+    """A WorksStore on ``db`` that holds no connection once a call returns.
+
+    WorksStore's first open of a path is never closed: a dropped sqlite3 connection lives until the cycle collector runs,
+    and Windows refuses to rename a file a live handle holds. So the schema is created here through a connection that is
+    closed, and the path is marked initialised, so the store skips that open. Its own insert closes what it opens.
+    """
+    key = str(db.resolve())
+    if key not in WorksStore._INITIALISED_PATHS:
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(str(db))) as conn:
+            conn.executescript(store_module._SCHEMA_SQL)
+        WorksStore._INITIALISED_PATHS.add(key)
+    return WorksStore(db)
 
 
 def _release_handles() -> None:
-    """A dropped WorksStore keeps its connections open until the cycle collector runs. Live code never opens the old file
-    through a WorksStore, but these tests seed it through one, so collect before anything renames or deletes a file
-    (Windows refuses to while a handle is open)."""
+    """The maker's own path opens works.db through stores this test can't reach, so collect them before the file is
+    damaged on purpose. One full collection; it costs CPU, so only the test that needs it calls this."""
     gc.collect()
 
 
@@ -96,7 +113,6 @@ def _make_one(persona_dir: Path) -> None:
         make_and_wire(persona_dir=persona_dir, store=store, provider=_FakeProvider(), now=None)
     finally:
         store.close()
-    _release_handles()
 
 
 def test_a_making_is_visible_to_the_works_tools(tmp_path):
@@ -122,6 +138,7 @@ def test_the_walker_checks_the_file_the_store_uses(tmp_path):
     from brain.health.walker import walk_persona
 
     _make_one(tmp_path)
+    _release_handles()
     for sidecar in ("works.db-wal", "works.db-shm"):  # else SQLite can serve the pages from the log
         (tmp_path / sidecar).unlink(missing_ok=True)
     (tmp_path / "works.db").write_bytes(b"this is not a sqlite database" * 64)
