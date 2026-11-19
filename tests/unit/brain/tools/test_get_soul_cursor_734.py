@@ -164,3 +164,25 @@ def test_the_schema_offers_the_field_read():
     assert set(props["field"]["enum"]) == {"moment", "why_it_matters", "who_or_what"}
     assert props["char_offset"]["type"] == "integer"
     assert "clipped_at" in SCHEMAS["get_soul"]["description"]
+
+
+# ---- #734 part 3: every love type the soul holds can be used as a filter ----
+def test_a_stored_love_type_outside_the_list_is_a_usable_filter(tmp_path):
+    from brain.soul.love_types import LOVE_TYPES
+
+    assert "found-family-from-kit" not in LOVE_TYPES  # as the emergence-kit migrator can store
+    _add(tmp_path, "kit1", minutes=0, love_type="found-family-from-kit")
+    _add(tmp_path, "c1", minutes=1)
+
+    page = get_soul(love_type="found-family-from-kit", **_ctx(tmp_path))
+    assert page["loaded"] is True and _ids(page) == ["kit1"]
+    assert "found-family-from-kit" in page["by_love_type"]
+    unknown = get_soul(love_type="never-stored", **_ctx(tmp_path))
+    assert unknown["loaded"] is False and "by_love_type" in unknown["error"]
+
+
+def test_the_schema_lets_any_love_type_through():
+    from brain.tools.schemas import SCHEMAS
+
+    prop = SCHEMAS["get_soul"]["parameters"]["properties"]["love_type"]
+    assert "enum" not in prop and "by_love_type" in prop["description"]

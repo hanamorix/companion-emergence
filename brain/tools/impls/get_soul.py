@@ -147,12 +147,16 @@ def get_soul(
             }
         return _read_field(persona_dir, id, field, char_offset, budget)
 
-    if love_type is not None and love_type not in LOVE_TYPES:
+    if love_type is not None and (
+        not isinstance(love_type, str) or (love_type not in LOVE_TYPES and love_type not in _stored_love_types(persona_dir))
+    ):
+        # #734: a type the soul already holds is a filter too, even outside the list (the emergence-kit
+        # migrator stores love_type unchecked), so every type by_love_type shows can be passed back.
         return {
             "loaded": False,
             "error": (
-                f"unknown love_type {love_type!r}. Use one of: {', '.join(sorted(LOVE_TYPES))}; "
-                "or leave it out for the whole soul."
+                f"unknown love_type {love_type!r}. Use one of: {', '.join(sorted(LOVE_TYPES))}, or a type "
+                "by_love_type shows; or leave it out for the whole soul."
             ),
         }
     parsed_limit = _as_int(limit)
@@ -298,3 +302,14 @@ def _read_field(persona_dir: Path, cid: str | None, field: str | None, char_offs
         else:
             hi = mid - 1
     return with_text(lo)
+
+
+def _stored_love_types(persona_dir: Path) -> set[str]:
+    """The love types the persona's active crystallizations hold (#734)."""
+    from brain.soul.store import SoulStore
+
+    soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
+    try:
+        return set(soul_store.active_love_type_counts())
+    finally:
+        soul_store.close()

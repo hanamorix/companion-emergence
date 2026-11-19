@@ -510,6 +510,8 @@ def test_schema_declares_optional_paging_and_filter_args() -> None:
     assert props["offset"]["type"] == "integer"
     assert props["offset"]["minimum"] == 0
     assert props["love_type"]["type"] == "string"
-    assert set(props["love_type"]["enum"]) == set(LOVE_TYPES)
+    # #734: no enum, so a stored type outside the list can be passed; the standard ones are named.
+    assert "enum" not in props["love_type"]
+    assert all(t in props["love_type"]["description"] for t in LOVE_TYPES)
     desc = SCHEMAS["get_soul"]["description"]
     assert "next_after" in desc and "newest first" in desc  # #734: the description pages by cursor

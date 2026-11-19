@@ -197,8 +197,11 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "love_type": {
                     "type": "string",
-                    "enum": list(LOVE_TYPES),
-                    "description": "Optional: only crystallisations of this love type.",
+                    # No enum (#734): a soul can hold types outside the list, and by_love_type names them.
+                    "description": (
+                        "Optional: only crystallisations of this love type: one of "
+                        f"{', '.join(LOVE_TYPES)}, or any type by_love_type shows."
+                    ),
                 },
                 "after": {
                     "type": "string",
