@@ -137,6 +137,15 @@ class _Window:
             self.full = True
 
     @property
+    def done(self) -> bool:
+        """No later line can be kept: the budget is spent, or the next line is past the range."""
+        return self.full or self.total >= self.end
+
+    def skip(self, count: int) -> None:
+        """Count ``count`` lines that are not kept (outside the window, #735)."""
+        self.total += count
+
+    @property
     def dedup_suffix(self) -> str:
         """Appended to the read-dedup key, so reading the next range of a file in the same
         turn is not mistaken for re-reading the range already shown (#590)."""
@@ -159,34 +168,54 @@ class _Window:
         return text + "; pass offset/max_lines to read more"
 
 
-def _stream_lines(fh, limit: int):
-    """Yield (line, cut) for each line of a UTF-8 byte stream, as str.splitlines(keepends=True)
-    would split the decoded text, holding at most ``limit`` characters of any line.
+def _breaks(text: str) -> int:
+    """How many lines end in ``text``, as str.splitlines counts them (a \\r\\n is one)."""
+    return sum(text.count(c) for c in _LINE_BREAKS) - text.count("\r\n")
 
-    Reads _READ_CHUNK_BYTES at a time, so memory is bounded by the chunk and ``limit``,
-    never the file. Invalid UTF-8 anywhere raises UnicodeDecodeError.
+
+def _scan_text(fh, window: _Window) -> None:
+    """Feed ``window`` the lines of a UTF-8 byte stream, as str.splitlines(keepends=True) would split the decoded
+    text, holding at most ``window.budget`` characters of any line.
+
+    Reads _READ_CHUNK_BYTES at a time, so memory is bounded by the chunk and the budget, never the file. Only a chunk
+    that reaches the window is split line by line; a chunk wholly before or after it is decoded and its line breaks
+    counted (#735: the per-line loop cost ~3 s on 20 MiB of bare newlines). Every chunk is still decoded, so invalid
+    UTF-8 anywhere raises UnicodeDecodeError, and the line count is the same either way.
     """
     decoder = codecs.getincrementaldecoder("utf-8")()
+    limit = window.budget
     line, cut, carry = "", False, ""
+    open_line = False  # a line has begun and not yet ended
     while True:
         chunk = fh.read(_READ_CHUNK_BYTES)
         text = carry + decoder.decode(chunk, final=not chunk)
         carry = ""
         if chunk and text.endswith("\r"):
             carry, text = "\r", text[:-1]  # it may pair with a "\n" in the next chunk
-        for part in text.splitlines(keepends=True):
-            if not cut:
-                room = limit - len(line)
-                if len(part) > room:
-                    line, cut = line + part[:room], True
-                else:
-                    line += part
-            if part[-1] in _LINE_BREAKS:
-                yield line, cut
-                line, cut = "", False
+        if text:
+            ended = _breaks(text)
+            # The lines ending here are numbered total .. total+ended-1, and the one still open after it total+ended.
+            before = window.total + ended < window.start
+            if (before or window.done) and not (line or cut):
+                window.skip(ended)
+                open_line = text[-1] not in _LINE_BREAKS if ended else True
+            else:
+                for part in text.splitlines(keepends=True):
+                    if not cut:
+                        room = limit - len(line)
+                        if len(part) > room:
+                            line, cut = line + part[:room], True
+                        else:
+                            line += part
+                    if part[-1] in _LINE_BREAKS:
+                        window.add(line, cut=cut)
+                        line, cut = "", False
+                open_line = bool(line or cut)
         if not chunk:
             if line or cut:
-                yield line, cut
+                window.add(line, cut=cut)
+            elif open_line:
+                window.skip(1)
             return
 
 
@@ -455,12 +484,12 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
 
     try:
         # #590: stream the file a chunk at a time; only the window's lines are kept.
-        # The whole file is still scanned, to count its lines and to call it binary
-        # if any of it is not UTF-8, as the old whole-file decode did.
+        # The whole file is still decoded, to count its lines and to call it binary
+        # if any of it is not UTF-8, as the old whole-file decode did; #735: only the
+        # chunks that reach the window are split line by line.
         try:
             with p.open("rb") as fh:
-                for line, cut in _stream_lines(fh, window.budget):
-                    window.add(line, cut=cut)
+                _scan_text(fh, window)
         except UnicodeDecodeError:
             _audit(
                 persona_dir,
