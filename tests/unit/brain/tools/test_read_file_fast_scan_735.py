@@ -74,3 +74,68 @@ def test_a_bad_byte_after_the_window_still_makes_the_file_binary(tmp_path):
     out = read_file(str(p), persona_dir=tmp_path / "x", max_lines=5)
 
     assert "content" not in out and "binary file" in out["note"]
+
+
+# ---- #735 part 2: a line cut at the window budget can be read past the cut ----
+def test_a_cut_line_can_be_read_to_its_end_with_char_offset(tmp_path):
+    import re
+
+    long_line = "".join(chr(ord("a") + i % 26) for i in range(100_000))
+    p = tmp_path / "long.txt"
+    p.write_text(long_line + "\nnext\n", encoding="utf-8")
+
+    got, char_offset, reads = "", 0, 0
+    while True:
+        _read_cache.reset()
+        out = read_file(str(p), persona_dir=tmp_path / "x", offset=0, max_lines=1, char_offset=char_offset)
+        got += out["content"]
+        reads += 1
+        m = re.search(r"pass offset=0, char_offset=(\d+) to read on", out.get("note", ""))
+        if m is None:
+            break
+        char_offset = int(m.group(1))
+        assert reads < 10
+    assert got == long_line + "\n"
+    assert reads == 3  # 100,000 characters at 40,000 a window
+
+
+def test_a_char_offset_past_the_line_end_gives_its_break_alone(tmp_path):
+    p = tmp_path / "f.txt"
+    p.write_text("short\nnext\n", encoding="utf-8")
+    out = read_file(str(p), persona_dir=tmp_path / "x", offset=0, max_lines=2, char_offset=999)
+    assert out["content"] == "\nnext\n"
+    assert "(line 0 from character 999)" in out["note"]
+
+
+@pytest.mark.no_base_failure(reason="pins that a negative char_offset reads from the line start, not an error (#735); main ignores char_offset, so it passes there too")
+def test_a_negative_char_offset_acts_as_zero(tmp_path):
+    p = tmp_path / "f.txt"
+    p.write_text("whole\n", encoding="utf-8")
+    out = read_file(str(p), persona_dir=tmp_path / "x", char_offset=-5)
+    assert out["content"] == "whole\n" and "truncated" not in out
+
+
+def test_two_char_offsets_in_one_turn_are_two_reads(tmp_path):
+    p = tmp_path / "f.txt"
+    p.write_text("abcdef\n", encoding="utf-8")
+    _read_cache.reset()
+    first = read_file(str(p), persona_dir=tmp_path / "x", char_offset=1)
+    second = read_file(str(p), persona_dir=tmp_path / "x", char_offset=3)
+    assert first["content"] == "bcdef\n" and second["content"] == "def\n"
+
+
+def test_a_pdf_line_is_read_from_char_offset(tmp_path):
+    from tests.unit.brain.tools.test_read_file_pdf import _make_pdf
+
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(_make_pdf(["hello world"]))
+    out = read_file(path=str(f), persona_dir=tmp_path, offset=0, max_lines=1, char_offset=6)
+    assert out["content"] == "world\n"
+
+
+def test_the_schema_offers_char_offset():
+    from brain.tools.schemas import SCHEMAS
+
+    params = SCHEMAS["read_file"]["parameters"]
+    assert params["properties"]["char_offset"]["type"] == "integer"
+    assert "char_offset" not in params["required"]

@@ -104,10 +104,13 @@ class _Window:
     Keeps lines [offset, offset + max_lines) — max_lines defaults to _DEFAULT_HEAD_LINES —
     up to _WINDOW_MAX_CHARS characters, and counts every line fed. A first line longer
     than the budget is cut to it; any later line that would pass it ends the window.
+    Line ``offset`` is shown from character ``char_offset`` (#735): every line is fed as it
+    is shown, so the feeder drops those characters (``_from_char``).
     """
 
-    def __init__(self, *, max_lines: int | None, offset: int) -> None:
+    def __init__(self, *, max_lines: int | None, offset: int, char_offset: int = 0) -> None:
         self.start = max(0, int(offset or 0))
+        self.start_char = max(0, int(char_offset or 0))
         count = _DEFAULT_HEAD_LINES if max_lines is None else max(0, int(max_lines))
         self.end = self.start + count
         self.budget = _WINDOW_MAX_CHARS
@@ -116,6 +119,7 @@ class _Window:
         self.total = 0
         self.full = False
         self.cut_line: int | None = None
+        self.cut_at = 0  # the character of the cut line where the next read starts
 
     def add(self, line: str, *, cut: bool = False) -> None:
         index = self.total
@@ -134,6 +138,7 @@ class _Window:
         self.used += size
         if cut:
             self.cut_line = index
+            self.cut_at = (self.start_char if index == self.start else 0) + len(line)
             self.full = True
 
     @property
@@ -149,11 +154,16 @@ class _Window:
     def dedup_suffix(self) -> str:
         """Appended to the read-dedup key, so reading the next range of a file in the same
         turn is not mistaken for re-reading the range already shown (#590)."""
-        return f"#lines={self.start}:{self.end}"
+        return f"#lines={self.start}:{self.end}" + (f"@{self.start_char}" if self.start_char else "")
 
     @property
     def truncated(self) -> bool:
-        return self.start > 0 or self.start + len(self.parts) < self.total or self.cut_line is not None
+        return (
+            self.start > 0
+            or self.start_char > 0
+            or self.start + len(self.parts) < self.total
+            or self.cut_line is not None
+        )
 
     def note(self, *, pages: int | None = None) -> str:
         across = f" across {pages} page(s)" if pages is not None else ""
@@ -161,11 +171,29 @@ class _Window:
             return f"offset {self.start} is past the end: there are {self.total} lines{across}"
         where = f"of {self.total}{across}"
         text = f"showing lines {self.start}-{self.start + len(self.parts)} {where}"
+        if self.start_char:
+            text += f" (line {self.start} from character {self.start_char})"
         if self.cut_line is not None:
-            text += f"; line {self.cut_line} is longer than {self.budget} characters and was cut short"
-        elif self.full:
+            return text + (
+                f"; line {self.cut_line} is longer than {self.budget} characters and was cut at character "
+                f"{self.cut_at}; pass offset={self.cut_line}, char_offset={self.cut_at} to read on"
+            )
+        if self.full:
             text += f"; stopped at {self.budget} characters"
         return text + "; pass offset/max_lines to read more"
+
+
+def _line_break_len(text: str) -> int:
+    """Length of the line break ``text`` ends with (2 for \\r\\n), or 0."""
+    if text.endswith("\r\n"):
+        return 2
+    return 1 if text and text[-1] in _LINE_BREAKS else 0
+
+
+def _from_char(line: str, start_char: int) -> str:
+    """``line`` from character ``start_char`` of its text; its line break is never dropped (#735)."""
+    body = len(line) - _line_break_len(line)
+    return line[min(start_char, body):]
 
 
 def _breaks(text: str) -> int:
@@ -186,6 +214,7 @@ def _scan_text(fh, window: _Window) -> None:
     limit = window.budget
     line, cut, carry = "", False, ""
     open_line = False  # a line has begun and not yet ended
+    to_drop = window.start_char  # characters of line `window.start` not to show (#735), dropped as they stream
     while True:
         chunk = fh.read(_READ_CHUNK_BYTES)
         text = carry + decoder.decode(chunk, final=not chunk)
@@ -201,6 +230,13 @@ def _scan_text(fh, window: _Window) -> None:
                 open_line = text[-1] not in _LINE_BREAKS if ended else True
             else:
                 for part in text.splitlines(keepends=True):
+                    if to_drop and window.total == window.start:
+                        drop = min(to_drop, len(part) - _line_break_len(part))
+                        part, to_drop = part[drop:], to_drop - drop
+                        if _line_break_len(part):
+                            to_drop = 0  # the start line ends here: a char_offset past its end shows its break alone
+                        if not part:
+                            continue  # this whole piece of the start line is before char_offset
                     if not cut:
                         room = limit - len(line)
                         if len(part) > room:
@@ -220,7 +256,7 @@ def _scan_text(fh, window: _Window) -> None:
 
 
 def _read_pdf(
-    p: Path, *, raw: str, persona_dir: Path, max_lines: int | None, offset: int
+    p: Path, *, raw: str, persona_dir: Path, max_lines: int | None, offset: int, char_offset: int = 0
 ) -> dict:
     """#126: return a PDF's text layer, page-marked and windowed like a text file.
 
@@ -233,7 +269,7 @@ def _read_pdf(
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=False, error="too large")
         return {"error": f"PDF too large ({size} bytes > {cap} cap) — not shown"}
 
-    window = _Window(max_lines=max_lines, offset=offset)
+    window = _Window(max_lines=max_lines, offset=offset, char_offset=char_offset)
     _dedup_key = os.path.normcase(os.path.realpath(str(p))) + window.dedup_suffix
     if _read_cache.seen_recently(_dedup_key):
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
@@ -270,8 +306,8 @@ def _read_pdf(
     joined = "".join(
         (f"--- page {i} ---\n" if i > 1 else "") + text + "\n" for i, text in enumerate(page_texts, 1)
     )
-    for line in joined.splitlines(keepends=True):
-        window.add(line)
+    for i, line in enumerate(joined.splitlines(keepends=True)):
+        window.add(_from_char(line, window.start_char) if i == window.start and window.start_char else line)
     _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True)
     out: dict = {"path": str(p), "content": "".join(window.parts), "pages": pages, "total_lines": window.total}
     if window.truncated:
@@ -331,11 +367,13 @@ def _audit(
 
 
 def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
-              offset: int = 0, **_) -> dict:
+              offset: int = 0, char_offset: int = 0, **_) -> dict:
     """Read a text file's contents (read-only). Refuses files over the size cap.
 
     max_lines: optional — return at most this many lines (ranged read).
     offset: 0-based line to start reading from.
+    char_offset: 0-based character of line ``offset`` to start from, to read past a line
+    cut at the window budget (#735); the cut note names it.
     Without max_lines a read shows _DEFAULT_HEAD_LINES lines from offset; any read
     shows at most _WINDOW_MAX_CHARS characters (#590).
     """
@@ -450,7 +488,9 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     # PDF branch (#126) — also BEFORE the text cap: a PDF is binary-large but
     # text-small, same cap-ordering reasoning as the image branch above.
     if _prefix.startswith(_PDF_MAGIC):
-        return _read_pdf(p, raw=raw, persona_dir=persona_dir, max_lines=max_lines, offset=offset)
+        return _read_pdf(
+            p, raw=raw, persona_dir=persona_dir, max_lines=max_lines, offset=offset, char_offset=char_offset
+        )
 
     cap = _file_read_max_bytes()
     size = p.stat().st_size
@@ -471,7 +511,7 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     # canonicalises case on the case-insensitive macOS FS and keeps genuinely
     # distinct files distinct on case-sensitive Linux. Do NOT casefold here — on
     # Linux that would collide two different files (Notes.md vs notes.md).
-    window = _Window(max_lines=max_lines, offset=offset)
+    window = _Window(max_lines=max_lines, offset=offset, char_offset=char_offset)
     _dedup_key = os.path.normcase(os.path.realpath(str(p))) + window.dedup_suffix
     if _read_cache.seen_recently(_dedup_key):
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
