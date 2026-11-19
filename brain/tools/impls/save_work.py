@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.works import WORK_TYPES, Work, make_work_id
+from brain.works.location import works_db_path
 from brain.works.storage import write_markdown
 from brain.works.store import WorksStore
 
@@ -63,7 +64,7 @@ def save_work(
     # write fails after a new insert, roll back the index row so /works cannot
     # advertise missing content. Duplicate ids are true idempotent no-ops and
     # must not rewrite existing markdown with different metadata.
-    store = WorksStore(persona_dir / "data" / "works.db")
+    store = WorksStore(works_db_path(persona_dir))
     inserted = store.insert(work, content=content)
     if not inserted:
         return {"id": work.id, "path": f"data/works/{work.id}.md", "deduped": True}
