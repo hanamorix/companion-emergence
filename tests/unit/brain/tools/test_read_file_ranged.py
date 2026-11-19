@@ -169,8 +169,8 @@ def test_a_huge_single_line_is_cut_to_the_window_budget(tmp_path):
     assert out["content"] == "x" * rf._WINDOW_MAX_CHARS
     assert out["total_lines"] == 1 and out["truncated"] is True
     assert out["note"] == (
-        f"showing lines 0-1 of 1; line 0 is longer than {rf._WINDOW_MAX_CHARS} characters and was cut short; "
-        "pass offset/max_lines to read more"
+        f"showing lines 0-1 of 1; line 0 is longer than {rf._WINDOW_MAX_CHARS} characters and was cut at character "
+        f"{rf._WINDOW_MAX_CHARS}; pass offset=0, char_offset={rf._WINDOW_MAX_CHARS} to read on"
     )
 
 

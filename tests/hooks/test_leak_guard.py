@@ -277,3 +277,107 @@ def test_plaintext_rules_substring_and_regex(lg, tmp_path):
     assert lg.scan_line_plaintext("+ note: plush, the kraken teapot photo", rules)
     assert lg.scan_line_plaintext("+ dated Blorpuary 21 in the letter", rules)
     assert not lg.scan_line_plaintext("+ dated Blorpuary 25 in the letter", rules)
+
+
+# ── #761: the pre-push hook reads the main checkout's local rules from a worktree ──
+_HOOK_FILES = ("pre-push", "leak_guard.py", "denied-paths.txt", "allowed-binary-paths.txt")
+_CANARY = "canary wombat teacup"  # synthetic marker, as in hooks/test_leak_guard.sh
+_ZERO = "0" * 40
+
+
+def _shell():
+    import shutil
+
+    sh = shutil.which("sh") or shutil.which("bash")
+    if sh is None:
+        pytest.skip("no POSIX shell to run the hook with")
+    return sh
+
+
+def _scratch_with_worktree(tmp_path, *, rules: str | None):
+    """A scratch main checkout carrying the real hook files, with ``hooks/leak-rules.local``
+    gitignored (and holding ``rules`` when given), plus a worktree on branch ``feat`` whose one
+    new commit adds the canary. Returns ``(main, worktree, feat_sha)``."""
+    import shutil
+    import subprocess
+
+    main = tmp_path / "main"
+    (main / "hooks").mkdir(parents=True)
+
+    def git(*args, cwd=main):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    hooks_src = _MODULE_PATH.parent
+    for name in _HOOK_FILES:
+        shutil.copy2(hooks_src / name, main / "hooks" / name)
+    # A scratch identity allowlist, so the metadata arm passes without naming a real person.
+    (main / "hooks" / "allowed-identities.txt").write_text("glob:*@example.com\n", encoding="utf-8")
+    (main / ".gitignore").write_text("hooks/leak-rules.local\n", encoding="utf-8")
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "X")
+    git("config", "user.email", "x@example.com")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    if rules is not None:
+        (main / "hooks" / "leak-rules.local").write_text(rules, encoding="utf-8")
+    wt = tmp_path / "wt"
+    git("worktree", "add", "-q", str(wt), "-b", "feat")
+    (wt / "note.txt").write_text(f"a line with the {_CANARY} in it\n", encoding="utf-8")
+    git("add", ".", cwd=wt)
+    git("commit", "-qm", "add a note", cwd=wt)
+    return main, wt, git("rev-parse", "HEAD", cwd=wt)
+
+
+def _push_hook(cwd, sha):
+    """Run the real pre-push hook from ``cwd`` as git would for a new branch ``feat`` at ``sha``."""
+    import os
+    import subprocess
+
+    env = {**os.environ, "LEAK_GUARD_FORCE": "1"}
+    # Bytes, not text: git writes "\n", and text mode on Windows would send "\r\n", which the hook's `read` keeps as
+    # part of the remote sha (so "0000...\r" is not the new-branch zero and rev-list fails).
+    done = subprocess.run(
+        [_shell(), "hooks/pre-push", "origin", "https://example.invalid/scratch.git"],
+        cwd=cwd, input=f"refs/heads/feat {sha} refs/heads/feat {_ZERO}\n".encode("ascii"),
+        capture_output=True, env=env,
+    )
+    return subprocess.CompletedProcess(
+        done.args, done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace")
+    )
+
+
+def test_a_push_from_a_worktree_uses_the_main_checkouts_local_rules(tmp_path):
+    """#761: the rules file is gitignored, so it lives only in the main checkout. A push from a
+    worktree must still be checked against it, and refused when an added line matches."""
+    _main, wt, sha = _scratch_with_worktree(tmp_path, rules=f"substr:{_CANARY}\n")
+    assert not (wt / "hooks" / "leak-rules.local").exists()
+
+    result = _push_hook(wt, sha)
+
+    assert result.returncode == 1, result.stderr
+    assert "LEAK-GUARD [content]" in result.stderr and "Traceback" not in result.stderr, result.stderr
+
+
+@pytest.mark.no_base_failure(reason="pins that a push from the main checkout still uses its own rules (#761); main does too")
+def test_a_push_from_the_main_checkout_still_uses_its_rules(tmp_path):
+    import subprocess
+
+    main, wt, sha = _scratch_with_worktree(tmp_path, rules=f"substr:{_CANARY}\n")
+    subprocess.run(["git", "merge", "-q", "--ff-only", "feat"], cwd=main, check=True, capture_output=True)
+
+    result = _push_hook(main, sha)
+
+    assert result.returncode == 1, result.stderr
+    assert "LEAK-GUARD [content]" in result.stderr and "Traceback" not in result.stderr, result.stderr
+
+
+def test_no_rules_file_anywhere_warns_and_still_passes_a_clean_push(tmp_path):
+    """#761: with no local rules at all the hook says so on stderr, and a push with nothing
+    else wrong still goes through (CI's marker-scan is the real boundary)."""
+    _main, wt, sha = _scratch_with_worktree(tmp_path, rules=None)
+
+    result = _push_hook(wt, sha)
+
+    assert result.returncode == 0, result.stderr
+    assert "leak-rules.local" in result.stderr and "not checked" in result.stderr
+    assert "Traceback" not in result.stderr
