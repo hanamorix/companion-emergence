@@ -27,12 +27,10 @@ from tests.unit.brain.emotion._engine_support import (
     queue,
     queue_events,
     queue_text_lines,
-    refuse_the_switch_stat,
     ruin_the_state,
     save,
     showing,
     simple_state,
-    skipped_warnings,
     state_of,
     tree,
 )
@@ -138,8 +136,9 @@ def test_the_early_out_does_not_fire_with_a_missing_or_unreadable_state_and_neve
         target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-    engine.note_active(D[3])  # an unreadable state on a persona whose switch is missing: starts empty and writes
+    engine.note_active(D[3])  # an unreadable state on a persona not seen switched over: the pass is skipped and nothing is written
     assert len(spy.within) == 3
+    assert engine_files.read_state(persona).problem == "unreadable"
 
 
 def test_a_saved_state_with_no_open_day_is_never_skipped_past(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -341,63 +340,45 @@ def test_a_fresh_persona_that_is_not_live_drains_a_first_showing_into_a_new_stat
     assert engine.status().caught_up
 
 
-def test_an_unreadable_state_on_a_persona_that_is_not_live_is_replaced_by_an_empty_one_once(
-    persona: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_drain_over_an_unreadable_state_of_a_persona_that_is_not_live_skips_its_pass_and_keeps_the_queue(
+    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Planning B31 SW4: an unreadable state is never replaced by an empty one. The first rebuild at the next start writes the
+    readable state from the database (`ensure`); until then the drain does nothing and the queue is kept, its bytes and position."""
     save(persona, simple_state(saved_at=D[3]))
-    for suffix in ("", ".bak1", ".bak2", ".bak3"):
-        target = engine_files.state_path(persona).with_name(engine_files.state_path(persona).name + suffix)
-        if target.exists():
-            target.write_bytes(b"\x00")
-    engine = install(persona)
-    engine.note_active(D[3])  # no lines and no day closed, yet the fallback to an empty state is saved
-    assert engine_files.read_state(persona).problem is None
-    saves = _count_saves(monkeypatch)
-    install(persona).note_active(D[3])  # the failing load is not retried on every call
-    assert saves == []
-
-
-def test_with_the_switch_unknown_a_drain_over_an_unreadable_state_skips_the_pass_and_keeps_everything(
-    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Owner 2026-11-05: an unknown switch is "not switched". A not-switched persona would start from an empty state, which
-    replaces the stored one, so with the switch unknown the pass is skipped: nothing is written, the queue is kept."""
-    save(persona, simple_state(saved_at=D[3], day=_day(3)))
+    queue(persona, showing("m1", D[4], {"joy": 6.0}))
     ruin_the_state(persona)
-    queue(persona, showing("m1", D[4], {"joy": 6.0}))
-    engine = install(persona, D[5])
-    before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
-    with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
-        engine.note_active(D[5])
-    assert len(skipped_warnings(caplog)) == 1
-    assert engine_errors(caplog) == []  # not a failure of a switched persona
-    assert engine._catch_up_failed is False  # no failure flag is set either
-    engine.note_active(D[5])  # the next pass skips again, and still changes nothing
-    assert tree(persona / "state") == before  # the stored state, its copies and the queue lines are exactly as they were
+    engine = install(persona)
+    state_dir = persona / "state"
+    before = tree(state_dir)
+    saves = _count_saves(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.engine"):
+        engine.note_active(D[4])
+        engine.note_active(D[4])  # and again: the pass is skipped every time, never started empty
+    assert saves == []
+    assert tree(state_dir) == before  # no new state, no emptied queue, no moved copy
     assert len(queue_events(persona)) == 1
-    monkeypatch.undo()  # the fault clears: the switch is known missing, so the retry starts empty and consumes the queue
-    engine.note_active(D[5])
-    assert queue_events(persona) == []
-    assert state_of(persona).emotions["joy"].short.avg == 6.0
+    assert engine_files.read_state(persona).problem == "unreadable"
+    assert [r for r in caplog.records if r.name == "brain.emotion.engine" and "cannot be read" in r.getMessage()]
 
 
-def test_with_the_switch_unknown_a_drain_over_a_missing_state_skips_the_pass_and_keeps_the_queue(
-    persona: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_drain_over_an_unreadable_state_of_a_persona_this_instance_saw_switched_over_flags_it_and_keeps_everything(
+    persona: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A switched persona's state is never replaced by an empty one: the pass is marked failed, nothing is written, the queue is
+    kept, and the recovery job repairs it. (An instance that never saw the switch-over cannot tell, and starts empty: the test
+    above, accepted edge (a) of Planning B25 SW2.)"""
+    save(persona, simple_state(saved_at=D[3], day=_day(3), switch_over_at=D[1]))
     queue(persona, showing("m1", D[4], {"joy": 6.0}))
     engine = install(persona, D[5])
+    assert engine.is_live()
+    ruin_the_state(persona)
     before = tree(persona / "state")
-    refuse_the_switch_stat(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger="brain.emotion.engine"):
         engine.note_active(D[5])
-    assert len(skipped_warnings(caplog)) == 1
-    assert engine_errors(caplog) == []
-    assert not engine_files.state_path(persona).exists()
-    assert tree(persona / "state") == before and len(queue_events(persona)) == 1
-    monkeypatch.undo()
-    engine.note_active(D[5])
-    assert queue_events(persona) == [] and state_of(persona).emotions["joy"].short.avg == 6.0
+    assert len(engine_errors(caplog)) == 1 and engine._catch_up_failed is True
+    assert tree(persona / "state") == before  # the stored copies and the queue lines are exactly as they were
+    assert len(queue_events(persona)) == 1
 
 
 # --- the stamp (V1, B17) and the time given -------------------------------------------------------------------

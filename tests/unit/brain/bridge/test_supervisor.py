@@ -384,7 +384,6 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
 
     # Fake HeartbeatEngine returns a result we can predict
     fake_result = MagicMock(
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         reflex_fired=(),
@@ -402,9 +401,10 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
     ):
         _run_heartbeat_tick(persona_dir, FakeProvider(), bus)
 
-    assert any(e.get("type") == "heartbeat_tick" for e in bus.events), (
-        "heartbeat_tick event was not published"
-    )
+    ticks = [e for e in bus.events if e.get("type") == "heartbeat_tick"]
+    assert ticks, "heartbeat_tick event was not published"
+    assert "memories_decayed" not in ticks[0]
+    assert ticks[0]["edges_pruned"] == 0
 
 
 # ---------------------------------------------------------------------------

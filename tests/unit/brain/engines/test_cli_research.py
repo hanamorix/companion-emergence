@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from brain.cli import main
+from brain.emotion.engine import ensure_engine_ready
 
 
 def _setup_persona(personas_root: Path, name: str = "testpersona") -> Path:
@@ -24,6 +25,7 @@ def test_cli_research_dry_run_no_interests(monkeypatch, tmp_path: Path, capsys):
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
     persona_dir = _setup_persona(tmp_path / "personas")
     (persona_dir / "interests.json").write_text('{"version": 1, "interests": []}', encoding="utf-8")
+    ensure_engine_ready(persona_dir)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     rc = main(
         [
             "research",
@@ -131,6 +133,7 @@ def test_cli_research_reads_provider_from_persona_config(monkeypatch, tmp_path: 
     (persona_dir / "persona_config.json").write_text(
         '{"provider": "fake", "searcher": "noop"}\n', encoding="utf-8"
     )
+    ensure_engine_ready(persona_dir)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     # No --provider / --searcher passed — must come from the file.
     rc = main(["research", "--persona", "testpersona", "--dry-run"])
     assert rc == 0
@@ -146,6 +149,7 @@ def test_cli_research_provider_flag_overrides_persona_config(monkeypatch, tmp_pa
     (persona_dir / "persona_config.json").write_text(
         '{"provider": "ollama", "searcher": "noop"}\n', encoding="utf-8"
     )
+    ensure_engine_ready(persona_dir)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     rc = main(
         [
             "research",

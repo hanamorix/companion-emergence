@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from brain.emotion import engine, engine_files
 from brain.emotion.engine import EmotionEngine
 from brain.emotion.engine_utils import Average, EmotionState, EngineState, Event
 from brain.memory.store import Memory, MemoryStore
-from brain.utils import file_lock, file_ops
+from brain.utils import file_lock
 
 NOW = datetime(2026, 6, 10, 15, 30, tzinfo=UTC)
 DAY0 = date(2026, 5, 1)
@@ -79,7 +80,9 @@ def install(persona_dir: Path, now: datetime = NOW) -> EmotionEngine:
     return instance
 
 
-def simple_state(*, saved_at: datetime, joy: float = 4.0, day: str | None = None, queue_line: int = 0) -> EngineState:
+def simple_state(
+    *, saved_at: datetime, joy: float = 4.0, day: str | None = None, queue_line: int = 0, switch_over_at: datetime | None = None
+) -> EngineState:
     """A small state: one emotion (`joy`) with one entry of weight 1, as a saved copy would hold."""
     return EngineState(
         saved_at=saved_at,
@@ -90,7 +93,26 @@ def simple_state(*, saved_at: datetime, joy: float = 4.0, day: str | None = None
             "joy": EmotionState(short=Average(joy, 1.0), long=Average(joy, 1.0), last_entry_day=day),
         },
         queue_line=queue_line,
+        switch_over_at=switch_over_at,
     )
+
+
+def make_live(persona_dir: Path, at: datetime) -> None:
+    """Switch a persona over the way the first rebuild leaves it: its state file holds `switch_over_at` = `at`.
+
+    Keeps the state that is already there (a state without the field gets it), and writes an empty state when there is none.
+    There is no switch file; this is the only record of the switch-over.
+    """
+    state = engine_files.read_state(persona_dir).state or EngineState(saved_at=at)
+    state.switch_over_at = at
+    assert engine_files.save_state(persona_dir, state, verify=True)
+
+
+def lose_the_state(persona_dir: Path) -> None:
+    """Delete every copy of the state file (main and the three backups): the persona has no state at all."""
+    base = engine_files.state_path(persona_dir)
+    for suffix in ("", ".bak1", ".bak2", ".bak3"):
+        base.with_name(base.name + suffix).unlink(missing_ok=True)
 
 
 def save(persona_dir: Path, state: EngineState) -> None:
@@ -142,18 +164,6 @@ def queue(persona_dir: Path, *events: Event) -> None:
         assert engine_files.append_event(persona_dir, event)
 
 
-def refuse_the_switch_stat(monkeypatch) -> None:  # noqa: ANN001 - a pytest MonkeyPatch
-    """Make the stat of the switch file fail with a permission error (any error other than "no such file"): the switch is unknown."""
-    real_stat = file_ops.stat_path
-
-    def refuse(path: str | Path):
-        if Path(path).name == "emotion_switch.json":
-            raise PermissionError("denied")
-        return real_stat(path)
-
-    monkeypatch.setattr(file_ops, "stat_path", refuse)
-
-
 def ruin_the_state(persona_dir: Path) -> None:
     """Leave every copy of the state file unreadable (main and the three backups)."""
     base = engine_files.state_path(persona_dir)
@@ -161,14 +171,6 @@ def ruin_the_state(persona_dir: Path) -> None:
         target = base.with_name(base.name + suffix)
         if target.exists():
             target.write_bytes(b"\x00")
-
-
-SKIPPED = "this pass is skipped"  # the log line of a pass skipped because the switch cannot be inspected
-
-
-def skipped_warnings(caplog) -> list[str]:  # noqa: ANN001 - a pytest LogCaptureFixture
-    """WARNING lines saying the pass was skipped for an unknown switch."""
-    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING and SKIPPED in r.getMessage()]
 
 
 def engine_errors(caplog) -> list[str]:  # noqa: ANN001 - a pytest LogCaptureFixture
@@ -226,5 +228,50 @@ class LockSpy:
 
 def joy_of(state: EngineState) -> EmotionState:
     return state.emotions["joy"]
+
+
+class OtherHolder:
+    """The engine lock held the way another process's rebuild holds it (flock locks belong to the open file description, so a
+    second open in the same thread conflicts). `release()` lets go; it may be called twice."""
+
+    def __init__(self, persona_dir: Path) -> None:
+        self._stack = contextlib.ExitStack()
+        self._stack.enter_context(engine_files.state_lock(persona_dir))
+
+    def release(self) -> None:
+        self._stack.close()
+
+
+class WaitLog:
+    """The lock-wait lines `EmotionEngine._locked_rebuild` logs through `warn_throttled` (one per wait step), and what to do at each.
+
+    Only a message holding "engine lock" counts (`_roll_forward_failed` also calls `engine.warn_throttled`); the throttle table is
+    process-wide, so the log level proves nothing and the call itself is spied. `steps` is the number of wait steps seen.
+    `on_step` maps the number of a step (1 is the first) to what the OTHER process does at that moment (the holder finishes or
+    fails and lets go); it runs from the spy's call, before the next try of the lock. `fail_on_wait` fails the test at the first
+    wait step (a wrongly retried timeout would otherwise loop for ever). In every mode the test fails after 50 wait steps, so a
+    holder action that never fires fails instead of hanging.
+    """
+
+    MAX_STEPS = 50
+
+    def __init__(self, monkeypatch, *, fail_on_wait: bool = False, on_step: dict[int, Callable[[], None]] | None = None) -> None:  # noqa: ANN001
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.steps = 0
+        real = engine.warn_throttled
+        log = self
+
+        def spy(logger: logging.Logger, key: str, msg: str, *args: object, **kwargs: object) -> None:
+            if "engine lock" in msg:
+                log.steps += 1
+                log.calls.append((key, kwargs))
+                assert not fail_on_wait, "the engine lock was waited for, and this test says it must not be"
+                assert log.steps < WaitLog.MAX_STEPS, "the wait loop never ended"
+                action = (on_step or {}).get(log.steps)
+                if action is not None:
+                    action()
+            real(logger, key, msg, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(engine, "warn_throttled", spy)
 
 

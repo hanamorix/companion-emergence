@@ -985,16 +985,16 @@ def test_process_one_candidate_keeps_an_unparseable_decision_in_the_persona_log(
 
 
 def _delivered_emotions(tmp_path: Path, monkeypatch, *, live: bool) -> dict[str, float]:
-    from brain.emotion import engine_files
     from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live
 
-    if live:  # a live persona with no state file applies nothing, so seed a memory first, then write the switch
+    if live:  # a live persona with no state file applies nothing, so seed a memory first, then record the switch-over
         seed_store = MemoryStore(tmp_path / "memories.db")
         try:
             seed_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
         finally:
             seed_store.close()
-        assert engine_files.write_switch(tmp_path, datetime.now(UTC))
+        make_live(tmp_path, datetime.now(UTC))
     monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
     emit_initiate_candidate(
         tmp_path, kind="message", source="dream", source_id="dream_b1_pr3", emotional_snapshot=_snap(), semantic_context=_ctx()

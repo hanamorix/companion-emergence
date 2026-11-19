@@ -230,13 +230,13 @@ def test_handle_arc_close_writes_breadcrumb_above_threshold(tmp_path: Path) -> N
 from datetime import UTC, datetime  # noqa: E402
 
 from brain.emotion import engine as emotion_engine  # noqa: E402
-from brain.emotion import engine_files  # noqa: E402
 from brain.emotion.engine import EmotionEngine  # noqa: E402
+from tests.unit.brain.emotion._engine_support import make_live  # noqa: E402
 
 
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return emotion_engine.engine_for(persona_dir)
 
 

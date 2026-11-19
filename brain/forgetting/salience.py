@@ -151,7 +151,7 @@ def _freshness_input(memory: Memory, felt_time_state: FeltTimeState | None) -> f
 
 def _peak_input(memory: Memory, felt_time_state: FeltTimeState | None) -> float:
     """Salience residue of having mattered: log-scaled peak intensity with a
-    long linear linger. Survives emotion decay + noise-floor deletion by
+    long linear linger. Survives the fading of the stored emotions and noise-floor deletion by
     reading the monotone peak field, not the live dict."""
     peak = getattr(memory, "peak_emotion_intensity", 0.0) or 0.0
     if peak <= 0.0:

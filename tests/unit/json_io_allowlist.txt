@@ -44,7 +44,7 @@ brain/maker/persist.py::not-file-io::1   # not-file: sqlite-or-wire
 brain/mcp_server/audit.py::not-file-io::2   # not-file: prompt-or-log
 brain/mcp_server/tools.py::not-file-io::2   # not-file: prompt-or-log
 brain/memory/relevance_judge.py::not-file-io::1   # not-file: model-reply
-brain/memory/store.py::not-file-io::32   # not-file: sqlite-or-wire
+brain/memory/store.py::not-file-io::33   # not-file: sqlite-or-wire
 brain/migrator/cli.py::not-file-io::1   # not-file: prompt-or-log
 brain/migrator/report.py::not-file-io::1   # not-file: string-codec
 brain/notes/compose.py::not-file-io::1   # not-file: model-reply

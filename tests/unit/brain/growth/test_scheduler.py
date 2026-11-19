@@ -451,11 +451,11 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
 
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float):
     from brain.emotion import engine as emotion_engine
-    from brain.emotion import engine_files
     from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     return emotion_engine.engine_for(persona_dir)
 
 
