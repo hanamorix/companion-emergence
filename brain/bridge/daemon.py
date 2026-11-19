@@ -507,9 +507,12 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         return
     # The child's identity, read now while it runs (once it has exited its token reads GONE): the notice it writes at a failure
     # inside it names this pid and token, and that is how a notice of its own is told from an older one (no clock is compared).
-    # A token that cannot be read means no notice can be told to be the child's, and the generic reason below is written. Accepted
-    # edge (P4): a child already gone at this read, or a launcher process whose pid is not the interpreter's, gets the generic
-    # reason too; only a less specific message, the exact error is in the log.
+    # A token that cannot be read means no notice can be told to be the child's, and the generic reason below is written. `bridge_python()`
+    # above already starts the interpreter itself, so `child.pid` is the pid the child writes: on the shipped Windows build (a standalone
+    # python.exe or pythonw.exe, no venv, from the app, `nell.bat` or the Task Scheduler run) it returns `sys.executable`, and on a Windows
+    # dev venv it returns the base interpreter, not the venv redirector. Accepted edge (P4): a child already gone at this read, or a
+    # setup that starts the child some other way than through `bridge_python()` (none in the product), gets the generic reason too;
+    # only a less specific message, the exact error is in the log.
     child_token = process_identity.token_of(child.pid)
     child_identity = (child.pid, child_token) if process_identity.is_token(child_token) else None
     try:
