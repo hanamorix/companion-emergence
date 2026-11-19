@@ -284,3 +284,56 @@ def test_a_malformed_current_gap_keeps_the_history(tmp_path, monkeypatch, caplog
     assert [g.note for g in state.gap_history] == ["kept"]
     assert recovered is True
     assert any("current_gap" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+# ── #752: the repair's "done" flag lives in the state file and survives every save ──
+def _plain_gap():
+    from brain.self_model.gap import Gap
+
+    return Gap(per_channel={"joy": 1.5}, magnitude=1.5, unnamed_pressure=0.0, status="open")
+
+
+def test_the_cleared_flag_survives_a_save_built_from_scratch(tmp_path):
+    from brain.self_model.state import push_gap, windowed_peak_cleared
+
+    save(tmp_path, SelfModelState(), windowed_peak_cleared=True)
+    save(tmp_path, SelfModelState(current_gap=_plain_gap(), gap_history=[]))  # how the supervisor and reconcile write
+    save(tmp_path, push_gap(load_or_recover(tmp_path)[0], _plain_gap()))
+    assert windowed_peak_cleared(tmp_path) is True
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered and loaded.current_gap is not None and len(loaded.gap_history) == 1
+
+
+def test_the_cleared_flag_is_never_written_false(tmp_path):
+    import json
+
+    from brain.self_model.state import _state_path, windowed_peak_cleared
+
+    save(tmp_path, SelfModelState())
+    assert "windowed_peak_cleared" not in json.loads(_state_path(tmp_path).read_text(encoding="utf-8"))
+    assert windowed_peak_cleared(tmp_path) is False
+
+
+import pytest  # noqa: E402 -- the #752 block's parametrize
+
+
+@pytest.mark.parametrize("content", [None, "{not json", "[1, 2]", '{"windowed_peak_cleared": "yes"}'])
+def test_the_cleared_flag_reads_false_for_a_missing_or_bad_file(tmp_path, content):
+    from brain.self_model.state import _state_path, windowed_peak_cleared
+
+    if content is not None:
+        _state_path(tmp_path).write_text(content, encoding="utf-8")
+    assert windowed_peak_cleared(tmp_path) is False
+
+
+@pytest.mark.no_base_failure(reason="pins that a save over a corrupt state file still writes the new state (#752); main does too")
+def test_a_save_over_a_corrupt_file_writes_the_new_state(tmp_path):
+    import json
+
+    from brain.self_model.state import _state_path
+
+    _state_path(tmp_path).write_text("{not json", encoding="utf-8")
+    save(tmp_path, SelfModelState(current_gap=_plain_gap(), gap_history=[]))
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered and loaded.current_gap is not None
+    assert "windowed_peak_cleared" not in json.loads(_state_path(tmp_path).read_text(encoding="utf-8"))
