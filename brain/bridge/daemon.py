@@ -405,7 +405,8 @@ def _rebuild_under_lock(persona_dir: Path) -> int | None:
     also records why in the rebuild notice (``engine_files.settle_rebuild_notice``, Hana's point 5 on #633), which the window shows while
     the persona is not switched over: the OSError text, or "the update of your memories stopped (exit code N)" unless the child wrote
     its own, more exact notice (told by the pid and token the notice names, read from the launched child right after the spawn, not
-    by a clock comparison); a child that exits 0 clears a notice once the persona is switched over. Any
+    by a clock comparison); a child that ends normally clears the notice itself once the
+    persona is switched over (this process does not). Any
     BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
 
     The runtime log is attached for the step (``_runtime_log``: transient, only when no persistent handler for the log is
@@ -532,9 +533,7 @@ def _run_rebuild_child(persona_dir: Path) -> None:
         _settle_rebuild_notice(
             persona_dir, f"the update of your memories stopped (exit code {code})", keep_notice_of=child_identity
         )
-    else:
-        # A completed child: the persona is switched over, so the writer deletes a notice an earlier attempt left.
-        _settle_rebuild_notice(persona_dir, None)
+    # A child that exited 0 is not settled here: the child clears the notice itself when it ends normally (`cli._supervisor_rebuild_handler`).
 
 
 def _settle_rebuild_notice(persona_dir: Path, reason: str | None, *, keep_notice_of: tuple[int, str] | None = None) -> None:

@@ -452,7 +452,8 @@ class EngineProgress:
 # persona whose roll-forward fails never gets one (that failure stays in the runtime log). ``build_persona_state`` reads it into the
 # window's state; the full error is in the runtime log. ONE writer, ``settle_rebuild_notice``, is called by the engine (the failure
 # points inside the rebuild process) and by the start process (``daemon``: a rebuild child that could not be started or ended
-# non-zero, a need check that failed). Not reused: ``shutdown_progress.write_record/read_record`` live in ``brain.bridge``, which the
+# non-zero, a need check that failed), and clears it: the rebuild child when its ready step returns (``cli`` handler), the start
+# process when its need check answers no. Not reused: ``shutdown_progress.write_record/read_record`` live in ``brain.bridge``, which the
 # engine may not import, and a daemon-only use would make two writers; ``EngineProgress`` is for a LIVE writer (it refuses another live
 # process's record, removes by pid, is read only while the writer lives), and a failure record must outlive its writer. Also not
 # chosen: a flag derived from ``is_live`` the way ``recovering`` is derived (no file), which cannot say what happened (S112: "saying

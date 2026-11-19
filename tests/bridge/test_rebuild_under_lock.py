@@ -455,15 +455,17 @@ def test_a_child_token_that_cannot_be_read_means_the_generic_reason_is_written(
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_a_child_that_completes_clears_the_notice_once_the_persona_is_switched_over(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+def test_the_start_does_not_clear_the_notice_after_a_child_that_exited_zero(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+    """The child clears the notice itself when it ends normally (`cli._supervisor_rebuild_handler`; test_supervisor_rebuild.py and the
+    real-child test), so the start has one mechanism fewer: with a stand-in child that clears nothing, a notice on a switched persona stays."""
     from datetime import UTC, datetime
 
     from tests.unit.brain.emotion._engine_support import make_live
 
-    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))  # what the real child's completed switch-over leaves
+    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))
     _plant(persona)
     assert daemon._rebuild_under_lock(persona) is None
-    assert not engine_files.rebuild_notice_path(persona).exists()
+    assert _notice(persona) == "an earlier attempt's"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")

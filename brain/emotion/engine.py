@@ -971,7 +971,8 @@ class EmotionEngine:
         not complete (the two skips above, and every failure through `_start_failed`) therefore calls
         `engine_files.settle_rebuild_notice` with a one-line reason, which writes `rebuild_notice.json` while the persona is not
         switched over. A switched persona (a failed roll-forward) gets none and any old one is deleted; a completed switch-over
-        clears it at the start process's next check. The errors themselves are logged as before.
+        clears it when the rebuild process's handler (`cli._supervisor_rebuild_handler`) calls the writer with no reason after this
+        method returns. The errors themselves are logged as before.
         """
         loaded = self._state_cache.get()
         if self._switched(loaded):

@@ -1234,7 +1234,7 @@ def test_case_1_a_failed_rebuild_leaves_a_notice_naming_the_step_and_the_error(t
     reason = _notice(persona)
     assert reason is not None and reason.startswith("the first rebuild failed (RebuildCheckError: ")
     monkeypatch.undo()
-    ensure_engine_ready(persona)  # the fault is gone: the start completes, and the start process's next check clears the notice
+    ensure_engine_ready(persona)  # the fault is gone: the start completes; the rebuild child's own call (the cli handler) then clears the notice
     engine_files.settle_rebuild_notice(persona, None)
     assert _notice(persona) is None
 
@@ -1291,7 +1291,7 @@ def test_case_3_a_state_and_a_database_that_both_cannot_be_read_skip_the_start_a
     reason = _notice(persona)
     assert reason is not None and reason.startswith("the saved feelings and memories.db could not be read (") and "page 7 is damaged" in reason
     monkeypatch.undo()
-    ensure_engine_ready(persona)  # the next start completes; the start process's check then clears the notice
+    ensure_engine_ready(persona)  # the next start completes; the rebuild child's own call (the cli handler) then clears the notice
     engine_files.settle_rebuild_notice(persona, None)
     assert _notice(persona) is None
 
