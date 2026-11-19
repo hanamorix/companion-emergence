@@ -200,12 +200,38 @@ def locked(persona_dir: Path) -> Iterator[None]:
         yield
 
 
-def save(persona_dir: Path, state: SelfModelState) -> None:
-    """Atomically persist state via write_json."""
-    payload = {
+# The one-time windowed-peak repair's own record of having cleared the gap (#752): a top-level key in this file, set
+# by the same save that clears it, so the clear and its record can't come apart. It isn't part of SelfModelState, so no
+# writer has to carry it: `save` keeps it once it is on disk. Additive: an older brain ignores it.
+_CLEARED_KEY = "windowed_peak_cleared"
+
+
+def _cleared_on_disk(persona_dir: Path) -> bool:
+    # The same read as `load_or_recover`, so it adds no new side effect.
+    res = read_json_result(_state_path(persona_dir), default=lambda: None, expect=dict)
+    return res.outcome == "ok" and isinstance(res.data, dict) and res.data.get(_CLEARED_KEY) is True
+
+
+def windowed_peak_cleared(persona_dir: Path) -> bool:
+    """True when the state file records that the windowed-peak repair cleared its gap (#752).
+
+    A missing, unreadable or non-object file, or any value other than ``true``, is False.
+    """
+    return _cleared_on_disk(persona_dir)
+
+
+def save(persona_dir: Path, state: SelfModelState, *, windowed_peak_cleared: bool = False) -> None:
+    """Atomically persist state via write_json.
+
+    ``windowed_peak_cleared`` is passed only by the one-time repair (#752). The key is written when it is True or the
+    file on disk already holds it, and never written False, so a writer that builds its state from scratch keeps it.
+    """
+    payload: dict = {
         "current_gap": _gap_to_dict(state.current_gap) if state.current_gap is not None else None,
         "gap_history": [_gap_to_dict(g) for g in state.gap_history],
     }
+    if windowed_peak_cleared or _cleared_on_disk(persona_dir):
+        payload[_CLEARED_KEY] = True
     write_json(_state_path(persona_dir), payload, backups=3)
 
 

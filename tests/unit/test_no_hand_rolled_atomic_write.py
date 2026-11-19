@@ -43,8 +43,11 @@ OS_FUNCS = {"replace", "rename", "renames"}
 # for the settings migration, which renames the finished old tunables.json aside as its backup (#529). (The emotion rebuild's
 # move-aside of an unreadable state copy, SW4, is gone: an unreadable state is simply replaced by the rebuild's write, owner S88.
 # The x10 fix's queue step had one more, for the replace of a checked `<file>.x10tmp` copy; it is gone since the step rewrites
-# each file once with `write_jsonl_bytes`, owner S84.)
-EXPECTED_MARKERS = 20
+# each file once with `write_jsonl_bytes`, owner S84.) #754 replaced the
+# migrators' five persona-folder moves (three renames in cli.py and emergence_kit.py, and both shutil.move moves) with the
+# four renames of the one shared install in brain/migrator/install_swap.py (the first-install rename, the move aside, the
+# rename in, and the put-back after a failed rename in): 20 - 5 + 4.
+EXPECTED_MARKERS = 19
 
 
 def flagged_calls(source: str, tree: ast.Module | None = None) -> list[tuple[int, int, str]]:

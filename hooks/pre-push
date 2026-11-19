@@ -30,6 +30,19 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 guard="$repo_root/hooks/leak_guard.py"
+# The local plaintext rules are gitignored, so they live only in the main
+# checkout. A push from a linked worktree (.worktrees/<n>) reads them from
+# there (#761): the shared git dir's parent is the main checkout.
+rules="$repo_root/hooks/leak-rules.local"
+if [ ! -f "$rules" ]; then
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [ -n "$common_dir" ] && [ -f "$(dirname "$common_dir")/hooks/leak-rules.local" ]; then
+    rules="$(dirname "$common_dir")/hooks/leak-rules.local"
+  else
+    echo "leak-guard: no hooks/leak-rules.local in this checkout or its main checkout," >&2
+    echo "leak-guard: so the local plaintext rules were not checked. CI's marker-scan still runs." >&2
+  fi
+fi
 zero=0000000000000000000000000000000000000000
 
 # Pick a python (stdlib only needed).
@@ -63,7 +76,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   "$PY" "$guard" check \
     --range "$range" \
     --repo "$repo_root" \
-    --rules "$repo_root/hooks/leak-rules.local" \
+    --rules "$rules" \
     --allowlist "$repo_root/hooks/allowed-identities.txt" \
     --denied-paths "$repo_root/hooks/denied-paths.txt" \
     --allowed-binary "$repo_root/hooks/allowed-binary-paths.txt" \

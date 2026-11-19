@@ -141,6 +141,6 @@ def test_read_file_pdf_long_line_is_cut_to_the_window_budget(tmp_path: Path, mon
 
     assert out["content"] == "z" * 50
     assert out["note"] == (
-        "showing lines 0-1 of 1 across 1 page(s); line 0 is longer than 50 characters and was cut short; "
-        "pass offset/max_lines to read more"
+        "showing lines 0-1 of 1 across 1 page(s); line 0 is longer than 50 characters and was cut at character 50; "
+        "pass offset=0, char_offset=50 to read on"
     )

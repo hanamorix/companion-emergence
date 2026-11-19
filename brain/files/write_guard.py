@@ -116,6 +116,9 @@ def _denied(resolved: Path, persona_dir: Path) -> bool:
 
 
 _DIR_OPEN = (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0)
+# A folder opened to list it (#703: commit finds a made folder that was moved by listing its new parent);
+# `scandir` refuses an O_PATH / O_SEARCH descriptor.
+_DIR_LIST = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _MAX_DEPTH = 4096
 
 
