@@ -139,3 +139,26 @@ def test_the_schema_offers_char_offset():
     params = SCHEMAS["read_file"]["parameters"]
     assert params["properties"]["char_offset"]["type"] == "integer"
     assert "char_offset" not in params["required"]
+
+
+def test_a_char_offset_past_an_unterminated_last_line_keeps_the_count(tmp_path):
+    """Review of #735: dropping the whole of a last line with no break must still count it."""
+    p = tmp_path / "f.txt"
+    p.write_bytes(b"abc")
+    out = read_file(str(p), persona_dir=tmp_path / "x", char_offset=3)
+    assert out["total_lines"] == 1
+    assert out["content"] == "" and out["note"].startswith("showing lines 0-1 of 1 (line 0 from character 3)")
+    _read_cache.reset()
+    p.write_bytes(b"l0\nabc")
+    assert read_file(str(p), persona_dir=tmp_path / "x", offset=1, char_offset=5)["total_lines"] == 2
+
+
+def test_the_count_after_the_window_stays_fast_when_chunks_end_mid_line(tmp_path):
+    """Review of #735: an odd first byte puts every chunk boundary inside a line; the tail must still be counted."""
+    p = tmp_path / "odd.txt"
+    p.write_bytes(b"x" + b"a\n" * (10 * 1024 * 1024 - 1))
+    start = time.process_time()
+    out = read_file(str(p), persona_dir=tmp_path / "x", max_lines=5)
+    cpu = time.process_time() - start
+    assert out["total_lines"] == 10 * 1024 * 1024 - 1  # "xa\n", then "a\n" lines
+    assert cpu < 0.5, f"the head read took {cpu:.2f} s of CPU"

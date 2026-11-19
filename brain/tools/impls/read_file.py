@@ -225,10 +225,14 @@ def _scan_text(fh, window: _Window) -> None:
             ended = _breaks(text)
             # The lines ending here are numbered total .. total+ended-1, and the one still open after it total+ended.
             before = window.total + ended < window.start
-            if (before or window.done) and not (line or cut):
+            if before or window.done:
+                # Nothing here is kept, an open line included: drop what was built of it and just count (#735
+                # review: keeping it per-line made every later chunk per-line when chunks ended mid-line).
                 window.skip(ended)
-                open_line = text[-1] not in _LINE_BREAKS if ended else True
+                open_line = (text[-1] not in _LINE_BREAKS) if ended else True
+                line, cut = "", False
             else:
+                start_dropped = False  # the start line has begun, all of it so far before char_offset
                 for part in text.splitlines(keepends=True):
                     if to_drop and window.total == window.start:
                         drop = min(to_drop, len(part) - _line_break_len(part))
@@ -236,6 +240,7 @@ def _scan_text(fh, window: _Window) -> None:
                         if _line_break_len(part):
                             to_drop = 0  # the start line ends here: a char_offset past its end shows its break alone
                         if not part:
+                            start_dropped = True
                             continue  # this whole piece of the start line is before char_offset
                     if not cut:
                         room = limit - len(line)
@@ -246,12 +251,15 @@ def _scan_text(fh, window: _Window) -> None:
                     if part[-1] in _LINE_BREAKS:
                         window.add(line, cut=cut)
                         line, cut = "", False
-                open_line = bool(line or cut)
+                # A start line dropped whole so far is still open (#735 review: an unterminated last line read past
+                # its end must still be counted).
+                open_line = bool(line or cut) or (start_dropped and window.total == window.start)
         if not chunk:
-            if line or cut:
+            if line or cut or open_line:
+                # An open line with nothing built is either outside the window (add keeps nothing then) or the
+                # start line read from at or past its end, which is shown as empty, as a terminated one shows its
+                # break alone.
                 window.add(line, cut=cut)
-            elif open_line:
-                window.skip(1)
             return
 
 
