@@ -627,7 +627,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         {/* Shown while the persona state carries the notice and refreshed by the poll above. No way to close it: it goes when
             a later attempt clears the brain's record. */}
         {state?.rebuild_notice && (
-          <NoticeBox testId="rebuild-notice">{rebuildNoticeMessage(state.rebuild_notice)}</NoticeBox>
+          <NoticeBox testId="rebuild-notice">{rebuildNoticeMessage(state.rebuild_notice, capitalize(persona))}</NoticeBox>
         )}
         <ChatPanel
           persona={persona}

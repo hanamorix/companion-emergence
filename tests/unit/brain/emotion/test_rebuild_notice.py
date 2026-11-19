@@ -2,7 +2,7 @@
 
 `rebuild_notice.json` in the persona folder says why a switch-over did not complete, for as long as the persona is NOT switched over.
 These tests cover the one writer's five steps in order (the healthy path's one stat, a switched persona's delete, the no-reason
-return, the `since` rule, the write), the one-line reason, the reader's refusals, and that no failure of the writer ever raises.
+return, the launched-child identity rule, the write), the one-line reason, the reader's refusals, and that no failure of the writer ever raises.
 Personas are tmp directories; nothing here touches a real persona.
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -32,8 +31,16 @@ def _record(persona: Path) -> dict:
     return json.loads(engine_files.rebuild_notice_path(persona).read_text(encoding="utf-8"))
 
 
-def _put(persona: Path, at: str, reason: str = "earlier failure") -> None:
-    engine_files.rebuild_notice_path(persona).write_text(json.dumps({"at": at, "reason": reason}), encoding="utf-8")
+CHILD = (424242, "linux:boot:424242:777")  # the identity of a rebuild child as a start process would hold it
+
+
+def _put(persona: Path, reason: str = "earlier failure", *, identity: tuple[int, str | None] | None = CHILD) -> None:
+    """Plant a notice the way the writer leaves it, naming `identity` (pid, token) as its writer; None plants the record from before
+    the identity was recorded (`at` and `reason` only)."""
+    record: dict = {"at": "2020-01-01T00:00:00Z", "reason": reason}
+    if identity is not None:
+        record = {"pid": identity[0], "pid_token": identity[1], "reason": reason}
+    engine_files.rebuild_notice_path(persona).write_text(json.dumps(record), encoding="utf-8")
 
 
 @pytest.fixture
@@ -48,9 +55,8 @@ def test_the_path_is_in_the_persona_folder_by_the_constant(persona: Path) -> Non
 def test_a_reason_on_an_unswitched_persona_is_written_and_read_back(persona: Path) -> None:
     engine_files.settle_rebuild_notice(persona, "the first rebuild failed (RebuildCheckError: forced)")
     written = _record(persona)
-    assert set(written) == {"at", "reason"} and written["reason"] == "the first rebuild failed (RebuildCheckError: forced)"
+    assert set(written) == {"pid", "pid_token", "reason"} and written["reason"] == "the first rebuild failed (RebuildCheckError: forced)"
     assert engine_files.read_rebuild_notice(persona) == written
-    assert datetime.fromisoformat(written["at"].replace("Z", "+00:00")) > datetime.now(UTC) - timedelta(minutes=1)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
@@ -79,14 +85,14 @@ def test_a_switched_persona_gets_no_notice(persona: Path) -> None:
 def test_a_switched_persona_has_an_old_notice_deleted_by_a_reason_or_by_none(persona: Path) -> None:
     make_live(persona, NOW)
     for reason in ("a roll-forward failed", None):
-        _put(persona, "2020-01-01T00:00:00Z")
+        _put(persona)
         engine_files.settle_rebuild_notice(persona, reason)
         assert not engine_files.rebuild_notice_path(persona).exists()
 
 
 @pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base there is no notice to keep, so the file is trivially still there")
 def test_no_reason_on_an_unswitched_persona_keeps_the_notice(persona: Path) -> None:
-    _put(persona, "2020-01-01T00:00:00Z")
+    _put(persona)
     before = engine_files.rebuild_notice_path(persona).read_bytes()
     engine_files.settle_rebuild_notice(persona, None)
     assert engine_files.rebuild_notice_path(persona).read_bytes() == before
@@ -108,24 +114,55 @@ def test_the_healthy_path_costs_one_stat_and_reads_no_state(persona: Path, monke
     assert stats == [dev_constants.REBUILD_NOTICE_FILENAME]
 
 
-def test_a_notice_newer_than_since_stands_and_an_older_one_is_replaced(persona: Path) -> None:
-    since = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
-    _put(persona, "2026-11-18T12:00:05Z", "the child's own, exact reason")
-    engine_files.settle_rebuild_notice(persona, "the update of your memories stopped (exit code 1)", since=since)
-    assert _record(persona)["reason"] == "the child's own, exact reason"
-    _put(persona, "2026-11-18T11:59:59Z", "an earlier attempt's")
-    engine_files.settle_rebuild_notice(persona, "the update of your memories stopped (exit code 1)", since=since)
-    assert _record(persona)["reason"] == "the update of your memories stopped (exit code 1)"
+def test_a_notice_written_by_the_launched_child_stands_whatever_the_clock_says(persona: Path) -> None:
+    _put(persona, "the child's own, exact reason", identity=CHILD)
+    before = engine_files.rebuild_notice_path(persona).read_bytes()
+    engine_files.settle_rebuild_notice(persona, "the update stopped", keep_notice_of=CHILD)
+    assert engine_files.rebuild_notice_path(persona).read_bytes() == before
 
 
-def test_a_notice_with_no_usable_time_or_that_cannot_be_read_is_replaced_under_since(persona: Path) -> None:
-    since = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
-    _put(persona, "not a time")
-    engine_files.settle_rebuild_notice(persona, "new", since=since)
-    assert _record(persona)["reason"] == "new"
+@pytest.mark.parametrize(
+    "identity",
+    [
+        (424243, CHILD[1]),  # another pid
+        (CHILD[0], "linux:boot:424242:778"),  # the same pid, another process that got it later
+        (CHILD[0], None),  # no token recorded
+        None,  # a record from before the identity was recorded
+    ],
+)
+def test_a_notice_not_written_by_the_launched_child_is_replaced(persona: Path, identity: tuple[int, str | None] | None) -> None:
+    _put(persona, "an earlier attempt's", identity=identity)
+    engine_files.settle_rebuild_notice(persona, "the update stopped", keep_notice_of=CHILD)
+    assert _record(persona)["reason"] == "the update stopped"
+
+
+@pytest.mark.parametrize("pid", ["424242", [424242], None])
+def test_a_notice_with_a_malformed_identity_is_replaced(persona: Path, pid: object) -> None:
+    engine_files.rebuild_notice_path(persona).write_text(json.dumps({"pid": pid, "pid_token": CHILD[1], "reason": "odd"}), encoding="utf-8")
+    engine_files.settle_rebuild_notice(persona, "the update stopped", keep_notice_of=CHILD)
+    assert _record(persona)["reason"] == "the update stopped"
+
+
+def test_a_notice_that_cannot_be_read_is_replaced_under_an_identity(persona: Path) -> None:
     engine_files.rebuild_notice_path(persona).write_bytes(b"\x00 not json")
-    engine_files.settle_rebuild_notice(persona, "newer", since=since)
+    engine_files.settle_rebuild_notice(persona, "newer", keep_notice_of=CHILD)
     assert _record(persona)["reason"] == "newer"
+
+
+@pytest.mark.no_base_failure(reason="a pin of the unchanged default: a call with no `since` and no identity replaced the notice on base too")
+def test_without_an_identity_a_later_reason_always_replaces_even_the_childs_notice(persona: Path) -> None:
+    _put(persona, "the child's", identity=CHILD)
+    engine_files.settle_rebuild_notice(persona, "later")
+    assert _record(persona)["reason"] == "later"
+
+
+def test_a_written_notice_names_the_writing_process_and_has_no_time(persona: Path) -> None:
+    from brain import process_identity
+
+    engine_files.settle_rebuild_notice(persona, "why")
+    written = _record(persona)
+    assert written == {"pid": process_identity.own_pid(), "pid_token": process_identity.own_token(), "reason": "why"}
+    assert engine_files.rebuild_notice_path(persona).exists() and "at" not in written
 
 
 def test_the_writer_never_creates_a_persona_folder(tmp_path: Path) -> None:
@@ -142,7 +179,7 @@ def test_the_reader_answers_none_for_a_missing_unreadable_or_reasonless_record(p
 
 
 def test_the_reader_answers_none_when_the_read_raises(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _put(persona, "2020-01-01T00:00:00Z")
+    _put(persona)
 
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("read blew up")
@@ -166,7 +203,7 @@ def test_a_failure_of_the_writer_never_raises_and_is_logged_without_a_traceback(
         engine_files.settle_rebuild_notice(persona, "why")
     elif failing == "delete":
         make_live(persona, NOW)
-        _put(persona, "2020-01-01T00:00:00Z")
+        _put(persona)
         monkeypatch.setattr(engine_files.file_ops, "delete_file", boom)
         engine_files.settle_rebuild_notice(persona, None)
     elif failing == "state":
@@ -182,7 +219,7 @@ def test_a_stat_that_raises_is_read_as_a_notice_that_exists_so_a_switched_person
     persona: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     make_live(persona, NOW)
-    _put(persona, "2020-01-01T00:00:00Z")
+    _put(persona)
     real = file_ops.stat_path
     calls: list[int] = []
 
@@ -197,5 +234,5 @@ def test_a_stat_that_raises_is_read_as_a_notice_that_exists_so_a_switched_person
     assert not engine_files.rebuild_notice_path(persona).exists()
 
 
-def test_the_record_shape_is_two_keys() -> None:
-    assert engine_files.rebuild_notice_record(at="2026-11-18T12:00:00Z", reason="why") == {"at": "2026-11-18T12:00:00Z", "reason": "why"}
+def test_the_record_shape_is_the_writers_identity_and_the_reason() -> None:
+    assert engine_files.rebuild_notice_record(pid=7, pid_token="t", reason="why") == {"pid": 7, "pid_token": "t", "reason": "why"}

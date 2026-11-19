@@ -31,6 +31,7 @@ from tests.unit.brain.emotion._engine_support import (
     install,
     local_day,
     local_noon,
+    make_live,
     make_persona,
     row,
     ruin_the_state,
@@ -206,6 +207,64 @@ def test_a_roll_forward_failure_that_the_engine_logs_exits_zero(persona: Path, m
     monkeypatch.setattr(engine_rebuild, "_read_window", broken)
     assert main(ARGV) == 0  # ensure_ready logs the failed check and goes on
     assert _record(persona) is None
+
+
+# --- the rebuild notice is cleared by the child itself when it ends normally (Hana's 11-18b point 4) --------------------------
+
+
+def _plant_notice(persona_dir: Path) -> Path:
+    path = engine_files.rebuild_notice_path(persona_dir)
+    path.write_text('{"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": "an earlier attempt"}', encoding="utf-8")
+    return path
+
+
+def test_a_hand_run_that_ends_normally_on_a_switched_persona_clears_the_notice(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The child clears the notice whichever process completed the switch-over: here the engine's call is a stand-in that returns."""
+    _Recorder(persona, monkeypatch)
+    make_live(persona, NOW)
+    notice = _plant_notice(persona)
+    assert main(ARGV) == 0
+    assert not notice.exists()
+
+
+def test_a_real_completed_rebuild_clears_a_notice_an_earlier_attempt_left(persona: Path) -> None:
+    install(persona, NOW)
+    notice = _plant_notice(persona)
+    assert main(ARGV) == 0
+    assert engine.engine_for(persona).is_live() and not notice.exists()
+
+
+@pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base the child never touches the notice, so it trivially stays")
+def test_a_normal_end_on_a_persona_still_not_switched_keeps_the_notice(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _Recorder(persona, monkeypatch)  # the engine call returns without switching over (a skip)
+    notice = _plant_notice(persona)
+    assert main(ARGV) == 0
+    assert notice.exists()
+
+
+@pytest.mark.no_base_failure(reason="a pin of a negative: on base nothing deletes the notice, so a failing engine call trivially keeps it")
+def test_a_failing_engine_call_does_not_clear_the_notice(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    recorder = _Recorder(persona, monkeypatch)
+    recorder.ensure_error = EngineStartupError("the first rebuild", OSError("disk"))
+    make_live(persona, NOW)
+    notice = _plant_notice(persona)
+    with pytest.raises(EngineStartupError):
+        main(ARGV)
+    assert notice.exists()
+
+
+@pytest.mark.no_base_failure(reason="a pin of a negative: on base the child clears nothing, so a failing delete trivially changes nothing")
+def test_a_clear_that_fails_is_logged_and_the_child_still_exits_zero(persona: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _Recorder(persona, monkeypatch)
+    make_live(persona, NOW)
+    notice = _plant_notice(persona)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr(engine_files.file_ops, "delete_file", boom)
+    assert main(ARGV) == 0
+    assert notice.exists()  # left for the next need check, an accepted edge
 
 
 def test_a_persona_that_does_not_exist_is_refused_and_nothing_is_made_or_run(

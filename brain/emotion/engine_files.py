@@ -446,12 +446,14 @@ class EngineProgress:
 # --- the rebuild notice: a switch-over that did not complete (Hana's 11-18 review of #633, point 5; owner S112) ---------------------
 #
 # ``rebuild_notice.json`` in the PERSONA directory holds why the persona's switch-over did not complete and the bridge started anyway
-# on the state saved before: ``{"at": <iso_utc>, "reason": <one line>}``. It exists exactly while, after an attempt, the persona is NOT
+# on the state saved before: ``{"pid", "pid_token", "reason": <one line>}`` (the writer's identity in the progress record's shape, so
+# a start can tell the notice its own rebuild child wrote from another; no time is recorded). It exists exactly while, after an attempt, the persona is NOT
 # switched over (``switch_over_state(read_state(...)) is True`` is the test; an unreadable state is not switched), so a switched
 # persona whose roll-forward fails never gets one (that failure stays in the runtime log). ``build_persona_state`` reads it into the
 # window's state; the full error is in the runtime log. ONE writer, ``settle_rebuild_notice``, is called by the engine (the failure
 # points inside the rebuild process) and by the start process (``daemon``: a rebuild child that could not be started or ended
-# non-zero, a need check that failed). Not reused: ``shutdown_progress.write_record/read_record`` live in ``brain.bridge``, which the
+# non-zero, a need check that failed), and clears it: the rebuild child when its ready step returns (``cli`` handler), the start
+# process when its need check answers no. Not reused: ``shutdown_progress.write_record/read_record`` live in ``brain.bridge``, which the
 # engine may not import, and a daemon-only use would make two writers; ``EngineProgress`` is for a LIVE writer (it refuses another live
 # process's record, removes by pid, is read only while the writer lives), and a failure record must outlive its writer. Also not
 # chosen: a flag derived from ``is_live`` the way ``recovering`` is derived (no file), which cannot say what happened (S112: "saying
@@ -463,9 +465,13 @@ def rebuild_notice_path(persona_dir: Path) -> Path:
     return Path(persona_dir) / dev_constants.REBUILD_NOTICE_FILENAME
 
 
-def rebuild_notice_record(*, at: str, reason: str) -> dict[str, Any]:
-    """The record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/rebuild_notice.json)."""
-    return {"at": at, "reason": reason}
+def rebuild_notice_record(*, pid: int, pid_token: str | None, reason: str) -> dict[str, Any]:
+    """The record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/rebuild_notice.json).
+
+    ``pid`` and ``pid_token`` name the process that wrote it, in the shape of the progress record, so the start process can ask
+    ``process_identity.names_this_bridge`` whether the notice was written by the rebuild child it launched (no clock is read for that).
+    """
+    return {"pid": pid, "pid_token": pid_token, "reason": reason}
 
 
 def read_rebuild_notice(persona_dir: Path) -> dict[str, Any] | None:
@@ -478,18 +484,20 @@ def read_rebuild_notice(persona_dir: Path) -> dict[str, Any] | None:
     return record if isinstance(reason, str) and reason else None
 
 
-def settle_rebuild_notice(persona_dir: Path, reason: str | None, *, since: datetime | None = None) -> None:
+def settle_rebuild_notice(persona_dir: Path, reason: str | None, *, keep_notice_of: tuple[int, str] | None = None) -> None:
     """Record, keep or clear the rebuild notice after an attempt. The one writer; never raises.
 
     ``reason`` is why the switch-over did not complete (made one line here), or None for an attempt that completed or a check that
-    found nothing to do. In order:
+    found nothing to do. ``keep_notice_of`` is the ``(pid, token)`` of the rebuild child a start process launched. In order:
     1. No notice file and ``reason`` None: return (the healthy path costs one stat; a stat that raises is logged and read as "a
        notice exists", and a notice that cannot be read still counts as existing).
     2. The persona is switched over: delete the notice and return (a switched persona never has one).
     3. ``reason`` None: return (the persona is not switched, so what the notice says still holds).
-    4. ``since`` given and the notice's ``at`` is not before it: return, that attempt's own, more exact notice stands (the start
-       process passes the time it spawned the rebuild child). A notice with no usable ``at``, or one that cannot be read, is replaced.
-    5. Write the notice, only when the persona folder exists (the writer never creates one).
+    4. ``keep_notice_of`` given and the notice names exactly that pid and token (``process_identity.names_this_bridge``): return,
+       the launched child's own, more exact notice stands. Decided by process identity, not by clock times (a clock stepped back
+       while the child ran cannot replace its reason). A notice that cannot be read, or has no identity (a record from before the
+       identity was recorded), or a malformed one, or another process's, is not the child's and is replaced.
+    5. Write the notice with this process's own pid and token, only when the persona folder exists (the writer never creates one).
 
     A failure of any step is logged by ``warn_throttled`` and the function returns. Accepted edge (P4, HRF red-team G2): a delete that
     fails (step 2, after the file layer's own retry) leaves a notice on a persona that is now switched over; the window then shows
@@ -517,16 +525,17 @@ def settle_rebuild_notice(persona_dir: Path, reason: str | None, *, since: datet
         if reason is None:
             return
         stage = "read"
-        if since is not None:
-            existing = read_rebuild_notice(persona_dir)
-            at = lenient_utc(existing.get("at")) if existing is not None else None
-            if at is not None and at >= since:
+        if keep_notice_of is not None:
+            child_pid, child_token = keep_notice_of
+            if process_identity.names_this_bridge(read_rebuild_notice(persona_dir), child_pid, child_token):
                 return
         stage = "write"
         folder = file_ops.stat_path(persona_dir)
         if folder is None or not folder.is_dir:
             return
-        record = rebuild_notice_record(at=iso_utc(datetime.now(UTC)), reason=" ".join(str(reason).split()))
+        record = rebuild_notice_record(
+            pid=process_identity.own_pid(), pid_token=process_identity.own_token(), reason=" ".join(str(reason).split())
+        )
         write_json(path, record, indent=2, sort_keys=True, fsync=False, mode=0o600)
     except Exception as exc:  # noqa: BLE001 - a display record must never fail the step it describes
         _notice_failed(persona_dir, stage, exc)

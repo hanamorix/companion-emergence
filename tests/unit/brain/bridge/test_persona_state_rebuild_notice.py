@@ -37,7 +37,7 @@ def _personas(home):
 
 
 def _plant(persona_dir, reason="the first rebuild failed (OSError: disk)"):
-    engine_files.rebuild_notice_path(persona_dir).write_text(json.dumps({"at": "2026-11-18T12:00:00Z", "reason": reason}), encoding="utf-8")
+    engine_files.rebuild_notice_path(persona_dir).write_text(json.dumps({"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": reason}), encoding="utf-8")
 
 
 def _notice(persona_dir):

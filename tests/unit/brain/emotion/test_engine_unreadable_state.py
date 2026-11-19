@@ -266,7 +266,7 @@ def test_a_database_that_fails_its_check_on_an_unreadable_state_skips_this_start
     assert len(lines) == 1 and "memories.db" in lines[0] and "next start" in lines[0]
     after = tree(persona)
     notice = after.pop(dev_constants.REBUILD_NOTICE_FILENAME, None)  # the one file the skip writes: the rebuild notice (Hana's point 5)
-    assert notice is not None and b"memories.db could not be read" in notice
+    assert notice is not None and b"the saved feelings and the memory database could not be read" in notice
     assert spy.calls == 0 and after == before  # nothing else is written
     monkeypatch.setattr(nudge_scale_fix, "MemoryStore", real)
     ensure_engine_ready(persona)
