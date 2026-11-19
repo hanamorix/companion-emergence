@@ -55,7 +55,14 @@ Hana picked A on 2026-11-19.
 ### Older brains
 
 - They read the state with `raw.get(...)`, so the extra key is ignored.
-- One that rewrites the file drops the key, and then the marker is the record, as today. The only case left open is a rollback to an older brain plus a marker write that failed.
+- One that rewrites the file drops the key, and then the marker is the record, as today.
+
+### Cases left open
+
+Each needs a failed marker write plus a second fault. In each, the marker is the only record, as on main:
+- a rollback to an older brain that rewrites the state file;
+- a state file that is partly unreadable and has no gap: the repair doesn't save it, and the supervisor's next save rewrites it without the key (found in the branch review);
+- a state file that is corrupt when a writer saves: `save()` can't read the key, so it doesn't carry it.
 - The key is additive and defaults to absent, so the file stays readable by an older brain (CLAUDE.local.md's persisted-state rule).
 
 ## Wiring
