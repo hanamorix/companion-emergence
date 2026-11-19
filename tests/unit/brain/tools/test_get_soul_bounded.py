@@ -369,7 +369,8 @@ def test_mcp_handler_text_is_bounded_and_names_the_prefixed_tool(soul_persona) -
 
     first = call({})
     assert first["truncated"] is True
-    assert f"call {prefix}get_soul with offset={first['next_offset']}" in first["message"]
+    # #734: the hint continues by cursor (after), which a soul changing mid-walk can't shift.
+    assert f'call {prefix}get_soul with after="{first["next_after"]}"' in first["message"]
 
     pages = _walk(call, {})
     seen = [c["id"] for p in pages for c in p["crystallizations"]]
@@ -420,8 +421,8 @@ def test_boot_over_mcp_names_the_prefixed_tool_for_the_next_soul_page(soul_perso
     text = asyncio.run(server.request_handlers[CallToolRequest](req)).root.content[0].text
     assert "{tool_prefix}" not in text
     result = json.loads(text)
-    nxt = result["soul"]["next_offset"]
-    assert f"call {prefix}get_soul with offset={nxt}" in result["message"]
+    nxt = result["soul"]["next_after"]
+    assert f'call {prefix}get_soul with after="{nxt}"' in result["message"]  # #734: by cursor
     assert "message" not in result["soul"]
 
 
@@ -514,6 +515,8 @@ def test_schema_declares_optional_paging_and_filter_args() -> None:
     assert props["offset"]["type"] == "integer"
     assert props["offset"]["minimum"] == 0
     assert props["love_type"]["type"] == "string"
-    assert set(props["love_type"]["enum"]) == set(LOVE_TYPES)
+    # #734: no enum, so a stored type outside the list can be passed; the standard ones are named.
+    assert "enum" not in props["love_type"]
+    assert all(t in props["love_type"]["description"] for t in LOVE_TYPES)
     desc = SCHEMAS["get_soul"]["description"]
-    assert "next_offset" in desc and "newest first" in desc
+    assert "next_after" in desc and "newest first" in desc  # #734: the description pages by cursor

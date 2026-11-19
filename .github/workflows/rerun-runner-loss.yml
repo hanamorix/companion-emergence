@@ -1,0 +1,46 @@
+name: rerun-runner-loss
+
+# #758: GitHub's macOS arm64 pool is short of runners. A `test` job that no runner picks up in time is cancelled with
+# "The job was not acquired by Runner of type hosted even after multiple attempts", and the run reads as failed
+# although no test failed. This re-runs the failed jobs, only when every job that didn't pass is such a cancellation
+# (a real failure is never retried): up to three times, each after a 3-minute pause so the queue can clear
+# (scripts/ci_rerun_runner_loss.py). It removes the manual re-run; it can't conjure a runner in a long shortage.
+#
+# Attempt 1 only: one watcher follows all of a run's retries, so a re-run (by this job or by a person) never starts a
+# second watcher for the same run.
+#
+# Safety: `workflow_run` runs with the base repository's token, even for a PR from a fork. This job checks out only the
+# default branch's copy of the script (no `ref:`), never a PR's code, and its token can re-run jobs and read check
+# annotations, nothing more.
+
+on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+
+permissions:
+  actions: write   # re-run the run's failed jobs
+  checks: read     # read the cancelled jobs' annotations
+  contents: read
+
+jobs:
+  rerun-runner-loss:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: rerun-runner-loss-${{ github.event.workflow_run.id }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/ci_rerun_runner_loss.py
+          sparse-checkout-cone-mode: false
+
+      - name: Re-run jobs lost to the runner shortage
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_rerun_runner_loss.py

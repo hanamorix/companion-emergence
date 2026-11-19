@@ -27,6 +27,7 @@ from typing import Any
 
 from brain import app_config
 from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
+from brain.migrator.install_swap import install_over, refuse_if_in_use
 from brain.migrator.report import MigrationReport
 from brain.paths import get_persona_dir
 
@@ -159,6 +160,22 @@ def preflight_companion_emergence(input_dir: Path) -> dict[str, Any]:
 
 
 def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> MigrationReport:
+    """Copy a companion-emergence persona in as `args.install_as`, under the migrate lock for that name.
+
+    #754: the copy is built in `<name>.new`, so a second run for the same name would delete and refill the first
+    run's build while the first swaps it in. The migrate lock (as `run_migrate` takes) keeps the runs apart.
+    """
+    from brain.migrator.cli import _acquire_migrate_lock, _migrate_lock_path, _release_migrate_lock
+
+    lock_path = _migrate_lock_path(get_persona_dir(args.install_as))
+    lock_fd = _acquire_migrate_lock(lock_path)
+    try:
+        return _migrate_companion_emergence_locked(args)
+    finally:
+        _release_migrate_lock(lock_path, lock_fd)
+
+
+def _migrate_companion_emergence_locked(args: CompanionEmergenceMigrateArgs) -> MigrationReport:
     started = time.monotonic()
 
     preflight = preflight_companion_emergence(args.input_dir)
@@ -173,12 +190,13 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
                 f"A Kindled named `{args.install_as}` already exists at {target_dir}. "
                 "Re-run with --force to back up and overwrite."
             )
-        backup = target_dir.with_name(
-            f"{target_dir.name}.backup-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}"
-        )
-        shutil.move(str(target_dir), str(backup))  # atomic-write: ok -- moves a persona directory aside to a backup (a directory move), not a file write
+        refuse_if_in_use(target_dir)  # #754: before any work; install_over checks again at the swap
 
-    shutil.copytree(args.input_dir, target_dir, dirs_exist_ok=False)
+    # #754: build the copy in <name>.new and swap it in under the start lock, so nothing starts in a half-copied folder.
+    work_dir = target_dir.with_name(f"{target_dir.name}.new")
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    shutil.copytree(args.input_dir, work_dir, dirs_exist_ok=False)
 
     manifest = {
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -191,7 +209,8 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
         "hebbian_edge_count": preflight["hebbian_edge_count"],
         "lived_age_hours_at_migration": _read_source_lived_age(args.input_dir),
     }
-    write_json(target_dir / "source-manifest.json", manifest, indent=2, fsync=False)
+    write_json(work_dir / "source-manifest.json", manifest, indent=2, fsync=False)
+    install_over(target_dir, work_dir)  # raises PersonaInUseError while the start lock is held
 
     app_config.write_if_missing(args.install_as)
 
