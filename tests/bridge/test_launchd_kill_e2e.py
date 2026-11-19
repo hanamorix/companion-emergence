@@ -15,9 +15,7 @@ children, in their own sessions, stay for the helper).
 The killed job is a stub bridge that ignores the hard-exit request, with a fake ``claude`` child (own session) and an
 MCP-named grandchild. The kill must leave no bridge and no descendant, and stay so across the respawn window and past
 ``ExitTimeOut``. Then every start path clears the stop intent, runs ``print`` -> ``bootstrap`` (when unloaded) ->
-plain ``kickstart``, and reaches a healthy bridge. The stub can hold its ``bridge.json`` record behind a gate file, so
-the start-path test makes the record deterministically absent when the stub's child files exist and must wait for it
-before the kill.
+plain ``kickstart``, and reaches a healthy bridge.
 """
 
 from __future__ import annotations
@@ -55,7 +53,6 @@ _STUB_BRIDGE = textwrap.dedent(
     from pathlib import Path
     from brain import process_identity as pi
     from brain.bridge import state_file
-    from tests.bridge._hooked_bridge import _wait_for_file
     pd, honour = Path(sys.argv[1]), sys.argv[2] == "1"
     # honour: SIGTERM ends the job with status 0 (so launchd does not respawn it); otherwise SIGTERM is ignored.
     signal.signal(signal.SIGTERM, (lambda *a: os._exit(0)) if honour else signal.SIG_IGN)
@@ -64,7 +61,6 @@ _STUB_BRIDGE = textwrap.dedent(
         "'brain.mcp_server']); open(sys.argv[1], 'w').write(str(g.pid)); time.sleep(600)",
         str(pd / "stub-grand"), "claude"], start_new_session=True)
     (pd / "stub-child").write_text(str(child.pid))
-    _wait_for_file(sys.argv[3] or None)  # optional gate: hold the record back until a test opens it
     state_file.write(pd, state_file.BridgeState(persona="nell", pid=os.getpid(), port=1, started_at="t",
         stopped_at=None, shutdown_clean=False, client_origin="launchd", pid_token=pi.own_token(), identity="token",
         phase="running"))
@@ -89,10 +85,8 @@ class FakeLaunchd:
         self._watch.start()
 
     # -- the job
-    def start_stub(self, *, honour_sigterm: bool, record_gate: Path | None = None) -> None:
-        """Start the stub job; with ``record_gate`` it writes its ``bridge.json`` only once that file exists."""
-        self.job = subprocess.Popen([sys.executable, "-c", _STUB_BRIDGE, str(self.pd), "1" if honour_sigterm else "0",
-                                     str(record_gate) if record_gate else ""],
+    def start_stub(self, *, honour_sigterm: bool) -> None:
+        self.job = subprocess.Popen([sys.executable, "-c", _STUB_BRIDGE, str(self.pd), "1" if honour_sigterm else "0"],
                                     env=self.env, start_new_session=True)
 
     def _start_real(self) -> None:
@@ -228,7 +222,8 @@ def _wait_file(path: Path, timeout: float = STUB_WAIT_S) -> int:
 
 
 def _wait_record(pd: Path, pid: int, timeout: float = STUB_WAIT_S) -> None:
-    """Poll until bridge.json names ``pid`` (the stub writes it after its child file), up to ``timeout``."""
+    """Poll until bridge.json names ``pid``, up to ``timeout``. The stub writes it after its child files, and
+    ``kill_bridge`` answers not_running when it reads no record, so a test must wait for it before the kill."""
     deadline = time.monotonic() + timeout
     while True:
         st = state_file.read(pd)
@@ -326,22 +321,8 @@ def test_every_start_path_after_a_kill_reaches_a_healthy_bridge(env_pd, launchd_
     fake = FakeLaunchd(pd, env, "m1")  # m1 leaves the job unloaded: the first start must bootstrap
     launchd_seams["fake"] = fake
     monkeypatch.setattr(cli, "_chat_via_bridge", lambda args, persona_dir, readiness=None: 0)
-    # The stub writes bridge.json after its child files, and kill_bridge answers not_running when it reads no record.
-    # So the stub holds its record behind a gate that opens only when a read of the record finds it missing: the
-    # record is then deterministically absent after the child files exist, and only a wait for it reaches "killed".
-    # (This relies on pd holding no bridge.json before the stub starts: a stale record would keep the gate shut.)
-    gate = pd / "stub-record-gate"
-    real_read = state_file.read
-
-    def read_then_open_gate(persona_dir):
-        st = real_read(persona_dir)
-        if st is None:
-            gate.touch()  # the record's absence was just observed: only now may the stub write it
-        return st
-
-    monkeypatch.setattr(state_file, "read", read_then_open_gate)
     try:
-        fake.start_stub(honour_sigterm=False, record_gate=gate)
+        fake.start_stub(honour_sigterm=False)
         _wait_file(pd / "stub-child")
         _wait_file(pd / "stub-grand")
         _wait_record(pd, fake.job.pid)
