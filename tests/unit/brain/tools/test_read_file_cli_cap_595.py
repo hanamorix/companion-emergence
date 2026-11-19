@@ -70,7 +70,7 @@ def test_a_one_line_megabyte_file_reaches_the_model_whole(call, tmp_path):
     p = _write(tmp_path, "one_line.txt", "x" * 1_000_000)
     text, out = call({"path": str(p)})
     assert len(text) <= CLI_INLINE_CAP_CHARS
-    assert "cut short" in out["note"]
+    assert "was cut at character" in out["note"] and "char_offset=" in out["note"]  # #735: and how to read on
 
 
 def test_control_characters_are_counted_as_their_escapes(call, tmp_path):

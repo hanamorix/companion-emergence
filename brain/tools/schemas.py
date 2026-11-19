@@ -721,6 +721,13 @@ SCHEMAS: dict[str, dict] = {
                     "type": "integer",
                     "description": "Optional: start reading at this 0-based line; without max_lines the usual 400-line window starts here.",
                 },
+                "char_offset": {
+                    "type": "integer",
+                    "description": (
+                        "Optional: start line `offset` at this 0-based character. Only needed to read past a line "
+                        "that was cut short; the note on the cut says what to pass."
+                    ),
+                },
             },
             "required": ["path"],
         },
