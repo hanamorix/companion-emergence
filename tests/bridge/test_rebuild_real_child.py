@@ -146,7 +146,7 @@ def test_a_completing_real_child_leaves_no_notice(rebuild_spawns: RealPopenSpyLo
 @pytest.mark.real_rebuild_child(reason="a completing real child clears a notice an earlier attempt left")
 def test_a_completing_real_child_clears_a_notice_an_earlier_attempt_left(rebuild_spawns: RealPopenSpyLog, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _persona()
-    engine_files.rebuild_notice_path(persona).write_text('{"at": "2020-01-01T00:00:00Z", "reason": "an earlier attempt"}', encoding="utf-8")
+    engine_files.rebuild_notice_path(persona).write_text('{"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": "an earlier attempt"}', encoding="utf-8")
     assert _run_the_step(persona, rebuild_spawns, monkeypatch) == 0
     assert engine.engine_for(persona).is_live()
     assert not engine_files.rebuild_notice_path(persona).exists()

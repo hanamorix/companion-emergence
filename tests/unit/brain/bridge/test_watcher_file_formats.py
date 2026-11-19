@@ -97,7 +97,7 @@ def test_command_run_record_matches_the_fixture(tmp_path, monkeypatch):
 def test_rebuild_notice_record_matches_the_fixture(tmp_path):
     """Point 5 of Hana's 11-18 review of #633: the notice of a switch-over that did not complete, as the one writer leaves it."""
     rec = engine_files.rebuild_notice_record(
-        at="2026-11-18T12:00:00.000000Z", reason="the update of your memories stopped (exit code 1)"
+        pid=4242, pid_token="linux:boot:4242:99", reason="the update of your memories stopped (exit code 1)"
     )
     assert rec == _fixture("rebuild_notice.json")
     assert engine_files.rebuild_notice_path(tmp_path) == tmp_path / "rebuild_notice.json"

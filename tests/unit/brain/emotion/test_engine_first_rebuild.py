@@ -1329,7 +1329,7 @@ def test_a_roll_forward_failure_of_a_switched_persona_stops_start_up_and_leaves_
     assert failure.value.what == "the roll-forward rebuild"
     assert not engine_files.rebuild_notice_path(persona).exists()  # a switched persona is never given a notice
     # and a notice an earlier attempt left on the persona is deleted by the same call
-    engine_files.rebuild_notice_path(persona).write_text('{"at": "2020-01-01T00:00:00Z", "reason": "old"}', encoding="utf-8")
+    engine_files.rebuild_notice_path(persona).write_text('{"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": "old"}', encoding="utf-8")
     with pytest.raises(EngineStartupError):
         ensure_engine_ready(persona)
     assert not engine_files.rebuild_notice_path(persona).exists()

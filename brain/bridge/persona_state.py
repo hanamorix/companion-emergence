@@ -136,7 +136,7 @@ def _build_rebuild_notice(persona_dir: Path) -> dict[str, str | None] | None:
 
     `log_path` is the runtime log every start-process and engine line about the failure went to (`paths.runtime_log_path`); it is
     None only if that path cannot be worked out (a failure of the home or log-folder lookup), and the reason is still sent, because a
-    reason without a path says more than nothing (HRF red-team G1). The notice's `at` stays in the file (only the writer reads it).
+    reason without a path says more than nothing (HRF red-team G1). The notice's writer identity (`pid`, `pid_token`) stays in the file (only the start process's writer reads it).
     Never raises: a failed read is None, with a warning.
     """
     try:

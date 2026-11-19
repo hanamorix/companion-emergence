@@ -9,6 +9,7 @@ under the bridge conftest's tmp home.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -200,7 +201,8 @@ def _notice(persona: Path) -> str | None:
 def _plant(persona: Path, reason: str = "an earlier attempt's") -> None:
     from brain.emotion import engine_files
 
-    engine_files.rebuild_notice_path(persona).write_text(f'{{"at": "2020-01-01T00:00:00Z", "reason": "{reason}"}}', encoding="utf-8")
+    record = {"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": reason}
+    engine_files.rebuild_notice_path(persona).write_text(json.dumps(record), encoding="utf-8")
 
 
 def _check_raises(monkeypatch: pytest.MonkeyPatch) -> None:
