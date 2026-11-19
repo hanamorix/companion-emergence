@@ -180,8 +180,10 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
     success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
     Each way the switch-over does not complete (the exit-1 failures and the skips that exit 0) also leaves the rebuild notice
     (`engine_files.settle_rebuild_notice`) while the persona is not switched over, so the window can say so (Hana's point 5 on #633);
-    a failed roll-forward of a switched persona leaves none. A hand run that completes does not clear it: the next start's or
-    command's need check does.
+    a failed roll-forward of a switched persona leaves none. When the ready step returns, the handler itself clears the notice
+    (`settle_rebuild_notice` with no reason, which deletes it only once the persona is switched over), so a hand run that completes
+    clears it as the start's child does; a failure the step raises leaves it. A delete that fails is logged and leaves the notice
+    until the next start's or command's need check clears it; running the handler again is safe (the call is idempotent).
 
     A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
     `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing. A bridge recorded running
@@ -210,6 +212,10 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
 
         runner._setup_runtime_logging(persona_dir)
         emotion_engine.ensure_engine_ready(persona_dir)
+        # Hana's 11-18b point 4: the ready step returned (a completed switch-over, no rebuild needed, or a skip or logged failure
+        # that returns), so the notice an earlier attempt left is cleared here, whichever process completed the switch-over. The
+        # writer deletes it only once the persona is switched over, so on any other ending this call changes nothing; it never raises.
+        engine_files.settle_rebuild_notice(persona_dir, None)
     finally:
         progress.remove()
     return 0

@@ -367,24 +367,33 @@ def _notice(persona: Path) -> str | None:
     return None if record is None else record["reason"]
 
 
-def _plant(persona: Path, at: str, reason: str = "an earlier attempt's") -> None:
-    engine_files.rebuild_notice_path(persona).write_text(json.dumps({"at": at, "reason": reason}), encoding="utf-8")
+CHILD_TOKEN = "linux:boot:424242:777"  # the token of the fake rebuild child (pid 424242) while it runs
+
+
+def _plant(persona: Path, reason: str = "an earlier attempt's", *, pid: int = 4242, pid_token: str | None = "linux:boot:4242:99") -> None:
+    engine_files.rebuild_notice_path(persona).write_text(json.dumps({"pid": pid, "pid_token": pid_token, "reason": reason}), encoding="utf-8")
+
+
+def _child_token(monkeypatch: pytest.MonkeyPatch, answer: str) -> None:
+    """The fake child has no real process: `process_identity.token_of` answers `answer` for its pid (424242)."""
+    real = process_identity.token_of
+    monkeypatch.setattr(process_identity, "token_of", lambda pid: answer if pid == 424242 else real(pid))
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_case_6_a_child_that_cannot_be_started_leaves_a_notice_with_the_error(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+def test_case_6_a_child_that_cannot_be_started_leaves_a_plain_notice_without_the_raw_error(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
     rebuild_spawns.error = FileNotFoundError("no such interpreter")
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "FileNotFoundError: no such interpreter"
+    assert _notice(persona) == "the update could not be started"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_a_child_that_exits_non_zero_with_no_notice_of_its_own_leaves_one_with_the_exit_code(
+def test_a_child_that_exits_non_zero_with_no_notice_of_its_own_leaves_a_plain_one(
     persona: Path, rebuild_spawns: RebuildPopenRecorder
 ) -> None:
     rebuild_spawns.exit_code = 3
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 3)"
+    assert _notice(persona) == "the update stopped before it finished"  # the exit code is only in the log and the stderr line
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
@@ -393,35 +402,76 @@ def test_a_child_that_exits_non_zero_after_writing_its_own_notice_keeps_it(
 ) -> None:
     rebuild_spawns.running_polls = 1
     rebuild_spawns.exit_code = 1
-    monkeypatch.setattr(clock, "sleep", lambda dt: engine_files.settle_rebuild_notice(persona, "the first rebuild failed (OSError: its own)"))
+    _child_token(monkeypatch, CHILD_TOKEN)
+    monkeypatch.setattr(
+        clock, "sleep", lambda dt: _plant(persona, "the first rebuild failed (OSError: its own)", pid=424242, pid_token=CHILD_TOKEN)
+    )
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the first rebuild failed (OSError: its own)"  # the child's, written after the spawn, is more exact
+    assert _notice(persona) == "the first rebuild failed (OSError: its own)"  # the launched child's own record is more exact
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_a_notice_older_than_the_spawn_is_replaced_by_a_non_zero_exit(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
-    _plant(persona, "2020-01-01T00:00:00Z")
+def test_a_notice_of_another_process_is_replaced_by_a_non_zero_exit(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _child_token(monkeypatch, CHILD_TOKEN)
+    _plant(persona)  # an earlier attempt's: another pid and token
     rebuild_spawns.exit_code = 9
     assert daemon._rebuild_under_lock(persona) is None
-    assert _notice(persona) == "the update of your memories stopped (exit code 9)"
+    assert _notice(persona) == "the update stopped before it finished"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
-def test_a_child_that_completes_clears_the_notice_once_the_persona_is_switched_over(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+def test_a_notice_of_a_recycled_pid_with_another_token_is_replaced(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _child_token(monkeypatch, CHILD_TOKEN)
+    _plant(persona, pid=424242, pid_token="linux:boot:424242:1")  # the same pid number, an earlier process
+    rebuild_spawns.exit_code = 9
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "the update stopped before it finished"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_a_notice_without_a_writer_identity_is_replaced_by_a_non_zero_exit(persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch) -> None:
+    _child_token(monkeypatch, CHILD_TOKEN)
+    engine_files.rebuild_notice_path(persona).write_text('{"at": "2999-01-01T00:00:00Z", "reason": "from before the identity"}', encoding="utf-8")
+    rebuild_spawns.exit_code = 9
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "the update stopped before it finished"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+@pytest.mark.parametrize("unreadable", [process_identity.GONE, process_identity.UNKNOWN])
+def test_a_child_token_that_cannot_be_read_means_the_generic_reason_is_written(
+    persona: Path, rebuild_spawns: RebuildPopenRecorder, monkeypatch: pytest.MonkeyPatch, clock: _Clock, unreadable: str
+) -> None:
+    _child_token(monkeypatch, unreadable)
+    rebuild_spawns.running_polls = 1
+    rebuild_spawns.exit_code = 1
+    monkeypatch.setattr(clock, "sleep", lambda d: _plant(persona, "its own", pid=424242, pid_token=CHILD_TOKEN))
+    assert daemon._rebuild_under_lock(persona) is None
+    assert _notice(persona) == "the update stopped before it finished"
+
+
+@pytest.mark.real_rebuild_step(reason="the step under test")
+def test_the_start_does_not_clear_the_notice_after_a_child_that_exited_zero(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
+    """The child clears the notice itself when it ends normally (`cli._supervisor_rebuild_handler`; test_supervisor_rebuild.py and the
+    real-child test), so the start has one mechanism fewer: with a stand-in child that clears nothing, a notice on a switched persona stays."""
     from datetime import UTC, datetime
 
     from tests.unit.brain.emotion._engine_support import make_live
 
-    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))  # what the real child's completed switch-over leaves
-    _plant(persona, "2020-01-01T00:00:00Z")
+    make_live(persona, datetime(2030, 1, 1, tzinfo=UTC))
+    _plant(persona)
     assert daemon._rebuild_under_lock(persona) is None
-    assert not engine_files.rebuild_notice_path(persona).exists()
+    assert _notice(persona) == "an earlier attempt's"
 
 
 @pytest.mark.real_rebuild_step(reason="the step under test")
 @pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base nothing writes or deletes the notice, so it trivially stays")
 def test_a_child_that_exits_zero_on_a_persona_still_not_switched_keeps_the_notice(persona: Path, rebuild_spawns: RebuildPopenRecorder) -> None:
-    _plant(persona, "2020-01-01T00:00:00Z")  # an exit-0 skip (S61): the persona stays unswitched, so what the notice says still holds
+    _plant(persona)  # an exit-0 skip (S61): the persona stays unswitched, so what the notice says still holds
     assert daemon._rebuild_under_lock(persona) is None
     assert _notice(persona) == "an earlier attempt's"
 
