@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from brain.utils.sqlite_open import close_on_error, open_store_connection, strict_wal_profile
+from brain.utils.sqlite_open import open_store_connection, strict_wal_profile
 from brain.works import Work
 
 logger = logging.getLogger(__name__)
@@ -126,13 +127,15 @@ class WorksStore:
 
     def __init__(self, db_path: Path | str) -> None:
         self._path = Path(db_path)
+        self._raw: list[sqlite3.Connection] = []  # handed out by `_conn`, closed by `close()`
         self._path.parent.mkdir(parents=True, exist_ok=True)
         key = str(self._path.resolve())
         if key not in self._INITIALISED_PATHS:
             conn = self._connect()
-            # `with conn:` commits or rolls back but never closes; a failed
-            # first-init must not leak the connection (#496).
-            with close_on_error(conn), conn:
+            # `with conn:` commits or rolls back but never closes, and a dropped
+            # connection is only closed by the cycle collector, holding the file
+            # until then; so close it on every path, failed first-init too (#496).
+            with closing(conn), conn:
                 conn.executescript(_SCHEMA_SQL)
                 conn.commit()
                 # First ALTER migration in the repo. Runs right after the
@@ -156,21 +159,24 @@ class WorksStore:
 
         The store opens per-call by design; this property hands back a new
         connection each access so callers needing a raw handle don't reach into
-        the per-method connection lifecycle.
+        the per-method connection lifecycle. The store keeps each one and
+        ``close()`` closes them, so a caller that closes the store closes these.
         """
-        return self._connect()
+        conn = self._connect()
+        self._raw.append(conn)
+        return conn
 
     def close(self) -> None:
-        """No-op close — the store holds no long-lived connection.
+        """Close the raw connections ``_conn`` handed out.
 
-        Provided for symmetry with MemoryStore so maker/test call sites can
-        ``store.close()`` uniformly; each method already opens + closes its own
-        connection.
+        Each method opens and closes its own connection, so these are the only
+        ones the store can still hold. Safe to call more than once.
         """
-        return None
+        while self._raw:
+            self._raw.pop().close()
 
     def schema_version(self) -> int:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("PRAGMA user_version").fetchone()
             return int(row[0]) if row else 0
 
@@ -267,7 +273,7 @@ class WorksStore:
     # ----- reads -----
 
     def get(self, work_id: str) -> Work | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             try:
                 row = conn.execute("SELECT * FROM works WHERE id = ?", (work_id,)).fetchone()
             except sqlite3.OperationalError as exc:
@@ -289,7 +295,7 @@ class WorksStore:
             params.append(type)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(int(limit))
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError as exc:
@@ -313,7 +319,7 @@ class WorksStore:
             params.append(type)
         sql += " ORDER BY works.created_at DESC LIMIT ?"
         params.append(int(limit))
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError as exc:

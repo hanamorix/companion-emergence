@@ -196,6 +196,9 @@ def test_list_recent_returns_empty_on_operational_error(
         def __exit__(self, *a):
             self._conn.__exit__(*a)
 
+        def close(self):
+            self._conn.close()
+
         def execute(self, *a, **kw):
             raise sqlite3.OperationalError("simulated DB corruption")
 
@@ -226,6 +229,9 @@ def test_get_returns_none_on_operational_error(
 
         def __exit__(self, *a):
             self._conn.__exit__(*a)
+
+        def close(self):
+            self._conn.close()
 
         def execute(self, *a, **kw):
             raise sqlite3.OperationalError("simulated DB corruption")
