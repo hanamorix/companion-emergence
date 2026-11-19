@@ -17,14 +17,15 @@ import os
 import re
 import uuid
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
-from datetime import UTC, datetime
+from contextlib import ExitStack, closing, contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.json_io import (
     Recovery,
     append_jsonl,
     encode_jsonl,
+    iter_jsonl_reversed,
     read_json,
     read_jsonl,
     write_json,
@@ -32,7 +33,9 @@ from brain.health.json_io import (
 )
 from brain.utils.atomic_write import fsync_dir, save_with_backup_text
 from brain.utils.file_lock import file_lock
-from brain.utils.file_ops import delete_file
+from brain.utils.file_ops import delete_file, list_dir, stat_path
+from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -356,7 +359,7 @@ def _archive_segments(persona_dir: Path, session_id: str) -> list[tuple[int, Pat
     out: list[tuple[int, Path]] = []
     for p in d.glob(f"{session_id}.*.jsonl"):
         mid = p.name[len(prefix) : -len(suffix)]
-        if mid.isdigit():
+        if mid.isascii() and mid.isdigit():  # str.isdigit() also accepts "²", which int() rejects
             out.append((int(mid), p))
     out.sort(key=lambda t: t[0])
     return out
@@ -424,6 +427,140 @@ def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
     for p in _archive_read_order(persona_dir, session_id):
         out.extend(read_jsonl(p, recover=Recovery.RAISE))
     return out
+
+
+# --- The time of the user's last turn -----------------------------------------------------------------------------
+# The one place it is computed (``days_since_human`` and the user-presence silence both call it). It reads the
+# conversation files and nothing else: no memory, no presence file. A reader must not write, so neither step creates a
+# folder (``_active_conversations_dir`` and ``_archived_conversations_dir`` both do).
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _latest_user_ts_in_file(path: Path) -> datetime | None:
+    """The ``ts`` of the last ``speaker == "user"`` row of one conversation file (the last in file order), or None.
+
+    The file is read from its end backwards and the read stops at that row (``iter_jsonl_reversed``), so only a file with no
+    user row, or whose last user row sits near its start, is read to its start. A user row whose ``ts`` does not parse is
+    skipped with a warning and the read goes on backwards. A bad line, including one the JSON parser cannot load, is skipped
+    by the reader with its own warning, so it never hides an earlier user row. A file that cannot be read reads as empty
+    (the reader warns)."""
+    with closing(iter_jsonl_reversed(path)) as rows:
+        for row in rows:
+            if row.get("speaker") != "user":
+                continue
+            ts = lenient_utc(row.get("ts"))
+            if ts is None:
+                warn_throttled(
+                    logger, "last_user_turn_ts:bad_ts", "last_user_turn_ts: a user row of %s has no usable ts", path.name,
+                    exc_info=False,
+                )
+                continue
+            return ts
+    return None
+
+
+def _latest_user_ts_in_active_files(persona_dir: Path) -> datetime | None:
+    try:
+        session_ids = list_active_sessions(persona_dir)
+    except OSError:
+        warn_throttled(
+            logger, "last_user_turn_ts:unlistable_active", "last_user_turn_ts: the active conversations folder cannot be listed"
+        )
+        return None
+    latest: datetime | None = None
+    for session_id in session_ids:
+        try:
+            path = _session_path(persona_dir, session_id)  # the folder exists (it was just listed): nothing is created
+        except ValueError:
+            continue  # a file name that is not a session id is not a session buffer
+        ts = _latest_user_ts_in_file(path)
+        if ts is not None and (latest is None or ts > latest):
+            latest = ts
+    return latest
+
+
+def _latest_user_ts_in_session_archive(persona_dir: Path, session_id: str) -> datetime | None:
+    """The latest user ``ts`` of one archived session: its files from the last backwards, stopping at the first that holds one."""
+    try:
+        files = _archive_read_order(persona_dir, session_id)
+    except OSError:
+        warn_throttled(
+            logger, "last_user_turn_ts:unlistable_session", "last_user_turn_ts: the archived files of session %s cannot be listed",
+            session_id,
+        )
+        return None
+    for path in reversed(files):
+        ts = _latest_user_ts_in_file(path)
+        if ts is not None:
+            return ts
+    return None
+
+
+def _latest_user_ts_in_archive(persona_dir: Path, best: datetime | None) -> datetime | None:
+    """The later of ``best`` (the newest user ``ts`` already found, None for none) and the newest archived user ``ts``."""
+    # Not ``_archived_conversations_dir``: it creates the folder. A missing folder lists as [].
+    folder = persona_dir / "archived_conversations"
+    try:
+        names = list_dir(folder)
+    except OSError:
+        warn_throttled(
+            logger, "last_user_turn_ts:unlistable_archive", "last_user_turn_ts: the archived conversations folder cannot be listed"
+        )
+        return best
+    # The session ids come from the names (``<sid>.jsonl`` legacy, ``<sid>.<NNN>.jsonl`` segments; a session id holds no
+    # dot). Each session's last file is read off this one listing: its largest numbered segment, else the legacy file.
+    last_file: dict[str, tuple[int, str]] = {}
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        session_id, _, segment = name[: -len(".jsonl")].partition(".")
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            continue
+        if not segment:
+            rank = -1  # the legacy file comes before every numbered segment
+        elif segment.isascii() and segment.isdigit():
+            rank = int(segment)
+        else:
+            continue
+        if session_id not in last_file or (rank, name) > last_file[session_id]:
+            last_file[session_id] = (rank, name)
+    # Session ids are not in time order, so the sessions are visited newest file first by modification time (a file's
+    # last row cannot be later than the time the file was last written).
+    visits: list[tuple[datetime, str]] = []
+    for session_id, (_, name) in last_file.items():
+        try:
+            stat = stat_path(folder / name)
+        except OSError:
+            warn_throttled(
+                logger, "last_user_turn_ts:stat", "last_user_turn_ts: the archived file %s cannot be inspected; skipped", name
+            )
+            continue
+        if stat is None or not stat.is_file:  # gone since the listing, or not a file
+            continue
+        visits.append((_EPOCH + timedelta(microseconds=stat.mtime_ns // 1000), session_id))
+    visits.sort(reverse=True)
+    for mtime, session_id in visits:
+        if best is not None and best >= mtime:
+            break  # no later session can hold a turn newer than the best found, so no further file is opened
+        ts = _latest_user_ts_in_session_archive(persona_dir, session_id)
+        if ts is not None and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def last_user_turn_ts(persona_dir: Path) -> datetime | None:
+    """The ``ts`` (aware, UTC) of the user's last turn, from the conversation files, or None when no file holds one.
+
+    Every conversation file is read from its end backwards to its last ``speaker == "user"`` row (``_latest_user_ts_in_file``).
+    Active step: every ``active_conversations/*.jsonl``, the latest of those rows' ``ts`` across the files. Archive step, always run, seeded with the active result (a
+    lingering active buffer must not hide a newer archived session; after a full fold the successor holds only a summary
+    row): the archived sessions visited newest file first, each read from its last file backwards to the first that holds
+    a user turn, the walk ending as soon as the best ``ts`` found (the active one included) is not older than the next
+    session's last-file modification time, so the read is bounded with no window constant. The answer is the later of the
+    active files' and the archive's newest user ``ts``. A naive ``ts`` means UTC. Reads only: no folder is created.
+    """
+    return _latest_user_ts_in_archive(persona_dir, _latest_user_ts_in_active_files(persona_dir))
 
 
 # --- Archive commit marker (Bug 3: idempotent archive-under-crash-retry) -----

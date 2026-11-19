@@ -25,10 +25,13 @@ def _setup_persona(personas_root: Path, persona_name: str = "testpersona") -> Pa
 
 def test_cli_reflex_dry_run_no_arcs(monkeypatch, tmp_path: Path, capsys):
     monkeypatch.setenv("NELLBRAIN_HOME", str(tmp_path))
-    _setup_persona(tmp_path / "personas", "testpersona")
+    persona_dir = _setup_persona(tmp_path / "personas", "testpersona")
     (tmp_path / "personas" / "testpersona" / "reflex_arcs.json").write_text(
         '{"version": 1, "arcs": []}', encoding="utf-8"
     )
+    from brain.emotion.engine import ensure_engine_ready
+
+    ensure_engine_ready(persona_dir)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
 
     rc = main(["reflex", "--persona", "testpersona", "--provider", "fake", "--dry-run"])
     assert rc == 0

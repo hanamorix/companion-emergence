@@ -1,13 +1,12 @@
 """A failed write on MemoryStore leaves no transaction open (Engine 3, #578, BC1).
 
 Python's sqlite3 opens a transaction before a write. When the write raises, the connection stays inside that transaction unless the method ends it, and
-the next writer's commit would take the failed call's earlier statements with it. `create`, `update`, `update_emotions_batch` and `deactivate` each
+the next writer's commit would take the failed call's earlier statements with it. `create`, `update` and `deactivate` each
 roll back the transaction they opened. The failure is forced with a trigger that aborts the write on one row, through the store's own connection.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
@@ -81,21 +80,6 @@ def test_a_failed_update_leaves_no_open_transaction_and_a_callers_own_is_left_al
     store._conn.commit()
     row_a = _durable(store.db_path, a.id)
     assert row_a is not None and row_a["importance"] == 3.0
-
-
-def test_a_failed_batch_leaves_no_open_transaction_and_its_earlier_rows_do_not_become_durable(store: MemoryStore) -> None:
-    a, b = _mem("a", emotions={"love": 4.0}), _mem("b", emotions={"love": 4.0})
-    store.create(a)
-    store.create(b)
-    _fail_on(store, "UPDATE", b.id)
-    with pytest.raises(sqlite3.DatabaseError, match="forced failure"):
-        store.update_emotions_batch([(a.id, {"love": 1.0}), (b.id, {"love": 1.0})])
-    assert not store._conn.in_transaction
-    _stop_failing(store)
-    store.update(b.id, importance=8.0)  # the next write on the same connection commits
-    row_a, row_b = _durable(store.db_path, a.id), _durable(store.db_path, b.id)
-    assert row_a is not None and json.loads(row_a["emotions_json"]) == {"love": 4.0}  # not the batch's first row
-    assert row_b is not None and row_b["importance"] == 8.0
 
 
 def test_a_failed_deactivate_leaves_no_open_transaction_and_the_next_write_succeeds(store: MemoryStore) -> None:

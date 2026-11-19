@@ -15,38 +15,6 @@ def _write_turn(conv_dir: Path, *, speaker: str, ts: datetime) -> None:
     )
 
 
-def test_compute_silence_days_no_buffer_returns_zero(tmp_path: Path) -> None:
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    assert _compute_silence_days(tmp_path) == pytest.approx(0.0)
-
-
-def test_compute_silence_days_recent_user_turn(tmp_path: Path) -> None:
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    twelve_hours_ago = datetime.now(UTC) - timedelta(hours=12)
-    _write_turn(conv_dir, speaker="user", ts=twelve_hours_ago)
-
-    result = _compute_silence_days(tmp_path)
-    assert 0.4 < result < 0.6  # ~0.5 days
-
-
-def test_compute_silence_days_skips_companion_turns(tmp_path: Path) -> None:
-    """Turns from the companion (persona_dir.name) must not reset the silence clock."""
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    # Companion spoke 5 minutes ago; user spoke 3 days ago
-    _write_turn(conv_dir, speaker=tmp_path.name, ts=datetime.now(UTC) - timedelta(minutes=5))
-    _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(days=3))
-
-    result = _compute_silence_days(tmp_path)
-    assert result > 2.9  # ~3 days — companion turn ignored
-
-
 def _write_audit_rows(persona_dir: Path, rows: list[dict]) -> None:
     """Write rows to initiate_audit.jsonl."""
     path = persona_dir / "initiate_audit.jsonl"
@@ -219,7 +187,9 @@ def test_c1_no_full_scan_when_daily_cadence_not_due(
 ) -> None:
     """Two calls to compute_user_presence in the same day: the first (cadence
     never-run -> due) may full-scan; the second (cadence not due) must not
-    call the full-directory-glob-and-read reader at all."""
+    call the full-directory-glob-and-read reader at all. (silence_days is not
+    one of those scans: it is read per call through ``last_user_turn_ts``
+    in brain.ingest.buffer, which uses its own reader, not this module's.)"""
     import brain.initiate.user_pattern as up
 
     conv_dir = tmp_path / "active_conversations"
@@ -786,20 +756,98 @@ def test_c6_new_inbound_turn_reflected_without_forcing_a_recompute(tmp_path: Pat
     t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
     _write_turn(conv_dir, speaker="user", ts=t0 - timedelta(days=5))
 
-    presence_stale = compute_user_presence(tmp_path, _now=t0)  # due -> caches 5-day-old last_seen
+    presence_stale = compute_user_presence(tmp_path, _now=t0)  # due -> the daily recompute runs
     assert presence_stale.silence_days > 4.5
 
-    # A REAL inbound turn arrives (the actual event hook engine.py fires).
+    # A REAL inbound turn arrives: the chat saves the user row (the file silence_days is read from) and fires the
+    # presence event hook (engine.py).
     fresh_ts = t0.isoformat()
+    _write_turn(conv_dir, speaker="user", ts=t0)
     presence_state.record_inbound_turn(tmp_path, fresh_ts)
 
     # Cadence must NOT be due yet (only a moment has passed) -- this call
     # must NOT trigger a new daily recompute to reflect the fresh event.
     presence_fresh = compute_user_presence(tmp_path, _now=t0 + timedelta(seconds=1))
     assert presence_fresh.silence_days < 0.01, (
-        "silence_days must reflect the fresh event immediately, not the "
-        "stale cached day-count from the last daily recompute"
+        "silence_days must reflect the fresh turn immediately, not wait for the next daily recompute"
     )
+
+
+def _stale_presence_file(persona_dir: Path, last_seen: datetime, now: datetime) -> None:
+    """A presence sidecar claiming the user was last seen at ``last_seen``, with the daily recompute not due."""
+    from brain.bridge.persisted_cadence import CadenceState, save_cadence
+    from brain.initiate import presence_state
+
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    save_cadence(persona_dir, "presence_daily_cadence.json", CadenceState(next_at=now + timedelta(days=1)))
+    presence_state.record_inbound_turn(persona_dir, last_seen.isoformat())
+
+
+def test_silence_days_comes_from_the_last_user_turn_not_from_the_presence_file(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+    _write_turn(conv_dir, speaker="user", ts=now - timedelta(hours=6))
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(0.25, abs=1e-3)
+
+
+def test_silence_days_is_zero_with_no_user_turn_whatever_the_presence_file_says(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(0.0)
+
+
+def test_silence_days_is_never_negative_for_a_user_turn_dated_after_now(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+    _write_turn(conv_dir, speaker="user", ts=now + timedelta(hours=3))  # clock skew
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(0.0)
+
+
+def test_silence_days_reads_the_archive_when_no_active_file_holds_a_user_turn(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+    archive = tmp_path / "archived_conversations"
+    archive.mkdir()
+    (archive / "sess_old.000.jsonl").write_text(
+        json.dumps({"speaker": "user", "text": "hi", "ts": (now - timedelta(days=2)).isoformat()}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(2.0, abs=1e-3)
+
+
+def test_a_failing_last_user_turn_ts_gives_zero_silence_and_leaves_the_other_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import brain.ingest.buffer as buffer_mod
+    from brain.initiate.user_pattern import compute_user_presence
+
+    def boom(_persona_dir):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(buffer_mod, "last_user_turn_ts", boom)
+    _write_audit_rows(tmp_path, [
+        {"audit_id": "1", "ts": "2026-05-29T10:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "dismissed"}},
+    ])
+    presence = compute_user_presence(tmp_path)
+    assert presence.silence_days == pytest.approx(0.0)
+    assert presence.ignore_streak == 1
 
 
 # ---------------------------------------------------------------------------
@@ -946,19 +994,17 @@ def test_c8_source_removal_after_populated_fails_open_at_next_recompute(
     presence_immediately_after = compute_user_presence(tmp_path, _now=now_peak + timedelta(seconds=1))
     assert presence_immediately_after.ignore_streak == 0
 
-    # silence_days/likely_active are cached at daily granularity; force the
-    # cadence due again so the removal is actually noticed, and assert the
-    # result is fail-open (not an exception, not still trusting the vanished
-    # histogram as if it were still valid).
+    # likely_active is cached at daily granularity; force the cadence due
+    # again so the removal is actually noticed, and assert the result is
+    # fail-open (not an exception, not still trusting the vanished histogram
+    # as if it were still valid).
     presence_after_next_recompute = compute_user_presence(
         tmp_path, _now=now_peak + timedelta(hours=25)
     )
     assert presence_after_next_recompute.likely_active is True  # hour_counts reset to None
-    # silence_days can only ever grow (never shrink) once its source
-    # vanishes -- per gates.py, a HIGHER silence_days only loosens gates
-    # further, so "no less permissive than the fail-open default" holds
-    # even though the exact cached last_seen_ts isn't reset to None.
-    assert presence_after_next_recompute.silence_days >= presence_before.silence_days
+    # silence_days is read from the conversation files on every call, so with
+    # no user turn left it is the fail-open 0.0 at once (no cached value).
+    assert presence_after_next_recompute.silence_days == pytest.approx(0.0)
 
 
 def test_c8_reply_lag_fails_open_after_source_removed_post_bootstrap(tmp_path: Path) -> None:
@@ -1043,7 +1089,6 @@ def test_c10_same_input_same_gate_decision_old_vs_new_mechanism(tmp_path: Path) 
         _compute_ignore_streak,
         _compute_likely_active,
         _compute_response_lag_p50,
-        _compute_silence_days,
         compute_user_presence,
     )
 
@@ -1080,9 +1125,10 @@ def test_c10_same_input_same_gate_decision_old_vs_new_mechanism(tmp_path: Path) 
     # New mechanism, settled.
     new_presence = compute_user_presence(tmp_path, _now=now)
 
-    # Old from-scratch mechanism, over the IDENTICAL final on-disk data.
+    # Old from-scratch mechanism, over the IDENTICAL final on-disk data. silence_days has no second implementation
+    # any more (both mechanisms read it from last_user_turn_ts), so it is taken as it is.
     old_presence = UserPresence(
-        silence_days=_compute_silence_days(tmp_path, _now=now),
+        silence_days=new_presence.silence_days,
         ignore_streak=_compute_ignore_streak(tmp_path),
         likely_active=_compute_likely_active(tmp_path, _now=now),
         response_lag_p50=_compute_response_lag_p50(tmp_path),
@@ -1196,16 +1242,3 @@ def test_621_hour_histogram_counts_only_the_user_rows(tmp_path: Path) -> None:
     hour_counts, _threshold = _build_hour_histogram(persona_dir, _now=_T621_NOW)
 
     assert hour_counts == _user_only_hour_counts(user_times)
-
-
-def test_621_silence_days_ignores_assistant_rows(tmp_path: Path) -> None:
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    persona_dir = tmp_path / "nell"
-    conv_dir = persona_dir / "active_conversations"
-    conv_dir.mkdir(parents=True)
-    _write_turn(conv_dir, speaker="user", ts=_T621_NOW - timedelta(days=3))
-    _write_turn(conv_dir, speaker="assistant", ts=_T621_NOW - timedelta(minutes=5))
-    _write_turn(conv_dir, speaker="image", ts=_T621_NOW - timedelta(minutes=4))
-
-    assert _compute_silence_days(persona_dir, _now=_T621_NOW) == pytest.approx(3.0)

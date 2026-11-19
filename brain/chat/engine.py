@@ -598,8 +598,8 @@ def _persist_turn(
         )
         return False, str(exc)
 
-    # Presence event hook (#225): update the silence-days last-seen
-    # timestamp AFTER persistence succeeds and session.py's registry lock
+    # Presence event hook (#225): update the persisted last-seen
+    # timestamp (no longer read for silence-days) AFTER persistence succeeds and session.py's registry lock
     # has released. Own dedicated try/except, deliberately separate from
     # the persistence try/except above — a presence-hook bug must never be
     # misreported as a persistence error, and must never break the chat

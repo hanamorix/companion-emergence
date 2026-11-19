@@ -395,14 +395,14 @@ def test_volatile_context_carries_the_live_trail(persona_dir, soul_store):
     """#688: once the engine is live the interior block in the volatile tail is a trail of whole notes."""
     from datetime import UTC, datetime
 
-    from brain.emotion import engine_files
     from brain.monologue.trace import write_trace_memory
+    from tests.unit.brain.emotion._engine_support import make_live
 
     live_header = "── interior continuity (your recent thoughts, as you noted them) ──"
     old_header = "── interior continuity (your own recent thought) ──"
     store = MemoryStore(db_path=persona_dir / "memories.db")
     store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
-    assert engine_files.write_switch(persona_dir, datetime.now(UTC))
+    make_live(persona_dir, datetime.now(UTC))
     digests = [f"{i}" + "d" * 219 for i in range(3)]
     for d in digests:
         write_trace_memory(store, "raw " + d, feed_digest=d, persona_dir=persona_dir, live=True)
