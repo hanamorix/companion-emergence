@@ -218,6 +218,34 @@ jobs:
           KINDLED_RUN_STRESS: "1"  # adds the 60s C15(c) write-lock stress test and its stand-in tests (#421, #540)
         run: uv run --python 3.13 pytest tests/bridge tests/unit/brain/bridge -v --tb=short
 
+  # #740: `requires-python` has no upper bound, so a dev machine whose default Python is 3.14 builds its .venv there,
+  # and a break that only shows on 3.14 passed CI twice (#678, #700). The whole suite, on one OS: both breaks were
+  # OS-independent, and the macOS runner pool is short (#758). The CPU budget stays on the main matrix's Ubuntu leg,
+  # so a slow runner can't fail it twice. Tests: tests/unit/scripts/test_ci_python_314.py.
+  python-314:
+    name: python 3.14 (full suite)
+    if: github.event_name != 'workflow_dispatch'
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.14
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --all-extras --python 3.14
+
+      # The main matrix's command (see its comment for -n / --dist / -p), with no path: the whole suite.
+      - name: Run pytest
+        run: uv run --python 3.14 pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short
+
   # Audit 2026-05-07 P2-5: frontend tests + production build now gate
   # PRs the same way Python does. The previous release cycle's biggest
   # regressions were React/Tauri glue (wizard provider field, persona
