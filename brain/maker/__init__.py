@@ -85,6 +85,7 @@ def run_maker_tick(
         if make_fn is not None:
             make_fn(persona_dir=persona_dir, store=store, provider=provider, now=now)
         state.charge = 0.0
+        state.emotion_part = state.soul_part = state.dream_part = 0.0  # what built it goes with it (#721)
         state.last_fire_ts = now.isoformat()
     except ThrottleDeferred:
         # Lost the slot in the pre-flight→acquire race. A quiet no-op: leave the
@@ -93,6 +94,11 @@ def run_maker_tick(
         return
     except Exception:
         logger.exception("maker: making failed — partial charge, cooldown engaged")
+        # The parts shrink with the charge, keeping their proportions, so they still sum to it (#721).
+        scale = _cfg.FAILED_MAKE_CHARGE / state.charge if state.charge > 0.0 else 0.0
+        state.emotion_part *= scale
+        state.soul_part *= scale
+        state.dream_part *= scale
         state.charge = _cfg.FAILED_MAKE_CHARGE
         state.last_fire_ts = now.isoformat()  # no tight retry loop
     save_charge(persona_dir, state)

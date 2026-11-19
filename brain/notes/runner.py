@@ -124,6 +124,7 @@ def _wire_note_back(persona_dir: Path, *, note: Any, folder: Path, user_name: st
     ambient mention, never the write itself."""
     from uuid import uuid4
 
+    from brain.emotion.engine import engine_for
     from brain.initiate.memory import write_initiate_memory
     from brain.memory.store import MemoryStore
 
@@ -138,7 +139,8 @@ def _wire_note_back(persona_dir: Path, *, note: Any, folder: Path, user_name: st
             state="note",
             ts=now.isoformat(),
             user_name=user_name,
-            reach_emotions={"tenderness": 0.12},
+            # On the engine's 0-10 scale once it is live (B1 PR 3); today's small value while the switch is off.
+            reach_emotions={"tenderness": 1.2 if engine_for(persona_dir).is_live() else 0.12},
         )
     except Exception:
         logger.exception("notes.runner: wiring the note-state memory failed")

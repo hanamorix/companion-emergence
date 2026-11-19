@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,6 +34,9 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # Text externalized to prompt_strings.toml [kindled_link.relationship] (issue #129 stage 2b).
 _REFLECTION_PROMPT_SEGMENTS = prompt_strings.register_segments(
     "kindled_link.relationship.reflection_prompt_segments"
+)
+_REFLECTION_PROMPT_LAST_SEGMENT_LIVE = prompt_strings.register(
+    "kindled_link.relationship.reflection_prompt_last_segment_live"
 )
 
 
@@ -55,9 +59,27 @@ def _is_grounded(quote: str, transcript: str) -> bool:
     return q in _normalise(transcript)
 
 
-def _build_reflection_prompt(*, current_stage: str, transcript: str) -> str:
+def _live_peer_values(raw: object) -> dict[str, float]:
+    """A reflection's ``emotion`` field as 0-10 values for a live peer memory (B1 PR 3).
+
+    Numbers only (``bool`` excluded) and finite; anything else is dropped, so one bad value no longer loses the memory.
+    A negative is held to 0 (and kept, like any 0) and the rest are held to 10.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            continue
+        out[str(name)] = min(max(float(value), 0.0), 10.0)
+    return out
+
+
+def _build_reflection_prompt(*, current_stage: str, transcript: str, live: bool = False) -> str:
+    """The reflection prompt. ``live`` (the emotion engine's switch is on) asks for emotion values from 0 to 10."""
     seg = _REFLECTION_PROMPT_SEGMENTS
-    return seg[0] + current_stage + seg[1] + transcript + seg[2]
+    last = _REFLECTION_PROMPT_LAST_SEGMENT_LIVE if live else seg[2]
+    return seg[0] + current_stage + seg[1] + transcript + last
 
 
 @dataclass
@@ -104,6 +126,26 @@ def persist_relationship_state(store, state: PeerRelationshipState, now: datetim
         evidence_json=json.dumps([vars(e) for e in state.evidence]),
         now=now,
     )
+
+
+def peer_trust(persona_dir: Path, peer_id: str) -> float:
+    """How far this persona trusts one peer, 0 to 1, for the emotion engine's peer modifier."""
+    from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+
+    path = kindled_db_path(persona_dir)
+    if not path.exists():  # reading must never create the database
+        return 0.0
+    # shortcut: no cache, one read per peer row under the engine lock; add one if the catch-up shows it.
+    try:
+        store = KindledLinkStore(path, integrity_check=False)
+        try:
+            return get_relationship_state(store, peer_id).trust_score
+        finally:
+            store.close()
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        # This runs inside the engine's catch-up, where an exception would fail the whole catch-up.
+        log.warning("peer_trust: could not read trust for a peer: %s", exc)
+        return 0.0
 
 
 def get_stage(store, peer_id: str) -> str:
@@ -188,6 +230,9 @@ def run_relationship_reflection(
     if today != now.strftime("%Y-%m-%d"):
         log.warning("relationship reflection: today disagrees with now; skipping")
         return get_relationship_state(store, peer_id)
+    from brain.emotion.engine import engine_for
+
+    live = persona_dir is not None and engine_for(Path(persona_dir)).is_live()  # B1 PR 3: off without a persona_dir
     state = get_relationship_state(store, peer_id)
     # Atomically reserve the provider slot up front (race-safe vs a concurrent
     # gate/reflection call for the same peer); refund if the LLM call never
@@ -198,7 +243,7 @@ def run_relationship_reflection(
     # Slot reserved — the try spans the prompt build too, so any raise before the
     # call releases it (no leaked reservation; fail-soft to unchanged state).
     try:
-        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript)
+        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript, live=live)
         with throttle.background_slot() as granted:
             if not granted:
                 store.release_provider_slot(peer_id, today)  # no call → refund
@@ -277,7 +322,15 @@ def run_relationship_reflection(
     if mem_store is not None:
         try:
             memory_summary = str(data.get("memory_summary", "")).strip()
-            if memory_summary:
+            if memory_summary and live:
+                from brain.chat.extractor import _filter_to_registered
+
+                write_kindled_peer_memory(
+                    mem_store, peer_id=peer_id, session_id=session_id,
+                    speaker=persona_name, stage=state.stage,
+                    content=memory_summary, emotions=_filter_to_registered(_live_peer_values(data.get("emotion"))),
+                )
+            elif memory_summary:
                 emotion_raw = data.get("emotion")
                 emotion_delta = (
                     {str(k): float(v) for k, v in emotion_raw.items()}
@@ -329,26 +382,6 @@ def save_reflection_cadence(persona_dir, now: datetime) -> None:
         indent=None,
         fsync=False,
     )
-
-
-# base + per-source accent (mirrors the W8 / maker reach_emotion map shape)
-_EMOTION_BASE = {"tenderness": 0.08}
-_EMOTION_ACCENT = {
-    "warmth": {"tenderness": 0.06},
-    "repair": {"relief": 0.06},
-    "delight": {"joy": 0.06},
-}
-
-
-def relationship_emotion_delta(*, dominant_source: str) -> dict[str, float]:
-    """Small vocab-filtered, decay-subordinate emotion delta for a peer moment."""
-    from brain.chat.extractor import _filter_to_registered
-    raw = dict(_EMOTION_BASE)
-    for name, v in _EMOTION_ACCENT.get(dominant_source, {}).items():
-        raw[name] = raw.get(name, 0.0) + v
-    # drop any non-finite values before they can reach felt state (stage-6 review)
-    raw = {k: v for k, v in raw.items() if math.isfinite(v)}
-    return _filter_to_registered(raw)
 
 
 def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: datetime) -> dict[str, float]:

@@ -432,10 +432,10 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("O_DIRECTORY",),
-        why="the directory-fsync flag is named only in the shared writer (#465, G3b)",
+        why="the directory-fsync flag is named only in the shared writer (#465, G3b); the write guard opens folders by descriptor to pin a commit's target (#699), never to fsync",
         ref=_ATOMIC_REF,
         kind="code",
-        allow=("brain/utils/atomic_write.py",),
+        allow=("brain/utils/atomic_write.py", "brain/files/write_guard.py"),
     ),
     Removed(
         names=("os.replace", "uuid", ".new"),
@@ -576,11 +576,175 @@ REMOVED: tuple[Removed, ...] = (
         scope=("brain/update/overlay.py",),
     ),
     Removed(
+        names=("exists_recent_grief_touch",),
+        why="the grief touch's recent-touch check and its insert are one store call, MemoryStore.create_grief_touch_unless_recent (the race, #342); a lookup kept alone would let a caller check and write in two steps again",
+        ref="#627 emotion rework Engine 3 (issue #578; the grief-touch race #342)",
+        kind="code",
+    ),
+    Removed(
         names=("read_bytes",),
         why="file_ops.read_bytes had no production caller once read_jsonl_from streamed through open_read; the whole-file accessor is file_ops.read_bytes_stat (pathlib's Path.read_bytes is a different, attribute-call use elsewhere)",
         ref=_FILE_OPS_REF,
         kind="code",
         scope=("brain/utils/file_ops.py",),
+    ),
+    Removed(
+        names=("oldest_entry_at",),
+        why="the emotion state's oldest-entry time (and the engine's `oldest_entry_at()` stub) had no reader; dropped before any live persona's state file was written with it, so no migration is needed",
+        ref="the maintainer's decision on PR #626 (Engine 2), 2026-11-05",
+    ),
+    # --- every full open is an access (#582) ----------------------------------------------------------------------------
+    Removed(
+        names=("deliberate",),
+        why="open_memory has no deliberate parameter: every full open sets last_accessed_at and reports to the emotion engine, so no caller says whether the open was deliberate",
+        ref="#582 (draft PR #631): the access fixes",
+        kind="code",
+        scope=(
+            "brain/memory/recall_open.py",
+            "brain/tools/impls/read_full_memory.py",
+            "brain/chat/prompt.py",
+        ),
+    ),
+    # --- the readers move onto the engine (#583, Readers 1) ---------------------------------------------------------------
+    Removed(
+        names=("_compute_unnamed_pressure",),
+        why="renamed compute_unnamed_pressure: the supervisor's live self-model tick imports it, so it is public",
+        ref="#583 (draft PR #632): Readers 1",
+        kind="code",
+    ),
+    Removed(
+        names=("_emotion_engine",),
+        why="renamed MemoryStore.emotion_engine: the readers that hold a store use it, so it is public",
+        ref="#583 (draft PR #632): Readers 1",
+        kind="code",
+    ),
+    # --- unused emotion code removed before the writer work (#672, A2a) ------------------------------------------------------
+    Removed(
+        names=("brain/emotion/blend.py",),
+        why="the blend detector had no production caller; felt blends are named by the vocabulary crystallizer",
+        ref="#672 A2a cleanup",
+        kind="file",
+    ),
+    Removed(
+        names=("BlendDetector", "DetectedBlend"),
+        why="the blend detector had no production caller",
+        ref="#672 A2a cleanup",
+    ),
+    Removed(
+        names=("ResidueEntry", "add_residue", "residue_max"),
+        why="EmotionalState's residue queue was never filled or read in production; daemon_state's emotional_residue is a separate, live thing",
+        ref="#672 A2a cleanup",
+    ),
+    Removed(
+        names=("residue",),
+        why="EmotionalState holds no residue queue, and from_dict ignores a legacy residue key by not naming it",
+        ref="#672 A2a cleanup",
+        kind="code",
+        scope=("brain/emotion/state.py",),
+    ),
+    Removed(
+        names=("_EMOTION_BASE", "_EMOTION_ACCENT", "relationship_emotion_delta"),
+        why="the peer emotion table had no live producer; a peer's emotion comes from the reflection reply through apply_peer_emotion",
+        ref="#672 A2a cleanup",
+        scope=("brain/kindled_link",),
+    ),
+    Removed(
+        names=("protected",),
+        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field and the column stay until phase C (the heartbeat check went with the old decay pass, Engine 6 G4)",
+        ref="#672 A2a cleanup",
+        kind="code",
+        scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
+    ),
+    # --- the user's last turn is read in one place (Engine 6 G3) ----------------------------------------------------------
+    Removed(
+        names=("_latest_user_turn_in_buffers", "_latest_conversation_memory_ts", "_compute_silence_days"),
+        why="three readers of the time of the user's last turn (active buffers, the newest conversation memory, a silence-days oracle); brain.ingest.buffer.last_user_turn_ts is the one",
+        ref="Engine 6 G3 (#584, draft PR #633)",
+    ),
+    # --- the x10 fix carries no marker on any row or queued candidate; its progress is `PRAGMA user_version` (Engine 6 Q10c, C2) ---
+    Removed(
+        names=("NUDGE_SCALE_FIX_MARKER", "NUDGE_SCALE_FIX_MARKER_KEY"),
+        why="the single int the x10 fix once wrote to `PRAGMA user_version`, and the metadata key it marked each multiplied row and queued candidate with; the owner ruled out per-row and per-entry markers (S77), and the fix's progress is now the two named numbers NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE and NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED in `PRAGMA user_version`",
+        ref="Engine 6 Q10c and C2 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- the x10 fix's queue step is simplified: no temporary copies, no check, no roll-forward (Engine 6 X10S, owner S84) ---
+    Removed(
+        names=("NUDGE_SCALE_FIX_PROGRESS_QUEUE_COPIES_CHECKED", "_x10_copy_path", "_check_x10_copy", "_prepare_x10_copy", "_x10_row_is_as_expected"),
+        why="the x10 fix's temporary `.x10tmp` queue copies, their re-read check, the in-transaction value compare of the database half, and the constant that said the copies were checked; the owner ruled (S84) that what the shared atomic writer and the database's own transaction already make all-or-nothing is not done again, and 2 now means the queue step started",
+        ref="Engine 6 X10S (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- an unreadable emotion state is decided from the x10 record, never skipped (Engine 6 SW4) ---------------------------
+    Removed(
+        names=("_skip_start_for_unreadable_state",),
+        why="the start-up skip for a state that exists but cannot be read; the owner ruled (S79) that such a state is decided from the database's x10 progress note and rebuilt",
+        ref="Engine 6 SW4 (#584, draft PR #633)",
+        kind="code",
+    ),
+    Removed(
+        names=("_move_unreadable_state_aside", "state_copy_paths"),
+        why="the rebuild's rename of an unreadable state file and its backups to `<name>.corrupt-<stamp>` (and the helper that listed those copies); the owner ruled (S88) that an unreadable state is simply replaced by the rebuild's normal state write, whose backup rotation ages the old copies out, and nothing is moved aside or deleted",
+        ref="Engine 6 RD2 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- "switched over" is read off the state, not off a switch file (Engine 6 SW2) ----------------------------------------
+    Removed(
+        names=(
+            "emotion_switch.json",
+            "EMOTION_SWITCH_FILENAME",
+            "switch_path",
+            "write_switch",
+            "read_switch",
+            "switch_exists",
+            "switch_state",
+            "_switch_seen",
+            "_switch_over_time",
+            "_skip_for_unknown_switch",
+            "_skip_start_for_unknown_switch",
+        ),
+        why="the switch file `state/emotion_switch.json` and the code that wrote, stat-ed and read it; the persona's one switch-over time is the `switch_over_at` field of the emotion state (`engine_files.switch_over_state` reads 'switched' off a loaded state)",
+        ref="Engine 6 SW2 (#584, draft PR #633; Planning B25, owner S73)",
+        kind="code",
+    ),
+    # --- the heartbeat no longer decays each memory's stored emotions (Engine 6 G4) -----------------------------------------
+    Removed(
+        names=("brain/emotion/decay.py",),
+        why="per-memory emotion decay: the engine fades a stored value when it is read (engine_utils.fade), so nothing rewrites memories.db emotions on a timer",
+        ref="Engine 6 G4 (#584, draft PR #633)",
+        kind="file",
+    ),
+    Removed(
+        names=(
+            "apply_decay",
+            "_apply_emotion_decay",
+            "_resume_decay_only",
+            "DecayCursor",
+            "decay_cursor",
+            "_parse_decay_cursor",
+            "HEARTBEAT_DECAY_BATCH_BUDGET_S",
+            "_DECAY_PAGE_SIZE",
+            "memories_decayed",
+            "update_emotions_batch",
+            "list_active_since",
+        ),
+        why="the heartbeat's batched per-memory emotion decay pass with its resume cursor, its batch time budget, its page size, its count (`memories_decayed`) and the two store methods only it used; the engine fades on read, so nothing decays a stored emotion on a timer",
+        ref="Engine 6 G4 (#584, draft PR #633)",
+        kind="code",
+    ),
+    # --- the own-record test moved to process_identity (Engine 6 HR5, Hana's review of #633 point 5) ---------------------------
+    Removed(
+        names=("shutdown_progress.names_this_bridge",),
+        why="`names_this_bridge` moved to `brain/process_identity.py`, the neutral module `brain/emotion` may import, because the engine's progress record used the same test as the bridge's watcher files (it now uses `is_own_identity`); its five callers were re-pointed and no alias was left behind",
+        ref="Engine 6 HR5 (#584, draft PR #633)",
+        kind="text",
+    ),
+    # --- the bridge and the commands stop rebuilding in-process (Engine 6 S107, HS7 and HS8) ----------------------------------
+    Removed(
+        names=("_StoppedWhileWaitingError", "stop_requested", "stop_requested_seen"),
+        why="the stop check of the engine-lock wait: the bridge's start-up no longer rebuilds in-process, the rebuild process (`nell supervisor rebuild`) waits for the lock with no stop check and no limit (`_locked_rebuild(wait_for_lock=True)`), so the `stop_requested` parameters, the stopped-while-waiting error and the test stub's `stop_requested_seen` list went (`stop_requested_at`, the bridge's stop time, is a different name)",
+        ref="Engine 6 S107 HS8 (#633, Planning B55)",
+        kind="code",
     ),
 )
 

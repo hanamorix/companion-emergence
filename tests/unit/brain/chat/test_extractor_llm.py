@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from brain.chat.extractor import ExtractorOutput, extract_from_thinking
 
 
@@ -232,3 +234,180 @@ def test_a_schema_failure_keeps_reply_text_out_of_the_runtime_log(tmp_path, capl
         extract_from_thinking(provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
                               recent_turn_context=(), persona_dir=tmp_path)
     assert "SECRET-EPISODE-TEXT" not in caplog.text
+
+
+# ── #640: an unscored crystallisation item is a parse problem, not an 8 ───────
+def test_unscored_crystallisation_item_is_dropped_and_recorded_through_pass2(tmp_path, monkeypatch):
+    """A reply item with no `importance` must not reach the soul queue (the old default
+    of 8 sat exactly on DEFAULT_SOUL_THRESHOLD), and the drop is kept in the parse-failure
+    log. The rest of the same reply still applies: a scored item is queued and the reflex
+    audit lands. Driven through run_pass2_monologue → extract_from_thinking → apply_side_effects."""
+    import brain.bridge.model_tier as model_tier
+    from brain.chat.tool_loop import run_pass2_monologue
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    raw = json.dumps(
+        {
+            "crystallisation": [
+                {"theme": "Unscored hunch", "evidence": "the reply forgot to score this one"},
+                {"theme": "Scored pull", "evidence": "she came back to the river again", "importance": 9},
+            ],
+            "reflex_audit": [{"tool": "search_memories", "reason": "named a known place"}],
+        }
+    )
+    monkeypatch.setattr(model_tier, "build_tier_provider", lambda *_a, **_k: _FakeProvider(raw))
+
+    run_pass2_monologue(monologue_text="thinking", visible_reply="hi", recent_user_msgs=(), persona_dir=persona_dir)
+
+    queued = (persona_dir / "soul_candidates.jsonl").read_text(encoding="utf-8")
+    assert "Unscored hunch" not in queued, "an item with no importance must not be queued as a soul candidate"
+    texts = [json.loads(line)["text"] for line in queued.splitlines()]
+    assert len(texts) == 1 and texts[0].startswith("Scored pull"), texts
+    assert (persona_dir / "reflex_audit.jsonl").exists(), "the rest of the reply must still apply"
+    (row,) = _parse_rows(persona_dir)
+    assert row["site"] == "extractor" and "importance" in row["error"] and row["raw"] == raw
+    assert "Unscored hunch" not in row["error"]  # #427: no reply text in the error field
+
+
+def test_null_importance_is_treated_as_missing(tmp_path):
+    raw = json.dumps({"crystallisation": [{"theme": "t", "evidence": "e", "importance": None}]})
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    assert out.crystallisation == []
+    (row,) = _parse_rows(tmp_path)
+    assert row["site"] == "extractor" and "without importance" in row["error"]
+
+
+def test_unscored_item_plus_schema_error_writes_one_schema_row(tmp_path):
+    """#640 review: when the reply also fails validation the whole reply is discarded, so
+    one row, the schema one, must say so; no extra row claiming only an item was dropped."""
+    raw = json.dumps(
+        {
+            "memory_writes": [{"episode": "x", "salience": 5}],
+            "crystallisation": [{"theme": "t", "evidence": "e"}],
+        }
+    )
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    assert out == ExtractorOutput()
+    (row,) = _parse_rows(tmp_path)
+    assert row["error"].startswith("schema:") and "without importance" in row["error"]
+
+
+# ── #733: an item with an invalid score costs only that item ──────────────
+def _extract(tmp_path, items, **extra):
+    raw = json.dumps({"crystallisation": items, **extra})
+    out = extract_from_thinking(
+        provider=_FakeProvider(raw), monologue_blocks=("m",), visible_reply="hi",
+        recent_turn_context=(), persona_dir=tmp_path,
+    )
+    return out, _parse_rows(tmp_path)
+
+
+_GOOD = {"theme": "good", "evidence": "she came back to the river again", "importance": 9}
+
+
+def test_invalid_score_is_dropped_and_the_rest_applies_through_pass2(tmp_path, monkeypatch):
+    """An item scored "high" must not take the reply with it: the scored item is queued, the
+    reflex audit lands, and the drop is recorded without reply text. Driven through
+    run_pass2_monologue -> extract_from_thinking -> apply_side_effects."""
+    import brain.bridge.model_tier as model_tier
+    from brain.chat.tool_loop import run_pass2_monologue
+
+    monkeypatch.setenv("KINDLED_HOME", str(tmp_path))
+    persona_dir = tmp_path / "personas" / "nell"
+    persona_dir.mkdir(parents=True)
+    raw = json.dumps(
+        {
+            "crystallisation": [
+                {"theme": "Bad score", "evidence": "the reply scored this in words", "importance": "high"},
+                {"theme": "Scored pull", "evidence": "she came back to the river again", "importance": 9},
+            ],
+            "reflex_audit": [{"tool": "search_memories", "reason": "named a known place"}],
+        }
+    )
+    monkeypatch.setattr(model_tier, "build_tier_provider", lambda *_a, **_k: _FakeProvider(raw))
+
+    run_pass2_monologue(monologue_text="thinking", visible_reply="hi", recent_user_msgs=(), persona_dir=persona_dir)
+
+    queued = (persona_dir / "soul_candidates.jsonl").read_text(encoding="utf-8")
+    assert "Bad score" not in queued
+    texts = [json.loads(line)["text"] for line in queued.splitlines()]
+    assert len(texts) == 1 and texts[0].startswith("Scored pull"), texts
+    assert (persona_dir / "reflex_audit.jsonl").exists(), "the rest of the reply must still apply"
+    (row,) = _parse_rows(persona_dir)
+    assert row["site"] == "extractor" and row["raw"] == raw
+    assert row["error"] == "1 invalid crystallisation item(s) dropped"
+    assert "Bad score" not in row["error"] and "high" not in row["error"]  # #427: no reply text
+
+
+@pytest.mark.parametrize("bad", ["", 0, 11, 9.5, "high"])
+def test_each_invalid_score_drops_only_its_item(tmp_path, bad):
+    out, rows = _extract(tmp_path, [{"theme": "bad", "evidence": "e", "importance": bad}, _GOOD])
+    assert [c.theme for c in out.crystallisation] == ["good"]
+    (row,) = rows
+    assert row["error"] == "1 invalid crystallisation item(s) dropped"
+
+
+def test_a_whitespace_theme_drops_only_its_item(tmp_path):
+    out, rows = _extract(tmp_path, [{"theme": "   ", "evidence": "e", "importance": 9}, _GOOD])
+    assert [c.theme for c in out.crystallisation] == ["good"]
+    (row,) = rows
+    assert row["error"] == "1 invalid crystallisation item(s) dropped"
+
+
+def test_a_non_dict_item_is_dropped(tmp_path):
+    out, rows = _extract(tmp_path, ["just a string", _GOOD])
+    assert [c.theme for c in out.crystallisation] == ["good"]
+    (row,) = rows
+    assert row["error"] == "1 invalid crystallisation item(s) dropped"
+
+
+def test_unscored_and_invalid_are_counted_in_one_row(tmp_path):
+    out, rows = _extract(
+        tmp_path,
+        [{"theme": "unscored", "evidence": "e"}, {"theme": "zero", "evidence": "e", "importance": 0}, _GOOD],
+    )
+    assert [c.theme for c in out.crystallisation] == ["good"]
+    (row,) = rows
+    assert row["error"] == "1 crystallisation item(s) without importance, 1 invalid crystallisation item(s) dropped"
+
+
+def test_invalid_item_plus_schema_error_writes_one_schema_row(tmp_path):
+    """#640's one-row rule: a reply that still fails is discarded, and its one schema row carries the drop note."""
+    out, rows = _extract(
+        tmp_path,
+        [{"theme": "t", "evidence": "e", "importance": 11}],
+        memory_writes=[{"episode": "x", "salience": 5}],
+    )
+    assert out == ExtractorOutput()
+    (row,) = rows
+    assert row["error"].startswith("schema: 1 invalid crystallisation item(s); ")
+
+
+@pytest.mark.no_base_failure(reason="pins that a long theme is truncated, not dropped (#733); main truncates it too")
+def test_a_long_theme_is_kept_truncated(tmp_path):
+    out, rows = _extract(tmp_path, [{"theme": "x" * 300, "evidence": "e", "importance": 9}])
+    assert [len(c.theme) for c in out.crystallisation] == [200]
+    assert rows == []
+
+
+@pytest.mark.no_base_failure(reason="pins that a numeric string score is kept (#733); main keeps it too")
+def test_a_numeric_string_score_is_kept(tmp_path):
+    out, rows = _extract(tmp_path, [{"theme": "t", "evidence": "e", "importance": "9"}])
+    assert [c.importance for c in out.crystallisation] == [9]
+    assert rows == []
+
+
+@pytest.mark.no_base_failure(reason="pins that a non-list crystallisation still fails the whole reply (#733); main does too")
+def test_a_non_list_crystallisation_still_fails_the_reply(tmp_path):
+    out, rows = _extract(tmp_path, "oops", reflex_audit=[{"tool": "search_memories", "reason": "r"}])
+    assert out == ExtractorOutput()
+    (row,) = rows
+    assert row["error"].startswith("schema: ")

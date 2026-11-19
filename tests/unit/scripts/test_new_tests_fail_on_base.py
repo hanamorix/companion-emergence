@@ -214,6 +214,35 @@ def test_the_script_reports_an_always_passing_new_test_and_exempts_a_marked_one(
     assert len(_git(repo, "worktree", "list").splitlines()) == 1, "no worktree is left registered"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the check uses git worktrees and POSIX paths; it runs on the ubuntu PR job and should run locally on macOS")
+def test_the_script_reaches_its_verdict_when_the_temp_dir_is_reached_through_a_symlink(tmp_path: Path) -> None:
+    """#696: macOS's /var is a symlink to /private/var. The canary compared brain.__file__ (imported via the
+    resolved cwd) with the unresolved scratch path and stopped before checking anything."""
+    repo, base = _base_repo(tmp_path)
+    (repo / "brain" / "__init__.py").write_text("def old():\n    return 1\n\n\ndef new():\n    return 2\n", encoding="utf-8")
+    (repo / "tests" / "unit" / "test_new.py").write_text("import brain\n\n\ndef test_new_works():\n    assert brain.new() == 2\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "head")
+    real = tmp_path / "real-tmp"
+    real.mkdir()
+    linked = tmp_path / "linked-tmp"
+    linked.symlink_to(real, target_is_directory=True)
+
+    done = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "new_tests_fail_on_base.py"), "--base", base, "--repo", str(repo), "--workers", "1"],
+        cwd=tmp_path,
+        env={**os.environ, "TMPDIR": str(linked), "TEMP": str(linked), "TMP": str(linked), "PYTEST_ADDOPTS": "-qq"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    out = done.stdout
+    assert "CANARY FAILED" not in out, out + done.stderr
+    assert done.returncode == 0, out + done.stderr
+    assert "checked 1: 1 bite, 0 do not, 0 exempt" in out, out
+    assert list(real.iterdir()) == [], "the scratch directory is removed"
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="the check runs on the ubuntu PR job; it uses git worktrees and POSIX paths")
 def test_the_script_refuses_to_pass_when_collection_itself_fails(tmp_path: Path) -> None:
     """A conftest that stops collection must not read as "no tests to check" (the silent-green case)."""

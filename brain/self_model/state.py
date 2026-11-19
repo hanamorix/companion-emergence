@@ -13,11 +13,15 @@ gap, the displaced gap MUST survive in gap_history AND a WARN log is emitted.
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from brain.health.json_io import read_json_result, write_json
-from brain.self_model.gap import Gap
+from brain.self_model.gap import UNSET, Gap
+from brain.utils.file_lock import locked_within
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -35,7 +39,7 @@ _UNRESOLVED_STATUSES = frozenset({"open", "acknowledged"})
 
 
 def _gap_to_dict(gap: Gap) -> dict:
-    return {
+    out = {
         "per_channel": gap.per_channel,
         "magnitude": gap.magnitude,
         "unnamed_pressure": gap.unnamed_pressure,
@@ -45,10 +49,40 @@ def _gap_to_dict(gap: Gap) -> dict:
         "last_seen_ts": gap.last_seen_ts,
         "sustained_ticks": gap.sustained_ticks,
         "channel_cooldowns": gap.channel_cooldowns,
+        "directions": gap.directions,
     }
+    # A gap that never carried the field stays without the key, so it reads back as UNSET.
+    if gap.reset_seen is not UNSET:
+        out["reset_seen"] = gap.reset_seen
+    return out
+
+
+def _directions_from(value: object) -> dict[str, int]:
+    """`{str: int}` from a saved value; an empty dict for a missing key or a malformed value."""
+    if not isinstance(value, dict):
+        return {}
+    try:
+        return {str(k): int(v) for k, v in value.items()}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _non_finite(value: object) -> bool:
+    """True when a JSON value holds NaN or ±Infinity anywhere (json.loads accepts them; old saves could write them)."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_non_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_non_finite(v) for v in value)
+    return False
 
 
 def _gap_from_dict(d: dict) -> Gap:
+    # A NaN never equals itself, so a gap holding one never matches its own re-load (the tick's snapshot check,
+    # #558) and cannot be saved (write_json refuses NaN): it is malformed.
+    if _non_finite(d):
+        raise ValueError("a non-finite number (NaN or Infinity)")
     return Gap(
         per_channel=d.get("per_channel") or {},
         magnitude=float(d.get("magnitude", 0.0)),
@@ -59,6 +93,8 @@ def _gap_from_dict(d: dict) -> Gap:
         last_seen_ts=d.get("last_seen_ts"),
         sustained_ticks=int(d.get("sustained_ticks", 0)),
         channel_cooldowns=d.get("channel_cooldowns") or {},
+        directions=_directions_from(d.get("directions")),
+        reset_seen=d["reset_seen"] if "reset_seen" in d else UNSET,
     )
 
 
@@ -92,6 +128,9 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
     - Missing file  → (fresh state, False)   — normal first-run
     - Corrupt JSON  → (fresh state, True)    — R-state recovery
     - Valid file    → (loaded state, False)
+    - Valid file with malformed gaps → (the gaps that parse, True): a bad
+      current_gap loads as None and a bad history entry is left out, so one
+      bad entry no longer costs the whole history (#558).
     """
     path = _state_path(persona_dir)
     # An unreadable, corrupt or non-object file is the module's default (None) and its evidence is logged there.
@@ -102,37 +141,97 @@ def load_or_recover(persona_dir: Path) -> tuple[SelfModelState, bool]:
         return SelfModelState(), True
     raw = res.data
 
-    try:
-        current_gap: Gap | None = None
-        raw_gap = raw.get("current_gap")
-        if raw_gap is not None:
+    problems: list[str] = []
+    current_gap: Gap | None = None
+    raw_gap = raw.get("current_gap")
+    if raw_gap is not None:
+        try:
             current_gap = _gap_from_dict(raw_gap)
+        except Exception as exc:  # noqa: BLE001 -- a malformed current gap loads as None
+            problems.append(f"dropped a malformed current_gap ({exc})")
 
-        gap_history: list[Gap] = []
-        for item in raw.get("gap_history") or []:
+    gap_history: list[Gap] = []
+    raw_history = raw.get("gap_history") or []
+    if not isinstance(raw_history, list):
+        problems.append(f"dropped gap_history: expected a list, got {type(raw_history).__name__}")
+        raw_history = []
+    bad: list[str] = []
+    for item in raw_history:
+        try:
             gap_history.append(_gap_from_dict(item))
+        except Exception as exc:  # noqa: BLE001 -- a malformed entry is left out, the rest load
+            bad.append(str(exc))
+    if bad:
+        problems.append(f"dropped {len(bad)} of {len(raw_history)} gap_history entries ({'; '.join(bad)})")
 
-        return SelfModelState(current_gap=current_gap, gap_history=gap_history), False
-    except Exception as exc:  # noqa: BLE001 -- any malformed gap starts fresh
-        return _recovered(path, f"malformed gap: {exc}")
+    state = SelfModelState(current_gap=current_gap, gap_history=gap_history)
+    if problems:
+        return _recovered(path, state, "; ".join(problems))
+    return state, False
 
 
-def _recovered(path: Path, why: str) -> tuple[SelfModelState, bool]:
-    """Start fresh, and say so: every caller discards the flag (#367)."""
+def _recovered(path: Path, state: SelfModelState, why: str) -> tuple[SelfModelState, bool]:
+    """Keep what parsed, and say so: every caller discards the flag (#367)."""
     # Callers load this every chat turn until the supervisor saves over it.
     warn_throttled(
         logger, f"self_model_state:{path}",
-        "self-model state %s %s; starting from an empty gap history", path, why,
+        "self-model state %s: %s; kept %d gap_history entries", path, why, len(state.gap_history),
+        exc_info=False,
     )
-    return SelfModelState(), True
+    return state, True
 
 
-def save(persona_dir: Path, state: SelfModelState) -> None:
-    """Atomically persist state via write_json."""
-    payload = {
+@contextmanager
+def locked(persona_dir: Path) -> Iterator[None]:
+    """Hold the state file's cross-process lock for a whole load → change → save (#558).
+
+    Every writer takes it around its read-modify-write: the reconcile tool, the supervisor tick (around a re-load
+    that checks its snapshot still holds, and its save) and the one-time repair. Readers that only render it (the
+    chat prompt, tool recruitment) do not: ``save`` replaces the file atomically. Not re-entrant: never load-and-save
+    under it through a helper that takes it again.
+
+    The wait is bounded by ``dev_constants.SELF_MODEL_LOCK_WAIT_S``: a holder stalled inside its save (a hung disk)
+    must not hang a chat turn's reconcile. When another holder keeps the lock for the whole wait this raises
+    :class:`brain.utils.file_lock.LockTimeoutError` and the body never runs; each caller handles that.
+    """
+    from brain import dev_constants
+
+    with locked_within(_state_path(persona_dir), dev_constants.SELF_MODEL_LOCK_WAIT_S):
+        yield
+
+
+# The one-time windowed-peak repair's own record of having cleared the gap (#752): a top-level key in this file, set
+# by the same save that clears it, so the clear and its record can't come apart. It isn't part of SelfModelState, so no
+# writer has to carry it: `save` keeps it once it is on disk. Additive: an older brain ignores it.
+_CLEARED_KEY = "windowed_peak_cleared"
+
+
+def _cleared_on_disk(persona_dir: Path) -> bool:
+    # The same read as `load_or_recover`, so it adds no new side effect.
+    res = read_json_result(_state_path(persona_dir), default=lambda: None, expect=dict)
+    return res.outcome == "ok" and isinstance(res.data, dict) and res.data.get(_CLEARED_KEY) is True
+
+
+def windowed_peak_cleared(persona_dir: Path) -> bool:
+    """True when the state file records that the windowed-peak repair cleared its gap (#752).
+
+    A missing, unreadable or non-object file, or any value other than ``true``, is False.
+    """
+    return _cleared_on_disk(persona_dir)
+
+
+def save(persona_dir: Path, state: SelfModelState, *, windowed_peak_cleared: bool = False) -> None:
+    """Atomically persist state via write_json.
+
+    ``windowed_peak_cleared`` is passed only by the one-time repair (#752). The key is written when it is True or the
+    file on disk already holds it, and never written False, so a writer that builds its state from scratch keeps it.
+    """
+    payload: dict = {
         "current_gap": _gap_to_dict(state.current_gap) if state.current_gap is not None else None,
         "gap_history": [_gap_to_dict(g) for g in state.gap_history],
     }
+    if windowed_peak_cleared or _cleared_on_disk(persona_dir):
+        payload[_CLEARED_KEY] = True
     write_json(_state_path(persona_dir), payload, backups=3)
 
 

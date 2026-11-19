@@ -770,7 +770,14 @@ def test_ratchet_counts_findings_by_identity_without_line_numbers() -> None:
 
 # Violations that exist today: (rule, file, site, settings, reason). It is meant to shrink (see the module docstring).
 _IMAGE_TYPES = ("tunables:files.image_types",)
-_UPLOAD_CAPS = ("tunables:files.image_max_bytes", "tunables:files.pdf_max_bytes", "tunables:files.upload_max_bytes")
+# files.read_max_bytes joined these in #590: the text cap was sized to match the upload cap (equal value, so the scan
+# names it too; the ChatPanel literal below is still a copy of the upload cap, not of the text cap).
+_UPLOAD_CAPS = (
+    "tunables:files.image_max_bytes",
+    "tunables:files.pdf_max_bytes",
+    "tunables:files.read_max_bytes",
+    "tunables:files.upload_max_bytes",
+)
 ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
     # The four kinds of image written out beside files.image_types. Different purpose, decided from the code in #531: the
     # setting says which images the read_file tool opens and can only narrow the set (the byte sniff recognises exactly these

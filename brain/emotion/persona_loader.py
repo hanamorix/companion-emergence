@@ -39,6 +39,7 @@ def load_persona_vocabulary_with_anomaly(
     path: Path,
     *,
     store: MemoryStore | None = None,
+    read_only: bool = False,
 ) -> tuple[int, BrainAnomaly | None]:
     """Load persona vocabulary with self-healing from .bak rotation if corrupt.
 
@@ -48,6 +49,8 @@ def load_persona_vocabulary_with_anomaly(
         empty default. Anomaly set.
       - Healthy file → counts of newly registered emotions, no anomaly.
     """
+    if read_only and store is not None:
+        raise ValueError("read_only takes no store: the store's rebuild and heal both write")
     if not path.exists():
         if store is not None:
             # Recover-dropped-vocab self-heal: `nell recover` backs up only
@@ -79,7 +82,8 @@ def load_persona_vocabulary_with_anomaly(
                 return registered, None
         return 0, None
 
-    _res = read_json_result(path, default=_default_vocab_factory, recover=Recovery.HEAL, validate=_vocab_schema_validator)
+    recover = Recovery.RAISE if read_only else Recovery.HEAL
+    _res = read_json_result(path, default=_default_vocab_factory, recover=recover, validate=_vocab_schema_validator)
     data, anomaly = _res.data, _res.anomaly
 
     # Reconstruct from memories when reset_to_default fires on vocabulary.
@@ -132,6 +136,7 @@ def load_persona_vocabulary(
     path: Path,
     *,
     store: MemoryStore | None = None,
+    read_only: bool = False,
 ) -> int:
     """Load persona vocabulary from JSON file and register each entry.
 
@@ -147,8 +152,11 @@ def load_persona_vocabulary(
     If `store` is provided, after registration the loader heals any emotion
     names referenced in memories but absent from the vocabulary — registering
     each as a persona_extension and persisting — rather than warning.
+
+    `read_only=True` writes nothing and takes no `store` (ValueError): a corrupt file raises `JsonFileError` instead of being
+    quarantined and reset, so a process that cannot rebuild from memories leaves the repair to one that can.
     """
-    count, _anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
+    count, _anomaly = load_persona_vocabulary_with_anomaly(path, store=store, read_only=read_only)
     return count
 
 

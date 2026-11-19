@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -147,7 +148,7 @@ def _load_vocab() -> frozenset[str]:
 
 
 def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
-    """Keep only registered names with intensity in (0, 10]; clamp to 10."""
+    """Keep only registered names with a finite intensity above 0; clamp to 10. NaN and inf are dropped."""
     result: dict[str, float] = {}
     for name, intensity in raw.items():
         if vocab and name not in vocab:
@@ -156,7 +157,7 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
             v = float(intensity)
         except (TypeError, ValueError):
             continue
-        if v <= 0.0:
+        if not math.isfinite(v) or v <= 0.0:
             continue
         result[name] = min(v, 10.0)
     return result

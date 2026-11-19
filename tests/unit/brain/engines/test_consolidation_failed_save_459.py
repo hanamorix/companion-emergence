@@ -326,10 +326,10 @@ def test_a_pass1_probe_environment_failure_requeues_and_nothing_is_lost(persona,
     _enqueue(queue, A, B, C)
     real = cons._has_exact_existing
 
-    def probe(store_, content, norm):
+    def probe(store_, content, norm, *, memory_types):
         if content == B:
             raise sqlite3.OperationalError("database is locked")
-        return real(store_, content, norm)
+        return real(store_, content, norm, memory_types=memory_types)
 
     monkeypatch.setattr(cons, "_has_exact_existing", probe)
     _run(tmp, store, heb, Clf())
@@ -347,10 +347,10 @@ def test_a_pass1_probe_item_failure_is_quarantined_and_the_others_continue(perso
     _enqueue(queue, A, B, C)
     real = cons._has_exact_existing
 
-    def probe(store_, content, norm):
+    def probe(store_, content, norm, *, memory_types):
         if content == B:
             raise sqlite3.IntegrityError("constraint")
-        return real(store_, content, norm)
+        return real(store_, content, norm, memory_types=memory_types)
 
     monkeypatch.setattr(cons, "_has_exact_existing", probe)
     _run(tmp, store, heb, Clf())

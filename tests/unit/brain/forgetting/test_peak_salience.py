@@ -31,7 +31,7 @@ def _fts(rate_one_hours: float = 24 * 200) -> FeltTimeState:
 
 
 def _emotion_term(mem: Memory) -> float:
-    blended = max(_emotion_input(mem), _peak_input(mem, _fts()))
+    blended = max(_emotion_input(mem, None), _peak_input(mem, _fts()))
     return DEFAULT_WEIGHTS["emotion"] * blended
 
 
@@ -50,7 +50,7 @@ def test_peak5_reaches_lose_within_six_months():
 def test_blend_takes_living_feeling_when_hotter():
     """A still-hot current emotion dominates a modest peak — max, not sum."""
     mem = _mem(peak=2.0, days_old=0, emotions={"joy": 9.0})
-    assert max(_emotion_input(mem), _peak_input(mem, _fts())) == _emotion_input(mem)
+    assert max(_emotion_input(mem, None), _peak_input(mem, _fts())) == _emotion_input(mem, None)
 
 
 def test_peak_zero_contributes_nothing():
@@ -60,7 +60,7 @@ def test_peak_zero_contributes_nothing():
 def test_peak_survives_empty_emotions():
     """The live failure shape: emotions dict noise-floor-emptied, peak intact."""
     mem = _mem(peak=5.0, days_old=7, emotions={})
-    assert _emotion_input(mem) == 0.0
+    assert _emotion_input(mem, None) == 0.0
     assert _peak_input(mem, _fts()) > 0.0
 
 

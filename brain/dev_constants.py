@@ -126,9 +126,40 @@ EMOTION_LOCK_WAIT_S: float = 5.0
 # The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"
-EMOTION_PENDING_FILENAME: str = "emotion_pending.json"
-EMOTION_SWITCH_FILENAME: str = "emotion_switch.json"
+EMOTION_PENDING_FILENAME: str = "emotion_pending.jsonl"
 EMOTION_CHANGES_DIRNAME: str = "emotion_changes"
+# The progress record of a start-up step that can take long (the x10 fix, the first rebuild; HR5 of #633). It lives in the
+# PERSONA directory beside `bridge.json` and the bridge's watcher files, not under `state/`, and is outside the engine lock.
+ENGINE_PROGRESS_FILENAME: str = "engine_progress.json"
+# The record of a switch-over that did not complete (Hana's 11-18 review of #633, point 5): why, per persona, while the persona is NOT switched
+# over. It lives in the PERSONA directory beside `engine_progress.json` (not under `state/`), is outside the engine lock, and is read into
+# `/persona/state` (`engine_files.settle_rebuild_notice`, `read_rebuild_notice`).
+REBUILD_NOTICE_FILENAME: str = "rebuild_notice.json"
+# The run records of commands (HS3 of #633): one `<pid>.json` per command process that touches the engine, in this folder of
+# the PERSONA directory, written at the command's start and removed at its exit, so a start can find and end a command that
+# runs (`engine_files.register_command_run`, `live_command_runs`, `kill.kill_command`).
+COMMAND_RUNS_DIRNAME: str = "command_runs"
+
+# --- the one-time x10 fix of small feelings (emotion rework, Engine 6, #584) ------------------------------------------
+# Three memory types hold feelings stored below 1, not on the 0-10 scale: reach-outs and notes (`initiate_outbound`, small
+# constants such as 0.15 and 0.12), makings (`making`, small constants such as 0.12) and peer memories (`kindled_peer`, a
+# model's deltas scaled so a peer's total stays within `KINDLED_LINK_PEER_EMOTION_WINDOW_CAP`). At the engine's first start
+# the one-time fix (`brain/emotion/nudge_scale_fix.py`) multiplies the feelings, the score and the
+# peak of those rows by the factor, but only for a row whose stored peak and every stored feeling are below the threshold (a
+# row with any value of 1 or more is not multiplied; a negative value is held to 0.0 first). It also multiplies the `making`
+# candidates still waiting in the pending queue the same way. No row or candidate carries a marker: the fix's progress is one
+# number in `memories.db`'s `PRAGMA user_version` (rows done, then queue step started), so a start-up that fails part way
+# and is run again never multiplies twice. The list comes from a survey of every
+# writer of feelings in `brain/`; `tests/unit/brain/emotion/test_nudge_scale_types.py` drives each known writer against it.
+# They are separate named constants on purpose: the factor is the scale change itself, not the engine's value cap
+# (`EMOTION_VALUE_CAP`); "below 1" is the owner's rule for what counts as a small row; the two progress numbers are a stored
+# format of the one-time fix (the fix's progress note in `memories.db`'s `PRAGMA user_version`: nothing else uses it there).
+# None is a tunable. They go with `nudge_scale_fix.py` when #388 removes it.
+NUDGE_SCALE_FIX_MEMORY_TYPES: tuple[str, ...] = ("initiate_outbound", "kindled_peer", "making")
+NUDGE_SCALE_FIX_FACTOR: float = 10.0
+NUDGE_SCALE_FIX_THRESHOLD: float = 1.0
+NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE: int = 1
+NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED: int = 2
 
 # --- sqlite store integrity-check transient-error retry (C16 Windows CI
 # flake, INC-10 follow-up, ram-spike-fix; generalized from MemoryStore-only
@@ -167,17 +198,6 @@ SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S: float = 0.1
 # own result, not this gate. Read by `brain.memory.judge_selftune` where the
 # weekly tick applies it.
 JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS: int = 200
-
-# --- heartbeat decay batch time budget (S24, S45, S47) ---------------------
-# Caps how long a single heartbeat decay batch (one `memories.db` write
-# transaction, `HeartbeatEngine._apply_emotion_decay`) may run before it
-# commits and the heartbeat saves its resume cursor, so a decay pass over a
-# large corpus never holds the write lock for longer than about this many
-# seconds at a stretch (S48/S58's busy-timeout sizing assumes this bound).
-# Checked after each row, not each batch (S45). ~2,500 rows/batch at the
-# measured 0.4 ms/row in-txn rate (2-plan.md §5.2, F-bob20k). A batch may
-# also end earlier if the rows run out.
-HEARTBEAT_DECAY_BATCH_BUDGET_S: float = 1.0
 
 # --- pass-2 `--no-bridge` exit-drain time budget (S80) ---------------------
 # Caps how long `nell chat --no-bridge`'s exit-drain (pass2_queue.py's
@@ -231,6 +251,12 @@ RERANK_MIN_REAL_CANDIDATES: int = 5
 MONOLOGUE_FAMILY_TYPES: frozenset[str] = frozenset(
     {"monologue", "monologue_trace", "monologue_emotion", "monologue_soul_candidate"}
 )
+
+# --- same-type merges (#619) ---------------------------------------------------
+# The memory types that count as ONE type when the temp gate or the dedup sweep decides whether two memories may merge
+# (owner S10: "a subset of the same category"). Not `MONOLOGUE_FAMILY_TYPES`: that set also holds `monologue_emotion`, which
+# does not merge with these. See `brain.engines.consolidation.merge_type`.
+MONOLOGUE_MERGE_TYPES: frozenset[str] = frozenset({"monologue", "monologue_trace", "monologue_soul_candidate"})
 
 # --- recall result order (name-recall fix, spec §4, S97, S98) ---------------
 # The order of the six result groups of a recall (passive recall and the
@@ -325,6 +351,15 @@ OVERLAY_RENAME_SLEEP_S: float = 0.11
 SETTINGS_FILE_LOCK_WAIT_S: float = 3.0
 # How often the bounded wait retries the non-blocking lock attempt. A poll costs one open and one flock call.
 SETTINGS_FILE_LOCK_POLL_S: float = 0.02
+
+# --- self-model state lock wait (#558) ----------------------------------------
+# How long a writer of <persona>/self_model_state.json (the reconcile tool, the supervisor's self-model tick, the
+# start-up repair) waits for the file's lock before it gives up and writes nothing (`brain.self_model.state.locked`).
+# Each holder does what a tunables holder does under its lock: one read and one atomic write of a small JSON file, with
+# nothing slow in between (the tick's articulate call and resolution path run outside it). So the bound derived above
+# holds unchanged: R_read + 2 * R_replace = 2.95 s, set to the same value. A reconcile runs inside a chat turn, so
+# the wait must stay a few seconds at most.
+SELF_MODEL_LOCK_WAIT_S: float = SETTINGS_FILE_LOCK_WAIT_S
 
 # --- embedding backfill scan cap (moved here, #531) --------------------------
 # Bounds how many candidate rows are even *examined* (read from `memories`)
@@ -444,3 +479,31 @@ KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
 # per poll PER PEER. Excess is left un-acked on the relay and surfaced as a
 # degraded state; bounds local decrypt/provider work against a flooding peer.
 KINDLED_LINK_INBOUND_FLOOD_CAP = 20
+
+# --- emotion readers (B2 phase B) ----------------------------------------------
+# The prompt's mood summary (`brain.chat.prompt._build_emotion_summary`) lists this many feelings by long average,
+# highest first; None lists them all. Read at use time, inside the function.
+EMOTION_SUMMARY_COUNT: int | None = 3
+# How each listed feeling is written: "long" (name:L), "long_short" (name:L/S) or "long_difference" (name:L(D), D signed).
+EMOTION_SUMMARY_MODE: str = "long"
+# The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
+# by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
+SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
+
+# A feeling counts as high (`engine.feels_high`, the one predicate the readers that used to fire on a fixed level call) when
+# its short average today is at or above `lowest + FEELS_HIGH_RANGE_FRACTION * (highest - lowest)`, taken over that feeling's
+# daily short averages in the 30-day snapshot (the shift reading, when it reads stronger, makes it high whatever its range), and either
+# way only at or above the floor in the next constant. Owner-set, 2026-11-04: "upper half of the range". Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_RANGE_FRACTION: float = 0.5
+# A feeling whose short average is below this level (0 to 10 scale) is never high, whatever its range or its shift: a feeling
+# that sits near zero all month has a tiny range, and without a floor its top half would count as "high" (a vulnerability at
+# 0.02 started a self-check). The maintainer set 1.0 on 2026-11-10 (#674) from `scripts/measure_feels_high_thresholds.py`, run on the
+# synthetic database and on a copy of one real persona: there, firings sit below 0.5 or at 1 and above, so any value from 0.5 to
+# 1 gives the same answer, and "high" under 1 in 10 would not be honest. 0.1 still let the research gate open on feelings from
+# 0.1 to 0.5, which the plateau rule does not count. The follow-up that makes the floor self-calibrating for a mature kindled
+# is #661. Read at call time, inside `engine_utils.feels_high_from`.
+FEELS_HIGH_FLOOR: float = 1.0
+# Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
+# `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
+# replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
+BODY_ENERGY_HIGH_COUNT: int = 6

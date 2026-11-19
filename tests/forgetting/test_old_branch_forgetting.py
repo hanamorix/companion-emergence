@@ -27,7 +27,7 @@ def test_emotion_input_is_the_stored_peak_over_ten():
         content="a stored memory", memory_type="episodic", domain="us", emotions={"joy": 7.2, "love": 9.0}
     )
 
-    assert _emotion_input(memory) == pytest.approx(0.9)
+    assert _emotion_input(memory, None) == pytest.approx(0.9)
 
 
 @pytest.mark.no_base_failure(

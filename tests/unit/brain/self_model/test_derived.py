@@ -101,3 +101,11 @@ def test_diverse_channels_no_dilution_artifact():
     long = compute_baseline(mems, now=NOW)
     gap = compute_gap(short, long)
     assert gap.magnitude < 3.0, f"dilution artifact present: magnitude={gap.magnitude:.1f}"
+
+
+def test_compute_unnamed_pressure_is_public_and_fires_only_for_an_extreme_body_with_no_low_arousal_channel():
+    """B2 phase B renamed it from `_compute_unnamed_pressure`: the live tick calls it with the engine's short averages."""
+    from brain.self_model.derived import compute_unnamed_pressure
+
+    assert compute_unnamed_pressure({"joy": 4.0}, body_energy=8, body_exhaustion=0) == 0.0
+    assert compute_unnamed_pressure({"joy": 4.0}, body_energy=1, body_exhaustion=8) > 0.0

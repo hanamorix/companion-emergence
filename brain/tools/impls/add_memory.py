@@ -68,15 +68,17 @@ def add_memory(
         importance=float(effective_importance),
         metadata={"tags": tags, "importance": effective_importance},
     )
+    # She reaches this memory at the moment she makes it (emotion rework, Hana half, Task 6).
+    memory.last_accessed_at = memory.created_at
     store.create(memory)
 
-    # Body event hook: when an LLM-tagged memory commits with climax >= 7,
-    # auto-write a private journal_entry referencing this originating memory.
-    # Fail-soft inside record_climax_event — never affects the add_memory
-    # return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
-    if memory.emotions.get("climax", 0.0) >= 7.0:
-        from brain.body.events import record_climax_event
+    # Body event hook: when an LLM-tagged memory commits with climax at or above
+    # CLIMAX_THRESHOLD, auto-write a private journal_entry referencing this
+    # originating memory. Fail-soft inside record_climax_event — never affects the
+    # add_memory return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
+    from brain.body.events import CLIMAX_THRESHOLD, record_climax_event
 
+    if memory.emotions.get("climax", 0.0) >= CLIMAX_THRESHOLD:
         record_climax_event(
             originating_memory=memory,
             store=store,
@@ -100,7 +102,8 @@ def add_memory(
         for kw in keywords:
             if len(related_ids) >= 3:
                 break
-            hits = store.search_text(kw, active_only=True, limit=4)
+            # bump=False: finding memories to link is not recalling them, this new one included.
+            hits = store.search_text(kw, active_only=True, limit=4, bump=False)
             for rel in hits:
                 if rel.id in seen_ids:
                     continue

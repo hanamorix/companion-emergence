@@ -6,6 +6,8 @@ import json
 import logging
 from pathlib import Path
 
+import pytest
+
 from brain.emotion import vocabulary
 from brain.emotion.persona_loader import (
     load_persona_vocabulary,
@@ -289,3 +291,15 @@ def test_missing_file_with_store_reconstructs_referenced_emotion(tmp_path: Path,
     finally:
         store.close()
         _cleanup_emotion("body_grief")
+
+
+def test_read_only_with_a_store_is_refused(tmp_path: Path):
+    """A store turns on the missing-file rebuild and the referenced-name heal, both of which write, so it contradicts
+    read_only (#691)."""
+    store = MemoryStore(db_path=tmp_path / "memories.db")
+    try:
+        with pytest.raises(ValueError, match="read_only"):
+            load_persona_vocabulary(tmp_path / "emotion_vocabulary.json", store=store, read_only=True)
+    finally:
+        store.close()
+    assert not (tmp_path / "emotion_vocabulary.json").exists()

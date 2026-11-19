@@ -27,3 +27,11 @@ def test_denied_path_is_gitignored(path: str) -> None:
         ["git", "check-ignore", "-q", probe], cwd=_REPO, capture_output=True, text=True
     )
     assert result.returncode == 0, f"{path} is in denied-paths.txt but not .gitignore"
+
+
+def test_mcp_config_is_gitignored() -> None:
+    """`.mcp.json` is per-developer config with local paths, and this repo is public."""
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", ".mcp.json"], cwd=_REPO, capture_output=True, text=True
+    )
+    assert result.returncode == 0, ".mcp.json must stay gitignored and untracked"

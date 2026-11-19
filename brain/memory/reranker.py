@@ -81,6 +81,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _platform() -> str:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662, #710)."""
+    return sys.platform
+
+
 def _detect_avx2() -> bool:
     """Best-effort startup AVX2 capability check (F2a inc3, #250 §3).
 
@@ -101,7 +106,7 @@ def _detect_avx2() -> bool:
     baseline honest). Fail-soft throughout: this must never raise into
     startup.
     """
-    if sys.platform != "linux":
+    if _platform() != "linux":
         return False
     try:
         with open("/proc/cpuinfo", encoding="utf-8") as f:
@@ -2369,7 +2374,7 @@ def _cgroup_v2_memory_headroom_bytes() -> float | None:
     capped: no cap anywhere -> no need to even read usage; a different cause from a capped level
     that cannot be measured, which gives 0.0). `None` means "the caller falls back to the next source" (cgroup v1, then
     psutil's host-wide available figure), never "unlimited"."""
-    if sys.platform != "linux":
+    if _platform() != "linux":
         return None
     cgroup_path = _read_proc_self_cgroup_v2_path()
     if cgroup_path is None:
@@ -2484,7 +2489,7 @@ def _cgroup_v1_memory_headroom_bytes() -> float | None:
     be used has headroom 0, as in the v2 reader (S240). `None` on no v1 controller, no level
     known to be capped on the walked chain - the same "caller falls back" signal as every other
     case here, never a fabricated headroom."""
-    if sys.platform != "linux":
+    if _platform() != "linux":
         return None
 
     cgroup_path = _read_proc_self_cgroup_v1_memory_path()

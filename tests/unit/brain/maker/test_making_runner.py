@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from brain.maker.making_runner import make_and_wire
 from brain.memory.store import MemoryStore
 from brain.works.store import WorksStore
@@ -79,3 +81,83 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     # discard moves nothing — empty-emotion act-memory only
     assert not mems[0].emotions
     store2.close()
+
+
+def test_make_and_wire_gives_a_baseline_persona_pride_for_satisfaction(tmp_path):
+    """#720: through the real path, a persona without "satisfaction" feels pride from a making, not nothing."""
+    from brain.emotion import vocabulary
+    from brain.maker.charge import MakerCharge, save_charge
+
+    assert vocabulary.get("satisfaction") is None
+    store = MemoryStore(tmp_path / "memories.db")
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        [made] = store2.list_by_type("making", limit=10)
+    finally:
+        store2.close()
+    assert made.emotions == {"pride": 0.12, "tenderness": 0.08}
+
+
+def test_make_and_wire_applies_the_accent_of_what_built_the_charge(tmp_path):
+    """#721: a dream-built charge gives the dream accent (wonder, which a baseline persona feels as awe, #720)."""
+    import pytest
+
+    from brain.emotion import vocabulary
+    from brain.maker.charge import MakerCharge, save_charge
+
+    assert vocabulary.get("wonder") is None
+    store = MemoryStore(tmp_path / "memories.db")
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0, emotion_part=9.0, soul_part=0.0, dream_part=90.0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        [made] = store2.list_by_type("making", limit=10)
+    finally:
+        store2.close()
+    assert made.emotions == pytest.approx({"pride": 0.12, "tenderness": 0.08, "awe": 0.10})
+
+
+# ---- emotion rework B1 PR 3: the making nudge is on the 0-10 scale once the engine is live ----
+
+
+def _go_live(persona_dir, store):
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
+    from datetime import UTC, datetime
+
+    from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+
+
+def _made_emotions(tmp_path, *, live):
+    from brain.maker.charge import MakerCharge, save_charge
+
+    store = MemoryStore(tmp_path / "memories.db")
+    if live:
+        _go_live(tmp_path, store)
+    save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
+    make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
+    store.close()
+    _promote_pending(tmp_path)
+    store2 = MemoryStore(tmp_path / "memories.db")
+    try:
+        return store2.list_by_type("making", limit=10)[0].emotions
+    finally:
+        store2.close()
+
+
+def test_make_and_wire_stores_the_nudge_ten_times_when_live(tmp_path):
+    # A baseline persona feels pride for satisfaction (#720), so both names reach her at ten times the old values.
+    assert _made_emotions(tmp_path, live=True) == pytest.approx({"pride": 1.2, "tenderness": 0.8})
+
+
+def test_make_and_wire_keeps_todays_nudge_when_off(tmp_path):
+    assert _made_emotions(tmp_path, live=False) == pytest.approx({"pride": 0.12, "tenderness": 0.08})

@@ -275,8 +275,8 @@ def test_group_d_writers_roundtrip_and_leave_no_temp(tmp_path: Path) -> None:
     assert pass2_queue._load_queue_unlocked(pd) == [{"id": "x"}]
     reflection_gate._atomic_write(pd, {"k": {"last_reflection_ts": "t"}})
     assert reflection_gate._load(pd) == {"k": {"last_reflection_ts": "t"}}
-    _save_cursor(pd, "model-1", ("2026-01-01T00:00:00", "id1"))
-    assert _load_cursor(pd, "model-1") == ("2026-01-01T00:00:00", "id1")
+    _save_cursor(pd, "model-1", 42)
+    assert _load_cursor(pd, "model-1") == 42
     assert _load_cursor(pd, "model-2") is None  # a model swap resets the cursor
     articulate._save_budget(pd, {"date": "d", "count": 1})
     assert articulate._load_budget(pd) == {"date": "d", "count": 1}

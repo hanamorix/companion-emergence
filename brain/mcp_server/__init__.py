@@ -15,6 +15,7 @@ Spec: docs/superpowers/specs/2026-04-27-mcp-config-path-for-brain-tools-design.m
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from mcp.server import Server
@@ -25,6 +26,8 @@ from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 
 __all__ = ["run_server", "register_tools"]
+
+logger = logging.getLogger(__name__)
 
 
 def run_server(persona_dir: Path, *, tool_prefix: str = "") -> None:
@@ -38,6 +41,7 @@ def run_server(persona_dir: Path, *, tool_prefix: str = "") -> None:
 
 
 async def _run(persona_dir: Path, tool_prefix: str = "") -> None:
+    _load_vocabulary(persona_dir)
     server = Server("brain-tools")
     store = MemoryStore(db_path=persona_dir / "memories.db")
     hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
@@ -56,3 +60,19 @@ async def _run(persona_dir: Path, tool_prefix: str = "") -> None:
             hebbian.close()
         finally:
             store.close()
+
+
+def _load_vocabulary(persona_dir: Path) -> None:
+    """Register the persona's own emotion names in this process before any tool runs (#689).
+
+    The brain tools (record_monologue, add_memory, the emotion reads) run in this per-turn process, and the registry is
+    per process; without this every name outside the baseline is unknown here. Read-only: nothing is written on a
+    turn's path, and a corrupt file is left as it is (logged, baseline names only) for the bridge's start-up load to
+    repair, since that load has the store and rebuilds from memories. Fail-soft: the tools must still serve.
+    """
+    try:
+        from brain.emotion.persona_loader import load_persona_vocabulary
+
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+    except Exception:  # noqa: BLE001
+        logger.warning("mcp server: could not load the persona vocabulary; tools see only the baseline names", exc_info=True)

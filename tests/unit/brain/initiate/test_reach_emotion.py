@@ -37,3 +37,12 @@ def test_all_channels_are_registered():
     ):
         for name in reach_emotions_for(src):
             assert vocab_get(name) is not None, f"{name} not registered"
+
+
+# ---- emotion rework B1 PR 3: on the 0-10 scale once the engine is live ----
+
+
+def test_reach_emotions_live_are_ten_times():
+    import pytest
+
+    assert reach_emotions_for("dream", live=True) == pytest.approx({"tenderness": 1.5, "vulnerability": 1.0})

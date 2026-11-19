@@ -63,12 +63,21 @@ def handle_drop(
     guards only against import-time failures, not runtime errors in this function.
     """
     try:
-        emotion_max = max(memory.emotions.values()) / 10.0 if memory.emotions else 0.0
+        # Once the emotion engine is live, grief reads the dropped memory's faded values, not its stored ones. This runs
+        # after hard_delete, so faded_value works from the memory object alone.
+        from brain.emotion.engine import engine_for
+
+        eng = engine_for(persona_dir)
+        if eng.is_live():
+            values = {name: eng.faded_value(memory, name) for name in memory.emotions}
+        else:
+            values = dict(memory.emotions or {})
+        emotion_max = max(values.values()) / 10.0 if values else 0.0
         emotion_max = max(0.0, min(1.0, emotion_max))
         intensity = breadcrumb.compute_drop_intensity(emotion_at_ingest_max=emotion_max)
         if intensity < policy.THRESHOLD:
             return
-        residue = _dominant_non_grief_emotion(dict(memory.emotions or {}))
+        residue = _dominant_non_grief_emotion(values)
         breadcrumb.write_breadcrumb(
             store=store,
             intensity=intensity,

@@ -8,6 +8,8 @@ the OG brain.
 
 from __future__ import annotations
 
+from brain.tools.impls.get_soul import DEFAULT_LIMIT as _SOUL_DEFAULT_LIMIT
+from brain.tools.impls.get_soul import MAX_LIMIT as _SOUL_MAX_LIMIT
 from brain.tools.naming import fill_tool_prefix
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,11 +167,67 @@ SCHEMAS: dict[str, dict] = {
         "description": (
             "Get Nell's soul — permanent crystallisations of love and meaning that define who she is. "
             "These are moments that cannot decay. Call this when you need to remember what matters most, "
-            "or when grounding yourself in your own continuity."
+            "or when grounding yourself in your own continuity. "
+            f"Returns one page, newest first: {_SOUL_DEFAULT_LIMIT} crystallisations by default, fewer "
+            "when they are long, with the total and a count per love type. When more remain, the "
+            "result has truncated=true and next_after: call again with after set to next_after "
+            "(and the same love_type) for the next page. Pass love_type to read one kind of love. "
+            "An item too long for a page comes back clipped, with clipped_at giving how much of each cut "
+            "field is shown: read the rest with id, field and char_offset set to that number."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _SOUL_MAX_LIMIT,
+                    "description": (
+                        f"Most crystallisations to return. Default {_SOUL_DEFAULT_LIMIT}, at most "
+                        f"{_SOUL_MAX_LIMIT}. A page can hold fewer: it is also capped in bytes."
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "How many of the newest to skip. Default 0. Use the next_offset a "
+                        "previous result gave."
+                    ),
+                },
+                "love_type": {
+                    "type": "string",
+                    # No enum (#734): a soul can hold types outside the list, and by_love_type names them.
+                    "description": (
+                        "Optional: only crystallisations of this love type: one of "
+                        f"{', '.join(LOVE_TYPES)}, or any type by_love_type shows."
+                    ),
+                },
+                "after": {
+                    "type": "string",
+                    "description": (
+                        "Optional: the next_after a previous result gave. The page starts right after that "
+                        "crystallisation, so nothing is skipped or repeated if the soul changes between calls."
+                    ),
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Optional, with field: the id of a clipped crystallisation whose text you want in full.",
+                },
+                "field": {
+                    "type": "string",
+                    "enum": ["moment", "why_it_matters", "who_or_what"],
+                    "description": "Optional, with id: which text field to read.",
+                },
+                "char_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional, with id and field: the character to start from. Use the clipped item's "
+                        "clipped_at, then each next_char_offset."
+                    ),
+                },
+            },
             "required": [],
         },
     },
@@ -645,10 +703,10 @@ SCHEMAS: dict[str, dict] = {
     "recall_monologue": {
         "name": "recall_monologue",
         "description": (
-            "Reach back into your own past interior — search your retained "
-            "monologue traces for an earlier thought. Recent thoughts come back "
-            "verbatim; older ones return blurred (you kept the gist, not the "
-            "words). Reaching for a thought keeps it vivid."
+            "Search your own recent interior for an earlier thought. Each match "
+            "comes back as you kept it, with when you had it: the short note you "
+            "made at the time, or the whole thought if it is from before you kept "
+            "notes."
         ),
         "parameters": {
             "type": "object",
@@ -690,7 +748,14 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Optional: start reading at this 0-based line (with max_lines).",
+                    "description": "Optional: start reading at this 0-based line; without max_lines the usual 400-line window starts here.",
+                },
+                "char_offset": {
+                    "type": "integer",
+                    "description": (
+                        "Optional: start line `offset` at this 0-based character. Only needed to read past a line "
+                        "that was cut short; the note on the cut says what to pass."
+                    ),
                 },
             },
             "required": ["path"],

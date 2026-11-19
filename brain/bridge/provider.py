@@ -251,7 +251,7 @@ def _claude_work_dir() -> str | None:
         logger.debug("claude work dir selection raised", exc_info=True)
     if not _claude_work_dir_warned:
         _claude_work_dir_warned = True
-        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if sys.platform == "win32" else ""
+        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if _is_windows() else ""
         logger.warning(
             "no memory-free working directory for claude spawns; tried %s — the owner's global "
             "CLAUDE.md may reach the companion%s",
@@ -259,6 +259,11 @@ def _claude_work_dir() -> str | None:
             extra,
         )
     return None
+
+
+def _is_windows() -> bool:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662)."""
+    return sys.platform == "win32"
 
 
 def _claude_work_dir_reset_for_tests() -> None:

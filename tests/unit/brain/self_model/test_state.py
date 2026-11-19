@@ -146,3 +146,194 @@ def test_a_corrupt_state_file_warns_once_not_every_turn(tmp_path, monkeypatch, c
         for _ in range(3):
             load_or_recover(tmp_path)
     assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1
+
+
+# ── B2 phase B: Gap.directions and Gap.reset_seen survive the file ────────────
+
+
+def test_directions_and_reset_seen_survive_save_and_load(tmp_path):
+    from brain.self_model.gap import Gap
+
+    gap = Gap(
+        per_channel={"joy": 1.5, "calm": -0.5},
+        magnitude=2.0,
+        unnamed_pressure=0.0,
+        directions={"joy": 1, "calm": -1},
+        reset_seen="2026-11-04T10:00:00+00:00",
+    )
+    save(tmp_path, SelfModelState(current_gap=gap, gap_history=[gap]))
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered
+    assert loaded.current_gap.directions == {"joy": 1, "calm": -1}
+    assert loaded.current_gap.reset_seen == "2026-11-04T10:00:00+00:00"
+    assert loaded.gap_history[0].directions == {"joy": 1, "calm": -1}
+
+
+def test_a_stored_none_reset_seen_reads_back_as_none_not_unset(tmp_path):
+    from brain.self_model.gap import UNSET, Gap
+
+    gap = Gap(per_channel={}, magnitude=0.0, unnamed_pressure=0.0, reset_seen=None)
+    save(tmp_path, SelfModelState(current_gap=gap))
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.current_gap.reset_seen is None
+    assert loaded.current_gap.reset_seen is not UNSET
+
+
+def test_a_gap_that_never_stored_reset_seen_reads_back_as_unset_and_stays_without_the_key(tmp_path):
+    import json
+
+    from brain.self_model.gap import UNSET, Gap
+
+    gap = Gap(per_channel={"joy": 1.0}, magnitude=1.0, unnamed_pressure=0.0)
+    assert gap.reset_seen is UNSET
+    save(tmp_path, SelfModelState(current_gap=gap))
+    raw = json.loads((tmp_path / "self_model_state.json").read_text(encoding="utf-8"))
+    assert "reset_seen" not in raw["current_gap"]
+    assert raw["current_gap"]["directions"] == {}
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.current_gap.reset_seen is UNSET
+
+
+def test_a_pre_field_gap_history_item_still_loads(tmp_path):
+    import json
+
+    from brain.self_model.gap import UNSET
+
+    old_item = {
+        "per_channel": {"calm": 2.0},
+        "magnitude": 2.0,
+        "unnamed_pressure": 0.0,
+        "status": "resolved",
+    }
+    (tmp_path / "self_model_state.json").write_text(
+        json.dumps({"current_gap": None, "gap_history": [old_item]}), encoding="utf-8"
+    )
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered
+    assert loaded.gap_history[0].directions == {}
+    assert loaded.gap_history[0].reset_seen is UNSET
+
+
+def test_a_malformed_directions_value_loads_as_empty(tmp_path):
+    import json
+
+    item = {"per_channel": {"joy": 1.0}, "magnitude": 1.0, "unnamed_pressure": 0.0, "directions": "up"}
+    (tmp_path / "self_model_state.json").write_text(
+        json.dumps({"current_gap": item, "gap_history": []}), encoding="utf-8"
+    )
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.current_gap.directions == {}
+
+
+# ── #558: one bad history entry must not cost the whole gap history ───────────
+
+
+def _write_raw_state(tmp_path, raw) -> None:
+    import json
+
+    from brain.self_model.state import _state_path
+
+    _state_path(tmp_path).write_text(json.dumps(raw), encoding="utf-8")
+
+
+def _gap_dict(note: str, status: str = "resolved") -> dict:
+    from brain.self_model.gap import Gap
+    from brain.self_model.state import _gap_to_dict
+
+    return _gap_to_dict(Gap(per_channel={"joy": 1.0}, magnitude=1.0, unnamed_pressure=0.0, status=status, note=note))
+
+
+def test_a_malformed_history_entry_drops_only_that_entry_and_says_so(tmp_path, monkeypatch, caplog):
+    """#558: a single malformed gap_history entry used to make load_or_recover return a fresh state, so the next save
+    wiped the whole history. The good entries (and the current gap) load; the bad ones are dropped, reported, and the
+    load is flagged as recovered."""
+    import logging
+
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    _write_raw_state(
+        tmp_path,
+        {
+            "current_gap": _gap_dict("now", status="open"),
+            "gap_history": [_gap_dict("first"), {"magnitude": "lots"}, "not a gap", _gap_dict("second")],
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        state, recovered = load_or_recover(tmp_path)
+
+    assert [g.note for g in state.gap_history] == ["first", "second"]
+    assert state.current_gap is not None and state.current_gap.note == "now"
+    assert recovered is True
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("dropped 2 of 4 gap_history entries" in m for m in messages), messages
+
+
+def test_a_malformed_current_gap_keeps_the_history(tmp_path, monkeypatch, caplog):
+    """#558: a bad current_gap is dropped on its own; the history it sits beside still loads."""
+    import logging
+
+    from brain.utils import log_throttle
+
+    monkeypatch.setattr(log_throttle, "_last", {})
+    _write_raw_state(tmp_path, {"current_gap": {"magnitude": "lots"}, "gap_history": [_gap_dict("kept")]})
+    with caplog.at_level(logging.WARNING, logger="brain.self_model.state"):
+        state, recovered = load_or_recover(tmp_path)
+
+    assert state.current_gap is None
+    assert [g.note for g in state.gap_history] == ["kept"]
+    assert recovered is True
+    assert any("current_gap" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+# ── #752: the repair's "done" flag lives in the state file and survives every save ──
+def _plain_gap():
+    from brain.self_model.gap import Gap
+
+    return Gap(per_channel={"joy": 1.5}, magnitude=1.5, unnamed_pressure=0.0, status="open")
+
+
+def test_the_cleared_flag_survives_a_save_built_from_scratch(tmp_path):
+    from brain.self_model.state import push_gap, windowed_peak_cleared
+
+    save(tmp_path, SelfModelState(), windowed_peak_cleared=True)
+    save(tmp_path, SelfModelState(current_gap=_plain_gap(), gap_history=[]))  # how the supervisor and reconcile write
+    save(tmp_path, push_gap(load_or_recover(tmp_path)[0], _plain_gap()))
+    assert windowed_peak_cleared(tmp_path) is True
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered and loaded.current_gap is not None and len(loaded.gap_history) == 1
+
+
+def test_the_cleared_flag_is_never_written_false(tmp_path):
+    import json
+
+    from brain.self_model.state import _state_path, windowed_peak_cleared
+
+    save(tmp_path, SelfModelState())
+    assert "windowed_peak_cleared" not in json.loads(_state_path(tmp_path).read_text(encoding="utf-8"))
+    assert windowed_peak_cleared(tmp_path) is False
+
+
+import pytest  # noqa: E402 -- the #752 block's parametrize
+
+
+@pytest.mark.parametrize("content", [None, "{not json", "[1, 2]", '{"windowed_peak_cleared": "yes"}'])
+def test_the_cleared_flag_reads_false_for_a_missing_or_bad_file(tmp_path, content):
+    from brain.self_model.state import _state_path, windowed_peak_cleared
+
+    if content is not None:
+        _state_path(tmp_path).write_text(content, encoding="utf-8")
+    assert windowed_peak_cleared(tmp_path) is False
+
+
+@pytest.mark.no_base_failure(reason="pins that a save over a corrupt state file still writes the new state (#752); main does too")
+def test_a_save_over_a_corrupt_file_writes_the_new_state(tmp_path):
+    import json
+
+    from brain.self_model.state import _state_path
+
+    _state_path(tmp_path).write_text("{not json", encoding="utf-8")
+    save(tmp_path, SelfModelState(current_gap=_plain_gap(), gap_history=[]))
+    loaded, recovered = load_or_recover(tmp_path)
+    assert not recovered and loaded.current_gap is not None
+    assert "windowed_peak_cleared" not in json.loads(_state_path(tmp_path).read_text(encoding="utf-8"))

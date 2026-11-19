@@ -27,6 +27,7 @@ import sys
 import textwrap
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ import pytest
 
 from brain import process_identity as pi
 from brain.bridge import daemon, kill, shutdown_progress, state_file
+from tests.unit.brain.emotion._engine_support import make_live
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the fake launchd runs on Linux CI/dev")
 
@@ -176,6 +178,9 @@ def env_pd(tmp_path, monkeypatch):
     pd = home / "personas" / "nell"
     (pd / "active_conversations").mkdir(parents=True)
     (pd / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}', encoding="utf-8")
+    # A real `supervisor run` child (`_start_real`) checks whether the persona needs the rebuild step before it starts the bridge (S107);
+    # a switched persona needs none, so no rebuild child is spawned (the conftest fixture that stops that does not reach a child).
+    make_live(pd, datetime(2030, 1, 1, tzinfo=UTC))
     monkeypatch.setenv("KINDLED_HOME", str(home))
     env = dict(os.environ, KINDLED_HOME=str(home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
     return env, pd

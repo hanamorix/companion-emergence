@@ -182,6 +182,8 @@ The order is random (`pytest-randomly`): the seed is printed in the header and a
 
 The product starts the claude CLI by its bare name. CI has no `claude`, so a test that reaches that spawn unpatched can only fail the spawn, and a test that tolerates the failure passes without testing what it claims (on a machine that has `claude`, it would spend tokens). When `GITHUB_ACTIONS` is set (or `KINDLED_GUARD_CLAUDE=1` locally, to try it), `tests/claude_spawn_guard.py` fails any test without the `requires_claude_cli` marker that starts a `claude` by bare name through `subprocess` (so `run`, `Popen`, `check_output` and asyncio subprocesses), even if the test catches the error. The message says where the spawn came from. Ways out: patch the spawn (a patched `subprocess.Popen` or provider helper is never seen by the guard); put a fake `claude` script under `tmp_path` and spawn it by explicit path, or put its directory first on the `PATH` you pass; or mark the test `@pytest.mark.requires_claude_cli`. Spawns by explicit path are never blocked. Not seen: spawns made by a child process of the test, by module- or session-scoped fixtures, or by a thread that was already running when the test began, and `shell=True`, `os.system` or `os.posix_spawn` spawns.
 
+A plain `pytest` leaves out tests marked `live` or `requires_claude_cli`, because on a machine with `claude` they spend subscription usage. To run them on purpose, pass your own `-m`, which replaces the default: `uv run pytest -m requires_claude_cli <path>`.
+
 ## What Discord is for
 
 Discord is still useful, just not as the source of truth:

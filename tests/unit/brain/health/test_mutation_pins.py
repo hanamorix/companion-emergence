@@ -311,7 +311,7 @@ def test_mut_archive_and_log_appenders_write_a_nan_as_null_instead_of_raising(tm
     from brain.engines import consolidation, dedup_sweep
     from brain.engines.heartbeat import HeartbeatEngine
 
-    consolidation._archive_preimage(tmp_path, _mem_nan(), "s1")
+    consolidation._archive_preimage(tmp_path, _mem_nan(), "s1", "dream")
     dedup_sweep._archive_preimage(tmp_path, _mem_nan())
     rows = [json.loads(line) for line in (tmp_path / "consolidation_archive.jsonl").read_text().splitlines()]
     assert len(rows) == 2 and all(r["target"]["emotions"]["love"] is None for r in rows)

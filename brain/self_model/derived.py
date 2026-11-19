@@ -169,7 +169,7 @@ def compute_derived(
     try:
         now = now or datetime.now(UTC)
         channels = _channel_ema(memories, now=now, half_life_hours=_SHORT_HALF_LIFE_HOURS)
-        unnamed_pressure = _compute_unnamed_pressure(
+        unnamed_pressure = compute_unnamed_pressure(
             channels, body_energy=body_energy, body_exhaustion=body_exhaustion
         )
         return DerivedRead(channels=channels, unnamed_pressure=unnamed_pressure, sources={})
@@ -198,7 +198,7 @@ def compute_baseline(memories: list, *, now: datetime | None = None) -> DerivedR
 # ── internal: unnamed_pressure ───────────────────────────────────────────────
 
 
-def _compute_unnamed_pressure(
+def compute_unnamed_pressure(
     channels: dict[str, float],
     *,
     body_energy: int,

@@ -8,10 +8,12 @@ Best-effort by design: every step is wrapped so a failure is logged to
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
@@ -58,7 +60,11 @@ class CrystallisationCandidate(BaseModel):
 
     theme: str = Field(min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=500)
-    importance: int = Field(ge=1, le=10, default=8)
+    # Required (#640): the old default of 8 sat exactly on DEFAULT_SOUL_THRESHOLD, so an
+    # unscored item was queued as a soul candidate. extract_from_thinking drops and records
+    # an unscored item, and one this model rejects (#733), before validation, so it can't
+    # take the rest of the reply with it.
+    importance: int = Field(ge=1, le=10)
 
     # The extractor LLM occasionally returns a field longer than its cap. Truncate
     # (mode="before", so it runs ahead of the max_length constraint) rather than
@@ -213,6 +219,47 @@ def _build_user_prompt(
     return "\n".join(parts)
 
 
+def _drop_bad_crystallisation(data: dict) -> tuple[int, int]:
+    """Remove the crystallisation items that would fail the reply from ``data`` in place, and
+    return ``(unscored, invalid)``: how many had no ``importance`` (missing or null, #640) and
+    how many ``CrystallisationCandidate`` rejects for any other reason (#733), such as a score
+    of ``0``, ``11`` or ``"high"``, a whitespace-only theme, or an item that isn't an object.
+
+    A bad item is a parse problem, not a soul-worthy one. Dropping it here, per item, keeps the
+    rest of the reply: a whole-reply schema failure would also lose the scored items, memory
+    writes and deltas. The kept items stay as the model sent them, so the whole-reply validation
+    sees what it saw before. A ``crystallisation`` value that isn't a list is left to that
+    validation. The caller records the drop once validation's outcome is known, naming only the
+    counts, never reply text or pydantic's message (which quotes the input, #427)."""
+    items = data.get("crystallisation")
+    if not isinstance(items, list):
+        return 0, 0
+    kept: list = []
+    unscored = invalid = 0
+    for item in items:
+        if isinstance(item, dict) and item.get("importance") is None:
+            unscored += 1
+            continue
+        try:
+            CrystallisationCandidate.model_validate(item)
+        except ValidationError:
+            invalid += 1
+            continue
+        kept.append(item)
+    data["crystallisation"] = kept
+    return unscored, invalid
+
+
+def _drop_note(unscored: int, invalid: int) -> str:
+    """The parse-failure note for the dropped items: counts only (#640, #733)."""
+    parts = []
+    if unscored:
+        parts.append(f"{unscored} crystallisation item(s) without importance")
+    if invalid:
+        parts.append(f"{invalid} invalid crystallisation item(s)")
+    return ", ".join(parts)
+
+
 def extract_from_thinking(
     *,
     provider: LLMProvider,
@@ -252,11 +299,18 @@ def extract_from_thinking(
         record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"non-JSON: {exc}")
         return ExtractorOutput()
 
+    # One row per reply (#640): if the reply fails validation anyway, the whole reply is
+    # discarded, so the drop note rides on the single schema row instead of a row of its own.
+    note = _drop_note(*_drop_bad_crystallisation(data))
     try:
-        return ExtractorOutput.model_validate(data)
+        out = ExtractorOutput.model_validate(data)
     except Exception as exc:  # noqa: BLE001
-        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"schema: {exc}")
+        prefix = f"schema: {note}; " if note else "schema: "
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"{prefix}{exc}")
         return ExtractorOutput()
+    if note:
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"{note} dropped")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,6 +411,18 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
 _MAX_DELTA_INTENSITY: float = 3.0
 
 
+def signed_change_values(delta: Mapping[str, float]) -> dict[str, float]:
+    """A [-1, 1] delta as signed 0-10-scale changes for the emotion engine: x10, capped at +/-_MAX_DELTA_INTENSITY.
+
+    Keeps the sign, so a negative delta lowers the feeling once the engine is live (B1 PR 2). A zero change is skipped.
+    """
+    return {
+        name: math.copysign(min(abs(v) * 10.0, _MAX_DELTA_INTENSITY), v)
+        for name, v in delta.items()
+        if abs(v) > 1e-9
+    }
+
+
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
     memory is committed per the system's existing aggregation model.
@@ -384,7 +450,17 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     # aggregate_state. Owner-accepted 2026-09-26: "the odds of it happening
     # are tiny, the consequence if it happens are small." See #240
     # (emotion-system untangle) for the durable fix.
+    from brain.emotion import engine
     from brain.memory.store import Memory, MemoryStore
+
+    # Live (B1 PR 2): fold the signed change straight into the engine and write no row, so a negative delta lowers
+    # the feeling. An unknown switch counts as off and takes the old path below.
+    live_engine = engine.engine_for(persona_dir)
+    if live_engine.is_live():
+        changes = signed_change_values(_filter_to_registered(delta))
+        if changes:
+            live_engine.fold_change(changes, None, "monologue_emotion")
+        return
 
     store = MemoryStore(persona_dir / "memories.db")
     try:

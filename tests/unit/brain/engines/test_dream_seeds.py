@@ -25,13 +25,13 @@ def test_emotional_congruence_sums_shared_emotions():
     mood = EmotionalState(emotions={"grief": 6.0, "joy": 1.0})
     mem = _mem("a", emotions={"grief": 4.0, "anger": 9.0})
     # only the shared emotion (grief) counts: 6.0 * 4.0
-    assert dream_seeds.emotional_congruence(mem, mood) == 24.0
+    assert dream_seeds.emotional_congruence(mem, mood, eng=None) == 24.0
 
 
 def test_emotional_congruence_zero_when_no_overlap():
     mood = EmotionalState(emotions={"grief": 6.0})
     mem = _mem("a", emotions={"joy": 5.0})
-    assert dream_seeds.emotional_congruence(mem, mood) == 0.0
+    assert dream_seeds.emotional_congruence(mem, mood, eng=None) == 0.0
 
 
 def test_mood_is_active_true_above_floor():
@@ -102,17 +102,17 @@ def test_identity_congruence_ignores_age():
 
 def test_grief_pull_zero_for_non_grief_memory():
     mem = _mem("a", emotions={"memory_grief": 9.0}, mtype="meta")
-    assert dream_seeds.grief_pull(mem) == 0.0
+    assert dream_seeds.grief_pull(mem, eng=None) == 0.0
 
 
 def test_grief_pull_normalizes_grief_event_intensity():
     mem = _mem("g", emotions={"memory_grief": 8.0}, mtype="grief_event")
-    assert dream_seeds.grief_pull(mem) == 0.8
+    assert dream_seeds.grief_pull(mem, eng=None) == 0.8
 
 
 def test_grief_pull_zero_when_no_grief_emotion():
     mem = _mem("g", emotions={}, mtype="grief_event")
-    assert dream_seeds.grief_pull(mem) == 0.0
+    assert dream_seeds.grief_pull(mem, eng=None) == 0.0
 
 
 def test_refractory_penalty_one_when_recently_seeded():
@@ -131,13 +131,13 @@ def test_composite_score_blends_terms():
     # importance 5.0/10 = 0.5; no crysts -> identity 0; grief_event 6.0 -> 0.6;
     # not recently seeded -> refractory 0. Total = 0.5 + 0.6 = 1.1
     mem = _mem("g", emotions={"memory_grief": 6.0}, importance=5.0, mtype="grief_event")
-    score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=[])
+    score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=[], eng=None)
     assert score == 1.1
 
 
 def test_composite_score_applies_refractory_penalty():
     mem = _mem("a", importance=10.0)  # 1.0 baseline
-    score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=["a"])
+    score = dream_seeds.composite_score(mem, EmotionalState(), [], recent_seed_ids=["a"], eng=None)
     # 1.0 - W_REFRACTORY(2.0) * 1.0 = -1.0
     assert score == -1.0
 
@@ -148,7 +148,7 @@ def test_select_seed_calm_night_is_importance_only():
         _mem("low", importance=2.0, emotions={"joy": 5.0}),
         _mem("high", importance=9.0, emotions={"calm": 1.0}),
     ]
-    seed = dream_seeds.select_seed(cands, EmotionalState(), [], recent_seed_ids=[])
+    seed = dream_seeds.select_seed(cands, EmotionalState(), [], recent_seed_ids=[], eng=None)
     assert seed.id == "high"
 
 
@@ -162,7 +162,7 @@ def test_select_seed_mood_gate_recolors_pool():
         _mem("g2", importance=2.0, emotions={"grief": 5.0}),
         _mem("g3", importance=3.0, emotions={"grief": 5.0}),
     ]
-    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[])
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[], eng=None)
     assert seed.id == "g3"  # highest importance within the grief-congruent pool
 
 
@@ -174,7 +174,7 @@ def test_select_seed_thin_pool_widens_to_full_window():
         _mem("joyful", importance=9.0, emotions={"joy": 8.0}),
         _mem("g1", importance=1.0, emotions={"grief": 5.0}),
     ]
-    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[])
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[], eng=None)
     assert seed.id == "joyful"
 
 
@@ -186,7 +186,7 @@ def test_select_seed_grief_event_is_eligible():
         _mem("g2", importance=1.0, emotions={"memory_grief": 5.0}),
         _mem("bc", importance=1.0, emotions={"memory_grief": 9.0}, mtype="grief_event"),
     ]
-    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[])
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[], eng=None)
     # All importance 1.0; grief_pull lifts the breadcrumb above the others.
     assert seed.id == "bc"
 
@@ -196,7 +196,7 @@ def test_select_seed_is_deterministic_tiebreak():
     older = _mem("a", importance=5.0)
     newer = _mem("b", importance=5.0)
     object.__setattr__(newer, "created_at", datetime(2026, 5, 27, tzinfo=UTC))
-    seed = dream_seeds.select_seed([older, newer], EmotionalState(), [], recent_seed_ids=[])
+    seed = dream_seeds.select_seed([older, newer], EmotionalState(), [], recent_seed_ids=[], eng=None)
     assert seed.id == "b"  # newer wins the tie
 
 
@@ -208,7 +208,7 @@ def test_select_seed_refractory_pushes_to_breadth():
         _mem("g2", importance=5.0, emotions={"grief": 5.0}),
         _mem("g3", importance=5.0, emotions={"grief": 5.0}),
     ]
-    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=["g3"])
+    seed = dream_seeds.select_seed(cands, mood, [], recent_seed_ids=["g3"], eng=None)
     assert seed.id in {"g1", "g2"}  # g3 demoted by the refractory penalty
 
 
@@ -220,7 +220,7 @@ def test_congruence_matches_a_variant_spelled_candidate_against_the_aggregate_mo
 
     candidate = _mem("a", emotions={"comfort-seeking": 7.0})
 
-    assert dream_seeds.emotional_congruence(candidate, mood) == 49.0
+    assert dream_seeds.emotional_congruence(candidate, mood, eng=None) == 49.0
     assert candidate.emotions == {"comfort-seeking": 7.0}  # the stored key is not rewritten
 
 
@@ -238,8 +238,25 @@ def test_congruence_counts_two_spellings_once_and_ignores_look_alikes(memory_emo
 
     # the larger spelling counts once (6 * 4), not summed (36) and not first-wins on the smaller one;
     # none of the look-alikes lands on a mood channel
-    assert dream_seeds.emotional_congruence(mem, mood) == 24.0
+    assert dream_seeds.emotional_congruence(mem, mood, eng=None) == 24.0
 
     # a memory key that canonicalises to the unknown mood channel does match it
     spelled = _mem("b", emotions={"Not-A-Real-Emotion": 2.0})
-    assert dream_seeds.emotional_congruence(spelled, mood) == 10.0
+    assert dream_seeds.emotional_congruence(spelled, mood, eng=None) == 10.0
+
+
+class _HalfFaded:
+    """Stands in for a live engine whose fade halves every stored value."""
+
+    def faded_value(self, memory: Memory, emotion: str) -> float:
+        return memory.emotions[emotion] * 0.5
+
+
+def test_congruence_and_grief_pull_read_faded_values():
+    half = _HalfFaded()
+    breadcrumb = _mem("g", emotions={"memory_grief": 8.0}, mtype="grief_event")
+    assert dream_seeds.grief_pull(breadcrumb, eng=half) == pytest.approx(8.0 / 20.0)
+
+    mood = EmotionalState(emotions={"grief": 6.0})
+    mem = _mem("a", emotions={"grief": 4.0, "anger": 9.0})
+    assert dream_seeds.emotional_congruence(mem, mood, eng=half) == pytest.approx(6.0 * 2.0)

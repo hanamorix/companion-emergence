@@ -130,6 +130,37 @@ class SoulStore:
         ).fetchall()
         return [_row_to_crystal(row) for row in rows]
 
+    def list_active_page(
+        self, *, offset: int, limit: int, love_type: str | None = None, after: str | None = None
+    ) -> list[Crystallization]:
+        """One page of active crystallizations, newest first (#596).
+
+        The order is total — ``crystallized_at`` then ``id``, both descending —
+        so walking ``offset`` reaches every row exactly once even when many
+        share a timestamp. ``list_active()`` keeps its own oldest-first order.
+        ``love_type`` narrows the page to one type.
+
+        ``after`` is a cursor (#734): the id of the last item of the previous
+        page. The page starts strictly after that row in the order, compared on
+        its stored values, so items added or revoked between calls can't shift
+        it; the row may itself be revoked since. ``offset`` is ignored with it.
+        """
+        where, params = _after_where(*_active_where(love_type), after)
+        rows = self._conn.execute(
+            f"SELECT * FROM crystallizations WHERE {where} "
+            "ORDER BY crystallized_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, limit, 0 if after is not None else offset),
+        ).fetchall()
+        return [_row_to_crystal(row) for row in rows]
+
+    def active_love_type_counts(self) -> dict[str, int]:
+        """Number of active crystallizations per love type."""
+        rows = self._conn.execute(
+            "SELECT love_type, COUNT(*) FROM crystallizations "
+            "WHERE revoked_at IS NULL GROUP BY love_type ORDER BY love_type"
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
     def list_revoked(self) -> list[Crystallization]:
         """Return revoked crystallizations, most-recently-revoked first."""
         rows = self._conn.execute(
@@ -155,11 +186,13 @@ class SoulStore:
         self._conn.commit()
         return self.get(id)
 
-    def count(self) -> int:
-        """Return count of active (non-revoked) crystallizations."""
+    def count(self, love_type: str | None = None, *, after: str | None = None) -> int:
+        """Return count of active (non-revoked) crystallizations, optionally of one type,
+        and with ``after`` only those older than that row in the page order (#734)."""
+        where, params = _after_where(*_active_where(love_type), after)
         return int(
             self._conn.execute(
-                "SELECT COUNT(*) FROM crystallizations WHERE revoked_at IS NULL"
+                f"SELECT COUNT(*) FROM crystallizations WHERE {where}", params
             ).fetchone()[0]
         )
 
@@ -280,6 +313,26 @@ class SoulStore:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def _active_where(love_type: str | None) -> tuple[str, tuple[str, ...]]:
+    """WHERE clause + params for active rows, optionally of one love type."""
+    if love_type is None:
+        return "revoked_at IS NULL", ()
+    return "revoked_at IS NULL AND love_type = ?", (love_type,)
+
+
+def _after_where(where: str, params: tuple[str, ...], after: str | None) -> tuple[str, tuple[str, ...]]:
+    """Narrow ``where`` to the rows strictly after the row ``after`` in the newest-first order (#734).
+
+    Compared on the row's stored values in SQL, so how a timestamp was written never matters.
+    """
+    if after is None:
+        return where, params
+    return (
+        f"{where} AND (crystallized_at, id) < (SELECT crystallized_at, id FROM crystallizations WHERE id = ?)",
+        (*params, after),
+    )
 
 
 def _row_to_crystal(row: sqlite3.Row) -> Crystallization:

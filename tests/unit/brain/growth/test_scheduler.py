@@ -444,3 +444,110 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
         c.source == "crystallization" and c.source_id == "vocabulary_emotion:lingering"
         for c in candidates
     )
+
+
+# ---- emotion rework B1 PR 5: a live persona's growth reads the engine ----
+
+
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float):
+    from brain.emotion import engine as emotion_engine
+    from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+    return emotion_engine.engine_for(persona_dir)
+
+
+def _blend_rows(store: MemoryStore, emotions: dict[str, float]) -> None:
+    from brain.memory.store import Memory
+
+    for i in range(3):
+        store.create(
+            Memory.create_new(content=f"braided {i}", memory_type="conversation", domain="us", emotions=emotions, importance=8.0)
+        )
+
+
+def _added_names(persona_dir: Path) -> list[str]:
+    log_path = persona_dir / "emotion_growth.log.jsonl"
+    if not log_path.exists():
+        return []
+    return [json.loads(line)["name"] for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_live_initiate_candidate_carries_short_averages(persona_dir: Path) -> None:
+    from brain.initiate.emit import read_candidates
+    from brain.memory.store import Memory
+
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        eng = _go_live(persona_dir, disk, love=6.0)
+        # A making counts for the engine; the old conversation-only aggregate never saw it.
+        disk.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
+        _blend_rows(disk, {"love": 9.0, "grief": 8.0})
+        eng.note_active(datetime.now(UTC))
+        expected = {name: r.short for name, r in eng.read().items() if r.short > 0}
+        assert "joy" in expected
+
+        run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    [candidate] = [c for c in read_candidates(persona_dir) if c.source_id.startswith("vocabulary_emotion:")]
+    assert candidate.emotional_snapshot is not None
+    assert candidate.emotional_snapshot.vector == pytest.approx(expected)
+
+
+def test_old_memories_do_not_form_a_blend_when_live(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.emotion.engine import EmotionEngine
+
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        _go_live(persona_dir, disk)
+        _blend_rows(disk, {"love": 7.0, "grief": 7.0})
+        # Faded to 3.5 each: below the 6.0 floor, so no blend.
+        monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+
+        result = run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    assert result.emotions_added == 0
+    assert _added_names(persona_dir) == []
+
+
+def test_top_two_are_chosen_by_faded_value(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.emotion.engine import EmotionEngine
+
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        _go_live(persona_dir, disk)
+        _blend_rows(disk, {"love": 9.0, "grief": 8.0, "joy": 7.0})
+        # love fades to 4.5 while grief and joy hold, so the strongest two are grief and joy.
+        monkeypatch.setattr(
+            EmotionEngine,
+            "faded_value",
+            lambda self, memory, emotion: memory.emotions[emotion] * (0.5 if emotion == "love" else 1.0),
+        )
+
+        run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    assert _added_names(persona_dir) == ["grief_joy_blend"]
+
+
+@pytest.mark.no_base_failure(reason="pins the switch-off tick, which is today's")
+def test_off_tick_is_unchanged(persona_dir: Path) -> None:
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        _blend_rows(disk, {"love": 9.0, "grief": 8.0, "joy": 7.0})
+        run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    assert _added_names(persona_dir) == ["grief_love_blend"]

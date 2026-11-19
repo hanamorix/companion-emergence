@@ -113,6 +113,17 @@ def test_peak_emotion_intensity_defaults_zero_for_old_schema(tmp_path):
     assert mems["m1"].peak_emotion_intensity == 0.0
 
 
+def test_recovery_reader_does_not_carry_protected(tmp_path):
+    """A source row's protected flag stays behind: no production code ever set it (#672)."""
+    src = _mk_v033_schema_source(tmp_path, subdir="src_protected")
+    conn = sqlite3.connect(src / "memories.db")
+    conn.execute("UPDATE memories SET protected = 1 WHERE id = 'm2'")
+    conn.commit()
+    conn.close()
+
+    assert read_source_memories(src)["m2"].protected is False
+
+
 def test_recall_count_round_trips_as_float(tmp_path):
     """G6 (recall-reinforcement): a source row with a fractional recall_count
     (as a REAL-typed post-fractional-bump DB would carry) round-trips as

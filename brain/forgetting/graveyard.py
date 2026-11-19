@@ -14,6 +14,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.emotion import engine
 from brain.forgetting.salience import SalienceInputs
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.memory.name_rules import (
@@ -52,6 +53,7 @@ def append(
     "write JSONL entry first".
     """
     persona_dir.mkdir(parents=True, exist_ok=True)
+    live_engine = engine.engine_for(persona_dir)
     entry = {
         "memory_id": memory.id,
         "forgotten_at_iso": datetime.now(UTC).isoformat(),
@@ -60,7 +62,7 @@ def append(
         "memory_type": memory.memory_type,
         "created_at_iso": memory.created_at.isoformat() if memory.created_at else None,
         "summary": memory.content,  # the fading body IS the summary at drop time
-        "emotion_at_ingest": dict(memory.emotions),
+        "emotion_at_ingest": {n: live_engine.faded_value(memory, n) for n in memory.emotions},
         "salience_at_drop": salience_at_drop,
         "salience_inputs_at_drop": asdict(inputs),
         "graveyard_reason": reason,

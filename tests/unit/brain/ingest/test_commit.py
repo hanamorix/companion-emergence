@@ -140,3 +140,23 @@ def test_commit_item_empty_image_shas_treated_as_unset(
     assert mem_id is not None
     memory = PendingQueue(store.persona_dir).read_recent("fact", limit=1)[0]
     assert "image_shas" not in memory.metadata
+
+
+def test_auto_hebbian_search_does_not_count_as_a_recall(
+    store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """#587: the auto-link search shows the kindled nothing, so it must not tick the rows it finds.
+
+    The search only runs for a gate-bypass label (the live pipeline's labels are all gated
+    today), so this drives that branch directly with ``journal_entry``.
+    """
+    related = Memory.create_new(content="Nell writes fiction and poetry", memory_type="fact", domain="brain")
+    store.create(related)
+
+    item = ExtractedItem(text="Nell writes dark fiction", label="journal_entry", importance=6)
+    mem_id = commit_item(item, session_id="sess_587", store=store, hebbian=hebbian)
+
+    assert related.id in [n for n, _ in hebbian.neighbors(mem_id)]  # the search still found and linked it
+    row = store.get(related.id, bump=False)
+    assert row.recall_count == 0.0
+    assert row.last_accessed_at is None
