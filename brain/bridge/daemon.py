@@ -71,7 +71,10 @@ _WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
 _EDEADLOCK = getattr(errno, "EDEADLOCK", errno.EDEADLK)
 
 
-def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
+_RELOCKS = 2  # #754: how many times acquire_lock locks again after finding the folder swapped under it
+
+
+def acquire_lock(persona_dir: Path, *, blocking: bool = False, _relocks_left: int = _RELOCKS) -> int | None:
     """Take the bridge's OS-level lock for the whole process life.
 
     Same pattern as brain.utils.file_lock: open with O_CREAT (never O_EXCL —
@@ -97,7 +100,12 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
     blocked there either way.
     """
     path = persona_dir / LOCKFILE
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    except FileNotFoundError:
+        # #754: every start path checks the persona folder exists before this, so a missing folder here is one a forced
+        # migrate install has moved aside and not yet replaced: it holds the lock for that swap, so answer "held".
+        return None
     try:
         if _IS_WINDOWS:
             os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
@@ -120,10 +128,32 @@ def acquire_lock(persona_dir: Path, *, blocking: bool = False) -> int | None:
         os.close(fd)
         return None
 
+    if not _IS_WINDOWS and _relocks_left > 0 and not _is_file_at(fd, path):
+        # #754: the persona folder was swapped while this waited (a forced migrate install holds this lock across its
+        # two renames, so the file locked here is now the backup's). Let it go and lock the file now at the path, or
+        # this process would run the new persona holding the backup's lock while a later start locks the real one.
+        # Bounded: on a filesystem whose inode numbers never match, the last try keeps its lock, as before the check.
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return acquire_lock(persona_dir, blocking=blocking, _relocks_left=_relocks_left - 1)
+
     os.ftruncate(fd, 0)
     os.lseek(fd, 0, os.SEEK_SET)
     os.write(fd, str(os.getpid()).encode())
     return fd
+
+
+def _is_file_at(fd: int, path: Path) -> bool:
+    """True when the open `fd` is the file now at `path` (same device and inode), or when that can't be told (any
+    other error inspecting them): the caller then keeps its lock, as before this check existed."""
+    try:
+        here = os.stat(path)
+        held = os.fstat(fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return (held.st_dev, held.st_ino) == (here.st_dev, here.st_ino)
 
 
 def lock_holder(persona_dir: Path) -> int | None:
