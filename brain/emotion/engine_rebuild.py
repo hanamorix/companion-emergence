@@ -3,8 +3,8 @@
 `replay` folds what happened in a window of time into a state: the rows of `memories.db` created or opened in it, the day each
 row was written on, and the change-log lines. `catch_up` is the recovery-first step (design 2.8, "Recovery first", of `docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md`): a state that had to be loaded
 from a backup copy is replayed forward from that copy's `saved_at` to now. `rebuild` builds a whole state from the last 30 days
-of rows and the change log: at a persona's first start (the switch-over, which records `switch_over_at` in its one state write) and as the recovery
-of a live persona whose state cannot be used. Both read the window through `_read_window`.
+of rows and the change log: at a persona's first start (the switch-over, which records `switch_over_at` in its one state write), as the recovery
+of a live persona whose state cannot be used, and at a start whose check (`rolled_forward`) finds rows written while an older brain ran. Each reads the window through `_read_window`, as does the start check.
 
 All three are called with the engine's lock already held by the caller (the drain, a direct apply or a batch, the first start, the
 recovery job). None takes it, and the lock is not re-entrant. `catch_up` holds the caller's lock for as long as the replay takes
@@ -31,6 +31,7 @@ from brain.emotion.engine_utils import (
     fold_entry,
     fold_event,
     fold_guarded,
+    larger_rowid,
     resolve_emotions,
 )
 from brain.memory.store import Memory, MemoryStore
@@ -86,8 +87,14 @@ def replay(
     stop: datetime | None,
     emotions_of: Callable[[Memory], Mapping[str, float]],
     modifier_of: Callable[[Memory], float],
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> frozenset[str]:
     """Fold a window of history into `state` and return the ids of the rows it folded.
+
+    `on_progress(done, total)` (the first rebuild passes one, `catch_up` none) is called with `total = len(rows)`: once when the
+    points are built, with `done` = the rows that did not become a point (skipped, with no feelings, out of the window), then
+    after each row point's fold with `done` one higher, a point whose fold failed included; stamp and change points are not
+    counted. So `done` reaches `total`. The callback must not raise (`engine_files.EngineProgress` never does).
 
     Points: a creation stamp for each of `stamps` (it closes the day it falls on and keeps the persona's start date through a
     start-only event); one entry for each counted row of `rows` that has emotions (below); each of `changes`. Every point is
@@ -145,6 +152,10 @@ def replay(
         points.append(_Point(change.at, _CHANGE, order, change))
         order += 1
 
+    done = 0
+    if on_progress is not None:
+        done = len(rows) - sum(1 for point in points if isinstance(point.payload, _RowPoint))  # the rows that became no point
+        on_progress(done, len(rows))
     repeat_window = timedelta(hours=dev_constants.EMOTION_REPEAT_WINDOW_H)
     folded: set[str] = set()
     for point in sorted(points, key=lambda p: (p.at, p.kind, p.order)):
@@ -167,6 +178,9 @@ def replay(
             label = f"{point.payload.kind} event at {point.at}"  # type: ignore[union-attr]
         if fold_guarded(state, step, f"catch-up {label}", key="engine_rebuild:replay") and isinstance(point.payload, _RowPoint):
             folded.add(point.payload.memory.id)
+        if on_progress is not None and isinstance(point.payload, _RowPoint):
+            done += 1
+            on_progress(done, len(rows))
     return frozenset(folded)
 
 
@@ -176,19 +190,63 @@ class _Window(NamedTuple):
     oldest: datetime | None  # the creation time of the oldest row of any type and state, in the whole database
 
 
-def _read_window(persona_dir: Path, since: datetime) -> _Window:
+def _read_window(persona_dir: Path, since: datetime, *, rowid_above: int | None = None) -> _Window:
     """The rows, creation stamps and oldest creation time `catch_up` and `rebuild` start from, read in ONE open of `memories.db`.
 
     Opens `MemoryStore(db, integrity_check=False)` (the rebuild's reads skip the check, E7.14; the one-time x10 fix before it
     ran the check on a first start), reads `list_engine_window(since)`, `creation_stamps_since(since)` and `oldest_created_at()`,
     and closes. It does not stat the file: opening a store on a missing path would create an empty database, so the missing-file
     rule belongs to each caller.
+
+    With `rowid_above` (the start check, `rolled_forward`) it reads only `list_engine_window(since, rowid_above=rowid_above)`:
+    the rows newer than that rowid, with no stamps and no oldest time (`stamps` is empty, `oldest` is None).
     """
     store = MemoryStore(persona_dir / _MEMORIES_DB, integrity_check=False)
     try:
+        if rowid_above is not None:
+            return _Window(store.list_engine_window(since, rowid_above=rowid_above), [], None)
         return _Window(store.list_engine_window(since), store.creation_stamps_since(since), store.oldest_created_at())
     finally:
         store.close()
+
+
+def _highest_rowid(rows: Sequence[Memory]) -> int | None:
+    """The highest rowid among `rows` (None when none has one): what a read of the window has seen of `memories`."""
+    return max((m.rowid for m in rows if m.rowid is not None), default=None)
+
+
+def rolled_forward(persona_dir: Path, loaded: engine_files.LoadedState, now: datetime) -> bool:
+    """The start check (HR1 of #633): do the rows hold something the engine's last save did not see, written while an older brain ran?
+
+    False without a read when `loaded` is not a state read from the main file (a backup-sourced state stays with the drain's
+    recovery-first catch-up) or lacks `rows_through`, `saved_at` or `switch_over_at`, and False when `memories.db` is missing
+    (it is statted, never opened: a store opened on a missing path creates the file). Otherwise it reads the rows through
+    `_read_window` with `rowid_above=rows_through`, since the later of `saved_at` and `now` minus `EMOTION_LONG_HALF_LIFE_D`, and
+    is True when one of them was created strictly after `saved_at` and has stored feelings that count (`_stored_emotions`: a
+    counted kind and a non-empty `resolve_emotions`). A refreshed row keeps its old rowid and so is never read here.
+    A failure of the read raises: the caller logs it and the start goes on. The one place the skip conditions live: the
+    start-up's check before the lock and its re-check under the lock both call it.
+    """
+    state = loaded.state
+    if loaded.source != "main" or state is None:
+        return False
+    if state.rows_through is None or state.saved_at is None or state.switch_over_at is None:
+        return False
+    saved_at = lenient_utc(state.saved_at)
+    when = lenient_utc(now)
+    if saved_at is None or when is None:
+        return False
+    if file_ops.stat_path(persona_dir / _MEMORIES_DB) is None:
+        return False
+    since = max(saved_at, when - timedelta(days=dev_constants.EMOTION_LONG_HALF_LIFE_D))
+    rows = _read_window(persona_dir, since, rowid_above=state.rows_through).rows
+    for memory in rows:
+        created = lenient_utc(memory.created_at)
+        if memory.rowid is None or memory.rowid <= state.rows_through or created is None or created <= saved_at:
+            continue
+        if _stored_emotions(memory):
+            return True
+    return False
 
 
 def catch_up(
@@ -208,7 +266,8 @@ def catch_up(
     OLDEST event among `queued`, all the lines of the queue file, which the drain folds after this once each. The queue
     position is set to 0, so that drain folds every line in the file (a backup's own position can name a line of an older
     queue). Writes nothing itself: the caller stamps `saved_at` and `reset_at` and saves. The returned ids are what the caller
-    tests its commit and assigned events against: those memories are already counted.
+    tests its commit and assigned events against: those memories are already counted. `state.rows_through` rises to the highest
+    rowid among the rows read (never down).
 
     Raises `CatchUpError` when `saved_at` is missing, more than `EMOTION_LONG_HALF_LIFE_D` days before now (a replay cannot
     stand in for a backup that old), or `memories.db` is missing (opening a store on a missing path would create an empty
@@ -244,6 +303,7 @@ def catch_up(
         modifier_of=modifier_of,
     )
     state.queue_line = 0
+    state.rows_through = larger_rowid(state.rows_through, _highest_rowid(window.rows))
     return folded
 
 
@@ -293,14 +353,18 @@ def rebuild(
     faded_emotions_of: Callable[[Memory], Mapping[str, float]],
     modifier_of: Callable[[Memory], float],
     switch_over_at: datetime | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Build the engine's state from the last 30 days of `memories.db` and the change log, and write it (Engine 6, #584).
 
+    `on_progress(done, total)` is the first rebuild's progress display (HR5 of #633): called with `(0, len(window.rows))` right
+    after the window is read (the total is known), then through `replay` (see there) as the rows are folded; it must not raise.
+
     Called with the engine lock held by the caller; it never takes the lock (it is not re-entrant). `mode` is "first" (a
     persona's switch-over: the stored values of its counted rows are folded as they are; a missing `memories.db` is an empty
-    window and creates nothing) or "recovery" (a live persona whose state cannot be used: the faded values `faded_emotions_of`
-    gives, faded to this rebuild's clock as `catch_up` does; a missing `memories.db` raises `CatchUpError`, because an empty
-    rebuild would rotate a readable backup out). `modifier_of` is the trust-aware weight, as for `catch_up`.
+    window and creates nothing) or "recovery" (a live persona whose state cannot be used, or whose start check found a
+    roll-forward (`rolled_forward`): the faded values `faded_emotions_of` gives, faded to this rebuild's clock as `catch_up`
+    does; a missing `memories.db` raises `CatchUpError`, because an empty rebuild would rotate a readable backup out). `modifier_of` is the trust-aware weight, as for `catch_up`.
 
     The switch-over time. First mode records it as the rebuild's own `now`, in the one verified state write (there is no
     switch file). A recovery rebuild copies it from the old state it loads (main, or a backup copy: the walk accepts either),
@@ -315,7 +379,8 @@ def rebuild(
     the creation stamps of every row of any type, one extra stamp at the access time of each counted row that is opened in the
     window and has no feelings to fold (`replay` folds a row with feelings at its access time; an emotion-less counted row would
     otherwise leave its access day unmarked), and the change-log lines. `persona_start_at` is the earliest of the oldest row of
-    any type, the replay's own and (recovery) the old state's.
+    any type, the replay's own and (recovery) the old state's. `rows_through` is the highest rowid the window read saw (recovery:
+    or the old state's, when that is higher).
 
     The order is fixed. (1) The check (`_check_rebuilt`). (2) The queue step: `empty_queue`, then the new state's `queue_line` is 0;
     if the emptying fails, `queue_line` is the queue's end line, so no line is folded on top of the rebuild. (3) ONE
@@ -339,12 +404,15 @@ def rebuild(
         window = _Window([], [], None)  # a fresh persona: an empty state, and nothing is created
     else:
         raise CatchUpError(f"{database} does not exist")
+    if on_progress is not None:
+        on_progress(0, len(window.rows))
 
     # E7.10 (accepted): a missing or corrupt part of the change log loses those changes at a rebuild; the log is a
     # crash-recovery record. E6.19 and E1.15 (accepted): the first rebuild has no chat-change history at all, because the
     # change log is only written once the persona is live.
     changes = engine_files.read_changes(persona_dir, after)
 
+    previous: EngineState | None = None
     previous_start: datetime | None = None
     carried_switch: datetime | None = None
     if mode == "recovery":
@@ -401,12 +469,16 @@ def rebuild(
         stop=None,
         emotions_of=emotions_of,
         modifier_of=modifier_of,
+        on_progress=on_progress,
     )
     close_days(state, now)
     starts = [t for t in (window.oldest, state.persona_start_at, previous_start) if t is not None]
     state.persona_start_at = min(starts, default=None)
     state.saved_at = state.reset_at = now
     state.switch_over_at = now if mode == "first" else carried_switch
+    # The highest rowid the window read saw. A row outside the 30-day window can have a higher rowid (an old-dated import):
+    # it is not read here, so it does not raise `rows_through`.
+    state.rows_through = larger_rowid(None if previous is None else previous.rows_through, _highest_rowid(window.rows))
     _check_rebuilt(state)
 
     # E7.18 (accepted): a change still queued at a rebuild with no change-log line (a failed append, or phase B, which writes no

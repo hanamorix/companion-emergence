@@ -283,6 +283,7 @@ class Monitor:
             self._stop.wait(self.poll_s)
 
     def poll_once(self) -> None:
+        from brain import process_identity
         from brain.bridge import shutdown_progress
 
         c = self.controller
@@ -295,7 +296,7 @@ class Monitor:
         # D6 (b): a request naming this pid + token is the only condition, whether or not a stop has begun (review
         # M2: the kill helper writes one for a running service bridge that was never asked to stop).
         request = shutdown_progress.read_record(self.persona_dir, shutdown_progress.REQUEST_FILENAME)
-        if shutdown_progress.names_this_bridge(request, self.pid, self.pid_token):
+        if process_identity.names_this_bridge(request, self.pid, self.pid_token):
             logger.warning("hard-exit request received")
             self.hard_exit(REASON_HARD_EXIT)
             return

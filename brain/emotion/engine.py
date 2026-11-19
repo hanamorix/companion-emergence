@@ -34,7 +34,11 @@ The switch-over and the live engine (Engine 6, #584):
   same two steps run, and the first rebuild writes a fresh state in place of the unreadable one (owner S88: it is simply
   replaced; the normal backup rotation moves the old file into `.bak1`). A start is skipped with one warning, and retried at
   the next start, when `memories.db` cannot be read either, or when the rebuild's own state write fails with an I/O error on
-  such a state. Any other failure raises `EngineStartupError`.
+  such a state. Any other failure raises `EngineStartupError`. It runs in the rebuild process (`nell supervisor rebuild`,
+  `cli._supervisor_rebuild_handler`, S107): the bridge and the commands no longer call it, their starter runs the child first
+  (`daemon.run_rebuild_step`, `daemon._rebuild_under_lock`). An engine lock held by another process (a rebuild, a hook, a drain)
+  is waited for, one `EMOTION_LOCK_WAIT_S` step after another, until it comes: there is no stop check and no limit (S101, "the
+  startup waits until the rebuild is finished"); only `recovery_rebuild` (the supervisor job) waits one step and raises.
 - `faded_value(memory, emotion)` fades the stored value by the memory's age, counted from its creation or from the switch-over
   time when that is later (before the switch it does not fade), and holds the result to 0-10 (a stored negative reads as 0).
   It raises `KeyError`, naming the memory id and the emotion, when the memory has no such emotion: "absent" is for the caller
@@ -55,6 +59,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NoReturn
@@ -73,6 +78,7 @@ from brain.emotion.engine_utils import (
     feels_high_from,
     fold_event,
     fold_guarded,
+    larger_rowid,
     memory_feelings,
     resolve_emotions,
     shift_for,
@@ -90,6 +96,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _UNSET = object()  # no clean drain yet: the early-out may not fire
+
+# The `what` of an `EngineStartupError` raised when the engine lock does not come: a `recovery_rebuild` (its one wait, the
+# supervisor job) or a lock file that cannot be opened. The start-up rebuilds wait for the lock instead (`wait_for_lock`).
+ENGINE_LOCK_STEP = "the engine lock"
+
+# The short plain reasons the rebuild notice shows for each way a start-up step fails (Hana's 11-18b point 2; placeholders on the
+# owner's wording list, one each; the window puts one after "could not be brought up to date: "). The raw error is only in the log
+# line each failing site already writes, never in the notice.
+_REASON_INTEGRITY = "the memory database failed its check"
+_REASON_X10 = "rescaling the saved feelings failed"
+_REASON_FIRST_REBUILD = "rebuilding the saved feelings failed"
+_REASON_ROLL_FORWARD = "bringing the saved feelings up to date failed"  # a switched persona gets no notice, so this is never shown
+_REASON_LOCK = "the saved feelings could not be opened for the update"
+_REASON_UNREADABLE = "the saved feelings and the memory database could not be read"
+_REASON_UNWRITABLE = "the rebuilt feelings could not be written to disk"
 
 
 class Reading(NamedTuple):
@@ -210,6 +231,7 @@ class EmotionEngine:
                 emotions=emotions,
                 modifier=self._modifier(memory, kind),
                 climax=self._stored_climax(memory),
+                rowid=memory.rowid,
             )
         )
 
@@ -228,6 +250,7 @@ class EmotionEngine:
                 memory_id=memory.id,
                 emotions=emotions,
                 modifier=self._modifier(memory, kind),
+                rowid=memory.rowid,
             )
         )
 
@@ -472,15 +495,15 @@ class EmotionEngine:
 
         return modifier_of
 
-    def _fold_events(self, state: EngineState, events: list[Event], now: datetime, skip_ids: frozenset[str]) -> bool:
-        """Fold `events` in time order, each with the days closing first; True when at least one event folded.
+    def _fold_events(self, state: EngineState, events: list[Event], now: datetime, skip_ids: frozenset[str]) -> list[Event]:
+        """Fold `events` in time order, each with the days closing first; the events that folded (empty: none did).
 
         A commit or assigned event of a memory the recovery already counted (`skip_ids`), or already folded in this same
         apply (E6.7: two events for one id in a batch), folds once at most; a showing is never skipped, and a start-only
         event has no memory id, so it is never skipped (its min-fold is idempotent). An event that raises is put back and
         skipped (`fold_guarded`), and the others still fold.
         """
-        applied = False
+        applied: list[Event] = []
         folded_ids: set[str] = set()
         for event in sorted(events, key=lambda e: e.at):
             memory_id = event.memory_id if event.kind in ("commit", "assigned") else None
@@ -492,7 +515,7 @@ class EmotionEngine:
                 fold_event(state, event, now)
 
             if fold_guarded(state, step, f"{event.kind} event at {event.at}", key=f"engine:fold:{self.persona_dir}"):
-                applied = True
+                applied.append(event)
                 if memory_id is not None:
                     folded_ids.add(memory_id)
         return applied
@@ -502,7 +525,9 @@ class EmotionEngine:
 
         Steps (spec 3.1 S4): (2) read the state, recovery first when it came from a backup copy, then (for the drain) read the
         queue by position; (3-5) fold the events in time order with `close_days` before each and once at `now`, prune the
-        change-log files and the repeat list; (6) one `save_state`, with the queue position, when anything was read, folded or
+        change-log files and the repeat list. `rows_through` rises to the highest rowid among the events that folded (an event
+        with no row leaves it; the rowid comes from the original event, because the queue form has none); (6) one `save_state`,
+        with the queue position, when anything was read, folded or
         closed, when a catch-up ran, or (the drain) when the stored position is above 0 over a queue with no lines (a stale
         position, saved as 0); (7) the drain then empties the queue file and saves position 0. A state that exists but cannot be
         read, or a backup whose catch-up failed, is never replaced here: a persona this instance has seen switched over is marked
@@ -587,7 +612,8 @@ class EmotionEngine:
             to_fold = []
             for event in events:
                 try:  # the check every queued line already passed: UTC time, a day `day_of` can convert, a held modifier
-                    to_fold.append(engine_files.event_from_json(engine_files.event_to_json(event)))
+                    # The queue form carries no rowid, so the copy that is folded gets its original's (HR1 of #633).
+                    to_fold.append(replace(engine_files.event_from_json(engine_files.event_to_json(event)), rowid=event.rowid))
                 except (ValueError, OverflowError, OSError, TypeError) as exc:
                     logger.warning("emotion engine: a %s event was dropped (%s: %s)", event.kind, type(exc).__name__, exc)
         applied = self._fold_events(state, to_fold, now, skip_ids)
@@ -608,6 +634,8 @@ class EmotionEngine:
                 self._remember_queue_key()
             return
         state.saved_at = now
+        for event in applied:  # the rows the folded events came from; an event with no row (rowid None) leaves it as it is
+            state.rows_through = larger_rowid(state.rows_through, event.rowid)
         if caught_up:
             state.reset_at = now
         if drain:
@@ -907,16 +935,23 @@ class EmotionEngine:
     def ensure_ready(self) -> None:
         """Make the engine ready to run: the persona's first start does its one-time switch-over here.
 
+        Only the rebuild process calls it (`nell supervisor rebuild`, S107), so step 3 waits for an engine lock another process
+        holds (a rebuild a dropped start left running, a hook, a drain) until the lock comes, one `EMOTION_LOCK_WAIT_S` step
+        after another, with no stop check and no limit (S101). See `_locked_rebuild`.
+
         There is no switch file: "switched" is the state holding `switch_over_at` (`engine_files.switch_over_state`).
 
-        1. The state is read (through `_switched`, cached when seen): it holds `switch_over_at`, return at once (no transaction,
-        no lock). A missing state file means not switched: go on. A state that exists but cannot be read cannot say whether the
+        1. The state is read (through `_switched`, cached when seen): it holds `switch_over_at`, the persona is switched. It
+        gets the start check for a roll-forward (`_roll_forward`: one stat and, when `memories.db` exists, one open and one
+        rowid-range read; no transaction and no lock unless rows newer than the last save are found, and then the recovery-mode
+        rebuild runs under the lock with the first rebuild's lock wait and progress record), and returns. A missing state file means not switched: go on. A state that exists but cannot be read cannot say whether the
         persona was switched; the decision comes from the database's own record of the x10 fix (Planning B31 SW4, owner S79):
         it goes on exactly like a missing one, nothing is written for it yet, nothing is cached.
         2. The x10 fix of small feelings (`nudge_scale_fix`), outside the lock: the rows of `memories.db`, then the `making`
         candidates still waiting in the pending queue. Each step reads the progress number itself, so a finished or started step
         is skipped and an unstarted step runs. When the state is unreadable and `memories.db` fails its integrity check too,
-        this start is skipped with one warning and nothing is written.
+        this start is skipped with one warning and nothing is written except the rebuild notice (below). The step shows a progress record while it runs
+        (`engine_files.EngineProgress`, phase "rescaling", no count; see `nudge_scale_fix`).
         3. The engine lock, taken once, the state read again under it (a second process that waited runs nothing), then
         `engine_rebuild.rebuild` in first mode with the lock held; its one verified state write records `switch_over_at` (now) and
         is the switch-over's last step. First mode, not recovery mode: a recovery copies `switch_over_at` from a loaded state, and
@@ -927,106 +962,295 @@ class EmotionEngine:
         state path, a directory at `.bak3`) on a state this call found unreadable, the start is skipped with one warning naming
         the file and the error, and retried at the next start (the fail-safe S61 rules out stopping start-up at every start; this
         skip is derived from it, not stated by it); the persona stays not live until the fault is cleared. Any other rebuild
-        write failure raises. The clock is read once inside the hold.
+        write failure raises. The clock is read once inside the hold. From the first try of the lock on it shows a progress
+        record (phase "rebuilding"): with no count while it waits for the lock, written before each wait step, and with the
+        memories done of the total while the rebuild runs (`_locked_rebuild`).
 
         Accepted edges (Planning B25 SW2, B31 SW4): see `engine_files.switch_over_state` (every copy of the state lost or
         unreadable, or the live state corrupted while `.bak1` is still the pre-switch state: the persona reads as not switched
         and this runs again at the next start, recording a later switch-over time; the x10 fix does not multiply anything on that
         re-run, because its progress note in `memories.db` (`PRAGMA user_version`) says it is done).
 
-        Any other failure (the x10 error or its integrity check on a state that is not unreadable, a lock that did not come, a failed rebuild check or write) is
+        Any other failure (the x10 error or its integrity check on a state that is not unreadable, a lock file that cannot be
+        opened, a failed rebuild check or write) is
         logged and raised as `EngineStartupError(what, cause)`; a failure stops start-up and the next start runs it again (every
         step is idempotent: the x10 fix's progress note in `memories.db`, the empty-state rebuild, the `switch_over_at` that only
         the one verified write records).
+
+        The rebuild notice (Hana's 11-18 review of #633, point 5; owner S112). The rebuild process exits 1 on a failure and 0 on a
+        skip, and the start goes on with the saved state either way, so the window would show nothing. Each way the switch-over does
+        not complete (the two skips above, and every failure through `_start_failed`) therefore calls
+        `engine_files.settle_rebuild_notice` with a one-line reason, which writes `rebuild_notice.json` while the persona is not
+        switched over. A switched persona (a failed roll-forward) gets none and any old one is deleted; a completed switch-over
+        clears it when the rebuild process's handler (`cli._supervisor_rebuild_handler`) calls the writer with no reason after this
+        method returns. The errors themselves are logged as before.
         """
         loaded = self._state_cache.get()
         if self._switched(loaded):
+            self._roll_forward(loaded)
             return
         try:
             nudge_scale_fix.scale_up_small_feelings(self.persona_dir)
         except BrainIntegrityError as exc:
             if loaded.problem == "unreadable":
                 # Planning B31 SW4: with the state unreadable the database's own record is the only thing that can say what the
-                # switch-over did, and it cannot be read either: skip this start (nothing is written), retry at the next (S61).
+                # switch-over did, and it cannot be read either: skip this start (nothing is written but the rebuild notice), retry at the next (S61).
                 # Accepted edge (P4): a persona that switched while `memories.db` was ABSENT (nowhere to record the x10) and
                 # later loses its whole state file is rebuilt as never switched, with a later `switch_over_at`.
                 logger.warning(
                     "emotion engine: the emotion state %s cannot be read and memories.db fails its integrity check (%s), so what "
-                    "the switch-over already did cannot be told: this start skips the switch-over and writes nothing, and the "
-                    "next start tries again",
+                    "the switch-over already did cannot be told: this start skips the switch-over and writes only the rebuild "
+                    "notice, and the next start tries again",
                     engine_files.state_path(self.persona_dir),
                     exc,
                 )
+                # The one file this skip writes: the rebuild notice (Hana's point 5), since the persona stays not switched over.
+                engine_files.settle_rebuild_notice(self.persona_dir, _REASON_UNREADABLE)
                 return
-            self._start_failed("the memories.db integrity check", exc)
+            self._start_failed("the memories.db integrity check", exc, _REASON_INTEGRITY)
         except Exception as exc:  # noqa: BLE001 - every failure of the x10 fix stops start-up, named
-            self._start_failed("the x10 fix of small feelings", exc)
-        self._locked_rebuild("first", self._first_rebuild_needed, found_unreadable=loaded.problem == "unreadable")
+            self._start_failed("the x10 fix of small feelings", exc, _REASON_X10)
+        self._locked_rebuild(
+            "first", self._first_rebuild_needed, found_unreadable=loaded.problem == "unreadable", wait_for_lock=True
+        )
+
+    def _roll_forward(self, loaded: engine_files.LoadedState) -> None:
+        """The start check of a switched persona (HR1 of #633, owner S99, S103): rows newer than the last save mean a roll-forward.
+
+        A persona rolled back to an older brain after the switch-over and then rolled forward again has rows the engine never
+        saw. `engine_rebuild.rolled_forward` decides (see there); when it says yes, the existing `_locked_rebuild` runs in its
+        "recovery" mode (the 30-day window, faded values, `switch_over_at` carried, so the fade clock is not restarted) with
+        the first rebuild's lock wait and progress record (`roll_forward=True`, `wait_for_lock=True`: the record shows while it
+        waits for the lock, written before each wait step, and while the rebuild runs), and `_roll_forward_needed` as its
+        re-check under the lock. No catch-up step and no new mode.
+
+        A failure of the check's read, and an error of the rebuild's own work (`RebuildCheckError`, `RebuildStateWriteError`,
+        `OSError`), is logged through `_roll_forward_failed` and start-up goes on with the loaded state, which is readable (S61:
+        no stop at every start for a fault on a working state); the next start tries again. The check reads every kind of
+        failure that way on purpose (HR1b (a)): it is logged with its type and reason, never silent.
+
+        Accepted edges (P4; R2's one issue is the one HR5b (c) names, widened to these; each is also a commit-log note and a
+        bullet of the as-built "Accepted edges"):
+        (i) The rebuild's existing losses, now on a roll-forward: history and snapshot older than the 30-day window, and queued
+        chat changes with no change-log line (E7.18); the queue is emptied before the verified write, so a roll-forward whose
+        write fails loses that start's queued changes too. This is the regular rebuild S103 asks for.
+        (ii) Stored feelings the older brain's heartbeat lowered are faded again, so those rows read lower until they age out
+        (TRIO HR1-E).
+        (iii) Old-scale small values the older brain wrote are not multiplied again (S77; the x10 fix's progress is 2).
+        (iv) A rowid is reused when the newest row is deleted (no AUTOINCREMENT) and a repair or restore can renumber rows, so a
+        row then written at or below `rows_through` is missed (TRIO HR1-D).
+        (v) A state whose `rows_through` is None (an older file, or a first rebuild with an empty window) skips the check until
+        the first commit writes it; a roll-back in that gap is missed.
+        (vi) An engine save made before this check runs (a command-line command that writes memories without
+        `_engine_ready_or_refuse`) moves `saved_at` and `rows_through` past the roll-forward rows: S99's accepted class. So do
+        the `fold=False` writers (the migrator, cli.py; recovery/engine.py; emergence_kit.py; consolidation.py's own write),
+        which are written so that they are not folded and whose `created_at` is their own older time; a failed direct apply
+        (the next rebuild folds it, as today); and a batch where one event folds and another's fold raises (only the folded
+        row's rowid counts; the failed one is that same S99 case).
+        (vii) A failed check or rebuild followed by a direct apply before the next start moves `rows_through` past the
+        roll-forward rows, so they are not folded by the start check; a later rebuild inside the 30-day window folds them.
+        A database removed between the check and the rebuild reaches `CatchUpError`, which stops start-up like any failure that
+        is not one of the three above (a narrow race).
+        """
+        try:
+            if not engine_rebuild.rolled_forward(self.persona_dir, loaded, self._now()):
+                return
+        except Exception as exc:  # noqa: BLE001 - HR1b (a): a failure of the check's read goes on, logged with its reason
+            self._roll_forward_failed(exc)
+            return
+        self._locked_rebuild("recovery", self._roll_forward_needed, roll_forward=True, wait_for_lock=True)
+
+    def _roll_forward_needed(self) -> bool:
+        """Under the lock: the start check again on a fresh read of the state (another process may have applied the rows while this one waited)."""
+        try:
+            return engine_rebuild.rolled_forward(self.persona_dir, engine_files.read_state(self.persona_dir), self._now())
+        except Exception as exc:  # noqa: BLE001 - HR1b (a): as the check before the lock
+            self._roll_forward_failed(exc)
+            return False
+
+    def _roll_forward_failed(self, exc: BaseException) -> None:
+        """One throttled line for a roll-forward check or rebuild that failed: what, why, and that the next start tries again."""
+        warn_throttled(
+            logger,
+            f"engine:roll-forward:{self.persona_dir}:{type(exc).__name__}",
+            "emotion engine: the roll-forward check or rebuild failed (%s: %s); start-up goes on with the loaded state and the "
+            "next start tries again",
+            type(exc).__name__,
+            exc,
+        )
 
     def _first_rebuild_needed(self) -> bool:
         """Under the lock: False when the state now holds `switch_over_at` (another process switched over while this one waited). A state that exists but cannot be read is not switched: the rebuild runs."""
         return not self._switched(engine_files.read_state(self.persona_dir))
 
-    @staticmethod
-    def _start_failed(what: str, cause: BaseException) -> NoReturn:
-        """Log a failed start-up step with its traceback and raise it as `EngineStartupError(what, cause)`."""
+    def _start_failed(self, what: str, cause: BaseException, reason: str) -> NoReturn:
+        """Log a failed start-up step with its traceback, record why in the rebuild notice, and raise `EngineStartupError(what, cause)`.
+
+        `reason` is the short plain reason the notice gets (one of the `_REASON_*` constants); the exception itself (`what`, type
+        and text) is only in the log line below and in the raised error, never in the notice (Hana's 11-18b point 2).
+
+        The notice (`engine_files.settle_rebuild_notice`, Hana's point 5) is written before the raise, so the window can say the
+        switch-over did not complete when the start goes on with the saved state. It is written only while the persona is not
+        switched over: a switched persona's failed roll-forward comes through here too and gets none (it stays logged).
+        """
         logger.error("emotion engine: %s failed (%s: %s); start-up stops", what, type(cause).__name__, cause, exc_info=cause)
+        engine_files.settle_rebuild_notice(self.persona_dir, reason)
         raise EngineStartupError(what, cause) from cause
 
-    def _locked_rebuild(self, mode: str, needed: Callable[[], bool], *, found_unreadable: bool = False) -> None:
+    def _locked_rebuild(
+        self,
+        mode: str,
+        needed: Callable[[], bool],
+        *,
+        found_unreadable: bool = False,
+        roll_forward: bool = False,
+        wait_for_lock: bool = False,
+    ) -> None:
         """Take the engine lock ONCE, ask `needed()` under it, and rebuild in `mode` ("first" or "recovery") if it says so.
 
         The one place that holds the lock for a rebuild, so "lock taken once" is true by construction. `needed` runs with the
         lock held (a re-check: another process may have done the work while this one waited). The clock is read inside the
         hold, once, and is the clock `faded_value` uses. The peer-trust memo is made for this call (`_replay_modifier_with_memo`)
-        and dropped when the call ends, success or failure. A failure (a lock that did not come within its wait, a failed
-        rebuild) is logged and raised as `EngineStartupError`.
+        and dropped when the call ends, success or failure. A failure (a failed rebuild, or a lock that did not come within its
+        wait when `wait_for_lock` is False) is logged and raised as `EngineStartupError` (through `_start_failed`, which also records
+        the rebuild notice while the persona is not switched over; the supervisor job's recovery rebuild raises directly and records none).
+
+        `wait_for_lock` (True from `ensure_ready` and `_roll_forward`, the rebuild process's steps) turns a lock that did not
+        come into a wait: the lock is tried again, one `EMOTION_LOCK_WAIT_S` step after another, each logged through
+        `warn_throttled`, until it comes. There is no stop check and no limit (S101: "the startup waits until the rebuild is
+        finished"). Only a lock that did not come is waited for, never a `LockTimeoutError` raised inside `needed()` or the
+        rebuild. The default False (`recovery_rebuild`, the supervisor job) keeps the one wait and the failure.
 
         One exception to that: `found_unreadable` is True when `ensure_ready` found the state unreadable. Then, in first mode
         only, a `RebuildStateWriteError` (the rebuild's own state write failed with an `OSError`) skips the switch-over for this
-        start: one warning names the state file and the error, start-up goes on, and the next start tries again (the persona
+        start: one warning names the state file and the error, the rebuild notice records why (`settle_rebuild_notice`; the
+        persona is not switched over, so the window can show it), start-up goes on, and the next start tries again (the persona
         stays not live until the fault is cleared). Derived from S61's fail-safe (an I/O fault: skip and retry); the rejected
         alternative is to let the `OSError` stop start-up at every start, which S61 rules out. Accepted edges (P4, owner S88): the
         rebuild empties the queue before its state write, so each skipped start loses that start's queued changes (the E7.18
         class); recovery mode is unchanged: it never skips, the supervisor's recovery job logs once per active day and retries
         at the next idle pass.
+
+        A FIRST rebuild also writes the progress record (`engine_files.EngineProgress`, "rebuilding"), in two places. While it
+        WAITS for the lock (`wait_for_lock`), one record is written with no count at the top of every pass of the wait loop,
+        before the lock is tried, so a write another live process's record refused, or a record that vanished (the x10 step's
+        removal on a first switch-over), is written again at the next wait step; it is removed when the function exits, by any
+        path (a retry is not an exit). Inside the lock hold a record is written with no count, with the total once the window is
+        read, then on each whole-number percentage of the rows folded, and removed before the lock hold ends, success or failure.
+        A write or removal that fails is logged and never fails the rebuild. The recovery rebuild of the supervisor job writes
+        none (it runs after start-up, and its `wait_for_lock` is False).
+
+        `roll_forward` (only `_roll_forward`, with `mode` "recovery"; anything else is a ValueError) is the start-up's rebuild of
+        a roll-forward: a start-up step, so it gets what the first rebuild gets (the progress record, and `_start_failed` for a
+        failure that is not one of the next sentence, not the supervisor job's silent raise). An error of the rebuild's own work
+        (`RebuildCheckError`, `RebuildStateWriteError`, `OSError`, which includes a `LockTimeoutError` raised inside it) while
+        the lock is held is logged by `_roll_forward_failed` and start-up goes on (HR1b (a)). A lock that does not come behaves
+        as for the first rebuild.
         """
+        if roll_forward and mode != "recovery":
+            raise ValueError(f"roll_forward is a recovery-mode rebuild, found mode {mode!r}")
         modifier_of = self._replay_modifier_with_memo()
-        held = False
+        # The record of the WAIT (Hana's 11-18 review of #633, point 1; Planning's HRV answer). On a first switch-over the x10 step
+        # replaces the rebuild child's "rebuilding" record (same pid) and removes it, and the in-lock record below is written only
+        # once the lock comes, so a rebuild that waits for the lock would show nothing and the app's 60 s start drop could fire.
+        # So one record is written at the top of each pass, before the lock is tried (a write refused because another live
+        # process's record is there is tried again at each wait step, and a record that vanished is written again), and removed
+        # when the function exits by any path (a retry `continue` is not an exit). The write, its retry and its removal are in
+        # this one function, which owns the wait. Only a rebuild that waits and that shows its progress has one: the supervisor
+        # job's recovery rebuild (`wait_for_lock` False) writes none. A first or roll-forward start whose `needed()` turns out
+        # False (another process switched over) shows this record for that moment and removes it: accepted (P4), harmless.
+        wait_progress = (
+            engine_files.EngineProgress(self.persona_dir, "rebuilding") if wait_for_lock and (mode == "first" or roll_forward) else None
+        )
         try:
-            with engine_files.state_lock(self.persona_dir):
-                held = True
-                if not needed():
+            while True:
+                if wait_progress is not None:
+                    wait_progress.write()
+                held = False
+                try:
+                    with engine_files.state_lock(self.persona_dir):
+                        held = True
+                        if not needed():
+                            return
+                        now = self._now()
+                        # The first rebuild shows its progress (HR5 of #633, owner S102): a record beside the bridge's files that
+                        # the status reads. Written inside the lock hold too, with the counts, and removed before it ends, success
+                        # or failure (the wait's record above is removed when the function exits). The supervisor's recovery job
+                        # runs after start-up: no record. A roll-forward's rebuild is a start-up step like the first one and shows
+                        # it (HR1 (1) of #633).
+                        progress = (
+                            engine_files.EngineProgress(self.persona_dir, "rebuilding") if mode == "first" or roll_forward else None
+                        )
+                        try:
+                            if progress is not None:
+                                progress.write()
+                            engine_rebuild.rebuild(
+                                self.persona_dir,
+                                mode,
+                                now,
+                                faded_emotions_of=self._replay_emotions,
+                                modifier_of=modifier_of,
+                                switch_over_at=self._switch_over_at,  # a recovery carries it when no readable copy of the state does
+                                on_progress=None if progress is None else progress.report,
+                            )
+                        finally:
+                            if progress is not None:
+                                progress.remove()
+                        if mode == "first":
+                            # The verified write recorded it: this instance has now seen the persona switched over (as `is_live`
+                            # would on its next call), so a state lost later in this process is a recovery, not an unknown.
+                            self._switch_over_at = lenient_utc(now)
                     return
-                now = self._now()
-                engine_rebuild.rebuild(
-                    self.persona_dir,
-                    mode,
-                    now,
-                    faded_emotions_of=self._replay_emotions,
-                    modifier_of=modifier_of,
-                    switch_over_at=self._switch_over_at,  # a recovery carries it when no readable copy of the state does
-                )
-                if mode == "first":
-                    # The verified write recorded it: this instance has now seen the persona switched over (as `is_live` would
-                    # on its next call), so a state lost later in this process is a recovery, not an unknown.
-                    self._switch_over_at = lenient_utc(now)
-        except Exception as exc:  # noqa: BLE001 - every failure is named and raised as the start-up error
-            if isinstance(exc, engine_rebuild.RebuildStateWriteError) and mode == "first" and found_unreadable:
-                logger.warning(
-                    "emotion engine: the rebuilt state could not be written to %s (%s: %s), so this start skips the switch-over "
-                    "and the next start tries again",
-                    exc.path,
-                    type(exc.cause).__name__,
-                    exc.cause,
-                )
-                return
-            what = f"the {mode} rebuild" if held else "the engine lock"
-            if mode == "recovery":
-                # Not a start-up: the recovery job (`recovery_job_run`) logs the failure once per active day, so a rebuild that
-                # keeps failing does not write an error line, with a traceback, on every quiet pass.
-                raise EngineStartupError(what, exc) from exc
-            self._start_failed(what, exc)
+                except Exception as exc:  # noqa: BLE001 - every failure is named and raised as the start-up error
+                    if wait_for_lock and not held and isinstance(exc, LockTimeoutError):
+                        # Hana's review of #633, point 5 (owner S101: "The startup waits until the rebuild is finished"): another
+                        # process holds the lock, most likely a rebuild a dropped start left running, which runs as long as it
+                        # runs. Wait one more step (`state_lock` bounds each at `EMOTION_LOCK_WAIT_S`); this runs only in the
+                        # rebuild process, whose starter ended the bridge and the commands first, so there is no stop to check and
+                        # no limit. Only a lock that did not come is waited for (`held` is False): a `LockTimeoutError` raised
+                        # inside `needed()` or the rebuild is a failure of that step and is never retried. When the lock comes,
+                        # `needed()` decides under it: the holder finished the switch-over (nothing to do), or failed and this
+                        # start runs the rebuild.
+                        # Accepted edge (P4, R2, B47b HR5 (7) as narrowed by B55 HS8 and B57 HSC (4)): a lock held by something
+                        # that is not a rebuild (a hung hook or drain, or an MCP server run by hand outside the product; a reading
+                        # of well under 1 in 10,000 starts, not measured). The rebuild child shows its "rebuilding" record, also on
+                        # a first switch-over (the record of the wait is written before each wait step, and again at the next step
+                        # if it was removed or refused meanwhile), and the start waits for ever: no stop check, no limit (S101).
+                        warn_throttled(
+                            logger,
+                            f"engine:lock-wait:{self.persona_dir}",
+                            "emotion engine: the engine lock of %s is held by another process (a rebuild, a hook or a drain), so "
+                            "start-up waits for it",
+                            self.persona_dir,
+                            exc_info=False,
+                        )
+                        continue
+                    if isinstance(exc, engine_rebuild.RebuildStateWriteError) and mode == "first" and found_unreadable:
+                        logger.warning(
+                            "emotion engine: the rebuilt state could not be written to %s (%s: %s), so this start skips the "
+                            "switch-over and the next start tries again",
+                            exc.path,
+                            type(exc.cause).__name__,
+                            exc.cause,
+                        )
+                        engine_files.settle_rebuild_notice(self.persona_dir, _REASON_UNWRITABLE)
+                        return
+                    if roll_forward and held and isinstance(exc, engine_rebuild.RebuildCheckError | engine_rebuild.RebuildStateWriteError | OSError):
+                        self._roll_forward_failed(exc)
+                        return
+                    what = ("the roll-forward rebuild" if roll_forward else f"the {mode} rebuild") if held else ENGINE_LOCK_STEP
+                    if not held:
+                        plain = _REASON_LOCK
+                    else:
+                        plain = _REASON_ROLL_FORWARD if roll_forward else _REASON_FIRST_REBUILD
+                    if mode == "recovery" and not roll_forward:
+                        # Not a start-up: the recovery job (`recovery_job_run`) logs the failure once per active day, so a rebuild
+                        # that keeps failing does not write an error line, with a traceback, on every quiet pass.
+                        raise EngineStartupError(what, exc) from exc
+                    self._start_failed(what, exc, plain)
+        finally:
+            if wait_progress is not None:
+                wait_progress.remove()
 
     def needs_recovery(self) -> bool:
         """True when a live persona's state cannot be used: missing or unreadable (through the cache), or the catch-up-failed flag is set.
@@ -1085,9 +1309,29 @@ def engine_for(persona_dir: Path) -> EmotionEngine:
 def ensure_engine_ready(persona_dir: Path) -> None:
     """Make the engine ready to run: `engine_for(persona_dir).ensure_ready()`, so a test stub that patches `engine_for` gets the call.
 
-    Raises `EngineStartupError(what, cause)` when the switch-over fails; a failure stops start-up.
+    Raises `EngineStartupError(what, cause)` when the switch-over fails; a failure stops start-up. The one caller in the product
+    is the rebuild process (`nell supervisor rebuild`); a lock held by another process is waited for until it comes (see
+    `ensure_ready`).
     """
     engine_for(persona_dir).ensure_ready()
+
+
+def start_rebuild_needed(persona_dir: Path) -> bool:
+    """Whether a start must run the rebuild process first (S107, HS2 of #633): the persona is not switched over, or a roll-forward is due.
+
+    True when the engine is not live (`is_live`: not switched, no state, an unreadable state; lock-free), otherwise
+    `engine_rebuild.rolled_forward` on a fresh read of the state at the engine's own clock. It takes no lock and writes nothing.
+    It repeats the two checks `ensure_ready` makes (its switched test and `_roll_forward`); `ensure_ready`'s own branch stays and
+    `test_start_rebuild_needed.py` keeps the two in step. `ensure_ready` decides from the engine's state cache and this reads the
+    file, as `_roll_forward_needed` does under the lock: in a starter or a fresh child the two cannot differ.
+
+    A failed read of the roll-forward check raises (`engine_rebuild.rolled_forward`'s own contract); the caller logs it.
+    The rebuild itself runs in `nell supervisor rebuild` (`cli._supervisor_rebuild_handler`), which calls `ensure_engine_ready`.
+    """
+    instance = engine_for(persona_dir)
+    if not instance.is_live():
+        return True
+    return engine_rebuild.rolled_forward(persona_dir, engine_files.read_state(persona_dir), instance._now())
 
 
 def recovery_job_run(persona_dir: Path) -> bool:

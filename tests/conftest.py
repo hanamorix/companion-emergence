@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
 import inspect
 import os
 import subprocess
@@ -32,6 +33,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     from tests.no_base_failure import marker_problems
 
     problems = marker_problems(items) + marker_problems(items, "slow")
+    problems += marker_problems(items, "real_rebuild_step") + marker_problems(items, "real_rebuild_child")
     if problems:
         raise pytest.UsageError("\n".join(problems))
 
@@ -415,6 +417,131 @@ def _no_real_service_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("brain.bridge.kill.service_installed", lambda persona, platform=None: False, raising=False)
 
 
+class FakeRebuildChild:
+    """The handle `RebuildPopenRecorder` returns for the rebuild child: `pid`, `poll()`, `wait()`, `kill()` and `returncode`.
+
+    `poll()` answers None for the first `running_polls` calls (the child "still runs"), then `exit_code`; `kill()` ends it with -9.
+    `killed`, `waited` and `poll_calls` say what the code under test did to it.
+    """
+
+    def __init__(self, *, running_polls: int = 0, exit_code: int = 0) -> None:
+        self.pid = 424242
+        self.returncode: int | None = None
+        self.running_polls = running_polls
+        self.exit_code = exit_code
+        self.poll_calls = 0
+        self.killed = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        self.poll_calls += 1
+        if self.returncode is None and self.poll_calls > self.running_polls:
+            self.returncode = self.exit_code
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = self.exit_code
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+
+class RebuildPopenRecorder:
+    """Stands in for `subprocess.Popen` as `brain.bridge.daemon` sees it, in a test marked `real_rebuild_step`.
+
+    It answers only an argv that holds "supervisor" and "rebuild" (the rebuild child): the call is kept in `calls` as
+    `(argv, kwargs)` and a `FakeRebuildChild` is returned (`children`), set up from `running_polls` and `exit_code`; `error`, when
+    set, is raised instead of spawning. Any other spawn goes to `subprocess.Popen`, looked up in the real module when it is
+    called, so a test's own patch of that name takes effect.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.children: list[FakeRebuildChild] = []
+        self.running_polls = 0
+        self.exit_code = 0
+        self.error: BaseException | None = None
+
+    def __call__(self, argv: Any, *args: Any, **kwargs: Any) -> Any:
+        if not (isinstance(argv, (list, tuple)) and "supervisor" in argv and "rebuild" in argv):
+            return subprocess.Popen(argv, *args, **kwargs)
+        self.calls.append((list(argv), dict(kwargs)))
+        if self.error is not None:
+            raise self.error
+        child = FakeRebuildChild(running_polls=self.running_polls, exit_code=self.exit_code)
+        self.children.append(child)
+        return child
+
+
+class RealPopenSpyLog:
+    """What a test marked `real_rebuild_child` gets: `popen` is `_RealPopenSpy`, a pass-through subclass of the real module's
+    `subprocess.Popen` built when the test runs, and `children` holds every handle it made (a real spawn, the handle kept)."""
+
+    def __init__(self) -> None:
+        self.children: list[subprocess.Popen] = []
+        log = self.children
+
+        class _RealPopenSpy(subprocess.Popen):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                log.append(self)
+
+        self.popen = _RealPopenSpy
+
+
+@pytest.fixture(autouse=True)
+def _no_real_rebuild_child(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> RebuildPopenRecorder | RealPopenSpyLog | None:
+    """S107 (HS-T): no test may spawn the real rebuild child (`nell supervisor rebuild`) or leave a command run record behind.
+
+    Unless the test carries `@pytest.mark.real_rebuild_step(reason=...)`, `brain.bridge.daemon._rebuild_needed` answers False
+    (so a start, a run or a command on a temp persona has no rebuild to run) and `engine_files.register_command_run` does nothing
+    (the commands call it through the module). The patch imports `brain.emotion.engine_files` at setup, so a command that
+    imports it lazily later gets the no-op too and writes no record and registers no `atexit` hook.
+
+    For a test with the marker, the daemon module's `subprocess` name is replaced by a copy of the module (a
+    `types.SimpleNamespace` of `vars(subprocess)`) whose `Popen` alone differs, so no other module's spawn is touched: a
+    `RebuildPopenRecorder` (also returned by the `rebuild_spawns` fixture), or, for a test that also carries
+    `@pytest.mark.real_rebuild_child(reason=...)`, a `RealPopenSpyLog`'s spy class, which spawns for real. A test that patches
+    "brain.bridge.daemon.subprocess.Popen" by string path overwrites the replacement; its own patch takes effect.
+
+    Every patch is `raising=False` and string-path, so a base without these names only sets an attribute nothing reads (the
+    new-tests-fail-on-base check runs this conftest against old product code). The `daemon` patches import
+    `brain.bridge.daemon` in every test (a `sys.modules` guard would miss a lazy first import), and the `engine_files` one imports
+    `brain.emotion.engine_files` for the same reason, unless a base has no such module (`importlib.util.find_spec`).
+    (`_reset_emotion_engine_registry` keeps its own `sys.modules` guard on purpose: it must not import the engine.)
+    """
+    if request.node.get_closest_marker("real_rebuild_step") is None and request.node.get_closest_marker("real_rebuild_child") is None:
+        monkeypatch.setattr("brain.bridge.daemon._rebuild_needed", lambda *args, **kwargs: False, raising=False)
+        # The string path imports the module here, so a command that imports it later gets this no-op. A base without the module
+        # (the new-tests-fail-on-base check runs this conftest against old product code) has nothing to patch.
+        if importlib.util.find_spec("brain.emotion.engine_files") is not None:
+            monkeypatch.setattr("brain.emotion.engine_files.register_command_run", lambda persona_dir: None, raising=False)
+        return None
+    import types
+
+    spawns: RebuildPopenRecorder | RealPopenSpyLog
+    if request.node.get_closest_marker("real_rebuild_child") is not None:
+        spawns = RealPopenSpyLog()
+        popen: Any = spawns.popen
+    else:
+        spawns = popen = RebuildPopenRecorder()
+    module = types.SimpleNamespace(**vars(subprocess))
+    module.Popen = popen
+    monkeypatch.setattr("brain.bridge.daemon.subprocess", module, raising=False)
+    return spawns
+
+
+@pytest.fixture
+def rebuild_spawns(_no_real_rebuild_child: RebuildPopenRecorder | RealPopenSpyLog | None) -> RebuildPopenRecorder | RealPopenSpyLog:
+    """The recorder (or the real spy's log) of the rebuild child's spawns; the test must carry `real_rebuild_step`."""
+    assert _no_real_rebuild_child is not None, "mark the test @pytest.mark.real_rebuild_step(reason=...)"
+    return _no_real_rebuild_child
+
+
 @pytest.fixture(autouse=True)
 def _reset_pass2_queue() -> Iterator[None]:
     """Reset pass2_queue global state before and after each test.
@@ -512,7 +639,10 @@ class EmotionEngineStub:
         return self.engine_status
 
     def ensure_ready(self) -> None:
-        """What `engine.ensure_engine_ready(<directory>)` reaches through the patched `engine_for`: recorded, and nothing happens."""
+        """What `engine.ensure_engine_ready(<directory>)` reaches through the patched `engine_for`: recorded, and nothing happens.
+
+        Only the rebuild process calls it (`nell supervisor rebuild`); the bridge and the commands do not.
+        """
         self.recorded_calls.append(("ensure_ready",))
 
     def needs_recovery(self) -> bool:

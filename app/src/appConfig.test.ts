@@ -159,3 +159,117 @@ describe("ensureBridgeRunning: a start already under way (#456 review R2-M1)", (
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("ensureBridgeRunning: the engine's start-up progress (HR5 parts 4 and 5)", () => {
+  const EXIT_2 = "supervisor start failed (exit 2): bridge already starting (lockfile held)";
+  const REC = { phase: "rebuilding", done: 3, total: 9 };
+  let shown = true;
+
+  /** The Tauri side: credentials, the start command (`start`), and the status with or without the record. */
+  function tauri(start: () => Promise<unknown>) {
+    mockInvoke.mockImplementation(async (cmd) => {
+      if (cmd === "get_bridge_credentials") return { port: 41001, auth_token: "tok" };
+      if (cmd === "ensure_bridge_running") return start();
+      if (cmd === "bridge_status") return { alive: "alive", engine_progress: shown ? REC : null };
+      return undefined;
+    });
+  }
+
+  function healthNeverAnswers() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }),
+    );
+  }
+
+  beforeEach(async () => {
+    const { resetBridgeCredentialCache } = await import("./bridge");
+    resetBridgeCredentialCache();
+    shown = true;
+    vi.useFakeTimers();
+    vi.stubEnv("DEV", false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("the wait for a start under way (exit 2) goes past 30 s while the record shows, then gives up at its budget", async () => {
+    const { ensureBridgeRunning } = await import("./appConfig");
+    tauri(async () => {
+      throw EXIT_2;
+    });
+    healthNeverAnswers();
+    const settled = vi.fn();
+    const p = ensureBridgeRunning("alice");
+    const caught = p.catch((e) => e);
+    caught.then(settled);
+    await vi.advanceTimersByTimeAsync(HEALTH_WAIT_MS * 3);
+    expect(settled).not.toHaveBeenCalled();
+    shown = false;
+    await vi.advanceTimersByTimeAsync(HEALTH_WAIT_MS * 2);
+    expect(await caught).toBe(EXIT_2);
+  });
+
+  it("the exit-2 wait passes each reading to the callback", async () => {
+    const { ensureBridgeRunning } = await import("./appConfig");
+    tauri(async () => {
+      throw EXIT_2;
+    });
+    healthNeverAnswers();
+    const seen: unknown[] = [];
+    const p = ensureBridgeRunning("alice", (r) => seen.push(r));
+    const caught = p.catch((e) => e);
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(seen).toContainEqual(REC);
+    shown = false;
+    await vi.advanceTimersByTimeAsync(HEALTH_WAIT_MS * 2);
+    await caught;
+    expect(seen[seen.length - 1]).toBeNull();
+  });
+
+  it("shows the progress while the ordinary blocking start runs, and stops when it settles", async () => {
+    const { ensureBridgeRunning } = await import("./appConfig");
+    let finish!: () => void;
+    tauri(() => new Promise<void>((res) => (finish = res)));
+    const seen: unknown[] = [];
+    const p = ensureBridgeRunning("alice", (r) => seen.push(r));
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    expect(seen[0]).toEqual(REC);
+    const statusReads = () => mockInvoke.mock.calls.filter(([cmd]) => cmd === "bridge_status").length;
+    finish();
+    await expect(p).resolves.toBeUndefined();
+    const after = statusReads();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(statusReads()).toBe(after); // the status loop ended with the start
+  });
+
+  it("a start with no callback reads no status and shows nothing", async () => {
+    const { ensureBridgeRunning } = await import("./appConfig");
+    let finish!: () => void;
+    tauri(() => new Promise<void>((res) => (finish = res)));
+    const p = ensureBridgeRunning("alice");
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(mockInvoke.mock.calls.filter(([cmd]) => cmd === "bridge_status")).toHaveLength(0);
+    finish();
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it("a start that fails still ends the loop and throws the start's error", async () => {
+    const { ensureBridgeRunning } = await import("./appConfig");
+    let fail!: (e: unknown) => void;
+    tauri(() => new Promise<void>((_res, rej) => (fail = rej)));
+    const seen: unknown[] = [];
+    const p = ensureBridgeRunning("alice", (r) => seen.push(r));
+    const caught = p.catch((e) => e);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(seen.length).toBeGreaterThanOrEqual(1);
+    fail("supervisor start failed (exit 1): persona directory not found");
+    expect(await caught).toMatch(/exit 1/);
+  });
+});

@@ -30,6 +30,8 @@ from brain.memory.store import Memory, MemoryStore
 from brain.utils import file_ops
 from tests.unit.brain.emotion._engine_support import (
     LockSpy,
+    OtherHolder,
+    WaitLog,
     change,
     install,
     local_day,
@@ -155,7 +157,9 @@ def test_a_first_start_runs_x10_takes_the_lock_once_empties_the_queue_and_writes
     assert state_of(persona).saved_at == state_of(persona).reset_at == NOW
 
 
-def test_a_second_start_returns_with_no_store_open_and_no_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_second_start_takes_no_lock_runs_no_rebuild_and_opens_the_store_only_for_the_roll_forward_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     persona = _standard_persona(tmp_path)
     instance = _ensure(persona)
     before = tree(persona)
@@ -163,7 +167,9 @@ def test_a_second_start_returns_with_no_store_open_and_no_lock(tmp_path: Path, m
     opened = _Spy(monkeypatch)
     ensure_engine_ready(persona)  # the same engine, which has seen the switch
     EmotionEngine(persona.resolve(), now=lambda: NOW).ensure_ready()  # a new process: it asks the file
-    assert spy.calls == 0 and opened.opened == []
+    # a switched persona's start reads its rows once (the HR1 start check, `engine_rebuild.rolled_forward`, one open per start):
+    # nothing newer than the last save, so no lock, no transaction and no write
+    assert spy.calls == 0 and opened.opened == ["rebuild", "rebuild"]
     assert tree(persona) == before
     assert instance.is_live()
 
@@ -284,19 +290,21 @@ def test_a_state_write_that_does_not_verify_is_a_failed_check_and_writes_no_swit
     assert engine_files.read_state(persona).state is None  # nothing was written, so the persona is not switched over
 
 
-def test_a_lock_that_does_not_come_raises_naming_the_lock_and_writes_nothing_after_the_x10_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_lock_that_does_not_come_is_waited_for_and_the_first_rebuild_runs_when_it_frees_after_the_x10_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = _standard_persona(tmp_path)
     install(persona, NOW)
     # A real second holder of the engine lock, with the wait cut to 0.05 s: patching the lock to raise would not prove that
-    # the lock `ensure` takes is the one the other holder has (the only real wait in this file).
+    # the lock `ensure` takes is the one the other holder has (the only real wait in this file). The start-up rebuild waits for
+    # it for ever (S101, S107: it runs in the rebuild process), so the holder lets go at the second wait step.
     monkeypatch.setattr(dev_constants, "EMOTION_LOCK_WAIT_S", 0.05)
-    with engine_files.state_lock(persona), pytest.raises(EngineStartupError) as failure:
+    holder = OtherHolder(persona)
+    waits = WaitLog(monkeypatch, on_step={2: holder.release})
+    try:
         ensure_engine_ready(persona)
-    assert failure.value.what == "the engine lock"
-    assert not engine_files.state_path(persona).exists()
-    monkeypatch.undo()
-    ensure_engine_ready(persona)  # the x10 progress note is already 2, the rebuild runs: idempotent
-    assert state_of(persona).switch_over_at == NOW
+    finally:
+        holder.release()
+    assert waits.steps == 2
+    assert state_of(persona).switch_over_at == NOW  # the x10 fix ran before the lock; the rebuild ran once the lock came
 
 
 def test_an_x10_error_raises_naming_the_fix_takes_no_lock_and_writes_no_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1205,3 +1213,138 @@ def test_ensure_engine_ready_calls_ensure_ready_through_engine_for(tmp_path: Pat
     assert engine.engine_for(tmp_path) is emotion_engine_stub
     ensure_engine_ready(tmp_path)
     assert emotion_engine_stub.recorded_calls == [("ensure_ready",)]
+
+
+# ================================================================================================
+# The rebuild notice: every way the switch-over does not complete (Hana's 11-18 review of #633, point 5; owner S112)
+# ================================================================================================
+
+
+def _notice(persona: Path) -> str | None:
+    record = engine_files.read_rebuild_notice(persona)
+    return None if record is None else record["reason"]
+
+
+def test_case_1_a_failed_rebuild_leaves_a_notice_naming_the_step_and_the_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    install(persona, NOW)
+    monkeypatch.setattr(engine_files, "state_to_json", lambda state: (_ for _ in ()).throw(ValueError("forced")))
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    reason = _notice(persona)
+    assert reason == "rebuilding the saved feelings failed"  # the error itself (RebuildCheckError and its text) is only in the log
+    monkeypatch.undo()
+    ensure_engine_ready(persona)  # the fault is gone: the start completes; the rebuild child's own call (the cli handler) then clears the notice
+    engine_files.settle_rebuild_notice(persona, None)
+    assert _notice(persona) is None
+
+
+def test_the_raw_error_is_in_the_log_and_not_in_the_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hana's 11-18b point 2: the notice holds a short plain reason, the exception text stays in the log line the site already writes."""
+    persona = _standard_persona(tmp_path)
+    install(persona, NOW)
+    monkeypatch.setattr(_x10(), "scale_up_small_feelings", lambda p: (_ for _ in ()).throw(RuntimeError("raw secret detail")))
+    caplog.set_level(logging.ERROR, logger="brain.emotion.engine")
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert any("raw secret detail" in r.getMessage() for r in caplog.records)
+    reason = _notice(persona)
+    assert reason is not None and "raw secret detail" not in reason and "RuntimeError" not in reason
+
+
+def test_case_2_an_x10_error_and_an_integrity_failure_on_a_readable_state_leave_a_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path / "x10")
+    install(persona, NOW)
+    monkeypatch.setattr(_x10(), "scale_up_small_feelings", lambda p: (_ for _ in ()).throw(RuntimeError("rolled back")))
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert _notice(persona) == "rescaling the saved feelings failed"
+    monkeypatch.undo()
+
+    other = _standard_persona(tmp_path / "integrity")
+    install(other, NOW)
+
+    def refuse(*args: object, **kwargs: object):
+        raise BrainIntegrityError("memories.db", "page 3 is damaged")
+
+    monkeypatch.setattr(_x10(), "MemoryStore", refuse)
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(other)
+    reason = _notice(other)
+    assert reason == "the memory database failed its check"
+    assert "page 3 is damaged" not in reason
+
+
+def test_a_lock_file_that_cannot_be_opened_leaves_a_notice_naming_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    install(persona, NOW)
+
+    def unopenable(persona_dir: Path) -> None:
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(engine_files, "state_lock", unopenable)
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert _notice(persona) == "the saved feelings could not be opened for the update"  # written before the raise: it is there once it propagated
+
+
+def test_case_3_a_state_and_a_database_that_both_cannot_be_read_skip_the_start_and_leave_a_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona = _standard_persona(tmp_path)
+    save(persona, simple_state(saved_at=T[39]))
+    ruin_the_state(persona)
+    install(persona, NOW)
+
+    def broken(*args: object, **kwargs: object):
+        raise BrainIntegrityError("memories.db", "page 7 is damaged")
+
+    monkeypatch.setattr(_x10(), "MemoryStore", broken)
+    ensure_engine_ready(persona)  # returns: the start is skipped, not failed
+    reason = _notice(persona)
+    assert reason == "the saved feelings and the memory database could not be read"  # "page 7 is damaged" is only in the log
+    monkeypatch.undo()
+    ensure_engine_ready(persona)  # the next start completes; the rebuild child's own call (the cli handler) then clears the notice
+    engine_files.settle_rebuild_notice(persona, None)
+    assert _notice(persona) is None
+
+
+def test_case_4_a_state_write_that_fails_on_an_unreadable_state_skips_the_start_and_leaves_a_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    persona = _standard_persona(tmp_path)
+    save(persona, simple_state(saved_at=T[39]))
+    ruin_the_state(persona)
+    install(persona, NOW)
+
+    def crash(*args: object, **kwargs: object) -> bool:
+        raise OSError("disk fault on the state write")
+
+    monkeypatch.setattr(engine_files, "save_state", crash)
+    ensure_engine_ready(persona)  # returns: the start is skipped, not failed
+    reason = _notice(persona)
+    assert reason == "the rebuilt feelings could not be written to disk"  # the path and the OSError are only in the log
+
+
+@pytest.mark.no_base_failure(reason="a pin of the rule's other half: on base no notice is ever written, so a switched persona trivially has none")
+def test_a_roll_forward_failure_of_a_switched_persona_stops_start_up_and_leaves_no_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _standard_persona(tmp_path)
+    make_live(persona, T[39])
+    install(persona, NOW)
+    monkeypatch.setattr(engine_rebuild, "rolled_forward", lambda *args, **kwargs: True)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ValueError("the rebuild broke")  # not one of the three errors a roll-forward goes on after: it stops start-up
+
+    monkeypatch.setattr(engine_rebuild, "rebuild", boom)
+    with pytest.raises(EngineStartupError) as failure:
+        ensure_engine_ready(persona)
+    assert failure.value.what == "the roll-forward rebuild"
+    assert not engine_files.rebuild_notice_path(persona).exists()  # a switched persona is never given a notice
+    # and a notice an earlier attempt left on the persona is deleted by the same call
+    engine_files.rebuild_notice_path(persona).write_text('{"pid": 4242, "pid_token": "linux:boot:4242:99", "reason": "old"}', encoding="utf-8")
+    with pytest.raises(EngineStartupError):
+        ensure_engine_ready(persona)
+    assert not engine_files.rebuild_notice_path(persona).exists()

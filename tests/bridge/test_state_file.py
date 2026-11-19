@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+from brain import process_identity
 from brain.bridge import state_file
 
 
@@ -194,3 +197,34 @@ def test_a_healing_reader_never_undoes_or_interleaves_with_the_owners_writes(per
     assert all(pid is not None and pid in range(1, last + 1) for pid in seen)  # every read saw a whole state
     left = [p.name for p in persona_dir.iterdir() if ".tmp" in p.name or p.name.endswith(".new")]
     assert not left, left
+
+
+# ---- update(): the bridge writes only its own record (HN2 moved the own-identity test to process_identity) -----------------
+
+_PIN = "pins what update() already did before the own-identity test moved to process_identity"
+
+
+@pytest.mark.no_base_failure(reason=_PIN)
+def test_update_writes_a_record_with_this_pid_and_no_token_when_this_process_has_none(persona_dir: Path, monkeypatch):
+    monkeypatch.setattr(process_identity, "own_token", lambda: None)
+    state_file.write(persona_dir, _state(os.getpid()))
+    assert state_file.update(persona_dir, lambda s: setattr(s, "port", 1234)) is True
+    assert state_file.read(persona_dir).port == 1234
+
+
+@pytest.mark.no_base_failure(reason=_PIN)
+def test_update_skips_a_record_of_another_pid(persona_dir: Path, monkeypatch):
+    monkeypatch.setattr(process_identity, "own_token", lambda: None)
+    state_file.write(persona_dir, _state(os.getpid() + 1))
+    assert state_file.update(persona_dir, lambda s: setattr(s, "port", 1234)) is False
+    assert state_file.read(persona_dir).port != 1234
+
+
+@pytest.mark.no_base_failure(reason=_PIN)
+def test_update_skips_a_record_with_another_token(persona_dir: Path, monkeypatch):
+    monkeypatch.setattr(process_identity, "own_token", lambda: "linux:mine:1:1")
+    state = _state(os.getpid())
+    state.pid_token = "linux:other:1:1"
+    state_file.write(persona_dir, state)
+    assert state_file.update(persona_dir, lambda s: setattr(s, "port", 1234)) is False
+    assert state_file.read(persona_dir).port != 1234

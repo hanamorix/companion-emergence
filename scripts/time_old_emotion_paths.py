@@ -152,10 +152,9 @@ def _step_vocabulary(scratch: Path, store) -> tuple[int, int]:
 
 
 def _step_start(scratch: Path) -> list[str]:
-    """Start the copy the way the app's start-up does, through `ensure_engine_ready`, and confirm the engine is live.
+    """Start the copy the way the rebuild process (`nell supervisor rebuild`) does, through `ensure_engine_ready`, and confirm the engine is live.
 
-    Run once, after the vocabulary load and before any timing, the order the CLI handlers use (the load, then `ensure`), so the
-    first rebuild sees the same registered names. It is not timed (its cost is the first-rebuild check's). It is the script's
+    Run once, after the vocabulary load and before any timing, so the first rebuild sees the same registered names. It is not timed (its cost is the first-rebuild check's). It is the script's
     one rebuild: the timed calls after it read a live engine, which is what `get_emotional_state` takes its live branch on. A
     commit with no `ensure_engine_ready` is skipped with a printed reason; a copy that is not live afterwards ends the run.
     """

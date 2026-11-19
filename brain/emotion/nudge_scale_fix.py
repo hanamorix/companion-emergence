@@ -94,6 +94,9 @@ def scale_up_small_feelings(persona_dir: Path) -> int | None:
     of the store method (the transaction rolled back, the progress number as it was) or of the queue method (a read fault or a
     failure to set the number: raised before any file is written) also goes out to the caller, which stops the start-up. A
     failed write of a queue file is not one of them: the queue method logs it and goes on.
+
+    While the step runs (from after the skips above until it ends, success or failure) it shows a progress record with phase
+    "rescaling" and no count (`engine_files.EngineProgress`, HR5 of #633); see the comment at the write.
     """
     if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is True:
         return None  # switched; a state that cannot be read (None) goes on: the progress number below decides (Planning B31 SW4)
@@ -101,10 +104,30 @@ def scale_up_small_feelings(persona_dir: Path) -> int | None:
     if file_ops.stat_path(database) is None:
         logger.warning("x10 fix: there is no memories.db, so nothing to multiply and nowhere to record progress; both halves skipped")
         return None
-    store = MemoryStore(database)
+    # The progress record (HR5 of #633, owner S102): written here, once the skips above have passed and BEFORE the checked open below
+    # (a long integrity check or transaction must show it is working), with no store opened for it (the unchecked open writes into
+    # a damaged file) and no count (the fix is one transaction). Removed when the step ends, a step with nothing to do included:
+    # it ends within moments, so the timers pause for that moment only. Never written over another live process's record.
+    # Accepted edge (P4, B47b HR5 (6), as narrowed by S107): the step runs in the rebuild child (`nell supervisor rebuild`), and
+    # starts hold the start lock, so two children overlap only when a child left by a dropped start is still running when the next
+    # start's child begins. If both find no live record inside the same few milliseconds, both write, the later replacing the
+    # earlier. No crash, freeze or data loss, and no kill by the daemon (its readiness wait begins only after the rebuild, and the
+    # starter waits for its child with no limit). If the record's writer ends first, the other child shows no record until its next
+    # write (once this step ends, `_locked_rebuild` writes one at the top of every pass of its lock wait, HRV of #633, so the gap is
+    # this step's length); the app's start wait (lib.rs `wait_for_start`) drops the start only after 60 s with none, which ends the start command,
+    # not the child, and at launch on an unconfirmed overlay a failed start reaches recoverUnhealthyBrain (brainRecovery.ts) and
+    # undoes the update. It needs an orphaned child and a new one inside the same milliseconds on the first start after the update
+    # that brings Engine 6 (well under 1 in 10,000 starts, not measured); closing it needs a lock around the record
+    # (disproportionate).
+    progress = engine_files.EngineProgress(persona_dir, "rescaling")
     try:
-        rows = store.scale_up_small_nudge_rows()
-        PendingQueue(persona_dir).scale_up_small_making_candidates(store)
-        return rows
+        progress.write()
+        store = MemoryStore(database)
+        try:
+            rows = store.scale_up_small_nudge_rows()
+            PendingQueue(persona_dir).scale_up_small_making_candidates(store)
+            return rows
+        finally:
+            store.close()
     finally:
-        store.close()
+        progress.remove()

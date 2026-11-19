@@ -1421,12 +1421,8 @@ def build_app(
         finally:
             _vocab_store.close()
 
-        # The emotion engine's switch-over (Engine 6, spec 3.1 S6): a persona's first start does its x10 fix and first rebuild
-        # here, before anything reads the engine. NOT fail-soft: a failure raises `EngineStartupError` out of the lifespan, so
-        # start-up stops before the supervisor thread is spawned (an emotion state that exists but cannot be read is not a
-        # failure: `ensure` decides from the database's x10 record, rebuilds the state and replaces the unreadable one; only
-        # when `memories.db` cannot be read either does it skip this start and log why).
-        emotion_engine.ensure_engine_ready(persona_dir)
+        # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
+        # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.
 
         # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
         # own failures and never raises.

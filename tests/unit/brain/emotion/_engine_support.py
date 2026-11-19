@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -227,5 +228,50 @@ class LockSpy:
 
 def joy_of(state: EngineState) -> EmotionState:
     return state.emotions["joy"]
+
+
+class OtherHolder:
+    """The engine lock held the way another process's rebuild holds it (flock locks belong to the open file description, so a
+    second open in the same thread conflicts). `release()` lets go; it may be called twice."""
+
+    def __init__(self, persona_dir: Path) -> None:
+        self._stack = contextlib.ExitStack()
+        self._stack.enter_context(engine_files.state_lock(persona_dir))
+
+    def release(self) -> None:
+        self._stack.close()
+
+
+class WaitLog:
+    """The lock-wait lines `EmotionEngine._locked_rebuild` logs through `warn_throttled` (one per wait step), and what to do at each.
+
+    Only a message holding "engine lock" counts (`_roll_forward_failed` also calls `engine.warn_throttled`); the throttle table is
+    process-wide, so the log level proves nothing and the call itself is spied. `steps` is the number of wait steps seen.
+    `on_step` maps the number of a step (1 is the first) to what the OTHER process does at that moment (the holder finishes or
+    fails and lets go); it runs from the spy's call, before the next try of the lock. `fail_on_wait` fails the test at the first
+    wait step (a wrongly retried timeout would otherwise loop for ever). In every mode the test fails after 50 wait steps, so a
+    holder action that never fires fails instead of hanging.
+    """
+
+    MAX_STEPS = 50
+
+    def __init__(self, monkeypatch, *, fail_on_wait: bool = False, on_step: dict[int, Callable[[], None]] | None = None) -> None:  # noqa: ANN001
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.steps = 0
+        real = engine.warn_throttled
+        log = self
+
+        def spy(logger: logging.Logger, key: str, msg: str, *args: object, **kwargs: object) -> None:
+            if "engine lock" in msg:
+                log.steps += 1
+                log.calls.append((key, kwargs))
+                assert not fail_on_wait, "the engine lock was waited for, and this test says it must not be"
+                assert log.steps < WaitLog.MAX_STEPS, "the wait loop never ended"
+                action = (on_step or {}).get(log.steps)
+                if action is not None:
+                    action()
+            real(logger, key, msg, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(engine, "warn_throttled", spy)
 
 

@@ -5,7 +5,8 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
 
 * ``emotion_state.json`` (+ ``.bak1``-``.bak3``): the averages, the weights and a 30-day snapshot per emotion, and the
   persona's one switch-over time, ``switch_over_at`` (the only record that the persona was switched over; there is no separate
-  switch file: ``switch_over_state`` reads "switched" off a loaded state). Written with
+  switch file: ``switch_over_state`` reads "switched" off a loaded state), and ``rows_through``, the highest ``memories``
+  rowid the engine has seen (``EngineState.rows_through``; null when none). Written with
   ``write_json(backups=3, indent=None)``. Read through ``json_io.read_json_walk``, the read-only walk with the validator
   below: a read never heals, quarantines, rotates or rewrites anything, and says which copy it loaded. ``read_state`` reads
   fresh objects (what a drain mutates); ``StateCache`` keeps the parsed state for readers by a stat key.
@@ -20,6 +21,14 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
   Whole files are deleted once they are older than the retention boundary.
 * ``emotion_vocabulary.json`` (the persona's own file, owned by the persona loader and the growth code): only READ here, for
   the half-life cache (``VocabularyHalfLives``, behind ``EmotionEngine.half_life``).
+* ``<persona_dir>/engine_progress.json`` (NOT under ``state/``, and outside the engine lock): the progress record the x10 fix
+  and the first rebuild write while they run, so the app can show the wait (``EngineProgress`` writes it, ``read_engine_progress``
+  returns it while its writer is alive; see the section after ``state_lock``).
+* ``<persona_dir>/rebuild_notice.json`` (also outside the lock): why a switch-over did not complete, while the persona is not
+  switched over, so the window can say so (``settle_rebuild_notice`` writes and clears it, ``read_rebuild_notice`` reads it; see
+  the section after ``EngineProgress``). Unlike the progress record it is not a live writer's: it outlives the process that wrote it.
+* ``<persona_dir>/command_runs/<pid>.json`` (also outside the lock): the run record of each command process that touches the
+  engine, so a start that rebuilds can find and end it (``register_command_run``, ``live_command_runs``).
 
 The lock. ONE lock guards the four files: ``state_lock(persona_dir)``, a non-re-entrant ``file_lock`` of the state file that
 waits at most ``dev_constants.EMOTION_LOCK_WAIT_S`` (``file_lock.locked_within``) and raises ``LockTimeoutError`` when the wait
@@ -49,17 +58,18 @@ interval).
 
 from __future__ import annotations
 
+import atexit
 import logging
 import math
 import reprlib
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from brain import dev_constants, paths
+from brain import dev_constants, paths, process_identity
 from brain.emotion.engine_utils import (
     _MODIFIER_FLOOR,  # with _MODIFIER_SPAN: the range `source_modifier` makes, which a stored modifier is held to
     _MODIFIER_SPAN,
@@ -78,6 +88,7 @@ from brain.health.json_io import (
     Recovery,
     append_jsonl,
     iter_jsonl_raw,
+    read_json,
     read_json_result,
     read_json_walk,
     read_jsonl_from,
@@ -264,6 +275,480 @@ def state_lock(persona_dir: Path) -> AbstractContextManager[None]:
     return file_lock.locked_within(state_path(persona_dir), dev_constants.EMOTION_LOCK_WAIT_S)
 
 
+# ================================================================================================
+# The progress record of a long start-up step (HR5 of #633; owner S101 and S102)
+# ================================================================================================
+#
+# ``engine_progress.json`` sits in the PERSONA directory beside ``bridge.json`` and the bridge's watcher files (not under
+# ``state/``), and is written outside the engine lock's protection: it is a display record, not engine state. Two steps write it,
+# each only when it is running: the x10 fix ("rescaling", no count) and the first rebuild ("rebuilding", with a count). The
+# reader returns it only while its writer is alive (``process_identity.holder_alive``): no age test, no heartbeat, so a live writer
+# counts however long a phase between writes takes. It calls ``json_io`` directly (``brain.emotion`` does not import
+# ``brain.bridge``). It is a LIVE writer's record and says nothing about a step that failed: a switch-over that did not complete
+# is remembered by the rebuild notice (the section after ``EngineProgress``), which outlives its writer.
+
+_PROGRESS_FORMAT_VERSION = 1
+
+
+def progress_path(persona_dir: Path) -> Path:
+    return Path(persona_dir) / dev_constants.ENGINE_PROGRESS_FILENAME
+
+
+def progress_record(
+    *, pid: int, pid_token: str | None, persona: str, phase: str, done: int | None, total: int | None, updated_at: str
+) -> dict[str, Any]:
+    """The record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/engine_progress.json).
+
+    ``phase`` "rescaling" (the x10 fix, no count) or "rebuilding" (the first rebuild, and the rebuild of a roll-forward at start-up); ``done`` and ``total`` are None until
+    the rebuild knows its window (shown as "preparing") and for the x10 step.
+    """
+    return {
+        "version": _PROGRESS_FORMAT_VERSION,
+        "pid": pid,
+        "pid_token": pid_token,
+        "persona": persona,
+        "phase": phase,
+        "done": done,
+        "total": total,
+        "updated_at": updated_at,
+    }
+
+
+def read_progress(persona_dir: Path) -> dict[str, Any] | None:
+    """The record as written, or None when missing or unreadable as a JSON object (like ``shutdown_progress.read_record``)."""
+    try:
+        return read_json(progress_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    except Exception:  # noqa: BLE001 - an unreadable display record is "no record"
+        return None
+
+
+def _pid_of(record: dict[str, Any] | None) -> int | None:
+    """The record's pid when it is a real process number (an int, not a bool, that the platform can hold as a pid), else None.
+
+    A number beyond the platform's range names no process and makes the OS pid check raise; it is "no usable pid" here, so the
+    one liveness test below never has to read that failure as alive (B59 HQD bycatch).
+    """
+    pid = record.get("pid") if isinstance(record, dict) else None
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) and process_identity.is_pid_number(pid) else None
+
+
+def _may_be_alive(pid: int, token: str | None, path: Path) -> bool:
+    """The one liveness test for the records of this module (progress records and command run records): is the writer of the
+    record at ``path`` alive (``holder_alive``: an unknown answer is alive; no token: a pid check)? A check that itself fails
+    counts as alive: a record that may name a live process is never dropped."""
+    try:
+        return process_identity.holder_alive(pid, token)
+    except Exception as exc:  # noqa: BLE001 - undecidable means "may be alive"
+        warn_throttled(
+            logger,
+            f"record-writer:alive:{path}",
+            "emotion engine: could not tell whether the writer of the record %s is alive (%s: %s); read as alive",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+        return True
+
+
+def _writer_alive(record: dict[str, Any], path: Path) -> bool:
+    """Is the process that wrote the progress ``record`` (read from ``path``) alive? No usable pid: not alive."""
+    pid = _pid_of(record)
+    token = record.get("pid_token")
+    return pid is not None and _may_be_alive(pid, token if isinstance(token, str) else None, path)
+
+
+def read_engine_progress(persona_dir: Path) -> dict[str, Any] | None:
+    """The progress record, only while its writer is alive; None for no record, a record that is not a mapping or has no usable
+    pid, and a writer that is gone (a record a crashed or killed process left behind). Feeds ``daemon.status_dict``."""
+    try:
+        record = read_progress(persona_dir)
+        return record if record is not None and _writer_alive(record, progress_path(persona_dir)) else None
+    except Exception:  # noqa: BLE001 - a status read must not fail on a display record
+        return None
+
+
+class EngineProgress:
+    """One start-up step's writer of the progress record. Never raises: a failed write or removal is logged and the step goes on.
+
+    ``write()`` at the start of the step (no count), ``report(done, total)`` as it goes (written only when the whole-number
+    percentage changed, so at most 101 counted writes), ``remove()`` when the step ends, success or failure (the caller's
+    ``finally``). Every write first reads the record there: one that names ANOTHER live process (the x10 step of a second
+    start) is not replaced, and the next write goes through once that record is gone (B47b HR5b (d)). A percentage counts as
+    tried when it is attempted, so a blocked writer does not read the file again for every row. ``remove()`` deletes only a record
+    that names this process's pid and token (``process_identity.is_own_identity``); with no token to read (``own_token()`` is
+    None) the record carries none and is still removed, so a bridge that cannot read its own token does not leave a record
+    that reads as live for as long as it runs. A record that names a token is not removed by a writer with none.
+    """
+
+    def __init__(self, persona_dir: Path, phase: str) -> None:
+        self._persona_dir = Path(persona_dir)
+        self._phase = phase
+        self._last_percent: int | None = None
+
+    def write(self) -> None:
+        """The entry write: this phase, no count."""
+        self._safely("write", self._put, None, None)
+
+    def report(self, done: int, total: int) -> None:
+        self._safely("write", self._report, done, total)
+
+    def remove(self) -> None:
+        self._safely("remove", self._remove)
+
+    def _safely(self, what: str, action: Callable[..., None], *args: int | None) -> None:
+        try:
+            action(*args)
+        except Exception as exc:  # noqa: BLE001 - a display record must never fail the step it describes
+            warn_throttled(
+                logger,
+                f"engine-progress:{what}:{self._persona_dir}",
+                "emotion engine: could not %s the progress record in %s (%s: %s); start-up goes on",
+                what,
+                self._persona_dir,
+                type(exc).__name__,
+                exc,
+                exc_info=False,
+            )
+
+    def _report(self, done: int, total: int) -> None:
+        if total <= 0:
+            return  # an empty window shows no count
+        percent = max(0, min(100, done * 100 // total))
+        if percent == self._last_percent:
+            return
+        self._last_percent = percent
+        self._put(done, total)
+
+    def _put(self, done: int | None, total: int | None) -> None:
+        existing = read_progress(self._persona_dir)
+        if existing is not None and _pid_of(existing) != process_identity.own_pid() and _writer_alive(existing, progress_path(self._persona_dir)):
+            return  # another live process's record (a second start's x10 step): never replaced
+        record = progress_record(
+            pid=process_identity.own_pid(),
+            pid_token=process_identity.own_token(),
+            persona=self._persona_dir.name,
+            phase=self._phase,
+            done=done,
+            total=total,
+            updated_at=iso_utc(datetime.now(UTC)),
+        )
+        write_json(progress_path(self._persona_dir), record, indent=2, sort_keys=True, fsync=False, mode=0o600)
+
+    def _remove(self) -> None:
+        record = read_progress(self._persona_dir)
+        if isinstance(record, dict) and process_identity.is_own_identity(
+            record.get("pid"), record.get("pid_token")
+        ):
+            file_ops.delete_file(progress_path(self._persona_dir))
+
+
+# --- the rebuild notice: a switch-over that did not complete (Hana's 11-18 review of #633, point 5; owner S112) ---------------------
+#
+# ``rebuild_notice.json`` in the PERSONA directory holds why the persona's switch-over did not complete and the bridge started anyway
+# on the state saved before: ``{"pid", "pid_token", "reason": <one line>}`` (the writer's identity in the progress record's shape, so
+# a start can tell the notice its own rebuild child wrote from another; no time is recorded). It exists exactly while, after an attempt, the persona is NOT
+# switched over (``switch_over_state(read_state(...)) is True`` is the test; an unreadable state is not switched), so a switched
+# persona whose roll-forward fails never gets one (that failure stays in the runtime log). ``build_persona_state`` reads it into the
+# window's state; the full error is in the runtime log. ONE writer, ``settle_rebuild_notice``, is called by the engine (the failure
+# points inside the rebuild process) and by the start process (``daemon``: a rebuild child that could not be started or ended
+# non-zero, a need check that failed), and clears it: the rebuild child when its ready step returns (``cli`` handler), the start
+# process when its need check answers no. Not reused: ``shutdown_progress.write_record/read_record`` live in ``brain.bridge``, which the
+# engine may not import, and a daemon-only use would make two writers; ``EngineProgress`` is for a LIVE writer (it refuses another live
+# process's record, removes by pid, is read only while the writer lives), and a failure record must outlive its writer. Also not
+# chosen: a flag derived from ``is_live`` the way ``recovering`` is derived (no file), which cannot say what happened (S112: "saying
+# what happened"; P9b), and the start's stderr line, which the app drops for a start that exits 0. No lock: the
+# write replaces the file atomically, and each writer states a real failure of a not-switched persona, so the last stands.
+
+
+def rebuild_notice_path(persona_dir: Path) -> Path:
+    return Path(persona_dir) / dev_constants.REBUILD_NOTICE_FILENAME
+
+
+def rebuild_notice_record(*, pid: int, pid_token: str | None, reason: str) -> dict[str, Any]:
+    """The record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/rebuild_notice.json).
+
+    ``pid`` and ``pid_token`` name the process that wrote it, in the shape of the progress record, so the start process can ask
+    ``process_identity.names_this_bridge`` whether the notice was written by the rebuild child it launched (no clock is read for that).
+    """
+    return {"pid": pid, "pid_token": pid_token, "reason": reason}
+
+
+def read_rebuild_notice(persona_dir: Path) -> dict[str, Any] | None:
+    """The notice as written, or None when missing, unreadable as a JSON object, or without a text ``reason``. Never raises."""
+    try:
+        record = read_json(rebuild_notice_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    except Exception:  # noqa: BLE001 - an unreadable display record is "no notice"
+        return None
+    reason = record.get("reason") if isinstance(record, dict) else None
+    return record if isinstance(reason, str) and reason else None
+
+
+def settle_rebuild_notice(persona_dir: Path, reason: str | None, *, keep_notice_of: tuple[int, str] | None = None) -> None:
+    """Record, keep or clear the rebuild notice after an attempt. The one writer; never raises.
+
+    ``reason`` is why the switch-over did not complete (made one line here), or None for an attempt that completed or a check that
+    found nothing to do. ``keep_notice_of`` is the ``(pid, token)`` of the rebuild child a start process launched. In order:
+    1. No notice file and ``reason`` None: return (the healthy path costs one stat; a stat that raises is logged and read as "a
+       notice exists", and a notice that cannot be read still counts as existing).
+    2. The persona is switched over: delete the notice and return (a switched persona never has one).
+    3. ``reason`` None: return (the persona is not switched, so what the notice says still holds).
+    4. ``keep_notice_of`` given and the notice names exactly that pid and token (``process_identity.names_this_bridge``): return,
+       the launched child's own, more exact notice stands. Decided by process identity, not by clock times (a clock stepped back
+       while the child ran cannot replace its reason). A notice that cannot be read, or has no identity (a record from before the
+       identity was recorded), or a malformed one, or another process's, is not the child's and is replaced.
+    5. Write the notice with this process's own pid and token, only when the persona folder exists (the writer never creates one).
+
+    A failure of any step is logged by ``warn_throttled`` and the function returns. Accepted edge (P4, HRF red-team G2): a delete that
+    fails (step 2, after the file layer's own retry) leaves a notice on a persona that is now switched over; the window then shows
+    "not brought up to date" until the next start's or command's need check clears it (the reader is a pure read and does not test
+    the state), and the failure is logged. Accepted edge (P4, Hana's point 5): a notice that
+    cannot be written leaves the window showing nothing; the original error is in the runtime log. The notice sits in the persona
+    folder where the bridge's own state file is written, so an unwritable folder mostly stops the bridge too (and the error screen
+    shows); the invisible case needs an incomplete switch-over and only this small write failing, read as well under 1 in 10,000
+    starts (not measured).
+    """
+    stage = "check"
+    try:
+        path = rebuild_notice_path(persona_dir)
+        try:
+            exists = file_ops.stat_path(path) is not None
+        except Exception as exc:  # noqa: BLE001 - read as "a notice exists": the next steps decide
+            _notice_failed(persona_dir, "check", exc)
+            exists = True
+        if not exists and reason is None:
+            return
+        if switch_over_state(read_state(persona_dir)) is True:
+            stage = "delete"
+            file_ops.delete_file(path)
+            return
+        if reason is None:
+            return
+        stage = "read"
+        if keep_notice_of is not None:
+            child_pid, child_token = keep_notice_of
+            if process_identity.names_this_bridge(read_rebuild_notice(persona_dir), child_pid, child_token):
+                return
+        stage = "write"
+        folder = file_ops.stat_path(persona_dir)
+        if folder is None or not folder.is_dir:
+            return
+        record = rebuild_notice_record(
+            pid=process_identity.own_pid(), pid_token=process_identity.own_token(), reason=" ".join(str(reason).split())
+        )
+        write_json(path, record, indent=2, sort_keys=True, fsync=False, mode=0o600)
+    except Exception as exc:  # noqa: BLE001 - a display record must never fail the step it describes
+        _notice_failed(persona_dir, stage, exc)
+
+
+def _notice_failed(persona_dir: Path, stage: str, exc: BaseException) -> None:
+    warn_throttled(
+        logger,
+        f"rebuild-notice:{stage}:{persona_dir}",
+        "emotion engine: could not %s the rebuild notice in %s (%s: %s); the window will not show it",
+        stage,
+        persona_dir,
+        type(exc).__name__,
+        exc,
+        exc_info=False,
+    )
+
+
+# --- the run records of commands (HS3 of #633) ----------------------------------------------------------------------------------
+#
+# One record per command process that touches the engine, ``<persona_dir>/command_runs/<pid>.json``, written when the command
+# starts (``register_command_run``) and removed when it exits. A start that must rebuild reads them (``live_command_runs``) and
+# ends each command named there (``kill.kill_command``), because no other mechanism finds a running command. Like the progress
+# record these are outside the engine lock and are not memory: a failed write or delete is logged and the step goes on. A record that
+# cannot be read is never dropped while the pid in its file name may be alive: the reader returns it marked ``UNREADABLE_RUN_KEY``
+# and the start fails naming its path (B58 HQB Q1).
+
+_COMMAND_RUN_FORMAT_VERSION = 1
+
+# The key of an entry ``live_command_runs`` returns for a record it cannot read whose file-name pid may be alive; the entry has
+# the keys ``pid`` (from the file name) and ``path`` and no token.
+UNREADABLE_RUN_KEY = "unreadable"
+
+
+def command_runs_dir(persona_dir: Path) -> Path:
+    return Path(persona_dir) / dev_constants.COMMAND_RUNS_DIRNAME
+
+
+def command_run_path(persona_dir: Path, pid: int) -> Path:
+    return command_runs_dir(persona_dir) / f"{pid}.json"
+
+
+def command_run_record(*, pid: int, pid_token: str | None, persona: str) -> dict[str, Any]:
+    """The run record's one shape (golden fixture: tests/fixtures/bridge_watcher_files/command_run.json)."""
+    return {"version": _COMMAND_RUN_FORMAT_VERSION, "pid": pid, "pid_token": pid_token, "persona": persona}
+
+
+def register_command_run(persona_dir: Path) -> None:
+    """Write this process's run record and remove it at exit (``atexit``), only if it still names this process.
+
+    A failed write is logged once and the command goes on unregistered: a start cannot then find it. A process that is killed
+    leaves its record; the next ``live_command_runs`` finds the writer dead and deletes it. ``atexit`` does not run on SIGKILL,
+    and not on a signal that ends the process without Python's own exit (SIGTERM with no handler).
+    """
+    persona_dir = Path(persona_dir)
+    record = command_run_record(
+        pid=process_identity.own_pid(), pid_token=process_identity.own_token(), persona=persona_dir.name
+    )
+    try:
+        write_json(command_run_path(persona_dir, record["pid"]), record, indent=2, sort_keys=True, fsync=False, mode=0o600)
+    except Exception as exc:  # noqa: BLE001 - a run record must never fail the command it describes
+        warn_throttled(
+            logger,
+            f"command-run:write:{persona_dir}",
+            "emotion engine: could not write this command's run record in %s (%s: %s); the command goes on unregistered",
+            persona_dir,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+        return
+    atexit.register(_remove_own_command_run, persona_dir)
+
+
+def _read_command_run(path: Path) -> dict[str, Any] | None:
+    """The record as written; None when its content is not a JSON object (or the file is gone). An I/O fault raises."""
+    return read_json(path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+
+
+def _remove_own_command_run(persona_dir: Path) -> None:
+    """The ``atexit`` step: delete this process's record, and only a record that names this process (pid and token)."""
+    path = command_run_path(persona_dir, process_identity.own_pid())
+    try:
+        record = _read_command_run(path)
+        if isinstance(record, dict) and process_identity.is_own_identity(record.get("pid"), record.get("pid_token")):
+            file_ops.delete_file(path)
+    except Exception as exc:  # noqa: BLE001 - nothing may raise at interpreter exit
+        warn_throttled(
+            logger,
+            f"command-run:remove:{persona_dir}",
+            "emotion engine: could not remove this command's run record in %s (%s: %s)",
+            persona_dir,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def _run_record_pid(name: str) -> int | None:
+    """The pid a record's file name gives: ``<pid>.json`` with ASCII digits that parse as a number the platform can hold as a pid,
+    else None (not a record: a name with more digits than Python converts or a number beyond the pid range is ignored, B58 HQB)."""
+    stem, dot, suffix = name.rpartition(".")
+    if dot != "." or suffix != "json" or not stem.isascii() or not stem.isdigit():
+        return None
+    try:
+        pid = int(stem)
+    except ValueError:  # more digits than Python converts: not a pid
+        return None
+    return pid if process_identity.is_pid_number(pid) else None
+
+
+def _unreadable_run(pid: int, path: Path) -> dict[str, Any]:
+    """The entry ``live_command_runs`` returns for a record it cannot read whose file-name pid is (or may be) alive."""
+    return {UNREADABLE_RUN_KEY: True, "pid": pid, "path": str(path)}
+
+
+def _delete_dead_run(path: Path) -> None:
+    """Delete the record of a dead writer; a delete that fails is logged and the record skipped (it names nothing alive)."""
+    try:
+        file_ops.delete_file(path)
+    except Exception as exc:  # noqa: BLE001 - one record that cannot be deleted must not stop the others
+        warn_throttled(
+            logger,
+            f"command-run:delete:{path}",
+            "emotion engine: could not delete the command run record %s of a command that has ended (%s: %s); skipped",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def live_command_runs(persona_dir: Path) -> list[dict[str, Any]]:
+    """The run records of the other commands that may be alive, in file-name order.
+
+    Only names of the form ``<pid>.json`` are records. A record named for this process's own pid is left out by its name, before
+    it is read, so a command never refuses against its own record. A record that reads as a JSON object with a usable pid is
+    decided by that pid: a dead writer (``holder_alive``) has the record deleted, a live one is returned as written (this process's
+    own identity is left out here too). Any other record, one that cannot be read (an I/O fault, a folder with the name), is not a JSON
+    object, or has no usable pid, is decided by the pid in its FILE NAME: dead, it is deleted; alive, or undecidable, it is kept
+    and returned as ``{UNREADABLE_RUN_KEY: True, "pid", "path"}``, which the caller treats as a command that could not be ended. A
+    read that answers "not a JSON object" for a file that is gone by the time it is checked (``file_ops.stat_path``: its own command
+    removed it at exit) is skipped. A delete that fails is logged and that record skipped.
+
+    Raises ``OSError`` when the folder cannot be listed (a missing folder is no records): the folder may hide a live command, so
+    the caller fails the step naming it. Nothing else raises.
+
+    Accepted edge (P4, B58 HQB Q1, B60 HQT): an unreadable record, or a readable one with no token (a command that could not read
+    its own identity), whose pid was reused by an unrelated live process blocks starts until that process exits or the user removes
+    the file the caller's line names.
+
+    Accepted edge (P4, B58 HQB Q2): a person runs one of the six commands by hand inside a shell spawned from another registered
+    command. The step's ``kill.kill_command`` then suspends every descendant of the outer command, the inner command included, so
+    the inner command freezes before it can end anything and both stay stopped until ended by hand. Nothing is lost beyond the
+    in-flight work. No code path of the product starts one of the six from inside another. A walk of the caller's ancestors to
+    leave them out is rejected (P17): new code for a case the product does not create.
+    """
+    persona_dir = Path(persona_dir)
+    folder = command_runs_dir(persona_dir)
+    names = file_ops.list_dir(folder)
+    own_pid = process_identity.own_pid()
+    runs: list[dict[str, Any]] = []
+    for name in names:
+        name_pid = _run_record_pid(name)
+        if name_pid is None or name_pid == own_pid:
+            continue
+        path = folder / name
+        try:
+            record = _read_command_run(path)
+        except Exception as exc:  # noqa: BLE001 - an I/O fault: the record may name a live command, so the name pid decides
+            warn_throttled(
+                logger,
+                f"command-run:read:{path}",
+                "emotion engine: could not read the command run record %s (%s: %s); decided by the pid in its name",
+                path,
+                type(exc).__name__,
+                exc,
+                exc_info=False,
+            )
+            record = None
+        else:
+            if record is None:
+                try:
+                    if file_ops.stat_path(path) is None:
+                        continue  # gone: its own command removed it at exit
+                except Exception as exc:  # noqa: BLE001 - cannot tell if it is gone: the name pid decides
+                    warn_throttled(
+                        logger,
+                        f"command-run:stat:{path}",
+                        "emotion engine: could not look at the command run record %s (%s: %s); decided by the pid in its name",
+                        path,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=False,
+                    )
+        record_pid = _pid_of(record)
+        # The file name is the record's identity (B58 HQB Q1): a record whose body names another pid than its file is not a valid
+        # record and is decided by the name pid below, so every record returned as read has the pid of its file and a caller
+        # building its path from the pid (the not-ended line, B60 HQT) names the right file.
+        if record is not None and record_pid is not None and record_pid == name_pid:
+            token = record.get("pid_token")
+            if not _may_be_alive(record_pid, token if isinstance(token, str) else None, path):
+                _delete_dead_run(path)
+            elif not process_identity.is_own_identity(record_pid, token):
+                runs.append(record)
+            continue
+        if _may_be_alive(name_pid, None, path):
+            runs.append(_unreadable_run(name_pid, path))
+        else:
+            _delete_dead_run(path)
+    return runs
+
+
 def peer_trust(persona_dir: Path, peer_id: str) -> float:
     """How far this persona trusts one peer (0 to 1): the engine's one door to the peer-trust score.
 
@@ -342,7 +827,8 @@ def validate_state(data: object) -> None:
     emotion that is not an object or lacks `short`, `long` or `last_entry_day`; a non-finite number, a bool, or a negative
     weight in an average; a `last_entry_day` that is not a real day or is later than `active_day`. An average outside 0-10 is
     NOT a rejection (`state_from_json` holds it), and neither is anything wrong with a snapshot or a repeat record (those are
-    dropped one at a time, never the whole state). Every refusal is a ValueError.
+    dropped one at a time, never the whole state), a `queue_line`, or a `rows_through` (both read as their default). Every
+    refusal is a ValueError.
     """
     if not isinstance(data, dict):
         raise ValueError(f"the state must be an object, found {type(data).__name__}")
@@ -489,12 +975,37 @@ def _queue_line_from(data: Mapping, label: str) -> int:
     return 0
 
 
+def _rows_through_from(data: Mapping, label: str) -> int | None:
+    """The stored `rows_through`: a whole number of 0 or more (a bool is not one), else None (never an unreadable state).
+
+    A missing or null key reads as None without a line (a state written before the field existed, or one with no row seen).
+    Any other value is logged (throttled per label and kind of fault; the key never holds the value, the text carries a short,
+    capped form of it) and read as None. `validate_state` never refuses a state for this key.
+    """
+    value = data.get("rows_through")
+    if value is None:
+        return None
+    if type(value) is int and value >= 0:
+        return value
+    found = type(value).__name__
+    count_throttled(
+        logger,
+        f"engine_files:rows_through:{label}:{found}",
+        logging.ERROR,
+        "emotion state %s: rows_through is %s, read as unset (it must be a whole number, 0 or more)",
+        label,
+        _VALUE_REPR.repr(value),
+    )
+    return None
+
+
 def state_from_json(data: dict, *, label: str = "state") -> EngineState:
     """The `EngineState` of a state that passed `validate_state`.
 
     Averages (the state's and the snapshot's) are held to 0-10. A bad snapshot day is dropped as a missing day and a bad
     repeat record is dropped, each with an error log line naming the emotion or the memory; the state stays valid. A missing
-    or unusable `queue_line` reads as 0, with a log line. `label` names the file in those lines.
+    or unusable `queue_line` reads as 0, with a log line; a missing, null or unusable `rows_through` reads as None (a log
+    line for an unusable one). `label` names the file in those lines.
     """
     repeats: dict[str, RepeatEntry] = {}
     for memory_id, record in data.get("repeats", {}).items():
@@ -530,6 +1041,7 @@ def state_from_json(data: dict, *, label: str = "state") -> EngineState:
         emotions=emotions,
         queue_line=_queue_line_from(data, label),
         switch_over_at=optional("switch_over_at"),
+        rows_through=_rows_through_from(data, label),
     )
 
 
@@ -574,6 +1086,7 @@ def state_to_json(state: EngineState) -> dict:
         "persona_start_at": _optional_iso(state.persona_start_at, "persona_start_at"),
         "switch_over_at": _optional_iso(state.switch_over_at, "switch_over_at"),
         "queue_line": state.queue_line,
+        "rows_through": state.rows_through,
         "repeats": {
             memory_id: {"first_at": _iso(entry.first_at, "first_at"), "count": entry.count}
             for memory_id, entry in state.repeats.items()
@@ -1062,7 +1575,12 @@ def switch_over_state(loaded: LoadedState) -> bool | None:
     state: the backup has no `switch_over_at`, so the persona reads as not switched until the first rebuild runs again (the
     same as (a)). Narrowed (Planning B28 Q18): a process that has already SEEN `switch_over_at` and loads a backup without it
     puts the value it saw back before its drain saves (`EmotionEngine._run_apply`), so (b) still applies to a new process
-    that starts after the live state is corrupted.
+    that starts after the live state is corrupted. (c) A brain built from main before Engine 6 merges (a rolled-back brain-main
+    overlay, a source install on main, or a release cut from main before the merge; no published release has it) runs a shadow
+    engine that rewrites the state without `switch_over_at` or `rows_through` and keeps `saved_at` fresh. A persona rolled back
+    to it and forward again reads as not switched, so the first rebuild runs again from the 30-day window and records a new
+    switch-over time, which restarts the fade clock: the rebuilt mood reads stronger than her real state for a while. Nothing
+    durable records the original switch time (TRIO HR1-C, accepted).
     """
     if loaded.state is not None:
         return loaded.state.switch_over_at is not None
