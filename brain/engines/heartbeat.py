@@ -82,7 +82,6 @@ class HeartbeatConfig:
     reflex_max_fires_per_tick: int = 1
     research_enabled: bool = True
     research_days_since_human_min: float = 1.5
-    research_emotion_threshold: float = 7.0
     research_cooldown_hours_per_interest: float = 24.0
     interest_bump_per_match: float = 0.1
     growth_enabled: bool = True
@@ -143,7 +142,6 @@ class HeartbeatConfig:
                 reflex_max_fires_per_tick=int(data.get("reflex_max_fires_per_tick", 1)),
                 research_enabled=bool(data.get("research_enabled", True)),
                 research_days_since_human_min=float(data.get("research_days_since_human_min", 1.5)),
-                research_emotion_threshold=float(data.get("research_emotion_threshold", 7.0)),
                 research_cooldown_hours_per_interest=float(
                     data.get("research_cooldown_hours_per_interest", 24.0)
                 ),
@@ -197,7 +195,6 @@ class HeartbeatConfig:
             "reflex_max_fires_per_tick": self.reflex_max_fires_per_tick,
             "research_enabled": self.research_enabled,
             "research_days_since_human_min": self.research_days_since_human_min,
-            "research_emotion_threshold": self.research_emotion_threshold,
             "research_cooldown_hours_per_interest": self.research_cooldown_hours_per_interest,
             "interest_bump_per_match": self.interest_bump_per_match,
             "growth_enabled": self.growth_enabled,
@@ -942,6 +939,7 @@ class HeartbeatEngine:
                 default_interests_path=self.default_interests_path,
                 pull_threshold=6.0,
                 cooldown_hours=config.research_cooldown_hours_per_interest,
+                research_days_since_human_min=config.research_days_since_human_min,
             )
             result = engine.run_tick(trigger=trigger, dry_run=dry_run)
         except ThrottleDeferred as exc:

@@ -6,9 +6,6 @@ up to `ATTUNEMENT_DAILY_BUDGET_DEFAULT = 150` back-to-back spawns while another 
 engine held the single slot — and `_inflight_background` never saw it, so
 nothing backed off for it either.
 
-Its sibling `brain/ingest/emotion_backfill.py` already does this correctly
-(per-iteration slot, idle yield, inter-call pacing); this is the port.
-
 The subtle half is the *state*: the loop falls through to `status="complete"`.
 A naive port that simply `break`s on a denied slot would mark the backfill
 complete having skipped windows — permanently, since `should_run_backfill`
@@ -91,8 +88,8 @@ def test_an_active_chat_turn_makes_the_backfill_stand_down(tmp_path: Path):
 
     `cli_throttle` keeps its state in a module global on a monotonic clock, so it
     resets on every supervisor restart. `compute_active_session_hours` reads the
-    conversation buffer off disk and survives one. Belt and braces, same as
-    emotion_backfill — a restart mid-conversation must not hand the backfill a
+    conversation buffer off disk and survives one. Belt and braces:
+    a restart mid-conversation must not hand the backfill a
     clean slate to burst from.
     """
     _make_buffer_file(tmp_path, n_turns=25)

@@ -30,7 +30,7 @@ DEFAULT_INTERESTS_PATH = Path(__file__).parents[4] / "brain" / "engines" / "defa
 
 
 def _build_engine(
-    tmp_path: Path, store: MemoryStore, provider=None, searcher=None
+    tmp_path: Path, store: MemoryStore, provider=None, searcher=None, **fields
 ) -> ResearchEngine:
     return ResearchEngine(
         store=store,
@@ -41,6 +41,7 @@ def _build_engine(
         interests_path=tmp_path / "interests.json",
         research_log_path=tmp_path / "research_log.json",
         default_interests_path=DEFAULT_INTERESTS_PATH,
+        **fields,
     )
 
 
@@ -140,6 +141,44 @@ def test_run_tick_days_since_human_triggers(tmp_path: Path):
         assert result.fired.topic == "marine bioluminescence"
     finally:
         store.close()
+
+
+def test_run_tick_gate_reads_the_configured_days_since_human_min(tmp_path: Path):
+    """Below the configured minimum the tick is not due; at it, the tick would fire."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store, research_days_since_human_min=3.0)
+        below = engine.run_tick(dry_run=True, days_since_human_override=2.0)
+        assert below.reason == "not_due"
+        assert below.would_fire is None
+        at = engine.run_tick(dry_run=True, days_since_human_override=3.0)
+        assert at.would_fire == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_run_tick_gate_opens_earlier_when_the_configured_minimum_is_lowered(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store, research_days_since_human_min=0.5)
+        result = engine.run_tick(dry_run=True, days_since_human_override=1.0)
+        assert result.would_fire == "marine bioluminescence"
+    finally:
+        store.close()
+
+
+def test_research_engine_default_minimum_is_the_heartbeat_config_default():
+    import dataclasses
+
+    from brain.engines.heartbeat import HeartbeatConfig
+
+    defaults = {f.name: f.default for f in dataclasses.fields(ResearchEngine)}
+    assert (
+        defaults["research_days_since_human_min"]
+        == HeartbeatConfig().research_days_since_human_min
+    )
 
 
 def test_run_tick_emotion_high_triggers(tmp_path: Path, emotion_engine_stub):
@@ -1040,6 +1079,7 @@ def _live_gate_reason(
     *,
     stored: dict[str, float],
     high: set[str] | None = None,
+    days_since: float = 0.0,
 ) -> str | None:
     from brain.emotion.engine import Reading
 
@@ -1055,7 +1095,7 @@ def _live_gate_reason(
             store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored))
         runner = _build_engine(tmp_path, store)
         result = runner.run_tick(
-            trigger="manual", dry_run=True, days_since_human_override=0.0, emotion_state_override=None
+            trigger="manual", dry_run=True, days_since_human_override=days_since, emotion_state_override=None
         )
     finally:
         store.close()
@@ -1089,6 +1129,183 @@ def test_live_gate_only_asks_about_feelings_the_read_returned(tmp_path: Path, em
 def test_live_gate_with_an_empty_read_is_closed(tmp_path: Path, emotion_engine_stub):
     reason = _live_gate_reason(tmp_path, emotion_engine_stub, {}, stored={"awe": 9.5}, high={"awe"})
     assert reason == "not_due"
+
+
+# ── the feeling half: opposing feelings never open it and raise the bar for the others (#651) ──
+# The stub's `feels_high` answers from its `high` set whatever the values, so each case sets the readings AND the set.
+
+
+def _gate(tmp_path: Path, stub, readings: dict[str, float], high: set[str], **kw) -> bool:
+    """True when the feeling half (or silence, if `days_since` is passed) opened the gate."""
+    return _live_gate_reason(tmp_path, stub, readings, stored={}, high=high, **kw) != "not_due"
+
+
+@pytest.mark.parametrize("name", ["shame", "comfort_seeking", "rest_need", "grief"])
+def test_gate_an_opposing_feeling_never_opens_it(tmp_path: Path, emotion_engine_stub, name: str):
+    assert _gate(tmp_path, emotion_engine_stub, {name: 9.0}, {name}) is False
+
+
+@pytest.mark.no_base_failure(reason="regression guard: the old any-feeling gate also opens here (high, above the bar); the new gate must keep it open. The threshold bites in the 'at the threshold' test")
+def test_gate_opening_feeling_above_the_threshold_opens_it(tmp_path: Path, emotion_engine_stub):
+    # grief 2.0 -> T = 5.0; awe 6.0 is above it
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 6.0, "grief": 2.0}, {"awe"}) is True
+
+
+def test_gate_opening_feeling_at_the_threshold_does_not_open_it(tmp_path: Path, emotion_engine_stub):
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 5.0, "grief": 2.0}, {"awe"}) is False
+
+
+@pytest.mark.no_base_failure(reason="spec A4: with no opposing feeling the new gate must give today's answer, so the old any-feeling gate passes it by design")
+def test_gate_without_opposing_feelings_todays_test_decides(tmp_path: Path, emotion_engine_stub):
+    """T(0) is 0, so any value above 0 that the engine calls high opens it (the real engine's own floor of 1.0 comes first)."""
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 0.5}, {"awe"}) is True
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 9.0}, set()) is False
+
+
+@pytest.mark.parametrize("readings", [{"grief": 3.0, "shame": 1.0}, {"shame": 1.0, "grief": 3.0}], ids=["grief first", "shame first"])
+def test_gate_opp_is_the_highest_opposing_value_in_either_order(tmp_path: Path, emotion_engine_stub, readings):
+    # max is 3.0 -> T = 5.3, so 5.5 opens; a sum (4.0 -> 5.55), a mean or the lower value (T 4.0, would open anyway) would differ
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 5.5, **readings}, {"awe"}) is True
+    # and 5.2 stays closed under max (T 5.3); the lowest value alone (T 4.0) would open it
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 5.2, **readings}, {"awe"}) is False
+
+
+def test_gate_opp_counts_an_opposing_feeling_the_engine_does_not_call_high(tmp_path: Path, emotion_engine_stub):
+    # rest_need 7.0 is not in `high`, but it still raises the bar to T(7) = 6.5, so awe at 6.0 stays closed
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 6.0, "rest_need": 7.0}, {"awe"}) is False
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 6.6, "rest_need": 7.0}, {"awe"}) is True
+
+
+@pytest.mark.no_base_failure(reason="regression guard: the engine's own high test still decides which feelings count; the old gate already behaves this way")
+def test_gate_only_the_opening_feeling_must_be_high(tmp_path: Path, emotion_engine_stub):
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 9.0, "joy": 9.0}, {"joy"}) is True
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 9.0, "joy": 9.0}, set()) is False
+
+
+def test_gate_silence_half_opens_with_only_an_opposing_feeling_high(tmp_path: Path, emotion_engine_stub):
+    assert _gate(tmp_path, emotion_engine_stub, {"grief": 9.0}, {"grief"}, days_since=0.0) is False
+    assert _gate(tmp_path, emotion_engine_stub, {"grief": 9.0}, {"grief"}, days_since=30.0) is True
+    assert _gate(tmp_path, emotion_engine_stub, {}, set(), days_since=30.0) is True
+
+
+def test_gate_follows_the_curve_constant(tmp_path: Path, emotion_engine_stub, monkeypatch):
+    from brain import dev_constants
+
+    readings = {"awe": 6.0, "grief": 2.0}  # T(2) is 5.0 on the owner's curve: opens
+    assert _gate(tmp_path, emotion_engine_stub, readings, {"awe"}) is True
+    monkeypatch.setattr(dev_constants, "RESEARCH_GATE_OPPOSING_CURVE", ((0.0, 0.0), (1.0, 7.0), (10.0, 8.0)))  # T(2) is above 7
+    assert _gate(tmp_path, emotion_engine_stub, readings, {"awe"}) is False
+
+
+def test_gate_follows_the_names_constant(tmp_path: Path, emotion_engine_stub, monkeypatch):
+    from brain import dev_constants
+
+    assert _gate(tmp_path, emotion_engine_stub, {"grief": 9.0}, {"grief"}) is False
+    monkeypatch.setattr(dev_constants, "RESEARCH_GATE_OPPOSING_FEELINGS", frozenset({"shame"}))
+    assert _gate(tmp_path, emotion_engine_stub, {"grief": 9.0}, {"grief"}) is True
+
+
+def test_opposing_threshold_at_the_curve_points_and_the_stated_value():
+    from brain import dev_constants
+    from brain.engines.research import opposing_threshold
+
+    for x, y in dev_constants.RESEARCH_GATE_OPPOSING_CURVE:
+        assert opposing_threshold(x) == pytest.approx(y, abs=1e-12)
+    assert opposing_threshold(0.5) == pytest.approx(2.5, abs=0.05)
+
+
+def test_opposing_threshold_is_built_from_the_constant(monkeypatch):
+    from brain import dev_constants
+    from brain.engines.research import opposing_threshold
+
+    monkeypatch.setattr(dev_constants, "RESEARCH_GATE_OPPOSING_CURVE", ((0.0, 1.0), (10.0, 3.0)))
+    assert opposing_threshold(5.0) == pytest.approx(2.0)
+
+
+def test_the_opposing_names_are_baseline_vocabulary_names():
+    """A typo in the constant would silently never oppose: every name must be in the baseline vocabulary."""
+    from brain import dev_constants
+    from brain.emotion import vocabulary
+
+    baseline = {e.name for e in vocabulary._BASELINE}
+    assert dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS == {"shame", "comfort_seeking", "rest_need", "grief"}
+    assert dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS <= baseline
+
+
+# ── feeling_half_passes: the one function the gate and the measuring script share (#651 S30) ──
+
+
+def _high_set(*names: str):
+    return set(names).__contains__
+
+
+@pytest.mark.parametrize("name", ["shame", "comfort_seeking", "rest_need", "grief"])
+def test_feeling_half_passes_an_opposing_feeling_never_opens_it(name: str):
+    from brain.engines.research import feeling_half_passes
+
+    assert feeling_half_passes({name: 10.0}, _high_set(name)) is False
+
+
+def test_feeling_half_passes_above_the_threshold_opens_and_at_it_does_not():
+    from brain.engines.research import feeling_half_passes, opposing_threshold
+
+    t = opposing_threshold(2.0)
+    assert feeling_half_passes({"grief": 2.0, "love": t + 0.01}, _high_set("love")) is True
+    assert feeling_half_passes({"grief": 2.0, "love": t}, _high_set("love")) is False
+    assert feeling_half_passes({"grief": 2.0, "love": t + 1.0}, _high_set()) is False  # above T but not high
+
+
+def test_feeling_half_passes_opp_is_the_max_of_the_opposing_values_present():
+    from brain.engines.research import feeling_half_passes
+
+    # max(3, 1) = 3 gives T 5.3 (5.5 opens); a sum (4) would give T 5.55 and close it
+    assert feeling_half_passes({"grief": 3.0, "shame": 1.0, "love": 5.5}, _high_set("love")) is True
+    assert feeling_half_passes({"shame": 1.0, "grief": 3.0, "love": 5.5}, _high_set("love")) is True
+    # an opposing feeling that is present but not high still sets opp (T(7) = 6.5)
+    assert feeling_half_passes({"grief": 7.0, "love": 6.0}, _high_set("love")) is False
+
+
+def test_feeling_half_passes_a_missing_opposing_feeling_counts_as_zero_and_empty_is_false():
+    from brain.engines.research import feeling_half_passes
+
+    assert feeling_half_passes({"love": 0.5}, _high_set("love")) is True  # opp 0, T 0
+    assert feeling_half_passes({}, _high_set("love")) is False
+
+
+def test_feeling_half_passes_asks_feels_high_only_about_names_above_the_threshold():
+    from brain.engines.research import feeling_half_passes
+
+    asked: list[str] = []
+
+    def high(name: str) -> bool:
+        asked.append(name)
+        return True
+
+    # grief 5 gives T 5.8: joy 6.0 is above it and is asked; love 5.0 is not and never is; grief is opposing, never asked
+    assert feeling_half_passes({"grief": 5.0, "love": 5.0, "joy": 6.0}, high) is True
+    assert asked == ["joy"]
+
+
+def test_run_tick_gate_calls_feeling_half_passes_with_the_read_and_the_engines_test(
+    tmp_path: Path, emotion_engine_stub, monkeypatch
+):
+    from brain.engines import research
+
+    calls: list[tuple[dict[str, float], bool, bool]] = []
+
+    def fake(values, feels_high):
+        # what the engine's own test says at call time (the stub's high set is {"awe"} in the first call, empty in the second)
+        calls.append((dict(values), feels_high("awe"), feels_high("grief")))
+        return fake.answer
+
+    monkeypatch.setattr(research, "feeling_half_passes", fake)
+    readings = {"awe": 9.0}
+    # the real rule would pass (awe high, opp 0): the patched answer closes the gate; and the other way round
+    fake.answer = False
+    assert _gate(tmp_path, emotion_engine_stub, readings, {"awe"}) is False
+    fake.answer = True
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 0.5}, set()) is True  # the real rule: nothing high, closed
+    assert calls == [({"awe": 9.0}, True, False), ({"awe": 0.5}, False, False)]
 
 
 # ---- B1 PR 4: a live fire carries its own feelings and rating ----

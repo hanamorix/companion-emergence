@@ -24,6 +24,7 @@ from brain.bridge import cli_throttle as _default_throttle
 from brain.health.json_io import append_jsonl, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.state_compat import from_known_fields
+from brain.utils.file_ops import stat_path
 
 log = logging.getLogger(__name__)
 
@@ -132,17 +133,17 @@ def peer_trust(persona_dir: Path, peer_id: str) -> float:
     """How far this persona trusts one peer, 0 to 1, for the emotion engine's peer modifier."""
     from brain.kindled_link.store import KindledLinkStore, kindled_db_path
 
-    path = kindled_db_path(persona_dir)
-    if not path.exists():  # reading must never create the database
-        return 0.0
     # shortcut: no cache, one read per peer row under the engine lock; add one if the catch-up shows it.
     try:
+        path = kindled_db_path(persona_dir)
+        if stat_path(path) is None:  # reading must never create the database
+            return 0.0
         store = KindledLinkStore(path, integrity_check=False)
         try:
             return get_relationship_state(store, peer_id).trust_score
         finally:
             store.close()
-    except (sqlite3.Error, ValueError, TypeError) as exc:
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
         # This runs inside the engine's catch-up, where an exception would fail the whole catch-up.
         log.warning("peer_trust: could not read trust for a peer: %s", exc)
         return 0.0

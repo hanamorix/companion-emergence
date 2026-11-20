@@ -129,9 +129,10 @@ def test_temperature_medium_no_contact():
     assert _body(days_since_contact=4.0).temperature == 3  # 4 - 1 (>3 days)
 
 
-def test_temperature_clamped_at_1():
-    # 4 - 1 - 1 - 2 = 0 → clamp 1
-    assert _body("body_grief", "touch_hunger", days_since_contact=10.0).temperature == 1
+@pytest.mark.no_base_failure(reason="renamed from the clamp test (#652): touch_hunger alone with more than 7 days gives 1 on the base code as well; it pins the lowest reachable temperature, not a changed behaviour")
+def test_temperature_lowest_reachable_is_1():
+    # 4 - 1 (touch_hunger) - 2 (>7 days) = 1, the floor of the 1-9 range
+    assert _body("touch_hunger", days_since_contact=10.0).temperature == 1
 
 
 def test_exhaustion_derivation():
@@ -213,14 +214,14 @@ def test_body_state_from_short_raises_no_io_audit_event() -> None:
         _AUDIT["installed"] = True
     every = (
         "love", "joy", "grief", "peace", "belonging", "arousal", "desire", "climax", "touch_hunger", "comfort_seeking",
-        "rest_need", "body_grief",
+        "rest_need",
     )  # fmt: skip
     short = dict.fromkeys(every, 5.0)
     high_grid = [
         frozenset(),
         frozenset(every),  # every feeling high: more than six loud, every warming and cooling feeling
         frozenset({"peace"}),
-        frozenset({"body_grief", "touch_hunger"}),
+        frozenset({"touch_hunger"}),
         frozenset({"rest_need"}),
         frozenset({"arousal", "desire", "belonging", "love", "climax"}),
     ]

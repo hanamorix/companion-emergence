@@ -182,9 +182,8 @@ def _cursor_index(windows: list[Window], cursor: str) -> int:
 _MIN_TURNS_FOR_BACKFILL = 10
 
 # Inter-call pacing between windows, so a backfill never bursts its whole daily
-# budget of `claude -p` spawns in one sitting. Mirrors _INTER_CALL_DELAY_S in
-# brain/ingest/emotion_backfill.py, the sibling backfill this loop is modelled
-# on. Tests pass delay_s=0 to skip the wait.
+# budget of `claude -p` spawns in one sitting. Tests pass delay_s=0 to skip the
+# wait.
 _INTER_CALL_DELAY_S = 1.5
 
 # Categories added in schema v0.0.29 that need a supplementary bootstrap
@@ -285,8 +284,7 @@ def run_backfill(
 
     # cli_throttle is imported locally: brain.bridge pulls in the supervisor, so
     # a module-level import would be circular. compute_active_session_hours is
-    # the layer-neutral primitive (brain/body/session_hours.py) — the same
-    # signal emotion_backfill's _user_recently_active wraps.
+    # the layer-neutral primitive (brain/body/session_hours.py).
 
     if cap is None:
         cap = dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT
@@ -378,7 +376,7 @@ def run_backfill(
     # #473: the start-of-run save is deferred to the first window whose detector call was not refused (or to the
     # budget deferral below), so a run refused at its first window leaves the state file exactly as it was.
 
-    # #144: mirror emotion_backfill's zero-tagged guard — count detector
+    # #144: a zero-tagged guard — count detector
     # outcomes so a run where every call errored is not marked complete.
     attempted_this_run = 0
     succeeded_this_run = 0
@@ -461,7 +459,7 @@ def run_backfill(
             _save_state(persona_dir, state)
 
         # Outside the slot: another background consumer can acquire while we pace.
-        # Tests pass delay_s=0 to skip the wait (matches emotion_backfill).
+        # Tests pass delay_s=0 to skip the wait.
         if delay_s > 0:
             time.sleep(delay_s)
 

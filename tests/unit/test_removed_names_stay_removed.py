@@ -785,6 +785,49 @@ REMOVED: tuple[Removed, ...] = (
             "brain/memory/store.py",
         ),
     ),
+    # --- the predefined `body_grief` feeling (#652) -----------------------------------------------------------------------
+    Removed(
+        names=("body_grief",),
+        why="a feeling like this comes from the kindled naming it herself, so it is not predefined: it left the migrator's canonical personal-emotions list and the body temperature rule; a persona whose memories carry it keeps it as an ordinary feeling through the vocabulary repair",
+        ref="#652 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the research gate's emotion setting (#653) ------------------------------------------------------------------------
+    Removed(
+        names=("research_emotion_threshold",),
+        why="the research gate asks the emotion engine's own reading of high (`feels_high`) and holds no level of its own, so the setting had no reader and left HeartbeatConfig; an old heartbeat_config.json that still holds the key loads and drops it on the next save",
+        ref="#653 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the emotion backfill job (#747) -----------------------------------------------------------------------------------
+    Removed(
+        names=(
+            "run_emotion_backfill",
+            "has_emotion_backfill_work",
+            "should_run_emotion_backfill",
+            "EmotionBackfillState",
+            "_make_default_tagger",
+            "has_active_without_emotions",
+            "emotion_backfill",
+            "emotion_backfill_state.json",
+            "emotion_backfill_budget.json",
+        ),
+        why="the emotion backfill is a step of the consolidation gate (a written or recalled memory without feelings is tagged by `tag_if_feelingless`), so the idle job with its cursor, daily cap, pacing, yield-to-chat and two state files is gone; the prompt-string section `[ingest.emotion_backfill]` keeps its name by design, and the tagger now lives in brain/ingest/emotion_tagger.py",
+        ref="#747 (draft PR #656)",
+        kind="code",
+    ),
+    Removed(
+        names=("brain/ingest/emotion_backfill.py",),
+        why="the emotion backfill module was deleted with the job (#747)",
+        ref="#747 (draft PR #656)",
+        kind="file",
+    ),
+    Removed(
+        names=("emotion_backfill",),
+        why="the app's status label for the removed emotion backfill job (#747)",
+        ref="#747 (draft PR #656)",
+        scope=("app/src",),
+    ),
     # --- the old max-pool aggregate leaves the writers' off branches (B1 PR 7), so Engine 7 can delete it ----------------
     Removed(
         names=("aggregate_state", "compute_body_state"),
