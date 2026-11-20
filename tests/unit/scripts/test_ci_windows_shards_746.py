@@ -68,14 +68,13 @@ def test_the_main_matrix_leaves_windows_to_the_shards_except_on_a_manual_run():
 
 @_HEAD_ONLY
 def test_one_python_windows_latest_check_passes_only_when_every_shard_passed():
-    """One name for people and scripts to read. Skipped, not failed, when a shard was cancelled: the runner-loss re-run
-    (rerun-runner-loss.yml) re-runs a run only when every job that didn't pass was lost, and a failing aggregate would
-    stop it; a re-run of the cancelled shard re-runs this job too."""
+    """One name for people and scripts to read. It fails, never skips, when a shard was cancelled: GitHub counts a
+    skipped check as satisfied, so a skip would pass with a shard's tests never run (#774 review). The runner-loss
+    re-run looks past this gate (SHARD_GATES in scripts/ci_rerun_runner_loss.py), and re-running the lost shard re-runs
+    this job too."""
     (job,) = [j for j in JOBS.values() if j.get("name") == "python windows-latest"]
     assert job["needs"] == "python-windows"
-    assert job["if"] == (
-        "always() && github.event_name != 'workflow_dispatch' && needs.python-windows.result != 'cancelled'"
-    )
+    assert job["if"] == "always() && github.event_name != 'workflow_dispatch'"
     assert job["runs-on"] == "ubuntu-latest"
     (step,) = job["steps"]
     assert step["env"] == {"RESULT": "${{ needs.python-windows.result }}"}
@@ -98,3 +97,17 @@ def test_each_shard_uploads_its_reports_under_its_own_name():
         f"slow-budget-cpu-windows-latest-${{{{ matrix.shard }}}}-of-{count}",
     ]
     assert sorted(names["python"]) == ["pytest-junit-${{ matrix.os }}", "slow-budget-cpu-${{ matrix.os }}"]
+
+
+@_HEAD_ONLY
+def test_the_runner_loss_re_run_knows_the_gate_and_its_shards_by_their_names():
+    """The re-run looks past a failing gate only in a run holding jobs named "<gate> (...)": a rename on either side here
+    would make a lost shard's run look like a real failure and never be re-run (#774 review)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ci_rerun_for_746", REPO / "scripts" / "ci_rerun_runner_loss.py")
+    rr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rr)
+    gate = JOBS["python-windows-result"]["name"]
+    assert gate in rr.SHARD_GATES
+    assert JOBS["python-windows"]["name"].startswith(f"{gate} (")

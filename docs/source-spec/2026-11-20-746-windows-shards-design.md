@@ -56,7 +56,8 @@ Hana picked A on 2026-11-20.
   - Each shard runs the same pytest command plus `--shard i/N`.
   - Artifacts are named per shard: `pytest-junit-windows-latest-i-of-N` and `slow-budget-cpu-windows-latest-i-of-N`.
   - Ruff runs once, in `python`.
-- **`python windows-latest`** needs `python-windows` and runs `if: always()`. It passes only when every shard passed.
+- **`python windows-latest`** needs `python-windows` and runs `if: always()`. It passes only when every shard passed, and fails (never skips) when one was cancelled, because GitHub counts a skipped check as satisfied (review of #774).
+- **The runner-loss re-run** (`scripts/ci_rerun_runner_loss.py`) looks past that gate, listed in `SHARD_GATES`, in a run that has its shards, so a shard lost to a runner is still re-run automatically. In a manual run the job of that name runs the tests itself, so its failure counts.
 
 N and the worker count were chosen by measurement:
 

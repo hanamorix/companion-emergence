@@ -210,13 +210,13 @@ jobs:
           path: slow-budget-cpu.jsonl
           if-no-files-found: ignore
 
-  # #746: one check says whether Windows passed, whatever the shard count. Skipped (not failed) when a shard was
-  # cancelled: rerun-runner-loss.yml re-runs a run only when every job that didn't pass was lost to a runner, and a
-  # failing job here would stop that; re-running the cancelled shard re-runs this job too.
+  # #746: one check says whether Windows passed, whatever the shard count. It fails, never skips, when a shard was
+  # cancelled: GitHub counts a skipped check as satisfied (#774 review). rerun-runner-loss.yml looks past it
+  # (SHARD_GATES in scripts/ci_rerun_runner_loss.py), and re-running the lost shard re-runs this job too.
   python-windows-result:
     name: python windows-latest
     needs: python-windows
-    if: always() && github.event_name != 'workflow_dispatch' && needs.python-windows.result != 'cancelled'
+    if: always() && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Every Windows shard passed
