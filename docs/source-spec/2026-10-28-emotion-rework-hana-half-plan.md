@@ -16,6 +16,14 @@ A1, A2a and A4 touch disjoint files and can run in parallel. B1 (writers) gets i
 
 **Spec:** `docs/source-spec/2026-10-28-emotion-rework-hana-half-design.md` (read it first — §2 has the file:line evidence this plan builds on).
 
+**Status (2026-11-20):**
+- **A1 (Task 1):** merged as #671.
+- **A2a (Tasks 2-3):** merged as #673.
+- **A4 (Tasks 4-7):** mostly not built. Of Task 6, `add_memory`'s `last_accessed_at` and its auto-link `bump=False` shipped in #745. Tasks 4, 5 and 7, and the rest of Task 6 (write-time registration, `emotion_half_lives`), are open.
+- **A2b (Task 8):** not started; it waits on #385.
+
+The spec's Status section lists each A4 piece that's missing.
+
 ## Global Constraints
 
 - **TDD.** Every task opens with its failing test. `tdd-guard` blocks implementation without one.

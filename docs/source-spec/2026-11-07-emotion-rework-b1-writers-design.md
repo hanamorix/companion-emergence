@@ -4,6 +4,30 @@ Umbrella: #240. Parent: `2026-10-28-emotion-rework-hana-half-design.md`, whose �
 
 Verified against `origin/main` @ `c9589209` on 2026-11-07. Line numbers are from that commit. The engine half is merged through Readers 1 (#632) and stays off until Engine 6 (#633) writes `state/emotion_switch.json`.
 
+## Status (2026-11-20, checked against `origin/main` @ `68247cd9`)
+
+All seven PRs are merged:
+
+| PR | Merged as | Date |
+|---|---|---|
+| 1 `peer_trust` | #685 | 2026-11-10 |
+| 2 signed changes | #718 | 2026-11-12 |
+| 3 nudges and peer memories | #719 | 2026-11-12 |
+| 4 research | #686 | 2026-11-10 |
+| 5 dreams, grief, growth | #726 | 2026-11-12 |
+| 6 monologue note | #690 | 2026-11-10 |
+| 7 cleanup | #742 | 2026-11-20 |
+
+Engine 6 (#633) merged on 2026-11-19 and Readers 2 (#634) on 2026-11-20. The `test_intended_*` pins from #671 pass on the live path, and none still carries `_flipped_by`.
+
+Left open:
+- **#125** is still open, although its fix (PR 2's signed fold, live since Engine 6) has shipped. Close it once that's confirmed.
+- **#687:** check that the digests still agree with her thoughts now that PR 6 is live.
+- **#566:** dynamic nudges, out of scope here.
+- **Engine 7 (#635):** comes next and removes the old aggregate.
+
+Settled since this was written: research's held zero (#707, fixed by #738), and the interior block's shape once live (#688, resolved by #743).
+
 ## 1. Outcome
 
 Every writer feeds the engine honestly once the switch is on: signed changes can lower a feeling, every stored value is on the 0-10 scale, peers count in proportion to real trust, research carries its own feelings and rating, and per-memory reads use faded values.
@@ -183,12 +207,14 @@ Tests: capture through the real `_dispatch_record_monologue` with a switch file 
 | Duplicate-check edges | §4 PR 6 | If digests repeat in practice |
 | Dynamic nudges (#566) | Out of scope | #566 |
 | Scale writers' accepted edge (PR 7) | A switched persona whose state can't be read and whose `memories.db` reads progress 0 (rebuilt or new) writes small values, because the x10 fix never runs for a switched persona. Agreed with ThinkerOfThoughts on #633 | If a rebuilt `memories.db` on a switched persona shows up |
-| Peer cap at a tenth (PR 7, Hana's call) | 0-10 peer values with `is_live()` false (state unreadable, or rescaled before the switch-over) go through the 0.6 cap at a tenth and are stored ×10, so the cap still holds the peer and the stored value is 0-10 | ThinkerOfThoughts' review of #742 |
-| Off paths take no feelings (PR 7) | With the engine not reading, the dream mood is empty, a trace has no feelings and growth's recent-emotion vectors are empty. With an empty mood, a high-importance grief breadcrumb can win the dream seed, as on the live path's empty read during a rebuild | If off-path dreams or traces read wrong while a state is unreadable |
+| Peer cap at a tenth (PR 7, Hana's call) | 0-10 peer values with `is_live()` false (state unreadable, or rescaled before the switch-over) go through the 0.6 cap at a tenth and are stored ×10, so the cap still holds the peer and the stored value is 0-10 | Kept: confirmed by ThinkerOfThoughts on #742 (2026-11-19) |
+| Off paths take no feelings (PR 7) | With the engine not reading, the dream mood is empty, a trace has no feelings and growth's recent-emotion vectors are empty. With an empty mood, a high-importance grief breadcrumb can win the dream seed, as on the live path's empty read during a rebuild | Accepted by ThinkerOfThoughts on #742 (2026-11-19), with a comment at the dream engine's empty-mood branch; revisit if off-path dreams or traces read wrong while a state is unreadable |
 
 These also go in `project_companion_emergence_deferred.md` and the next brainstorm.
 
 ## 7. Merge order and coordination
+
+All seven merged within this order (see Status). The order as planned:
 
 - PR 1 can land any time.
 - PRs 2, 3 and 5 wait for #671, because each flips its pins.

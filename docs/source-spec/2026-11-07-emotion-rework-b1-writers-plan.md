@@ -10,6 +10,8 @@
 
 **Spec:** `docs/source-spec/2026-11-07-emotion-rework-b1-writers-design.md`
 
+**Status (2026-11-20):** every task is done. PRs 1-7 merged as #685, #718, #719, #686, #726, #690 and #742; the spec's Status section has the dates and what's still open. The steps below are the record of how it was built.
+
 ## Global Constraints
 
 - With the switch off, nothing she feels changes. Every task pins its off path.
