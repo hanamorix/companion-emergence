@@ -7,6 +7,7 @@ shrunk to 0.05 s of CPU so the plants stay quick (`KINDLED_SLOW_BUDGET_S`); they
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -186,12 +187,34 @@ def _is_slow_call(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "slow" and _is_mark(node.func.value)
 
 
+@pytest.fixture(scope="module")
+def slow_mark_scan() -> tuple[int, list[str]]:
+    """The scan of the real tests/ tree, run once in setup: reading every file and parsing those that mention `mark.slow`
+    grows with the tree and once used 2.5 s of CPU on CI, which belongs to no one test (the call-phase budget, #787)."""
+    return _slow_mark_scan()
+
+
 @pytest.mark.no_base_failure(reason=_REASON)
-def test_slow_marks_are_only_function_decorators_and_their_number_never_goes_up() -> None:
-    count, elsewhere = _slow_mark_scan()
+def test_slow_marks_are_only_function_decorators_and_their_number_never_goes_up(slow_mark_scan: tuple[int, list[str]]) -> None:
+    count, elsewhere = slow_mark_scan
     assert not elsewhere, f"mark a slow test with a decorator on the function itself, not like this: {elsewhere}"
     assert count <= PINNED_SLOW_MARKS, (
         f"{count} `@pytest.mark.slow` decorators, the pin is {PINNED_SLOW_MARKS}: a new slow test needs the pin raised in this file "
         "(a visible, reviewable edit); first try to make the test fast"
     )
     assert count == PINNED_SLOW_MARKS, f"{count} slow marks now: lower PINNED_SLOW_MARKS in {Path(__file__).name} to {count} (the pin only goes down)"
+
+
+@pytest.mark.no_base_failure(
+    reason="the change is in this test file, which the base check keeps at the PR head; against main's version of the "
+    "file it fails (the test there takes no fixture and calls _slow_mark_scan() itself, #787)"
+)
+def test_the_slow_mark_scan_runs_in_setup_not_in_the_budgeted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#787: the scan reads every file under tests/ and parses those that mention `mark.slow`, which grows with the tree
+    and used 2.5 s of the 2 s call-phase budget on a loaded runner. Setup is not budgeted, so the scan belongs in a module
+    fixture, as the Windows-pitfalls lint's does (#665); the test itself only checks the result."""
+    def scanned_in_the_call() -> tuple[int, list[str]]:
+        raise AssertionError("the test called _slow_mark_scan() itself, in its budgeted call phase")
+
+    monkeypatch.setattr(sys.modules[__name__], "_slow_mark_scan", scanned_in_the_call)
+    test_slow_marks_are_only_function_decorators_and_their_number_never_goes_up(slow_mark_scan=(PINNED_SLOW_MARKS, []))
