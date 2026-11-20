@@ -10,13 +10,21 @@ Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md
 from __future__ import annotations
 
 import logging
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain import dev_constants
 from brain.emotion import vocabulary
 from brain.emotion.vocabulary import Emotion
-from brain.health.json_io import Recovery, read_json_result, write_json
+from brain.health.adaptive import compute_treatment
+from brain.health.json_io import JsonFileError, Recovery, read_json, read_json_result, write_json
+from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 from brain.memory.store import MemoryStore
+from brain.paths import cadence_state_path
+from brain.utils import file_ops
+from brain.utils.file_lock import file_lock
 
 if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
@@ -127,7 +135,16 @@ def load_persona_vocabulary_with_anomaly(
     registered = _register_from_data(data)
 
     if store is not None:
-        registered += _heal_referenced_but_unregistered(path, data, store)
+        # One-time backfill: new words now register when written, so the scan of every active
+        # memory runs only until its marker exists. Reconstruction above is not gated by it.
+        marker = cadence_state_path(path.parent, "vocab_heal_final.json")
+        if not marker.exists():
+            healed = _heal_referenced_but_unregistered(path, data, store)
+            registered += healed
+            write_json(
+                marker,
+                {"healed_at": datetime.now(UTC).isoformat(), "count": healed},
+            )
 
     return registered, anomaly
 
@@ -158,6 +175,99 @@ def load_persona_vocabulary(
     """
     count, _anomaly = load_persona_vocabulary_with_anomaly(path, store=store, read_only=read_only)
     return count
+
+
+def register_new_word(
+    vocab_path: Path,
+    raw_name: str,
+    *,
+    half_life_days: float | None = None,
+    description: str = PLACEHOLDER_DESCRIPTION,
+) -> str | None:
+    """Register a new emotion word in this process and persist it to the vocabulary file.
+
+    Returns the canonical name, or None when the gate refuses the name or the file cannot be
+    read safely (a corrupt file is left untouched). A word already registered returns its
+    name and touches nothing. The file is re-read under the cross-process lock so an entry
+    another process wrote is kept.
+    """
+    name = vocabulary.validate_new_name(raw_name)
+    if name is None:
+        return None
+    if vocabulary.get(name) is not None:
+        return name
+    with file_lock(vocab_path):
+        try:
+            data = read_json(
+                vocab_path,
+                default=_default_vocab_factory,
+                recover=Recovery.RAISE,
+                expect=dict,
+                validate=_vocab_schema_validator,
+            )
+        except JsonFileError:
+            logger.warning(
+                "emotion vocabulary %s is unreadable; not registering %r", vocab_path, name, exc_info=True
+            )
+            return None
+        entries = data["emotions"]
+        known = {e.get("name") for e in entries if isinstance(e, dict)}
+        if name not in known:
+            entries.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "category": "persona_extension",
+                    "decay_half_life_days": half_life_days or dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS,
+                    "intensity_clamp": 10.0,
+                }
+            )
+            try:
+                backups = compute_treatment(vocab_path.parent, vocab_path.name).backup_count
+                write_json(vocab_path, data, backups=backups)
+            except OSError:
+                logger.warning("could not write %s; not registering %r", vocab_path, name, exc_info=True)
+                return None
+        try:
+            _register_from_data(
+                {"emotions": [e for e in entries if isinstance(e, dict) and e.get("name") == name]}
+            )
+        except ValueError:
+            # Another thread registered the same word between the check and here: it is registered.
+            pass
+    return name
+
+
+_REFRESH_KEYS: dict[str, object] = {}
+_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_if_changed(vocab_path: Path) -> int:
+    """Register words another process added to the vocabulary file; read-only.
+
+    Costs one ``stat`` when the file is unchanged since the last call for this path. A changed
+    file is loaded with ``read_only=True`` (no heal, quarantine or write) and its count of
+    newly registered words returned. A failed read re-raises, and the file's key is recorded
+    all the same so a corrupt file is not re-parsed on every call; a failed ``stat`` records
+    nothing and propagates.
+    """
+    path_key = Path(vocab_path).as_posix()
+    with _REFRESH_LOCK:
+        stat = file_ops.stat_path(vocab_path)
+        key = None if stat is None else stat.key
+        if path_key in _REFRESH_KEYS and _REFRESH_KEYS[path_key] == key:
+            return 0
+        if key is None:
+            _REFRESH_KEYS[path_key] = None
+            return 0
+        try:
+            count = load_persona_vocabulary(vocab_path, read_only=True)
+        except JsonFileError as exc:
+            if exc.kind != "io":
+                _REFRESH_KEYS[path_key] = key
+            raise
+        _REFRESH_KEYS[path_key] = key
+        return count
 
 
 def _register_from_data(data: dict) -> int:

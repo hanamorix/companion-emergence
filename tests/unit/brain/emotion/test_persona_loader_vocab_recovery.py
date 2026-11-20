@@ -169,3 +169,57 @@ def test_reconstruct_mints_canonical_names(tmp_path: Path):
         assert ext == ["grief_love_blend"]
     finally:
         store.close()
+
+
+def test_heal_runs_once_then_marker_stops_it(tmp_path: Path):
+    """The referenced-but-unregistered scan is a one-time backfill: a marker stops later loads rerunning it."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="a", memory_type="conversation", domain="us", emotions={"zeta_feel": 8.0}
+            )
+        )
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert vocabulary.get("zeta_feel") is not None
+        marker = tmp_path / "cadence" / "vocab_heal_final.json"
+        assert marker.exists()
+
+        store.create(
+            Memory.create_new(
+                content="b", memory_type="conversation", domain="us", emotions={"eta_feel": 8.0}
+            )
+        )
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert vocabulary.get("eta_feel") is None
+    finally:
+        store.close()
+
+
+def test_missing_file_still_reconstructs_after_heal_marker(tmp_path: Path):
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="a", memory_type="conversation", domain="us", emotions={"theta_feel": 8.0}
+            )
+        )
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+        assert (tmp_path / "cadence" / "vocab_heal_final.json").exists()
+
+        vocab_path.unlink()
+        _cleanup_emotion("theta_feel")
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert vocabulary.get("theta_feel") is not None
+        names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+        assert "theta_feel" in names
+    finally:
+        store.close()
