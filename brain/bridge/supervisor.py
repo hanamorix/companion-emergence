@@ -86,6 +86,12 @@ from brain.felt_time import FeltTime, TickContext
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.forgetting import run_pass as forgetting_run_pass
 from brain.health.json_io import Recovery, iter_jsonl
+from brain.health.jsonl_nul_repair import (
+    run_jsonl_nul_repair as _jsonl_nul_repair_run,
+)
+from brain.health.jsonl_nul_repair import (
+    should_run_jsonl_nul_repair as _jsonl_nul_repair_should_run,
+)
 from brain.health.log_rotation import (
     rotate_age_archive_yearly,
     rotate_rolling_size,
@@ -394,6 +400,14 @@ def run_folded(
         if pending_reconcile_interval_s is not None
         else None
     )
+
+    # One-shot startup (#618): remove the NUL runs an unclean stop left in JSONL
+    # files. Provider-free, and first so every later one-shot reads clean logs.
+    try:
+        if _jsonl_nul_repair_should_run(persona_dir):
+            _jsonl_nul_repair_run(persona_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("jsonl NUL repair failed during startup: %s", exc)
 
     # One-shot startup: run the attunement backfill if this is a first-launch
     # (≥10 user turns + no completed backfill_state.json). Wrapped in

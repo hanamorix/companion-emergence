@@ -165,3 +165,36 @@ def test_an_unreadable_file_leaves_the_state_unwritten_and_the_next_run_repairs_
     assert list(iter_jsonl(p)) == [{"a": 1}, {"b": 2}]
     assert (tmp_path / STATE_FILENAME).exists()
     assert should_run_jsonl_nul_repair(tmp_path) is False
+
+
+def test_supervisor_startup_repairs_a_damaged_file(tmp_path):
+    """The real repair, through the real run_folded: nothing is patched."""
+    import json
+    import threading
+
+    from brain.bridge.events import EventBus
+    from brain.bridge.provider import FakeProvider
+    from brain.bridge.supervisor import run_folded
+
+    persona_dir = tmp_path / "test-persona"
+    persona_dir.mkdir()
+    (persona_dir / "active_conversations").mkdir()
+    (persona_dir / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
+    p = _write(
+        persona_dir, "heartbeats.log.jsonl", b'{"a":1}\n' + b"\0" * 20 + b'{"b":2}\n'
+    )
+
+    stop = threading.Event()
+    stop.set()
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=FakeProvider(),
+        event_bus=EventBus(),
+        tick_interval_s=0.1,
+        heartbeat_interval_s=None,
+    )
+
+    assert list(iter_jsonl(p)) == [{"a": 1}, {"b": 2}]
+    state = json.loads((persona_dir / STATE_FILENAME).read_text(encoding="utf-8"))
+    assert state["done"] is True
