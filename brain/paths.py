@@ -18,6 +18,8 @@ from pathlib import Path
 
 from platformdirs import PlatformDirs
 
+from brain import dev_constants
+
 _APP_NAME = "companion-emergence"
 _APP_AUTHOR = "hanamorix"
 
@@ -180,6 +182,17 @@ def get_log_dir() -> Path:
     return _dirs.user_log_path.resolve()
 
 
+# The runtime log rotates at this size keeping this many backups; its sibling bridge-<persona>.log uses the same.
+RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024
+RUNTIME_LOG_BACKUPS = 3
+
+
+def runtime_log_path(persona_name: str) -> Path:
+    """The bridge's logging output for a persona (warnings, errors, ticks). ``bridge-<persona>.log`` beside it holds
+    only the detached child's raw stdout/stderr."""
+    return get_log_dir() / f"runtime-{persona_name}.log"
+
+
 _CADENCE_SUBDIR = "cadence"
 
 
@@ -222,3 +235,13 @@ def presence_state_path(persona_dir: Path) -> Path:
     cadence pointer.
     """
     return persona_dir / "presence_state.json"
+
+
+def state_dir(persona_dir: Path) -> Path:
+    """The persona's ``state/`` folder, where the emotion engine keeps its files (the state file, the queue, the change log
+    and the switch). The folder name is ``dev_constants.EMOTION_STATE_DIR``, read at call time.
+
+    Nothing here creates the folder: the writers (``write_json``, ``append_jsonl``, ``file_lock``) each create a missing
+    parent. One resolver, so the day the other persona state files move in, one function changes.
+    """
+    return Path(persona_dir) / dev_constants.EMOTION_STATE_DIR

@@ -5,8 +5,7 @@ When the harness stands up the real bridge (BridgeServer.start() -> brain.bridge
 emotion_vocabulary.json from the Canary's seeded memories and register()s any persona-extension
 emotion (e.g. "warmth") into the process-global brain.emotion.vocabulary._REGISTRY. Pre-fix,
 sandbox() restored env + tempdirs but NOT that registry, so the registration escaped the run and
-polluted later unit tests (notably tests/unit/brain/emotion/test_aggregate.py::
-test_dropped_unregistered_emotion_warns_once, which then saw 0 warnings instead of 1).
+polluted later unit tests that count the registered emotions.
 
 These tests reproduce that leak and prove sandbox() now restores the registry on teardown — both on
 a clean exit AND when SandboxLeak is raised. Zero model tokens: BridgeServer.start() only
@@ -46,19 +45,14 @@ def _seed_fake_cred(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 @pytest.fixture(autouse=True)
 def _registry_self_clean():
     """G9: this test must never leak the very thing it tests, regardless of prior state. Snapshot the
-    process-global registry + warned-set around each test and restore in a finally, so the test
+    process-global registry around each test and restore in a finally, so the test
     passes whether or not `warmth`/`reverence` were registered before it ran."""
-    import brain.emotion.aggregate as aggregate
-
     saved_registry = dict(vocabulary._REGISTRY)
-    saved_warned = set(aggregate._warned_unregistered)
     try:
         yield
     finally:
         vocabulary._REGISTRY.clear()
         vocabulary._REGISTRY.update(saved_registry)
-        aggregate._warned_unregistered.clear()
-        aggregate._warned_unregistered.update(saved_warned)
 
 
 def test_sandbox_does_not_leak_persona_emotion_registration(

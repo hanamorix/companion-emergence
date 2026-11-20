@@ -575,7 +575,8 @@ a debug log. Remaining depth (grief-specific defers) tracked in
   `dispatched_invocations`, pinned by an integration test). `**The trigger to
   drift.**` behavioural rule added to the default voice template. Six-file
   version pin documented (was four). `sync-to-public.sh` preflight verifies all
-  six agree. launchd plist generator bakes node's bin dir into PATH for the
+  six agree (that script was retired in v0.0.41; `scripts/release_preflight.sh`
+  checks the six now). launchd plist generator bakes node's bin dir into PATH for the
   SessionEnd hook.
 
 **2026-05-31 — Inner monologue via tool call (v0.0.26)**

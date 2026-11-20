@@ -105,6 +105,49 @@ SubtypeLiteral = Literal["drop", "arc_close", "recall_touch"]
 ReferentTypeLiteral = Literal["memory", "arc"]
 
 
+def build_breadcrumb(
+    *,
+    intensity: float,
+    subtype: SubtypeLiteral,
+    referent_type: ReferentTypeLiteral,
+    referent_id: str,
+    content: str,
+    residue_emotion: tuple[str, float] | None,
+    triggering_arc_id: str | None = None,
+) -> Memory:
+    """Build a grief breadcrumb memory per spec §4, without writing it.
+
+    `write_breadcrumb` writes it with the store's plain insert; the recall touch hands it to the store's one-step
+    check-and-insert (`MemoryStore.create_grief_touch_unless_recent`, #342).
+    """
+    emotions: dict[str, float] = {"memory_grief": float(intensity)}
+    if residue_emotion is not None:
+        name, value = residue_emotion
+        # Skip if name is the primary grief key (avoid double-counting) or value <= 0. Held to 10: dream rows store
+        # unclamped sums (switch-off dreams still do, dream.py), so a dropped memory's strongest feeling can be above 20
+        # (emotion rework B1 PR 6).
+        if name != "memory_grief" and value > 0.0:
+            emotions[name] = min(10.0, float(value) * policy.RESIDUE_FACTOR)
+
+    metadata: dict[str, object] = {
+        "grief_referent_type": referent_type,
+        "grief_referent_id": referent_id,
+        "grief_subtype": subtype,
+        "triggering_arc_id": triggering_arc_id,
+    }
+    return Memory.create_new(
+        content=content,
+        memory_type="grief_event",
+        domain="grief",
+        emotions=emotions,
+        metadata=metadata,
+        # P3 retention rework, Change 1: grief intensity is already on a
+        # ~0-10 scale; pass it through directly instead of letting the
+        # create_new default deflate it to intensity/10.0.
+        importance=_clamp(intensity),
+    )
+
+
 def write_breadcrumb(
     *,
     store: MemoryStore,
@@ -120,28 +163,13 @@ def write_breadcrumb(
 
     No threshold gating here — callers apply the threshold before calling.
     """
-    emotions: dict[str, float] = {"memory_grief": float(intensity)}
-    if residue_emotion is not None:
-        name, value = residue_emotion
-        # Skip if name is the primary grief key (avoid double-counting) or value <= 0.
-        if name != "memory_grief" and value > 0.0:
-            emotions[name] = float(value) * policy.RESIDUE_FACTOR
-
-    metadata: dict[str, object] = {
-        "grief_referent_type": referent_type,
-        "grief_referent_id": referent_id,
-        "grief_subtype": subtype,
-        "triggering_arc_id": triggering_arc_id,
-    }
-    memory = Memory.create_new(
+    memory = build_breadcrumb(
+        intensity=intensity,
+        subtype=subtype,
+        referent_type=referent_type,
+        referent_id=referent_id,
         content=content,
-        memory_type="grief_event",
-        domain="grief",
-        emotions=emotions,
-        metadata=metadata,
-        # P3 retention rework, Change 1: grief intensity is already on a
-        # ~0-10 scale; pass it through directly instead of letting the
-        # create_new default deflate it to intensity/10.0.
-        importance=_clamp(intensity),
+        residue_emotion=residue_emotion,
+        triggering_arc_id=triggering_arc_id,
     )
     return store.create(memory)

@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from brain.bridge.provider import LLMProvider
 from brain.memory.store import MemoryStore
 from brain.soul.review import parse_decision, review_pending_candidates
@@ -515,30 +517,16 @@ def test_parse_decision_unknown_love_type_on_accept_defers() -> None:
 # ── _current_emotional_summary regression ─────────────────────────────────────
 
 
-def test_current_emotional_summary_uses_emotions_attr_not_all_method() -> None:
-    """Regression: EmotionalState exposes ``emotions: dict[str, float]`` directly,
-    not a ``.all()`` method. The helper used to call ``state.all()`` which
-    raised AttributeError every invocation against a real store, swallowing
-    silently to return "unknown". This test ensures real emotion data flows
-    through the helper as a non-"unknown" summary string.
+def test_current_emotional_summary_uses_emotions_attr_not_all_method(tmp_path, emotion_engine_stub) -> None:
+    """Regression: the helper once raised AttributeError on every invocation, swallowed silently into "unknown".
+    This test ensures the engine's emotion data flows through the helper as a non-"unknown" summary string.
     """
-    from brain.memory.store import Memory
+    from brain.emotion.engine import Reading
     from brain.soul.review import _current_emotional_summary
 
-    store = MemoryStore(":memory:")
-    # "love" is a baseline emotion in brain.emotion.vocabulary — no persona
-    # loader needed for the regression check.
-    store.create(
-        Memory.create_new(
-            content="A genuinely meaningful moment.",
-            memory_type="experience",
-            domain="us",
-            emotions={"love": 9.0},
-            importance=8.0,
-        )
-    )
+    emotion_engine_stub.readings = {"love": Reading(short=9.0, long=0.0, difference=0.0, shift=0)}
 
-    summary = _current_emotional_summary(store)
+    summary = _current_emotional_summary(tmp_path)
     assert summary != "unknown", (
         "helper still raising AttributeError — likely regressed back to state.all()"
     )
@@ -760,7 +748,7 @@ def test_source_memory_snippet_fail_soft() -> None:
 
     # (c) store raising → None (no exception propagated)
     class _BadStore:
-        def get(self, mid: str):
+        def get(self, mid: str, *, bump: bool = True):
             raise RuntimeError("simulated store error")
 
     assert _source_memory_snippet(_BadStore(), {"memory_id": "any"}) is None  # type: ignore[arg-type]
@@ -780,6 +768,40 @@ def test_source_memory_snippet_fail_soft() -> None:
     assert result is not None
     assert len(result) <= 400
     store_d.close()
+
+
+def test_context_reads_do_not_tick_the_memories_they_read() -> None:
+    """The two reads that feed the review prompt (the source memory and the related memories) are not accesses."""
+    from brain.memory.store import Memory
+    from brain.soul.review import _related_memory_snippets, _source_memory_snippet
+
+    store = MemoryStore(":memory:")
+    source = Memory.create_new(
+        content="the lamp was still on when she fell asleep",
+        memory_type="experience",
+        domain="us",
+        emotions={},
+        importance=8.0,
+    )
+    related = Memory.create_new(
+        content="another night the lamp stayed on until morning",
+        memory_type="experience",
+        domain="us",
+        emotions={},
+        importance=8.0,
+    )
+    store.create(source)
+    store.create(related)
+
+    assert _source_memory_snippet(store, {"memory_id": source.id}) is not None  # the reads ran
+    assert len(_related_memory_snippets(store, "the lamp")) == 2
+
+    for mid in (source.id, related.id):
+        row = store.get(mid, bump=False)
+        assert row is not None
+        assert row.recall_count == 0.0
+        assert row.last_accessed_at is None
+    store.close()
 
 
 def test_review_prompt_carries_source_moment_through_loop(tmp_path: Path) -> None:
@@ -1046,3 +1068,36 @@ def test_expired_not_forgetting_exempt(tmp_path: Path) -> None:
     assert expired_mem_id not in under_review, "expired memory_id must NOT be under-review"
     assert accepted_mem_id not in under_review, "accepted memory_id must NOT be under-review"
     assert rejected_mem_id not in under_review, "rejected memory_id must NOT be under-review"
+
+
+# ── the review's emotional summary is the engine's short averages ─────────────
+
+
+def test_current_emotional_summary_is_the_top_three_short_averages(tmp_path, emotion_engine_stub) -> None:
+    from brain.emotion.engine import Reading
+    from brain.soul.review import _current_emotional_summary
+
+    emotion_engine_stub.readings = {
+        "love": Reading(short=6.25, long=0.0, difference=0.0, shift=0),
+        "joy": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+        "awe": Reading(short=3.0, long=0.0, difference=0.0, shift=0),
+        "calm": Reading(short=1.0, long=0.0, difference=0.0, shift=0),
+    }
+    assert _current_emotional_summary(tmp_path) == "love:6.2, awe:3.0, calm:1.0"
+    emotion_engine_stub.readings = {}
+    assert _current_emotional_summary(tmp_path) == "neutral"
+
+
+@pytest.mark.no_base_failure(
+    reason=(
+        "renamed from the _live_ variant; on the base the helper takes a store, so a directory argument also ends in 'unknown' through the same fail-soft except"
+    )
+)
+def test_current_emotional_summary_with_a_read_that_raises_says_unknown(tmp_path, emotion_engine_stub) -> None:
+    from brain.soul.review import _current_emotional_summary
+
+    def boom():
+        raise RuntimeError("engine fault")
+
+    emotion_engine_stub.read = boom
+    assert _current_emotional_summary(tmp_path) == "unknown"

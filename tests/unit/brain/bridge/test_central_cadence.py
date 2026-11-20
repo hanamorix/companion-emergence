@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import json
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -49,9 +48,9 @@ INTERVAL_JOBS: dict[str, tuple[str, float]] = {
     "initiate_review": ("initiate_review_cadence.json", 900.0),
 }
 NO_INTERVAL_JOBS = (
+    "emotion_recovery_rebuild",
     "pass2",
     "session_snapshot_prune",
-    "emotion_backfill",
     "research_recovery",
     "embedding_backfill",
     "extraction_backfill",
@@ -162,6 +161,13 @@ def stubs(monkeypatch):
 
         return _f
 
+    # Engine 6 (#584): the recovery job asks the engine whether it has work and runs `recovery_job_run`; both are stood in for.
+    monkeypatch.setattr(
+        supervisor.emotion_engine.EmotionEngine,
+        "needs_recovery",
+        lambda _self: work["emotion_recovery_rebuild"],
+    )
+    monkeypatch.setattr(supervisor.emotion_engine, "recovery_job_run", rec("emotion_recovery_rebuild", True))
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
     monkeypatch.setattr(pass2_queue, "queue_length", lambda _pd: 1 if work["pass2"] else 0)
@@ -180,16 +186,6 @@ def stubs(monkeypatch):
         supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"]
     )
     monkeypatch.setattr(supervisor, "snapshot_stale_sessions", rec("session_snapshot_prune", []))
-    monkeypatch.setattr(
-        supervisor, "_emotion_backfill_has_work", lambda _pd, **_k: work["emotion_backfill"]
-    )
-    # INC-10: _emotion_backfill_job reads .status off the return value to
-    # tell a real between-items pause ("running") from a finish.
-    monkeypatch.setattr(
-        supervisor,
-        "_emotion_backfill_run",
-        rec("emotion_backfill", SimpleNamespace(status="complete")),
-    )
     monkeypatch.setattr(
         supervisor.research_recovery, "has_recovery_work", lambda _pd: work["research_recovery"]
     )
@@ -296,8 +292,10 @@ def _fake_jobs(names, log, *, due=True):
 def test_job_table_is_the_22_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    # #523: the extraction backfill joined after the recall diagnostics flush; #591: the research recovery after the emotion backfill
+    # #523: the extraction backfill joined after the recall diagnostics flush; #591: the research recovery after the session
+    # snapshot/prune; Engine 6 (#584): the emotion recovery rebuild runs first; #747: the emotion backfill job is gone
     assert len(names) == 22
+    assert names[0] == "emotion_recovery_rebuild"
     # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
     # name-recall fix S100: the stuck-width re-measure follows them, and S164's
     # cost-series flush follows that (the re-measure's own sample is saved the
@@ -361,7 +359,7 @@ def test_c15a_all_17_due_run_in_s55_order_real_table(tmp_path, stubs):
 
 
 # The loop asks is-chat-idle in one place before every job (no per-job branch), so the first and second job, one in
-# the middle and the last stand for all 22; the real-table test below pins the calibration boundary.
+# the middle and the last stand for all 23; the real-table test below pins the calibration boundary.
 @pytest.mark.parametrize("j", [0, 1, len(GATED_JOB_ORDER) // 2, len(GATED_JOB_ORDER) - 1])
 def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     log: list[str] = []
@@ -377,31 +375,11 @@ def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     assert (decisions[-1].job, decisions[-1].action) == (GATED_JOB_ORDER[j], "skip-no-lull")
 
 
-@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
-def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tmp_path, stubs, monkeypatch):
-    """The real emotion_backfill job hands the backfill a provider built for the background-classifier tier
-    (#154: the backfill used to receive the bare shared provider)."""
-    from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
-
+def test_the_supervisor_job_table_has_no_emotion_backfill_job(tmp_path):
+    """#747: the emotion backfill is a step of the consolidation gate now, not a gated job of its own."""
     persona_dir = _persona(tmp_path)
-    built: list[tuple] = []
-    given: dict = {}
-    provider = FakeProvider()
-
-    def build(pd, tier, *a, **k):
-        built.append((pd, tier))
-        return provider
-
-    def run(pd, **kwargs):
-        given.update(kwargs)
-        return SimpleNamespace(status="complete")
-
-    monkeypatch.setattr(supervisor, "build_tier_provider", build)
-    monkeypatch.setattr(supervisor, "_emotion_backfill_run", run)
-    job = next(j for j in _real_jobs(persona_dir) if j.name == "emotion_backfill")
-    assert job.run() is JobOutcome.COMPLETED
-    assert built == [(persona_dir, TIER_BACKGROUND_CLASSIFIER)]
-    assert given["provider"] is provider
+    assert "emotion_backfill" not in [j.name for j in _real_jobs(persona_dir)]
+    assert "emotion_backfill" not in GATED_JOB_ORDER
 
 
 def test_the_research_recovery_job_is_due_while_it_has_work_and_runs_one_pass_on_the_tick_store(tmp_path, monkeypatch):
@@ -420,6 +398,23 @@ def test_the_research_recovery_job_is_due_while_it_has_work_and_runs_one_pass_on
     assert job.has_work() is False
     assert job.run() is JobOutcome.COMPLETED
     assert ran == [(persona_dir, "MemoryStore")]
+
+
+def test_the_emotion_recovery_job_is_due_while_the_engine_needs_recovery_and_maps_the_run_to_an_outcome(
+    tmp_path, emotion_engine_stub, monkeypatch
+):
+    """Engine 6 (#584): due iff the engine's own `needs_recovery()` holds; no interval; a finished rebuild is COMPLETED and a
+    failed one (logged by `recovery_job_run`, which the next pass retries) is SKIPPED, so the sequence goes on to the next job."""
+    persona_dir = _persona(tmp_path)
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "emotion_recovery_rebuild")
+    assert job.cadence_file is None and job.interval_s is None and job.has_work is not None
+    assert job.has_work() is False
+    emotion_engine_stub.recovery_needed = True
+    assert job.has_work() is True
+    assert job.run() is JobOutcome.COMPLETED
+    assert [call for call in emotion_engine_stub.recorded_calls if call[0] == "recovery_rebuild"] == [("recovery_rebuild",)]
+    monkeypatch.setattr(supervisor.emotion_engine, "recovery_job_run", lambda _pd: False)
+    assert job.run() is JobOutcome.SKIPPED
 
 
 def test_c15a_idle_flip_real_table_stops_before_calibration(tmp_path, stubs):
@@ -461,7 +456,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 22 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -573,7 +568,7 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 22
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * len(GATED_JOB_ORDER)
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)
@@ -752,9 +747,13 @@ def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stu
     assert attempts == [(persona_dir,)] * 2, "a job that stays due is tried again at the next pass, on this persona"
 
 
-def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch):
+def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch, emotion_engine_stub):
     """Self-model keeps its own cadence (S29): a reflect that raises is
     caught by its own handler and backs off (still an advance, S44)."""
+    from brain.emotion.engine import Reading
+
+    # The tick reaches its reflect only when the engine has something to read.
+    emotion_engine_stub.readings = {"joy": Reading(short=6.0, long=5.0, difference=1.0, shift=1)}
     persona_dir = _persona(tmp_path)
     sm_cadence.save(
         persona_dir,
@@ -981,7 +980,6 @@ _GATED_CALLS = {
     "_run_calibration_tick",
     "_run_deploy_recalibration_check",
     "_run_deploy_recalibration",
-    "_emotion_backfill_run",
     "_run_clustering_tick",
     "_run_finalize_tick",
     "_run_initiate_review_tick",
@@ -994,6 +992,7 @@ _GATED_CALLS = {
     "drain_all_locked",
 }
 _NON_GATED_ONE_SHOTS = {
+    "_jsonl_nul_repair_run",
     "_attunement_run_backfill",
     "_attunement_run_supplementary_backfill",
     "_run_vocab_repair_tick",
@@ -1249,52 +1248,8 @@ def _mem(content="a memory long enough to embed", emotions=None):
 
     m = Memory.create_new(content=content, memory_type="meta", domain="test")
     if emotions is not None:
-        m.emotions = emotions
+        m._stored_emotions = emotions
     return m
-
-
-def test_c39_emotion_backfill_has_work_probe(tmp_path):
-    from brain.ingest import emotion_backfill as eb
-    from brain.memory.store import MemoryStore
-
-    persona_dir = _persona(tmp_path)
-    assert eb.has_emotion_backfill_work(persona_dir) is False  # no db
-    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
-    try:
-        store.create(_mem(emotions={"joy": 3.0}))
-        assert eb.has_emotion_backfill_work(persona_dir, store=store) is False
-        store.create(_mem(emotions={}))
-        assert eb.has_emotion_backfill_work(persona_dir, store=store) is True
-        assert eb.has_emotion_backfill_work(persona_dir) is True  # own short-lived store
-
-        def _state(status):
-            eb._save_state(  # noqa: SLF001
-                persona_dir,
-                eb.EmotionBackfillState(
-                    started_at="x",
-                    total_memories=2,
-                    tagged_memories=1,
-                    last_cursor="",
-                    status=status,
-                    schema_version="v1",
-                ),
-            )
-
-        _state("complete")
-        assert eb.has_emotion_backfill_work(persona_dir, store=store) is False
-        # Cap hit today → no work until the budget's day is over.
-        _state("deferred_to_next_day")
-        now = datetime.now(UTC)
-        eb._budget_path(persona_dir).write_text(  # noqa: SLF001
-            json.dumps({"date": eb._today_str(now), "count": 200})  # noqa: SLF001
-        )
-        assert eb.has_emotion_backfill_work(persona_dir, store=store, now=now) is False
-        assert (
-            eb.has_emotion_backfill_work(persona_dir, store=store, now=now + timedelta(days=1))
-            is True
-        )
-    finally:
-        store.close()
 
 
 def test_c39_embedding_backfill_has_work_probe(tmp_path, monkeypatch):

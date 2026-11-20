@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.review import run_initiate_review_tick
 from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
@@ -773,8 +775,8 @@ def test_delivered_reach_out_writes_source_emotions(tmp_path: Path, monkeypatch)
         delivered = [m for m in initiate_mems if "delivered" in (m.tags or [])]
         assert delivered, f"no delivered-tagged memory; initiate_mems={initiate_mems}"
         m = delivered[0]
-        assert m.emotions.get("tenderness", 0) > 0, (
-            f"tenderness missing or zero in emotions: {m.emotions}"
+        assert m._stored_emotions.get("tenderness", 0) > 0, (
+            f"tenderness missing or zero in emotions: {m._stored_emotions}"
         )
     finally:
         store.close()
@@ -977,3 +979,69 @@ def test_process_one_candidate_keeps_an_unparseable_decision_in_the_persona_log(
 
     rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
     assert [(r["site"], r["raw"]) for r in rows] == [("initiate_voice_edit", "not a decision")]
+
+
+# ---- emotion rework B1 PR 3: the reach-out nudge is on the 0-10 scale once the engine is live ----
+
+
+def _delivered_emotions(
+    tmp_path: Path, monkeypatch, *, live: bool, ruin: bool = False, progress: int = 0
+) -> dict[str, float]:
+    """`live` switches the persona over; `ruin` then leaves its state unreadable; `progress` is the x10 fix's note (B1 PR 7)."""
+    from brain.memory.store import Memory, MemoryStore
+    from tests.unit.brain.emotion._engine_support import make_live, ruin_the_state
+
+    seed_store = MemoryStore(tmp_path / "memories.db")
+    try:
+        seed_store.set_x10_progress(progress)
+        if live:  # a live persona with no state file applies nothing, so seed a memory first, then record the switch-over
+            seed_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    finally:
+        seed_store.close()
+    if live:
+        make_live(tmp_path, datetime.now(UTC))
+    if ruin:
+        ruin_the_state(tmp_path)
+    monkeypatch.setattr("brain.initiate.review.reflection_run", _promote_all_reflection_run)
+    emit_initiate_candidate(
+        tmp_path, kind="message", source="dream", source_id="dream_b1_pr3", emotional_snapshot=_snap(), semantic_context=_ctx()
+    )
+    run_initiate_review_tick(
+        tmp_path,
+        provider=_fake_provider("send_quiet"),
+        voice_template="be warm",
+        cap_per_tick=3,
+        now=datetime(2026, 5, 16, 14, 0, tzinfo=_LOCAL),
+    )
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        delivered = [m for m in store.list_active(limit=20) if "delivered" in (m.tags or [])]
+    finally:
+        store.close()
+    assert len(delivered) == 1
+    return delivered[0]._stored_emotions
+
+
+def test_delivered_reach_out_stores_the_nudge_ten_times_when_live(tmp_path: Path, monkeypatch) -> None:
+    assert _delivered_emotions(tmp_path, monkeypatch, live=True) == pytest.approx({"tenderness": 1.5, "vulnerability": 1.0})
+
+
+@pytest.mark.no_base_failure(reason="pins today's small reach-out nudge with the switch off (B1 PR 3); main stores it too")
+def test_delivered_reach_out_keeps_todays_nudge_when_off(tmp_path: Path, monkeypatch) -> None:
+    assert _delivered_emotions(tmp_path, monkeypatch, live=False) == pytest.approx({"tenderness": 0.15, "vulnerability": 0.10})
+
+
+# ---- B1 PR 7: the scale follows the switch-over, then the x10 fix's progress (cut 1, a row written to memories.db) ----
+
+
+def test_delivered_reach_out_is_on_the_engine_scale_when_switched_over_but_state_unreadable(tmp_path: Path, monkeypatch) -> None:
+    emotions = _delivered_emotions(tmp_path, monkeypatch, live=True, ruin=True, progress=1)
+    assert emotions == pytest.approx({"tenderness": 1.5, "vulnerability": 1.0})
+
+
+@pytest.mark.no_base_failure(reason="B1 PR 7 pins the accepted edge (#633): switched, state unreadable, progress 0 stays small")
+def test_delivered_reach_out_keeps_todays_scale_when_switched_state_unreadable_and_progress_zero(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emotions = _delivered_emotions(tmp_path, monkeypatch, live=True, ruin=True, progress=0)
+    assert emotions == pytest.approx({"tenderness": 0.15, "vulnerability": 0.10})

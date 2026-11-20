@@ -68,7 +68,9 @@ def test_nell_heartbeat_second_tick_does_work(nell_persona: Path) -> None:
 def test_nell_heartbeat_dry_run_no_writes(nell_persona: Path) -> None:
     """--dry-run doesn't create state file or log entry."""
     from brain.cli import main
+    from brain.emotion.engine import ensure_engine_ready
 
+    ensure_engine_ready(nell_persona)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
     rc = main(
         ["heartbeat", "--persona", "nell", "--trigger", "manual", "--provider", "fake", "--dry-run"]
     )
@@ -125,7 +127,8 @@ def test_nell_heartbeat_compact_output_suppresses_not_due(
     assert "interests bumped: 0" not in out
     # But the basic heartbeat lines should still be there
     assert "Heartbeat tick complete" in out
-    assert "decayed:" in out
+    assert "pruned" in out
+    assert "decayed" not in out
 
 
 def test_nell_heartbeat_verbose_shows_all_gated_reasons(
@@ -199,7 +202,6 @@ def test_compact_cli_self_treated_emits_bandage_line(
         return HeartbeatResult(
             trigger=trigger,
             elapsed_seconds=3600.0,
-            memories_decayed=0,
             edges_pruned=0,
             dream_id=None,
             dream_gated_reason="not_due",
@@ -233,7 +235,6 @@ def test_compact_cli_alarm_emits_banner_above_engine_status(
         return HeartbeatResult(
             trigger=trigger,
             elapsed_seconds=3600.0,
-            memories_decayed=0,
             edges_pruned=0,
             dream_id=None,
             dream_gated_reason="not_due",

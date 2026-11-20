@@ -257,7 +257,7 @@ def _fetch_content(store: MemoryStore, memory_id: str) -> str | None:
     """
     if not memory_id:
         return None
-    mem = store.get(memory_id)
+    mem = store.get(memory_id, bump=False)  # a repair read, not a recall (#587)
     if mem is None:
         return None
     content = (mem.content or "").strip()

@@ -495,6 +495,63 @@ async fn bridge_healthy(persona: &str) -> bool {
     matches!(req.send().await, Ok(r) if r.status().is_success())
 }
 
+/// How long the app waits for `nell supervisor start` while no engine progress is shown (Audit 2026-05-07 P2-9: without a
+/// bound a hung start would freeze the renderer). The clock stands still while the status shows a live rebuild
+/// (`wait_for_start`); the user otherwise gets `supervisor_start_timeout`.
+const START_TIMEOUT_S: u64 = 60;
+/// How often `ensure_bridge_running` reads the bridge status while it waits for the start command (the app's STATUS_POLL_MS,
+/// useRestartBridge.ts).
+const START_STATUS_POLL_MS: u64 = 5000;
+
+/// The start command did not finish within its budget.
+#[derive(Debug, PartialEq)]
+struct StartWaitTimeout;
+
+/// What one `bridge_status` reading says about a rebuild: `Some(true)` an engine progress record names a live writer,
+/// `Some(false)` the field is there and empty, `None` the reading has no such field (a status read that timed out is
+/// `{"alive": "unknown"}`) so the previous reading stands.
+fn engine_progress_shown(status: &serde_json::Value) -> Option<bool> {
+    status.get("engine_progress").map(|v| !v.is_null())
+}
+
+/// Waits for `run` (the start command), reading the status between steps of `poll`; gives up after `budget` of waiting
+/// that was not spent while engine progress was shown (Engine 6, HR5 part 4, owner S101: the start waits until a rebuild is
+/// finished). Time before the record appears counts. `run` is polled across steps, not restarted, and dropped only when
+/// this gives up (which kills the command, `kill_on_drop`).
+async fn wait_for_start<T, R, S, SF>(
+    budget: std::time::Duration,
+    poll: std::time::Duration,
+    run: R,
+    mut read_status: S,
+) -> Result<T, StartWaitTimeout>
+where
+    R: std::future::Future<Output = T>,
+    S: FnMut() -> SF,
+    SF: std::future::Future<Output = Option<bool>>,
+{
+    tokio::pin!(run);
+    let mut remaining = budget;
+    let mut paused = false;
+    loop {
+        let step = if paused { poll } else { poll.min(remaining) };
+        let began = std::time::Instant::now();
+        if let Ok(done) = tokio::time::timeout(step, &mut run).await {
+            return Ok(done);
+        }
+        // A reading with no field (a timed-out status read) leaves the previous one standing. The step and the read both
+        // count against the budget, unless the reading says a rebuild is running.
+        if let Some(shown) = read_status().await {
+            paused = shown;
+        }
+        if !paused {
+            remaining = remaining.saturating_sub(began.elapsed());
+            if remaining.is_zero() {
+                return Err(StartWaitTimeout);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result<(), String> {
     validate_persona_name(&persona)?;
@@ -506,11 +563,9 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     // start command — it blocks until /health returns 200, so when
     // the subprocess exits we can trust the bridge is up.
     //
-    // Audit 2026-05-07 P2-9: 60s timeout. Without a bound, a hung
-    // Python init / supervisor stall would freeze the Tauri renderer
-    // through `await ensureBridgeRunning(...)` indefinitely. 60s is
-    // generous against typical 5-15s startup; if it triggers, the
-    // user gets `supervisor_start_timeout` instead of a stuck UI.
+    // Bounded by START_TIMEOUT_S of waiting that is not spent on a live
+    // rebuild (see `wait_for_start`); if it triggers, the user gets
+    // `supervisor_start_timeout` instead of a stuck UI.
     let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
@@ -519,7 +574,22 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
+    let output = match wait_for_start(
+        std::time::Duration::from_secs(START_TIMEOUT_S),
+        std::time::Duration::from_millis(START_STATUS_POLL_MS),
+        cmd.output(),
+        || {
+            let app = app.clone();
+            let persona = persona.clone();
+            async move {
+                match bridge_status(app, persona).await {
+                    Ok(status) => engine_progress_shown(&status),
+                    Err(_) => None,
+                }
+            }
+        },
+    )
+    .await
     {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -527,7 +597,7 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
             record_spawn_failure(&app, "nell supervisor start", None, Some(&msg), started);
             return Err(msg);
         }
-        Err(_) => {
+        Err(StartWaitTimeout) => {
             record_spawn_failure(
                 &app,
                 "nell supervisor start",
@@ -3197,5 +3267,133 @@ mod bridge_stop_tests {
         let terminate = concat!("Terminate", "Process(");
         assert!(!src.contains(direct_kill));
         assert!(!src.contains(terminate));
+    }
+
+    // ── wait_for_start (Engine 6, HR5 part 4): millisecond budgets, every wait bounded by an outer 5 s timeout ──
+
+    const T_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+    const T_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// A status reader that answers the scripted readings in order and then repeats the last one.
+    fn scripted(
+        readings: Vec<Option<bool>>,
+    ) -> impl FnMut() -> std::future::Ready<Option<bool>> {
+        let mut i = 0;
+        move || {
+            let r = readings
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| readings.last().copied().flatten());
+            i += 1;
+            std::future::ready(r)
+        }
+    }
+
+    /// Runs `wait_for_start` with `run`; the outer timeout turns a hang into a failed test.
+    async fn waited<T>(
+        run: impl std::future::Future<Output = T>,
+        readings: Vec<Option<bool>>,
+    ) -> (Result<T, StartWaitTimeout>, std::time::Duration) {
+        let began = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(T_BUDGET, T_POLL, run, scripted(readings)),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
+        (result, began.elapsed())
+    }
+
+    async fn finishes_after(ms: u64) -> u8 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        7
+    }
+
+    #[test]
+    fn engine_progress_shown_reads_the_field() {
+        assert_eq!(engine_progress_shown(&serde_json::json!({"engine_progress": {"phase": "rebuilding"}})), Some(true));
+        assert_eq!(engine_progress_shown(&serde_json::json!({"engine_progress": null})), Some(false));
+        assert_eq!(engine_progress_shown(&serde_json::json!({"alive": "unknown"})), None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_returns_the_commands_result() {
+        let (r, _) = waited(finishes_after(0), vec![Some(false)]).await;
+        assert_eq!(r, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_gives_up_at_the_budget_with_no_engine_progress() {
+        let (r, took) = waited(std::future::pending::<u8>(), vec![Some(false)]).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(took >= T_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_keeps_the_command_running_across_steps() {
+        // a long budget, so only a restarted or dropped command could fail this
+        let began = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(
+                std::time::Duration::from_secs(2),
+                T_POLL,
+                finishes_after(120),
+                scripted(vec![Some(false)]),
+            ),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
+        assert_eq!(r, Ok(7));
+        assert!(began.elapsed() >= std::time::Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_does_not_give_up_while_engine_progress_is_shown() {
+        // the command outlasts the 50 ms budget several times over
+        let (r, _) = waited(finishes_after(300), vec![Some(true)]).await;
+        assert_eq!(r, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_gives_up_after_the_pause_ends() {
+        // five paused steps (>= 50 ms not counted), then the record is gone: the budget runs from there
+        let mut readings = vec![Some(true); 5];
+        readings.push(Some(false));
+        let (r, took) = waited(std::future::pending::<u8>(), readings).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(took >= T_BUDGET * 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_keeps_a_shown_reading_when_a_status_read_times_out() {
+        let (r, _) = waited(finishes_after(300), vec![Some(true), None]).await;
+        assert_eq!(r, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_keeps_an_absent_reading_when_a_status_read_times_out() {
+        let (r, took) = waited(std::future::pending::<u8>(), vec![Some(false), None]).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(took >= T_BUDGET);
+        let (r, _) = waited(std::future::pending::<u8>(), vec![None]).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_counts_a_slow_status_read_against_the_budget() {
+        let began = std::time::Instant::now();
+        let slow = || async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Some(false)
+        };
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(T_BUDGET, T_POLL, std::future::pending::<u8>(), slow),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(began.elapsed() >= T_BUDGET);
     }
 }

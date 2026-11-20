@@ -262,9 +262,9 @@ def test_write_toml_text_fsyncs_before_the_replace(tmp_path: Path, monkeypatch: 
     from brain.utils import atomic_write
 
     order: list[str] = []
-    real_fsync, real_replace = os.fsync, atomic_write._replace_with_retry
+    real_fsync, real_replace = os.fsync, atomic_write.replace_file
     monkeypatch.setattr(toml_io.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
-    monkeypatch.setattr(atomic_write, "_replace_with_retry", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
+    monkeypatch.setattr(atomic_write, "replace_file", lambda s, d: (order.append("replace"), real_replace(s, d))[1])
     toml_io.write_toml_text(tmp_path / "a.toml", b"a = 1\n")
     assert order[:2] == ["fsync", "replace"]  # the data is on disk before the replace; the folder fsync comes after
 
@@ -291,7 +291,7 @@ def test_write_toml_text_removes_the_temp_file_when_the_replace_fails(tmp_path: 
 
     from brain.utils import atomic_write
 
-    monkeypatch.setattr(atomic_write, "_replace_with_retry", boom)
+    monkeypatch.setattr(atomic_write, "replace_file", boom)
     with pytest.raises(PermissionError):
         toml_io.write_toml_text(p, b"new = 2\n")
     assert p.read_bytes() == b"old = 1\n"

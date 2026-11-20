@@ -103,7 +103,14 @@ def run_growth_tick(
     if vocab_anomaly is not None and anomalies_collector is not None:
         anomalies_collector.append(vocab_anomaly)
 
-    proposals = crystallize_vocabulary(store, current_vocabulary_names=current_names)
+    from brain.emotion.engine import engine_for
+
+    live_engine = engine_for(persona_dir)
+    proposals = crystallize_vocabulary(
+        store,
+        current_vocabulary_names=current_names,
+        eng=live_engine if live_engine.is_live() else None,
+    )
 
     emotions_added = 0
     proposals_rejected = 0
@@ -259,7 +266,7 @@ def _emit_vocabulary_initiate_candidate(
         from brain.initiate.emit import emit_initiate_candidate
         from brain.initiate.schemas import EmotionalSnapshot, SemanticContext
 
-        emotion_vector = _aggregate_recent_emotion_vector(store, now=now)
+        emotion_vector = _aggregate_recent_emotion_vector(store, now=now, persona_dir=persona_dir)
 
         emit_initiate_candidate(
             persona_dir,
@@ -286,26 +293,21 @@ def _aggregate_recent_emotion_vector(
     store: MemoryStore,
     *,
     now: datetime,
+    persona_dir: Path,
     look_back_days: int = 30,
 ) -> dict[str, float]:
-    """Return a max-pooled emotion vector across recent active memories.
+    """Return her recent emotion vector: the emotion engine's short averages above 0. Context only.
 
-    Empty dict on any failure.
+    Empty while the engine is not reading (not switched over, or its state cannot be read), and on any failure. The old
+    max-pool of recent memories went in emotion rework B1 PR 7.
     """
     try:
-        from brain.emotion.aggregate import aggregate_state
-        from brain.utils.memory import list_conversation_memories
+        from brain.emotion.engine import engine_for
 
-        cutoff = now - timedelta(days=look_back_days)
-        recent = [
-            m
-            for m in list_conversation_memories(store, active_only=True)
-            if m.created_at >= cutoff and m.emotions
-        ]
-        if not recent:
+        eng = engine_for(persona_dir)
+        if not eng.is_live():
             return {}
-        state = aggregate_state(recent)
-        return dict(state.emotions)
+        return {name: r.short for name, r in eng.read().items() if r.short > 0}
     except Exception as exc:  # noqa: BLE001
         logger.warning("vocabulary: recent-emotion aggregation failed: %s", exc)
         return {}

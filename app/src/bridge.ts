@@ -125,6 +125,10 @@ export interface InteriorEntry {
 export interface PersonaState {
   persona: string;
   emotions: Record<string, number>;
+  /** The feeling names the emotion engine calls high, from `engine.feels_high` (computed server-side). An array
+   *  whenever the server's read of the engine worked (possibly empty); null when that call failed, and absent on
+   *  older bridge builds. Without the list the avatar counts nothing as high. */
+  feels_high?: string[] | null;
   body: BodyState | null;
   interior: {
     dream: InteriorEntry | null;
@@ -205,6 +209,11 @@ export interface PersonaState {
    *  until the user fixes the file (#462). Null/absent when there is nothing to say. Optional so older bridge builds degrade to
    *  no notice. */
   tunables_notice?: TunablesNotice | null;
+  /** The persona's switch-over did not complete and the bridge started anyway on the feelings saved before: the one-line
+   *  `reason`, and `log_path`, the runtime log that holds the full error (null when the brain could not name it). The brain
+   *  keeps it until a later attempt clears the record, so the window shows it while it is non-null and cannot close it.
+   *  Null/absent when there is nothing to say. Optional so older bridge builds degrade to no notice. */
+  rebuild_notice?: RebuildNotice | null;
   /** #456 (Q6): the supervisor's state ("restarted" with its error, or "failed"); absent on older bridges. */
   supervisor?: SupervisorInfo | null;
 }
@@ -215,6 +224,12 @@ export interface TunablesNotice {
   line: number | null;
   column: number | null;
   reason: string | null;
+}
+
+/** See `PersonaState.rebuild_notice`. */
+export interface RebuildNotice {
+  reason: string | null;
+  log_path: string | null;
 }
 
 /** One entry in `PersonaState.background_jobs` (ram-spike-fix INC-11). */
@@ -587,6 +602,20 @@ export interface SupervisorInfo {
   last_error_at: string | null;
 }
 
+/** The engine's start-up record while a live process runs the first rebuild ("rebuilding", counting once `total` is
+ *  known) or the scale update ("rescaling", no count): `engine_progress` of `nell supervisor status --json`
+ *  (tests/fixtures/bridge_watcher_files/engine_progress.json). Only a record whose writer is alive is reported. */
+export interface EngineProgress {
+  phase: string;
+  done: number | null;
+  total: number | null;
+  persona?: string;
+  pid?: number;
+  pid_token?: string | null;
+  updated_at?: string;
+  version?: number;
+}
+
 /** `nell supervisor status --json` (#456; tests/fixtures/bridge_watcher_files/status.json). */
 export interface BridgeStatus {
   alive: "alive" | "gone" | "unknown";
@@ -600,6 +629,8 @@ export interface BridgeStatus {
   stop_requested_at?: string | null;
   stop_intent?: { state: string; pid: number; pid_token: string | null; reason?: string } | null;
   remaining?: { count: number | null; tasks: string[] | null } | null;
+  /** Present while a live process runs the engine's start-up rebuild or scale update (HR5); null or missing otherwise. */
+  engine_progress?: EngineProgress | null;
   client_origin?: string | null;
   service_installed?: boolean;
   recovery_needed?: boolean;

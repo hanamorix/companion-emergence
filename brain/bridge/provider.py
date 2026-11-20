@@ -51,6 +51,7 @@ from brain.bridge.chat import (
 )
 from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier
 from brain.bridge.usage_log import log_usage
+from brain.health.json_io import append_jsonl
 from brain.utils.time import format_local, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -141,11 +142,8 @@ def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> No
     if persona_dir is None:
         return
     try:
-        path = persona_dir / "stream_timeouts.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
+        append_jsonl(persona_dir / "stream_timeouts.jsonl", payload, on_error="log", nonfinite="null")
+    except Exception:  # noqa: BLE001 — an unencodable payload must not break stream teardown
         pass
 
 _DEFAULT_TIMEOUT_SECONDS = 300
@@ -251,7 +249,7 @@ def _claude_work_dir() -> str | None:
         logger.debug("claude work dir selection raised", exc_info=True)
     if not _claude_work_dir_warned:
         _claude_work_dir_warned = True
-        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if sys.platform == "win32" else ""
+        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if _is_windows() else ""
         logger.warning(
             "no memory-free working directory for claude spawns; tried %s — the owner's global "
             "CLAUDE.md may reach the companion%s",
@@ -259,6 +257,11 @@ def _claude_work_dir() -> str | None:
             extra,
         )
     return None
+
+
+def _is_windows() -> bool:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662)."""
+    return sys.platform == "win32"
 
 
 def _claude_work_dir_reset_for_tests() -> None:
@@ -2355,9 +2358,7 @@ def _maybe_log_cache_debug(
             "volatile_present": bool(volatile_suffix),
             "volatile_tok_est": len(vol_bytes) // 4,
         }
-        path = Path(pd) / "cache_debug.jsonl"
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        append_jsonl(Path(pd) / "cache_debug.jsonl", row, on_error="log")
     except Exception:  # noqa: BLE001 — debug logging must never break a turn
         pass
 

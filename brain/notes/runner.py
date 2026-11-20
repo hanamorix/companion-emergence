@@ -124,11 +124,15 @@ def _wire_note_back(persona_dir: Path, *, note: Any, folder: Path, user_name: st
     ambient mention, never the write itself."""
     from uuid import uuid4
 
+    from brain.dev_constants import NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
+    from brain.emotion.write_scale import writes_engine_scale
     from brain.initiate.memory import write_initiate_memory
     from brain.memory.store import MemoryStore
 
     store = MemoryStore(persona_dir / "memories.db")
     try:
+        # The note's row goes straight to memories.db, so the x10 fix's rows step (cut 1) rescales it (B1 PR 7).
+        engine_scale = writes_engine_scale(persona_dir, store, cut=NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)
         seg = _WIRE_NOTE_BACK_MESSAGE_SEGMENTS
         write_initiate_memory(
             store,
@@ -138,7 +142,8 @@ def _wire_note_back(persona_dir: Path, *, note: Any, folder: Path, user_name: st
             state="note",
             ts=now.isoformat(),
             user_name=user_name,
-            reach_emotions={"tenderness": 0.12},
+            # On the engine's 0-10 scale (B1 PR 3), chosen by the scale rule (B1 PR 7); today's small value otherwise.
+            reach_emotions={"tenderness": 1.2 if engine_scale else 0.12},
         )
     except Exception:
         logger.exception("notes.runner: wiring the note-state memory failed")

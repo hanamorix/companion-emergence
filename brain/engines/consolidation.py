@@ -37,7 +37,11 @@ import numpy as np
 
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.dev_constants import MONOLOGUE_MERGE_TYPES
+from brain.emotion import engine
+from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import append_jsonl
+from brain.ingest.emotion_tagger import EmotionTagger, make_emotion_tagger, tag_if_feelingless
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
@@ -56,6 +60,7 @@ from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
 from brain.utils.llm_output import find_json_object_block
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,8 @@ _REAPPRAISER_USER_TEMPLATE = prompt_strings.register(
 )
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
+# Never rotate or truncate the archive: the forgetting exemption (brain/soul/candidates.py::merge_target_map) reads it
+# to protect merge targets (#430). Canary: test_supervisor.py::test_consolidation_archive_is_never_rotated.
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
 _QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
 
@@ -188,6 +195,23 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().casefold()
 
 
+def merge_type(memory_type: str) -> str:
+    """The type a memory counts as when deciding whether two memories may merge (#619): its own ``memory_type``, except that
+    the three monologue types (``MONOLOGUE_MERGE_TYPES``) are one type. The label returned for them is ``"monologue"``."""
+    return "monologue" if memory_type in MONOLOGUE_MERGE_TYPES else memory_type
+
+
+def matchable_types(memory_type: str) -> frozenset[str]:
+    """The ``memory_type`` values of the existing rows a candidate of ``memory_type`` may match, merge into or be dropped as
+    an exact duplicate of: its own merge type (all three monologue types for a monologue one), and for an ``observation``
+    also ``fact`` (an observation can become a fact, never the reverse; owner S9)."""
+    if memory_type in MONOLOGUE_MERGE_TYPES:
+        return MONOLOGUE_MERGE_TYPES
+    if memory_type == "observation":
+        return frozenset({"observation", "fact"})
+    return frozenset({memory_type})
+
+
 def _promote_all_classifier(_cand: Memory, _context: list[Memory]) -> Decision:
     """Degraded default when no provider is available: promote everything.
 
@@ -208,6 +232,7 @@ def run_consolidation(
     hebbian: HebbianMatrix | None = None,
     salience_floor: float | None = None,
     reappraiser: Reappraiser | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> ConsolidationResult:
     """Drain the pending queue and consolidate, under a non-blocking gate lock.
 
@@ -227,6 +252,9 @@ def run_consolidation(
         builds the Haiku-backed default when `provider` is given, else
         degrades to the no-op fallback (importance unchanged) — mirrors the
         classifier's degrade-to-`_promote_all_classifier` pattern.
+    emotion_tagger: tags a memory that is written without feelings (`tag_if_feelingless`): a promoted candidate, a merge
+        target, a recalled row. None (default) builds the provider-backed tagger when `provider` is given; with neither,
+        no memory is tagged and no model call is made.
     """
     persona_dir = Path(persona_dir)
     lock_path = persona_dir / _GATE_LOCK_FILENAME
@@ -250,7 +278,9 @@ def run_consolidation(
                 if provider is not None
                 else _noop_reappraiser
             )
-        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser)
+        if emotion_tagger is None and provider is not None:
+            emotion_tagger = make_emotion_tagger(provider)
+        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser, emotion_tagger)
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
 
@@ -266,6 +296,7 @@ def _run_locked(
     hebbian: HebbianMatrix | None,
     salience_floor: float | None,
     reappraiser: Reappraiser | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> ConsolidationResult:
     pending = PendingQueue(persona_dir)
     # Claimed, not drained: the batch stays in a processing file until each item is settled, so an exception or a kill
@@ -283,7 +314,7 @@ def _run_locked(
 
     result = ConsolidationResult(batch=len(candidate_entries))
     if reappraise_entries and _handle_reappraisals(
-        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result
+        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result, emotion_tagger
     ):
         claim.close()
         return result
@@ -301,18 +332,21 @@ def _run_locked(
 
     # --- Pass 1: exact-dup + (scoped) salience; cluster is implicit per-candidate.
     survivors: list[tuple[dict, Memory]] = []
-    seen_norm: set[str] = set()
+    # Seen texts, keyed by normalized text and merge type: a repeat is a repeat only of a memory this candidate may match (#619).
+    seen_norm: set[tuple[str, str]] = set()
     ended = False
     for entry, cand in candidates:
         try:
             norm = _normalize(cand.content)
-            if norm and norm in seen_norm:  # within-batch exact repeat
+            may_match = matchable_types(cand.memory_type)
+            own_key = (norm, merge_type(cand.memory_type))
+            if norm and any((norm, merge_type(t)) in seen_norm for t in may_match):  # within-batch exact repeat
                 result.exact_dropped += 1
                 claim.settle(entry)
                 continue
-            if norm and _has_exact_existing(store, cand.content, norm):
+            if norm and _has_exact_existing(store, cand.content, norm, memory_types=may_match):
                 result.exact_dropped += 1
-                seen_norm.add(norm)
+                seen_norm.add(own_key)
                 claim.settle(entry)
                 continue
             if (
@@ -324,7 +358,7 @@ def _run_locked(
                 claim.settle(entry)
                 continue
             if norm:
-                seen_norm.add(norm)
+                seen_norm.add(own_key)
             survivors.append((entry, cand))
         except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
             if _settle_failed_item(store, pending, persona_dir, claim, entry, cand, "pass1", exc, result):
@@ -357,7 +391,7 @@ def _run_locked(
                 # `UnusableClassifierReply`, re-raised above, and the candidate is quarantined.
                 raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
             decision = _clean_decision(decision)
-            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded, emotion_tagger)
             claim.settle(entry)
         except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
             # The decision's target is named in the log so a link lost to a failed post-save step can be rebuilt.
@@ -541,17 +575,18 @@ def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
         return None
 
 
-def _has_exact_existing(store: MemoryStore, content: str, norm: str) -> bool:
-    """True if a memories.db row is exact-identical (normalized) to `content`.
+def _has_exact_existing(store: MemoryStore, content: str, norm: str, *, memory_types: frozenset[str]) -> bool:
+    """True if a memories.db row of one of `memory_types` is exact-identical (normalized) to `content`.
 
     Non-recall-bumping (``bump=False``). Uses a content snippet as the LIKE
-    probe, then confirms full normalized equality.
+    probe, then confirms full normalized equality. Only rows of the types the
+    candidate may match are searched, so another type's row never counts (#619).
     """
     snippet = content.strip()[:200]
     if not snippet:
         return False
     try:
-        hits = store.search_text(snippet, active_only=True, limit=20, bump=False)
+        hits = store.search_text(snippet, active_only=True, limit=20, bump=False, memory_types=memory_types)
     except ValueError:
         return False
     return any(_normalize(h.content) == norm for h in hits)
@@ -582,13 +617,19 @@ def _related_existing(
     (`embedded is None`), the warm matrix is cold / holds no active
     embedded rows yet (empty candidate pool — same "graceful warm-up"
     degrade `build_semantic_candidate_pool`'s other callers already have),
-    or the cosine retrieval itself raises. Read-only, non-bumping — Pass-2
+    the pool holds no row of a type the candidate may match, or the cosine
+    retrieval itself raises. Read-only, non-bumping — Pass-2
     context, not recall.
+
+    Only existing memories of the types the candidate may match
+    (`matchable_types`) are returned, on both paths, filtered before the
+    `limit` cut: the judge is never shown a row it may not merge into (#619).
     """
+    may_match = matchable_types(cand.memory_type)
     if embedded is not None:
         cand_vec, _model_id = embedded
         try:
-            hits = _related_existing_cosine(store, cand_vec, limit=limit)
+            hits = _related_existing_cosine(store, cand_vec, limit=limit, memory_types=may_match)
             if hits:
                 return hits
         except Exception:  # noqa: BLE001 — degrade to lexical, never lose Pass-2 context
@@ -597,31 +638,38 @@ def _related_existing(
                 "falling back to lexical token-overlap",
                 exc_info=True,
             )
-    return _related_existing_lexical(store, cand, limit=limit)
+    return _related_existing_lexical(store, cand, limit=limit, memory_types=may_match)
 
 
 def _related_existing_cosine(
-    store: MemoryStore, cand_vec: np.ndarray, *, limit: int
+    store: MemoryStore, cand_vec: np.ndarray, *, limit: int, memory_types: frozenset[str]
 ) -> list[Memory]:
     """Top-`limit` most cosine-similar active, embedded, committed memories
-    to `cand_vec` — the same matrix-read + score-sort-slice shape
-    `run_semantic_recall` uses (reusing `build_semantic_candidate_pool` for
-    the matrix half, not reinventing it). Empty list when the matrix has no
-    comparison vectors yet (cold-start / pre-backfill)."""
+    of one of `memory_types` to `cand_vec` — the same matrix-read +
+    score-sort-slice shape `run_semantic_recall` uses (reusing
+    `build_semantic_candidate_pool` for the matrix half, not reinventing it).
+    The pool is filtered by type before scoring and slicing. Empty list when
+    the matrix has no comparison vectors yet (cold-start / pre-backfill) or
+    none of a wanted type."""
     matrix = build_embedding_matrix(store.db_path)
     pool = build_semantic_candidate_pool(store, matrix)
-    if not pool:
+    scored = [
+        (mem, cosine_similarity(cand_vec, vec)) for mem, vec in pool.values() if mem.memory_type in memory_types
+    ]
+    if not scored:
         return []
-    scored = [(mem, cosine_similarity(cand_vec, vec)) for mem, vec in pool.values()]
     scored.sort(key=lambda pair: -pair[1])
     return [mem for mem, _score in scored[:limit]]
 
 
-def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 8) -> list[Memory]:
-    """Gather existing memories sharing salient tokens with the candidate.
+def _related_existing_lexical(
+    store: MemoryStore, cand: Memory, *, limit: int = 8, memory_types: frozenset[str]
+) -> list[Memory]:
+    """Gather existing memories of one of `memory_types` sharing salient tokens with the candidate.
 
     The PRE-F3 cosine-free probe, kept as `_related_existing`'s fallback
     for a cold matrix / a failed candidate embed (F1 #259 F3, spec §4b).
+    The type filter runs inside `store.search_text`, before its per-token limit.
     Read-only, non-bumping — Pass-2 context, not recall.
     """
     tokens = [w for w in re.findall(r"\w+", cand.content or "") if len(w) > 3][:6]
@@ -629,7 +677,7 @@ def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 
     out: list[Memory] = []
     for tok in tokens:
         try:
-            hits = store.search_text(tok, active_only=True, limit=3, bump=False)
+            hits = store.search_text(tok, active_only=True, limit=3, bump=False, memory_types=memory_types)
         except ValueError:
             continue
         for h in hits:
@@ -838,6 +886,7 @@ def _handle_reappraisals(
     entries: list[dict],
     reappraiser: Reappraiser,
     result: ConsolidationResult,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> bool:
     """Process Change-3 existing-memory re-appraise items: load the target
     row, compute a new importance (and names) via the injectable `reappraiser`,
@@ -855,6 +904,10 @@ def _handle_reappraisals(
     in this memory's text (the matcher, entry-side rules), and is not also in its
     ``names``; the write itself never removes a name the kindled added, and puts
     each removed name on the rejects list (S135).
+
+    Once the emotion engine is live, a re-appraised row also has its emotions rewritten at their faded values and its
+    ``created_at`` set to now (`_write_back_faded_emotions`): remembering a memory restarts its fading. The date it had before
+    the reset goes to the start of its text first, unless it is already there.
 
     Each item runs in its own try (#459): a failure is settled by `_settle_failed_item`, and True is returned when the pass
     must end (an environment failure or a deferred call); the unsettled items stay in the processing file.
@@ -891,6 +944,7 @@ def _handle_reappraisals(
                 claim.settle(entry)
                 continue
             result.reappraised += 1
+            _write_back_faded_emotions(store, persona_dir, memory, emotion_tagger)
             _remove_not_names(persona_dir, memory, names, not_names)
             _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
             claim.settle(entry)
@@ -898,6 +952,81 @@ def _handle_reappraisals(
             if _settle_failed_item(store, pending, persona_dir, claim, entry, None, "reappraise", exc, result):
                 return True
     return False
+
+
+def _tag_feelingless_soft(
+    store: MemoryStore, tagger: EmotionTagger | None, memory_id: str, site: str, memory: Memory | None = None
+) -> None:
+    """`tag_if_feelingless` as a gate step that never fails the item: any failure (the tagger's deferred call included) leaves the
+    row untagged and is logged, and the gate carries on and settles the item as it would have, so a row that is already written is
+    never judged, merged or faded again (a retried merge would merge a second time). The row is tried again at its next recall,
+    and a deferred call ends the pass at the judge's own next call.
+
+    ``memory`` is the row when the caller holds it (the promoted candidate, the recalled row); without it the row is read as the
+    gate's other maintenance reads are (no recall bump), inside the same fail-soft step, and a row gone since the write is left alone.
+    """
+    if tagger is None:
+        return
+    try:
+        row = memory if memory is not None else store.get(memory_id, bump=False)
+        if row is not None:
+            tag_if_feelingless(store, tagger, row)
+    except Exception as exc:  # noqa: BLE001 — a lost tag costs one tagging; the write it follows has committed
+        warn_throttled(
+            logger,
+            "consolidation.emotion_tag",
+            "consolidation gate: emotion tagging failed at the %s for memory %s (%s: %s); row left without feelings",
+            site,
+            memory_id,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def _write_back_faded_emotions(
+    store: MemoryStore, persona_dir: Path, memory: Memory, emotion_tagger: EmotionTagger | None = None
+) -> None:
+    """The temp-gate write-back, once the engine is live: the row's emotions become their faded values and its ``created_at``
+    becomes now, in one store write (`refresh_faded_emotions`, no hook), which also puts the date the row had before the reset at
+    the start of its text when it is not there yet. Every memory type and state, a row without emotions included (its
+    ``created_at`` is still reset). Runs after the importance update committed.
+
+    A row without emotions is tagged first (`tag_if_feelingless`), before the engine-live return, so a persona whose engine is not
+    live is tagged too, and the re-read below and the refresh carry the tags.
+
+    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and another write may have
+    put emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
+    BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
+    neither requeued nor settled as failed, so the outer per-item handler never sees it. A row whose stored emotion the read leaves
+    out is skipped the same way (logged, left as it was), because the write replaces the row's whole map.
+    """
+    _tag_feelingless_soft(store, emotion_tagger, memory.id, "recall write-back", memory)
+    try:
+        live_engine = engine.engine_for(persona_dir)
+        if not live_engine.is_live():
+            return
+        fresh = store.get(memory.id, bump=False)  # a maintenance read, not an access
+        if fresh is None:
+            return  # hard-deleted since the importance update: nothing to write
+        row = replace(fresh, importance=memory.importance)
+        # The engine's one read: faded, held to 0-10, canonical names. `refresh_faded_emotions` replaces the row's whole map, so a
+        # stored name the read leaves out (a value that is not a finite number, or a fade that failed, with a warning from the
+        # read) would be deleted: that row is skipped and its stored values stay, as when a fade failed before. Two spellings of
+        # one name that the read pools into one are not missing. A skipped row keeps its unfaded values with the importance
+        # committed above, so they fade later under that new importance from the row's old `created_at`.
+        faded = dict(live_engine.memory_feelings(row).feelings)
+        if any(canonical_name(name) not in faded for name in store.stored_emotion_names(row)):
+            logger.warning(
+                "consolidation gate: temp-gate write-back skipped for memory %s; the read left a stored emotion out", memory.id
+            )
+            return
+        store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
+    except Exception:  # noqa: BLE001
+        # A lost write-back costs one refresh; the importance update has already committed.
+        logger.error(
+            "consolidation gate: temp-gate write-back failed for memory %s; row left as it was", memory.id, exc_info=True
+        )
 
 
 def _remove_not_names(persona_dir: Path, memory: Memory, names: object, not_names: object) -> None:
@@ -918,14 +1047,17 @@ def _remove_not_names(persona_dir: Path, memory: Memory, names: object, not_name
         logger.warning("consolidation reappraiser: known-names removal failed", exc_info=True)
 
 
-def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None:
+def _archive_preimage(persona_dir: Path, target: Memory, source_id: str, candidate_type: str) -> None:
     """Append the pre-merge memory to the plain consolidation archive (lossless
-    before lossy — NOT the grief graveyard)."""
+    before lossy — NOT the grief graveyard), with the merged-in candidate's id
+    and memory type. A line written before the type was recorded has no
+    ``merged_from_candidate_type``: a reader treats the key as optional (#619)."""
     rec = {
         "archived_at": datetime.now(UTC).isoformat(),
         "reason": "consolidation_merge",
         "target": target.to_dict(),
         "merged_from_candidate": source_id,
+        "merged_from_candidate_type": candidate_type,
     }
     path = persona_dir / _ARCHIVE_FILENAME
     append_jsonl(path, rec, nonfinite="null")
@@ -940,6 +1072,7 @@ def _dispatch(
     decision: Decision,
     result: ConsolidationResult,
     embedded: tuple[np.ndarray, str] | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> None:
     verdict = decision.verdict if decision.verdict in VERDICTS else "new"
 
@@ -953,19 +1086,43 @@ def _dispatch(
     _admit_extracted_names(persona_dir, decision.names, list_source="gate", label="gate judge")
 
     if verdict == "merge":
-        target = store.get(decision.target_id) if decision.target_id else None
+        # A merge verdict's read of its target is a maintenance read, not an access: bump=False, like every other internal read here.
+        target = store.get(decision.target_id, bump=False) if decision.target_id else None
         if target is None or target.state == "fading":
             # Target missing or mid-fade: defer — re-enqueue for the next tick
             # rather than lose the candidate or clobber a concurrent fade.
             pending.enqueue(cand, source="gate-deferred")
             result.deferred += 1
             return
-        _archive_preimage(persona_dir, target, cand.id)
+        if target.memory_type not in matchable_types(cand.memory_type):
+            # The judge is shown only rows the candidate may match, so this is an id it was not given. A memory never merges
+            # into a memory of another type (#619): store the candidate as its own row through the promote path below, with
+            # its own content, and write no archive line (nothing is merged).
+            logger.info(
+                "consolidation gate: merge verdict named a %s target for a %s candidate; storing it as a new row",
+                target.memory_type,
+                cand.memory_type,
+            )
+            verdict = "new"
+
+    if verdict == "merge":
+        _archive_preimage(persona_dir, target, cand.id, cand.memory_type)
         merged = decision.merged_content
         if not merged:
             merged = _fold(target.content, cand.content)
+        # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
+        live = engine.engine_for(persona_dir).is_live()
         try:
-            store.update(target.id, content=merged)
+            # Once the engine is live the merge combines both memories' emotions (`merge_into`, `store._merge_emotions`), in the
+            # one update that writes the content. fold=False: the target's own update fires no hook (not even "assigned" when
+            # its emotions were empty); the incoming memory's mood move is sent below.
+            #
+            # Only memories of one merge type reach this write (#619), so no memory's feelings pass into a memory of another
+            # type. Two memories of ONE merge type can still differ in whether the engine counts them; they merge with no
+            # extra check and the incoming memory's own commit event counts it if its type is counted. That same-type case
+            # of the counted/uncounted requirement is deferred to Phase 5 with the "newer memory keeps the feelings" rule
+            # (owner S13, S14).
+            store.merge_into(target, cand, merged, engine_live=live)
         except KeyError:
             # Target hard-deleted between the read and the write (a concurrent
             # forgetting LOSE). Defer the candidate; the archive record is
@@ -973,6 +1130,24 @@ def _dispatch(
             pending.enqueue(cand, source="gate-deferred")
             result.deferred += 1
             return
+        if live:
+            # The incoming emotions also move her mood, once, when the merge writes them: the existing commit event, for the
+            # incoming memory `cand`, which is never created as a row (so `create` never sends it). It follows the successful
+            # write, so a deferred merge (above) sends nothing and the tick that finally writes the merge sends it once. The
+            # event follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the
+            # climax reset like any commit. No try here: the engine's hooks never raise into their caller.
+            #
+            # The merge keeps this hook: design 3.1 ("The merge keeps the hook for the incoming memory's mood move") in
+            # docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md, decided by the maintainer on #629
+            # (issue #580). Two edges are accepted there, in design section 6:
+            # - If the update above commits and the item is retried before claim.settle (the process dies, or an error follows
+            #   the commit), the candidate is merged again: the emotions are averaged with it a second time (the content is
+            #   protected by `_fold`'s "contains it" rule, the averages are not), and the event is sent again and counts at the
+            #   repeat factor 1/2.
+            # - A rebuild or a catch-up counts the merged target row's current emotions once and does not restore this separate
+            #   mood move (the merged memory has no row and the merge writes no change-log line): a lost event, one merge's worth.
+            engine.engine_for(persona_dir).on_memory_committed(cand)
+        _tag_feelingless_soft(store, emotion_tagger, decision.target_id, "merge")
         result.merged += 1
         return
 
@@ -1006,6 +1181,8 @@ def _dispatch(
         )
     if verdict in ("correction", "continuation") and decision.target_id and hebbian is not None:
         hebbian.set_edge_weight(cand.id, decision.target_id, ASSOC_WEIGHT)
+    # Last, after the row, its embedding and its edge: a promoted row without feelings is tagged (the row holds what `cand` holds).
+    _tag_feelingless_soft(store, emotion_tagger, cand.id, "promote", cand)
 
     if verdict == "correction":
         result.corrections += 1

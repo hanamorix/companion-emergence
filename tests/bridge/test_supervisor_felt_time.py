@@ -48,7 +48,6 @@ def test_heartbeat_and_felt_time_passes_real_counts(
     fake_result = HeartbeatResult(
         trigger="background",
         elapsed_seconds=0.1,
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         dream_gated_reason=None,
@@ -111,7 +110,6 @@ def test_heartbeat_tick_returns_result_with_reflex_fired(
     fake_result = HeartbeatResult(
         trigger="background",
         elapsed_seconds=0.1,
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         dream_gated_reason=None,
@@ -375,7 +373,7 @@ def _make_emotion_memory(store, *, channel: str, value: float, days_ago: float):
 
 def test_derive_intensity_drivers_emotional_intensity_high_deviation(tmp_path: Path) -> None:
     """A memory with sorrow far above the 15-memory baseline saturates the driver."""
-    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.bridge.supervisor import _dormant_emotional_intensity
     from brain.felt_time.state import FeltTimeState, persist
     from brain.memory.store import MemoryStore
 
@@ -388,24 +386,24 @@ def test_derive_intensity_drivers_emotional_intensity_high_deviation(tmp_path: P
     _make_emotion_memory(store, channel="sorrow", value=9.0, days_ago=0.1)
     store.close()
 
-    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    intensity = _dormant_emotional_intensity(tmp_path)
     # deviation >> 3σ → clipped to 1.0
-    assert drivers.emotional_intensity == pytest.approx(1.0)
+    assert intensity == pytest.approx(1.0)
 
 
 def test_derive_intensity_drivers_emotional_intensity_zero_when_no_memories(tmp_path: Path) -> None:
     """No memories.db → emotional_intensity falls back to 0.0."""
-    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.bridge.supervisor import _dormant_emotional_intensity
 
-    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
-    assert drivers.emotional_intensity == 0.0
+    intensity = _dormant_emotional_intensity(tmp_path)
+    assert intensity == 0.0
 
 
 def test_derive_intensity_drivers_emotional_intensity_zero_below_sample_threshold(
     tmp_path: Path,
 ) -> None:
     """Fewer than 10 samples per channel → no baseline → emotional_intensity stays 0.0."""
-    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.bridge.supervisor import _dormant_emotional_intensity
     from brain.memory.store import MemoryStore
 
     store = MemoryStore(tmp_path / "memories.db")
@@ -413,13 +411,13 @@ def test_derive_intensity_drivers_emotional_intensity_zero_below_sample_threshol
         _make_emotion_memory(store, channel="sorrow", value=9.0, days_ago=20 + i)
     store.close()
 
-    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
-    assert drivers.emotional_intensity == 0.0
+    intensity = _dormant_emotional_intensity(tmp_path)
+    assert intensity == 0.0
 
 
 def test_derive_intensity_drivers_emotional_intensity_zero_when_at_baseline(tmp_path: Path) -> None:
     """When all memories share the same emotion value, sigma=0 → intensity stays 0."""
-    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.bridge.supervisor import _dormant_emotional_intensity
     from brain.memory.store import MemoryStore
 
     store = MemoryStore(tmp_path / "memories.db")
@@ -428,5 +426,81 @@ def test_derive_intensity_drivers_emotional_intensity_zero_when_at_baseline(tmp_
         _make_emotion_memory(store, channel="sorrow", value=3.0, days_ago=20 + i)
     store.close()
 
-    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    intensity = _dormant_emotional_intensity(tmp_path)
+    assert intensity == 0.0
+
+
+# ── the felt-time drivers from the engine's read ─────────────────────
+
+
+def _live_drivers(tmp_path: Path, stub, readings: dict[str, float], *, high: set[str] | None = None):
+    """`high` is what the engine's `feels_high` says (default: nothing is high, whatever the numbers)."""
+    from brain.bridge.supervisor import _derive_intensity_drivers
+    from brain.emotion.engine import Reading
+
+    stub.high = set(high or ())
+    stub.readings = {n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()}
+    return _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+
+
+@pytest.mark.parametrize(
+    "readings",
+    [
+        {},
+        {"rest_need": 8.0},
+        dict.fromkeys(("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal"), 9.0),
+    ],
+    ids=["empty", "partial", "full"],
+)
+def test_live_drivers_are_finite_in_unit_range_and_emotional_intensity_is_unplugged(
+    tmp_path: Path, emotion_engine_stub, readings
+) -> None:
+    import math
+
+    from brain.felt_time.state import FeltTimeState, persist
+    from brain.memory.store import MemoryStore
+
+    persist(FeltTimeState(lived_age_hours=200.0), tmp_path)
+    store = MemoryStore(tmp_path / "memories.db")
+    # The old path would saturate emotional_intensity from these rows (a stored spike over a flat baseline).
+    for i in range(15):
+        _make_emotion_memory(store, channel="sorrow", value=1.0, days_ago=20 + i)
+    _make_emotion_memory(store, channel="sorrow", value=9.0, days_ago=0.1)
+    store.close()
+    drivers = _live_drivers(tmp_path, emotion_engine_stub, readings)
     assert drivers.emotional_intensity == 0.0
+    for value in (drivers.body_strain, drivers.chat_activity, drivers.narrative_weight):
+        assert math.isfinite(value) and 0.0 <= value <= 1.0
+
+
+def test_live_body_strain_follows_the_engines_predicate_not_the_store_or_a_level(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from brain.memory.store import MemoryStore
+
+    store = MemoryStore(tmp_path / "memories.db")
+    for i in range(3):
+        _make_emotion_memory(store, channel="rest_need", value=9.0, days_ago=0.1 + i)  # stored: strain from rest_need
+    store.close()
+    names = ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")
+    quiet = _live_drivers(tmp_path, emotion_engine_stub, {})
+    # Every value far above the old levels, but the engine calls nothing high: strain does not move.
+    not_high = _live_drivers(tmp_path, emotion_engine_stub, dict.fromkeys(names, 9.0))
+    assert not_high.body_strain == quiet.body_strain
+    # Values far below the old levels, but the engine calls rest_need high: energy drops, so strain rises.
+    tired = _live_drivers(tmp_path, emotion_engine_stub, {"rest_need": 0.5}, high={"rest_need"})
+    assert tired.body_strain > quiet.body_strain
+
+
+def test_live_drivers_survive_a_read_that_raises(tmp_path: Path, emotion_engine_stub) -> None:
+    """The felt-time drivers keep their fail-soft except: a raising read leaves body strain and emotional
+    intensity at their 0.0 defaults and the other two drivers still come back."""
+
+    def boom():
+        raise RuntimeError("engine fault")
+
+    emotion_engine_stub.read = boom
+    from brain.bridge.supervisor import _derive_intensity_drivers
+
+    drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
+    assert drivers.body_strain == 0.0 and drivers.emotional_intensity == 0.0

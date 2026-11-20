@@ -336,3 +336,46 @@ def test_creative_dna_crystallization_emits_initiate_candidate(
         and c.source_id == "creative_dna_addition:intentional sentence fragments"
         for c in candidates
     )
+
+
+def test_live_creative_dna_candidate_carries_short_averages(persona_dir, store):
+    """Emotion rework B1 PR 5: once the engine is live, the candidate's vector is the engine's short averages."""
+    from brain.emotion import engine as emotion_engine
+    from brain.initiate.emit import read_candidates
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 6.0}))
+    # A making counts for the engine; the old conversation-only aggregate never saw it.
+    store.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
+    make_live(persona_dir, datetime.now(UTC))
+    eng = emotion_engine.engine_for(persona_dir)
+    eng.note_active(datetime.now(UTC))
+    expected = {name: r.short for name, r in eng.read().items() if r.short > 0}
+    assert "joy" in expected
+
+    response = json.dumps(
+        {
+            "emerging_additions": [
+                {
+                    "name": "intentional sentence fragments",
+                    "reasoning": "appeared in 3 recent fiction sessions distinct from previous patterns",
+                    "evidence_memory_ids": ["mem_a", "mem_b", "mem_c"],
+                }
+            ],
+            "emerging_promotions": [],
+            "active_demotions": [],
+        }
+    )
+    crystallize_creative_dna(
+        store=store,
+        persona_dir=persona_dir,
+        provider=_FakeProvider(response),
+        persona_name="t",
+        now=datetime.now(UTC),
+    )
+
+    [candidate] = [
+        c for c in read_candidates(persona_dir) if c.source_id == "creative_dna_addition:intentional sentence fragments"
+    ]
+    assert candidate.emotional_snapshot is not None
+    assert candidate.emotional_snapshot.vector == pytest.approx(expected)

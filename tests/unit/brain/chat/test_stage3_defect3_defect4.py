@@ -488,7 +488,7 @@ def test_reappraisal_enqueue_matches_across_conclusive_and_inconclusive_turns(tm
 # EVERY path (owner ruling: "if it gets opened, it gets the full bump,
 # doesn't matter how it got opened"). On the lexical (inconclusive) path the
 # importance-threshold `full_ids` memories are rendered untruncated, i.e.
-# OPENED, so they get store.bump_recall(id, 1.0) at full strength, NOT the
+# OPENED, so they get the full +1.0 through the `open_memory` door (`store.get(bump=True)`) at full strength, NOT the
 # fractional snippet rate, and are no longer EXCLUDED from every bump. That
 # full-open bump is ungated on SNIPPET_MODE_ENABLED, mirroring the semantic
 # full-inject tier. Pre-fix these lexical full_ids memories got NO bump at
@@ -549,6 +549,73 @@ def test_lexical_full_open_gets_full_bump_not_fractional(tmp_path: Path) -> None
     # than the full tick and non-zero (a lone snippet-tier row -> 0.8).
     snip_bump = _rc(store, snippet_mem.id) - before_snip
     assert 0 < snip_bump < 1.0
+
+
+def test_recall_block_full_render_sets_last_accessed_and_reports_the_showing(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """A full render in the recall block is an access: the row's `last_accessed_at` is set and the showing is reported
+    to the engine once. A snippet row in the same block is neither reported nor stamped (it keeps the fractional bump)."""
+    store = MemoryStore(":memory:")
+    full_mem, snippet_mem = _seed_lexical_full_and_snippet(store)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert full_mem.id in block
+    assert snippet_mem.id in block
+
+    full_row = store.get(full_mem.id, bump=False)
+    snippet_row = store.get(snippet_mem.id, bump=False)
+    assert full_row is not None and snippet_row is not None
+    assert full_row.last_accessed_at is not None
+    assert snippet_row.last_accessed_at is None
+
+    shown = [c[1].id for c in emotion_engine_stub.recorded_calls if c[0] == "on_memory_shown"]
+    assert shown == [full_mem.id]
+
+
+def test_recall_block_reports_every_row_once_when_snippet_mode_is_off(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """With snippet mode off every active row renders in full, so each is opened through the door and reported once."""
+    store = MemoryStore(":memory:")
+    full_mem, snippet_mem = _seed_lexical_full_and_snippet(store)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", False),
+    ):
+        _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    shown = [c[1].id for c in emotion_engine_stub.recorded_calls if c[0] == "on_memory_shown"]
+    assert sorted(shown) == sorted([full_mem.id, snippet_mem.id])
+
+
+def test_recall_block_without_a_persona_dir_sets_last_accessed_and_reports_nothing(
+    emotion_engine_stub,
+) -> None:
+    """The legacy path (no persona_dir) opens full rows through the door too: last_accessed_at is set, and nothing is
+    reported to the engine."""
+    store = MemoryStore(":memory:")
+    full_mem, _snippet_mem = _seed_lexical_full_and_snippet(store)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=None)
+
+    assert full_mem.id in block
+    row = store.get(full_mem.id, bump=False)
+    assert row is not None and row.last_accessed_at is not None
+    assert emotion_engine_stub.recorded_calls == []
 
 
 def test_lexical_full_open_bump_fires_when_snippet_mode_off(tmp_path: Path) -> None:

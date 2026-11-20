@@ -217,7 +217,7 @@ def test_narrative_pass_is_skipped_when_the_soul_exemptions_cannot_be_read(
     store.create(Memory.create_new(content="a memory", memory_type="event", domain="d"))
     store.close()
 
-    def _unavailable(_persona_dir):
+    def _unavailable(_persona_dir, *, caller="forgetting"):
         raise SoulExemptionsUnavailableError("soul-crystallised memory ids")
 
     monkeypatch.setattr("brain.forgetting._load_soul_linked_ids", _unavailable)

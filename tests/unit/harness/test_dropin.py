@@ -108,6 +108,28 @@ def no_venv(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.no_base_failure(reason="the fix is in tests/harness, which the base check keeps at the PR's version")
+@pytest.mark.parametrize("deps", ["auto", "none"])
+def test_uv_venv_uses_the_interpreter_running_the_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deps: str
+) -> None:
+    """A bare `uv venv` picks whatever Python it finds, which can be one the brain's dependencies don't support (#679)."""
+    commands: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> None:
+        commands.append(argv)
+        venv_python = dropin_mod._venv_python(tmp_path / dropin_mod._VENV_DIRNAME)
+        venv_python.parent.mkdir(parents=True, exist_ok=True)
+        venv_python.touch()
+
+    monkeypatch.setattr(dropin_mod.shutil, "which", lambda name: "/fake/uv")
+    monkeypatch.setattr(dropin_mod, "_run", fake_run)
+    dropin_mod._build_venv(tmp_path, deps)
+    create = commands[0]
+    assert create[:2] == ["/fake/uv", "venv"]
+    assert create[create.index("--python") + 1] == sys.executable
+
+
 # --- C1: copy independence -----------------------------------------------------------------------
 
 

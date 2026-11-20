@@ -39,6 +39,7 @@ import { Wizard } from "./wizard/Wizard";
 import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
 import { tunablesNoticeMessage } from "./lib/tunablesNotice";
+import { rebuildNoticeMessage } from "./lib/rebuildNotice";
 
 const STATE_POLL_MS = 5000;
 
@@ -570,8 +571,10 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           in its own column. */}
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
         <div style={{ transform: "translateY(50px)" }}>
+          {/* Nothing coming in (the poll is failing) means no state: the avatar shows neutral, not the last
+              good snapshot. */}
           <NellAvatar
-            state={state}
+            state={stateError ? null : state}
             persona={persona}
             isSpeaking={isSpeaking}
             soulFlashing={soulFlashing}
@@ -619,22 +622,12 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           </div>
         )}
         {state?.tunables_notice && (
-          <div
-            role="status"
-            data-testid="tunables-notice"
-            style={{
-              border: "1px solid var(--panel-border, rgba(234,222,218,0.18))",
-              borderRadius: 8,
-              padding: 10,
-              background: "var(--panel-bg)",
-              fontSize: 11,
-              lineHeight: 1.5,
-              color: "var(--text-mute)",
-              wordBreak: "break-word",
-            }}
-          >
-            {tunablesNoticeMessage(state.tunables_notice)}
-          </div>
+          <NoticeBox testId="tunables-notice">{tunablesNoticeMessage(state.tunables_notice)}</NoticeBox>
+        )}
+        {/* Shown while the persona state carries the notice and refreshed by the poll above. No way to close it: it goes when
+            a later attempt clears the brain's record. */}
+        {state?.rebuild_notice && (
+          <NoticeBox testId="rebuild-notice">{rebuildNoticeMessage(state.rebuild_notice, capitalize(persona))}</NoticeBox>
         )}
         <ChatPanel
           persona={persona}
@@ -644,6 +637,29 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           mode={stateError ? "bridge_down" : (state?.mode ?? "live")}
         />
       </div>
+    </div>
+  );
+}
+
+/** One small status box above the chat, for a notice the brain keeps for the window (the tunables notice, the rebuild notice).
+ *  It has no state and no button: a notice shown here cannot be closed, it goes when the brain stops sending it. */
+function NoticeBox({ testId, children }: { testId: string; children: ReactNode }) {
+  return (
+    <div
+      role="status"
+      data-testid={testId}
+      style={{
+        border: "1px solid var(--panel-border, rgba(234,222,218,0.18))",
+        borderRadius: 8,
+        padding: 10,
+        background: "var(--panel-bg)",
+        fontSize: 11,
+        lineHeight: 1.5,
+        color: "var(--text-mute)",
+        wordBreak: "break-word",
+      }}
+    >
+      {children}
     </div>
   );
 }
@@ -771,7 +787,6 @@ const JOB_LABEL_PAREN_SPACE = " ";
 const JOB_DESCRIPTORS: Record<string, string> = {
   pass2: "follow-up memory pass",
   session_snapshot_prune: "conversation snapshot",
-  emotion_backfill: "emotion tagging",
   embedding_backfill: "memory indexing",
   rerank_width_remeasure: "re-scoring cost check",
   cosine_floor_bootstrap: "similarity pass mark setup",

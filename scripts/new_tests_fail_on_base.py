@@ -320,7 +320,9 @@ def run(repo: Path, base: str, head: str, workers: str, expr: str, only: Sequenc
         print("no changed test files: nothing to check")
         return 0
 
-    scratch = Path(tempfile.mkdtemp(prefix="ntfob-"))
+    # resolved (#696): the canary imports brain via the subprocess cwd, which os.getcwd() reports resolved, so a
+    # temp dir reached through a symlink (macOS /var -> /private/var) must not be compared unresolved
+    scratch = Path(tempfile.mkdtemp(prefix="ntfob-")).resolve()
     head_tree, base_tree = scratch / "head", scratch / "base"
     plugin_dir = scratch / "plugin"
     plugin_dir.mkdir()

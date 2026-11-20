@@ -609,6 +609,13 @@ def _reset_judge_provider_cache() -> None:
         _provider_cache.clear()
 
 
+def _platform() -> str:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662, #710)."""
+    import sys
+
+    return sys.platform
+
+
 def release_judge() -> None:
     """Release the judge's RAM after a calibration or self-tune job FINISHES
     (S11/S27, inc5; the PAUSE arm is INC-10). Called in the `finally` of
@@ -648,21 +655,21 @@ def release_judge() -> None:
     RSS drops less promptly, not that anything is wrong).
     """
     import gc
-    import sys
 
     with _provider_cache_lock:
         _provider_cache.clear()
 
     gc.collect()
 
-    if sys.platform.startswith("linux"):
+    platform = _platform()
+    if platform.startswith("linux"):
         try:
             import ctypes
 
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except (OSError, AttributeError):
             logger.warning("release_judge: malloc_trim(0) unavailable on this libc — RSS may drop later")
-    elif sys.platform == "darwin":
+    elif platform == "darwin":
         # macOS analogue of the Linux malloc_trim(0) above: libSystem's
         # malloc zones keep freed pages resident after free(), so after the
         # judge's tensors are dropped RSS can sit well above the pre-load

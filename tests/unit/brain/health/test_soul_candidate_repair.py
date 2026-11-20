@@ -415,3 +415,25 @@ def test_repair_uses_file_lock_for_rewrite(tmp_path: Path) -> None:
     assert any(p == candidates_path for p in lock_paths), (
         "soul_candidate_repair must acquire file_lock on soul_candidates.jsonl"
     )
+
+
+def test_repair_read_is_not_a_recall(tmp_path: Path) -> None:
+    """#587: the repair reads a memory only to rebuild its candidate's text; that shows her nothing."""
+    from brain.health.soul_candidate_repair import run_soul_candidate_repair
+
+    store = _make_store(tmp_path)
+    try:
+        mem = Memory.create_new(
+            content="Ordinary trust — she let the goodnight be ordinary",
+            memory_type="monologue_soul_candidate",
+            domain="interior",
+            emotions={},
+        )
+        store.create(mem)
+        _write_candidates(tmp_path, [_monologue_pending(mem.id, text="Ordinary trust")])
+
+        assert run_soul_candidate_repair(tmp_path, store=store).repaired == 1
+        row = store.get(mem.id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()

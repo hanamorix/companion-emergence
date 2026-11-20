@@ -9,15 +9,14 @@ backend's surface looks like.
 
 from __future__ import annotations
 
-import sys
-
 import pytest
 
+import brain.service as service_pkg
 from brain.service import UnsupportedPlatformError, current_backend
 
 
 def test_current_backend_returns_launchd_on_darwin(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(service_pkg, "current_platform", lambda: "darwin")
     backend = current_backend()
     assert backend.__name__ == "brain.service.launchd"
 
@@ -25,7 +24,7 @@ def test_current_backend_returns_launchd_on_darwin(monkeypatch) -> None:
 def test_current_backend_returns_systemd_on_linux(monkeypatch) -> None:
     """Linux gets the real systemd-user backend (graduated from stub
     on 2026-05-08 — unit-file generation + systemctl wrappers)."""
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(service_pkg, "current_platform", lambda: "linux")
     backend = current_backend()
     assert backend.__name__ == "brain.service.systemd"
     assert hasattr(backend, "install_service")
@@ -38,7 +37,7 @@ def test_current_backend_returns_systemd_on_linux(monkeypatch) -> None:
 def test_current_backend_returns_windows_service_on_windows(monkeypatch) -> None:
     """Windows gets the real Task Scheduler backend (graduated from
     stub on 2026-05-08 — task XML generation + schtasks wrappers)."""
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(service_pkg, "current_platform", lambda: "win32")
     backend = current_backend()
     assert backend.__name__ == "brain.service.windows_service"
     assert hasattr(backend, "install_service")
@@ -50,7 +49,7 @@ def test_current_backend_returns_windows_service_on_windows(monkeypatch) -> None
 
 def test_current_backend_unknown_platform_raises(monkeypatch) -> None:
     """Anything outside darwin/linux/win* raises with a hint."""
-    monkeypatch.setattr(sys, "platform", "freebsd13")
+    monkeypatch.setattr(service_pkg, "current_platform", lambda: "freebsd13")
     with pytest.raises(UnsupportedPlatformError) as exc:
         current_backend()
     assert "freebsd13" in str(exc.value)

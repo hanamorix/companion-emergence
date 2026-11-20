@@ -8,10 +8,12 @@ Best-effort by design: every step is wrapped so a failure is logged to
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
@@ -58,7 +60,11 @@ class CrystallisationCandidate(BaseModel):
 
     theme: str = Field(min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=500)
-    importance: int = Field(ge=1, le=10, default=8)
+    # Required (#640): the old default of 8 sat exactly on DEFAULT_SOUL_THRESHOLD, so an
+    # unscored item was queued as a soul candidate. extract_from_thinking drops and records
+    # an unscored item, and one this model rejects (#733), before validation, so it can't
+    # take the rest of the reply with it.
+    importance: int = Field(ge=1, le=10)
 
     # The extractor LLM occasionally returns a field longer than its cap. Truncate
     # (mode="before", so it runs ahead of the max_length constraint) rather than
@@ -174,8 +180,8 @@ _SYSTEM_PROMPT = prompt_strings.register("chat.extractor.system_prompt")
 def _vocab_prompt_line() -> str:
     """Registered emotion names appended to the system prompt (soft assist).
 
-    The load-bearing guard is the `_filter_to_registered` apply-time filter;
-    this line just steers the LLM away from inventing channel names. Fail-soft:
+    The pass-2 emotion_delta is folded into the emotion engine; this
+    line steers the LLM away from inventing channel names. Fail-soft:
     any registry error → empty string, the extraction call proceeds unassisted.
     """
     try:
@@ -211,6 +217,47 @@ def _build_user_prompt(
     parts.append(visible_reply)
     parts.append("</visible_reply>")
     return "\n".join(parts)
+
+
+def _drop_bad_crystallisation(data: dict) -> tuple[int, int]:
+    """Remove the crystallisation items that would fail the reply from ``data`` in place, and
+    return ``(unscored, invalid)``: how many had no ``importance`` (missing or null, #640) and
+    how many ``CrystallisationCandidate`` rejects for any other reason (#733), such as a score
+    of ``0``, ``11`` or ``"high"``, a whitespace-only theme, or an item that isn't an object.
+
+    A bad item is a parse problem, not a soul-worthy one. Dropping it here, per item, keeps the
+    rest of the reply: a whole-reply schema failure would also lose the scored items, memory
+    writes and deltas. The kept items stay as the model sent them, so the whole-reply validation
+    sees what it saw before. A ``crystallisation`` value that isn't a list is left to that
+    validation. The caller records the drop once validation's outcome is known, naming only the
+    counts, never reply text or pydantic's message (which quotes the input, #427)."""
+    items = data.get("crystallisation")
+    if not isinstance(items, list):
+        return 0, 0
+    kept: list = []
+    unscored = invalid = 0
+    for item in items:
+        if isinstance(item, dict) and item.get("importance") is None:
+            unscored += 1
+            continue
+        try:
+            CrystallisationCandidate.model_validate(item)
+        except ValidationError:
+            invalid += 1
+            continue
+        kept.append(item)
+    data["crystallisation"] = kept
+    return unscored, invalid
+
+
+def _drop_note(unscored: int, invalid: int) -> str:
+    """The parse-failure note for the dropped items: counts only (#640, #733)."""
+    parts = []
+    if unscored:
+        parts.append(f"{unscored} crystallisation item(s) without importance")
+    if invalid:
+        parts.append(f"{invalid} invalid crystallisation item(s)")
+    return ", ".join(parts)
 
 
 def extract_from_thinking(
@@ -252,11 +299,18 @@ def extract_from_thinking(
         record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"non-JSON: {exc}")
         return ExtractorOutput()
 
+    # One row per reply (#640): if the reply fails validation anyway, the whole reply is
+    # discarded, so the drop note rides on the single schema row instead of a row of its own.
+    note = _drop_note(*_drop_bad_crystallisation(data))
     try:
-        return ExtractorOutput.model_validate(data)
+        out = ExtractorOutput.model_validate(data)
     except Exception as exc:  # noqa: BLE001
-        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"schema: {exc}")
+        prefix = f"schema: {note}; " if note else "schema: "
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"{prefix}{exc}")
         return ExtractorOutput()
+    if note:
+        record_parse_failure(persona_dir, site="extractor", raw=reply, error=f"{note} dropped")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,7 +387,7 @@ def _apply_memory_writes(writes: list[MemoryWrite], persona_dir: Path) -> None:
 def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
     """Drop channels whose names are not in the process-global emotion registry.
 
-    Mirrors the pattern in brain/ingest/emotion_backfill.py::_normalize.
+    Mirrors the pattern in brain/ingest/emotion_tagger.py::_normalize.
     Fail-soft: on ANY error the input dict is returned unchanged so extraction
     never breaks on a vocab read error.  A debug log is emitted so the failure
     is visible without surfacing into the chat path.
@@ -347,71 +401,46 @@ def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
         return emotions
 
 
-# A pass-2 emotion_delta is a NUDGE, not a set. The x10 mapping below turns the
-# validated [-1.0, 1.0] delta into a 0..10 MemoryStore intensity; without a
-# ceiling a single extraction mints 10.0 and wins aggregate_state's max-pool
-# outright against a whole history (#94). test_extractor_schema.py already
-# states this intent — "so a malformed extractor can't slam the vector" — but
-# bounds the delta, not what the delta becomes. Sustained feeling still climbs
-# across turns; one turn cannot peak her.
+# Ceiling on the intensity one pass-2 emotion_delta can give a channel, on the 0..10 scale (the validated [-1.0, 1.0]
+# delta times 10, capped). test_extractor_schema.py already states the intent, "so a malformed extractor can't slam the
+# vector", but bounds the delta, not what the delta becomes. Sustained feeling still climbs across turns; one turn cannot
+# peak her.
 _MAX_DELTA_INTENSITY: float = 3.0
 
 
+def signed_change_values(delta: Mapping[str, float]) -> dict[str, float]:
+    """A [-1, 1] delta as signed 0-10-scale changes for the emotion engine: x10, capped at +/-_MAX_DELTA_INTENSITY.
+
+    Keeps the sign, so a negative delta lowers the feeling once the engine is live (B1 PR 2). A zero change is skipped.
+    """
+    return {
+        name: math.copysign(min(abs(v) * 10.0, _MAX_DELTA_INTENSITY), v)
+        for name, v in delta.items()
+        if abs(v) > 1e-9
+    }
+
+
 def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
-    """Apply emotion deltas via MemoryStore influence — a tiny emotion-carrying
-    memory is committed per the system's existing aggregation model.
+    """Fold the pass-2 emotion deltas into the emotion engine as signed changes; no memory row is written.
 
-    EmotionalState is DERIVED from memory aggregation (see brain/emotion/aggregate.py
-    and brain/bridge/persona_state.py _build_emotions). There is no separate
-    persisted emotion JSON file — the bridge reads aggregate_state(memories) on
-    each /persona/state poll. Writing a small monologue-source memory with the
-    delta vector is the correct way to influence the felt state without bypassing
-    the engine's normal accounting.
+    Deltas are on a [-1.0, 1.0] scale from the extractor. ``signed_change_values`` maps each to a signed change on the
+    0..10 scale (x10, capped at +/-_MAX_DELTA_INTENSITY), so a negative delta lowers the feeling and one extraction
+    can't peg a channel (#94).
 
-    Deltas are on a [-1.0, 1.0] scale from the extractor. We map them to
-    importance = abs(delta) * 10, capped at _MAX_DELTA_INTENSITY, so a 0.15
-    nudge becomes importance 1.5 on the 0..10 MemoryStore scale — a maximal
-    1.0 delta caps at _MAX_DELTA_INTENSITY rather than the uncapped 10.0;
-    one extraction can't peg a channel to the full clamp (#94).
-
-    Channel names are constrained to the registered emotion vocabulary before
-    writing — LLM-invented names are silently dropped here (mirrors the
-    _normalize pattern in brain/ingest/emotion_backfill.py).
+    Channel names are constrained to the registered emotion vocabulary first: LLM-invented names are dropped here
+    (mirrors the _normalize pattern in brain/ingest/emotion_tagger.py).
     """
     # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
     # pass2_queue.py's drain_all_locked pop-after-process step) can call
-    # this twice for one logical item, adding one extra emotion nudge to
-    # aggregate_state. Owner-accepted 2026-09-26: "the odds of it happening
+    # this twice for one logical item, folding one extra emotion nudge.
+    # Owner-accepted 2026-09-26: "the odds of it happening
     # are tiny, the consequence if it happens are small." See #240
     # (emotion-system untangle) for the durable fix.
-    from brain.memory.store import Memory, MemoryStore
+    from brain.emotion import engine
 
-    store = MemoryStore(persona_dir / "memories.db")
-    try:
-        registered_delta = _filter_to_registered(delta)
-        emotions = {
-            ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
-            for ch, v in registered_delta.items()
-            if abs(v) > 1e-9
-        }
-        if not emotions:
-            return
-        # Build a brief descriptive content string from the non-zero emotion channels.
-        # Use the already-filtered `emotions` dict so the content string and stored
-        # vector stay consistent (zero entries appear in neither).
-        channel_str = ", ".join(f"{ch}:{v:.2f}" for ch, v in emotions.items())
-        mem = Memory.create_new(
-            content=f"[monologue emotion influence: {channel_str}]",
-            memory_type="monologue_emotion",
-            domain="monologue",
-            emotions=emotions,
-            importance=max(emotions.values()),
-        )
-        from brain.memory.pending import route_write
-
-        route_write(store, mem, source="extractor")
-    finally:
-        store.close()
+    changes = signed_change_values(_filter_to_registered(delta))
+    if changes:
+        engine.engine_for(persona_dir).fold_change(changes, None, "monologue_emotion")
 
 
 _INTEREST_SPAWN_STATE = "interest_spawn_state.json"

@@ -324,10 +324,14 @@ def _process_one_candidate(
             except Exception:  # noqa: BLE001
                 _pron = _resolve_pronouns(None)
 
+            from brain.dev_constants import NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
+            from brain.emotion.write_scale import writes_engine_scale
             from brain.initiate.reach_emotion import reach_emotions_for
 
             store = MemoryStore(persona_dir / "memories.db")
             try:
+                # The reach-out's row goes straight to memories.db: the x10 fix's rows step (cut 1) rescales it (B1 PR 7).
+                engine_scale = writes_engine_scale(persona_dir, store, cut=NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)
                 write_initiate_memory(
                     store,
                     audit_id=audit_id,
@@ -337,7 +341,7 @@ def _process_one_candidate(
                     ts=now.isoformat(),
                     user_name=user_name,
                     pronouns=_pron,
-                    reach_emotions=reach_emotions_for(candidate.source),
+                    reach_emotions=reach_emotions_for(candidate.source, engine_scale=engine_scale),
                 )
             finally:
                 store.close()

@@ -103,14 +103,14 @@ def test_peak_emotion_intensity_carried_from_v033_source(tmp_path):
     src = _mk_v033_schema_source(tmp_path)
     mems = read_source_memories(src)
     assert "m2" in mems
-    assert mems["m2"].peak_emotion_intensity == 7.0
+    assert mems["m2"]._stored_peak == 7.0
 
 
 def test_peak_emotion_intensity_defaults_zero_for_old_schema(tmp_path):
     """Old-schema source DB (no peak_emotion_intensity column) defaults to 0.0."""
     src = _mk_old_schema_source(tmp_path)
     mems = read_source_memories(src)
-    assert mems["m1"].peak_emotion_intensity == 0.0
+    assert mems["m1"]._stored_peak == 0.0
 
 
 def test_recall_count_round_trips_as_float(tmp_path):

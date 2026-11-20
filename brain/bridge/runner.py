@@ -118,10 +118,28 @@ def _after_run(persona_dir: Path, app: object, monitor: object) -> None:
     shutdown_mod.hard_exit(persona_dir, shutdown_mod.REASON_HARD_EXIT)
 
 
-_RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
-_RUNTIME_LOG_BACKUPS = 3
 _RUNTIME_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _RUNTIME_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def _find_runtime_log_handler(persona_dir: Path) -> bool:
+    """Is the persistent (size-rotating) handler for this persona's runtime log on the root logger? The append-and-close
+    transient handler is not it. A failed path lookup raises."""
+    from logging.handlers import RotatingFileHandler
+
+    from brain.paths import runtime_log_path
+
+    path = str(runtime_log_path(persona_dir.name).resolve())
+    return any(isinstance(h, RotatingFileHandler) and h.baseFilename == path for h in logging.getLogger().handlers)
+
+
+def _runtime_log_attached(persona_dir: Path) -> bool:
+    """Best-effort form of the lookup, like the other runtime-log helpers, for callers that only decide whether to attach
+    a transient handler: a failed lookup answers False. ``_setup_runtime_logging`` uses the raising form."""
+    try:
+        return _find_runtime_log_handler(persona_dir)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _setup_runtime_logging(persona_dir: Path) -> None:
@@ -143,18 +161,23 @@ def _setup_runtime_logging(persona_dir: Path) -> None:
     try:
         from logging.handlers import RotatingFileHandler
 
-        from brain.paths import get_log_dir
+        from brain.paths import (
+            RUNTIME_LOG_BACKUPS,
+            RUNTIME_LOG_MAX_BYTES,
+            get_log_dir,
+            runtime_log_path,
+        )
 
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        path = log_dir / f"runtime-{persona_dir.name}.log"
+        path = runtime_log_path(persona_dir.name)
         root = logging.getLogger()
-        if any(isinstance(h, RotatingFileHandler) and h.baseFilename == str(path.resolve()) for h in root.handlers):
+        if _find_runtime_log_handler(persona_dir):
             return  # already set up (``supervisor run`` sets it up before the start back-off wait, D26)
         handler = RotatingFileHandler(
             path,
-            maxBytes=_RUNTIME_LOG_MAX_BYTES,
-            backupCount=_RUNTIME_LOG_BACKUPS,
+            maxBytes=RUNTIME_LOG_MAX_BYTES,
+            backupCount=RUNTIME_LOG_BACKUPS,
             encoding="utf-8",
         )
         handler.setFormatter(
@@ -186,11 +209,11 @@ def _attach_transient_runtime_log(persona_dir: Path) -> logging.Handler | None:
     closes per record, so the back-off's lines reach the log while nothing keeps it open. The caller removes it before
     ``_setup_runtime_logging`` attaches the persistent one (once the bridge lock is held). Best-effort."""
     try:
-        from brain.paths import get_log_dir
+        from brain.paths import get_log_dir, runtime_log_path
 
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        handler = _AppendThenCloseHandler(log_dir / f"runtime-{persona_dir.name}.log", encoding="utf-8", delay=True)
+        handler = _AppendThenCloseHandler(runtime_log_path(persona_dir.name), encoding="utf-8", delay=True)
         handler.setFormatter(logging.Formatter(_RUNTIME_LOG_FORMAT, datefmt=_RUNTIME_LOG_DATEFMT))
         handler.setLevel(logging.INFO)
         root = logging.getLogger()

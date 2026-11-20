@@ -11,6 +11,8 @@ then early-returned on the missing file without reconstructing.
 from __future__ import annotations
 
 import json
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.emotion import vocabulary
@@ -110,6 +112,44 @@ def test_heal_mints_canonical_name_for_variant_memory_key(tmp_path: Path):
     finally:
         store.close()
         _cleanup_emotion("present_ness")
+
+
+def test_heal_names_a_non_finite_valued_emotion_and_logs_no_drop(tmp_path: Path, caplog):
+    """A stored emotion whose value is NaN still names an emotion the memory uses, so the heal registers it.
+
+    The heal reads names only: it neither skips the name nor logs "dropping emotion" on every heartbeat load.
+    `create_new` drops non-finite values, so the memory is built the way a loaded row is.
+    """
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.from_stored_row(
+                id="nan-valued-row",
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                created_at=datetime.now(UTC),
+                emotions={"Nan-Ache": float("nan"), "finite_ache": 6.0},
+            ),
+            fold=False,
+        )
+        _cleanup_emotion("nan_ache")
+        _cleanup_emotion("finite_ache")
+
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+
+        with caplog.at_level(logging.DEBUG):
+            load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        names = {e["name"] for e in json.loads(vocab_path.read_text())["emotions"]}
+        assert names == {"nan_ache", "finite_ache"}
+        assert vocabulary.get("nan_ache") is not None
+        assert not [r for r in caplog.records if "dropping emotion" in r.getMessage()]
+    finally:
+        store.close()
+        _cleanup_emotion("nan_ache")
+        _cleanup_emotion("finite_ache")
 
 
 def test_reconstruct_mints_canonical_names(tmp_path: Path):

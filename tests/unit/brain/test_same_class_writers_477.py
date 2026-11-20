@@ -29,6 +29,7 @@ from brain.felt_time.chat_log import (
 )
 from brain.initiate.audit import append_audit_row, iter_initiate_audit_full
 from brain.initiate.schemas import AuditRow
+from brain.utils import file_ops
 from tests.thread_support import finish_threads
 
 
@@ -43,7 +44,7 @@ def _flaky_replace(monkeypatch, suffix: str, failures: int = 2):
         return real(src, dst)
 
     monkeypatch.setattr(heal.os, "replace", flaky)
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     return state
 
 

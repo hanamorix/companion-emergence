@@ -2,15 +2,18 @@
 
 read_file and list_directory may open any file the user asks about, except these.
 Checked right after the path is resolved, before anything is opened, listed or
-suggested. Directories are compared by file identity (os.path.samestat) on every
-existing ancestor, so a case variant on a case-insensitive volume or a symlink
-cannot reach around a rule the way a string-prefix check can.
+suggested. Directories are compared by file identity on every existing ancestor
+(brain.files.path_identity, shared with the write guard), so a case variant on a
+case-insensitive volume or a symlink cannot reach around a rule the way a
+string-prefix check can.
 
 The lists are best-effort: they name the common credential stores per platform,
 not every one. A hard link to a listed single file is refused (same identity);
 shortcut: a hard link to a file INSIDE a denied directory is not, since that would
 mean indexing every file under those trees — the read tools can't make links, so
-upgrade only if a write path ever can.
+upgrade only if a write path ever can. Decided on #694: the write guard refuses an
+append to any multi-link file, but reads keep this shortcut, because refusing every
+multi-link read would also refuse the files pnpm and uv hard-link into projects.
 """
 from __future__ import annotations
 
@@ -18,6 +21,8 @@ import os
 from pathlib import Path
 
 from brain.bridge.state_file import STATE_FILENAME
+from brain.files.path_identity import stat_or_none as _stat
+from brain.files.path_identity import under_any, unusable
 from brain.paths import get_home
 
 PROTECTED = "protected location (credentials or secrets)"
@@ -99,28 +104,18 @@ def _denied_paths(persona_dir: Path) -> list[Path]:
     return paths
 
 
-def _stat(p: Path) -> os.stat_result | None:
-    try:
-        return os.stat(p)
-    except OSError:
-        return None
-
-
 def denied_stats(persona_dir: Path) -> list[os.stat_result]:
     """The protected locations that exist, for checking many paths against one snapshot (a directory listing)."""
     return [st for st in map(_stat, _denied_paths(persona_dir)) if st is not None]
 
 
 def is_read_denied(resolved: Path, *, persona_dir: Path, denied: list[os.stat_result] | None = None) -> bool:
-    """True if `resolved` (already .resolve()d) is, or is inside, a protected location."""
-    if _secret_name(resolved):
+    """True if `resolved` (already .resolve()d) is, or is inside, a protected location.
+    A path the OS can't use (too long, no permission) counts as protected: fail closed (#695)."""
+    if unusable(resolved) is not None or _secret_name(resolved):
         return True
     if resolved.parts[:2] == ("/", "proc") and resolved.name == "environ":  # a process's environment: tokens, keys
         return True
     if denied is None:
         denied = denied_stats(persona_dir)
-    for anc in (resolved, *resolved.parents):
-        st = _stat(anc)
-        if st is not None and any(os.path.samestat(st, d) for d in denied):
-            return True
-    return False
+    return under_any(resolved, denied)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -66,7 +65,7 @@ def test_no_clean_candidate_returns_none_and_warns_once(tmp_path: Path, monkeypa
     (home / ".claude").mkdir()
     monkeypatch.setattr(provider_mod.tempfile, "gettempdir", lambda: str(t))
     monkeypatch.setenv("KINDLED_HOME", str(home))
-    monkeypatch.setattr(sys, "platform", "linux")  # pin the non-Windows arm; real win32 hosts get the #252 text
+    monkeypatch.setattr(provider_mod, "_is_windows", lambda: False)  # pin the non-Windows arm; real win32 hosts get the #252 text
     with caplog.at_level(logging.WARNING, logger="brain.bridge.provider"):
         assert provider_mod._claude_work_dir() is None
         assert provider_mod._claude_work_dir() is None
@@ -82,7 +81,7 @@ def test_windows_warning_names_the_issue(tmp_path: Path, monkeypatch, caplog):
     (home / ".claude").mkdir()
     monkeypatch.setattr(provider_mod.tempfile, "gettempdir", lambda: str(t))
     monkeypatch.setenv("KINDLED_HOME", str(home))
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(provider_mod, "_is_windows", lambda: True)
     with caplog.at_level(logging.WARNING, logger="brain.bridge.provider"):
         assert provider_mod._claude_work_dir() is None
     assert any("#252" in r.getMessage() for r in caplog.records)
@@ -94,8 +93,8 @@ def test_simulated_windows_clean_profile_returns_tempdir_candidate(tmp_path: Pat
     monkeypatch.setattr(provider_mod.tempfile, "gettempdir", lambda: str(t))
     monkeypatch.setenv("KINDLED_HOME", str(_clean_root(tmp_path, "home")))
     # os.name cannot be faked on macOS (pathlib would instantiate WindowsPath); the Windows hazard
-    # is the missing os.getuid attribute, so remove exactly that and set the platform tag.
-    monkeypatch.setattr(sys, "platform", "win32")
+    # is the missing os.getuid attribute, so remove exactly that and set the platform seam.
+    monkeypatch.setattr(provider_mod, "_is_windows", lambda: True)
     monkeypatch.delattr(os, "getuid", raising=False)
     assert provider_mod._claude_work_dir() == str((t / "companion-emergence-claude-work").resolve())
 

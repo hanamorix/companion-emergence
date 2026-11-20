@@ -25,8 +25,10 @@ wait keeps waiting, a kill treats it as "not this process".
 from __future__ import annotations
 
 import os
+import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 GONE = "gone"
 UNKNOWN = "unknown"
@@ -132,8 +134,12 @@ def _macos_token(pid: int) -> str:  # pragma: no cover - exercised on the macOS 
 
 
 def token_of(pid: int | None) -> str:
-    """The identity token of ``pid``, or ``GONE`` / ``UNKNOWN``."""
-    if pid is None or pid <= 0:
+    """The identity token of ``pid``, or ``GONE`` / ``UNKNOWN``.
+
+    A pid outside the platform's range (#755: a damaged or hand-edited record) names no process, so it is ``GONE``
+    without asking the OS: Windows's reader would fail on it (read as UNKNOWN, which ``holder_alive`` counts as alive)
+    and macOS's would read whatever process the number cut to a C int names."""
+    if pid is None or not is_pid_number(pid):
         return GONE
     try:
         if sys.platform.startswith("linux"):
@@ -151,11 +157,33 @@ def is_token(value: str | None) -> bool:
     return bool(value) and value not in (GONE, UNKNOWN)
 
 
+def is_pid_number(value: int) -> bool:
+    """Can ``value`` be a process id on this platform? A POSIX ``pid_t`` is a signed C int and a Windows process id is an
+    unsigned 32-bit value (both sizes from ``struct``, no literal); 0 and below name no process. A larger number can name no
+    process either, and the OS calls that take a pid refuse it with ``OverflowError`` (``os.kill``), which no liveness check
+    expects: a pid read from a record or a file name goes through here first."""
+    if sys.platform == "win32":
+        limit = 1 << (8 * struct.calcsize("I"))
+    else:
+        limit = 1 << (8 * struct.calcsize("i") - 1)
+    return 0 < value < limit
+
+
+def own_pid() -> int:
+    """This process's pid: the one place code outside this module gets it (engine_files makes no raw ``os`` call)."""
+    return os.getpid()
+
+
 def own_token() -> str | None:
-    """This process's token (cached), or None when it cannot be read here."""
+    """This process's token, or None when it cannot be read here.
+
+    The first answer stands for the life of the process, a failed read included: a bridge that recorded no token
+    (runner.py, identity "unavailable") must keep matching its own record in ``is_own_identity`` (``state_file.update``,
+    the engine's progress record).
+    """
     global _OWN
     if _OWN is None:
-        tok = token_of(os.getpid())
+        tok = token_of(own_pid())
         _OWN = tok if is_token(tok) else ""
     return _OWN or None
 
@@ -187,6 +215,30 @@ def holder_alive(pid: int | None, recorded: str | None) -> bool:
     from brain.bridge.state_file import pid_is_alive
 
     return pid_is_alive(pid)
+
+
+def names_this_bridge(record: dict[str, Any] | None, pid: int | None, token: str | None) -> bool:
+    """True when ``record`` names exactly ``pid`` + ``token`` (C43 a: anything else is ignored).
+
+    A comparison against an expected identity only, no liveness (that is ``holder_alive``). The bridge's watcher files use it
+    for "is this record the bridge's": a record with no token never matches. A process asking whether a record is its OWN uses
+    ``is_own_identity``, which lets a missing token match a missing token.
+    """
+    if not isinstance(record, dict) or pid is None or not token:
+        return False
+    return record.get("pid") == pid and record.get("pid_token") == token
+
+
+def is_own_identity(pid: int | None, token: str | None) -> bool:
+    """Do ``pid`` and ``token`` name this process: the pid is this process's and the token equals ``own_token()``?
+
+    Both tokens None count as equal: a process that cannot read its own token records none, and that record is still
+    its own (the engine's progress record, bridge.json). A real token against a missing one, or the reverse, does not match.
+    A bool is not a pid.
+    """
+    if isinstance(pid, bool) or pid != own_pid():
+        return False
+    return token == own_token()
 
 
 def token_digest(token: str) -> str:

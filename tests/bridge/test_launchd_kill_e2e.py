@@ -27,6 +27,7 @@ import sys
 import textwrap
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,12 +36,14 @@ import pytest
 
 from brain import process_identity as pi
 from brain.bridge import daemon, kill, shutdown_progress, state_file
+from tests.unit.brain.emotion._engine_support import make_live
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the fake launchd runs on Linux CI/dev")
 
 REPO = Path(__file__).resolve().parents[2]
 EXIT_TIMEOUT_S = 300.0
 THROTTLE_S = 0.5
+STUB_WAIT_S = 30.0  # how long a test waits for the stub job's child files and its bridge.json record
 
 _STUB_BRIDGE = textwrap.dedent(
     """
@@ -176,6 +179,9 @@ def env_pd(tmp_path, monkeypatch):
     pd = home / "personas" / "nell"
     (pd / "active_conversations").mkdir(parents=True)
     (pd / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}', encoding="utf-8")
+    # A real `supervisor run` child (`_start_real`) checks whether the persona needs the rebuild step before it starts the bridge (S107);
+    # a switched persona needs none, so no rebuild child is spawned (the conftest fixture that stops that does not reach a child).
+    make_live(pd, datetime(2030, 1, 1, tzinfo=UTC))
     monkeypatch.setenv("KINDLED_HOME", str(home))
     env = dict(os.environ, KINDLED_HOME=str(home), PYTHONPATH=str(REPO), KINDLED_TEST_STUB_TASKS="0")
     return env, pd
@@ -207,12 +213,24 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def _wait_file(path: Path, timeout: float = 30.0) -> int:
+def _wait_file(path: Path, timeout: float = STUB_WAIT_S) -> int:
     deadline = time.monotonic() + timeout
     while not path.exists() or not path.read_text().strip():
         assert time.monotonic() < deadline, f"{path} never appeared"
         time.sleep(0.05)
     return int(path.read_text())
+
+
+def _wait_record(pd: Path, pid: int, timeout: float = STUB_WAIT_S) -> None:
+    """Poll until bridge.json names ``pid``, up to ``timeout``. The stub writes it after its child files, and
+    ``kill_bridge`` answers not_running when it reads no record, so a test must wait for it before the kill."""
+    deadline = time.monotonic() + timeout
+    while True:
+        st = state_file.read(pd)
+        if st is not None and st.pid == pid:
+            return
+        assert time.monotonic() < deadline, f"no bridge.json record for pid {pid} (last: {st})"
+        time.sleep(0.05)
 
 
 def _wait_gone(pids: list[int], timeout: float) -> bool:
@@ -240,10 +258,7 @@ def test_a_launchd_owned_bridge_is_killed_with_its_tree_and_stays_down(env_pd, l
         child = _wait_file(pd / "stub-child")
         grand = _wait_file(pd / "stub-grand")
         stub = fake.job.pid
-        _wait_until = time.monotonic() + 30
-        while state_file.read(pd) is None or state_file.read(pd).pid != stub:
-            assert time.monotonic() < _wait_until
-            time.sleep(0.05)
+        _wait_record(pd, stub)
         t0 = time.monotonic()
         result = kill.kill_bridge(pd, timeout=1.0)
         assert time.monotonic() - t0 <= kill.kill_bound_s(1.0) + 5.0
@@ -310,6 +325,7 @@ def test_every_start_path_after_a_kill_reaches_a_healthy_bridge(env_pd, launchd_
         fake.start_stub(honour_sigterm=False)
         _wait_file(pd / "stub-child")
         _wait_file(pd / "stub-grand")
+        _wait_record(pd, fake.job.pid)
         assert kill.kill_bridge(pd, timeout=1.0).outcome == "killed"
         assert not fake.loaded
         starts = {

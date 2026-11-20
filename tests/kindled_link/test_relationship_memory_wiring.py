@@ -5,6 +5,8 @@ docs/superpowers/specs/2026-06-30-kindled-link-mind-wiring-and-relay-gate.md.
 import contextlib
 from datetime import UTC, datetime
 
+import pytest
+
 from brain.kindled_link.relationship import (
     PeerRelationshipState,
     persist_relationship_state,
@@ -75,8 +77,8 @@ def test_reflection_with_mem_store_writes_kindled_peer_memory_and_caps_emotion(t
     assert m.metadata.get("relationship_stage") == "acquaintance"
     assert m.content == "I talked with a peer today and felt a quiet warmth."
     # emotion was applied (capped, vocab-filtered) — non-empty for a fresh peer
-    assert m.emotions
-    assert all(0.0 < v <= 0.08 + 1e-9 for v in m.emotions.values())
+    assert m._stored_emotions
+    assert all(0.0 < v <= 0.08 + 1e-9 for v in m._stored_emotions.values())
 
 
 def test_mem_store_none_back_compat_no_memory_written(tmp_path):
@@ -144,4 +146,148 @@ def test_no_memory_summary_means_no_write(tmp_path):
         transcript=_TRANSCRIPT, now=NOW, today=TODAY, throttle=_Grant(),
         mem_store=ms, persona_name="Nell", session_id="s1",
     )
+    assert ms.list_by_type("kindled_peer") == []
+
+
+# ---- emotion rework B1 PR 3: peer memories carry 0-10 values once the engine is live ----
+
+
+def test_live_prompt_asks_for_zero_to_ten():
+    from brain.kindled_link.relationship import _build_reflection_prompt
+
+    prompt = _build_reflection_prompt(current_stage="stranger", transcript="peer: hi", engine_scale=True)
+    assert "0 to 10" in prompt and "small float" not in prompt
+
+
+@pytest.mark.no_base_failure(reason="pins that the switch-off prompt is byte-identical (B1 PR 3); main builds it the same way")
+def test_off_prompt_is_byte_identical():
+    from brain.kindled_link.relationship import (
+        _REFLECTION_PROMPT_SEGMENTS,
+        _build_reflection_prompt,
+    )
+
+    prompt = _build_reflection_prompt(current_stage="stranger", transcript="peer: hi")
+    seg = _REFLECTION_PROMPT_SEGMENTS
+    assert prompt == seg[0] + "stranger" + seg[1] + "peer: hi" + seg[2] and "small float" in prompt
+
+
+def _verdict(emotion_json: str) -> str:
+    return _VERDICT_WITH_MEMORY.replace('"emotion":{"tenderness":0.08}', '"emotion":' + emotion_json)
+
+
+def _go_live(persona_dir, mem_store):
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over."""
+    from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    mem_store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+
+
+def _live_reflect(tmp_path, reply: str, *, now=NOW, today=TODAY, ms=None, s=None):
+    s = s or KindledLinkStore(tmp_path / "k.db")
+    if ms is None:
+        ms = MemoryStore(tmp_path / "memories.db")
+        _go_live(tmp_path, ms)
+    run_relationship_reflection(
+        store=s, provider=_P(reply), peer_id="kid_a", transcript=_TRANSCRIPT, now=now, today=today,
+        throttle=_Grant(), persona_dir=tmp_path, mem_store=ms, persona_name="Nell", session_id="s1",
+    )
+    return s, ms
+
+
+def test_live_reflection_stores_held_values_and_holds_negatives_to_zero(tmp_path):
+    _, ms = _live_reflect(tmp_path, _verdict('{"joy": 9, "grief": -3, "love": 40}'))
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    assert peer_memory._stored_emotions == {"joy": 9.0, "grief": 0.0, "love": 10.0}
+
+
+def test_live_reflection_drops_non_numeric_and_non_finite_and_keeps_the_memory(tmp_path):
+    _, ms = _live_reflect(tmp_path, _verdict('{"joy": 4, "love": "lots", "awe": null, "fear": true, "grief": NaN}'))
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    assert peer_memory._stored_emotions == {"joy": 4.0}
+
+
+def test_live_reflection_does_not_charge_the_bucket(tmp_path):
+    from datetime import timedelta
+
+    s, ms = _live_reflect(tmp_path, _verdict('{"joy": 9}'))
+    later = NOW + timedelta(hours=1)
+    _live_reflect(tmp_path, _verdict('{"joy": 9}'), now=later, today=later.strftime("%Y-%m-%d"), ms=ms, s=s)
+    assert [m._stored_emotions for m in ms.list_by_type("kindled_peer")] == [{"joy": 9.0}, {"joy": 9.0}]
+
+
+# ---- B1 PR 7: the prompt and stored values follow the scale rule (cut 1); the peer cap still follows is_live() ----
+
+
+def test_peer_memory_is_on_the_engine_scale_and_capped_when_switched_over_but_state_unreadable(tmp_path):
+    from brain import dev_constants
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
+
+    ms = MemoryStore(tmp_path / "memories.db")
+    ms.set_x10_progress(dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)
+    _go_live(tmp_path, ms)
+    ruin_the_state(tmp_path)  # switched over, but the engine cannot read: is_live() is False
+    s = KindledLinkStore(tmp_path / "k.db")
+    provider = _P(_verdict('{"joy": 4}'))
+    run_relationship_reflection(
+        store=s, provider=provider, peer_id="kid_a", transcript=_TRANSCRIPT, now=NOW, today=TODAY,
+        throttle=_Grant(), persona_dir=tmp_path, mem_store=ms, persona_name="Nell", session_id="s1",
+    )
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    # 0-10, as the x10 fix has run and nothing would rescale a small value; 4 is 0.4 on the cap's own scale, inside it.
+    assert peer_memory._stored_emotions == pytest.approx({"joy": 4.0})
+    # The engine is not reading, so the anti-love-bomb bucket still caps the peer, charged on its own (old) scale.
+    assert s.get_peer_emotion_accumulated("kid_a", NOW) == pytest.approx(0.4)
+
+
+@pytest.mark.no_base_failure(
+    reason="B1 PR 7 keeps today's behaviour here (the old code asked for 0-10 whenever is_live() was True); it guards the scale rule from undoing that"
+)
+def test_an_engine_that_saw_the_switch_asks_for_zero_to_ten_even_when_the_state_is_lost(tmp_path):
+    # is_live() caches a switch-over it has seen, so it stays True after the state turns unreadable, while a fresh read
+    # of the state cannot tell. The prompt must then match the live branch that parses the answer as 0-10.
+    from brain.emotion.engine import engine_for
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
+
+    ms = MemoryStore(tmp_path / "memories.db")  # progress 0: the accepted edge if the engine had not seen the switch
+    _go_live(tmp_path, ms)
+    assert engine_for(tmp_path).is_live()
+    ruin_the_state(tmp_path)
+    prompts: list[str] = []
+
+    class _Recording(_P):
+        def complete(self, prompt):
+            prompts.append(prompt)
+            return super().complete(prompt)
+
+    run_relationship_reflection(
+        store=KindledLinkStore(tmp_path / "k.db"), provider=_Recording(_verdict('{"joy": 4}')), peer_id="kid_a",
+        transcript=_TRANSCRIPT, now=NOW, today=TODAY, throttle=_Grant(), persona_dir=tmp_path, mem_store=ms,
+        persona_name="Nell", session_id="s1",
+    )
+    assert len(prompts) == 1 and "0 to 10" in prompts[0]
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    assert peer_memory._stored_emotions == {"joy": 4.0}
+
+
+@pytest.mark.no_base_failure(reason="B1 PR 7 pins that a reflection with no persona_dir keeps today's scale; main does too")
+def test_peer_memory_without_a_persona_dir_keeps_todays_scale_even_after_the_x10_fix(tmp_path):
+    from brain import dev_constants
+
+    s = KindledLinkStore(tmp_path / "k.db")
+    ms = MemoryStore(tmp_path / "mem.db")
+    ms.set_x10_progress(dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED)
+    provider = _P(_VERDICT_WITH_MEMORY)
+    run_relationship_reflection(
+        store=s, provider=provider, peer_id="kid_a", transcript=_TRANSCRIPT, now=NOW, today=TODAY,
+        throttle=_Grant(), mem_store=ms, persona_name="Nell", session_id="s1",
+    )
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    assert peer_memory._stored_emotions == pytest.approx({"tenderness": 0.08})
+
+
+@pytest.mark.no_base_failure(reason="pins that a breach seeds no warmth on the live path too (B1 PR 3); main returns early before any write")
+def test_hard_breach_writes_no_memory_when_live(tmp_path):
+    _, ms = _live_reflect(tmp_path, _verdict('{"joy": 9}').replace('"hard_breach":false', '"hard_breach":true'))
     assert ms.list_by_type("kindled_peer") == []

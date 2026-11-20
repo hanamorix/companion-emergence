@@ -2,9 +2,7 @@
 on pause (spec §4; S14/S31/S32/S36/S41/S65).
 
 Criteria covered here: C8 (per-item pause for every pausable job in the S32
-table), C31 (the new job_progress shared-state accessor's atomicity), and a
-regression guard for the emotion_backfill "wrongly marks complete on pause"
-bug found and fixed while building this increment. C16 (real-subprocess
+table) and C31 (the new job_progress shared-state accessor's atomicity). C16 (real-subprocess
 crash resume) and C2's calibration pause-arm (real-model RSS) live in their
 own files (test_c16_crash_resume.py, test_judge_release_rss.py) — the
 former needs a real subprocess kill, the latter needs the real torch judge.
@@ -171,105 +169,6 @@ def test_c8_pass2_job_reports_paused_with_items_remaining_then_resumes(tmp_path:
     assert len(ran) == 3
     assert pass2_queue.queue_length(persona_dir) == 0
     assert len(set(ran)) == 3, "no item drained twice"
-
-
-# ---------------------------------------------------------------------------
-# C8 — emotion backfill (S32 row 3): also the regression-guard for the real
-# bug found while building this (a paused run wrongly marked status=complete).
-# ---------------------------------------------------------------------------
-
-
-def test_c8_emotion_backfill_pauses_between_memories_and_resumes(tmp_path: Path) -> None:
-    from brain.ingest.emotion_backfill import run_emotion_backfill
-    from brain.memory.store import Memory, MemoryStore
-
-    persona_dir = _persona(tmp_path)
-    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
-    ids = []
-    for i in range(3):
-        m = Memory.create_new(content=f"memory number {i} with enough content", memory_type="conversation", domain="us")
-        store.create(m)
-        ids.append(m.id)
-    ids.sort()  # run_emotion_backfill processes in id order
-
-    tagged_order: list[str] = []
-
-    def _tagger(memory):
-        tagged_order.append(memory.id)
-        return {"joy": 5.0}
-
-    pause = _pause_on_call(2)  # checked BEFORE each item; pause before item 1
-    state = run_emotion_backfill(
-        persona_dir, tagger_fn=_tagger, store=store, delay_s=0, should_pause=pause
-    )
-    assert state.status == "running", "a genuine between-items pause must NOT mark complete"
-    assert tagged_order == [ids[0]]
-    assert state.last_cursor == ids[0]
-
-    # Regression guard: has_emotion_backfill_work must still see work (the
-    # bug this run fixed would have wrongly reported "complete" here).
-    from brain.ingest.emotion_backfill import has_emotion_backfill_work
-
-    assert has_emotion_backfill_work(persona_dir, store=store) is True
-
-    # Resume: no more pausing -> finishes the rest, item 0 never re-tagged.
-    state2 = run_emotion_backfill(persona_dir, tagger_fn=_tagger, store=store, delay_s=0)
-    assert state2.status == "complete"
-    assert tagged_order == [ids[0], ids[1], ids[2]], "item 0 must not be re-tagged on resume"
-    store.close()
-
-
-def test_c8_emotion_backfill_zero_tagged_guard_is_not_confused_with_pause(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A systematic tagger failure (processed candidates, tagged none) sets
-    status='running' too, but for an UNRELATED reason -- supervisor.py's
-    _emotion_backfill_job must only report JobOutcome.PAUSED for a REAL
-    between-items pause, never for this case (else it would wrongly stop
-    the whole S55 sequence for a tagger bug, not a chat-idle event) -- see
-    test_supervisor.py::test_supervisor_tick_embeds_backlogged_memory for
-    the end-to-end proof this exact confusion broke."""
-    from brain.bridge import supervisor
-    from brain.bridge.central_cadence import JobOutcome
-    from brain.bridge.events import EventBus
-    from brain.bridge.provider import FakeProvider
-    from brain.bridge.supervisor import _build_gated_jobs
-    from brain.memory.store import Memory, MemoryStore
-
-    # The job builds its own classifier-tier provider: without this it starts the real claude CLI (and spends tokens) on a
-    # machine that has it, which is what the CI guard (tests/claude_spawn_guard.py) caught.
-    monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
-    persona_dir = _persona(tmp_path)
-    store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
-    m = Memory.create_new(content="a memory long enough to tag", memory_type="conversation", domain="us")
-    store.create(m)
-    store.close()
-
-    jobs = _build_gated_jobs(
-        persona_dir=persona_dir,
-        provider=FakeProvider(),
-        event_bus=EventBus(),
-        is_session_busy=None,
-        finalize_after_hours=24.0,
-        finalize_interval_s=None,
-        initiate_review_interval_s=None,
-        maintenance_interval_s=None,
-        self_model_interval_s=None,
-        compaction_interval_s=None,
-        calibration_interval_s=None,
-        interest_sweep_interval_s=None,
-        judge_selftune_interval_s=None,
-        clustering_interval_s=None,
-        intensity_drivers=lambda: None,
-        tick_stats={"closed_sessions": 0, "pruned_empty_sessions": 0},
-        between_items=lambda: False,  # never idle-paused
-    )
-    job = next(j for j in jobs if j.name == "emotion_backfill")
-    outcome = job.run()
-    # FakeProvider's .complete() output isn't valid tagger JSON -> the
-    # default tagger raises for every candidate -> zero tagged, status stays
-    # "running" -- but this is NOT a chat-idle pause.
-    assert outcome is JobOutcome.COMPLETED
 
 
 # ---------------------------------------------------------------------------

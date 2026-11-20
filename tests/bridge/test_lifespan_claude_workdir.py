@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -31,7 +30,8 @@ def test_lifespan_warns_when_no_neutral_dir(persona_dir: Path, tmp_path: Path, m
     kh = tmp_path / "kindled-home"  # the conftest fixture points KINDLED_HOME here
     kh.mkdir(exist_ok=True)
     (kh / ".claude").mkdir(exist_ok=True)  # second candidate also dirty
-    monkeypatch.setattr(sys, "platform", "win32")
+    # The seam, not sys.platform: faking the whole platform leaks into process-wide caches (#662).
+    monkeypatch.setattr(provider_mod, "_is_windows", lambda: True)
     provider_mod._claude_work_dir_reset_for_tests()
     with caplog.at_level(logging.WARNING):
         with TestClient(build_app(persona_dir=persona_dir, client_origin="tests")):

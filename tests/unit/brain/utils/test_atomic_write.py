@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import brain.utils.atomic_write as aw
+from brain import dev_constants
 from brain.utils.atomic_write import (
     fsync_dir,
     save_blob_once,
@@ -133,7 +134,7 @@ def test_g1e_transient_permission_errors_are_retried_and_a_persistent_one_is_rai
     state = _flaky_replace(monkeypatch, "persist.bin", 10_000)
     with pytest.raises(PermissionError):
         save_bytes_atomic(p2, b"new")
-    assert state["calls"] == aw._REPLACE_RETRIES
+    assert state["calls"] == dev_constants.FILE_RETRY_ATTEMPTS
     assert p2.read_bytes() == b"old"
     assert _temps(tmp_path) == []
 
@@ -407,3 +408,18 @@ def test_text_writer_keeps_its_newline_and_encoding_options(tmp_path):
     assert p.read_bytes() == b"a\nb\n"
     save_with_backup_text(p, "hé", keep_backups=False, encoding="utf-16")
     assert p.read_bytes().decode("utf-16") == "hé"
+
+
+def test_save_stream_atomic_fills_the_temp_and_publishes_it_and_a_failed_write_leaves_the_file(tmp_path):
+    p = tmp_path / "s.bin"
+    aw.save_stream_atomic(p, lambda fh: (fh.write(b"one "), fh.write(b"two")))
+    assert p.read_bytes() == b"one two"
+
+    def boom(fh):
+        fh.write(b"half")
+        raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        aw.save_stream_atomic(p, boom)
+    assert p.read_bytes() == b"one two"
+    assert [f.name for f in tmp_path.iterdir()] == ["s.bin"]

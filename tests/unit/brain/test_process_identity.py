@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -144,3 +145,139 @@ def test_windows_reader_reads_the_error_saved_by_ctypes_not_a_clobbered_one(monk
     monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": k32})(), raising=False)
     monkeypatch.setattr(ctypes, "get_last_error", lambda: 87, raising=False)
     assert pi._windows_token(4242) == pi.GONE
+
+
+@pytest.mark.no_base_failure(
+    reason="pins the stable answer that state_file.update relies on; a test for what must not change"
+)
+def test_a_failed_first_read_stays_the_answer_so_a_bridge_keeps_its_own_record(
+    tmp_path, monkeypatch
+):
+    """A bridge whose first read failed records no token (runner.py) and `state_file.update` then requires the record to equal
+    `own_token()`. If a later read could succeed, the two would differ and the bridge could never write its own record again."""
+    from brain.bridge import state_file
+
+    real_token_of = pi.token_of
+    monkeypatch.setattr(pi, "_OWN", None)
+    monkeypatch.setattr(pi, "token_of", lambda pid: pi.UNKNOWN)
+    recorded = pi.own_token()
+    assert recorded is None
+    state_file.write(
+        tmp_path,
+        state_file.BridgeState(
+            persona=tmp_path.name,
+            pid=os.getpid(),
+            port=1,
+            started_at="2026-11-05T00:00:00+00:00",
+            stopped_at=None,
+            shutdown_clean=False,
+            client_origin="tests",
+            pid_token=recorded,
+            identity="unavailable",
+        ),
+    )
+
+    monkeypatch.setattr(pi, "token_of", real_token_of)  # the failure has passed
+    assert pi.own_token() is None
+    assert state_file.update(tmp_path, lambda st: setattr(st, "shutdown_clean", True)) is True
+    assert state_file.read(tmp_path).shutdown_clean is True
+
+
+def test_a_test_that_fakes_the_platform_cannot_leave_later_tests_without_a_token():
+    """#662: this test fakes win32 and starts the app. When it faked the whole platform, as the first caller it cached a failed
+    read, so every later test in that worker saw no token. Runs in its own pytest so it really is the first caller."""
+    root = Path(__file__).resolve().parents[3]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "no:xdist",
+            "tests/bridge/test_lifespan_claude_workdir.py::test_lifespan_warns_when_no_neutral_dir",
+            "tests/unit/brain/test_data_home_isolation_488.py::test_a_live_supervisor_writing_its_own_persona_is_not_a_leak",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout[-2000:]
+
+
+def test_is_pid_number_holds_what_the_platform_can_hold_as_a_pid_and_nothing_beyond():
+    limit = (1 << 32) if sys.platform == "win32" else (1 << 31)  # a Windows id is an unsigned 32-bit value, a POSIX pid_t a signed C int
+    assert pi.is_pid_number(1)
+    assert pi.is_pid_number(limit - 1)
+    assert not pi.is_pid_number(0)
+    assert not pi.is_pid_number(-1)
+    assert not pi.is_pid_number(limit)
+    assert not pi.is_pid_number(99999999999999999999)
+
+
+def test_names_this_bridge_needs_the_pid_and_the_token_to_match():
+    """The own-record test of the bridge's watcher files and of the engine's progress record (moved here from shutdown_progress)."""
+    token = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456"
+    record = {"pid": 4242, "pid_token": token}
+    assert pi.names_this_bridge(record, 4242, token)
+    assert not pi.names_this_bridge(record, 4243, token)
+    assert not pi.names_this_bridge(record, 4242, "linux:other:4242:9")
+    assert not pi.names_this_bridge(record, 4242, None)  # no token to match: never mine
+    assert not pi.names_this_bridge({"pid": 4242, "pid_token": None}, 4242, None)
+    assert not pi.names_this_bridge(None, 4242, token)
+    assert not pi.names_this_bridge(["pid"], 4242, token)  # type: ignore[arg-type]
+    assert not pi.names_this_bridge(record, None, token)
+
+
+_A_TOKEN = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456"
+
+
+def test_is_own_identity_is_true_for_this_pid_and_this_token(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: _A_TOKEN)
+    assert pi.is_own_identity(os.getpid(), _A_TOKEN)
+
+
+def test_is_own_identity_counts_two_missing_tokens_as_equal(monkeypatch):
+    """A machine that cannot read its own token records none: that record still names this process (HN2)."""
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    assert pi.is_own_identity(os.getpid(), None)
+
+
+def test_is_own_identity_is_false_when_only_one_token_is_missing(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: _A_TOKEN)
+    assert not pi.is_own_identity(os.getpid(), None)
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    assert not pi.is_own_identity(os.getpid(), _A_TOKEN)
+
+
+def test_is_own_identity_is_false_for_another_token(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: _A_TOKEN)
+    assert not pi.is_own_identity(os.getpid(), "linux:other:4242:9")
+
+
+def test_is_own_identity_is_false_for_another_pid_or_none(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    assert not pi.is_own_identity(os.getpid() + 1, None)
+    assert not pi.is_own_identity(None, None)
+
+
+def test_is_own_identity_does_not_take_a_bool_for_a_pid(monkeypatch):
+    monkeypatch.setattr(pi, "own_token", lambda: None)
+    monkeypatch.setattr(pi, "own_pid", lambda: 1)  # True == 1: only the bool check keeps it out
+    assert not pi.is_own_identity(True, None)
+    assert pi.is_own_identity(1, None)
+
+
+def test_names_this_bridge_lives_only_in_process_identity():
+    from brain.bridge import shutdown_progress
+
+    assert not hasattr(shutdown_progress, "names_this_bridge")

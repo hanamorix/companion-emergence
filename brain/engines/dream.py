@@ -10,16 +10,21 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from brain.bridge.provider import LLMProvider
-from brain.emotion.aggregate import aggregate_state
+from brain.emotion import engine as emotion_engine
+from brain.emotion.engine_utils import feelings_of
+from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
 from brain.health.json_io import Recovery, append_jsonl, iter_jsonl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.soul.store import SoulStore
 from brain.utils.memory import list_conversation_memories
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +94,8 @@ class DreamEngine:
         seed_id: str | None = None,
         dry_run: bool = False,
     ) -> DreamResult:
-        seed = self._select_seed(seed_id=seed_id, lookback_hours=self.lookback_hours)
+        eng = self._live_engine()
+        seed = self._select_seed(seed_id=seed_id, lookback_hours=self.lookback_hours, eng=eng)
         neighbours = self._spread_activate(
             seed,
             depth=self.depth,
@@ -128,10 +134,20 @@ class DreamEngine:
             raw_text = self.provider.generate(user_prompt, system=system_prompt)
             dream_text = raw_text if raw_text.startswith("DREAM:") else f"DREAM: {raw_text}"
 
-            dream_memory = self._write_dream_memory(seed, neighbours, dream_text)
+            dream_memory = self._write_dream_memory(seed, neighbours, dream_text, eng=eng)
             edges = self._strengthen_edges(seed, neighbours, self.strengthen_delta)
             self._log(seed, neighbours, dream_memory)
             self._emit_initiate_candidate(seed, neighbours, dream_memory)
+
+            # The dream was dreamed, so the memories in its prompt were in front of her: one recall each (#587).
+            # A dry run, a denied slot or a failed call returns or raises before here and ticks nothing. After
+            # the writes above and fail-soft, so a store error here can't cost the dream. An auto-picked seed
+            # comes from list reads, which never ticked; a seed asked for by id did.
+            try:
+                for mem in ([seed] if seed_id is not None else []) + [m for m, _ in neighbours]:
+                    self.store.get(mem.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("dream recall tick failed for seed %s: %s", seed.id, exc)
 
             return DreamResult(
                 seed=seed,
@@ -143,9 +159,18 @@ class DreamEngine:
                 strengthened_edges=edges,
             )
 
-    def _select_seed(self, *, seed_id: str | None, lookback_hours: int) -> Memory:
+    def _live_engine(self) -> EmotionEngine | None:
+        """The persona's emotion engine when its switch is on; None when off, unknown, or there is no persona_dir."""
+        if self.persona_dir is None:
+            return None
+        eng = emotion_engine.engine_for(self.persona_dir)
+        return eng if eng.is_live() else None
+
+    def _select_seed(
+        self, *, seed_id: str | None, lookback_hours: int, eng: EmotionEngine | None
+    ) -> Memory:
         if seed_id is not None:
-            mem = self.store.get(seed_id)
+            mem = self.store.get(seed_id, bump=False)  # ticked by run_cycle once the dream is dreamed (#587)
             if mem is None:
                 raise NoSeedAvailable(f"Seed id {seed_id!r} not found in store.")
             return mem
@@ -168,8 +193,20 @@ class DreamEngine:
             )
 
         # Mood from conversation residue only (not grief breadcrumbs) so a
-        # breadcrumb cannot self-set the mood that retrieves it.
-        mood = aggregate_state(convo)
+        # breadcrumb cannot self-set the mood that retrieves it. Live, the mood is
+        # the engine's short averages: every counted source, and the engine does not
+        # count a grief_event either. An empty read during a rebuild is accepted. With the engine not reading (no
+        # persona, not switched over, or the state unreadable) the mood is empty, the same as that empty read: the old
+        # aggregate of conversation memories went in B1 PR 7.
+        if eng is not None:
+            mood = EmotionalState(emotions={name: r.short for name, r in eng.read().items()})
+        else:
+            # Accepted edge (ThinkerOfThoughts, #742): this off path is reached by a start that skipped the switch-over,
+            # or by a saved state that cannot be read, which can last the whole bridge session. An empty mood pools every
+            # candidate, as it does on the live path during a rebuild, and grief breadcrumbs are seed candidates by
+            # design, so a grief breadcrumb can win the seed here: a dream seeded from an important memory, nothing lost.
+            # No grief_event filter on either path.
+            mood = EmotionalState()
         crystallizations = self.soul_store.list_active() if self.soul_store else []
         recent = self._recent_seed_ids(self.refractory_window)
 
@@ -178,6 +215,7 @@ class DreamEngine:
             mood,
             crystallizations,
             recent_seed_ids=recent,
+            eng=eng,
             mood_floor=self.mood_floor,
             min_congruent=self.min_congruent,
             w_identity=self.w_identity,
@@ -205,7 +243,7 @@ class DreamEngine:
         activation.pop(seed.id, None)
         results: list[tuple[Memory, float]] = []
         for mid, act in sorted(activation.items(), key=lambda p: p[1], reverse=True):
-            mem = self.store.get(mid)
+            mem = self.store.get(mid, bump=False)  # ticked by run_cycle once the dream is dreamed (#587)
             if mem is not None:
                 results.append((mem, act))
                 if len(results) >= limit:
@@ -243,16 +281,13 @@ class DreamEngine:
         seed: Memory,
         neighbours: list[tuple[Memory, float]],
         dream_text: str,
+        *,
+        eng: EmotionEngine | None,
     ) -> Memory:
-        # Sum per-emotion across seed + neighbours. Values are intentionally
-        # NOT clamped here — a vivid "love"-saturated dream may legitimately
-        # show love=80 across 8 activated memories. Downstream consumers that
-        # need a bounded 0..10 range (e.g. EmotionalState.set) clamp on
-        # ingest, not here.
-        aggregated_emotions: dict[str, float] = dict(seed.emotions)
-        for mem, _ in neighbours:
-            for k, v in mem.emotions.items():
-                aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
+        if eng is not None:
+            aggregated_emotions = self._faded_means(seed, neighbours, eng)
+        else:
+            aggregated_emotions = self._stored_sums(seed, neighbours)
 
         dream = Memory.create_new(
             content=dream_text,
@@ -269,6 +304,37 @@ class DreamEngine:
 
         route_write(self.store, dream, source="dream")
         return dream
+
+    def _stored_sums(self, seed: Memory, neighbours: list[tuple[Memory, float]]) -> dict[str, float]:
+        # Sum per-emotion across seed + neighbours. Each memory's values are held to 0-10
+        # by the one read before they are summed (love 18 and love 2 give 10 + 2 = 12, not
+        # 20); the SUM is not clamped, so a vivid "love"-saturated dream may legitimately
+        # show love=80 across 8 activated memories. Downstream consumers that need a
+        # bounded 0..10 range (e.g. EmotionalState.set) clamp on ingest, not here.
+        # Reached only when the engine is not live (`run_cycle` got None from `_live_engine`), where the engine's own read is
+        # the pure read, so this asks for the pure read (None) rather than looking the engine up again.
+        aggregated_emotions: dict[str, float] = dict(feelings_of(seed, None).feelings)  # a copy: the read's map is shared
+        for mem, _ in neighbours:
+            for k, v in feelings_of(mem, None).feelings.items():
+                aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
+        return aggregated_emotions
+
+    @staticmethod
+    def _faded_means(
+        seed: Memory, neighbours: list[tuple[Memory, float]], eng: EmotionEngine
+    ) -> dict[str, float]:
+        """Per emotion, the mean of the engine's read values across the seed and the neighbours that carry it.
+
+        The read fades each memory's values and holds each to 0-10 (old rows can hold values below 0 or over 10), so the
+        mean stays within 0-10 too. A value held to 0 is kept, not dropped.
+        """
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for mem in [seed, *(m for m, _ in neighbours)]:
+            for name, value in eng.memory_feelings(mem).feelings.items():
+                totals[name] = totals.get(name, 0.0) + value
+                counts[name] = counts.get(name, 0) + 1
+        return {name: total / counts[name] for name, total in totals.items()}
 
     def _strengthen_edges(
         self,
@@ -339,7 +405,7 @@ class DreamEngine:
                 source="dream",
                 source_id=dream_memory.id,
                 emotional_snapshot=EmotionalSnapshot(
-                    vector=dict(dream_memory.emotions),
+                    vector=dict(feelings_of(dream_memory, None).feelings),  # a row made this instant: the pure read
                     rolling_baseline_mean=0.0,
                     rolling_baseline_stdev=0.0,
                     current_resonance=0.0,

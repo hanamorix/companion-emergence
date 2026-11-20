@@ -188,12 +188,14 @@ def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
     # about 10 ms is caught, which the base matcher (seconds) is.
     base, doubled_list = _warm_pair((known, text), (known2, text))
     assert doubled_list < 1.5 * base + 0.005, "doubling the list"
-    # The message grows 4x: linear is 4x, a quadratic matcher 16x. Measured linear ratios run 3.1x-5.8x (about 24000
-    # regex match objects: cache and allocation costs make the larger message a little worse than linear), so the bound
-    # sits at 10x. A tight bound on a doubling (3x against 2x linear and 4x quadratic) left no room for noise.
-    _, text4 = _large(shape, 399, 24000)
-    base, grown = _warm_pair((known, text), (known, text4))
-    assert grown < 10 * base, "growing the paste 4x"
+    # The message grows 8x: linear is 8x, a quadratic matcher 64x. Load slows the larger run more than the smaller one, so
+    # the gap has to be wide: at 4x growth a busy macOS runner measured 14.5x for the linear matcher (#780), past a 10x
+    # bound, while a quadratic one under load can come in near 10x. Measured 2026-11-20 on an 11-core Mac: linear
+    # 7.9x-8.5x idle and up to 24x with every core busy; a quadratic matcher at least 60x idle and 113x under load. The
+    # bound sits at 40x, between the two.
+    _, text8 = _large(shape, 399, 48000)
+    base, grown = _warm_pair((known, text), (known, text8))
+    assert grown < 40 * base, "growing the paste 8x"
 
 
 # --------------------------------------------------------------------------

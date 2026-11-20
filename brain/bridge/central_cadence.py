@@ -8,9 +8,10 @@ background job whether it runs now. A gated job runs only when BOTH:
   reached wait for the next lull), and
 * the job is due: an interval job's persisted ``next_at`` has passed
   (S23/S34), or a no-interval job has work (pass 2, session snapshot/prune,
-  emotion backfill, embedding backfill: S53/S66; the extraction backfill,
+  embedding backfill: S53/S66; the extraction backfill,
   #523: an armed plan with an open target; the research recovery, #591: lost
-  research memories still to be recovered), or a predicate job's own
+  research memories still to be recovered; the emotion recovery rebuild,
+  #584: a live persona's engine state is missing or unreadable), or a predicate job's own
   condition holds (deploy recalibration: the stored floor is stale, S70/S73;
   self-model articulation: its own cadence module, S29).
 
@@ -78,12 +79,13 @@ logger = logging.getLogger(__name__)
 # the re-measure and the RAM figure so their samples are saved the same lull), then the recall
 # diagnostics flush (S189: records buffered while the log's lock was held), then the extraction
 # backfill (#523: one chunk per pass, after embedding backfill so the vectors its dedup reads are
-# current). The research recovery (#591: one interest's lost research memories per pass) runs right after the emotion
-# backfill. Names are the job table's keys and the log's `job=` values.
+# current). The research recovery (#591: one interest's lost research memories per pass) runs right after the session
+# snapshot/prune. The emotion recovery rebuild (Engine 6, #584: a live persona's missing or unreadable engine state rebuilt from its rows)
+# runs first, before any job that reads the engine. Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
+    "emotion_recovery_rebuild",
     "pass2",
     "session_snapshot_prune",
-    "emotion_backfill",
     "research_recovery",
     "embedding_backfill",
     "cosine_floor_bootstrap",

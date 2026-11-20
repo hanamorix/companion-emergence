@@ -376,6 +376,7 @@ _R2_VIOLATING = {
     "unprefixed_form_as_a_parameter": "def f(daily_budget_default=3.5):\n    return daily_budget_default\n",
     "unprefixed_form_in_a_class": "class C:\n    ROW_LIMIT_CAP = 9\n",
     "unprefixed_form_of_the_smallest_group": "GAUGE_WIDTH_LIMIT = 9.5\n",
+    "drifted_copy_named_after_a_tunable_key": "UPLOAD_CAP = 1234\n",  # #601: area.upload_cap, value drifted
 }
 _R2_CONFORMING = {
     "owner_file_of_a_dev_constant": ("WIDGET_TIMEOUT_S: float = 45.0\n", "brain/dev_constants.py"),
@@ -769,7 +770,14 @@ def test_ratchet_counts_findings_by_identity_without_line_numbers() -> None:
 
 # Violations that exist today: (rule, file, site, settings, reason). It is meant to shrink (see the module docstring).
 _IMAGE_TYPES = ("tunables:files.image_types",)
-_UPLOAD_CAPS = ("tunables:files.image_max_bytes", "tunables:files.pdf_max_bytes", "tunables:files.upload_max_bytes")
+# files.read_max_bytes joined these in #590: the text cap was sized to match the upload cap (equal value, so the scan
+# names it too; the ChatPanel literal below is still a copy of the upload cap, not of the text cap).
+_UPLOAD_CAPS = (
+    "tunables:files.image_max_bytes",
+    "tunables:files.pdf_max_bytes",
+    "tunables:files.read_max_bytes",
+    "tunables:files.upload_max_bytes",
+)
 ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
     # The four kinds of image written out beside files.image_types. Different purpose, decided from the code in #531: the
     # setting says which images the read_file tool opens and can only narrow the set (the byte sniff recognises exactly these
@@ -787,7 +795,7 @@ ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
     # The app mirrors the upload cap.
     ("APP-R3", "app/src/components/ChatPanel.tsx", "number 20971520", _UPLOAD_CAPS,
      "real copy of the 20 MiB upload cap (MAX_BYTES, applied to every staged file) that cannot read the setting: the "
-     "TypeScript cannot import the Python tunable; see the draft issue in the #531 records"),
+     "TypeScript cannot import the Python tunable; tracked in #560"),
 )
 ALLOW_SIZE = 4
 

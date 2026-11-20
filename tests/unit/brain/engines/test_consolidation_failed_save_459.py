@@ -326,10 +326,10 @@ def test_a_pass1_probe_environment_failure_requeues_and_nothing_is_lost(persona,
     _enqueue(queue, A, B, C)
     real = cons._has_exact_existing
 
-    def probe(store_, content, norm):
+    def probe(store_, content, norm, *, memory_types):
         if content == B:
             raise sqlite3.OperationalError("database is locked")
-        return real(store_, content, norm)
+        return real(store_, content, norm, memory_types=memory_types)
 
     monkeypatch.setattr(cons, "_has_exact_existing", probe)
     _run(tmp, store, heb, Clf())
@@ -347,10 +347,10 @@ def test_a_pass1_probe_item_failure_is_quarantined_and_the_others_continue(perso
     _enqueue(queue, A, B, C)
     real = cons._has_exact_existing
 
-    def probe(store_, content, norm):
+    def probe(store_, content, norm, *, memory_types):
         if content == B:
             raise sqlite3.IntegrityError("constraint")
-        return real(store_, content, norm)
+        return real(store_, content, norm, memory_types=memory_types)
 
     monkeypatch.setattr(cons, "_has_exact_existing", probe)
     _run(tmp, store, heb, Clf())
@@ -828,14 +828,19 @@ def test_a_deferred_real_haiku_classifier_does_not_promote_unclassified(persona,
     _enqueue(queue, A, B, C)
     provider = _DeferringProvider(refuse="bravo")
 
+    no_tagger = lambda _m: {}  # noqa: E731 — the provider's calls counted below are the judge's only
     with caplog.at_level(logging.INFO):
-        result = run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+        result = run_consolidation(
+            store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser, emotion_tagger=no_tagger
+        )
 
     assert _contents(store) == [A]
     assert sorted(_label(e) for e in _unsettled(tmp)) == sorted([B, C])
     assert result.failed == 0
     provider.refuse = "nothing-matches-this"
-    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+    run_consolidation(
+        store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser, emotion_tagger=no_tagger
+    )
     assert _contents(store) == sorted([A, B, C])
     assert len(provider.calls) == 4
 

@@ -39,8 +39,8 @@ def test_transform_happy_path_produces_memory() -> None:
     assert mem is not None
     assert mem.id == "m1"
     assert mem.content == "hello"
-    assert mem.emotions == {"love": 9.0}
-    assert mem.score == 9.0
+    assert mem._stored_emotions == {"love": 9.0}
+    assert mem._stored_score == 9.0
 
 
 def test_transform_preserves_tz_aware_created_at() -> None:
@@ -68,7 +68,7 @@ def test_transform_uses_emotion_score_as_score() -> None:
     """OG emotion_score → new score (verbatim)."""
     mem, _ = transform_memory(_og(emotions={"love": 8.0, "tenderness": 6.0}, emotion_score=14.0))
     assert mem is not None
-    assert mem.score == 14.0
+    assert mem._stored_score == 14.0
 
 
 def test_transform_defaults_missing_optional_fields() -> None:
@@ -89,8 +89,8 @@ def test_transform_defaults_missing_optional_fields() -> None:
     assert mem.tags == []
     assert mem.importance == 4.0
     assert mem.active is True
-    assert mem.emotions == {}
-    assert mem.score == 0.0
+    assert mem._stored_emotions == {}
+    assert mem._stored_score == 0.0
 
 
 def test_transform_absorbs_og_only_fields_into_metadata() -> None:
@@ -175,7 +175,7 @@ def test_transform_score_mismatch_prefers_og_value() -> None:
     """If emotion_score disagrees with sum(emotions.values()), use OG's value."""
     mem, _ = transform_memory(_og(emotions={"love": 8.0, "tenderness": 6.0}, emotion_score=99.0))
     assert mem is not None
-    assert mem.score == 99.0
+    assert mem._stored_score == 99.0
 
 
 def test_skipped_memory_dataclass_shape() -> None:
@@ -187,7 +187,7 @@ def test_skipped_memory_dataclass_shape() -> None:
     assert s.raw_snippet == "..."
 
 
-def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None:
+def test_transform_non_numeric_importance_falls_back_to_the_emotion_bucket() -> None:
     """Non-numeric importance (e.g. 'high') must not crash float() — it is
     treated as malformed/missing and backfilled from emotions (P3 retention
     rework, Change 1: `_og()`'s default emotions={"love": 9.0} -> emotion_score
@@ -198,7 +198,7 @@ def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None
     assert mem.importance == 3.0
 
 
-def test_transform_list_importance_degrades_to_emotion_backfill() -> None:
+def test_transform_list_importance_falls_back_to_the_emotion_bucket() -> None:
     """A list-valued importance field degrades gracefully (no crash) and is
     backfilled from emotions the same way a missing importance is, not a
     hard 0.0."""
@@ -232,4 +232,4 @@ def test_transform_bool_emotion_score_falls_back_to_sum() -> None:
     """bool emotion_score is rejected by the isinstance(v, bool) guard; falls back to sum."""
     mem, _ = transform_memory(_og(emotions={"love": 5.0}, emotion_score=True))
     assert mem is not None
-    assert mem.score == 5.0  # sum of emotions, not float(True)=1.0
+    assert mem._stored_score == 5.0  # sum of emotions, not float(True)=1.0

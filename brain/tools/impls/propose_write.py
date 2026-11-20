@@ -51,9 +51,10 @@ def propose_write(path: str, content: str | None = None, *, op: str,
                   making_id: str | None = None, persona_dir: Path, **_) -> dict:
     # making_id source (Maker combined-build integration; Task 16b of the maker plan)
     if making_id and content is None:
+        from brain.works.location import works_db_path
         from brain.works.storage import read_markdown
         from brain.works.store import WorksStore
-        store = WorksStore(persona_dir / "works.db")
+        store = WorksStore(works_db_path(persona_dir))
         try:
             w = store.get(making_id)
         finally:

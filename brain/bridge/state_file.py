@@ -123,7 +123,7 @@ def update(persona_dir: Path, fn: Callable[[BridgeState], None]) -> bool:
 
     with _update_lock:
         cur = read(persona_dir)
-        if cur is None or cur.pid != os.getpid() or cur.pid_token != process_identity.own_token():
+        if cur is None or not process_identity.is_own_identity(cur.pid, cur.pid_token):
             return False
         if _update_between is not None:
             _update_between()
@@ -190,7 +190,11 @@ def _windows_pid_is_alive(pid: int) -> bool:
 
 def pid_is_alive(pid: int) -> bool:
     """Return True if the given pid is a live process owned by this user."""
-    if pid <= 0:
+    from brain import process_identity
+
+    # #755: a pid outside the platform's range (a damaged or hand-edited file) names no process, and the OS calls
+    # below refuse it with OverflowError (os.kill) or ctypes.ArgumentError (OpenProcess), which no caller expects.
+    if not process_identity.is_pid_number(pid):
         return False
     if os.name == "nt":
         return _windows_pid_is_alive(pid)

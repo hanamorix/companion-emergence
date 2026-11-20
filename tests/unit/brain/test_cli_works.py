@@ -24,7 +24,7 @@ def _seed(persona_dir: Path) -> str:
         summary="Sample story.",
     )
     write_markdown(persona_dir, w, content="A small story body.")
-    WorksStore(persona_dir / "data" / "works.db").insert(w, content="A small story body.")
+    WorksStore(persona_dir / "works.db").insert(w, content="A small story body.")
     return w.id
 
 

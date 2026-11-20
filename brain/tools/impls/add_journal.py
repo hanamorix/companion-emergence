@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.behavioral.log import append_behavioral_event
+from brain.emotion.engine_utils import memory_feelings
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 
@@ -64,7 +65,8 @@ def add_journal(
             timestamp=datetime.now(UTC),
             source="brain_authored",
             reflex_arc_name=None,
-            emotional_state=dict(memory.emotions),
+            # The journal row was created this instant (nothing to fade): the pure read, held to 0-10 under canonical names.
+            emotional_state=dict(memory_feelings(memory, None, None, None).feelings),
         )
     except (OSError, ValueError) as exc:
         logger.warning("add_journal: behavioral_log append failed: %s", exc)

@@ -278,18 +278,18 @@ def test_a_non_object_record_is_skipped_and_reported(tmp_path, monkeypatch, capl
 
 
 def test_a_transient_permission_error_is_not_a_warning(tmp_path, monkeypatch, caplog):
-    """Windows: a lock-free read can meet PermissionError while replace() runs; json_io retries it before it reports."""
+    """Windows: a lock-free read can meet PermissionError while replace() runs; file_ops retries it before it reports."""
     import builtins
     import logging
 
     from brain.files import pending
-    from brain.health import json_io
+    from brain.utils import file_ops
 
     _fresh_throttle(monkeypatch)
     now = datetime(2026, 10, 16, tzinfo=UTC)
     rid = pending.create(tmp_path, op="create", resolved_path=str(tmp_path / "a.txt"), content="a", now=now)
-    monkeypatch.setattr(json_io, "_IS_WINDOWS", True)
-    monkeypatch.setattr(json_io.time, "sleep", lambda s: None)
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", True)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda s: None)
     calls = {"n": 0}
     real_open = builtins.open
 
@@ -299,7 +299,7 @@ def test_a_transient_permission_error_is_not_a_warning(tmp_path, monkeypatch, ca
             raise PermissionError("in use")
         return real_open(file, *a, **k)
 
-    monkeypatch.setattr(json_io, "open", busy_once, raising=False)  # the module's own `open`, not the builtin
+    monkeypatch.setattr(file_ops, "open", busy_once, raising=False)  # the module's own `open`, not the builtin
     with caplog.at_level(logging.WARNING):
         assert pending.get(tmp_path, rid)["id"] == rid
     assert calls["n"] == 1 and caplog.records == []
@@ -312,10 +312,10 @@ def test_a_permission_error_off_windows_is_a_warning(tmp_path, monkeypatch, capl
     import logging
 
     from brain.files import pending
-    from brain.health import json_io
+    from brain.utils import file_ops
 
     _fresh_throttle(monkeypatch)
-    monkeypatch.setattr(json_io, "_IS_WINDOWS", False)
+    monkeypatch.setattr(file_ops, "_IS_WINDOWS", False)
     real_open = builtins.open
 
     def denied(file, *a, **k):
@@ -323,7 +323,7 @@ def test_a_permission_error_off_windows_is_a_warning(tmp_path, monkeypatch, capl
             raise PermissionError("denied")
         return real_open(file, *a, **k)
 
-    monkeypatch.setattr(json_io, "open", denied, raising=False)
+    monkeypatch.setattr(file_ops, "open", denied, raising=False)
     with caplog.at_level(logging.WARNING):
         assert pending.get(tmp_path, "rid-x") is None
     assert any("rid-x" in r.getMessage() for r in caplog.records)

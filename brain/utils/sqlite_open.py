@@ -45,8 +45,14 @@ class OpenProfile:
     wal_fallback: bool = True
 
 
-DEFAULT_PROFILE = OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S)
-STRICT_WAL_PROFILE = OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, wal_fallback=False)
+# Built when a store opens, not at import, so the dev constant is read on every open (#528), as
+# `memories_profile()` already does for MemoryStore.
+def default_profile() -> OpenProfile:
+    return OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S)
+
+
+def strict_wal_profile() -> OpenProfile:
+    return OpenProfile(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S, wal_fallback=False)
 
 
 @contextmanager
@@ -89,7 +95,7 @@ def open_store_connection(
     *,
     caller: str,
     integrity_check: bool,
-    profile: OpenProfile = DEFAULT_PROFILE,
+    profile: OpenProfile | None = None,
     setup: Callable[[sqlite3.Connection], None] | None = None,
 ) -> sqlite3.Connection:
     """Open `db_path` and return the connection; on any failure close it and re-raise.
@@ -97,7 +103,10 @@ def open_store_connection(
     `caller` names the store in the integrity-retry log line. `integrity_check` has
     no default on purpose (see the module docstring). `setup(conn)` is the store's own
     tail (row factory, schema, migrations, commits) and runs last, inside the guard.
+    No `profile` means `default_profile()`, built now.
     """
+    if profile is None:
+        profile = default_profile()
     conn = sqlite3.connect(str(db_path), timeout=profile.busy_timeout_s)
     with close_on_error(conn):
         if integrity_check:

@@ -27,6 +27,7 @@ from brain.ingest.buffer import (
 from brain.ingest.pipeline import extract_session_snapshot
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.utils import file_ops
 from brain.utils.file_lock import file_lock
 
 TS = "2026-06-15T10:00:00+00:00"
@@ -70,7 +71,7 @@ def test_a_transient_permission_error_on_the_replace_is_retried(tmp_path, monkey
         return real(src, dst)
 
     monkeypatch.setattr(heal.os, "replace", flaky)
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     if which == "cursor":
         write_cursor(tmp_path, "s1", TS)
         assert read_cursor(tmp_path, "s1") == TS
@@ -88,7 +89,7 @@ def test_a_persistent_failure_raises_and_leaves_no_temp_behind(tmp_path, monkeyp
         raise PermissionError(13, "denied")
 
     monkeypatch.setattr(heal.os, "replace", always)
-    monkeypatch.setattr(heal.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
     with pytest.raises(PermissionError):
         if which == "cursor":
             write_cursor(tmp_path, "s1", TS)

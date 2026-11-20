@@ -18,14 +18,17 @@ from pathlib import Path
 from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
+from brain.emotion import engine as emotion_engine
+from brain.emotion import engine_files, vocabulary_swap
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
-from brain.engines.heartbeat import HeartbeatEngine
+from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
-from brain.health.json_io import Recovery, append_jsonl, iter_jsonl, read_jsonl
+from brain.health.json_io import JsonFileError, Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -165,6 +168,64 @@ def _supervisor_status_handler(args: argparse.Namespace) -> int:
     return daemon.cmd_status(args)
 
 
+def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor rebuild`: the one-shot rebuild as its own process (S107, HS1 of #633). Internal: the start spawns it.
+
+    In order: (1) the first progress record ("rebuilding") before anything slow, removed in a `finally`, so a waiting start and the
+    window show the child at once; (2) the runtime log, as `cmd_run` sets it up (its bridge-stack import comes after the record);
+    (3) no store and no vocabulary are opened here: `ensure_engine_ready` opens its own and the rebuild reads half-lives from the
+    persona's vocabulary file; (4) `ensure_engine_ready`, which is the x10 step and the first rebuild, or a switched persona's
+    roll-forward check and rebuild, which waits for an engine lock another process holds until it comes (no stop check, no
+    limit: S101). Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
+    success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
+    Each way the switch-over does not complete (the exit-1 failures and the skips that exit 0) also leaves the rebuild notice
+    (`engine_files.settle_rebuild_notice`) while the persona is not switched over, so the window can say so (Hana's point 5 on #633);
+    a failed roll-forward of a switched persona leaves none. When the ready step returns, the handler itself clears the notice
+    (`settle_rebuild_notice` with no reason, which deletes it only once the persona is switched over), so a hand run that completes
+    clears it as the start's child does; a failure the step raises leaves it. A delete that fails is logged and leaves the notice
+    until the next start's or command's need check clears it; running the handler again is safe (the call is idempotent).
+
+    A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
+    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing. A bridge recorded running
+    (`state_file.is_running`) is refused next, still before the first record and any engine call: one plain line on stderr, nothing
+    written, exit 2 (a hand run only; the product never spawns this process beside a bridge).
+    """
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"persona directory not found: {persona_dir}", file=sys.stderr)
+        return 1
+    # Hana's 11-18 review of #633, point 3 (Planning's HRV answer): a hand run beside a live bridge would read the bridge's
+    # committed-but-unapplied rows as a roll-forward and rebuild under it. The product spawns this process from `cmd_start`,
+    # `cmd_run` and `run_rebuild_step` only when no bridge runs (each holds the start lock, which a live bridge holds too), so
+    # only a hand run reaches this refusal. The start lock cannot be the check here: the parent holds it while its child runs.
+    # Accepted edge (P4, R2): `is_running` answers False for a bridge whose identity cannot be read and for a bridge that is
+    # still starting (the runner takes the lock before it writes the state file), so a hand run in either case is not refused and
+    # runs beside the bridge as it did before, with edge (i) of `engine.EmotionEngine._roll_forward`'s losses. It needs a hand run
+    # and one of those two states at once.
+    if state_file.is_running(persona_dir):
+        print("A bridge is running for this persona, so the rebuild was not run.", file=sys.stderr)
+        return 2
+    progress = engine_files.EngineProgress(persona_dir, "rebuilding")
+    progress.write()
+    try:
+        from brain.bridge import runner
+
+        runner._setup_runtime_logging(persona_dir)
+        # The one-time vocabulary swap (#648) comes first, so this rebuild already uses the swapped half-lives (a start has no other
+        # step before the rebuild). It logs and never raises; the marker makes a second run a no-op. If the swap fails here, this
+        # first rebuild runs on the old half-lives and is not redone when a later swap succeeds: the #648 failure rule is "warn,
+        # start-up continues, retry at the next start".
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
+        emotion_engine.ensure_engine_ready(persona_dir)
+        # Hana's 11-18b point 4: the ready step returned (a completed switch-over, no rebuild needed, or a skip or logged failure
+        # that returns), so the notice an earlier attempt left is cleared here, whichever process completed the switch-over. The
+        # writer deletes it only once the persona is switched over, so on any other ending this call changes nothing; it never raises.
+        engine_files.settle_rebuild_notice(persona_dir, None)
+    finally:
+        progress.remove()
+    return 0
+
+
 def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path) -> None:
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
@@ -292,7 +353,9 @@ def _service_status_field(status: object, *names: str, default: object = None) -
 
 def _service_print_plist_handler(args: argparse.Namespace) -> int:
     """Print the macOS LaunchAgent plist for a persona without installing it."""
-    if sys.platform != "darwin":
+    from brain import service as _service
+
+    if _service.current_platform() != "darwin":
         print(
             "service print-plist: macOS launchd plist output is only supported on macOS",
             file=sys.stderr,
@@ -499,6 +562,7 @@ def _dedup_sweep_handler(args: argparse.Namespace) -> int:
     Idempotent — safe to re-run.
     """
     from brain.engines.dedup_sweep import run_dedup_sweep
+    from brain.forgetting import SoulExemptionsUnavailableError
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
@@ -508,6 +572,10 @@ def _dedup_sweep_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
         report = run_dedup_sweep(store, persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        # The sweep fails closed (#392): it touched nothing. The loader has logged each failed read.
+        print(f"dedup-sweep stopped, nothing was deleted: {exc}.", file=sys.stderr)
+        return 1
     finally:
         store.close()
 
@@ -615,6 +683,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         return rc
     try:
         memory = store.get(args.memory_id)
+        engine = store.emotion_engine()
     finally:
         store.close()
 
@@ -622,6 +691,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         print(f"unknown memory id: {args.memory_id}", file=sys.stderr)
         return 1
 
+    felt = feelings_of(memory, engine)
     print(f"id: {memory.id}")
     print(f"type: {memory.memory_type}")
     print(f"domain: {memory.domain}")
@@ -630,11 +700,10 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         f"last_accessed_at: {memory.last_accessed_at.isoformat() if memory.last_accessed_at else '(never)'}"
     )
     print(f"importance: {memory.importance:.2f}")
-    print(f"score: {memory.score:.2f}")
+    print(f"score: {felt.score:.2f}")
     print(f"active: {'yes' if memory.active else 'no'}")
-    print(f"protected: {'yes' if memory.protected else 'no'}")
     print(f"tags: {', '.join(memory.tags) if memory.tags else '(none)'}")
-    print(f"emotions: {_format_mapping(memory.emotions)}")
+    print(f"emotions: {_format_mapping(felt.feelings)}")
     print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")
     print("content:")
     print(memory.content)
@@ -937,6 +1006,9 @@ def _dream_handler(args: argparse.Namespace) -> int:
         from brain.soul.store import SoulStore
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
         try:
@@ -981,6 +1053,58 @@ def _dream_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drain_emotion_engine(persona_dir: Path) -> None:
+    """Run the emotion engine's drain and day close now (spec 3.1 S4); it catches and logs its own failures and never raises.
+
+    Called by the commands that run in their own process (`nell heartbeat`, `nell chat --no-bridge`) after the work that
+    queues or writes emotions, since no bridge supervisor is running to do it. The module is imported as `emotion_engine`
+    (a local named `engine` exists in several handlers here), and a patch of the module reaches this call.
+    """
+    from datetime import UTC, datetime
+
+    emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+
+
+def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
+    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
+
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run first runs the one-time
+    vocabulary swap (#648), then no longer rebuilds in-process: it registers the command (`engine_files.register_command_run`, so a
+    start that needs a rebuild can end it) and runs the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a
+    rebuild needed it takes the start lock, ends every other running command and runs the rebuild as its own process
+    (`nell supervisor rebuild`, which runs the swap again before its rebuild; the marker makes that a no-op), then goes on. Its code
+    is returned: 1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was
+    run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
+    plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
+    on a switched persona it goes on as today.
+    """
+    if not dry_run:
+        # The one-time vocabulary swap for contentment, calm, peace and groundedness (#648) comes first, so a rebuild the step runs
+        # uses the swapped half-lives. It logs and never raises; a dry run (below) writes nothing and never calls it.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
+        from brain.bridge import daemon
+
+        engine_files.register_command_run(persona_dir)  # through the module: the tests' fixture replaces the name
+        return daemon.run_rebuild_step(persona_dir)
+    if emotion_engine.engine_for(persona_dir).is_live():
+        return None
+    if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is None:
+        message = (
+            f"This persona's emotion state file ({engine_files.state_path(persona_dir)}) cannot be read, so its emotion engine "
+            "counts as not switched, and a dry run writes nothing. Nothing was run. Check that the file and its folder are "
+            "readable, then try again."
+        )
+    else:
+        message = (
+            "This persona's emotion engine is not switched on yet, and a dry run writes nothing, so it cannot switch it on. "
+            "Nothing was run. The switch-over happens at the persona's first start: the bridge, or any of these commands "
+            "without --dry-run."
+        )
+    print(message, file=sys.stderr)
+    return 2
+
+
 def _heartbeat_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell heartbeat` to the HeartbeatEngine."""
     persona_dir = get_persona_dir(args.persona)
@@ -998,6 +1122,9 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)
@@ -1027,6 +1154,8 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             hebbian.close()
     finally:
         store.close()
+    if not args.dry_run:  # a dry run writes nothing, so it drains nothing
+        _drain_emotion_engine(persona_dir)
 
     if result.initialized:
         if args.dry_run:
@@ -1036,7 +1165,6 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     elif args.dry_run:
         print("Heartbeat dry-run — no writes.")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
-        print(f"  would decay: {result.memories_decayed} memories")
         print(f"  would prune: {result.edges_pruned} edges")
         # `or "gated"` defends against any future engine refactor that could
         # leave dream_gated_reason=None — prevents literal "dream: None" output.
@@ -1056,7 +1184,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
         print(f"Heartbeat tick complete ({args.trigger}).")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
-        print(f"  decayed: {result.memories_decayed} memories, pruned {result.edges_pruned} edges")
+        print(f"  pruned {result.edges_pruned} edges")
 
         # Dream: show fires + interesting gates. Suppress "not_due" by default.
         if result.dream_id:
@@ -1120,6 +1248,9 @@ def _reflex_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
         engine = ReflexEngine(
             store=store,
@@ -1176,8 +1307,12 @@ def _research_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
         searcher = get_searcher(searcher_name)
+        heartbeat_config = HeartbeatConfig.load(persona_dir / "heartbeat_config.json")
         engine = ResearchEngine(
             store=store,
             provider=provider,
@@ -1190,6 +1325,7 @@ def _research_handler(args: argparse.Namespace) -> int:
             interests_path=persona_dir / "interests.json",
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=_default_interests_path(),
+            research_days_since_human_min=heartbeat_config.research_days_since_human_min,
         )
         result = engine.run_tick(
             trigger=args.trigger,
@@ -1219,7 +1355,11 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
+    # Listing only reads (#708): a corrupt vocabulary is left as it is for a load that has the store and can rebuild it.
+    try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+    except JsonFileError as exc:
+        print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
     interests = InterestSet.load(
         persona_dir / "interests.json", default_path=_default_interests_path()
     )
@@ -1809,6 +1949,9 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
 
         from brain.soul.review import review_pending_candidates
@@ -2153,6 +2296,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but the rebuild step can still refuse (1 or 2)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)
@@ -2173,6 +2319,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     _flush_cost_series_at_exit(store)
                     raise
                 print(result.content)
+                _drain_emotion_engine(persona_dir)  # the reply is printed: fold what it queued
                 # Flush conversation through ingest pipeline (best-effort).
                 # Mirrors the REPL's finally block — without this, every
                 # one-shot reply orphans its buffer file and no memories
@@ -2195,6 +2342,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                 _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
+                _drain_emotion_engine(persona_dir)  # the pass-2 drain can queue changes of its own
                 return 0
 
             # Interactive REPL mode
@@ -2221,6 +2369,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                     print(result.content)
                     print()
+                    _drain_emotion_engine(persona_dir)  # after each reply
                     total_tool_calls += len(result.tool_invocations)
                     # S210: the reply is finished and printed; only now may the RAM
                     # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
@@ -2245,6 +2394,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                 _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
+                _drain_emotion_engine(persona_dir)  # after the pass-2 drain
                 # Summary
                 print(
                     f"\nSession ended. {session.turns} turn(s), "
@@ -2406,6 +2556,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a bridge that appears after the check above is refused, never stopped for a rebuild (S107)
 
         rc = daemon.cmd_start(_StartArgs(), out=readiness_out)
         if rc != 0:
@@ -2418,6 +2569,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a start over a running bridge only fetches its readiness: never stops it for a rebuild (S107)
 
         daemon.cmd_start(_NoOpStartArgs(), out=readiness_out)
 
@@ -3312,6 +3464,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     s_status.set_defaults(func=_supervisor_status_handler)
 
+    s_rebuild = s_actions.add_parser(
+        "rebuild",
+        help="Internal: run the one-shot emotion rebuild for a persona (the start runs it before the bridge).",
+    )
+    _add_persona_arg(s_rebuild)
+    s_rebuild.set_defaults(func=_supervisor_rebuild_handler)
+
     s_restart = s_actions.add_parser(
         "restart",
         help="Stop and start — gated on stop success.",
@@ -3329,7 +3488,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     s_tail_log = s_actions.add_parser(
         "tail-log",
-        help="Tail the bridge log file (cross-platform).",
+        help="Tail the bridge's runtime log, runtime-<persona>.log (cross-platform).",
     )
     _add_persona_arg(s_tail_log)
     s_tail_log.add_argument(

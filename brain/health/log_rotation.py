@@ -39,7 +39,6 @@ import errno
 import gzip
 import io
 import logging
-import os
 import shutil
 from collections import Counter
 from collections.abc import Iterator
@@ -48,8 +47,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.json_io import Recovery, iter_jsonl_raw, write_jsonl
-from brain.utils.atomic_write import _replace_with_retry, fsync_dir, save_bytes_atomic
+from brain.utils.atomic_write import fsync_dir, save_bytes_atomic
 from brain.utils.file_lock import file_lock
+from brain.utils.file_ops import replace_file
 from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
@@ -164,10 +164,10 @@ def _rotate_rolling_locked(log_path: Path, archive_keep: int) -> Path:
         (n for n in range(1, archive_keep + 1) if not _archive_path(log_path, n).exists()), archive_keep + 1
     )
     for i in range(min(first_empty, archive_keep) - 1, 0, -1):
-        os.replace(_archive_path(log_path, i), _archive_path(log_path, i + 1))  # atomic-write: ok -- the rotation's shift is a plain rename of a finished archive up one slot, not a write
+        replace_file(_archive_path(log_path, i), _archive_path(log_path, i + 1))  # atomic-write: ok -- the rotation's shift is a plain rename of a finished archive up one slot, not a write
 
     # 4. Publish the staged archive as .1.gz.
-    _replace_with_retry(staging, new_archive)  # atomic-write: ok -- publishes the finished, fsynced staging file by rename (the write above went through the shared writer)
+    replace_file(staging, new_archive)  # atomic-write: ok -- publishes the finished, fsynced staging file by rename (the write above went through the shared writer)
 
     # 5. Make the archive crash-durable (the shift and the publish are renames), THEN truncate the active log, so a
     #    power cut cannot leave the log emptied and the archive's directory entry not yet on disk.

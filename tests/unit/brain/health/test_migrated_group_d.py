@@ -40,9 +40,6 @@ READERS = {
         lambda pd: _imp("brain.health.soul_candidate_repair")._load_state(pd), "CONTENT", None),
     "vocab_repair._load_state": (
         "vocab_repair_state.json", lambda pd: _imp("brain.health.vocab_repair")._load_state(pd), "CONTENT", None),
-    "emotion_backfill._consume_budget": (
-        "emotion_backfill_budget.json",
-        lambda pd: _imp("brain.ingest.emotion_backfill")._consume_budget(pd, now=NOW, cap=5), "CONTENT", True),
     "kindled_link.cadence.load_tick_cadence": (
         "kindled_link/tick_cadence.json",
         lambda pd: _imp("brain.kindled_link.cadence").load_tick_cadence(pd), "DEFAULT", {"last_run": None}),
@@ -123,22 +120,6 @@ def test_group_d_reader_io_fault_follows_its_mode(tmp_path: Path, name: str) -> 
         with pytest.raises(OSError) as exc:
             call(pd)
         assert isinstance(exc.value, JsonFileError) and exc.value.kind == "io"
-
-
-def test_group_d_consume_budget_corrupt_counter_restarts_but_an_unreadable_one_is_not_reset(tmp_path: Path) -> None:
-    from brain.ingest.emotion_backfill import _consume_budget
-
-    pd = tmp_path
-    path = pd / "emotion_backfill_budget.json"
-    for _ in range(3):
-        assert _consume_budget(pd, now=NOW, cap=3) is True
-    assert _consume_budget(pd, now=NOW, cap=3) is False  # cap reached
-    path.write_bytes(b"{torn")  # corrupt content: as before, starts from an empty counter
-    assert _consume_budget(pd, now=NOW, cap=3) is True
-    path.unlink()
-    path.mkdir()  # unreadable: the daily cap must NOT reset
-    with pytest.raises(OSError):
-        _consume_budget(pd, now=NOW, cap=3)
 
 
 def test_group_d_files_pending_read(tmp_path: Path) -> None:
@@ -275,8 +256,8 @@ def test_group_d_writers_roundtrip_and_leave_no_temp(tmp_path: Path) -> None:
     assert pass2_queue._load_queue_unlocked(pd) == [{"id": "x"}]
     reflection_gate._atomic_write(pd, {"k": {"last_reflection_ts": "t"}})
     assert reflection_gate._load(pd) == {"k": {"last_reflection_ts": "t"}}
-    _save_cursor(pd, "model-1", ("2026-01-01T00:00:00", "id1"))
-    assert _load_cursor(pd, "model-1") == ("2026-01-01T00:00:00", "id1")
+    _save_cursor(pd, "model-1", 42)
+    assert _load_cursor(pd, "model-1") == 42
     assert _load_cursor(pd, "model-2") is None  # a model swap resets the cursor
     articulate._save_budget(pd, {"date": "d", "count": 1})
     assert articulate._load_budget(pd) == {"date": "d", "count": 1}

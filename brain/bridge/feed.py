@@ -217,8 +217,9 @@ def build_maker_entries(persona_dir: Path, *, limit: int) -> list[FeedEntry]:
     is_auto_surfaceable() — the privacy gate, not the SQL WHERE, is what keeps
     private + discard makings out. Even if a future schema/query change returned
     private rows, the gate drops them (privacy invariant, gate-asserted)."""
+    from brain.works.location import works_db_path
     from brain.works.store import WorksStore
-    db = persona_dir / "works.db"
+    db = works_db_path(persona_dir)
     if not db.exists():
         return []
     store = WorksStore(db)

@@ -294,3 +294,22 @@ def test_home_for_env_honours_xdg_data_home_like_platformdirs_on_linux_and_macos
         else Path("/h", "Library", "Application Support", "companion-emergence")
     )
     assert paths.home_for_env(blank, platform) == default
+
+
+def test_state_dir_is_the_state_folder_of_the_persona(tmp_path: Path) -> None:
+    assert paths.state_dir(tmp_path) == tmp_path / "state"
+    assert paths.state_dir(tmp_path).parent == tmp_path
+
+
+def test_state_dir_follows_the_dev_constant_at_call_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "EMOTION_STATE_DIR", "elsewhere")
+    assert paths.state_dir(tmp_path) == tmp_path / "elsewhere"
+
+
+def test_state_dir_creates_nothing(tmp_path: Path) -> None:
+    paths.state_dir(tmp_path)
+    assert list(tmp_path.iterdir()) == []

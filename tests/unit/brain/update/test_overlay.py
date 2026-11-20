@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+from brain import dev_constants
 from brain.update import overlay
 
 ENTRY_A = {"dir": "aaaa", "commit": "a" * 40, "brain_version": "0.0.42", "bundle_id": "b1"}
@@ -286,7 +287,7 @@ def test_replace_retries_a_transient_permission_error(tmp_path, monkeypatch):
         real(src, dst)
 
     monkeypatch.setattr(os, "replace", flaky)
-    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)
     overlay.activate(tmp_path, ENTRY_A)
     assert len(calls) == 3
     assert overlay.read_state(tmp_path)["active"] == ENTRY_A
@@ -297,7 +298,7 @@ def test_replace_gives_up_after_the_bounded_retries(tmp_path, monkeypatch):
         raise PermissionError("in use")
 
     monkeypatch.setattr(os, "replace", always)
-    monkeypatch.setattr(overlay, "_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0)
     with pytest.raises(PermissionError):
         overlay.activate(tmp_path, ENTRY_A)
 

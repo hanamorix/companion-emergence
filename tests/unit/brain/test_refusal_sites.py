@@ -640,29 +640,6 @@ def test_soul_review_refusal_after_a_decision_keeps_that_decision(persona):
     assert rows["cand-1"] == _candidate(1)
 
 
-# ---------------------------------------------------------------- emotion backfill
-
-
-@pytest.mark.parametrize("kind", REFUSALS)
-def test_emotion_backfill_refusal_leaves_state_cursor_and_budget(persona, kind):
-    from brain.ingest import emotion_backfill
-    from brain.memory.store import Memory, MemoryStore
-
-    budget = emotion_backfill._budget_path(persona)
-    store = MemoryStore(persona / "memories.db", integrity_check=False)
-    try:
-        for i in range(3):
-            store.create(Memory.create_new(content=f"memory {i}", memory_type="conversation", domain="us"))
-        prov = Refusing(kind, persona)
-        with pytest.raises(_refused_type(kind)):
-            emotion_backfill.run_emotion_backfill(persona, provider=prov, store=store, delay_s=0)
-    finally:
-        store.close()
-    assert prov.calls == 1
-    assert not budget.exists()  # the refused call was not charged
-    _assert_unchanged(prov)
-
-
 # ---------------------------------------------------------------- self-model articulation
 
 
@@ -678,12 +655,16 @@ def test_articulate_refusal_raises_and_leaves_the_budget(persona, kind):
 
 
 @pytest.mark.parametrize("kind", REFUSALS)
-def test_self_model_tick_refusal_leaves_state_and_cadence(persona, monkeypatch, kind):
+def test_self_model_tick_refusal_leaves_state_and_cadence(persona, monkeypatch, emotion_engine_stub, kind):
     import brain.bridge.supervisor as sup
+    from brain.emotion.engine import Reading
     from brain.self_model.gap import Gap
 
-    monkeypatch.setattr(sup, "compute_gap", lambda *_a, **_k: Gap(per_channel={"joy": 1.0}, magnitude=1.0,
-                                                                  unnamed_pressure=0.0))
+    # The engine reads one shifted channel, and the gap built from it is above the articulation threshold, so the
+    # tick reaches `sm_articulate`.
+    emotion_engine_stub.readings = {"joy": Reading(short=6.0, long=5.0, difference=1.0, shift=1)}
+    monkeypatch.setattr(sup, "gap_from_read", lambda *_a, **_k: Gap(per_channel={"joy": 1.0}, magnitude=1.0,
+                                                                    unnamed_pressure=0.0))
     prov = Refusing(kind, persona)
     with pytest.raises(_refused_type(kind)):
         sup._run_self_model_tick(persona, provider=prov, event_bus=object())
@@ -829,9 +810,13 @@ def test_dream_refusal_writes_nothing(persona, kind):
 
 
 @pytest.mark.parametrize("kind", REFUSALS)
-def test_reflex_refusal_writes_nothing(persona, kind):
+def test_reflex_refusal_writes_nothing(persona, emotion_engine_stub, kind):
+    from brain.emotion.engine import Reading
     from brain.engines.reflex import ReflexEngine
 
+    # The engine reads love and calls it high, so the arc fires and reaches the provider.
+    emotion_engine_stub.readings = {"love": Reading(short=8.0, long=8.0, difference=0.0, shift=0)}
+    emotion_engine_stub.high = {"love"}
     arcs = persona / "reflex_arcs.json"
     arcs.write_text(json.dumps({"version": 1, "arcs": [{
         "name": "test_arc", "description": "d", "trigger": {"love": 5}, "days_since_human_min": 0,

@@ -182,7 +182,7 @@ def crystallize_creative_dna(
 
     # Aggregate a real emotion vector over recent active memories so emitted
     # initiate candidates carry honest context instead of a zero-filled lie.
-    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now)
+    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now, persona_dir=persona_dir)
 
     # Apply atomically — single save_creative_dna after mutating dna in place
     try:
@@ -469,29 +469,24 @@ def _aggregate_recent_emotion_vector(
     store: MemoryStore,
     *,
     now: datetime,
+    persona_dir: Path,
     look_back_days: int = 30,
 ) -> dict[str, float]:
-    """Return a max-pooled emotion vector across recent active memories.
+    """Return her recent emotion vector: the emotion engine's short averages above 0. Context only.
 
     Used by the creative_dna crystallizer so emitted initiate candidates
-    carry a real signal of what's been emotionally alive in the window
-    that produced the crystallization, rather than zero-filled fields.
-    Empty dict on any failure.
+    carry a real signal of what's been emotionally alive, rather than
+    zero-filled fields. Empty while the engine is not reading (not switched
+    over, or its state cannot be read), and on any failure. The old max-pool
+    of recent memories went in emotion rework B1 PR 7.
     """
     try:
-        from brain.emotion.aggregate import aggregate_state
-        from brain.utils.memory import list_conversation_memories
+        from brain.emotion.engine import engine_for
 
-        cutoff = now - timedelta(days=look_back_days)
-        recent = [
-            m
-            for m in list_conversation_memories(store, active_only=True)
-            if m.created_at >= cutoff and m.emotions
-        ]
-        if not recent:
+        eng = engine_for(persona_dir)
+        if not eng.is_live():
             return {}
-        state = aggregate_state(recent)
-        return dict(state.emotions)
+        return {name: r.short for name, r in eng.read().items() if r.short > 0}
     except Exception as exc:  # noqa: BLE001
         logger.warning("creative_dna: recent-emotion aggregation failed: %s", exc)
         return {}

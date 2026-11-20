@@ -10,8 +10,8 @@ images and file_store (:func:`save_blob_once`). The healing readers stay in ``br
 Exclusive-create cases (the machine id, model blobs) and plain moves of finished files do not belong here; they carry an
 ``# atomic-write: ok -- <why>`` marker that ``tests/unit/test_no_hand_rolled_atomic_write.py`` requires.
 
-This module imports only the standard library at module level and never ``brain.health``: it sits below it, so every
-module may call it without an import cycle.
+This module imports only the standard library and ``brain.utils.file_ops`` (the one retry for the sharing violation) at
+module level and never ``brain.health``: it sits below it, so every module may call it without an import cycle.
 """
 
 from __future__ import annotations
@@ -24,39 +24,12 @@ import secrets
 import shutil
 import stat
 import threading
-import time
 from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import BinaryIO
 
-_REPLACE_RETRIES = 8
-_REPLACE_RETRY_SLEEP_S = 0.05
-
-
-def _retry_perm(action: Callable[[], Any]) -> Any:
-    """Run ``action`` with a short bounded retry on transient PermissionError.
-
-    Windows refuses to rename a file another handle has open (WinError 32).
-    The supervisor reads persona_config.json inside its ticks in the same
-    process as the settings writer, so a save can collide with a read (#200).
-    Mirrors brain.ingest.buffer._unlink_with_retry: a transient failure is
-    retried, and a persistent one (on POSIX that means a real permission
-    problem, which burns the whole ~1.4 s budget) is re-raised so it still
-    fails loud. ``action`` must be safe to run again from the top.
-    """
-    for attempt in range(_REPLACE_RETRIES):
-        try:
-            return action()
-        except PermissionError:
-            if attempt == _REPLACE_RETRIES - 1:
-                raise
-            time.sleep(_REPLACE_RETRY_SLEEP_S * (attempt + 1))
-
-
-def _replace_with_retry(src: Path, dst: Path) -> None:
-    """os.replace with a short bounded retry on transient PermissionError (#200)."""
-    _retry_perm(lambda: os.replace(src, dst))
+from brain.utils.file_ops import replace_file, retry_transient
 
 
 def _copy_for_backup(src: Path, dst: Path) -> bool:
@@ -89,7 +62,7 @@ def _copy_for_backup(src: Path, dst: Path) -> bool:
         return True
 
     try:
-        return _retry_perm(attempt)
+        return retry_transient(attempt)
     except Exception:
         try:
             dst.unlink(missing_ok=True)
@@ -148,6 +121,12 @@ def _remove_stale_temps(path: Path) -> None:
         if m is None:
             continue
         pid = int(m.group(1))
+        from brain import process_identity
+
+        if not process_identity.is_pid_number(pid):
+            # #755: no save writes a pid no process can have, so this is not a leftover of ours: leave it. (Before,
+            # the liveness check raised on it and the except in _owner_alive kept it; it now reads such a pid as dead.)
+            continue
         with _INFLIGHT_LOCK:
             if temp.name in _INFLIGHT:
                 continue
@@ -223,13 +202,13 @@ def _save_payload(
                 dst = path.with_name(f"{path.name}.bak{i + 1}")
                 if src.exists():
                     try:
-                        _replace_with_retry(src, dst)
+                        replace_file(src, dst)
                     except FileNotFoundError:
                         pass
         if backed_up:
-            _replace_with_retry(bak1_new, bak1)
+            replace_file(bak1_new, bak1)
 
-        _replace_with_retry(new_path, path)
+        replace_file(new_path, path)
 
         if backup_mode is not None and keep_backups:
             for i in range(1, max(backup_count, 1) + 1):
@@ -353,6 +332,32 @@ def save_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None, fsync
     archive.
     """
     write_temp = partial(_write_temp_file, payload=data, mode=mode, fsync=fsync)
+    _save_payload(path, write_temp, fsync=fsync)
+
+
+def save_stream_atomic(
+    path: Path, write: Callable[[BinaryIO], None], *, mode: int | None = None, fsync: bool = True
+) -> None:
+    """Atomic save of a payload produced by ``write(fh)``: the streaming variant of :func:`save_bytes_atomic`.
+
+    ``write`` fills the save's own temp (opened ``"wb"``, created with ``mode`` when given, as in
+    :func:`save_bytes_atomic`) piece by piece, so a large file is never held in memory; the temp is then flushed,
+    fsynced when ``fsync``, and published with the same retried replace and directory fsync. A failure (including one
+    raised by ``write``) leaves ``path`` as it was and removes the temp.
+    """
+
+    def write_temp(new_path: Path) -> None:
+        if mode is None:
+            new_file = new_path.open("wb")
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            new_file = os.fdopen(os.open(new_path, flags, mode), "wb")
+        with new_file as f:
+            write(f)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+
     _save_payload(path, write_temp, fsync=fsync)
 
 
