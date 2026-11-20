@@ -787,17 +787,18 @@ REMOVED: tuple[Removed, ...] = (
     ),
     # --- the old max-pool aggregate leaves the writers' off branches (B1 PR 7), so Engine 7 can delete it ----------------
     Removed(
-        names=("aggregate_state",),
-        why="the off branches of the dream mood, the monologue trace's feelings and growth's three recent-emotion vectors pooled recent memories with `aggregate_state`; with the engine not reading (not switched over, or the state unreadable) they now take no feelings, and Readers 2 removes every other caller",
-        ref="emotion rework B1 PR 7 (#742), before Engine 7 (#635) deletes brain/emotion/aggregate.py",
+        names=("aggregate_state", "compute_body_state"),
+        why="the old max-pool of recent memory rows into a mood (`aggregate_state`) and the body state computed from it (`compute_body_state`); the emotion engine is the one source of a felt state, the last reader branches went in B1 PR 7 (#742) and Engine 7 deleted brain/emotion/aggregate.py",
+        ref="emotion rework B1 PR 7 (#742) and Engine 7 (#635, #586)",
         kind="code",
-        scope=(
-            "brain/engines/dream.py",
-            "brain/monologue/trace.py",
-            "brain/growth/scheduler.py",
-            "brain/growth/crystallizers/creative_dna.py",
-            "brain/growth/crystallizers/reflex.py",
-        ),
+        scope=("brain", "scripts"),
+    ),
+    Removed(
+        names=("brain.emotion.aggregate",),
+        why="the import path of the deleted aggregate module (see brain/emotion/aggregate.py above); nothing may import it back",
+        ref="emotion rework B1 PR 7 (#742) and Engine 7 (#635, #586)",
+        kind="text",
+        scope=("brain", "scripts"),
     ),
     # --- the own-record test moved to process_identity (Engine 6 HR5, Hana's review of #633 point 5) ---------------------------
     Removed(

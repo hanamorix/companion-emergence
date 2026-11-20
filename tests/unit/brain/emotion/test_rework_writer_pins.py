@@ -1,8 +1,8 @@
 """Pins of today's emotion-writer bugs, for the emotion rework (#240, work item A1).
 
 Each bug has a `test_today_*` that passes now and a `test_intended_*` marked xfail(strict), so the PR that fixes the bug
-has to remove the marker and rewrite the pin. "The felt-state read" is `aggregate_state` today; the B1 PRs switch to the
-engine's read with the switch on.
+has to remove the marker and rewrite the pin. "The felt-state read" was the old `aggregate_state` max-pool (removed since); the B1 PRs
+switched to the engine's read.
 
 The design's sixth row (spelling variants pooling as separate channels) has no pin here: #565 fixed it, and
 `test_aggregate.py` covers it.
