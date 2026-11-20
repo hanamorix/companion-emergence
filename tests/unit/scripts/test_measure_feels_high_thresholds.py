@@ -269,6 +269,9 @@ def test_research_row_opp_is_the_max_over_opposing_names_present_not_their_sum_o
     # max(2, 2) = 2, T = 5.0; a sum (4) would give a higher T
     assert opposing_threshold(2.0) < 5.2 < opposing_threshold(4.0)
     assert row({"shame": 2.0, "grief": 2.0, "love": 5.2}, _high("love"))
+    # unequal values: max 7 gives T 6.5 (closed at 5.6); the mean of the two (4) would give T 5.55 (open)
+    assert opposing_threshold(7.0) > 5.6 > opposing_threshold(4.0)
+    assert not row({"grief": 1.0, "shame": 7.0, "love": 5.6}, _high("love"))
     # an opposing feeling that is present but not high still sets opp
     assert opposing_threshold(7.0) > 6.0
     assert not row({"grief": 7.0, "love": 6.0}, _high("love"))
@@ -287,7 +290,7 @@ def test_research_row_follows_the_engine_constants_it_copies_nothing(monkeypatch
 
 
 def _grief_db(path: Path) -> None:
-    """The same history with a constant grief of 5 (an opposing feeling, T = 5.8) beside love swinging between 2 and 9."""
+    """The same history with a constant grief of 5 (an opposing feeling) beside love swinging between 2 and 9."""
     from brain.memory.store import Memory, MemoryStore
 
     store = MemoryStore(path)
@@ -318,7 +321,7 @@ def test_the_research_row_end_to_end_is_stricter_than_any_feeling_high(tmp_path)
     after_30 = text.split("Firing counts, after day 30")[1].split("Firing counts, all ticks")[0]
     research = next(line for line in after_30.splitlines() if line.startswith(f"| {RESEARCH_ROW} |"))
     fired, total = (int(x) for x in research.split("|")[3].strip().split("/"))  # the floor 1 column
-    # grief is high on every tick of this history, so "any feeling high" would fire on all of them; the curve closes most.
+    # grief, an opposing feeling, never opens the gate and raises the threshold for love: some ticks fire, not all.
     assert 0 < fired < total, research
 
 
