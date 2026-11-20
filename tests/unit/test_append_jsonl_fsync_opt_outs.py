@@ -6,6 +6,8 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 MARKER = "# fsync off:"
 REASONED = re.compile(r"# fsync off:\s*\S")
@@ -35,6 +37,9 @@ def find_unreasoned_opt_outs(source: str) -> list[int]:
     return sorted(offending)
 
 
+@pytest.mark.no_base_failure(
+    reason="tests the guard's own checker on synthetic source, so swapping brain/ to the old code cannot change it"
+)
 def test_the_checker_wants_a_reason_on_the_nearest_comment() -> None:
     reasoned = "# fsync off: a rebuildable cache\nappend_jsonl(p, r, fsync=False)\n"
     bare = "# fsync off:\nappend_jsonl(p, r, fsync=False)\n"
