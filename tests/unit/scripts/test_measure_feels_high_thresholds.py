@@ -189,6 +189,43 @@ def test_the_script_runs_end_to_end_on_the_engine_rule_alone(tmp_path):
     assert int(first_cell.split("/")[0]) > 0, love_row
 
 
+def test_a_row_whose_only_emotion_is_non_finite_counts_as_having_emotions_and_logs_no_drop(tmp_path, caplog):
+    """The "with emotions" count asks whether a row names an emotion, not whether it has a finite value.
+
+    The extra row is an "event" row, which the engine does not count, so the report's only read of it is that count.
+    `create_new` drops non-finite values, so the row is built the way a loaded row is.
+    """
+    import logging
+
+    from brain.memory.store import Memory, MemoryStore
+
+    db = tmp_path / "memories.db"
+    _synthetic_db(db)
+    store = MemoryStore(db)
+    try:
+        store.create(
+            Memory.from_stored_row(
+                id="nan-valued-row",
+                content="a thing the engine does not count",
+                memory_type="event",
+                domain="creative",
+                created_at=datetime(2026, 2, 1, 6, tzinfo=UTC),
+                emotions={"nan_ache": float("nan")},
+            ),
+            fold=False,
+        )
+    finally:
+        store.close()
+
+    with caplog.at_level(logging.DEBUG):
+        lines, code = mod.run(str(db), (0.0, 0.1, 1.0))
+
+    text = "\n".join(lines)
+    assert code == 0, text[-2000:]
+    assert "101 active rows, 101 with emotions" in text
+    assert not [r for r in caplog.records if "dropping emotion" in r.getMessage()]
+
+
 def test_main_prints_the_report_and_exits_zero(tmp_path, capsys):
     db = tmp_path / "memories.db"
     _synthetic_db(db)
