@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import pytest
+
 from brain.health import jsonl_nul_repair
 from brain.health.json_io import append_jsonl, iter_jsonl
 from brain.health.jsonl_nul_repair import (
@@ -33,15 +35,21 @@ def test_a_nul_run_at_a_line_start_is_removed_and_the_swallowed_record_comes_bac
     assert (tmp_path / "x.jsonl.pre-618").read_bytes() == original
 
 
-def test_a_run_after_a_torn_record_becomes_a_newline(tmp_path):
-    p = _write(tmp_path, "x.jsonl", b'{"a":1}\n{"to' + b"\0" * 8 + b'{"b":2}\n')
-    run_jsonl_nul_repair(tmp_path)
+_TORN_THEN_RUN = b'{"a":1}\n{"to' + b"\0" * 8 + b'{"b":2}\n'
+_RUN_THEN_NEWLINE = b'{"to' + b"\0" * 4 + b'\n{"b":2}\n'
+
+
+@pytest.mark.parametrize("chunk_size", range(1, len(_TORN_THEN_RUN) + 1))
+def test_a_run_after_a_torn_record_becomes_a_newline(tmp_path, chunk_size):
+    p = _write(tmp_path, "x.jsonl", _TORN_THEN_RUN)
+    run_jsonl_nul_repair(tmp_path, chunk_size=chunk_size)
     assert p.read_bytes() == b'{"a":1}\n{"to\n{"b":2}\n'
 
 
-def test_a_run_before_a_newline_after_a_torn_record_adds_no_blank_line(tmp_path):
-    p = _write(tmp_path, "x.jsonl", b'{"to' + b"\0" * 4 + b'\n{"b":2}\n')
-    run_jsonl_nul_repair(tmp_path)
+@pytest.mark.parametrize("chunk_size", range(1, len(_RUN_THEN_NEWLINE) + 1))
+def test_a_run_before_a_newline_after_a_torn_record_adds_no_blank_line(tmp_path, chunk_size):
+    p = _write(tmp_path, "x.jsonl", _RUN_THEN_NEWLINE)
+    run_jsonl_nul_repair(tmp_path, chunk_size=chunk_size)
     assert p.read_bytes() == b'{"to\n{"b":2}\n'
 
 
@@ -165,6 +173,115 @@ def test_an_unreadable_file_leaves_the_state_unwritten_and_the_next_run_repairs_
     assert list(iter_jsonl(p)) == [{"a": 1}, {"b": 2}]
     assert (tmp_path / STATE_FILENAME).exists()
     assert should_run_jsonl_nul_repair(tmp_path) is False
+
+
+def test_an_unlistable_folder_leaves_the_state_unwritten(tmp_path):
+    import os
+    import sys
+
+    import pytest
+
+    if sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("needs POSIX permissions and a non-root user")
+    p = _write(tmp_path, "sub/x.jsonl", b'{"a":1}\n' + b"\0" * 20 + b'{"b":2}\n')
+    (tmp_path / "sub").chmod(0o000)
+    try:
+        report = run_jsonl_nul_repair(tmp_path)
+        assert report.done is False
+        assert "sub" in report.failed
+        assert not (tmp_path / STATE_FILENAME).exists()
+    finally:
+        (tmp_path / "sub").chmod(0o755)
+
+    report = run_jsonl_nul_repair(tmp_path)
+    assert report.done is True
+    assert list(iter_jsonl(p)) == [{"a": 1}, {"b": 2}]
+    assert (tmp_path / STATE_FILENAME).exists()
+
+
+def test_the_emotion_engines_state_folder_is_left_alone(tmp_path):
+    original = b'{"a":1}\n' + b"\0" * 20 + b'{"b":2}\n'
+    p = _write(tmp_path, "state/emotion_changes/2026-11-20.jsonl", original)
+
+    report = run_jsonl_nul_repair(tmp_path)
+
+    assert p.read_bytes() == original
+    assert not list(p.parent.glob("*.pre-618*"))
+    assert report.repaired == {}
+
+
+def test_a_failed_rewrite_removes_its_backup(tmp_path, monkeypatch):
+    original = b'{"a":1}\n' + b"\0" * 20 + b'{"b":2}\n'
+    p = _write(tmp_path, "x.jsonl", original)
+    real = jsonl_nul_repair.save_stream_atomic
+    calls = {"n": 0}
+
+    def second_raises(path, write, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real(path, write, **kwargs)
+
+    monkeypatch.setattr(jsonl_nul_repair, "save_stream_atomic", second_raises)
+
+    report = run_jsonl_nul_repair(tmp_path)
+
+    assert p.read_bytes() == original
+    assert not list(tmp_path.glob("*.pre-618*"))
+    assert report.failed == ["x.jsonl"]
+
+
+def test_a_symlinked_file_is_not_replaced(tmp_path):
+    import os
+
+    import pytest
+
+    outside = tmp_path / "outside"
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    original = b'{"a":1}\n' + b"\0" * 20 + b'{"b":2}\n'
+    target = _write(outside, "real.jsonl", original)
+    link = persona / "link.jsonl"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks cannot be created here")
+
+    run_jsonl_nul_repair(persona)
+
+    assert os.path.islink(link)
+    assert target.read_bytes() == original
+
+
+def test_the_file_mode_is_kept(tmp_path):
+    import stat
+    import sys
+
+    import pytest
+
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits")
+    p = _write(tmp_path, "x.jsonl", b'{"a":1}\n' + b"\0" * 20 + b'{"b":2}\n')
+    p.chmod(0o600)
+
+    run_jsonl_nul_repair(tmp_path)
+
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "x.jsonl.pre-618").stat().st_mode) == 0o600
+
+
+def test_many_short_runs_are_repaired_quickly(tmp_path):
+    import time
+
+    p = _write(tmp_path, "x.jsonl", b"a\0" * 100_000)  # 200 KB of alternating byte and NUL
+
+    start = time.perf_counter()
+    report = run_jsonl_nul_repair(tmp_path)
+    elapsed = time.perf_counter() - start
+
+    assert report.repaired["x.jsonl"].runs == 100_000
+    assert p.read_bytes() == b"a\n" * 100_000
+    assert elapsed < 2.0
 
 
 def test_supervisor_startup_repairs_a_damaged_file(tmp_path):

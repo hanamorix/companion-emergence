@@ -8,7 +8,13 @@ newline where a run sat in the middle of a line so the record after it is whole 
 
 Everything streams in ``chunk_size`` pieces (these logs can be large); the rewrite and the copy are atomic saves done
 under the file's own lock, so an append waits instead of landing in a file about to be replaced. A file that cannot be
-read or written is listed in ``failed`` and no state file is written, so the next start tries again. State file
+read or written, or a folder that cannot be listed, is listed in ``failed`` and no state file is written, so the next
+start tries again.
+
+The file's ``file_lock(path)`` holds off the writers that go through ``append_jsonl``'s default lock. The emotion
+engine's change logs and queue under the top-level ``<persona_dir>/state/`` are appended under the engine's own
+``state_lock`` (and the queue is read by line position), so that folder is left to the engine and is not walked.
+Symlinked files are skipped, and a rewritten file and its backup keep the original's permission bits. State file
 ``<persona_dir>/jsonl_nul_repair_state.json`` makes a finished repair a no-op.
 """
 
@@ -17,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +40,8 @@ BACKUP_SUFFIX = ".pre-618"
 
 _ROTATED = re.compile(r".+\.jsonl\.\d+")
 _NL = 0x0A
+_NUL = re.compile(rb"\x00")
+_NOT_NUL = re.compile(rb"[^\x00]")
 
 
 @dataclass(frozen=True)
@@ -94,14 +103,16 @@ class _NulFilter:
         pos, size = 0, len(chunk)
         while pos < size:
             if self._in_run:
-                nuls = size - pos - len(chunk[pos:].lstrip(b"\0"))
-                self._run_len += nuls
-                pos += nuls
+                m = _NOT_NUL.search(chunk, pos)
+                stop = size if m is None else m.start()
+                self._run_len += stop - pos
+                pos = stop
                 if pos < size:
                     self._end_run(chunk[pos], at_eof=False)
                 continue
-            idx = chunk.find(b"\0", pos)
-            end = size if idx < 0 else idx
+            m = _NUL.search(chunk, pos)
+            idx = -1 if m is None else m.start()
+            end = size if m is None else idx
             if end > pos:
                 self._out.write(chunk[pos:end])
                 self._last = chunk[end - 1]
@@ -142,9 +153,14 @@ def _repair_file(path: Path, chunk_size: int) -> tuple[int, int, Path]:
         stats["runs"], stats["removed"] = flt.runs, flt.bytes_removed
 
     with file_lock(path):
+        mode = stat.S_IMODE(os.stat(path).st_mode)
         backup = _backup_path(path)
-        save_stream_atomic(backup, copy_original)
-        save_stream_atomic(path, rewrite)
+        save_stream_atomic(backup, copy_original, mode=mode)
+        try:
+            save_stream_atomic(path, rewrite, mode=mode)
+        except OSError:
+            backup.unlink(missing_ok=True)  # a copy of a file that did not change
+            raise
     return stats["runs"], stats["removed"], backup
 
 
@@ -167,12 +183,26 @@ def run_jsonl_nul_repair(persona_dir: Path, *, chunk_size: int = 1 << 20) -> Rep
     scanned = 0
     repaired: dict[str, FileRepair] = {}
     failed: list[str] = []
-    for root, dirs, files in os.walk(persona_dir):
+
+    def unlistable(exc: OSError) -> None:
+        folder = Path(exc.filename) if exc.filename else persona_dir
+        try:
+            rel = folder.relative_to(persona_dir).as_posix()
+        except ValueError:
+            rel = folder.as_posix()
+        logger.warning("jsonl_nul_repair: cannot list %s: %s", rel, exc)
+        failed.append(rel)
+
+    for root, dirs, files in os.walk(persona_dir, onerror=unlistable):
         dirs.sort()
+        if Path(root) == persona_dir and "state" in dirs:
+            dirs.remove("state")  # the emotion engine's own logs and queue: its state_lock, not ours
         for name in sorted(files):
             if not _is_candidate(name):
                 continue
             path = Path(root) / name
+            if os.path.islink(path):
+                continue  # never follow or replace a link
             rel = path.relative_to(persona_dir).as_posix()
             scanned += 1
             try:
