@@ -1,8 +1,8 @@
 """Pins of today's emotion-writer bugs, for the emotion rework (#240, work item A1).
 
 Each bug has a `test_today_*` that passes now and a `test_intended_*` marked xfail(strict), so the PR that fixes the bug
-has to remove the marker and rewrite the pin. "The felt-state read" is `aggregate_state` today; the B1 PRs switch to the
-engine's read with the switch on.
+has to remove the marker and rewrite the pin. "The felt-state read" was the old `aggregate_state` max-pool (removed since); the B1 PRs
+switched to the engine's read.
 
 The design's sixth row (spelling variants pooling as separate channels) has no pin here: #565 fixed it, and
 `test_aggregate.py` covers it.
@@ -11,7 +11,6 @@ The design's sixth row (spelling variants pooling as separate channels) has no p
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,7 +20,6 @@ from brain import dev_constants
 from brain.bridge.provider import FakeProvider
 from brain.chat.extractor import _apply_emotion_delta
 from brain.emotion import engine
-from brain.emotion.aggregate import aggregate_state
 from brain.emotion.engine import EmotionEngine, Reading
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine
@@ -46,12 +44,6 @@ WINDOW_HOURS = dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS
 _PINNED = pytest.mark.no_base_failure(reason="pins a writer bug that is on main until a B1 PR fixes it, so the old code cannot fail it")
 
 
-def _flipped_by(pr: str) -> Callable[[Callable[..., None]], Callable[..., None]]:
-    # raises=AssertionError: a broken setup must fail loudly, not pass as the expected failure.
-    xfail = pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"writer bug, fixed by {pr}")
-    return lambda test: _PINNED(xfail(test))
-
-
 @pytest.fixture
 def persona_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
@@ -72,10 +64,6 @@ def hebbian():
     matrix = HebbianMatrix(db_path=":memory:")
     yield matrix
     matrix.close()
-
-
-def _felt(store: MemoryStore) -> dict[str, float]:
-    return aggregate_state(store.list_active()).emotions
 
 
 def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEngine:
@@ -193,7 +181,7 @@ def _live_peer_memories(persona_dir: Path, store: MemoryStore, *emotions_json: s
             )
     finally:
         link_store.close()
-    return [m.emotions for m in sorted(store.list_by_type("kindled_peer"), key=lambda m: m.created_at)]
+    return [m._stored_emotions for m in sorted(store.list_by_type("kindled_peer"), key=lambda m: m.created_at)]
 
 
 def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]]:
@@ -207,26 +195,11 @@ def _peer_changes(persona_dir: Path) -> tuple[dict[str, float], dict[str, float]
     return first, second
 
 
-@_PINNED
-def test_today_extractor_negative_delta_raises_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    assert "joy" not in _felt(store)
-    _apply_emotion_delta({"joy": -0.2}, persona_dir)
-    assert _felt(store)["joy"] == pytest.approx(2.0)
-
-
 def test_intended_extractor_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
     eng = _go_live(persona_dir, store, joy=5.0)
     before = _settled(eng)["joy"].short
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
     assert _settled(eng)["joy"].short < before
-
-
-@_PINNED
-def test_today_reconcile_negative_delta_raises_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
-    assert "joy" not in _felt(store)
-    result = reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
-    assert result["delta_written"] is True
-    assert _felt(store)["joy"] == pytest.approx(2.0)
 
 
 def test_intended_reconcile_negative_delta_lowers_the_feeling(persona_dir: Path, store: MemoryStore) -> None:
@@ -243,16 +216,16 @@ def test_today_dream_over_ten_survives_a_heartbeat(
     # erased this value. The pass is gone (the engine fades on read), so a heartbeat leaves every stored value as written.
     # The out-of-range write is B1-4's.
     dream, seed = _write_dream_over_ten(store, hebbian, persona_dir, eng=None)
-    assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
+    assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
     _one_heartbeat(store, hebbian, persona_dir)
-    assert store.get(dream.id).emotions == {"love": pytest.approx(18.0)}
-    assert store.get(seed.id).emotions == {"love": pytest.approx(6.0)}
+    assert store.get(dream.id)._stored_emotions == {"love": pytest.approx(18.0)}
+    assert store.get(seed.id)._stored_emotions == {"love": pytest.approx(6.0)}
 
 
 def test_intended_dream_value_stays_in_range(persona_dir: Path, store: MemoryStore, hebbian: HebbianMatrix) -> None:
     eng = _go_live(persona_dir, store)
     dream, _seed_memory = _write_dream_over_ten(store, hebbian, persona_dir, eng=eng)
-    assert store.get(dream.id).emotions["love"] <= 10.0
+    assert store.get(dream.id)._stored_emotions["love"] <= 10.0
 
 
 def test_today_negative_peer_value_survives_a_heartbeat(
@@ -261,9 +234,9 @@ def test_today_negative_peer_value_survives_a_heartbeat(
     # Renamed from test_today_negative_peer_value_is_erased_by_one_heartbeat: before Engine 6 the heartbeat's decay pass erased
     # the negative value. The pass is gone, so a heartbeat leaves the row as written. The negative write is B1-2's.
     memory_id = _write_negative_peer_memory(store)
-    assert store.get(memory_id).emotions["tenderness"] == pytest.approx(-0.3)
+    assert store.get(memory_id)._stored_emotions["tenderness"] == pytest.approx(-0.3)
     _one_heartbeat(store, hebbian, persona_dir)
-    emotions = store.get(memory_id).emotions
+    emotions = store.get(memory_id)._stored_emotions
     assert emotions["tenderness"] == pytest.approx(-0.3)
     assert emotions["joy"] == pytest.approx(5.0)
 
@@ -288,15 +261,11 @@ def test_intended_peer_bucket_does_not_scale(persona_dir: Path, store: MemorySto
     assert second == {"love": 0.5}
 
 
-@pytest.mark.no_base_failure(reason="pins that an unknown switch keeps today's path (B1 PR 2); main always takes it")
-def test_unknown_switch_takes_todays_path(persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The state file is unreadable: the switch is unknown, which counts as off, so the old row is written."""
-    from tests.unit.brain.emotion._engine_support import ruin_the_state
-
+@pytest.mark.no_base_failure(reason="pins the absence of a row; main's live branch already writes none, only its off branch did")
+def test_the_extractor_and_reconcile_write_no_emotion_row(persona_dir: Path, store: MemoryStore) -> None:
+    """Pass-2 and reconcile deltas fold into the engine only: no `monologue_emotion` or `self_model_reconcile` row."""
     _go_live(persona_dir, store, joy=5.0)
-    ruin_the_state(persona_dir)
-    assert engine.engine_for(persona_dir).is_live() is False
     _apply_emotion_delta({"joy": -0.2}, persona_dir)
-    # monologue_emotion bypasses the pending queue, so the row lands in memories.db directly.
-    rows = store.list_by_type("monologue_emotion", active_only=False)
-    assert [r.emotions for r in rows] == [{"joy": pytest.approx(2.0)}]
+    reconcile_self_read(persona_dir=persona_dir, action="revise", channel="joy", delta=-0.2)
+    assert store.list_by_type("monologue_emotion", active_only=False) == []
+    assert store.list_by_type("self_model_reconcile", active_only=False) == []

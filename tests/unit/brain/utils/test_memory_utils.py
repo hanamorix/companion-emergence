@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,26 +40,15 @@ def _conversation_memory(store: MemoryStore, *, created_at: datetime) -> Memory:
     return mem
 
 
-class _WatchedStore:
-    """A store that records every attribute asked of it: ``days_since_human`` reads no memory. (It records instead of
-    raising because ``list_conversation_memories`` swallows any exception from a failing store.)"""
-
-    def __init__(self) -> None:
-        object.__setattr__(self, "touched", [])
-
-    def __getattr__(self, name: str):
-        self.touched.append(name)
-        raise AttributeError(name)
+def test_days_since_human_takes_no_store():
+    """It reads the conversation files only: its parameters are the clock and the folder."""
+    assert list(inspect.signature(days_since_human).parameters) == ["now", "persona_dir"]
 
 
 def test_days_since_human_returns_999_when_no_signal_anywhere(tmp_path: Path):
     """No conversation folder at all: the fallback, and the call creates nothing."""
-    store = MemoryStore(":memory:")
-    try:
-        assert days_since_human(store, datetime.now(UTC), persona_dir=tmp_path) == 999.0
-        assert list(tmp_path.iterdir()) == []
-    finally:
-        store.close()
+    assert days_since_human(datetime.now(UTC), persona_dir=tmp_path) == 999.0
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_days_since_human_prefers_active_buffer_over_closed_memories(tmp_path: Path):
@@ -69,11 +59,11 @@ def test_days_since_human_prefers_active_buffer_over_closed_memories(tmp_path: P
     (tmp_path / "presence_state.json").write_text(
         json.dumps({"last_seen_ts": (now - timedelta(minutes=1)).isoformat()}), encoding="utf-8"
     )
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         _conversation_memory(store, created_at=now - timedelta(days=3))
         _conversation_memory(store, created_at=now - timedelta(minutes=1))
-        result = days_since_human(store, now, persona_dir=tmp_path)
+        result = days_since_human(now, persona_dir=tmp_path)
         assert result == pytest.approx(2 / 24, abs=1e-3)
     finally:
         store.close()
@@ -82,26 +72,17 @@ def test_days_since_human_prefers_active_buffer_over_closed_memories(tmp_path: P
 def test_days_since_human_does_not_move_when_a_memorys_created_at_is_refreshed(tmp_path: Path):
     now = datetime.now(UTC)
     _write_buffer(tmp_path, [_turn("user", now - timedelta(days=2))])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         mem = _conversation_memory(store, created_at=now - timedelta(days=9))
-        before = days_since_human(store, now, persona_dir=tmp_path)
+        before = days_since_human(now, persona_dir=tmp_path)
         store._conn.execute(  # type: ignore[attr-defined]
             "UPDATE memories SET created_at = ? WHERE id = ?", (now.isoformat(), mem.id)
         )
         store._conn.commit()  # type: ignore[attr-defined]
-        assert days_since_human(store, now, persona_dir=tmp_path) == before == pytest.approx(2.0, abs=1e-3)
+        assert days_since_human(now, persona_dir=tmp_path) == before == pytest.approx(2.0, abs=1e-3)
     finally:
         store.close()
-
-
-def test_days_since_human_reads_no_memory(tmp_path: Path):
-    now = datetime.now(UTC)
-    _write_buffer(tmp_path, [_turn("user", now - timedelta(hours=1))])
-    store = _WatchedStore()
-    assert days_since_human(store, now, persona_dir=tmp_path) == pytest.approx(1 / 24, abs=1e-3)  # type: ignore[arg-type]
-    assert days_since_human(store, now, persona_dir=tmp_path / "nobody") == 999.0  # type: ignore[arg-type]
-    assert store.touched == []
 
 
 def test_days_since_human_ignores_assistant_turns_in_buffer(tmp_path: Path):
@@ -109,11 +90,7 @@ def test_days_since_human_ignores_assistant_turns_in_buffer(tmp_path: Path):
     'days since human contact' counter."""
     now = datetime.now(UTC)
     _write_buffer(tmp_path, [_turn("assistant", now - timedelta(hours=1))])
-    store = MemoryStore(":memory:")
-    try:
-        assert days_since_human(store, now, persona_dir=tmp_path) == 999.0  # no user signal at all
-    finally:
-        store.close()
+    assert days_since_human(now, persona_dir=tmp_path) == 999.0  # no user signal at all
 
 
 def test_days_since_human_handles_corrupt_buffer_lines_gracefully(tmp_path: Path):
@@ -129,11 +106,7 @@ def test_days_since_human_handles_corrupt_buffer_lines_gracefully(tmp_path: Path
         + json.dumps({"speaker": "user", "text": "hi", "ts": fresh_ts})
         + "\n"
     )
-    store = MemoryStore(":memory:")
-    try:
-        assert days_since_human(store, now, persona_dir=tmp_path) == pytest.approx(3 / 24, abs=1e-3)
-    finally:
-        store.close()
+    assert days_since_human(now, persona_dir=tmp_path) == pytest.approx(3 / 24, abs=1e-3)
 
 
 def test_days_since_human_reads_the_archive_when_no_active_file_holds_a_user_turn(tmp_path: Path):
@@ -144,29 +117,21 @@ def test_days_since_human_reads_the_archive_when_no_active_file_holds_a_user_tur
     (archive / "sess.000.jsonl").write_text(
         json.dumps(_turn("user", now - timedelta(days=6))) + "\n", encoding="utf-8"
     )
-    store = MemoryStore(":memory:")
-    try:
-        assert days_since_human(store, now, persona_dir=tmp_path) == pytest.approx(6.0, abs=1e-3)
-    finally:
-        store.close()
+    assert days_since_human(now, persona_dir=tmp_path) == pytest.approx(6.0, abs=1e-3)
 
 
 def test_days_since_human_is_999_for_a_missing_folder_and_for_a_folder_where_a_session_file_should_be(tmp_path: Path):
     now = datetime.now(UTC)
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         _conversation_memory(store, created_at=now - timedelta(minutes=1))  # a recent memory is not a signal
-        assert days_since_human(store, now, persona_dir=tmp_path / "missing") == 999.0
+        assert days_since_human(now, persona_dir=tmp_path / "missing") == 999.0
         (tmp_path / "active_conversations" / "s.jsonl").mkdir(parents=True)  # a folder where the file should be
-        assert days_since_human(store, now, persona_dir=tmp_path) == 999.0
+        assert days_since_human(now, persona_dir=tmp_path) == 999.0
     finally:
         store.close()
 
 
 def test_days_since_human_requires_persona_dir():
-    store = MemoryStore(":memory:")
-    try:
-        with pytest.raises(TypeError):
-            days_since_human(store, datetime.now(UTC))  # type: ignore[call-arg]
-    finally:
-        store.close()
+    with pytest.raises(TypeError):
+        days_since_human(datetime.now(UTC))  # type: ignore[call-arg]

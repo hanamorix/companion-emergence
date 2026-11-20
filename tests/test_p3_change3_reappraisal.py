@@ -54,7 +54,7 @@ def test_c3_1_reappraise_updates_existing_row_no_new_row(tmp_path):
     assert store.count(active_only=False) == before_count  # no INSERT — same row count
     # A normal reappraise update does not clobber unrelated fields.
     assert got.content == "Bob's home address is 12 Elm Street"
-    assert got.emotions == {}
+    assert got._stored_emotions == {}
     store.close()
 
 

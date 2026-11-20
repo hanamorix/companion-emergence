@@ -151,7 +151,7 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
 
     Idempotent — re-registering emotions is a no-op. Mirrors the supervisor tick
     load (brain/bridge/supervisor.py ~line 639), but called at bridge startup so
-    the chat path never aggregates with an empty vocab during the ~15-min window
+    the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
@@ -1411,7 +1411,7 @@ def build_app(
             logger.warning("FTS health check skipped: %s", _exc)
 
         # Load the persona emotion vocabulary before any chat request can arrive.
-        # Without this, aggregate_state silently drops all persona-extension
+        # Without this, every reader silently drops all persona-extension
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
         # fires for the first time). Uses a short-lived store — no persistent
         # handle held on app.state per HA hardening rule.

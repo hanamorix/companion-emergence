@@ -128,7 +128,7 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
     # from emotions when present (reusing the OG add_memory auto-importance
     # bucket), else a moderate flat default — migrated history should not
     # start at the bottom of the scale. A numeric-but-oversized OG value
-    # (e.g. 50.0) is clamped, same as every other create_new/Memory(...)
+    # (e.g. 50.0) is clamped, same as every other create_new/from_stored_row
     # boundary (finding #4).
     importance_raw = og.get("importance")
     if isinstance(importance_raw, (int, float)) and not isinstance(importance_raw, bool):
@@ -144,7 +144,7 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
     tags_raw = og.get("tags")
     tags = list(tags_raw) if isinstance(tags_raw, list) else []
 
-    mem = Memory(
+    mem = Memory.from_stored_row(
         id=og_id,
         content=content,
         memory_type=str(og.get("memory_type") or "conversation"),

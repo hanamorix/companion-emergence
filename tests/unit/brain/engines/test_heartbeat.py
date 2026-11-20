@@ -463,7 +463,7 @@ def test_second_tick_leaves_stored_emotions_as_written(live_engine: HeartbeatEng
     reloaded = live_engine.store.get(m.id)
     assert reloaded is not None
     # tenderness has a 7-day half-life: the old per-memory pass dropped it from 5.0 after 48 h.
-    assert reloaded.emotions == {"love": 9.0, "tenderness": 5.0}
+    assert reloaded._stored_emotions == {"love": 9.0, "tenderness": 5.0}
 
 
 def test_dream_gate_respects_config(live_engine: HeartbeatEngine) -> None:
@@ -525,7 +525,7 @@ def test_dry_run_does_not_mutate_store_or_state(live_engine: HeartbeatEngine) ->
     assert not live_engine.state_path.exists()
     reloaded = live_engine.store.get(m.id)
     assert reloaded is not None
-    assert reloaded.emotions.get("love", 0.0) == 9.0
+    assert reloaded._stored_emotions.get("love", 0.0) == 9.0
 
 
 def test_heartbeats_log_has_init_entry(live_engine: HeartbeatEngine) -> None:

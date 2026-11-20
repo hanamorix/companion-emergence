@@ -22,13 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
+from brain.memory.store import MemoryStore
 from brain.utils.llm_output import extract_json_object
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
-    from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -283,8 +284,10 @@ def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
         # F3: cap the search so a high-frequency name doesn't pull all rows.
         candidates = store.search_text(name, limit=10)
         excerpts = []
+        wanted = canonical_name(name)
         for mem in candidates:
-            if name in (mem.emotions or {}):
+            # Names only: a stored emotion whose value is not finite still counts as evidence for its name.
+            if wanted in {canonical_name(n) for n in MemoryStore.stored_emotion_names(mem)}:
                 text = mem.content[:_EXCERPT_CHAR_LIMIT]
                 excerpts.append(text)
                 if len(excerpts) >= _MAX_EXCERPTS_PER_NAME:

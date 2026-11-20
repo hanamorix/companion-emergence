@@ -1,9 +1,9 @@
 """#540: a test's change to the emotion vocabulary registry must not reach the next test.
 
-``vocabulary.register`` (a persona's extension emotions) and the warn-once set of unregistered emotions are
-process-global. Under pytest-xdist the order of tests in a worker is not the order in a file, so a count such as
-"the baseline has 26 emotions" is only stable when every test restores both. The autouse fixture in tests/conftest.py
-does it; these tests run two ordered tests in an inner session to prove it, with a control arm without the fixture.
+``vocabulary.register`` (a persona's extension emotions) is process-global. Under pytest-xdist the order of tests in a
+worker is not the order in a file, so a count such as "the baseline has 26 emotions" is only stable when every test
+restores it. The autouse fixture in tests/conftest.py does it; these tests run two ordered tests in an inner session to
+prove it, with a control arm without the fixture.
 """
 
 from __future__ import annotations
@@ -11,26 +11,22 @@ from __future__ import annotations
 import pytest
 
 _TESTS = '''
-from brain.emotion import aggregate, vocabulary
+from brain.emotion import vocabulary
 from brain.emotion.vocabulary import Emotion
 
 _REGISTRY_ID = id(vocabulary._REGISTRY)
-_WARNED_ID = id(aggregate._warned_unregistered)
 
 
-def test_a_registers_and_warns():
+def test_a_registers():
     vocabulary.register(
         Emotion(name="zz_leak", description="d", category="nell_specific", decay_half_life_days=None, intensity_clamp=10)
     )
-    aggregate._warned_unregistered.add("zz_warned")
     assert vocabulary.get("zz_leak") is not None
 
 
-def test_b_sees_none_of_it_and_the_same_objects():
+def test_b_sees_none_of_it_and_the_same_object():
     assert vocabulary.get("zz_leak") is None
-    assert "zz_warned" not in aggregate._warned_unregistered
     assert id(vocabulary._REGISTRY) == _REGISTRY_ID
-    assert id(aggregate._warned_unregistered) == _WARNED_ID
 '''
 
 

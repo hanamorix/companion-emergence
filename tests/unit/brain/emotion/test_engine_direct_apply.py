@@ -461,7 +461,7 @@ def test_n_creates_in_a_batch_save_once_and_give_the_numbers_n_separate_applies_
     eng = install(batched, NOW)
     with contextlib.closing(MemoryStore(batched / "memories.db")) as store, eng.batch():
         for memory in rows:
-            store.create(row(memory.created_at, emotions=memory.emotions))
+            store.create(row(memory.created_at, emotions=memory._stored_emotions))
         assert saves == []
     assert saves == [0]
     one, other = state_of(separate), state_of(batched)

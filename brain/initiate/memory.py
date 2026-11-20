@@ -114,7 +114,7 @@ def write_initiate_memory(
     record; a missing memory entry degrades ambient recall but isn't fatal.
 
     reach_emotions: optional vocab-filtered emotion vector from reach_emotions_for();
-        applied to the delivered-reach memory so aggregate_state picks it up.
+        applied to the delivered-reach memory so the engine can count them.
         None (default) → no emotions written (back-compat).
     """
     text = render_memory_for_state(subject=subject, message=message, state=state, user_name=user_name, pronouns=pronouns)

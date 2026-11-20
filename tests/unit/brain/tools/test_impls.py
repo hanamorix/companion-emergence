@@ -159,6 +159,46 @@ def test_search_memories_emotion_filter_boosts_matches(tmp_path: Path) -> None:
     assert "grief" in first["emotions"]
 
 
+def test_search_memories_emotion_boost_names_a_non_finite_valued_emotion_without_a_drop_per_candidate(
+    tmp_path: Path, caplog
+) -> None:
+    """A memory whose stored value for the asked emotion is NaN is still boosted, and the boost reads names only.
+
+    Rendering the one returned memory reads its values and logs its own drop; the candidates outside `limit` log none.
+    `create_new` drops non-finite values, so the memories are built the way a loaded row is.
+    """
+    import logging
+    from datetime import UTC, datetime, timedelta
+
+    from brain.tools.impls.search_memories import search_memories
+
+    store = _make_store()
+    hebbian = _make_hebbian()
+    # order="age" makes every match a candidate and sorts newest first, so the boosted row is the oldest: only the boost
+    # can put it first, and the two newer candidates fall outside `limit`.
+    now = datetime.now(UTC)
+    for row_id, emotion, age_days in (("a-other", "joy", 1), ("b-other", "calm", 2), ("c-boosted", "Grief", 3)):
+        store.create(
+            Memory.from_stored_row(
+                id=row_id,
+                content="quiet morning memory",
+                memory_type="event",
+                domain="relationship",
+                created_at=now - timedelta(days=age_days),
+                emotions={emotion: float("nan")},
+            ),
+            fold=False,
+        )
+
+    with caplog.at_level(logging.DEBUG):
+        result = search_memories(
+            "quiet", emotion="grief", limit=1, order="age", store=store, hebbian=hebbian, persona_dir=tmp_path
+        )
+
+    assert [m["id"] for m in result["memories"]] == ["c-boosted"]
+    assert len([r for r in caplog.records if "dropping emotion" in r.getMessage()]) == 1
+
+
 def test_search_memories_limit_caps_results(tmp_path: Path) -> None:
     """limit parameter caps the number of results returned."""
     from brain.tools.impls.search_memories import search_memories

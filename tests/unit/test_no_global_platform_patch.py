@@ -25,11 +25,7 @@ _PATCH = re.compile(
 )
 
 # Files left alone on purpose, each with why.
-_ALLOWED = {
-    # Three patches, left alone: #635 (emotion rework Engine 7) deletes the script this tests along with the test, and
-    # #633/#634 edit that script, so changing it here would only conflict. Remove this entry in #635 with the file.
-    "unit/scripts/test_time_old_emotion_paths_host_line.py",
-}
+_ALLOWED: set[str] = set()
 
 
 def _offenders() -> list[str]:

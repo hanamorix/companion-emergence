@@ -21,7 +21,7 @@ def _old(days):
 def test_lose_removes_edges_and_records_neighbors(tmp_path):
     # Survivor S (high emotion → salience > FADE), victim V (will be LOST).
     store = MemoryStore(tmp_path / "memories.db")
-    store.create(Memory(id="S", content="survivor", memory_type="conversation",
+    store.create(Memory.from_stored_row(id="S", content="survivor", memory_type="conversation",
                         domain="us", created_at=_old(400), importance=10.0,
                         emotions={"love": 9.0}, score=9.0))
     store.create(Memory(id="V", content="victim", memory_type="conversation",

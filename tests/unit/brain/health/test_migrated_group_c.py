@@ -266,7 +266,7 @@ def test_group_c_feed_monologue_and_count_words_survive_bad_lines(tmp_path: Path
         f'{{"speaker": "assistant", "ts": "{NOW.isoformat()}", "text": "one two three"}}\n'.encode()
         + b"garbage\n"
     )
-    assert count_words_in_session(None, persona_dir=pd, session_hours=24, now=NOW + timedelta(hours=1)) == 3
+    assert count_words_in_session(persona_dir=pd, session_hours=24, now=NOW + timedelta(hours=1)) == 3
 
 
 # ---------------------------------------------------------------------------------------------

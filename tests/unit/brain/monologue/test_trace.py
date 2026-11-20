@@ -44,7 +44,7 @@ def test_write_trace_memory_off_stores_the_raw_thought_with_no_feelings(tmp_path
     write_trace_memory(store, "drifting again", feed_digest="a digest", persona_dir=None)
     mem = _trace_candidate(store)
     assert mem.content == "drifting again"
-    assert mem.emotions == {}
+    assert mem._stored_emotions == {}
 
 
 def test_capture_writes_trace_memory_and_surfaced_digest(tmp_path):

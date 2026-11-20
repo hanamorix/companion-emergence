@@ -25,7 +25,7 @@ def test_ingest_item_reaches_the_queue_on_the_zero_to_ten_scale(tmp_path: Path):
     finally:
         store.close()
         hebbian.close()
-    assert [m.emotions for m in queued] == [{"pride": 10.0, "joy": 3.0}]
+    assert [m._stored_emotions for m in queued] == [{"pride": 10.0, "joy": 3.0}]
 
 
 @pytest.mark.no_base_failure(reason="pins the file-commit memory's existing empty feelings")
@@ -47,12 +47,13 @@ def test_file_commit_memory_stores_no_feelings(tmp_path: Path, monkeypatch):
         queued = PendingQueue(persona).read_recent("file_write", limit=5)
     finally:
         store.close()
-    assert [m.emotions for m in queued] == [{}]
+    assert [m._stored_emotions for m in queued] == [{}]
 
 
 def test_grief_breadcrumb_residue_is_held_to_ten(tmp_path: Path):
-    """Dream rows store unclamped sums (switch-off dreams still do), so a dropped memory's strongest feeling can be above 20; the residue the
-    drop breadcrumb carries (half of it) is held to 10."""
+    """Dream rows store unclamped sums (switch-off dreams still do), so a dropped memory's strongest feeling can be above 20. The drop reads
+    the memory through the engine's one read, which holds it to 10 first, so the residue the breadcrumb carries (half of the held feeling)
+    is 5 and never above 10."""
     from brain.grief import handle_drop
     from brain.memory.store import Memory, MemoryStore
 
@@ -64,4 +65,4 @@ def test_grief_breadcrumb_residue_is_held_to_ten(tmp_path: Path):
     finally:
         store.close()
     assert len(crumbs) == 1
-    assert crumbs[0].emotions["desire"] == 10.0
+    assert crumbs[0]._stored_emotions["desire"] == 5.0

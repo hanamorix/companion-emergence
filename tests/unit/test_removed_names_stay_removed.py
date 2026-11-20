@@ -677,10 +677,22 @@ REMOVED: tuple[Removed, ...] = (
     ),
     Removed(
         names=("protected",),
-        why="no production code ever set the flag, so these paths stopped carrying it; the Memory field and the column stay until phase C (the heartbeat check went with the old decay pass, Engine 6 G4)",
-        ref="#672 A2a cleanup",
+        why="no production code ever set the flag, so these paths stopped carrying it (#672); the Memory field, its insert and update went with the old decay pass (#586); only the database column stays",
+        ref="#672 A2a cleanup; #586 Engine 7",
         kind="code",
         scope=("brain/migrator/transform.py", "brain/cli.py", "brain/recovery/source_reader.py"),
+    ),
+    Removed(
+        names=("brain/emotion/aggregate.py",),
+        why="the old max-pool of recent memory rows into a mood; the emotion engine is the one source of a felt state",
+        ref="#586 Engine 7",
+        kind="file",
+    ),
+    Removed(
+        names=("_warned_unregistered",),
+        why="the warn-once set of the deleted aggregate; the engine keeps its own warned-name sets on the engine instance",
+        ref="#586 Engine 7",
+        kind="code",
     ),
     # --- the user's last turn is read in one place (Engine 6 G3) ----------------------------------------------------------
     Removed(
@@ -759,19 +771,34 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 G4 (#584, draft PR #633)",
         kind="code",
     ),
+    # --- one thing reads emotions (the stored feelings of a memory are private to the store and the engine) -------------
+    Removed(
+        names=("_stored_emotions", "_stored_score", "_stored_peak"),
+        why="the private stored feelings of a `Memory` (its emotions, score and highest value as the row holds them, faded by nothing and held by nothing); only the store and the emotion engine may read them, and every other reader asks the engine for `memory_feelings` (faded by age, held to 0-10)",
+        ref="Engine 7 ONE4 (#635)",
+        kind="code",
+        allow=(
+            "brain/emotion/engine.py",
+            "brain/emotion/engine_files.py",
+            "brain/emotion/engine_rebuild.py",
+            "brain/emotion/engine_utils.py",
+            "brain/memory/store.py",
+        ),
+    ),
     # --- the old max-pool aggregate leaves the writers' off branches (B1 PR 7), so Engine 7 can delete it ----------------
     Removed(
-        names=("aggregate_state",),
-        why="the off branches of the dream mood, the monologue trace's feelings and growth's three recent-emotion vectors pooled recent memories with `aggregate_state`; with the engine not reading (not switched over, or the state unreadable) they now take no feelings, and Readers 2 removes every other caller",
-        ref="emotion rework B1 PR 7 (#742), before Engine 7 (#635) deletes brain/emotion/aggregate.py",
+        names=("aggregate_state", "compute_body_state"),
+        why="the old max-pool of recent memory rows into a mood (`aggregate_state`) and the body state computed from it (`compute_body_state`); the emotion engine is the one source of a felt state, the last reader branches went in B1 PR 7 (#742) and Engine 7 deleted brain/emotion/aggregate.py",
+        ref="emotion rework B1 PR 7 (#742) and Engine 7 (#635, #586)",
         kind="code",
-        scope=(
-            "brain/engines/dream.py",
-            "brain/monologue/trace.py",
-            "brain/growth/scheduler.py",
-            "brain/growth/crystallizers/creative_dna.py",
-            "brain/growth/crystallizers/reflex.py",
-        ),
+        scope=("brain", "scripts"),
+    ),
+    Removed(
+        names=("brain.emotion.aggregate",),
+        why="the import path of the deleted aggregate module (see brain/emotion/aggregate.py above); nothing may import it back",
+        ref="emotion rework B1 PR 7 (#742) and Engine 7 (#635, #586)",
+        kind="text",
+        scope=("brain", "scripts"),
     ),
     # --- the own-record test moved to process_identity (Engine 6 HR5, Hana's review of #633 point 5) ---------------------------
     Removed(

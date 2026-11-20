@@ -16,11 +16,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from brain.health.json_io import iter_jsonl
-from brain.memory.store import MemoryStore
 
 
 def count_words_in_session(
-    store: MemoryStore,  # noqa: ARG001 — unused; kept for signature symmetry across body helpers
     *,
     persona_dir: Path,
     session_hours: float,

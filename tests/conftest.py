@@ -634,7 +634,24 @@ class EmotionEngineStub:
         return name in self.high
 
     def faded_value(self, memory: Any, emotion: str) -> float:
-        return self.faded.get((memory.id, emotion), memory.emotions[emotion])
+        """The settable faded value (else the stored one), held to 0-10 as the real `faded_value` holds its result."""
+        from brain.emotion.engine_utils import resolve_emotions
+        from brain.emotion.vocabulary import canonical_name
+
+        value = self.faded.get((memory.id, emotion), memory._stored_emotions[emotion])
+        return resolve_emotions({emotion: value}).get(canonical_name(emotion), 0.0)
+
+    def memory_feelings(self, memory: Any) -> Any:
+        """The real pure read over the memory with each emotion's value replaced by what this stub's `faded_value` answers."""
+        from dataclasses import replace
+
+        from brain.emotion.engine_utils import memory_feelings
+
+        shown = replace(
+            memory,
+            _stored_emotions={name: self.faded_value(memory, name) for name in memory._stored_emotions},
+        )
+        return memory_feelings(shown, None, None, None)
 
     def status(self) -> Any:
         return self.engine_status
@@ -971,19 +988,15 @@ def _tunables_registry_restore() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _vocabulary_registry_restore() -> Iterator[None]:
-    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary) or trigger the
-    warn-once log of an unregistered emotion; neither may reach the next test, whatever worker runs it (#540). Restored IN
-    PLACE (clear + update), never rebound, like ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the
-    dict and set objects themselves."""
-    from brain.emotion import aggregate, vocabulary
+    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary); that may not reach
+    the next test, whatever worker runs it (#540). Restored IN PLACE (clear + update), never rebound, like
+    ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the dict object itself."""
+    from brain.emotion import vocabulary
 
     saved_registry = dict(vocabulary._REGISTRY)
-    saved_warned = set(aggregate._warned_unregistered)
     yield
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
-    aggregate._warned_unregistered.clear()
-    aggregate._warned_unregistered.update(saved_warned)
 
 
 @pytest.fixture(autouse=True)

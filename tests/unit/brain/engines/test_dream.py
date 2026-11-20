@@ -11,6 +11,7 @@ import pytest
 from brain.bridge.chat import ChatMessage, ChatResponse
 from brain.bridge.provider import FakeProvider, LLMProvider
 from brain.emotion import engine as emotion_engine
+from brain.emotion import engine_utils
 from brain.emotion.engine import EmotionEngine
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
@@ -18,7 +19,7 @@ from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
-from tests.unit.brain.emotion._engine_support import make_live
+from tests.unit.brain.emotion._engine_support import half_fade, make_live
 
 
 class _PrefixedFakeProvider(LLMProvider):
@@ -658,8 +659,9 @@ def _go_live(persona_dir: Path, store: MemoryStore, **seed: float) -> EmotionEng
 
 
 def _half_faded(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Until Engine 6, faded_value returns the stored value; halving it tells a faded read from a stored one.
-    monkeypatch.setattr(EmotionEngine, "faded_value", lambda self, memory, emotion: memory.emotions[emotion] * 0.5)
+    # Halving the stored value tells a faded read from a stored one: the engine's per-memory read fades through
+    # `engine_utils.faded_emotion`.
+    monkeypatch.setattr(engine_utils, "faded_emotion", half_fade)
 
 
 def _live_dream_engine(store: MemoryStore, hebbian: HebbianMatrix, persona_dir: Path) -> DreamEngine:
@@ -689,7 +691,7 @@ def test_live_cycle_stores_the_mean_of_faded_values(
 
     # love: the mean of the faded 4 and 2; awe: only the neighbour carries it, faded to 3.
     assert result.memory is not None
-    assert result.memory.emotions == pytest.approx({"love": 3.0, "awe": 3.0})
+    assert result.memory._stored_emotions == pytest.approx({"love": 3.0, "awe": 3.0})
 
 
 def test_live_dream_holds_old_rows_within_range(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
@@ -703,9 +705,9 @@ def test_live_dream_holds_old_rows_within_range(store: MemoryStore, hebbian: Heb
     result = _live_dream_engine(store, hebbian, tmp_path).run_cycle(seed_id=seed.id)
 
     assert result.memory is not None
-    assert all(0.0 <= v <= 10.0 for v in result.memory.emotions.values())
-    assert result.memory.emotions["love"] == 10.0
-    assert result.memory.emotions["tenderness"] == 0.0  # a negative mean is held to 0 and kept, not dropped
+    assert all(0.0 <= v <= 10.0 for v in result.memory._stored_emotions.values())
+    assert result.memory._stored_emotions["love"] == 10.0
+    assert result.memory._stored_emotions["tenderness"] == 0.0 # a negative mean is held to 0 and kept, not dropped
 
 
 def _mood_rows(store: MemoryStore) -> list[Memory]:
