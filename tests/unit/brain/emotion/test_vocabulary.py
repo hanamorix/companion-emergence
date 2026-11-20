@@ -284,3 +284,43 @@ def test_pool_by_canonical_name_leaves_unknown_names_apart() -> None:
 
     # Two spellings of the unknown name share one key; look-alikes of a registered name stay their own keys.
     assert pooled == {unknown: 2.0, "comfort": 3.0, "comfort_seeking_extra": 4.0, "comfort_seeking": 5.0}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Comfort-Seeking", "comfort_seeking"),
+        ("grief_love_blend", "grief_love_blend"),
+        ("love_grief_blend", "grief_love_blend"),
+        ("x" * 100, "x" * 100),
+        ("x" * 101, None),
+        ("Love!!", None),
+        ("", None),
+        ("   ", None),
+        ("comfort seeking", None),
+        ("_joy", None),
+        ("joy2", None),
+        ("日本", None),
+        ("joy\nsorrow", None),
+    ],
+)
+def test_validate_new_name(raw: str, expected: str | None) -> None:
+    assert vocabulary.validate_new_name(raw) == expected
+
+
+def test_register_is_safe_across_threads() -> None:
+    import threading
+
+    before = len(vocabulary.list_all())
+
+    def worker(i: int) -> None:
+        for j in range(25):
+            vocabulary.register(Emotion(f"t{i}_{j}", "thread word", "persona_extension", 1.0))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(vocabulary.list_all()) == before + 200
