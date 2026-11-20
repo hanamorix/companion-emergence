@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from brain.utils.time import format_local
+from brain.works.location import works_db_path
 from brain.works.store import WorksStore
 
 
@@ -15,7 +16,7 @@ def list_works(
     persona_dir: Path,
 ) -> list[dict]:
     """Return up to `limit` recent works as slim dicts (no content)."""
-    db_path = persona_dir / "data" / "works.db"
+    db_path = works_db_path(persona_dir)
     if not db_path.exists():
         return []
     works_list = WorksStore(db_path).list_recent(limit=limit, type=type)

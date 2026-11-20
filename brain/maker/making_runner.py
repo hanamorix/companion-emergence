@@ -14,6 +14,7 @@ from brain.bridge import cli_throttle as _cli_throttle
 from brain.maker import maker as _maker
 from brain.maker.charge import load_charge
 from brain.maker.persist import persist_making
+from brain.works.location import works_db_path
 from brain.works.store import WorksStore
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
         making = _maker.make(provider, charge_sources=sources,
                              emotion_summary=_emotion_summary(store), persona_dir=persona_dir)
 
-    works = WorksStore(persona_dir / "works.db")
+    works = WorksStore(works_db_path(persona_dir))
     try:
         wid = persist_making(persona_dir, works, making, charge_sources=sources, now=now)
     finally:

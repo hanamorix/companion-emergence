@@ -25,7 +25,8 @@ from tests.claude_spawn_guard import (
     no_real_claude_in_ci,  # noqa: F401  (autouse, J11: no real `claude` in CI)
 )
 
-pytest_plugins = ["pytester"]
+# tests.shard: `--shard i/N` splits the suite across CI runners (#746); without the option it does nothing.
+pytest_plugins = ["pytester", "tests.shard"]
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

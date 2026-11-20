@@ -34,7 +34,7 @@ def test_save_work_creates_index_row_and_file(tmp_path: Path) -> None:
     assert "id" in result
     work_id = result["id"]
     assert (persona_dir / "data" / "works" / f"{work_id}.md").exists()
-    assert (persona_dir / "data" / "works.db").exists()
+    assert (persona_dir / "works.db").exists()
 
 
 def test_save_work_rejects_invalid_type(tmp_path: Path) -> None:
