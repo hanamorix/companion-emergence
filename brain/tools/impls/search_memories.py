@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from brain.emotion.engine_utils import memory_feelings
 from brain.emotion.vocabulary import canonical_name
 from brain.memory import keyword_budget, recall_diagnostics
 from brain.memory.hebbian import HebbianMatrix
@@ -440,7 +439,10 @@ def search_memories(
         # Partition: emotion-matching memories first, then the rest.
         # Use id-set membership (O(n)) rather than object identity (O(n²)).
         emotion_key = canonical_name(emotion_lower)
-        boosted = [m for m in candidates if emotion_key in memory_feelings(m, None, None, None).feelings]
+        # Names only: a stored emotion whose value is not finite still names the emotion the memory carries.
+        boosted = [
+            m for m in candidates if emotion_key in {canonical_name(n) for n in MemoryStore.stored_emotion_names(m)}
+        ]
         boosted_ids = {m.id for m in boosted}
         rest = [m for m in candidates if m.id not in boosted_ids]
         ordered = boosted + rest
