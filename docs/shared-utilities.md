@@ -67,10 +67,11 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `fsync_dir` | brain/utils/atomic_write.py:223 | fsync a directory so a new or renamed entry is durable; POSIX only, best effort, never fails a save. |
-| `save_with_backup_text` | brain/utils/atomic_write.py:275 | Atomic raw-text save with a rotating .bak1..N chain; the live path always holds a complete file. |
-| `save_bytes_atomic` | brain/utils/atomic_write.py:318 | Atomic raw-bytes save: unique temp in the same directory, optional mode and fsync, one retried replace, no backup chain. |
-| `save_blob_once` | brain/utils/atomic_write.py:331 | Write a content-addressed blob once; skips if the target exists and tolerates a concurrent writer of the same content (used by images and file_store). |
+| `fsync_dir` | brain/utils/atomic_write.py:224 | fsync a directory so a new or renamed entry is durable; POSIX only, best effort, never fails a save. |
+| `save_with_backup_text` | brain/utils/atomic_write.py:276 | Atomic raw-text save with a rotating .bak1..N chain; the live path always holds a complete file. |
+| `save_bytes_atomic` | brain/utils/atomic_write.py:319 | Atomic raw-bytes save: unique temp in the same directory, optional mode and fsync, one retried replace, no backup chain. |
+| `save_stream_atomic` | brain/utils/atomic_write.py:332 | Atomic save of a payload a callback writes into the temp piece by piece (`write(fh)`), so a large file is never held in memory; same temp, fsync, retried replace and directory fsync as the bytes writer. |
+| `save_blob_once` | brain/utils/atomic_write.py:350 | Write a content-addressed blob once; skips if the target exists and tolerates a concurrent writer of the same content (used by images and file_store). |
 
 ### `brain/utils/file_lock.py`
 
@@ -188,7 +189,15 @@ Storage is UTC everywhere; local time is for display only.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `short_values` | brain/emotion/engine.py:87 | The short average of each feeling in an engine `read()`, as a `{name: short}` dict: the map every reader of how she feels now works from. Use it, do not write the `{name: r.short ...}` comprehension again. |
+| `short_values` | brain/emotion/engine.py:125 | The short average of each feeling in an engine `read()`, as a `{name: short}` dict: the map every reader of how she feels now works from. Use it, do not write the `{name: r.short ...}` comprehension again. |
+| `EmotionEngine.memory_feelings` | brain/emotion/engine.py:843 | A memory's feelings, peak and score with this engine's half-lives, switch-over time and clock (the pure read before the switch-over, when nothing fades). The memory is read, never changed, and no store is read. |
+
+### `brain/emotion/engine_utils.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `memory_feelings` | brain/emotion/engine_utils.py:634 | The one pure read of a memory's feelings, peak and score from a half-life lookup, a switch-over time and a clock; it needs no engine running, and with `switch_over_at` None nothing fades. |
+| `feelings_of` | brain/emotion/engine_utils.py:657 | A memory's feelings through the engine when one is passed, through the pure `memory_feelings` when `eng` is None: the one place that choice is made. `.feelings` is a cached dict shared by every use of the read; copy it before changing it. |
 
 ### `brain/prompt_strings.py`
 
@@ -279,6 +288,13 @@ Live in utils but read the MemoryStore.
 | `days_since_human` | brain/utils/memory.py:14 | Days since the user last spoke (999.0 if never). Reads no memory: it is the days since `brain.ingest.buffer.last_user_turn_ts` (the later of the newest user turn in the active conversation files and in the newest archived session; None if none). The user-presence silence uses the same function. |
 | `is_conversation_derived` | brain/utils/memory.py:41 | True if a memory came from a conversation buffer (conversation tag or `source_summary` starting `conversation:`), plus the legacy type. |
 | `list_conversation_memories` | brain/utils/memory.py:58 | List chat-derived memories, newest first, using the conversation-derived contract. |
+
+### `brain/memory/store.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `Memory.from_stored_row` | brain/memory/store.py:405 | Rebuild a Memory that is not new from a stored row's own values, under public parameter names: the one way (row mapper, `from_dict`, migrator, recovery) so the private stored-field names stay inside the memory store and the emotion engine. `Memory.create_new` is for a new memory. |
+| `MemoryStore.merge_into` | brain/memory/store.py:1414 | Write the consolidation merge's result into the target memory: the merged content and, once the engine is live, the two memories' stored emotions merged, in one `update` call with `fold=False`. Reads stored emotions on purpose, not feelings, so a faded value is not faded twice. |
 
 ### `brain/ingest/buffer.py`
 

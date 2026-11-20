@@ -155,7 +155,7 @@ def test_no_memory_summary_means_no_write(tmp_path):
 def test_live_prompt_asks_for_zero_to_ten():
     from brain.kindled_link.relationship import _build_reflection_prompt
 
-    prompt = _build_reflection_prompt(current_stage="stranger", transcript="peer: hi", live=True)
+    prompt = _build_reflection_prompt(current_stage="stranger", transcript="peer: hi", engine_scale=True)
     assert "0 to 10" in prompt and "small float" not in prompt
 
 
@@ -215,6 +215,76 @@ def test_live_reflection_does_not_charge_the_bucket(tmp_path):
     later = NOW + timedelta(hours=1)
     _live_reflect(tmp_path, _verdict('{"joy": 9}'), now=later, today=later.strftime("%Y-%m-%d"), ms=ms, s=s)
     assert [m._stored_emotions for m in ms.list_by_type("kindled_peer")] == [{"joy": 9.0}, {"joy": 9.0}]
+
+
+# ---- B1 PR 7: the prompt and stored values follow the scale rule (cut 1); the peer cap still follows is_live() ----
+
+
+def test_peer_memory_is_on_the_engine_scale_and_capped_when_switched_over_but_state_unreadable(tmp_path):
+    from brain import dev_constants
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
+
+    ms = MemoryStore(tmp_path / "memories.db")
+    ms.set_x10_progress(dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)
+    _go_live(tmp_path, ms)
+    ruin_the_state(tmp_path)  # switched over, but the engine cannot read: is_live() is False
+    s = KindledLinkStore(tmp_path / "k.db")
+    provider = _P(_verdict('{"joy": 4}'))
+    run_relationship_reflection(
+        store=s, provider=provider, peer_id="kid_a", transcript=_TRANSCRIPT, now=NOW, today=TODAY,
+        throttle=_Grant(), persona_dir=tmp_path, mem_store=ms, persona_name="Nell", session_id="s1",
+    )
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    # 0-10, as the x10 fix has run and nothing would rescale a small value; 4 is 0.4 on the cap's own scale, inside it.
+    assert peer_memory._stored_emotions == pytest.approx({"joy": 4.0})
+    # The engine is not reading, so the anti-love-bomb bucket still caps the peer, charged on its own (old) scale.
+    assert s.get_peer_emotion_accumulated("kid_a", NOW) == pytest.approx(0.4)
+
+
+@pytest.mark.no_base_failure(
+    reason="B1 PR 7 keeps today's behaviour here (the old code asked for 0-10 whenever is_live() was True); it guards the scale rule from undoing that"
+)
+def test_an_engine_that_saw_the_switch_asks_for_zero_to_ten_even_when_the_state_is_lost(tmp_path):
+    # is_live() caches a switch-over it has seen, so it stays True after the state turns unreadable, while a fresh read
+    # of the state cannot tell. The prompt must then match the live branch that parses the answer as 0-10.
+    from brain.emotion.engine import engine_for
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
+
+    ms = MemoryStore(tmp_path / "memories.db")  # progress 0: the accepted edge if the engine had not seen the switch
+    _go_live(tmp_path, ms)
+    assert engine_for(tmp_path).is_live()
+    ruin_the_state(tmp_path)
+    prompts: list[str] = []
+
+    class _Recording(_P):
+        def complete(self, prompt):
+            prompts.append(prompt)
+            return super().complete(prompt)
+
+    run_relationship_reflection(
+        store=KindledLinkStore(tmp_path / "k.db"), provider=_Recording(_verdict('{"joy": 4}')), peer_id="kid_a",
+        transcript=_TRANSCRIPT, now=NOW, today=TODAY, throttle=_Grant(), persona_dir=tmp_path, mem_store=ms,
+        persona_name="Nell", session_id="s1",
+    )
+    assert len(prompts) == 1 and "0 to 10" in prompts[0]
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    assert peer_memory._stored_emotions == {"joy": 4.0}
+
+
+@pytest.mark.no_base_failure(reason="B1 PR 7 pins that a reflection with no persona_dir keeps today's scale; main does too")
+def test_peer_memory_without_a_persona_dir_keeps_todays_scale_even_after_the_x10_fix(tmp_path):
+    from brain import dev_constants
+
+    s = KindledLinkStore(tmp_path / "k.db")
+    ms = MemoryStore(tmp_path / "mem.db")
+    ms.set_x10_progress(dev_constants.NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED)
+    provider = _P(_VERDICT_WITH_MEMORY)
+    run_relationship_reflection(
+        store=s, provider=provider, peer_id="kid_a", transcript=_TRANSCRIPT, now=NOW, today=TODAY,
+        throttle=_Grant(), mem_store=ms, persona_name="Nell", session_id="s1",
+    )
+    [peer_memory] = ms.list_by_type("kindled_peer")
+    assert peer_memory._stored_emotions == pytest.approx({"tenderness": 0.08})
 
 
 @pytest.mark.no_base_failure(reason="pins that a breach seeds no warmth on the live path too (B1 PR 3); main returns early before any write")

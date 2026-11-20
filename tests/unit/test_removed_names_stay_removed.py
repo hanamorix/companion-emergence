@@ -828,6 +828,21 @@ REMOVED: tuple[Removed, ...] = (
         ref="#747 (draft PR #656)",
         scope=("app/src",),
     ),
+    # --- the old max-pool aggregate leaves the writers' off branches (B1 PR 7), so Engine 7 can delete it ----------------
+    Removed(
+        names=("aggregate_state", "compute_body_state"),
+        why="the old max-pool of recent memory rows into a mood (`aggregate_state`) and the body state computed from it (`compute_body_state`); the emotion engine is the one source of a felt state, the last reader branches went in B1 PR 7 (#742) and Engine 7 deleted brain/emotion/aggregate.py",
+        ref="emotion rework B1 PR 7 (#742) and Engine 7 (#635, #586)",
+        kind="code",
+        scope=("brain", "scripts"),
+    ),
+    Removed(
+        names=("brain.emotion.aggregate",),
+        why="the import path of the deleted aggregate module (see brain/emotion/aggregate.py above); nothing may import it back",
+        ref="emotion rework B1 PR 7 (#742) and Engine 7 (#635, #586)",
+        kind="text",
+        scope=("brain", "scripts"),
+    ),
     # --- the own-record test moved to process_identity (Engine 6 HR5, Hana's review of #633 point 5) ---------------------------
     Removed(
         names=("shutdown_progress.names_this_bridge",),

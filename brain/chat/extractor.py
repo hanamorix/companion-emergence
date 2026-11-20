@@ -345,6 +345,8 @@ def apply_side_effects(out: ExtractorOutput, *, persona_dir: Path) -> None:
     """Apply pass-2 outputs to the relevant engines. Best-effort per step."""
     if out.memory_writes:
         _safely("memory_writes", persona_dir, lambda: _apply_memory_writes(out.memory_writes, persona_dir))
+    if out.emotion_delta:
+        _safely("emotion_delta", persona_dir, lambda: _apply_emotion_delta(out.emotion_delta, persona_dir))
     if out.interest_candidate is not None:
         _safely(
             "interest_candidate",
@@ -353,8 +355,6 @@ def apply_side_effects(out: ExtractorOutput, *, persona_dir: Path) -> None:
         )
     if out.crystallisation:
         _safely("crystallisation", persona_dir, lambda: _apply_crystallisation(out.crystallisation, persona_dir))
-    if out.emotion_delta:
-        _safely("emotion_delta", persona_dir, lambda: _apply_emotion_delta(out.emotion_delta, persona_dir))
     if out.reflex_audit:
         _safely("reflex_audit", persona_dir, lambda: _apply_reflex_audit(out.reflex_audit, persona_dir))
 

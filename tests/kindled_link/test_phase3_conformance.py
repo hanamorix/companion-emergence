@@ -91,6 +91,7 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.health.parse_failures",      # #364 parse-failure evidence log — no tool surface (stdlib + jsonl_reader + log_rotation only; relationship.py and privacy_gate.py keep a malformed verdict)
     "brain.utils.file_ops",             # #705: relationship.peer_trust reads the shared stat_path accessor — no tool surface (stdlib plus brain.dev_constants only, which is already allowlisted)
     "brain.emotion.engine",             # emotion rework B1 PR 3: relationship.py reads the switch (engine_for(...).is_live()) — no tool surface; importing it after brain.chat.extractor and brain.memory.store loads no new brain module, so it adds nothing to the reachable set
+    "brain.emotion.write_scale",        # emotion rework B1 PR 7: relationship.py picks the peer values' scale (writes_engine_scale) — no tool surface; it reads the state file and memories.db's x10 progress only, and after brain.emotion.engine and brain.memory.store it loads no new brain module (checked 2026-11-16), so it adds nothing to the reachable set
 }
 
 

@@ -439,6 +439,38 @@ def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:
     assert data["emotions"][0]["description"] == "the weight of it"
 
 
+def test_excerpt_evidence_counts_a_non_finite_valued_emotion_and_logs_no_drop(tmp_path: Path, caplog) -> None:
+    """A memory whose stored value for the name is NaN still names that emotion, so it is evidence and nothing is logged.
+
+    `create_new` drops non-finite values, so the memory is built the way a loaded row is.
+    """
+    import logging
+    from datetime import UTC, datetime
+
+    from brain.health.vocab_repair import _excerpts_for_name
+
+    store = _make_store(tmp_path)
+    try:
+        store.create(
+            Memory.from_stored_row(
+                id="nan-valued-row",
+                content="a long ache_of_nan evening",
+                memory_type="conversation",
+                domain="us",
+                created_at=datetime.now(UTC),
+                emotions={"Ache-Of-Nan": float("nan")},
+            ),
+            fold=False,
+        )
+        with caplog.at_level(logging.DEBUG):
+            excerpts = _excerpts_for_name("ache_of_nan", store)
+    finally:
+        store.close()
+
+    assert excerpts == ["a long ache_of_nan evening"]
+    assert not [r for r in caplog.records if "dropping emotion" in r.getMessage()]
+
+
 def test_repair_warns_when_provider_json_matches_no_stub(tmp_path: Path, caplog) -> None:
     """#173: a parseable reply whose keys match nothing must not fail silently."""
     import logging

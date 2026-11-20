@@ -670,9 +670,8 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
     started = time.perf_counter()
     source, commit = _step_source(db)
     from brain import dev_constants
-    from brain.emotion import engine_utils as eu
     from brain.emotion import vocabulary
-    from brain.memory.store import _row_to_memory
+    from brain.memory.store import MemoryStore, _row_to_memory
     from brain.paths import get_home
 
     scratch = _guarded("copy", lambda: Path(tempfile.mkdtemp(prefix="measure-feels-high-")).resolve())
@@ -689,7 +688,8 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
         ]
         rows = [m for m in rows if m.created_at is not None]
         rows.sort(key=lambda m: m.created_at)
-        with_emotions = sum(1 for m in rows if eu.memory_feelings(m, None, None, None).feelings)
+        # Names only: a row whose stored emotion value is not finite still names an emotion.
+        with_emotions = sum(1 for m in rows if MemoryStore.stored_emotion_names(m))
         first, last = rows[0].created_at.date(), rows[-1].created_at.date()
         dates = [first + timedelta(days=i) for i in range((last - first).days + 1)]
         arcs = reflex_arcs()

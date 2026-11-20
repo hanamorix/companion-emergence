@@ -137,12 +137,17 @@ def _go_live(persona_dir, store):
     make_live(persona_dir, datetime.now(UTC))
 
 
-def _made_emotions(tmp_path, *, live):
+def _made_emotions(tmp_path, *, live, ruin=False, progress=0):
+    """`live` switches the persona over; `ruin` then leaves its state unreadable; `progress` is the x10 fix's note (B1 PR 7)."""
     from brain.maker.charge import MakerCharge, save_charge
+    from tests.unit.brain.emotion._engine_support import ruin_the_state
 
     store = MemoryStore(tmp_path / "memories.db")
+    store.set_x10_progress(progress)
     if live:
         _go_live(tmp_path, store)
+    if ruin:
+        ruin_the_state(tmp_path)
     save_charge(tmp_path, MakerCharge(99.0, "2026-06-14T00:00:00+00:00", None, 0))
     make_and_wire(persona_dir=tmp_path, store=store, provider=_FakeProvider(), now=None)
     store.close()
@@ -161,3 +166,18 @@ def test_make_and_wire_stores_the_nudge_ten_times_when_live(tmp_path):
 
 def test_make_and_wire_keeps_todays_nudge_when_off(tmp_path):
     assert _made_emotions(tmp_path, live=False) == pytest.approx({"pride": 0.12, "tenderness": 0.08})
+
+
+# ---- B1 PR 7: the scale follows the switch-over, then the x10 fix's progress (cut 2: a making goes to the pending queue) ----
+
+
+def test_make_and_wire_is_on_the_engine_scale_when_switched_over_but_state_unreadable(tmp_path):
+    # The queue step has started (progress 2), so nothing multiplies a queued value again: it must be 0-10 already.
+    assert _made_emotions(tmp_path, live=True, ruin=True, progress=2) == pytest.approx({"pride": 1.2, "tenderness": 0.8})
+
+
+@pytest.mark.no_base_failure(reason="B1 PR 7 pins the per-writer cut: a queued making stays small at progress 1; main does too")
+def test_make_and_wire_keeps_todays_scale_while_the_x10_queue_step_has_not_started(tmp_path):
+    # Progress 1: the rows step ran but the queue step has not, and it multiplies the queue, so a 0-10 making would be
+    # multiplied again. This is where a single cut of 1 for every writer would be wrong (ThinkerOfThoughts, #633).
+    assert _made_emotions(tmp_path, live=False, progress=1) == pytest.approx({"pride": 0.12, "tenderness": 0.08})

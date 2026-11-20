@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion import engine as emotion_engine
-from brain.emotion.aggregate import aggregate_state
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
@@ -160,13 +159,6 @@ class DreamEngine:
                 strengthened_edges=edges,
             )
 
-    def _persona_engine(self) -> EmotionEngine | None:
-        """The persona's emotion engine whether or not it is switched on (its read falls back to the pure read while it is
-        off); None when there is no persona_dir. For `feelings_of`, which makes the engine-or-pure choice."""
-        if self.persona_dir is None:
-            return None
-        return emotion_engine.engine_for(self.persona_dir)
-
     def _live_engine(self) -> EmotionEngine | None:
         """The persona's emotion engine when its switch is on; None when off, unknown, or there is no persona_dir."""
         if self.persona_dir is None:
@@ -203,11 +195,18 @@ class DreamEngine:
         # Mood from conversation residue only (not grief breadcrumbs) so a
         # breadcrumb cannot self-set the mood that retrieves it. Live, the mood is
         # the engine's short averages: every counted source, and the engine does not
-        # count a grief_event either. An empty read during a rebuild is accepted.
+        # count a grief_event either. An empty read during a rebuild is accepted. With the engine not reading (no
+        # persona, not switched over, or the state unreadable) the mood is empty, the same as that empty read: the old
+        # aggregate of conversation memories went in B1 PR 7.
         if eng is not None:
             mood = EmotionalState(emotions={name: r.short for name, r in eng.read().items()})
         else:
-            mood = aggregate_state(convo)
+            # Accepted edge (ThinkerOfThoughts, #742): this off path is reached by a start that skipped the switch-over,
+            # or by a saved state that cannot be read, which can last the whole bridge session. An empty mood pools every
+            # candidate, as it does on the live path during a rebuild, and grief breadcrumbs are seed candidates by
+            # design, so a grief breadcrumb can win the seed here: a dream seeded from an important memory, nothing lost.
+            # No grief_event filter on either path.
+            mood = EmotionalState()
         crystallizations = self.soul_store.list_active() if self.soul_store else []
         recent = self._recent_seed_ids(self.refractory_window)
 
@@ -312,10 +311,11 @@ class DreamEngine:
         # 20); the SUM is not clamped, so a vivid "love"-saturated dream may legitimately
         # show love=80 across 8 activated memories. Downstream consumers that need a
         # bounded 0..10 range (e.g. EmotionalState.set) clamp on ingest, not here.
-        eng = self._persona_engine()
-        aggregated_emotions: dict[str, float] = dict(feelings_of(seed, eng).feelings)  # a copy: the read's map is shared
+        # Reached only when the engine is not live (`run_cycle` got None from `_live_engine`), where the engine's own read is
+        # the pure read, so this asks for the pure read (None) rather than looking the engine up again.
+        aggregated_emotions: dict[str, float] = dict(feelings_of(seed, None).feelings)  # a copy: the read's map is shared
         for mem, _ in neighbours:
-            for k, v in feelings_of(mem, eng).feelings.items():
+            for k, v in feelings_of(mem, None).feelings.items():
                 aggregated_emotions[k] = aggregated_emotions.get(k, 0.0) + v
         return aggregated_emotions
 
@@ -405,7 +405,7 @@ class DreamEngine:
                 source="dream",
                 source_id=dream_memory.id,
                 emotional_snapshot=EmotionalSnapshot(
-                    vector=dict(feelings_of(dream_memory, self._persona_engine()).feelings),
+                    vector=dict(feelings_of(dream_memory, None).feelings),  # a row made this instant: the pure read
                     rolling_baseline_mean=0.0,
                     rolling_baseline_stdev=0.0,
                     current_resonance=0.0,
