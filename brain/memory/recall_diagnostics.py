@@ -186,7 +186,7 @@ def _take_pending(key: str) -> list[bytes]:
 
 
 def _write_lines(path: Path, lines: list[bytes]) -> None:
-    # No fsync: this runs on the recall path (I6) and the data is diagnostic. The caller holds the
+    # fsync off: this runs on the recall path (I6) and the data is diagnostic. The caller holds the
     # non-blocking file lock (never-wait contract, S189), so the append takes none of its own.
     append_jsonl(path, b"".join(lines), lock="held", fsync=False)
 
