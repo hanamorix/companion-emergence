@@ -190,9 +190,14 @@ def lock_holder(persona_dir: Path) -> int | None:
     finally:
         os.close(fd)
     try:
-        return int(raw.decode("ascii", "replace").strip())
+        pid = int(raw.decode("ascii", "replace").strip())
     except ValueError:
         return None
+    from brain import process_identity
+
+    # #755: a hand-edited lock can hold a number no process can have; the kill helper passes the holder to
+    # psutil.pid_exists, which raises OverflowError on it.
+    return pid if process_identity.is_pid_number(pid) else None
 
 
 def release_lock(persona_dir: Path, fd: int) -> None:
