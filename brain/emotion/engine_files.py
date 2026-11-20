@@ -1435,7 +1435,8 @@ def _append_line(path_of: Callable[[], Path], event: Event, what: str) -> bool:
     cannot be encoded, or a time that cannot be dated (the path is built inside the guard), gets an ordinary error line here.
     """
     try:
-        written = append_jsonl(path_of(), event_to_json(event), lock="held", on_error="log")
+        # fsync off: the engine's design (section 2.9) chose no fsync per append; asked of ToT on #618's PR.
+        written = append_jsonl(path_of(), event_to_json(event), lock="held", fsync=False, on_error="log")
     except (ValueError, TypeError, OverflowError, OSError) as exc:
         logger.error("emotion %s: an event at %s was not recorded (%s: %s)", what, event.at, type(exc).__name__, exc)
         return False

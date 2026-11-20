@@ -27,6 +27,7 @@ import threading
 from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
+from typing import BinaryIO
 
 from brain.utils.file_ops import replace_file, retry_transient
 
@@ -331,6 +332,32 @@ def save_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None, fsync
     archive.
     """
     write_temp = partial(_write_temp_file, payload=data, mode=mode, fsync=fsync)
+    _save_payload(path, write_temp, fsync=fsync)
+
+
+def save_stream_atomic(
+    path: Path, write: Callable[[BinaryIO], None], *, mode: int | None = None, fsync: bool = True
+) -> None:
+    """Atomic save of a payload produced by ``write(fh)``: the streaming variant of :func:`save_bytes_atomic`.
+
+    ``write`` fills the save's own temp (opened ``"wb"``, created with ``mode`` when given, as in
+    :func:`save_bytes_atomic`) piece by piece, so a large file is never held in memory; the temp is then flushed,
+    fsynced when ``fsync``, and published with the same retried replace and directory fsync. A failure (including one
+    raised by ``write``) leaves ``path`` as it was and removes the temp.
+    """
+
+    def write_temp(new_path: Path) -> None:
+        if mode is None:
+            new_file = new_path.open("wb")
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            new_file = os.fdopen(os.open(new_path, flags, mode), "wb")
+        with new_file as f:
+            write(f)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+
     _save_payload(path, write_temp, fsync=fsync)
 
 
