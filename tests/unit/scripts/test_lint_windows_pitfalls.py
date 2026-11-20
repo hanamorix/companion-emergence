@@ -11,6 +11,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[3]
 _SCRIPT = REPO / "scripts" / "lint_windows_pitfalls.py"
 
@@ -26,8 +28,26 @@ def _load():
 lint = _load()
 
 
-def test_brain_tree_has_no_unreviewed_windows_pitfalls() -> None:
-    assert lint.scan() == []
+@pytest.fixture(scope="module")
+def real_findings() -> list[str]:
+    """The lint's findings on the real brain/ tree, scanned once in setup: reading and parsing the whole tree costs
+    0.5 to 1.8 s of CPU on CI and grows with the tree, which belongs to no one test (the call-phase budget, #665)."""
+    return lint.scan()
+
+
+def test_brain_tree_has_no_unreviewed_windows_pitfalls(real_findings) -> None:
+    assert real_findings == []
+
+
+def test_the_real_tree_is_scanned_in_setup_not_in_the_budgeted_call(monkeypatch) -> None:
+    """#665: the scan reads and parses all of brain/ (0.5 to 1.8 s of CPU on CI, growing with the tree) and failed the
+    2 s call-phase budget three times in a week. Setup is not budgeted, so the scan belongs in a module fixture, as the
+    single-writer guard's does (#610); the test itself only checks the result."""
+    def scanned_in_the_call(*args, **kwargs):
+        raise AssertionError("the test called lint.scan() itself, in its budgeted call phase")
+
+    monkeypatch.setattr(lint, "scan", scanned_in_the_call)
+    test_brain_tree_has_no_unreviewed_windows_pitfalls(real_findings=[])
 
 
 def _tree(tmp_path: Path, source: str) -> Path:
