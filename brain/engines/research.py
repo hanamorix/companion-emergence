@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain import prompt_strings
+from brain import dev_constants, prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
@@ -27,6 +27,7 @@ from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
 from brain.utils.llm_output import extract_json_object
 from brain.utils.memory import days_since_human
+from brain.utils.spline import monotone_spline
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,16 @@ _RENDER_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
 _RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE = prompt_strings.register_segments(
     "engines.research.render_system_prompt_segments_live"
 )
+
+
+def opposing_threshold(opp: float) -> float:
+    """The value a high opening feeling must be strictly above for the research gate, given `opp`.
+
+    `opp` is the highest plain value (0-10) among the opposing feelings in the read (0 when none is present). The answer is
+    the monotone cubic curve through `dev_constants.RESEARCH_GATE_OPPOSING_CURVE`, built at call time (seven points cost
+    almost nothing). The gate, its tests and `scripts/measure_feels_high_thresholds.py` all call this one function.
+    """
+    return monotone_spline(dev_constants.RESEARCH_GATE_OPPOSING_CURVE)(opp)
 
 
 def _compute_topic_overlap_via_haiku(
@@ -194,7 +205,7 @@ class ResearchEngine:
                 evaluated_at=now,
             )
 
-        # Gate: need a trigger signal (days-since-human or emotion-peak).
+        # Gate: need a trigger signal (days-since-human, or the feeling half below).
         days_since = (
             days_since_human_override
             if days_since_human_override is not None
@@ -215,8 +226,15 @@ class ResearchEngine:
             # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
             emo_state = EmotionalState(emotions=engine.short_values(live_engine.read()))
 
-        # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
-        emotion_gate = any(live_engine.feels_high(name) for name in emo_state.emotions)
+        # The feeling half: an opening feeling (any name in the read that is not in RESEARCH_GATE_OPPOSING_FEELINGS) opens it when
+        # the engine calls it high (`live_engine.feels_high`) and its plain value is strictly above `opposing_threshold(opp)`,
+        # where opp is the highest value among the opposing feelings in the read (0 when none). Opposing feelings never open it.
+        opposing = dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS
+        threshold = opposing_threshold(max((emo_state.emotions.get(n, 0.0) for n in opposing), default=0.0))
+        emotion_gate = any(
+            name not in opposing and value > threshold and live_engine.feels_high(name)
+            for name, value in emo_state.emotions.items()
+        )
 
         gate_ok = days_since >= self.research_days_since_human_min or emotion_gate
         if not gate_ok:

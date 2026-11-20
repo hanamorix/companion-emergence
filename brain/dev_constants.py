@@ -515,6 +515,21 @@ FEELS_HIGH_RANGE_FRACTION: float = 0.5
 # 0.1 to 0.5, which the plateau rule does not count. The follow-up that makes the floor self-calibrating for a mature kindled
 # is #661. Read at call time, inside `engine_utils.feels_high_from`.
 FEELS_HIGH_FLOOR: float = 1.0
+# The research gate's feeling half (`brain.engines.research.ResearchEngine.run_tick`): feelings that oppose research never open
+# it themselves, and the highest of them raises the bar every other high feeling must clear. Both constants were picked by the
+# owner on 2026-11-20 (ledger S18, S22, S24): the four names, and the seven (opposing value, threshold) points of a monotone
+# cubic curve through them (`brain.utils.spline.monotone_spline`, evaluated by `brain.engines.research.opposing_threshold`).
+# With no opposing feeling present the threshold is 0 and `engine.feels_high` alone decides. Read at call time.
+RESEARCH_GATE_OPPOSING_FEELINGS: frozenset[str] = frozenset({"shame", "comfort_seeking", "rest_need", "grief"})
+RESEARCH_GATE_OPPOSING_CURVE: tuple[tuple[float, float], ...] = (
+    (0.0, 0.0),
+    (1.0, 4.0),
+    (2.0, 5.0),
+    (3.0, 5.3),
+    (5.0, 5.8),
+    (7.0, 6.5),
+    (10.0, 8.0),
+)
 # Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
 # `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
 # replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
