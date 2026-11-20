@@ -97,11 +97,11 @@ def test_only_the_currently_running_job_is_published_not_the_whole_due_set(tmp_p
         seen.append(background_jobs.snapshot())
 
     job_a = GatedJob("session_snapshot_prune", run=run_a, has_work=lambda: True)
-    job_b = GatedJob("emotion_backfill", run=run_b, has_work=lambda: True)
+    job_b = GatedJob("research_recovery", run=run_b, has_work=lambda: True)
 
     _pass(tmp_path, [job_b, job_a])  # order_jobs sorts into GATED_JOB_ORDER
 
-    assert seen == [["session_snapshot_prune"], ["emotion_backfill"]]
+    assert seen == [["session_snapshot_prune"], ["research_recovery"]]
     assert background_jobs.snapshot() == []
 
 

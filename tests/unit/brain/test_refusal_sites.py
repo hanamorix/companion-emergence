@@ -640,29 +640,6 @@ def test_soul_review_refusal_after_a_decision_keeps_that_decision(persona):
     assert rows["cand-1"] == _candidate(1)
 
 
-# ---------------------------------------------------------------- emotion backfill
-
-
-@pytest.mark.parametrize("kind", REFUSALS)
-def test_emotion_backfill_refusal_leaves_state_cursor_and_budget(persona, kind):
-    from brain.ingest import emotion_backfill
-    from brain.memory.store import Memory, MemoryStore
-
-    budget = emotion_backfill._budget_path(persona)
-    store = MemoryStore(persona / "memories.db", integrity_check=False)
-    try:
-        for i in range(3):
-            store.create(Memory.create_new(content=f"memory {i}", memory_type="conversation", domain="us"))
-        prov = Refusing(kind, persona)
-        with pytest.raises(_refused_type(kind)):
-            emotion_backfill.run_emotion_backfill(persona, provider=prov, store=store, delay_s=0)
-    finally:
-        store.close()
-    assert prov.calls == 1
-    assert not budget.exists()  # the refused call was not charged
-    _assert_unchanged(prov)
-
-
 # ---------------------------------------------------------------- self-model articulation
 
 

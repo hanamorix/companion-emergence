@@ -119,17 +119,17 @@ def test_merge_emotions_lives_in_the_store():
     assert _merge_emotions({"trust": 4, "joy": 7}, {"awe": 6, "Joy": 5}) == {"trust": 4.0, "joy": 6.0, "awe": 6.0}
 
 
-def test_the_backfill_probe_and_emptiness_check_are_store_methods(tmp_path: Path):
+@pytest.mark.no_base_failure(
+    reason="the old test of this predicate lost its other half (the deleted probe) and was renamed; the predicate existed and behaves the same on base"
+)
+def test_the_emptiness_check_is_a_store_method(tmp_path: Path):
     store = MemoryStore(tmp_path / "memories.db")
     try:
-        assert store.has_active_without_emotions() is False  # no rows
         with_feelings = Memory.create_new(content="a", memory_type="conversation", domain="us", emotions={"joy": 4.0})
         store.create(with_feelings, fold=False)
-        assert store.has_active_without_emotions() is False
         assert store.has_stored_emotions(with_feelings) is True
         bare = Memory.create_new(content="b", memory_type="conversation", domain="us")
         store.create(bare, fold=False)
-        assert store.has_active_without_emotions() is True
         assert store.has_stored_emotions(bare) is False
     finally:
         store.close()

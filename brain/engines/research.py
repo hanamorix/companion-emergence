@@ -17,6 +17,7 @@ from brain import prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
+from brain.engines.heartbeat import HeartbeatConfig
 from brain.engines.research_notes import append_session_notes, read_notes_tail
 from brain.engines.research_session import extract_felt_lines, parse_session_output
 from brain.health.json_io import Recovery, read_json_result, write_json
@@ -156,6 +157,8 @@ class ResearchEngine:
 
     pull_threshold: float = 6.0
     cooldown_hours: float = 24.0
+    # The persona's `research_days_since_human_min` (HeartbeatConfig): its callers pass it; the default is the config's own.
+    research_days_since_human_min: float = HeartbeatConfig.research_days_since_human_min
 
     def run_tick(
         self,
@@ -215,10 +218,7 @@ class ResearchEngine:
         # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
         emotion_gate = any(live_engine.feels_high(name) for name in emo_state.emotions)
 
-        gate_ok = (
-            days_since >= 1.5  # research_days_since_human_min default
-            or emotion_gate
-        )
+        gate_ok = days_since >= self.research_days_since_human_min or emotion_gate
         if not gate_ok:
             return ResearchResult(
                 fired=None,

@@ -16,15 +16,25 @@ def test_extract_subtracts_framework_baseline():
 
 
 def test_extract_canonical_nell_specific():
-    """Memory with body_grief → canonical entry with proper description + decay."""
-    memories = [{"emotions": {"body_grief": 6.0}}]
+    """Memory with anchor_pull → canonical entry with proper description + decay."""
+    memories = [{"emotions": {"anchor_pull": 6.0}}]
     result = extract_persona_vocabulary(memories, framework_baseline_names={"love"})
     assert len(result) == 1
     entry = result[0]
-    assert entry["name"] == "body_grief"
+    assert entry["name"] == "anchor_pull"
     assert entry["category"] == "persona_extension"
     assert entry["decay_half_life_days"] is None  # identity-level
-    assert "physical form" in entry["description"]
+    assert "gravitational draw" in entry["description"]
+
+
+def test_extract_body_grief_is_an_ordinary_feeling_with_a_placeholder():
+    """`body_grief` is not predefined (#652): a memory that carries it registers it like any unknown name."""
+    result = extract_persona_vocabulary([{"emotions": {"body_grief": 6.0}}], framework_baseline_names={"love"})
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["name"] == "body_grief"
+    assert entry["decay_half_life_days"] == 14.0
+    assert "migrated from OG" in entry["description"]
 
 
 def test_extract_unknown_emotion_uses_placeholder():
@@ -42,7 +52,7 @@ def test_extract_unknown_emotion_uses_placeholder():
 def test_extract_sorted_deterministic():
     """Result sorted by name for diff-friendly output."""
     memories = [
-        {"emotions": {"freedom_ache": 5.0, "anchor_pull": 6.0, "body_grief": 7.0}},
+        {"emotions": {"freedom_ache": 5.0, "anchor_pull": 6.0, "emergence": 7.0}},
     ]
     result = extract_persona_vocabulary(memories, framework_baseline_names=set())
     names = [e["name"] for e in result]
@@ -57,7 +67,7 @@ def test_extract_empty_memories():
 
 def test_extract_memory_without_emotions_dict():
     """Memory without 'emotions' key → silently skipped (defensive)."""
-    memories = [{"content": "no emotions"}, {"emotions": {"body_grief": 5.0}}]
+    memories = [{"content": "no emotions"}, {"emotions": {"emergence": 5.0}}]
     result = extract_persona_vocabulary(memories, framework_baseline_names=set())
     assert len(result) == 1
-    assert result[0]["name"] == "body_grief"
+    assert result[0]["name"] == "emergence"

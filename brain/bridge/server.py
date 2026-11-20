@@ -86,6 +86,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
+from brain.emotion import vocabulary_swap
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -1420,6 +1421,12 @@ def build_app(
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
             _vocab_store.close()
+
+        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648). A start that needs a
+        # rebuild has already run it in the rebuild child (`_supervisor_rebuild_handler`), right before that rebuild; this call covers
+        # a start that needs none and a bridge started around the supervisor. The marker makes the second run a no-op. Fail-soft: it
+        # logs and never raises.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
 
         # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
         # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.

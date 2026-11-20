@@ -828,14 +828,19 @@ def test_a_deferred_real_haiku_classifier_does_not_promote_unclassified(persona,
     _enqueue(queue, A, B, C)
     provider = _DeferringProvider(refuse="bravo")
 
+    no_tagger = lambda _m: {}  # noqa: E731 — the provider's calls counted below are the judge's only
     with caplog.at_level(logging.INFO):
-        result = run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+        result = run_consolidation(
+            store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser, emotion_tagger=no_tagger
+        )
 
     assert _contents(store) == [A]
     assert sorted(_label(e) for e in _unsettled(tmp)) == sorted([B, C])
     assert result.failed == 0
     provider.refuse = "nothing-matches-this"
-    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+    run_consolidation(
+        store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser, emotion_tagger=no_tagger
+    )
     assert _contents(store) == sorted([A, B, C])
     assert len(provider.calls) == 4
 

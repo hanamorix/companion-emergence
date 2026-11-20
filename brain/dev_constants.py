@@ -64,7 +64,7 @@ KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 # answers `half_life(name)` from the persona's own vocabulary file first, then
 # this table, then EMOTION_DEFAULT_HALF_LIFE_DAYS. Keys are canonical names
 # (`vocabulary.canonical_name`). Emotions the old vocabulary stored as "never
-# fades" and that have no entry here (body_grief, anchor_pull, freedom_ache) take
+# fades" and that have no entry here (anchor_pull, freedom_ache) take
 # the default; love and belonging are given their long half-lives here.
 EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "love": 730.0,
@@ -95,6 +95,13 @@ EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "rest_need": 0.75,
     "emergence": 60.0,
     "creative_hunger": 5.0,
+    # The four feelings of #648 (contentment and its three flavours). Their half-lives are written only here: the four
+    # `brain.emotion.vocabulary._BASELINE` entries read them from this table. The owner set them: contentment one day,
+    # peace and calm four hours each, groundedness two days.
+    "contentment": 1.0,
+    "peace": 4.0 / 24.0,
+    "calm": 4.0 / 24.0,
+    "groundedness": 2.0,
 }
 # The half-life of an emotion that is in neither the persona's vocabulary file nor the table above.
 EMOTION_DEFAULT_HALF_LIFE_DAYS: float = 14.0

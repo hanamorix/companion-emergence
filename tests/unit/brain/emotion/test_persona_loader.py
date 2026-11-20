@@ -199,7 +199,7 @@ def test_load_corrupt_no_bak_with_store_reconstructs_from_memories(tmp_path: Pat
                 content="x",
                 memory_type="conversation",
                 domain="us",
-                emotions={"love": 9.0, "body_grief": 5.0},
+                emotions={"love": 9.0, "emergence": 5.0},
             )
         )
         store.create(
@@ -212,7 +212,7 @@ def test_load_corrupt_no_bak_with_store_reconstructs_from_memories(tmp_path: Pat
         )
 
         # Pre-cleanup so the test is repeatable
-        _cleanup_emotion("body_grief")
+        _cleanup_emotion("emergence")
         _cleanup_emotion("creative_hunger")
 
         # Corrupt the vocabulary file (no .bak alongside)
@@ -230,20 +230,20 @@ def test_load_corrupt_no_bak_with_store_reconstructs_from_memories(tmp_path: Pat
         on_disk = json.loads(vocab_path.read_text(encoding="utf-8"))
         names = {e["name"] for e in on_disk["emotions"]}
         assert "love" in names  # baseline
-        assert "body_grief" in names  # reconstructed extension
+        assert "emergence" in names  # reconstructed extension
         assert "creative_hunger" in names  # reconstructed extension
 
         # Reconstructed extensions registered + count > 0
         assert count > 0
-        assert vocabulary.get("body_grief") is not None
+        assert vocabulary.get("emergence") is not None
         assert vocabulary.get("creative_hunger") is not None
         # Persona-extension entries carry the placeholder description
-        body_grief = vocabulary.get("body_grief")
-        assert body_grief is not None
-        assert "reconstructed from memory" in body_grief.description
+        emergence = vocabulary.get("emergence")
+        assert emergence is not None
+        assert "reconstructed from memory" in emergence.description
     finally:
         store.close()
-        _cleanup_emotion("body_grief")
+        _cleanup_emotion("emergence")
         _cleanup_emotion("creative_hunger")
 
 
@@ -276,21 +276,21 @@ def test_missing_file_with_store_reconstructs_referenced_emotion(tmp_path: Path,
                 content="x",
                 memory_type="conversation",
                 domain="us",
-                emotions={"body_grief": 5.0},
+                emotions={"emergence": 5.0},
             )
         )
-        _cleanup_emotion("body_grief")  # clean registry for a meaningful assertion
+        _cleanup_emotion("emergence")  # clean registry for a meaningful assertion
 
         with caplog.at_level(logging.WARNING, logger="brain.emotion.persona_loader"):
             result = load_persona_vocabulary(tmp_path / "missing.json", store=store)
 
         assert result >= 1
-        assert vocabulary.get("body_grief") is not None
+        assert vocabulary.get("emergence") is not None
         # The misdirecting OG-migrate remediation no longer fires for this path.
         assert not any("nell migrate" in r.message for r in caplog.records)
     finally:
         store.close()
-        _cleanup_emotion("body_grief")
+        _cleanup_emotion("emergence")
 
 
 def test_read_only_with_a_store_is_refused(tmp_path: Path):
