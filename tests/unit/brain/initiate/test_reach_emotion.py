@@ -45,4 +45,4 @@ def test_all_channels_are_registered():
 def test_reach_emotions_live_are_ten_times():
     import pytest
 
-    assert reach_emotions_for("dream", live=True) == pytest.approx({"tenderness": 1.5, "vulnerability": 1.0})
+    assert reach_emotions_for("dream", engine_scale=True) == pytest.approx({"tenderness": 1.5, "vulnerability": 1.0})

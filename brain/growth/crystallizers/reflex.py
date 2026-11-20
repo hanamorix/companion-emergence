@@ -508,34 +508,21 @@ def _aggregate_recent_emotion_vector(
     persona_dir: Path,
     look_back_days: int = 7,
 ) -> dict[str, float]:
-    """Return a max-pooled emotion vector across recent active memories.
+    """Return her recent emotion vector: the emotion engine's short averages above 0. Context only.
 
     Used by crystallizers to give their initiate candidates a real
-    emotional context — what's been alive in the persona over the
-    last week, not a moment-in-time felt state. Empty dict on any
-    failure (the emit candidate just carries no vector — better than
-    a zero-filled lie). Once the emotion engine is live, its short
-    averages above 0 instead.
+    emotional context. Empty while the engine is not reading (not switched
+    over, or its state cannot be read), and on any failure: the emit
+    candidate just carries no vector, better than a zero-filled lie. The
+    old max-pool of recent memories went in emotion rework B1 PR 7.
     """
     try:
         from brain.emotion.engine import engine_for
 
         eng = engine_for(persona_dir)
-        if eng.is_live():
-            # Once the engine is live: her short averages above 0. Context only.
-            return {name: r.short for name, r in eng.read().items() if r.short > 0}
-        from brain.emotion.aggregate import aggregate_state
-
-        cutoff = now - timedelta(days=look_back_days)
-        recent: list[Any] = []
-        for mtype in _CONVERSATION_TYPES:
-            for mem in store.list_by_type(mtype, active_only=True):
-                if mem.created_at >= cutoff and mem.emotions:
-                    recent.append(mem)
-        if not recent:
+        if not eng.is_live():
             return {}
-        state = aggregate_state(recent)
-        return dict(state.emotions)
+        return {name: r.short for name, r in eng.read().items() if r.short > 0}
     except Exception as exc:  # noqa: BLE001
         logger.warning("reflex: recent-emotion aggregation failed: %s", exc)
         return {}

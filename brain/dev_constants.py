@@ -472,6 +472,9 @@ KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD = KINDLED_LINK_MIN_SEND_DEBIT
 
 # Per-peer emotion influence cap (parent §14.3, anti love-bomb). Cumulative
 # influence within a rolling window decays linearly to zero over the window.
+# Its numbers are on the small scale (values below 1, as peer feelings were
+# stored before the engine's 0-10): a 0-10 value goes through it at a tenth
+# (relationship.py's engine-scale branch when the engine is not reading).
 KINDLED_LINK_PEER_EMOTION_WINDOW_CAP = 0.6
 KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
 
