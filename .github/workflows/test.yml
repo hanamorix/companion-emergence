@@ -163,13 +163,15 @@ jobs:
   # own fresh seed. A manual run stays one unsharded job in `python` above. To reproduce a red shard, run its seed with
   # the same `--shard i/N`.
   python-windows:
-    name: python windows-latest (${{ matrix.shard }}/4)
+    name: python windows-latest (${{ matrix.shard }}/5)
     if: github.event_name != 'workflow_dispatch'
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # Five, measured on #774: four shards took 11.0 to 12.5 minutes against macOS's 11.6. More xdist workers do not
+        # help here (4 workers on the 4-vCPU runner took 33.2 minutes for the whole suite, as 2 did).
+        shard: [1, 2, 3, 4, 5]
     runs-on: windows-latest
 
     steps:
@@ -190,13 +192,13 @@ jobs:
       - name: Run pytest
         env:
           KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
-        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml --shard=${{ matrix.shard }}/4
+        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml --shard=${{ matrix.shard }}/5
 
       - name: Upload pytest junit report
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: pytest-junit-windows-latest-${{ matrix.shard }}-of-4
+          name: pytest-junit-windows-latest-${{ matrix.shard }}-of-5
           path: pytest-junit.xml
           if-no-files-found: warn
 
@@ -204,7 +206,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: slow-budget-cpu-windows-latest-${{ matrix.shard }}-of-4
+          name: slow-budget-cpu-windows-latest-${{ matrix.shard }}-of-5
           path: slow-budget-cpu.jsonl
           if-no-files-found: ignore
 

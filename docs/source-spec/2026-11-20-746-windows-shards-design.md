@@ -58,7 +58,11 @@ Hana picked A on 2026-11-20.
   - Ruff runs once, in `python`.
 - **`python windows-latest`** needs `python-windows` and runs `if: always()`. It passes only when every shard passed.
 
-N and the worker count (`-n auto` or `-n logical`) are chosen from a 4-worker measurement run (#746 work log), then checked on this PR's own CI.
+N and the worker count were chosen by measurement:
+
+- **Workers.** A full-suite Windows run on main with 4 workers took 33.2 minutes, the same as with 2 (32 to 35). So the shards keep `-n auto`.
+- **Shard count.** This PR's first CI run used 4 shards. They took 11.0 to 12.5 minutes, against 11.6 for macOS, not clearly under it. So there are 5.
+- **Coverage.** That run's four junit reports together held exactly main's Windows test set plus this PR's 15 new tests. None was missing or repeated (one id was seen twice, but it is a module-level skip entry each shard reports when it collects that module, not a test).
 
 ## Wiring
 

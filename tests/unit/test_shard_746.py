@@ -120,8 +120,9 @@ def test_run_through_pytest_the_recorded_timings_balance_the_shards(pytester, mo
 
 @_TEST_INFRA
 def test_the_suite_itself_offers_the_shard_option(pytestconfig):
-    """CI passes `--shard i/N` to the real suite, so tests/conftest.py must load the plugin."""
-    assert pytestconfig.getoption("--shard", default="missing") is None
+    """CI passes `--shard i/N` to the real suite, so tests/conftest.py must load the plugin. (Its value is the running
+    shard in CI and None elsewhere; only an unregistered option gives back the default.)"""
+    assert pytestconfig.getoption("--shard", default="missing") != "missing"
 
 
 def _collected(result) -> list[str]:
