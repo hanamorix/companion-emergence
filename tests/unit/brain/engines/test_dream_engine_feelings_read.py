@@ -1,7 +1,8 @@
 """The dream sites read a memory's feelings through the one read (Engine 7 ONE5 item 4).
 
-A `DreamEngine` with a persona directory asks the persona's engine (faded values once switched over); one without asks the pure
-read. `dream_seeds` stays pure: it takes the live engine (or None for the pure read) as `eng`.
+The dream row's off-path sum (`_stored_sums`, reached only when the engine is not live) and the initiate snapshot vector of the new
+dream row both take the pure read, with no engine lookup, whether or not the `DreamEngine` has a persona directory. `dream_seeds`
+stays pure: it takes the live engine (or None for the pure read) as `eng`.
 """
 
 from __future__ import annotations
@@ -68,28 +69,38 @@ def test_select_seed_ranks_by_the_engine_read_it_is_given():
     assert dream_seeds.select_seed(cands, mood, [], recent_seed_ids=[], eng=inverted).id == "g2"
 
 
-def test_a_dream_engine_with_a_persona_dir_reads_through_the_persona_engine(tmp_path: Path, emotion_engine_stub):
-    emotion_engine_stub.faded = {("a", "joy"): 3.0, ("b", "joy"): 4.0}
+def _engine_lookup_fails(monkeypatch) -> None:
+    """Any `engine_for` call fails the test: the sites under test must not look the engine up."""
+
+    def _no_lookup(persona_dir):
+        raise AssertionError("the emotion engine was looked up")
+
+    monkeypatch.setattr(emotion_engine, "engine_for", _no_lookup)
+
+
+def test_the_off_path_dream_sum_is_the_pure_read_with_no_engine_lookup(tmp_path: Path, emotion_engine_stub, monkeypatch):
+    emotion_engine_stub.faded = {("a", "joy"): 3.0, ("b", "joy"): 4.0}  # would show if the engine were asked
+    _engine_lookup_fails(monkeypatch)
     engine = _engine(tmp_path, persona_dir=tmp_path)
     try:
         seed, neighbour = _mem("a", emotions={"joy": 9.0}), _mem("b", emotions={"joy": 8.0})
-        assert feelings_of(seed, emotion_engine.engine_for(tmp_path)).feelings == {"joy": 3.0}
         dream = engine._write_dream_memory(seed, [(neighbour, 1.0)], "DREAM: x", eng=None)
-        assert dream._stored_emotions == {"joy": 7.0}  # the off-path sum of the engine's read values, not 9 + 8
+        assert dream._stored_emotions == {"joy": 17.0}  # the pure read's sum, 9 + 8, not the stub's 3 + 4
     finally:
         engine.store.close()
 
 
-def test_the_initiate_snapshot_vector_is_the_engine_read_of_the_dream_row(tmp_path: Path, emotion_engine_stub, monkeypatch):
+def test_the_initiate_snapshot_vector_is_the_pure_read_of_the_dream_row(tmp_path: Path, emotion_engine_stub, monkeypatch):
     from brain.initiate import emit
 
-    emotion_engine_stub.faded = {("d", "joy"): 2.5}
+    emotion_engine_stub.faded = {("d", "joy"): 2.5}  # would show if the engine were asked
+    _engine_lookup_fails(monkeypatch)
     seen = []
     monkeypatch.setattr(emit, "emit_initiate_candidate", lambda *a, **k: seen.append(k["emotional_snapshot"]))
     engine = _engine(tmp_path, persona_dir=tmp_path)
     try:
-        engine._emit_initiate_candidate(_mem("s", emotions={}), [], _mem("d", emotions={"joy": 9.0}))
-        assert [snap.vector for snap in seen] == [{"joy": 2.5}]
+        engine._emit_initiate_candidate(_mem("s", emotions={}), [], _mem("d", emotions={"joy": 9.0, "grief": 12.0}))
+        assert [snap.vector for snap in seen] == [{"joy": 9.0, "grief": 10.0}]  # the pure read, held to 10
     finally:
         engine.store.close()
 
