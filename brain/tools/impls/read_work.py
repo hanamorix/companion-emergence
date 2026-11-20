@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from brain.utils.time import format_local
+from brain.works.location import works_db_path
 from brain.works.storage import read_markdown
 from brain.works.store import WorksStore
 
@@ -14,7 +15,7 @@ def read_work(id: str, *, persona_dir: Path) -> dict:
 
     Returns {"error": "..."} if the work is unknown or the file is missing.
     """
-    db_path = persona_dir / "data" / "works.db"
+    db_path = works_db_path(persona_dir)
     if not db_path.exists():
         return {"error": f"no works.db for persona at {persona_dir}"}
     work = WorksStore(db_path).get(id)

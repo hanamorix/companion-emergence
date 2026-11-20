@@ -17,10 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 def surface_makings(*, persona_dir: Path, limit: int = 20) -> dict:
+    from brain.works.location import works_db_path
     from brain.works.storage import read_markdown
     from brain.works.store import WorksStore
 
-    db = persona_dir / "works.db"
+    db = works_db_path(persona_dir)
     if not db.exists():
         return {"makings": []}
     store = WorksStore(db)

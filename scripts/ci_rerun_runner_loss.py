@@ -24,15 +24,28 @@ Gh = Callable[[list[str]], str]  # runs `gh <args>` and returns its stdout; rais
 
 _PASSING = frozenset({"success", "skipped", "neutral"})
 
+# Jobs that only report on their shards, named "<gate> (i/N)" (#746). A gate fails when a shard was cancelled, because a
+# skipped check counts as passing (#774 review), so it says nothing about why: its shards do. Re-running a lost shard
+# re-runs its gate too.
+SHARD_GATES = frozenset({"python windows-latest"})
+
+
+def _is_shard_gate(job: Mapping, names: set[str]) -> bool:
+    """A gate is only a gate in a run that has its shards; in a manual run the job of that name runs the tests itself."""
+    name = job.get("name", "")
+    return name in SHARD_GATES and any(n.startswith(f"{name} (") for n in names)
+
 
 def runner_loss_only(jobs: Iterable[Mapping], annotations: Mapping[int, list[str]]) -> bool:
     """True when at least one job didn't pass and every such job was cancelled with the runner-loss annotation.
 
-    `jobs` are the run's jobs as the API gives them (`id`, `conclusion`); `annotations` maps a job id to its annotation
-    messages. A real failure, a timeout, or a cancellation for any other reason (a person, a newer push) is never a
-    runner loss, so a run holding one is not retried.
+    `jobs` are the run's jobs as the API gives them (`id`, `name`, `conclusion`); `annotations` maps a job id to its
+    annotation messages. A real failure, a timeout, or a cancellation for any other reason (a person, a newer push) is
+    never a runner loss, so a run holding one is not retried. A shard gate (SHARD_GATES) is left out: its shards decide.
     """
-    failed = [job for job in jobs if job.get("conclusion") not in _PASSING]
+    jobs = list(jobs)
+    names = {job.get("name", "") for job in jobs}
+    failed = [job for job in jobs if job.get("conclusion") not in _PASSING and not _is_shard_gate(job, names)]
     return bool(failed) and all(
         job.get("conclusion") == "cancelled" and any(RUNNER_LOSS in note for note in annotations.get(job.get("id"), ()))
         for job in failed

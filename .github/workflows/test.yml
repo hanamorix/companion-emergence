@@ -51,9 +51,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Push and pull_request: all three OSes. A manual run narrows this to the
-        # chosen OS (`os` is a choice input, so only the four listed values exist).
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        # Push and pull_request: Ubuntu and macOS; Windows runs as shards in `python-windows` (#746). A manual run
+        # narrows this to the chosen OS, or all three (Windows unsharded) for `all` (`os` is a choice input, so only
+        # the four listed values exist).
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && (inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') || '["ubuntu-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -154,6 +155,76 @@ jobs:
       - name: Lint with ruff
         if: github.event_name != 'workflow_dispatch'
         run: uv run ruff check .
+
+  # #746: the Windows suite took 32 to 50 minutes on one runner (its tests add up to about 80 minutes there), the
+  # longest check on every PR. It runs as shards on separate runners: `--shard i/N` (tests/shard.py) puts every test in
+  # exactly one shard and keeps each xdist_group whole, balanced by tests/shard_durations.json
+  # (scripts/refresh_shard_durations.py), and the split does not depend on the random order, so each shard keeps its
+  # own fresh seed. A manual run stays one unsharded job in `python` above. To reproduce a red shard, run its seed with
+  # the same `--shard i/N`.
+  python-windows:
+    name: python windows-latest (${{ matrix.shard }}/5)
+    if: github.event_name != 'workflow_dispatch'
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Five, measured on #774: four shards took 11.0 to 12.5 minutes against macOS's 11.6. More xdist workers do not
+        # help here (4 workers on the 4-vCPU runner took 33.2 minutes for the whole suite, as 2 did).
+        shard: [1, 2, 3, 4, 5]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run pytest
+        env:
+          KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
+        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml --shard=${{ matrix.shard }}/5
+
+      - name: Upload pytest junit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-junit-windows-latest-${{ matrix.shard }}-of-5
+          path: pytest-junit.xml
+          if-no-files-found: warn
+
+      - name: Upload the slow-test CPU log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: slow-budget-cpu-windows-latest-${{ matrix.shard }}-of-5
+          path: slow-budget-cpu.jsonl
+          if-no-files-found: ignore
+
+  # #746: one check says whether Windows passed, whatever the shard count. It fails, never skips, when a shard was
+  # cancelled: GitHub counts a skipped check as satisfied (#774 review). rerun-runner-loss.yml looks past it
+  # (SHARD_GATES in scripts/ci_rerun_runner_loss.py), and re-running the lost shard re-runs this job too.
+  python-windows-result:
+    name: python windows-latest
+    needs: python-windows
+    if: always() && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every Windows shard passed
+        env:
+          RESULT: ${{ needs.python-windows.result }}
+        run: |
+          echo "the Windows shards: $RESULT"
+          test "$RESULT" = success
 
   # #540: a test that cannot fail proves nothing. Every NEW test a PR adds must fail against the product
   # code the PR branched from (or be marked `no_base_failure(reason=...)`, which is counted and listed).

@@ -38,7 +38,7 @@ def _seed_two_works(persona_dir: Path) -> tuple[str, str]:
     )
     write_markdown(persona_dir, older, content="def foo(): pass")
     write_markdown(persona_dir, newer, content="A small story about a lighthouse keeper.")
-    db = WorksStore(persona_dir / "data" / "works.db")
+    db = WorksStore(persona_dir / "works.db")
     db.insert(older, content="def foo(): pass")
     db.insert(newer, content="A small story about a lighthouse keeper.")
     return older.id, newer.id

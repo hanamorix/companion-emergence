@@ -143,3 +143,20 @@ def test_only_runner_losses_are_retried():
     assert rr.runner_loss_only([_job(6, "wheel smoke", "timed_out")], {6: [LOSS]}) is False
     # nothing failed: nothing to retry
     assert rr.runner_loss_only([passed], {}) is False
+
+
+def test_a_shard_gate_failing_only_because_its_shard_was_lost_does_not_stop_the_re_run():
+    """#774 review: `python windows-latest` reports on the Windows shards and fails when one is cancelled (a skipped
+    check would count as passing). It is looked past only in a run that has its shards; in a manual run the job of that
+    name runs the tests itself, so its failure is a real one."""
+    lost = _job(2, "python windows-latest (3/5)", "cancelled")
+    gate = _job(3, "python windows-latest", "failure")
+    notes = {2: [LOSS], 3: ["Process completed with exit code 1."]}
+    assert rr.runner_loss_only([_job(1, "python windows-latest (1/5)", "success"), lost, gate], notes) is True
+    # a shard that really failed is still a real failure, gate or no gate
+    failed = _job(4, "python windows-latest (4/5)", "failure")
+    assert rr.runner_loss_only([lost, failed, gate], {**notes, 4: ["Process completed with exit code 1."]}) is False
+    # a manual run: no shards, and a failing `python windows-latest` ran the tests itself
+    assert rr.runner_loss_only([_job(5, "tauri", "cancelled"), gate], {5: [LOSS], 3: notes[3]}) is False
+    # the gate alone failing, every shard passed: nothing lost, nothing to re-run
+    assert rr.runner_loss_only([_job(1, "python windows-latest (1/5)", "success"), gate], notes) is False
