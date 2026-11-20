@@ -289,6 +289,28 @@ def test_research_row_follows_the_engine_constants_it_copies_nothing(monkeypatch
     assert not row({"love": 9.0, "joy": 4.0}, _high("love", "joy"))  # love is now opposing: opp 9, T 7.4, joy 4 below
 
 
+def test_research_row_is_the_engines_feeling_half_function_nothing_is_copied(monkeypatch):
+    from brain.engines import research
+
+    seen: list[tuple[dict[str, float], object]] = []
+
+    def fake(values, feels_high):
+        seen.append((values, feels_high))
+        return fake.answer
+
+    monkeypatch.setattr(research, "feeling_half_passes", fake)
+    row = _research_row()
+    high = _high("love")
+    e = {"love": 9.0}  # the real rule opens on this
+    fake.answer = False
+    assert row(e, high) is False
+    e2 = {"grief": 9.0}  # the real rule is closed on this
+    fake.answer = True
+    assert row(e2, _high("grief")) is True
+    assert seen[0] == ({"love": 9.0}, high)
+    assert seen[1][0] == {"grief": 9.0}
+
+
 def _grief_db(path: Path) -> None:
     """The same history with a constant grief of 5 (an opposing feeling) beside love swinging between 2 and 9."""
     from brain.memory.store import Memory, MemoryStore

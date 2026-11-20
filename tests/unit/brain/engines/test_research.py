@@ -1232,6 +1232,82 @@ def test_the_opposing_names_are_baseline_vocabulary_names():
     assert dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS <= baseline
 
 
+# ── feeling_half_passes: the one function the gate and the measuring script share (#651 S30) ──
+
+
+def _high_set(*names: str):
+    return set(names).__contains__
+
+
+@pytest.mark.parametrize("name", ["shame", "comfort_seeking", "rest_need", "grief"])
+def test_feeling_half_passes_an_opposing_feeling_never_opens_it(name: str):
+    from brain.engines.research import feeling_half_passes
+
+    assert feeling_half_passes({name: 10.0}, _high_set(name)) is False
+
+
+def test_feeling_half_passes_above_the_threshold_opens_and_at_it_does_not():
+    from brain.engines.research import feeling_half_passes, opposing_threshold
+
+    t = opposing_threshold(2.0)
+    assert feeling_half_passes({"grief": 2.0, "love": t + 0.01}, _high_set("love")) is True
+    assert feeling_half_passes({"grief": 2.0, "love": t}, _high_set("love")) is False
+    assert feeling_half_passes({"grief": 2.0, "love": t + 1.0}, _high_set()) is False  # above T but not high
+
+
+def test_feeling_half_passes_opp_is_the_max_of_the_opposing_values_present():
+    from brain.engines.research import feeling_half_passes
+
+    # max(3, 1) = 3 gives T 5.3 (5.5 opens); a sum (4) would give T 5.55 and close it
+    assert feeling_half_passes({"grief": 3.0, "shame": 1.0, "love": 5.5}, _high_set("love")) is True
+    assert feeling_half_passes({"shame": 1.0, "grief": 3.0, "love": 5.5}, _high_set("love")) is True
+    # an opposing feeling that is present but not high still sets opp (T(7) = 6.5)
+    assert feeling_half_passes({"grief": 7.0, "love": 6.0}, _high_set("love")) is False
+
+
+def test_feeling_half_passes_a_missing_opposing_feeling_counts_as_zero_and_empty_is_false():
+    from brain.engines.research import feeling_half_passes
+
+    assert feeling_half_passes({"love": 0.5}, _high_set("love")) is True  # opp 0, T 0
+    assert feeling_half_passes({}, _high_set("love")) is False
+
+
+def test_feeling_half_passes_asks_feels_high_only_about_names_above_the_threshold():
+    from brain.engines.research import feeling_half_passes
+
+    asked: list[str] = []
+
+    def high(name: str) -> bool:
+        asked.append(name)
+        return True
+
+    # grief 5 gives T 5.8: joy 6.0 is above it and is asked; love 5.0 is not and never is; grief is opposing, never asked
+    assert feeling_half_passes({"grief": 5.0, "love": 5.0, "joy": 6.0}, high) is True
+    assert asked == ["joy"]
+
+
+def test_run_tick_gate_calls_feeling_half_passes_with_the_read_and_the_engines_test(
+    tmp_path: Path, emotion_engine_stub, monkeypatch
+):
+    from brain.engines import research
+
+    calls: list[tuple[dict[str, float], bool, bool]] = []
+
+    def fake(values, feels_high):
+        # what the engine's own test says at call time (the stub's high set is {"awe"} in the first call, empty in the second)
+        calls.append((dict(values), feels_high("awe"), feels_high("grief")))
+        return fake.answer
+
+    monkeypatch.setattr(research, "feeling_half_passes", fake)
+    readings = {"awe": 9.0}
+    # the real rule would pass (awe high, opp 0): the patched answer closes the gate; and the other way round
+    fake.answer = False
+    assert _gate(tmp_path, emotion_engine_stub, readings, {"awe"}) is False
+    fake.answer = True
+    assert _gate(tmp_path, emotion_engine_stub, {"awe": 0.5}, set()) is True  # the real rule: nothing high, closed
+    assert calls == [({"awe": 9.0}, True, False), ({"awe": 0.5}, False, False)]
+
+
 # ---- B1 PR 4: a live fire carries its own feelings and rating ----
 
 _FELT_REPLY = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8}\nENGAGEMENT: 6/10'

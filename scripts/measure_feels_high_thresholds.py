@@ -261,15 +261,11 @@ def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> di
         return lambda e, high: all(n in e and high(n) for n in wanted)
 
     def research_feeling_half(e: dict[str, float], high: HighFn) -> bool:
-        # The research gate's feeling half, as `ResearchEngine.run_tick` asks it: an opening (not opposing) feeling that is
-        # high and strictly above the curve's threshold for the highest opposing value present. The names and the curve
-        # are read from the engine's own constants and function, never copied here.
-        from brain import dev_constants
-        from brain.engines.research import opposing_threshold
+        # The research gate's feeling half is the engine's own function, the one `ResearchEngine.run_tick` calls: no copy
+        # of the rule lives here. Imported at call time, like the other brain imports of this script.
+        from brain.engines.research import feeling_half_passes
 
-        opposing = dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS
-        threshold = opposing_threshold(max((e.get(n, 0.0) for n in opposing), default=0.0))
-        return any(n not in opposing and high(n) and e[n] > threshold for n in e)
+        return feeling_half_passes(e, high)
 
     rows: dict[str, Callable[[dict[str, float], HighFn], bool]] = {
         f"body: more than {many} feelings high": lambda e, high: sum(1 for n in e if high(n)) > many,

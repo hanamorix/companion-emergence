@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,9 +64,24 @@ def opposing_threshold(opp: float) -> float:
 
     `opp` is the highest plain value (0-10) among the opposing feelings in the read (0 when none is present). The answer is
     the monotone cubic curve through `dev_constants.RESEARCH_GATE_OPPOSING_CURVE`, built at call time (seven points cost
-    almost nothing). The gate, its tests and `scripts/measure_feels_high_thresholds.py` all call this one function.
+    almost nothing). `feeling_half_passes` is its one caller outside tests.
     """
     return monotone_spline(dev_constants.RESEARCH_GATE_OPPOSING_CURVE)(opp)
+
+
+def feeling_half_passes(values: Mapping[str, float], feels_high: Callable[[str], bool]) -> bool:
+    """The research gate's feeling half: does an opening feeling in the read pass?
+
+    `values` is the read as plain values (name -> 0-10); `feels_high(name)` is the caller's "high" test. opp is the highest
+    value among `dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS` present in `values` (a missing one counts as 0). The half
+    passes when some name that is not opposing has a value strictly above `opposing_threshold(opp)` and `feels_high(name)`.
+    The value test runs first, so `feels_high` is only asked about names that are above the threshold; the answer is the
+    same in either order. `ResearchEngine.run_tick` and the research row of `scripts/measure_feels_high_thresholds.py` both
+    call this one function; neither keeps its own copy of the loop.
+    """
+    opposing = dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS
+    threshold = opposing_threshold(max((values.get(n, 0.0) for n in opposing), default=0.0))
+    return any(name not in opposing and value > threshold and feels_high(name) for name, value in values.items())
 
 
 def _compute_topic_overlap_via_haiku(
@@ -227,14 +243,9 @@ class ResearchEngine:
             emo_state = EmotionalState(emotions=engine.short_values(live_engine.read()))
 
         # The feeling half: an opening feeling (any name in the read that is not in RESEARCH_GATE_OPPOSING_FEELINGS) opens it when
-        # the engine calls it high (`live_engine.feels_high`) and its plain value is strictly above `opposing_threshold(opp)`,
-        # where opp is the highest value among the opposing feelings in the read (0 when none). Opposing feelings never open it.
-        opposing = dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS
-        threshold = opposing_threshold(max((emo_state.emotions.get(n, 0.0) for n in opposing), default=0.0))
-        emotion_gate = any(
-            name not in opposing and value > threshold and live_engine.feels_high(name)
-            for name, value in emo_state.emotions.items()
-        )
+        # the engine calls it high (`live_engine.feels_high`) and its plain value is strictly above the opposing-feelings
+        # threshold; opposing feelings never open it. The rule is `feeling_half_passes`, shared with the measuring script.
+        emotion_gate = feeling_half_passes(emo_state.emotions, live_engine.feels_high)
 
         gate_ok = days_since >= self.research_days_since_human_min or emotion_gate
         if not gate_ok:
