@@ -306,9 +306,10 @@ def test_research_row_is_the_engines_feeling_half_function_nothing_is_copied(mon
     assert row(e, high) is False
     e2 = {"grief": 9.0}  # the real rule is closed on this
     fake.answer = True
-    assert row(e2, _high("grief")) is True
+    high2 = _high("grief")
+    assert row(e2, high2) is True
     assert seen[0] == ({"love": 9.0}, high)
-    assert seen[1][0] == {"grief": 9.0}
+    assert seen[1] == ({"grief": 9.0}, high2)
 
 
 def _grief_db(path: Path) -> None:
