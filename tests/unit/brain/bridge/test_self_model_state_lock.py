@@ -401,6 +401,7 @@ def test_a_startup_repair_that_cannot_get_the_lock_leaves_its_marker_unwritten(
     assert should_run_self_model_repair(persona_dir), "the marker was written though the repair did not run"
 
 
+@pytest.mark.no_base_failure(reason="main's test of the same name stem (..._writes_no_delta_so_...), renamed and its assertions rewritten from no delta written to the gap left open then acknowledged when the self-authored delta writer was removed; the property, that a reconcile whose lock wait gives up changes nothing so a retry works, already held on main (the gap is changed first and returns busy before any write)")
 def test_an_accept_that_cannot_get_the_lock_changes_nothing_so_trying_again_is_safe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
