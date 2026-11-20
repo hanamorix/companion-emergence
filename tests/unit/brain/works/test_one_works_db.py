@@ -162,6 +162,29 @@ def test_an_unreadable_old_file_is_left_in_place(tmp_path):
     assert not (tmp_path / "data" / "works.db.migrated").exists()
 
 
+def test_a_lock_that_cannot_be_taken_leaves_the_old_file_and_returns_the_live_path(tmp_path, monkeypatch):
+    """A read-only persona folder can't hold the lock sidecar: the merge warns and is skipped, nothing raises."""
+    import contextlib
+
+    import brain.works.location as location
+
+    @contextlib.contextmanager
+    def refusing_lock(path):
+        raise PermissionError(f"cannot create {path}.lock")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(location, "file_lock", refusing_lock)
+    _seed(tmp_path / "data" / "works.db", tmp_path, "bbbbbbbbbbbb", "Old", "first import")
+    old = (tmp_path / "data" / "works.db").read_bytes()
+
+    with pytest.warns(RuntimeWarning, match="could not merge"):
+        path = location.works_db_path(tmp_path)
+
+    assert path == tmp_path / "works.db"
+    assert (tmp_path / "data" / "works.db").read_bytes() == old
+    assert not (tmp_path / "data" / "works.db.migrated").exists()
+
+
 def test_a_second_old_file_keeps_the_first_backup(tmp_path):
     from brain.works.location import works_db_path
 

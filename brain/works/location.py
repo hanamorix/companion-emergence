@@ -44,19 +44,21 @@ def works_db_path(persona_dir: Path) -> Path:
 
 
 def _merge_legacy(live: Path, legacy: Path) -> None:
-    with file_lock(live):
-        if not legacy.is_file():  # another process merged it while this one waited
-            return
-        try:
+    # The lock is inside the try: a folder that can't hold the lock sidecar (read-only) warns and skips the merge,
+    # like any other failure here, instead of raising out of works_db_path into every caller.
+    try:
+        with file_lock(live):
+            if not legacy.is_file():  # another process merged it while this one waited
+                return
             _copy_rows(live, legacy)
             _retire(legacy)
-        except (sqlite3.Error, OSError, WorksMergeCheckError) as exc:
-            _FAILED.add(str(legacy))
-            warnings.warn(
-                f"works_db_path: could not merge {legacy} into {live}; the old file is left in place ({exc})",
-                RuntimeWarning,
-                stacklevel=3,
-            )
+    except (sqlite3.Error, OSError, WorksMergeCheckError) as exc:
+        _FAILED.add(str(legacy))
+        warnings.warn(
+            f"works_db_path: could not merge {legacy} into {live}; the old file is left in place ({exc})",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def _copy_rows(live: Path, legacy: Path) -> None:
