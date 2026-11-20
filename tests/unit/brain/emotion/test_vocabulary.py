@@ -308,6 +308,31 @@ def test_validate_new_name(raw: str, expected: str | None) -> None:
     assert vocabulary.validate_new_name(raw) == expected
 
 
+def test_by_category_survives_a_register_during_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A register landing mid-iteration must not break a reader (iterate a snapshot)."""
+    registry: dict[str, object] = {}
+
+    class _Probe:
+        """Registers a new word the moment the reader looks at its category."""
+
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.fired = False
+
+        @property
+        def category(self) -> str:
+            if not self.fired:
+                self.fired = True
+                registry[f"late_{self.key}"] = _Probe(f"late_{self.key}")
+            return "core"
+
+    registry["a"] = _Probe("a")
+    registry["b"] = _Probe("b")
+    monkeypatch.setattr(vocabulary, "_REGISTRY", registry)
+
+    assert len(vocabulary.by_category("core")) == 2
+
+
 def test_register_is_safe_across_threads() -> None:
     import threading
 

@@ -125,10 +125,11 @@ _BASELINE: tuple[Emotion, ...] = (
 
 
 # Writers (register / _unregister) take _REGISTRY_LOCK, so words may be
-# registered at runtime from more than one thread. Readers (get, list_all,
-# by_category) do not lock: a single dict lookup or iteration copy is safe
-# under the GIL for the sizes involved, and a reader may see a word added a
-# moment late.
+# registered at runtime from more than one thread. Readers do not lock: get is
+# one dict lookup and list_all is one C-level copy of the values, both atomic
+# under the GIL. Any reader that loops over the registry must loop over a
+# list_all() snapshot, never the live dict (a register mid-loop would raise
+# "dictionary changed size"). A reader may see a word added a moment late.
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 _REGISTRY_LOCK = threading.Lock()
 
@@ -191,7 +192,7 @@ def list_all() -> list[Emotion]:
 
 def by_category(category: str) -> list[Emotion]:
     """Return every Emotion with the given category."""
-    return [e for e in _REGISTRY.values() if e.category == category]
+    return [e for e in list_all() if e.category == category]
 
 
 def register(emotion: Emotion) -> None:
