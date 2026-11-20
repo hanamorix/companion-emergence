@@ -67,10 +67,11 @@ Use these for retried replace and delete, whole-file byte reads, folder listing 
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `fsync_dir` | brain/utils/atomic_write.py:223 | fsync a directory so a new or renamed entry is durable; POSIX only, best effort, never fails a save. |
-| `save_with_backup_text` | brain/utils/atomic_write.py:275 | Atomic raw-text save with a rotating .bak1..N chain; the live path always holds a complete file. |
-| `save_bytes_atomic` | brain/utils/atomic_write.py:318 | Atomic raw-bytes save: unique temp in the same directory, optional mode and fsync, one retried replace, no backup chain. |
-| `save_blob_once` | brain/utils/atomic_write.py:331 | Write a content-addressed blob once; skips if the target exists and tolerates a concurrent writer of the same content (used by images and file_store). |
+| `fsync_dir` | brain/utils/atomic_write.py:224 | fsync a directory so a new or renamed entry is durable; POSIX only, best effort, never fails a save. |
+| `save_with_backup_text` | brain/utils/atomic_write.py:276 | Atomic raw-text save with a rotating .bak1..N chain; the live path always holds a complete file. |
+| `save_bytes_atomic` | brain/utils/atomic_write.py:319 | Atomic raw-bytes save: unique temp in the same directory, optional mode and fsync, one retried replace, no backup chain. |
+| `save_stream_atomic` | brain/utils/atomic_write.py:332 | Atomic save of a payload a callback writes into the temp piece by piece (`write(fh)`), so a large file is never held in memory; same temp, fsync, retried replace and directory fsync as the bytes writer. |
+| `save_blob_once` | brain/utils/atomic_write.py:350 | Write a content-addressed blob once; skips if the target exists and tolerates a concurrent writer of the same content (used by images and file_store). |
 
 ### `brain/utils/file_lock.py`
 
@@ -183,6 +184,12 @@ Storage is UTC everywhere; local time is for display only.
 | function | where (path:line) | what it is for |
 |---|---|---|
 | `format_emotion_summary` | brain/utils/emotion.py:8 | Top 5 emotions as `- name: X.X/10` lines for LLM prompt context. |
+
+### `brain/emotion/engine.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `short_values` | brain/emotion/engine.py:87 | The short average of each feeling in an engine `read()`, as a `{name: short}` dict: the map every reader of how she feels now works from. Use it, do not write the `{name: r.short ...}` comprehension again. |
 
 ### `brain/prompt_strings.py`
 

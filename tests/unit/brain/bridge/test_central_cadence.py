@@ -779,9 +779,13 @@ def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stu
     assert attempts == [(persona_dir,)] * 2, "a job that stays due is tried again at the next pass, on this persona"
 
 
-def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch):
+def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch, emotion_engine_stub):
     """Self-model keeps its own cadence (S29): a reflect that raises is
     caught by its own handler and backs off (still an advance, S44)."""
+    from brain.emotion.engine import Reading
+
+    # The tick reaches its reflect only when the engine has something to read.
+    emotion_engine_stub.readings = {"joy": Reading(short=6.0, long=5.0, difference=1.0, shift=1)}
     persona_dir = _persona(tmp_path)
     sm_cadence.save(
         persona_dir,
@@ -1021,6 +1025,7 @@ _GATED_CALLS = {
     "drain_all_locked",
 }
 _NON_GATED_ONE_SHOTS = {
+    "_jsonl_nul_repair_run",
     "_attunement_run_backfill",
     "_attunement_run_supplementary_backfill",
     "_run_vocab_repair_tick",

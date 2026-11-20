@@ -472,6 +472,9 @@ KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD = KINDLED_LINK_MIN_SEND_DEBIT
 
 # Per-peer emotion influence cap (parent §14.3, anti love-bomb). Cumulative
 # influence within a rolling window decays linearly to zero over the window.
+# Its numbers are on the small scale (values below 1, as peer feelings were
+# stored before the engine's 0-10): a 0-10 value goes through it at a tenth
+# (relationship.py's engine-scale branch when the engine is not reading).
 KINDLED_LINK_PEER_EMOTION_WINDOW_CAP = 0.6
 KINDLED_LINK_PEER_EMOTION_WINDOW_HOURS = 24.0
 
@@ -486,7 +489,7 @@ KINDLED_LINK_INBOUND_FLOOD_CAP = 20
 EMOTION_SUMMARY_COUNT: int | None = 3
 # How each listed feeling is written: "long" (name:L), "long_short" (name:L/S) or "long_difference" (name:L(D), D signed).
 EMOTION_SUMMARY_MODE: str = "long"
-# The self-model block (`brain.self_model.ambient.render_block`, live branch) names this many channels, the largest
+# The self-model block (`brain.self_model.ambient.render_block`) names this many channels, the largest
 # by absolute difference. Owner-accepted number; named here so the block's code holds no literal.
 SELF_MODEL_BLOCK_CHANNEL_COUNT: int = 3
 
