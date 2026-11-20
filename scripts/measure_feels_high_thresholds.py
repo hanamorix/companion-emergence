@@ -260,6 +260,17 @@ def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> di
     def names(*wanted: str) -> Callable[[dict[str, float], HighFn], bool]:
         return lambda e, high: all(n in e and high(n) for n in wanted)
 
+    def research_feeling_half(e: dict[str, float], high: HighFn) -> bool:
+        # The research gate's feeling half, as `ResearchEngine.run_tick` asks it: an opening (not opposing) feeling that is
+        # high and strictly above the curve's threshold for the highest opposing value present. The names and the curve
+        # are read from the engine's own constants and function, never copied here.
+        from brain import dev_constants
+        from brain.engines.research import opposing_threshold
+
+        opposing = dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS
+        threshold = opposing_threshold(max((e.get(n, 0.0) for n in opposing), default=0.0))
+        return any(n not in opposing and high(n) and e[n] > threshold for n in e)
+
     rows: dict[str, Callable[[dict[str, float], HighFn], bool]] = {
         f"body: more than {many} feelings high": lambda e, high: sum(1 for n in e if high(n)) > many,
         "body: rest_need": names("rest_need"),
@@ -270,7 +281,7 @@ def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> di
         "temperature: love": names("love"),
         "temperature: climax": names("climax"),
         "temperature: touch_hunger": names("touch_hunger"),
-        "research gate: any feeling high": lambda e, high: any(high(n) for n in e),
+        "research gate: feeling half (opposing curve)": research_feeling_half,
     }
     for name, trig in arcs:
         rows[f"reflex arc {name}"] = names(*trig)
