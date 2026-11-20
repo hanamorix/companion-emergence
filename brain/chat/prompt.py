@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from brain import prompt_strings
 from brain.chat.monologue_prompts import build_monologue_frame, build_reply_frame
 from brain.chat.tool_inventory import build_tool_inventory
+from brain.emotion.engine_utils import feelings_of
 from brain.engines.daemon_state import DaemonState, get_residue_context
 from brain.engines.research_ambient import build_research_awareness_block
 from brain.health.json_io import read_jsonl
@@ -223,7 +224,7 @@ def build_system_message(
             parts.append(reply_block)
 
     # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
-    body_block = _build_body_block(store, persona_dir)
+    body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -484,7 +485,7 @@ def build_volatile_context(
             parts.append(reply_block)
 
     # 5. Body block.
-    body_block = _build_body_block(store, persona_dir)
+    body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)
 
@@ -658,7 +659,7 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
+def _build_body_block(persona_dir: Path) -> str:
     """Render the body block: computed energy/temperature/exhaustion +
     six body emotions inline.
 
@@ -672,7 +673,7 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
     Inviolate properties enforced here:
     - #4 the body projection does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
       the input reads below are this function's, not the projection's
-    - #5 no self-perpetuation (we read from store, never write)
+    - #5 no self-perpetuation (this block reads only, never writes)
     - #8 no cache (the body state is recomputed every call)
     """
     try:
@@ -692,12 +693,11 @@ def _build_body_block(store: MemoryStore, persona_dir: Path) -> str:
         # pending or retrying, read() returns nothing and the body block shows baselines.
         short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
-        days = days_since_human(store, now=now, persona_dir=persona_dir)
+        days = days_since_human(now=now, persona_dir=persona_dir)
         # Chat composer doesn't track session_hours yet — passes 0.0; words
         # falls back to 1-hour window. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
         words = count_words_in_session(
-            store,
             persona_dir=persona_dir,
             session_hours=0.0,
             now=now,
@@ -1924,16 +1924,10 @@ def _build_recent_journal_block(store: MemoryStore, *, window_days: int = 7, use
         source = (m.metadata or {}).get("source", "unknown")
         arc_name = (m.metadata or {}).get("reflex_arc_name")
         source_str = f"reflex_arc({arc_name})" if arc_name else source
-        # Top-2 emotions by intensity, faded (the engine's faded_value returns the stored value until the switch;
-        # an in-memory store has no engine, so its stored values stand).
-        emotions = sorted(
-            (
-                (n, v if live_engine is None else live_engine.faded_value(m, n))
-                for n, v in (m.emotions or {}).items()
-            ),
-            key=lambda kv: kv[1],
-            reverse=True,
-        )[:2]
+        # Top-2 emotions by intensity, through the one read of a memory's feelings (faded once the persona has switched over,
+        # held to 0-10; an in-memory store has no engine, so the pure read returns its stored values held).
+        feelings = feelings_of(m, live_engine).feelings
+        emotions = sorted(feelings.items(), key=lambda kv: kv[1], reverse=True)[:2]
         if emotions:
             emotions_str = ", ".join(f"{n} {v:.0f}" for n, v in emotions)
         else:

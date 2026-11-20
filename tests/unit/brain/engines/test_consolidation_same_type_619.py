@@ -140,7 +140,7 @@ def test_a_merge_verdict_naming_a_row_of_another_type_stores_a_new_row(persona, 
     assert (res.merged, res.promoted) == (0, 1)
     assert _archive(tmp) == []  # no archive line for a merge that did not happen
     untouched = store.get(target.id, bump=False)
-    assert untouched.content == "Bob likes tea" and untouched.emotions == {"joy": 4.0}
+    assert untouched.content == "Bob likes tea" and untouched._stored_emotions == {"joy": 4.0}
     stored = store.get(cand.id, bump=False)
     assert stored is not None and stored.content == "Bob takes honey in it"  # its OWN text, not the judge's merge
     assert stored.memory_type == cand_type and stored.importance == 8.0
@@ -188,10 +188,10 @@ def test_a_wrong_type_merge_does_not_change_the_targets_feelings(persona, emotio
     queue.enqueue(cand, source="x")
     emotion_engine_stub.recorded_calls.clear()
     _run(persona, _merge_into(target.id))
-    assert store.get(target.id, bump=False).emotions == {"joy": 2.0}
+    assert store.get(target.id, bump=False)._stored_emotions == {"joy": 2.0}
     # The override stores the candidate as a row: its one commit event comes from `create`, none from the merge path.
     assert [c[0] for c in emotion_engine_stub.recorded_calls].count("on_memory_committed") == 1
-    assert store.get(cand.id, bump=False).emotions == {"joy": 10.0, "fear": 9.0}
+    assert store.get(cand.id, bump=False)._stored_emotions == {"joy": 10.0, "fear": 9.0}
 
 
 def test_the_archive_line_records_the_candidates_type(persona):

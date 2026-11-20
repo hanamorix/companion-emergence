@@ -1179,9 +1179,9 @@ class HeartbeatEngine:
 
     @staticmethod
     def _faded_emotions(persona_dir: Path, mem) -> dict[str, float]:
-        """`mem`'s emotions at their faded values (the stored values until the switch)."""
+        """`mem`'s feelings: the engine's one read (faded values held to 0-10; the stored values held until the switch)."""
         live_engine = emotion_engine.engine_for(persona_dir)
-        return {n: live_engine.faded_value(mem, n) for n in mem.emotions}
+        return dict(live_engine.memory_feelings(mem).feelings)
 
     @staticmethod
     def _peak_emotion(

@@ -62,7 +62,7 @@ def append(
         "memory_type": memory.memory_type,
         "created_at_iso": memory.created_at.isoformat() if memory.created_at else None,
         "summary": memory.content,  # the fading body IS the summary at drop time
-        "emotion_at_ingest": {n: live_engine.faded_value(memory, n) for n in memory.emotions},
+        "emotion_at_ingest": dict(live_engine.memory_feelings(memory).feelings),
         "salience_at_drop": salience_at_drop,
         "salience_inputs_at_drop": asdict(inputs),
         "graveyard_reason": reason,

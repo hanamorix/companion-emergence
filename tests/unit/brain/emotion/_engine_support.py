@@ -44,7 +44,7 @@ def row(
 ) -> Memory:
     emo = {"joy": 6.0} if emotions is None else dict(emotions)
     numbers = [float(v) for v in emo.values()]
-    return Memory(
+    return Memory.from_stored_row(
         id=mid or str(uuid.uuid4()),
         content="an engine test memory",
         memory_type=memory_type,
@@ -228,6 +228,12 @@ class LockSpy:
 
 def joy_of(state: EngineState) -> EmotionState:
     return state.emotions["joy"]
+
+
+def half_fade(memory: Memory, emotion: str, half_lives: object, switch_over_at: object, now: object) -> float:
+    """A stand-in for `engine_utils.faded_emotion` that halves the stored value: `monkeypatch.setattr(engine_utils,
+    "faded_emotion", half_fade)` makes the engine's one per-memory read fade, so a faded read differs from a stored one."""
+    return memory._stored_emotions[emotion] * 0.5
 
 
 class OtherHolder:

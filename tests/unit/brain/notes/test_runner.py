@@ -106,7 +106,7 @@ def _note_emotions(tmp_path, *, live, ruin=False, progress=0):
     finally:
         store.close()
     assert len(wired) == 1
-    return wired[0].emotions
+    return wired[0]._stored_emotions
 
 
 def test_note_wire_back_stores_the_nudge_ten_times_when_live(tmp_path):

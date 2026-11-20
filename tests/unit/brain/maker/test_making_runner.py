@@ -56,7 +56,7 @@ def test_make_and_wire_writes_act_memory_with_emotion_for_nondiscard(tmp_path):
     mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # the emotion delta was applied W8-style: seeded onto the act-memory
-    assert mems[0].emotions
+    assert mems[0]._stored_emotions
     store2.close()
 
 
@@ -79,7 +79,7 @@ def test_make_and_wire_discard_moves_no_emotion(tmp_path):
     mems = store2.list_by_type("making", limit=10)
     assert len(mems) == 1
     # discard moves nothing — empty-emotion act-memory only
-    assert not mems[0].emotions
+    assert not mems[0]._stored_emotions
     store2.close()
 
 
@@ -99,7 +99,7 @@ def test_make_and_wire_gives_a_baseline_persona_pride_for_satisfaction(tmp_path)
         [made] = store2.list_by_type("making", limit=10)
     finally:
         store2.close()
-    assert made.emotions == {"pride": 0.12, "tenderness": 0.08}
+    assert made._stored_emotions == {"pride": 0.12, "tenderness": 0.08}
 
 
 def test_make_and_wire_applies_the_accent_of_what_built_the_charge(tmp_path):
@@ -120,7 +120,7 @@ def test_make_and_wire_applies_the_accent_of_what_built_the_charge(tmp_path):
         [made] = store2.list_by_type("making", limit=10)
     finally:
         store2.close()
-    assert made.emotions == pytest.approx({"pride": 0.12, "tenderness": 0.08, "awe": 0.10})
+    assert made._stored_emotions == pytest.approx({"pride": 0.12, "tenderness": 0.08, "awe": 0.10})
 
 
 # ---- emotion rework B1 PR 3: the making nudge is on the 0-10 scale once the engine is live ----
@@ -154,7 +154,7 @@ def _made_emotions(tmp_path, *, live, ruin=False, progress=0):
     _promote_pending(tmp_path)
     store2 = MemoryStore(tmp_path / "memories.db")
     try:
-        return store2.list_by_type("making", limit=10)[0].emotions
+        return store2.list_by_type("making", limit=10)[0]._stored_emotions
     finally:
         store2.close()
 

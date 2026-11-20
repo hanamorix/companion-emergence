@@ -77,8 +77,8 @@ def test_reflection_with_mem_store_writes_kindled_peer_memory_and_caps_emotion(t
     assert m.metadata.get("relationship_stage") == "acquaintance"
     assert m.content == "I talked with a peer today and felt a quiet warmth."
     # emotion was applied (capped, vocab-filtered) — non-empty for a fresh peer
-    assert m.emotions
-    assert all(0.0 < v <= 0.08 + 1e-9 for v in m.emotions.values())
+    assert m._stored_emotions
+    assert all(0.0 < v <= 0.08 + 1e-9 for v in m._stored_emotions.values())
 
 
 def test_mem_store_none_back_compat_no_memory_written(tmp_path):
@@ -199,13 +199,13 @@ def _live_reflect(tmp_path, reply: str, *, now=NOW, today=TODAY, ms=None, s=None
 def test_live_reflection_stores_held_values_and_holds_negatives_to_zero(tmp_path):
     _, ms = _live_reflect(tmp_path, _verdict('{"joy": 9, "grief": -3, "love": 40}'))
     [peer_memory] = ms.list_by_type("kindled_peer")
-    assert peer_memory.emotions == {"joy": 9.0, "grief": 0.0, "love": 10.0}
+    assert peer_memory._stored_emotions == {"joy": 9.0, "grief": 0.0, "love": 10.0}
 
 
 def test_live_reflection_drops_non_numeric_and_non_finite_and_keeps_the_memory(tmp_path):
     _, ms = _live_reflect(tmp_path, _verdict('{"joy": 4, "love": "lots", "awe": null, "fear": true, "grief": NaN}'))
     [peer_memory] = ms.list_by_type("kindled_peer")
-    assert peer_memory.emotions == {"joy": 4.0}
+    assert peer_memory._stored_emotions == {"joy": 4.0}
 
 
 def test_live_reflection_does_not_charge_the_bucket(tmp_path):
@@ -214,7 +214,7 @@ def test_live_reflection_does_not_charge_the_bucket(tmp_path):
     s, ms = _live_reflect(tmp_path, _verdict('{"joy": 9}'))
     later = NOW + timedelta(hours=1)
     _live_reflect(tmp_path, _verdict('{"joy": 9}'), now=later, today=later.strftime("%Y-%m-%d"), ms=ms, s=s)
-    assert [m.emotions for m in ms.list_by_type("kindled_peer")] == [{"joy": 9.0}, {"joy": 9.0}]
+    assert [m._stored_emotions for m in ms.list_by_type("kindled_peer")] == [{"joy": 9.0}, {"joy": 9.0}]
 
 
 # ---- B1 PR 7: the prompt and stored values follow the scale rule (cut 1); the peer cap still follows is_live() ----
@@ -236,7 +236,7 @@ def test_peer_memory_is_on_the_engine_scale_and_capped_when_switched_over_but_st
     )
     [peer_memory] = ms.list_by_type("kindled_peer")
     # 0-10, as the x10 fix has run and nothing would rescale a small value; 4 is 0.4 on the cap's own scale, inside it.
-    assert peer_memory.emotions == pytest.approx({"joy": 4.0})
+    assert peer_memory._stored_emotions == pytest.approx({"joy": 4.0})
     # The engine is not reading, so the anti-love-bomb bucket still caps the peer, charged on its own (old) scale.
     assert s.get_peer_emotion_accumulated("kid_a", NOW) == pytest.approx(0.4)
 
@@ -268,7 +268,7 @@ def test_an_engine_that_saw_the_switch_asks_for_zero_to_ten_even_when_the_state_
     )
     assert len(prompts) == 1 and "0 to 10" in prompts[0]
     [peer_memory] = ms.list_by_type("kindled_peer")
-    assert peer_memory.emotions == {"joy": 4.0}
+    assert peer_memory._stored_emotions == {"joy": 4.0}
 
 
 @pytest.mark.no_base_failure(reason="B1 PR 7 pins that a reflection with no persona_dir keeps today's scale; main does too")
@@ -284,7 +284,7 @@ def test_peer_memory_without_a_persona_dir_keeps_todays_scale_even_after_the_x10
         throttle=_Grant(), mem_store=ms, persona_name="Nell", session_id="s1",
     )
     [peer_memory] = ms.list_by_type("kindled_peer")
-    assert peer_memory.emotions == pytest.approx({"tenderness": 0.08})
+    assert peer_memory._stored_emotions == pytest.approx({"tenderness": 0.08})
 
 
 @pytest.mark.no_base_failure(reason="pins that a breach seeds no warmth on the live path too (B1 PR 3); main returns early before any write")

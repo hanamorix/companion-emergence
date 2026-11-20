@@ -24,7 +24,8 @@ def reconstruct_vocabulary_from_memories(store: MemoryStore) -> dict:
     baseline_names: set[str] = {e.name for e in _vocabulary._BASELINE}
     seen_names: set[str] = set()
     for mem in store.list_active(limit=None):
-        for name in mem.emotions:
+        # Names only: a stored emotion whose value is not finite still has a name the vocabulary needs.
+        for name in MemoryStore.stored_emotion_names(mem):
             seen_names.add(_vocabulary.canonical_name(name))  # #174
 
     entries: list[dict] = []

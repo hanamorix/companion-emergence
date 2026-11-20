@@ -149,7 +149,7 @@ def test_refresh_writes_the_emotions_and_created_at_in_the_plus_zero_form(store)
     assert raw["created_at"] == "2031-05-06T07:08:09+00:00"
     assert "Z" not in raw["created_at"]
     got = store.get(memory_id, bump=False)
-    assert got.emotions == {"joy": 2.5, "trust": 1.0}
+    assert got._stored_emotions == {"joy": 2.5, "trust": 1.0}
     assert got.created_at == _WRITTEN_AT
 
 

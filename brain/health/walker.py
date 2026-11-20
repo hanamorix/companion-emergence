@@ -4,6 +4,7 @@ and triggered automatically when a heartbeat tick produces >=2 anomalies."""
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -112,7 +113,8 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
 
                     SoulStore(db_path=db_path).close()
                 else:  # works.db
-                    with sqlite3.connect(str(db_path)) as conn:
+                    # closing(): the connection's own `with` only commits; an open handle blocks a rename on Windows (#779)
+                    with closing(sqlite3.connect(str(db_path))) as conn:
                         result = conn.execute("PRAGMA integrity_check").fetchall()
                     if result != [("ok",)]:
                         detail = "; ".join(str(row[0]) for row in result)

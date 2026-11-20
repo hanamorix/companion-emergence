@@ -62,4 +62,4 @@ def test_note_memory_carries_emotion_delta(tmp_path, monkeypatch):
     assert note_mems
     # vocab-filtered tenderness delta seeded onto the memory (if tenderness is
     # registered for this persona; on the empty default vocab it filters to {}).
-    assert isinstance(note_mems[0].emotions, dict)
+    assert isinstance(note_mems[0]._stored_emotions, dict)

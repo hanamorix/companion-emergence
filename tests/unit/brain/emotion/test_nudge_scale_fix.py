@@ -38,7 +38,7 @@ def _memory(
     peak: float | None = None,
 ) -> Memory:
     numbers = [float(v) for v in emotions.values()]
-    return Memory(
+    return Memory.from_stored_row(
         id=memory_id,
         content=f"content of {memory_id}",
         memory_type=memory_type,

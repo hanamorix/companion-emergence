@@ -81,7 +81,7 @@ def _pride(persona: Path, memory_id: str) -> float:
     try:
         found = store.get(memory_id, bump=False)
         assert found is not None
-        return found.emotions["pride"]
+        return found._stored_emotions["pride"]
     finally:
         store.close()
 

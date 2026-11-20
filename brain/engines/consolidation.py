@@ -39,7 +39,7 @@ from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.dev_constants import MONOLOGUE_MERGE_TYPES
 from brain.emotion import engine
-from brain.emotion.engine_utils import resolve_emotions
+from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
@@ -953,7 +953,8 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
     The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
     have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
     BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
-    neither requeued nor settled as failed, so the outer per-item handler never sees it.
+    neither requeued nor settled as failed, so the outer per-item handler never sees it. A row whose stored emotion the read leaves
+    out is skipped the same way (logged, left as it was), because the write replaces the row's whole map.
     """
     try:
         live_engine = engine.engine_for(persona_dir)
@@ -963,7 +964,17 @@ def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Me
         if fresh is None:
             return  # hard-deleted since the importance update: nothing to write
         row = replace(fresh, importance=memory.importance)
-        faded = {name: live_engine.faded_value(row, name) for name in row.emotions}
+        # The engine's one read: faded, held to 0-10, canonical names. `refresh_faded_emotions` replaces the row's whole map, so a
+        # stored name the read leaves out (a value that is not a finite number, or a fade that failed, with a warning from the
+        # read) would be deleted: that row is skipped and its stored values stay, as when a fade failed before. Two spellings of
+        # one name that the read pools into one are not missing. A skipped row keeps its unfaded values with the importance
+        # committed above, so they fade later under that new importance from the row's old `created_at`.
+        faded = dict(live_engine.memory_feelings(row).feelings)
+        if any(canonical_name(name) not in faded for name in store.stored_emotion_names(row)):
+            logger.warning(
+                "consolidation gate: temp-gate write-back skipped for memory %s; the read left a stored emotion out", memory.id
+            )
+            return
         store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
     except Exception:  # noqa: BLE001
         # A lost write-back costs one refresh; the importance update has already committed.
@@ -1054,20 +1065,17 @@ def _dispatch(
             merged = _fold(target.content, cand.content)
         # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
         live = engine.engine_for(persona_dir).is_live()
-        fields: dict = {"content": merged}
-        if live:
-            # Once the engine is live the merge combines both memories' emotions (see `_merge_emotions`), in the one update that
-            # writes the content. fold=False: the target's own update fires no hook (not even "assigned" when its emotions were
-            # empty); the incoming memory's mood move is sent below.
+        try:
+            # Once the engine is live the merge combines both memories' emotions (`merge_into`, `store._merge_emotions`), in the
+            # one update that writes the content. fold=False: the target's own update fires no hook (not even "assigned" when
+            # its emotions were empty); the incoming memory's mood move is sent below.
             #
             # Only memories of one merge type reach this write (#619), so no memory's feelings pass into a memory of another
             # type. Two memories of ONE merge type can still differ in whether the engine counts them; they merge with no
             # extra check and the incoming memory's own commit event counts it if its type is counted. That same-type case
             # of the counted/uncounted requirement is deferred to Phase 5 with the "newer memory keeps the feelings" rule
             # (owner S13, S14).
-            fields.update(emotions=_merge_emotions(target.emotions, cand.emotions), fold=False)
-        try:
-            store.update(target.id, **fields)
+            store.merge_into(target, cand, merged, engine_live=live)
         except KeyError:
             # Target hard-deleted between the read and the write (a concurrent
             # forgetting LOSE). Defer the candidate; the archive record is
@@ -1132,19 +1140,6 @@ def _dispatch(
         result.continuations += 1
     else:
         result.promoted += 1
-
-
-def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, float]:
-    """The emotions of two memories that merge. Each memory goes through the engine's one name-resolution step first
-    (`resolve_emotions`: each name in its standard spelling, two spellings of one emotion one entry with their average, every
-    value held to 0-10, a value that is not a finite number dropped with a log line). Then an emotion on both memories is the
-    average of the two, and an emotion on one memory only is copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory counts
-    once in the average across the two. Returns a new dict, the target's names first.
-    """
-    merged = resolve_emotions(target_emotions)
-    for name, value in resolve_emotions(cand_emotions).items():
-        merged[name] = (merged[name] + value) / 2 if name in merged else value
-    return merged
 
 
 def _fold(existing: str, addition: str) -> str:

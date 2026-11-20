@@ -21,6 +21,9 @@ What lives here:
 
 All constants are read as `dev_constants.NAME` at call time. Times are aware datetimes (UTC); a "day" is the machine's
 local calendar day (`day_of`), written `YYYY-MM-DD`.
+
+The engine class (`EmotionEngine`) appears here only as a type, imported under `TYPE_CHECKING`: `engine.py` imports this
+module at run time, so this module takes no run-time import of the engine.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from brain.utils.memory import is_conversation_derived
 from brain.utils.time import lenient_utc, to_local
 
 if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
     from brain.memory.store import Memory
 
 logger = logging.getLogger(__name__)
@@ -579,7 +583,7 @@ def faded_emotion(
     has no such emotion: "absent" is for the caller to decide.
     """
     try:
-        stored = memory.emotions[emotion]
+        stored = memory._stored_emotions[emotion]
     except KeyError:
         raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}") from None
     created = lenient_utc(memory.created_at)
@@ -619,7 +623,7 @@ class MemoryFeelings:
     @cached_property
     def feelings(self) -> dict[str, float]:
         faded: dict = {}
-        for name in self._memory.emotions:
+        for name in self._memory._stored_emotions:
             try:
                 faded[name] = faded_emotion(self._memory, name, self._half_lives, self._switch_over_at, self._now)
             except Exception:
@@ -641,13 +645,26 @@ def memory_feelings(
     negative reads as 0 in `feelings` and `peak`.
     """
     return MemoryFeelings(
-        peak=_held_or_zero(memory.peak_emotion_intensity),
-        score=memory.score,
+        peak=_held_or_zero(memory._stored_peak),
+        score=memory._stored_score,
         _memory=memory,
         _half_lives=half_lives,
         _switch_over_at=switch_over_at,
         _now=now,
     )
+
+
+def feelings_of(memory: Memory, eng: EmotionEngine | None) -> MemoryFeelings:
+    """A memory's feelings, peak and score through the engine when one is passed, through the pure read when `eng` is None.
+
+    The one place that choice is made. An engine's own read (`EmotionEngine.memory_feelings`) already falls back to the pure
+    read while the persona is not switched over, so a caller passes the engine it has, or None when it has none. `eng` is
+    required: None is a value the caller states. `.feelings` is a cached dict shared by every use of the returned read; a caller
+    that changes it copies it first.
+    """
+    if eng is None:
+        return memory_feelings(memory, None, None, None)
+    return eng.memory_feelings(memory)
 
 
 # --- runs and the shift rule ----------------------------------------------------------------------------------------

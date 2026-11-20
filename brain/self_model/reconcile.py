@@ -5,9 +5,10 @@ diverged (the ambient gap block), this is how she acts on it — by her own
 choice, never anyone else's insistence.
 
 Actions:
-  accept / revise  — write a self-authored emotion delta for one channel,
-                     bounded [-1, 1] + clamped, routed through the registered
-                     vocabulary filter (off-vocab channels are dropped). The gap
+  accept / revise  — fold a self-authored emotion delta for one channel into the
+                     emotion engine as a signed change (bounded [-1, 1] + clamped,
+                     routed through the registered vocabulary filter; off-vocab
+                     channels are dropped; no memory row is written). The gap
                      is marked ``acknowledged`` and the channel gets a cooldown
                      (R-B2 anti-oscillation).
   dismiss          — let the gap pass; mark it ``dismissed`` + channel cooldown.
@@ -18,12 +19,6 @@ Actions:
                      evidence with a proper half-life + description and dedups
                      against existing channels (R-A — the v0.0.32 stub-flood
                      stays closed).
-
-The emotion write mirrors ``brain/chat/extractor.py::_apply_emotion_delta`` — a
-tiny emotion-carrying Memory committed through MemoryStore, importance from
-magnitude. There is no separate persisted emotion file; felt state is derived
-from memory aggregation, so this is the correct (non-bypassing) way to influence
-it.
 """
 from __future__ import annotations
 
@@ -42,8 +37,7 @@ logger = logging.getLogger(__name__)
 # Channel cooldown after a reconcile, expressed in cadence ticks. The self-model
 # reflection cadence runs on a 6-hour base interval (brain/self_model/cadence.py),
 # so 4 ticks ≈ 24h of "don't re-surface this channel" — long enough to let the
-# self-authored delta settle into the derived read before a new gap can re-open
-# on the same channel (R-B2).
+# acknowledged gap settle before a new one can re-open on the same channel (R-B2).
 _RECONCILE_COOLDOWN_TICKS = 4
 _TICK_HOURS = 6.0
 
@@ -95,66 +89,21 @@ def is_channel_in_cooldown(gap, channel: str, *, now: datetime | None = None) ->
 
 
 def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) -> bool:
-    """Commit a tiny emotion-carrying memory for a self-authored revision.
+    """Fold a self-authored revision into the emotion engine as a signed change; no row is written.
 
-    Mirrors brain/chat/extractor.py::_apply_emotion_delta: the delta is routed
-    through ``_filter_to_registered`` (off-vocab channel → dropped) and clamped
-    to [-1, 1]; importance is abs(delta) * 10 on the 0..10 MemoryStore scale,
-    then capped at ``extractor._MAX_DELTA_INTENSITY`` — one reconcile can't peg
-    a channel to the full clamp any more than one chat-turn extraction can.
+    The delta is clamped to [-1, 1] and routed through ``_filter_to_registered`` (off-vocab channel → dropped); the
+    signed change is the delta times 10, capped at ``extractor._MAX_DELTA_INTENSITY`` (``signed_change_values``), so
+    one reconcile can't peg a channel any more than one chat-turn extraction can.
 
-    Once the engine is live, the signed change is folded into the engine instead
-    and no memory is written (B1 PR 2).
-
-    Returns True if a memory was written (or, live, a change was folded), False
-    if the channel was off-vocab or the delta was effectively zero.
+    Returns True if a change was folded, False if the channel was off-vocab or the delta was effectively zero.
     """
-    from brain.chat.extractor import (
-        _MAX_DELTA_INTENSITY,
-        _filter_to_registered,
-        signed_change_values,
-    )
+    from brain.chat.extractor import _filter_to_registered, signed_change_values
     from brain.emotion import engine
-    from brain.memory.store import Memory, MemoryStore
 
-    clamped = _clamp_delta(delta)
-    registered = _filter_to_registered({channel: clamped})
-
-    # Live (B1 PR 2): fold the signed change into the engine and write no row; True means something was folded. An
-    # unknown switch counts as off and takes the old path below.
-    live_engine = engine.engine_for(persona_dir)
-    if live_engine.is_live():
-        changes = signed_change_values(registered)
-        if not changes:
-            return False
-        live_engine.fold_change(changes, None, "self_model_reconcile")
-        return True
-
-    emotions = {
-        ch: min(abs(v) * 10.0, _MAX_DELTA_INTENSITY)
-        for ch, v in registered.items()
-        if abs(v) > 1e-9
-    }
-    if not emotions:
+    changes = signed_change_values(_filter_to_registered({channel: _clamp_delta(delta)}))
+    if not changes:
         return False
-
-    store = MemoryStore(persona_dir / "memories.db")
-    try:
-        channel_str = ", ".join(f"{ch}:{v:.2f}" for ch, v in emotions.items())
-        mem = Memory.create_new(
-            content=f"[self-model reconcile: {channel_str}]",
-            memory_type="self_model_reconcile",
-            domain="self",
-            emotions=emotions,
-            importance=max(emotions.values()),
-        )
-        # Automatic generated write → route through the consolidation gate (enqueue as a
-        # candidate) rather than straight into memories.db. Gated by memory_type.
-        from brain.memory.pending import route_write
-
-        route_write(store, mem, source="self_model_reconcile")
-    finally:
-        store.close()
+    engine.engine_for(persona_dir).fold_change(changes, None, "self_model_reconcile")
     return True
 
 

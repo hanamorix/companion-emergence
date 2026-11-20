@@ -25,7 +25,7 @@ from brain.utils.memory import days_since_human
 
 def get_body_state(
     *,
-    store: MemoryStore,
+    store: MemoryStore,  # noqa: ARG001 — kept for dispatcher signature symmetry
     hebbian: HebbianMatrix,  # noqa: ARG001 — kept for dispatcher signature symmetry
     persona_dir: Path,
     session_hours: float = 0.0,
@@ -46,9 +46,8 @@ def get_body_state(
     # or retrying, read() returns nothing and the body emotions are absent.
     short = engine.short_values(live_engine.read())
 
-    days_since = days_since_human(store, now=now, persona_dir=persona_dir)
+    days_since = days_since_human(now=now, persona_dir=persona_dir)
     words = count_words_in_session(
-        store,
         persona_dir=persona_dir,
         session_hours=session_hours,
         now=now,

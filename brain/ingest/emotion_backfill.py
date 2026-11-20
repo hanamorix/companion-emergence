@@ -224,8 +224,7 @@ def should_run_emotion_backfill(persona_dir: Path) -> bool:
     from brain.memory.store import MemoryStore
     store = MemoryStore(str(db_path), integrity_check=False)
     try:
-        memories = store.list_active()
-        return any(not m.emotions for m in memories)
+        return store.has_active_without_emotions()
     finally:
         store.close()
 
@@ -265,20 +264,8 @@ def has_emotion_backfill_work(
         if raw.get("date") == _today_str(now):
             return False
 
-    def _scan(s: MemoryStore) -> bool:
-        cur = s._conn.execute(  # noqa: SLF001 — one-column streaming read
-            "SELECT emotions_json FROM memories WHERE active = 1"
-        )
-        try:
-            for (emotions_json,) in cur:
-                if not json.loads(emotions_json):
-                    return True
-            return False
-        finally:
-            cur.close()
-
     if store is not None:
-        return _scan(store)
+        return store.has_active_without_emotions()
 
     db_path = persona_dir / "memories.db"
     if not db_path.exists():
@@ -288,7 +275,7 @@ def has_emotion_backfill_work(
 
     own = _MemoryStore(str(db_path), integrity_check=False)
     try:
-        return _scan(own)
+        return own.has_active_without_emotions()
     finally:
         own.close()
 
@@ -371,7 +358,7 @@ def run_emotion_backfill(
 
         # Filter to emotion-less only, sorted deterministically by id (stable cursor).
         candidates = sorted(
-            [m for m in all_active if not m.emotions],
+            [m for m in all_active if not store.has_stored_emotions(m)],
             key=lambda m: m.id,
         )
 

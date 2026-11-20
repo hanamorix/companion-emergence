@@ -125,7 +125,7 @@ def clamp_importance(x: float) -> float:
     importance, however derived, passes through here before it can reach a
     Memory row. Applied inside Memory.create_new (covers an unclamped
     emotion-sum default, e.g. engines/dream.py's saturated aggregate) AND
-    inside migrator/transform.py's bespoke Memory(...) construction (which
+    inside migrator/transform.py's Memory.from_stored_row construction (which
     bypasses create_new). One helper, both boundaries: no producer can ever
     emit importance > 10.0, and a legitimate value already in range is
     never altered.
@@ -138,6 +138,23 @@ def _json_column(value: dict[str, Any]) -> str:
     the refresh writers and the x10 fix share this one encoder, so they add no direct ``json.dumps`` site to ``store.py`` (the
     json-io allowlist's count for this file does not grow)."""
     return json.dumps(value)
+
+
+def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, float]:
+    """The emotions of two memories that merge. Each memory goes through the engine's one name-resolution step first
+    (`resolve_emotions`: each name in its standard spelling, two spellings of one emotion one entry with their average, every
+    value held to 0-10, a value that is not a finite number dropped with a log line). Then an emotion on both memories is the
+    average of the two, and an emotion on one memory only is copied (a lone ``Joy`` 5 becomes ``joy`` 5). Each memory counts
+    once in the average across the two. Returns a new dict, the target's names first.
+
+    `brain.emotion.engine_utils` is imported here, not at the top: it pulls `brain.utils.memory`, which imports this module.
+    """
+    from brain.emotion.engine_utils import resolve_emotions
+
+    merged = resolve_emotions(target_emotions)
+    for name, value in resolve_emotions(cand_emotions).items():
+        merged[name] = (merged[name] + value) / 2 if name in merged else value
+    return merged
 
 
 def _metadata_or_none(raw: object) -> dict[str, Any] | None:
@@ -342,18 +359,21 @@ class Memory:
         memory_type: "conversation", "meta", "dream", "consolidated",
             "heartbeat", "reflex", or any persona-defined category.
         domain: "us", "work", "craft", or any persona-defined scope.
-        emotions: {emotion_name: intensity} at creation time.
+        _stored_emotions: {emotion_name: intensity} as stored at creation time.
+            Private: the only readers are the store and the emotion engine
+            (`engine_utils.memory_feelings`, `EmotionEngine.memory_feelings`).
+            Every other reader asks the engine for the memory's feelings.
         tags: free-form labels.
         importance: 0.0..10.0 (normalised). Auto-defaults to score/10 if
             not explicitly specified at create_new() time.
-        score: sum of emotion intensities — snapshot at construction.
-            Not updated if `emotions` is mutated in place after creation;
-            consumers that want a live sum should recompute themselves.
+        _stored_score: sum of emotion intensities, a snapshot at construction.
+            Private like `_stored_emotions`; read through `MemoryFeelings.score`.
+        _stored_peak: the highest stored intensity. Private like
+            `_stored_emotions`; read through `MemoryFeelings.peak`.
         created_at: tz-aware UTC datetime of creation.
         last_accessed_at: tz-aware UTC datetime of most recent read, or None.
         active: F22 deactivation flag. Inactive memories are excluded from
             default queries but remain in the database (reversible).
-        protected: reserved. It is stored and loaded, but no code acts on it now that the heartbeat's decay pass is gone.
         metadata: free-form dict for fields not modelled as first-class
             attributes — absorbs OG-only fields (source_date, supersedes,
             etc.) during migration without proliferating the dataclass.
@@ -368,19 +388,65 @@ class Memory:
     memory_type: str
     domain: str
     created_at: datetime
-    emotions: dict[str, float] = field(default_factory=dict)
+    _stored_emotions: dict[str, float] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     importance: float = 0.0
-    score: float = 0.0
+    _stored_score: float = 0.0
     last_accessed_at: datetime | None = None
     active: bool = True
-    protected: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     state: str = "active"
     content_snapshot: str | None = None
     recall_count: float = 0.0
-    peak_emotion_intensity: float = 0.0
+    _stored_peak: float = 0.0
     rowid: int | None = field(default=None, compare=False)
+
+    @classmethod
+    def from_stored_row(
+        cls,
+        *,
+        id: str,
+        content: str,
+        memory_type: str,
+        domain: str,
+        created_at: datetime,
+        emotions: dict[str, float] | None = None,
+        tags: list[str] | None = None,
+        importance: float = 0.0,
+        score: float = 0.0,
+        last_accessed_at: datetime | None = None,
+        active: bool = True,
+        metadata: dict[str, Any] | None = None,
+        state: str = "active",
+        content_snapshot: str | None = None,
+        recall_count: float = 0.0,
+        peak_emotion_intensity: float = 0.0,
+        rowid: int | None = None,
+    ) -> Memory:
+        """Rebuild a memory from a stored row's own values, under public parameter names.
+
+        The one way to build a `Memory` that is not new (the row mapper, `from_dict`, the migrator,
+        recovery): the private field names stay inside this module and the emotion engine.
+        """
+        return cls(
+            id=id,
+            content=content,
+            memory_type=memory_type,
+            domain=domain,
+            created_at=created_at,
+            _stored_emotions=emotions if emotions is not None else {},
+            tags=tags if tags is not None else [],
+            importance=importance,
+            _stored_score=score,
+            last_accessed_at=last_accessed_at,
+            active=active,
+            metadata=metadata if metadata is not None else {},
+            state=state,
+            content_snapshot=content_snapshot,
+            recall_count=recall_count,
+            _stored_peak=peak_emotion_intensity,
+            rowid=rowid,
+        )
 
     @classmethod
     def create_new(
@@ -416,12 +482,12 @@ class Memory:
             memory_type=memory_type,
             domain=domain,
             created_at=datetime.now(UTC),
-            emotions=emotions,
+            _stored_emotions=emotions,
             tags=tags,
             importance=clamp_importance(raw_importance),
-            score=score,
+            _stored_score=score,
             metadata=metadata,
-            peak_emotion_intensity=max(
+            _stored_peak=max(
                 (float(v) for v in emotions.values()), default=0.0
             ),
         )
@@ -433,16 +499,15 @@ class Memory:
             "content": self.content,
             "memory_type": self.memory_type,
             "domain": self.domain,
-            "emotions": dict(self.emotions),
+            "emotions": dict(self._stored_emotions),
             "tags": list(self.tags),
             "importance": self.importance,
-            "score": self.score,
+            "score": self._stored_score,
             "created_at": self.created_at.isoformat(),
             "last_accessed_at": self.last_accessed_at.isoformat()
             if self.last_accessed_at
             else None,
             "active": self.active,
-            "protected": self.protected,
             "metadata": dict(self.metadata),
         }
 
@@ -456,7 +521,7 @@ class Memory:
         last_accessed = (
             _coerce_utc(data["last_accessed_at"]) if data.get("last_accessed_at") else None
         )
-        return cls(
+        return cls.from_stored_row(
             id=data["id"],
             content=data["content"],
             memory_type=data["memory_type"],
@@ -468,7 +533,6 @@ class Memory:
             score=float(data.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(data.get("active", True)),
-            protected=bool(data.get("protected", False)),
             metadata=dict(data.get("metadata") or {}),
         )
 
@@ -1322,31 +1386,44 @@ class MemoryStore:
             """
             INSERT INTO memories (
                 id, content, memory_type, domain, emotions_json, tags_json,
-                importance, score, created_at, last_accessed_at, active, protected,
+                importance, score, created_at, last_accessed_at, active,
                 metadata_json, peak_emotion_intensity
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory.id,
                 memory.content,
                 memory.memory_type,
                 memory.domain,
-                json.dumps(memory.emotions),
+                json.dumps(memory._stored_emotions),
                 json.dumps(memory.tags),
                 memory.importance,
-                memory.score,
+                memory._stored_score,
                 memory.created_at.isoformat(),
                 memory.last_accessed_at.isoformat() if memory.last_accessed_at else None,
                 1 if memory.active else 0,
-                1 if memory.protected else 0,
                 metadata_json,
                 max(
-                    [memory.peak_emotion_intensity]
-                    + [float(v) for v in memory.emotions.values()]
+                    [memory._stored_peak]
+                    + [float(v) for v in memory._stored_emotions.values()]
                 ),
             ),
         )
         return cursor.lastrowid
+
+    def merge_into(self, target: Memory, candidate: Memory, merged_content: str, *, engine_live: bool) -> None:
+        """Write the consolidation merge's result into `target`: the merged content and, once the engine is live, the
+        two memories' stored emotions merged (`_merge_emotions`), in ONE `update` call with ``fold=False``.
+
+        This reads the stored emotions of both memories on purpose and is not a reader of their feelings: the merged map is
+        written back to the row under its old ``created_at``, so a value already faded by age would be faded twice. A
+        merge before the switch-over (``engine_live`` False) writes the content only. Raises `KeyError` as `update` does when
+        the target row no longer exists.
+        """
+        fields: dict[str, Any] = {"content": merged_content}
+        if engine_live:
+            fields.update(emotions=_merge_emotions(target._stored_emotions, candidate._stored_emotions), fold=False)
+        self.update(target.id, **fields)
 
     def emotion_engine(self) -> Any | None:
         """The emotion engine for this store's persona directory, or None for an in-memory store (it has no directory).
@@ -1376,11 +1453,11 @@ class MemoryStore:
     def _notify_assigned(self, before: Memory, new_emotions: dict[str, float]) -> None:
         """Tell the engine a row that had no feelings now has some: the row as it was before the update (its rowid from the update's own lookup), with the new emotions."""
         try:
-            if before.emotions or not new_emotions:
+            if before._stored_emotions or not new_emotions:
                 return
             target = self.emotion_engine()
             if target is not None:
-                target.on_emotions_assigned(replace(before, emotions=dict(new_emotions)))
+                target.on_emotions_assigned(replace(before, _stored_emotions=dict(new_emotions)))
         except Exception:
             logger.error("MemoryStore.update: telling the emotion engine about %s failed", before.id, exc_info=True)
 
@@ -3022,7 +3099,7 @@ class MemoryStore:
         """Update the given fields on an existing memory.
 
         Accepts: content, memory_type, domain, emotions (dict), tags (list),
-        importance, score, last_accessed_at, active, protected.
+        importance, score, last_accessed_at, active.
 
         `fold` is not a field. When true and `emotions` is among the fields, a row that had no emotions and gets some now
         is reported to the emotion engine (`on_emotions_assigned`), once the update, and the re-embed of a changed content,
@@ -3058,7 +3135,7 @@ class MemoryStore:
                     key,
                     value.isoformat() if value else None,
                 )
-            elif key in ("active", "protected"):
+            elif key == "active":
                 column_map[key] = (key, 1 if value else 0)
             elif key in (
                 "content",
@@ -3201,7 +3278,7 @@ class MemoryStore:
 
     _ENGINE_WINDOW_COLUMNS = (
         "rowid, id, content, memory_type, domain, emotions_json, tags_json, importance, score, created_at, "
-        "last_accessed_at, active, protected, metadata_json, state, content_snapshot, recall_count, "
+        "last_accessed_at, active, metadata_json, state, content_snapshot, recall_count, "
         "peak_emotion_intensity"
     )
 
@@ -3846,6 +3923,38 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
+    def has_active_without_emotions(self) -> bool:
+        """True when some active memory has an empty stored emotion vector.
+
+        The emotion backfill's work probe: it streams only the ``emotions_json`` column and stops at the first empty vector,
+        instead of loading every active row (with its embedding) the way `list_active` does.
+        """
+        cur = self._conn.execute("SELECT emotions_json FROM memories WHERE active = 1")
+        try:
+            for (emotions_json,) in cur:
+                if not json.loads(emotions_json):
+                    return True
+            return False
+        finally:
+            cur.close()
+
+    @staticmethod
+    def has_stored_emotions(memory: Memory) -> bool:
+        """True when the memory carries any stored emotion (the emotion backfill's emptiness check on a loaded row).
+
+        A check of whether the row was ever given feelings, not a read of their values: the values go through `memory_feelings`.
+        """
+        return bool(memory._stored_emotions)
+
+    @staticmethod
+    def stored_emotion_names(memory: Memory) -> list[str]:
+        """The names the memory has stored emotions under, text names only (a name that is not text cannot be named canonically).
+
+        The temp-gate write-back's guard input: it compares these names, in canonical form, with the names the one read returns.
+        Names only, never values: the values go through `memory_feelings`.
+        """
+        return [name for name in memory._stored_emotions if isinstance(name, str)]
+
     def list_unembedded_since(
         self,
         cursor: int | None,
@@ -4059,7 +4168,7 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
     created = _coerce_utc(row["created_at"])
     last_accessed = _coerce_utc(row["last_accessed_at"]) if row["last_accessed_at"] else None
     row_keys = row.keys()
-    return Memory(
+    return Memory.from_stored_row(
         id=row["id"],
         content=row["content"],
         memory_type=row["memory_type"],
@@ -4071,7 +4180,6 @@ def _row_to_memory(row: sqlite3.Row) -> Memory:
         score=float(row["score"]),
         last_accessed_at=last_accessed,
         active=bool(row["active"]),
-        protected=bool(row["protected"]),
         metadata=_safe_load_metadata(row["metadata_json"]),
         state=row["state"] if "state" in row_keys else "active",
         content_snapshot=row["content_snapshot"] if "content_snapshot" in row_keys else None,

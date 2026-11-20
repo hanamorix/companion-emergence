@@ -44,7 +44,7 @@ COPY_SUFFIX = ".x10tmp"
 
 def _memory(memory_id: str, emotions: dict[str, float], *, memory_type: str = "making", metadata: dict | None = None) -> Memory:
     numbers = [float(v) for v in emotions.values()]
-    return Memory(
+    return Memory.from_stored_row(
         id=memory_id,
         content=f"content of {memory_id}",
         memory_type=memory_type,
@@ -226,7 +226,7 @@ def test_a_promoted_row_built_from_a_multiplied_entry_carries_no_marker_and_a_re
     nudge_scale_fix.scale_up_small_feelings(tmp_path)
     (entry,) = read_jsonl(tmp_path / QUEUE)
     promoted = Memory.from_dict(entry)  # what the gate does at consolidation.py (`Memory.from_dict(entry)`) before `store.create`
-    assert promoted.emotions == pytest.approx({"joy": 0.5}) and promoted.score == pytest.approx(0.5)
+    assert promoted._stored_emotions == pytest.approx({"joy": 0.5}) and promoted._stored_score == pytest.approx(0.5)
     assert promoted.metadata == {"keep": "me"}
     store = MemoryStore(tmp_path / "memories.db")
     try:
@@ -237,7 +237,7 @@ def test_a_promoted_row_built_from_a_multiplied_entry_carries_no_marker_and_a_re
     store = MemoryStore(tmp_path / "memories.db", integrity_check=False)
     try:
         row = store.get("small", bump=False)
-        assert row is not None and row.emotions == pytest.approx({"joy": 0.5})  # not 5.0
+        assert row is not None and row._stored_emotions == pytest.approx({"joy": 0.5})  # not 5.0
     finally:
         store.close()
 

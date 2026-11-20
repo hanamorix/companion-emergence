@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from brain.emotion import engine
+from brain.emotion.engine_utils import feelings_of
 from brain.memory.store import Memory
 from brain.tools.naming import TOOL_PREFIX_SLOT
 from brain.utils.time import format_local
@@ -18,10 +19,11 @@ from brain.utils.time import format_local
 def _mem_to_result(memory: Memory, persona_dir: Path | None) -> dict:
     """Slim a Memory dataclass down to the fields the LLM needs.
 
-    ``emotions`` carries the faded values (`faded_value` of this persona's emotion
-    engine; the stored values until the switch). With no persona directory (None) there
-    is no engine to ask, and ``emotions`` carries the stored values. The argument is
-    required: None is a value the caller states, not an omitted argument.
+    ``emotions`` carries the memory's feelings: this persona's emotion engine's
+    `memory_feelings` (faded values held to 0-10; the stored values held until the switch).
+    With no persona directory (None) there is no engine to ask, and the pure read gives the
+    stored values held. The argument is required: None is a value the caller states, not an
+    omitted argument.
 
     Mirrors OG nell_tools.py:_mem_to_result shape while using the new
     Memory dataclass attribute names (emotions dict, not emotional_tone).
@@ -30,11 +32,7 @@ def _mem_to_result(memory: Memory, persona_dir: Path | None) -> dict:
     Memory row itself stays stored in UTC; only this tool-result copy is
     converted.
     """
-    if persona_dir is None:
-        emotions = dict(memory.emotions)
-    else:
-        live_engine = engine.engine_for(persona_dir)
-        emotions = {n: live_engine.faded_value(memory, n) for n in memory.emotions}
+    emotions = dict(feelings_of(memory, None if persona_dir is None else engine.engine_for(persona_dir)).feelings)
     return {
         "id": memory.id,
         "content": memory.content,

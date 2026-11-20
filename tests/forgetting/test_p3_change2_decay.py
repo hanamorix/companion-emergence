@@ -26,11 +26,13 @@ from brain.memory.store import Memory
 
 
 class _StoredValues:
-    """An engine whose faded value is the stored one. These simulations score synthetic memories with no store, and
+    """An engine whose feelings are the stored ones. These simulations score synthetic memories with no store, and
     `score` resolves its engine from the store unless one is passed."""
 
-    def faded_value(self, memory, emotion):
-        return memory.emotions[emotion]
+    def memory_feelings(self, memory):
+        from brain.emotion.engine_utils import memory_feelings
+
+        return memory_feelings(memory, None, None, None)
 
 _CADENCE_HOURS = 6.0
 _TWO_LIVED_YEARS_HOURS = 17_532.0  # per plan's stated anchor

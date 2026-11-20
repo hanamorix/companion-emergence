@@ -217,7 +217,7 @@ def _modifier(_memory) -> float:  # noqa: ANN001
 
 
 def _stored(memory) -> dict:  # noqa: ANN001
-    return dict(memory.emotions)
+    return dict(memory._stored_emotions)
 
 
 def test_the_first_rebuild_sets_rows_through_to_the_highest_rowid_of_its_window(tmp_path: Path) -> None:
