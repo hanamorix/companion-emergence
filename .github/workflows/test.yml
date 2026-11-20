@@ -51,9 +51,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Push and pull_request: all three OSes. A manual run narrows this to the
-        # chosen OS (`os` is a choice input, so only the four listed values exist).
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        # Push and pull_request: Ubuntu and macOS; Windows runs as shards in `python-windows` (#746). A manual run
+        # narrows this to the chosen OS, or all three (Windows unsharded) for `all` (`os` is a choice input, so only
+        # the four listed values exist).
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && (inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') || '["ubuntu-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -154,6 +155,74 @@ jobs:
       - name: Lint with ruff
         if: github.event_name != 'workflow_dispatch'
         run: uv run ruff check .
+
+  # #746: the Windows suite took 32 to 50 minutes on one runner (its tests add up to about 80 minutes there), the
+  # longest check on every PR. It runs as shards on separate runners: `--shard i/N` (tests/shard.py) puts every test in
+  # exactly one shard and keeps each xdist_group whole, balanced by tests/shard_durations.json
+  # (scripts/refresh_shard_durations.py), and the split does not depend on the random order, so each shard keeps its
+  # own fresh seed. A manual run stays one unsharded job in `python` above. To reproduce a red shard, run its seed with
+  # the same `--shard i/N`.
+  python-windows:
+    name: python windows-latest (${{ matrix.shard }}/4)
+    if: github.event_name != 'workflow_dispatch'
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run pytest
+        env:
+          KINDLED_SLOW_BUDGET_LOG: slow-budget-cpu.jsonl
+        run: uv run pytest -n auto --dist loadgroup -p no:tdd-guard -v --tb=short --durations=100 --junitxml=pytest-junit.xml --shard=${{ matrix.shard }}/4
+
+      - name: Upload pytest junit report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pytest-junit-windows-latest-${{ matrix.shard }}-of-4
+          path: pytest-junit.xml
+          if-no-files-found: warn
+
+      - name: Upload the slow-test CPU log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: slow-budget-cpu-windows-latest-${{ matrix.shard }}-of-4
+          path: slow-budget-cpu.jsonl
+          if-no-files-found: ignore
+
+  # #746: one check says whether Windows passed, whatever the shard count. Skipped (not failed) when a shard was
+  # cancelled: rerun-runner-loss.yml re-runs a run only when every job that didn't pass was lost to a runner, and a
+  # failing job here would stop that; re-running the cancelled shard re-runs this job too.
+  python-windows-result:
+    name: python windows-latest
+    needs: python-windows
+    if: always() && github.event_name != 'workflow_dispatch' && needs.python-windows.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every Windows shard passed
+        env:
+          RESULT: ${{ needs.python-windows.result }}
+        run: |
+          echo "the Windows shards: $RESULT"
+          test "$RESULT" = success
 
   # #540: a test that cannot fail proves nothing. Every NEW test a PR adds must fail against the product
   # code the PR branched from (or be marked `no_base_failure(reason=...)`, which is counted and listed).
