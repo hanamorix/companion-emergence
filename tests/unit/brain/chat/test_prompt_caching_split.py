@@ -262,10 +262,17 @@ def _seed_rich_persona(persona_dir: Path, store: MemoryStore, soul_store: SoulSt
 
 
 def test_information_completeness_static_union_volatile(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, emotion_engine_stub
 ) -> None:
     """Every block the pre-change build_system_message emitted must be present
     across (static ∪ volatile) for the same inputs — only repositioned (C4)."""
+    from brain.emotion.engine import Reading
+
+    # The mood summary ("current emotions:") is the engine's read.
+    emotion_engine_stub.readings = {
+        "love": Reading(short=8.0, long=8.0, difference=0.0, shift=0),
+        "tenderness": Reading(short=6.0, long=6.0, difference=0.0, shift=0),
+    }
     _seed_rich_persona(persona_dir, store, soul_store)
     voice = "# Nell\n\nsouthern novelist."
     kwargs = {
