@@ -39,6 +39,10 @@ def test_brain_tree_has_no_unreviewed_windows_pitfalls(real_findings) -> None:
     assert real_findings == []
 
 
+@pytest.mark.no_base_failure(
+    reason="the change is in this test file, which the base check keeps at the PR head; against main's version of the "
+    "file it fails (the test there takes no fixture and calls lint.scan() itself, #665)"
+)
 def test_the_real_tree_is_scanned_in_setup_not_in_the_budgeted_call(monkeypatch) -> None:
     """#665: the scan reads and parses all of brain/ (0.5 to 1.8 s of CPU on CI, growing with the tree) and failed the
     2 s call-phase budget three times in a week. Setup is not budgeted, so the scan belongs in a module fixture, as the
