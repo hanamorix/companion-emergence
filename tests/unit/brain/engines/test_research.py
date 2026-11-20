@@ -1145,6 +1145,7 @@ def test_gate_an_opposing_feeling_never_opens_it(tmp_path: Path, emotion_engine_
     assert _gate(tmp_path, emotion_engine_stub, {name: 9.0}, {name}) is False
 
 
+@pytest.mark.no_base_failure(reason="regression guard: the old any-feeling gate also opens here (high, above the bar); the new gate must keep it open. The threshold bites in the 'at the threshold' test")
 def test_gate_opening_feeling_above_the_threshold_opens_it(tmp_path: Path, emotion_engine_stub):
     # grief 2.0 -> T = 5.0; awe 6.0 is above it
     assert _gate(tmp_path, emotion_engine_stub, {"awe": 6.0, "grief": 2.0}, {"awe"}) is True
@@ -1154,6 +1155,7 @@ def test_gate_opening_feeling_at_the_threshold_does_not_open_it(tmp_path: Path, 
     assert _gate(tmp_path, emotion_engine_stub, {"awe": 5.0, "grief": 2.0}, {"awe"}) is False
 
 
+@pytest.mark.no_base_failure(reason="spec A4: with no opposing feeling the new gate must give today's answer, so the old any-feeling gate passes it by design")
 def test_gate_without_opposing_feelings_todays_test_decides(tmp_path: Path, emotion_engine_stub):
     """T(0) is 0, so any value above 0 that the engine calls high opens it (the real engine's own floor of 1.0 comes first)."""
     assert _gate(tmp_path, emotion_engine_stub, {"awe": 0.5}, {"awe"}) is True
@@ -1174,6 +1176,7 @@ def test_gate_opp_counts_an_opposing_feeling_the_engine_does_not_call_high(tmp_p
     assert _gate(tmp_path, emotion_engine_stub, {"awe": 6.6, "rest_need": 7.0}, {"awe"}) is True
 
 
+@pytest.mark.no_base_failure(reason="regression guard: the engine's own high test still decides which feelings count; the old gate already behaves this way")
 def test_gate_only_the_opening_feeling_must_be_high(tmp_path: Path, emotion_engine_stub):
     assert _gate(tmp_path, emotion_engine_stub, {"awe": 9.0, "joy": 9.0}, {"joy"}) is True
     assert _gate(tmp_path, emotion_engine_stub, {"awe": 9.0, "joy": 9.0}, set()) is False

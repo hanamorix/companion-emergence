@@ -10,6 +10,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from brain.bridge.provider import FakeProvider
 from brain.emotion.engine_utils import Average, EmotionState, EngineState, SnapshotDay
 from brain.engines.research import ResearchEngine
@@ -71,12 +73,14 @@ def _reason(tmp_path: Path, shorts: dict[str, float]) -> str | None:
         store.close()
 
 
+@pytest.mark.no_base_failure(reason="spec A6: with no opposing feeling present the new gate must give today's answer, so the old gate passes it by design; it guards against a wrong default for a missing name")
 def test_real_engine_an_absent_opposing_feeling_counts_as_zero(tmp_path: Path):
     # awe is high at 5.0 and the persona has no grief, shame, comfort_seeking or rest_need: opp 0, T 0, so it opens
     # (a missing name counted as 10 would make T 8 and keep it closed)
     assert _reason(tmp_path, {"awe": 5.0}) != "not_due"
 
 
+@pytest.mark.no_base_failure(reason="tests the engine's feels_high on a name the persona lacks, which this change does not touch; spec A6 asks for it as a guard")
 def test_real_engine_an_opening_feeling_she_lacks_is_never_high(tmp_path: Path):
     persona = make_persona(tmp_path / "persona")
     state = EngineState(
