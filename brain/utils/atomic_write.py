@@ -120,6 +120,12 @@ def _remove_stale_temps(path: Path) -> None:
         if m is None:
             continue
         pid = int(m.group(1))
+        from brain import process_identity
+
+        if not process_identity.is_pid_number(pid):
+            # #755: no save writes a pid no process can have, so this is not a leftover of ours: leave it. (Before,
+            # the liveness check raised on it and the except in _owner_alive kept it; it now reads such a pid as dead.)
+            continue
         with _INFLIGHT_LOCK:
             if temp.name in _INFLIGHT:
                 continue

@@ -134,8 +134,12 @@ def _macos_token(pid: int) -> str:  # pragma: no cover - exercised on the macOS 
 
 
 def token_of(pid: int | None) -> str:
-    """The identity token of ``pid``, or ``GONE`` / ``UNKNOWN``."""
-    if pid is None or pid <= 0:
+    """The identity token of ``pid``, or ``GONE`` / ``UNKNOWN``.
+
+    A pid outside the platform's range (#755: a damaged or hand-edited record) names no process, so it is ``GONE``
+    without asking the OS: Windows's reader would fail on it (read as UNKNOWN, which ``holder_alive`` counts as alive)
+    and macOS's would read whatever process the number cut to a C int names."""
+    if pid is None or not is_pid_number(pid):
         return GONE
     try:
         if sys.platform.startswith("linux"):
