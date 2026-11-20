@@ -13,13 +13,12 @@ call (or not).
 Render conditions (all must hold):
   1. state.current_gap is not None
   2. status in {"open", "acknowledged"}  (a dismissed/resolved gap is silent)
-  3. there is something to say — a note OR a non-trivial per_channel.
+  3. there is something to say — a note OR a channel the engine reads as shifted.
 
 Otherwise → None (block omitted entirely).
 
-Live render (the emotion engine is live, `live=True`): the gap's channels come from the
-engine's shift rule, valued at their signed difference with a direction (+1 rising,
--1 fading). There is no noise floor (the engine already decided the channel shifted);
+The gap's channels come from the emotion engine's shift rule, valued at their signed difference
+with a direction (+1 rising, -1 fading). There is no noise floor (the engine already decided the channel shifted);
 the block names the largest `dev_constants.SELF_MODEL_BLOCK_CHANNEL_COUNT` channels by
 absolute difference, each by where it sits (the sign of the difference) and which way
 it moves. The fragments are `prompt_strings` keys under `self_model.ambient`.
@@ -32,10 +31,6 @@ from brain.self_model.state import SelfModelState
 
 # Statuses where the gap is still live and worth surfacing.
 _LIVE_STATUSES = frozenset({"open", "acknowledged"})
-
-# Only channels diverging by at least this much are worth naming in the block —
-# tiny deltas are noise and would clutter the hedge.
-_CHANNEL_FLOOR = 0.5
 
 
 def _live_fragment_key(delta: float, direction: int | None) -> str | None:
@@ -70,13 +65,10 @@ def _live_channels(gap: Gap) -> list[tuple[str, str]]:
     return [(name, key) for name, _delta, key in named[:count]]
 
 
-def render_block(
-    state: SelfModelState, *, tool_prefix: str = "", live: bool = False
-) -> str | None:
+def render_block(state: SelfModelState, *, tool_prefix: str = "") -> str | None:
     """Return the hedged self-model gap block, or None when nothing to surface.
 
-    `live` is True when the emotion engine is live: the channels are then the engine's shifted channels with their
-    position and direction (see the module docstring). Otherwise today's floor-and-sign render runs.
+    The channels are the engine's shifted channels with their position and direction (see the module docstring).
     """
     gap = state.current_gap
     if gap is None:
@@ -84,21 +76,11 @@ def render_block(
     if gap.status not in _LIVE_STATUSES:
         return None
 
-    live_channels: list[tuple[str, str]] = []
-    channels: dict[str, float] = {}
-    if live:
-        live_channels = _live_channels(gap)
-    else:
-        # Pull the channels worth naming: short − long deltas above the floor.
-        channels = {
-            name: delta
-            for name, delta in (gap.per_channel or {}).items()
-            if abs(delta) >= _CHANNEL_FLOOR
-        }
+    live_channels = _live_channels(gap)
     note = (gap.note or "").strip() or None
 
     # Nothing to say → omit the block entirely (R-F1).
-    if not channels and not live_channels and note is None:
+    if not live_channels and note is None:
         return None
 
     lines: list[str] = [
@@ -117,17 +99,6 @@ def render_block(
             prompt_strings.get(f"self_model.ambient.{key}").format(name=name)
             for name, key in live_channels
         ]
-        lines.append("")
-        lines.append("; ".join(fragments) + ".")
-    elif channels:
-        # Sort by magnitude so the loudest divergence reads first.
-        ordered = sorted(channels.items(), key=lambda kv: abs(kv[1]), reverse=True)
-        fragments = []
-        for name, delta in ordered:
-            if delta > 0:
-                fragments.append(f"{name}'s been running stronger than your baseline lately")
-            else:
-                fragments.append(f"{name}'s been running quieter than usual lately")
         lines.append("")
         lines.append("; ".join(fragments) + ".")
 

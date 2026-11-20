@@ -58,7 +58,8 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     # discarded making moves nothing — empty-emotion act-memory only. The feed
     # wire-back (eventual_share → shared) is driven by flip_ready_shares from
     # run_maker_tick, not here.
-    from brain.emotion import engine
+    from brain.dev_constants import NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    from brain.emotion.write_scale import writes_engine_scale
     from brain.maker import wiring
     from brain.maker.sources import making_source
     if making.disposition != "discard":
@@ -66,7 +67,8 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
         delta = wiring.making_emotion_delta(
             making,
             dominant_source=making_source(charge, store),
-            live=engine.engine_for(persona_dir).is_live(),
+            # A making goes to the pending queue: only the x10 fix's queue step (cut 2) rescales it (B1 PR 7).
+            engine_scale=writes_engine_scale(persona_dir, store, cut=NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED),
         )
         wiring.write_making_memory(store, making, emotions=delta)
     else:
