@@ -243,9 +243,8 @@ def test_unreadable_state_counts_as_off_through_dispatch(tmp_path: Path):
     assert trace.content == "raw drift"
 
 
-@pytest.mark.no_base_failure(reason="pins today's switch-off trace, which this PR must leave unchanged")
-def test_switch_off_capture_stores_todays_trace(tmp_path: Path):
-    from brain.emotion.aggregate import aggregate_state
+def test_switch_off_capture_stores_the_raw_thought_with_no_feelings(tmp_path: Path):
+    # B1 PR 7: the switch-off trace keeps the raw thought; the old aggregate seed of recent memories is gone.
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import Memory, MemoryStore
     from brain.monologue.trace import _trace_importance
@@ -258,15 +257,14 @@ def test_switch_off_capture_stores_todays_trace(tmp_path: Path):
         store.create(
             Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 8.0, "grief": 3.0})
         )
-        expected = dict(aggregate_state(store.list_active()).emotions)
         result = _record(persona_dir, store, hebbian, "raw drift", "she drifted")
         trace = _traces(persona_dir)[0]
     finally:
         store.close()
         hebbian.close()
     assert result == {"ok": True, "monologue_text": "raw drift"}
-    assert (trace.content, trace._stored_emotions) == ("raw drift", expected)
-    assert trace.importance == pytest.approx(_trace_importance(expected))
+    assert (trace.content, trace._stored_emotions) == ("raw drift", {})
+    assert trace.importance == pytest.approx(_trace_importance({}))
 
 
 def test_write_trace_memory_without_a_persona_dir_is_off(tmp_path: Path):
@@ -283,20 +281,17 @@ def test_write_trace_memory_without_a_persona_dir_is_off(tmp_path: Path):
 
 
 def test_live_answer_without_a_persona_dir_is_still_off(tmp_path: Path):
-    """No persona means no engine to read, so the whole trace is today's, not digest content with old feelings."""
+    """No persona means no engine to read, so the whole trace is today's raw thought, with no feelings (B1 PR 7)."""
     from brain.monologue.trace import write_trace_memory
 
     persona_dir, store, hebbian, _eng = _live_persona(tmp_path)
     try:
-        from brain.emotion.aggregate import aggregate_state
-
-        expected = dict(aggregate_state(store.list_active()).emotions)
         write_trace_memory(store, "raw drift", feed_digest="she drifted", persona_dir=None, live=True)
         trace = _traces(persona_dir)[0]
     finally:
         store.close()
         hebbian.close()
-    assert (trace.content, trace._stored_emotions) == ("raw drift", expected)
+    assert (trace.content, trace._stored_emotions) == ("raw drift", {})
 
 
 def test_live_interior_block_shows_the_digest_not_the_raw_thought(tmp_path: Path):

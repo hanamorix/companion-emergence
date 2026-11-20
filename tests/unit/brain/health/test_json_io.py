@@ -2345,12 +2345,13 @@ def test_ca4_a_stale_check_costs_at_most_a_blank_line(tmp_path: Path, monkeypatc
     assert b"\n\n" in p.read_bytes()  # the blank line the reader skips
 
 
-def test_ca5_fsync_is_opt_in_for_appends(tmp_path: Path, monkeypatch) -> None:
+def test_ca5_appends_fsync_by_default(tmp_path: Path, monkeypatch) -> None:
     calls = _count_fsyncs(monkeypatch)
     jio.append_jsonl(tmp_path / "a.jsonl", {"a": 1})
-    assert calls == []
-    jio.append_jsonl(tmp_path / "b.jsonl", {"a": 1}, fsync=True)
     assert calls
+    calls.clear()
+    jio.append_jsonl(tmp_path / "b.jsonl", {"a": 1}, fsync=False)
+    assert calls == []
 
 
 @pytest.mark.parametrize(

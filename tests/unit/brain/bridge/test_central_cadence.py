@@ -1025,6 +1025,7 @@ _GATED_CALLS = {
     "drain_all_locked",
 }
 _NON_GATED_ONE_SHOTS = {
+    "_jsonl_nul_repair_run",
     "_attunement_run_backfill",
     "_attunement_run_supplementary_backfill",
     "_run_vocab_repair_tick",

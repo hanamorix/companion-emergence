@@ -13,6 +13,8 @@ from brain.bridge.provider import FakeProvider, LLMProvider
 from brain.emotion import engine as emotion_engine
 from brain.emotion import engine_utils
 from brain.emotion.engine import EmotionEngine
+from brain.emotion.state import EmotionalState
+from brain.engines import dream_seeds
 from brain.engines.consolidation import Decision, run_consolidation
 from brain.engines.dream import DreamEngine, NoSeedAvailable
 from brain.memory.hebbian import HebbianMatrix
@@ -705,7 +707,7 @@ def test_live_dream_holds_old_rows_within_range(store: MemoryStore, hebbian: Heb
     assert result.memory is not None
     assert all(0.0 <= v <= 10.0 for v in result.memory._stored_emotions.values())
     assert result.memory._stored_emotions["love"] == 10.0
-    assert result.memory._stored_emotions["tenderness"] == 0.0  # a negative mean is held to 0 and kept, not dropped
+    assert result.memory._stored_emotions["tenderness"] == 0.0 # a negative mean is held to 0 and kept, not dropped
 
 
 def _mood_rows(store: MemoryStore) -> list[Memory]:
@@ -729,12 +731,22 @@ def _mood_rows(store: MemoryStore) -> list[Memory]:
     return breadcrumbs
 
 
-@pytest.mark.no_base_failure(reason="pins the switch-off mood, which is today's")
-def test_off_mood_comes_from_conversation_rows(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:
-    breadcrumbs = _mood_rows(store)
-    seed = _live_dream_engine(store, hebbian, tmp_path).run_cycle(dry_run=True).seed
-    assert seed.id not in {b.id for b in breadcrumbs}
-    assert seed._stored_emotions == {"grief": 6.0}
+def test_off_mood_is_empty_like_an_empty_engine_read(
+    store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B1 PR 7: with the engine not reading, the old aggregate of the conversation rows (grief here) is gone; the mood
+    # is empty, the same as the live path's accepted empty read during a rebuild.
+    _mood_rows(store)
+    seen: list[EmotionalState] = []
+    real = dream_seeds.select_seed
+
+    def _spy(candidates, mood, *args, **kwargs):
+        seen.append(mood)
+        return real(candidates, mood, *args, **kwargs)
+
+    monkeypatch.setattr(dream_seeds, "select_seed", _spy)
+    _live_dream_engine(store, hebbian, tmp_path).run_cycle(dry_run=True)
+    assert [m.emotions for m in seen] == [{}]
 
 
 def test_live_mood_comes_from_the_engine_read(store: MemoryStore, hebbian: HebbianMatrix, tmp_path: Path) -> None:

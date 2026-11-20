@@ -1249,7 +1249,7 @@ def append_jsonl(
     records: dict | Iterable[dict] | bytes,
     *,
     lock: Literal["block", "try", "held"] = "block",
-    fsync: bool = False,
+    fsync: bool = True,
     on_error: Literal["raise", "log"] = "raise",
     nonfinite: Nonfinite = "raise",
 ) -> int | None:
@@ -1264,6 +1264,9 @@ def append_jsonl(
     and the record is not written (the caller, like the recall path, buffers on None). ``on_error="log"`` turns
     an OSError into a throttled warning and None. ``nonfinite`` applies only when ``records`` are dicts;
     pre-encoded bytes are written as given (encode them with ``encode_jsonl(..., nonfinite=...)``).
+
+    An unclean machine stop can leave a just-appended record as NUL bytes (#618), so appends are fsynced unless
+    the caller passes ``fsync=False`` with a ``# fsync off:`` comment giving the reason.
     """
     path = _as_path(path)
     if lock not in ("block", "try", "held"):

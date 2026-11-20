@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 
 from brain.bridge.provider import LLMProvider
 from brain.emotion import engine as emotion_engine
-from brain.emotion.aggregate import aggregate_state
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
 from brain.engines import dream_seeds
@@ -203,11 +202,18 @@ class DreamEngine:
         # Mood from conversation residue only (not grief breadcrumbs) so a
         # breadcrumb cannot self-set the mood that retrieves it. Live, the mood is
         # the engine's short averages: every counted source, and the engine does not
-        # count a grief_event either. An empty read during a rebuild is accepted.
+        # count a grief_event either. An empty read during a rebuild is accepted. With the engine not reading (no
+        # persona, not switched over, or the state unreadable) the mood is empty, the same as that empty read: the old
+        # aggregate of conversation memories went in B1 PR 7.
         if eng is not None:
             mood = EmotionalState(emotions={name: r.short for name, r in eng.read().items()})
         else:
-            mood = aggregate_state(convo)
+            # Accepted edge (ThinkerOfThoughts, #742): this off path is reached by a start that skipped the switch-over,
+            # or by a saved state that cannot be read, which can last the whole bridge session. An empty mood pools every
+            # candidate, as it does on the live path during a rebuild, and grief breadcrumbs are seed candidates by
+            # design, so a grief breadcrumb can win the seed here: a dream seeded from an important memory, nothing lost.
+            # No grief_event filter on either path.
+            mood = EmotionalState()
         crystallizations = self.soul_store.list_active() if self.soul_store else []
         recent = self._recent_seed_ids(self.refractory_window)
 

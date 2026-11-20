@@ -669,7 +669,7 @@ def test_the_append_asks_append_jsonl_for_a_held_lock_and_logging_with_no_fsync(
 
     monkeypatch.setattr(engine_files, "append_jsonl", spy)
     assert engine_files.append_event(tmp_path, _event(0)) is True
-    assert seen == {"lock": "held", "on_error": "log", "path": engine_files.queue_path(tmp_path)}
+    assert seen == {"lock": "held", "on_error": "log", "fsync": False, "path": engine_files.queue_path(tmp_path)}
     result[0] = None  # append_jsonl's way of saying it logged and wrote nothing
     assert engine_files.append_event(tmp_path, _event(0)) is False
 
@@ -959,7 +959,7 @@ def test_the_append_asks_for_a_held_lock_and_logging_not_raising(
 
     monkeypatch.setattr(engine_files, "append_jsonl", spy)
     assert engine_files.append_change(tmp_path, _change(NOW)) is True
-    assert seen == {"lock": "held", "on_error": "log"}
+    assert seen == {"lock": "held", "on_error": "log", "fsync": False}
 
 
 def test_an_unwritable_change_log_logs_and_returns_false(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
