@@ -189,8 +189,7 @@ Storage is UTC everywhere; local time is for display only.
 
 | function | where (path:line) | what it is for |
 |---|---|---|
-| `short_values` | brain/emotion/engine.py:87 | The short average of each feeling in an engine `read()`, as a `{name: short}` dict: the map every reader of how she feels now works from. Use it, do not write the `{name: r.short ...}` comprehension again. |
-
+| `short_values` | brain/emotion/engine.py:125 | The short average of each feeling in an engine `read()`, as a `{name: short}` dict: the map every reader of how she feels now works from. Use it, do not write the `{name: r.short ...}` comprehension again. |
 | `EmotionEngine.memory_feelings` | brain/emotion/engine.py:843 | A memory's feelings, peak and score with this engine's half-lives, switch-over time and clock (the pure read before the switch-over, when nothing fades). The memory is read, never changed, and no store is read. |
 
 ### `brain/emotion/engine_utils.py`
