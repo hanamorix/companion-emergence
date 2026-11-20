@@ -78,6 +78,7 @@ OPENERS: dict[str, str] = {
     "brain/soul/store.py": "crystallizations.db (SoulStore, through open_store_connection).",
     "brain/kindled_link/store.py": "the kindled-link db (KindledLinkStore, through open_store_connection).",
     "brain/works/store.py": "works.db (WorksStore, through open_store_connection).",
+    "brain/works/location.py": "works.db: the one-time merge of an old data/works.db into it, and that old file's retirement (#606).",
     "brain/memory/known_names.py": "known_names.db, a separate small file (read-only URIs plus its own writer).",
     "brain/initiate/resonance.py": "memory_activation_baseline.db, the resonance tick's own file.",
     "brain/health/walker.py": "works.db integrity check only; the other databases go through their stores.",

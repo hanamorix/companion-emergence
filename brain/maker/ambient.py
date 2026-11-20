@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 def build_maker_awareness_block(persona_dir: Path, *, limit: int = 5) -> str | None:
+    from brain.works.location import works_db_path
     from brain.works.store import WorksStore
-    db = persona_dir / "works.db"
+    db = works_db_path(persona_dir)
     if not db.exists():
         return None
     store = WorksStore(db)

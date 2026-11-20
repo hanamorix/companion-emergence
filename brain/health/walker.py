@@ -88,8 +88,12 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
 
     # SQLite integrity — constructors run PRAGMA integrity_check where available;
     # works.db is checked explicitly because WorksStore is optimized for hot
-    # request paths and does not deep-scan on every init.
-    for db_name in ("memories.db", "hebbian.db", "crystallizations.db", "data/works.db"):
+    # request paths and does not deep-scan on every init. Its path comes from the one
+    # resolver (#606), so this checks the file the store actually uses.
+    from brain.works.location import works_db_path
+
+    works_name = works_db_path(persona_dir).relative_to(persona_dir).as_posix()
+    for db_name in ("memories.db", "hebbian.db", "crystallizations.db", works_name):
         db_path = persona_dir / db_name
         if not db_path.exists():
             continue
@@ -107,7 +111,7 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
                     from brain.soul.store import SoulStore
 
                     SoulStore(db_path=db_path).close()
-                else:  # data/works.db
+                else:  # works.db
                     with sqlite3.connect(str(db_path)) as conn:
                         result = conn.execute("PRAGMA integrity_check").fetchall()
                     if result != [("ok",)]:

@@ -49,8 +49,9 @@ def flip_ready_shares(persona_dir, *, now, delay_hours: float) -> int:
     """eventual_share makings older than delay → mark shared_at (surfaces to feed). Returns count flipped."""
     from datetime import datetime
 
+    from brain.works.location import works_db_path
     from brain.works.store import WorksStore
-    db = persona_dir / "works.db"
+    db = works_db_path(persona_dir)
     if not db.exists():
         return 0
     store = WorksStore(db)
