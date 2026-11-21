@@ -231,6 +231,34 @@ def test_anomaly_on_a_store_load_heals_even_with_the_marker(tmp_path: Path):
         store.close()
 
 
+def test_bak_restore_in_the_same_process_writes_the_word_back(tmp_path: Path):
+    """The loader restores an older .bak1 while this process's registry still holds the word: the file gets it back."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(content="a", memory_type="conversation", domain="us", emotions={"xi_feel": 8.0})
+        )
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+        assert vocabulary.get("xi_feel") is not None
+
+        (tmp_path / "emotion_vocabulary.json.bak1").write_text(
+            json.dumps({"version": 1, "emotions": []}), encoding="utf-8"
+        )
+        vocab_path.write_text("{corrupt{{", encoding="utf-8")
+
+        _count, anomaly = load_persona_vocabulary_with_anomaly(vocab_path, store=store)  # same process: no _unregister
+
+        assert anomaly is not None and "bak1" in anomaly.action
+        names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+        assert "xi_feel" in names
+        marker = json.loads((tmp_path / "cadence" / "vocab_heal_final.json").read_text(encoding="utf-8"))
+        assert marker["count"] == 1
+    finally:
+        store.close()
+
+
 def test_missing_file_still_reconstructs_after_heal_marker(tmp_path: Path):
     store = MemoryStore(":memory:")
     try:

@@ -3,6 +3,7 @@ and triggered automatically when a heartbeat tick produces >=2 anomalies."""
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
@@ -11,6 +12,8 @@ from pathlib import Path
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
 from brain.health.json_io import Recovery, read_json_result
 from brain.paths import cadence_state_path
+
+logger = logging.getLogger(__name__)  # the heal-marker unlink warning in walk_persona
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
 #
@@ -62,8 +65,17 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
             if name == "emotion_vocabulary.json":
                 # This heal has no store: a restored .bak or a reset can drop words only the
                 # memories still carry. Delete the one-time heal marker so the next load that
-                # has a store re-registers them (#784).
-                cadence_state_path(persona_dir, "vocab_heal_final.json").unlink(missing_ok=True)
+                # has a store re-registers them (#784). A failure is logged, never fatal to the walk.
+                marker = cadence_state_path(persona_dir, "vocab_heal_final.json")
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "could not remove %s after repairing %s; the vocabulary heal may not re-run",
+                        marker,
+                        name,
+                        exc_info=True,
+                    )
 
     # Auto-creating text identity scan (voice.md). load_voice() owns the
     # default template and the attempt_heal_text invocation.

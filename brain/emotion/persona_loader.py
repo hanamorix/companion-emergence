@@ -142,11 +142,11 @@ def load_persona_vocabulary_with_anomaly(
         # repairs with no store, deletes the marker for the same reason.
         marker = cadence_state_path(path.parent, "vocab_heal_final.json")
         if anomaly is not None or not marker.exists():
-            healed = _heal_referenced_but_unregistered(path, data, store)
+            written, healed = _heal_referenced_but_unregistered(path, data, store)
             registered += healed
             write_json(
                 marker,
-                {"healed_at": datetime.now(UTC).isoformat(), "count": healed},
+                {"healed_at": datetime.now(UTC).isoformat(), "count": written},
             )
 
     return registered, anomaly
@@ -314,10 +314,14 @@ def _entry_to_emotion(entry: dict) -> Emotion:
     )
 
 
-def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore) -> int:
-    """Register + persist emotions referenced in active memories but absent from
-    the vocabulary — e.g. extractor-minted channel names the growth crystallizer
-    never added. Returns the count healed.
+def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore) -> tuple[int, int]:
+    """Persist (and register) emotions referenced in active memories but absent from the vocabulary FILE.
+
+    E.g. extractor-minted channel names the growth crystallizer never added, or words a repair of the file dropped. The
+    comparison is against the file's entries, not this process's registry: a long-running process (the bridge) still
+    holds a word in its registry after the file lost it, and only writing it back keeps it across a restart. Baseline
+    emotions are never written. A word this process already has is written with its registered fields; any other gets
+    a placeholder entry and is registered. Returns ``(entries written to the file, words newly registered)``.
 
     Replaces the old misdirecting "run nell migrate" warning. Those orphaned
     emotions broke the emotion readers and soul crystallization (the names
@@ -326,7 +330,11 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     """
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
 
-    seen: set[str] = set()
+    entries = data.setdefault("emotions", [])
+    in_file = {
+        vocabulary.canonical_name(e["name"]) for e in entries if isinstance(e, dict) and isinstance(e.get("name"), str)
+    }
+    skip = in_file | {e.name for e in vocabulary._BASELINE}
     new_entries: list[dict] = []
     for mem in store.list_active(limit=None):
         # Names only: a stored emotion whose value is not finite still has a name the vocabulary needs.
@@ -334,31 +342,44 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
             # #174: heal under the canonical spelling so a variant memory key
             # (present-ness, Love_Grief_blend) never mints a twin entry.
             name = vocabulary.canonical_name(raw_name)
-            if name in seen or vocabulary.get(name) is not None:
+            if name in skip:
                 continue
-            seen.add(name)
-            new_entries.append(
-                {
-                    "name": name,
-                    "description": PLACEHOLDER_DESCRIPTION,
-                    "category": "persona_extension",
-                    "decay_half_life_days": PLACEHOLDER_DECAY_DAYS,
-                    "intensity_clamp": 10.0,
-                }
-            )
+            skip.add(name)
+            known = vocabulary.get(name)
+            if known is not None:
+                new_entries.append(
+                    {
+                        "name": name,
+                        "description": known.description,
+                        "category": known.category,
+                        "decay_half_life_days": known.decay_half_life_days,
+                        "intensity_clamp": known.intensity_clamp,
+                    }
+                )
+            else:
+                new_entries.append(
+                    {
+                        "name": name,
+                        "description": PLACEHOLDER_DESCRIPTION,
+                        "category": "persona_extension",
+                        "decay_half_life_days": PLACEHOLDER_DECAY_DAYS,
+                        "intensity_clamp": 10.0,
+                    }
+                )
 
     if not new_entries:
-        return 0
+        return 0, 0
 
+    # Registers only the words missing from the registry; one another thread registered meanwhile is skipped there.
     healed = _register_from_data({"emotions": new_entries})
-    data.setdefault("emotions", []).extend(new_entries)
+    entries.extend(new_entries)
     write_json(path, data, backups=3)
     logger.warning(
         "emotion_vocabulary.json was missing %d referenced emotion(s) %s — "
-        "registered them as persona_extension and appended to %s (extractor-"
-        "minted emotions the vocabulary crystallizer hadn't added yet).",
+        "appended them to %s (extractor-minted words the vocabulary crystallizer hadn't added, "
+        "or words a repair of the file dropped).",
         len(new_entries),
         sorted(e["name"] for e in new_entries),
         path.name,
     )
-    return healed
+    return len(new_entries), healed
