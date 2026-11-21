@@ -495,6 +495,99 @@ def test_add_memory_importance_clamped_to_1_10(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_add_memory_registers_new_word_with_given_half_life(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="a quiet ache settled in after she left",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives={"quiet_ache": 5},
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    registered = vocabulary.get("quiet_ache")
+    assert registered is not None
+    assert registered.decay_half_life_days == 5.0
+
+
+def test_add_memory_refuses_junk_names_keeps_valid_ones(tmp_path: Path) -> None:
+    from brain.emotion.engine_utils import memory_feelings
+    from brain.tools.impls.add_memory import add_memory
+
+    ctx = _ctx(tmp_path)
+    result = add_memory(
+        content="a mixed bag of names",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "Love!!": 9, "": 5, "comfort seeking": 6},
+        importance=8,
+        **ctx,
+    )
+
+    assert result["created"] is True
+    assert result["refused_emotions"] == ["", "Love!!", "comfort seeking"]
+    stored = ctx["store"].get(result["id"], bump=False)
+    assert memory_feelings(stored, None, None, None).feelings == {"love": 9.0}
+
+
+@pytest.mark.parametrize("bad", [-1, 0, float("nan"), "soon", 1e9, True])
+def test_add_memory_bad_half_life_falls_back_to_default(tmp_path: Path, bad) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="a word with a bad half-life",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives={"quiet_ache": bad},
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
+
+
+def test_add_memory_non_dict_half_lives_is_ignored(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="half lives as a string",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives="soon",
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
+
+
+def test_add_memory_refused_write_registers_no_word(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="too faint to keep",
+        memory_type="event",
+        domain="relationship",
+        emotions={"quiet_ache": 3},
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is False
+    assert vocabulary.get("quiet_ache") is None
+
+
 def test_boot_returns_all_composition_keys(tmp_path: Path) -> None:
     """boot() returns a dict with all 5+1 required keys."""
     from brain.tools.impls.boot import boot
