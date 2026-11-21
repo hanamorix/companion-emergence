@@ -472,11 +472,20 @@ def _repair_broken_entries(data: dict) -> list[str]:
                 base["category"] = next(
                     (e["category"] for e in others if isinstance(e.get("category"), str)), "persona_extension"
                 )
-            if not ("decay_half_life_days" in base and base["decay_half_life_days"] is None):  # None: no decay, usable
-                base["decay_half_life_days"] = _first_usable_number(
-                    [base.get("decay_half_life_days")] + [e.get("decay_half_life_days") for e in others],
-                    PLACEHOLDER_DECAY_DAYS,
-                )
+            # The first copy, base first, that states a usable half-life: None (no decay) or a finite number. A missing
+            # field is not a statement; NaN, infinity and non-numbers are unusable.
+            half_life: float | None = PLACEHOLDER_DECAY_DAYS
+            for copy_entry in [base, *others]:
+                if "decay_half_life_days" not in copy_entry:
+                    continue
+                if copy_entry["decay_half_life_days"] is None:
+                    half_life = None
+                    break
+                number = _finite_or(copy_entry["decay_half_life_days"], math.nan)
+                if not math.isnan(number):
+                    half_life = number
+                    break
+            base["decay_half_life_days"] = half_life
             base["intensity_clamp"] = _first_usable_number(
                 [base.get("intensity_clamp")] + [e.get("intensity_clamp") for e in others], 10.0
             )
@@ -513,6 +522,18 @@ def _repair_broken_entries(data: dict) -> list[str]:
                 changed = changed or key_changed
             if changed and entry["name"] not in repaired:
                 repaired.append(entry["name"])
+    # Outside any named entry (an unnamed entry, or a top-level field): such a value names no word, but JSON can't write
+    # it back either, so every write of the file would raise. Reported by place, since there is no word to name.
+    for entry in entries:
+        if _entry_canonical_name(entry) is None and _null_non_finite(entry)[1]:
+            if "(an entry with no name)" not in repaired:
+                repaired.append("(an entry with no name)")
+    for key, value in data.items():
+        if key == "emotions":
+            continue
+        data[key], changed = _null_non_finite(value)
+        if changed and "(the file's top level)" not in repaired:
+            repaired.append("(the file's top level)")
     if dropped:
         entries[:] = [e for e in entries if id(e) not in dropped]
     return repaired

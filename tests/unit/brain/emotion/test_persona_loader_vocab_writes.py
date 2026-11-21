@@ -282,6 +282,37 @@ def test_a_nested_non_finite_value_becomes_null_so_the_file_can_be_written(tmp_p
     assert rho["meta"] == {"score": None}
 
 
+def test_the_merge_carries_an_explicit_no_decay_half_life_to_a_broken_copy(tmp_path: Path) -> None:
+    """`decay_half_life_days: null` means "no decay"; a copy missing the field must not turn that into 14 days."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    copies = [{"name": "tau2_feel", "description": "the real meaning"}, {"name": "tau2_feel", "decay_half_life_days": None}]
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": copies}), encoding="utf-8")
+    vocabulary._unregister("tau2_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert vocabulary.get("tau2_feel").decay_half_life_days is None
+    (tau,) = [e for e in _entries(vocab_path) if e["name"] == "tau2_feel"]
+    assert tau["decay_half_life_days"] is None and tau["description"] == "the real meaning"
+
+
+def test_a_non_finite_value_outside_any_named_entry_becomes_null_so_the_heal_can_write(tmp_path: Path) -> None:
+    """A NaN in an unnamed entry or a top-level field names no word, but still makes every write of the file raise."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    data = {"version": 1, "built_at_score": "NaN", "emotions": [{"name": 5, "weight": "NaN"}]}
+    vocab_path.write_text(json.dumps(data).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("psi2_feel")
+    store = _store_with("psi2_feel")
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    written = json.loads(vocab_path.read_text(encoding="utf-8"))
+    assert written["built_at_score"] is None
+    assert {"name": 5, "weight": None} in written["emotions"]
+    assert "psi2_feel" in {e.get("name") for e in written["emotions"]}
+
+
 def test_register_new_word_repairs_a_non_finite_entry_instead_of_being_blocked_by_it(tmp_path: Path) -> None:
     """JSON can't write NaN back, so an unrepaired NaN entry for another word would refuse every new word for good."""
     import math
