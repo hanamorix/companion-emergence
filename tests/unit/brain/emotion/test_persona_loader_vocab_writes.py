@@ -313,24 +313,8 @@ def test_a_non_finite_value_outside_any_named_entry_becomes_null_so_the_heal_can
     assert "psi2_feel" in {e.get("name") for e in written["emotions"]}
 
 
-def test_a_corrupt_stated_half_life_keeps_the_word_decaying_despite_a_no_decay_copy(tmp_path: Path) -> None:
-    """The base stated a number (NaN): it meant the word decays, so another copy's null mustn't make it permanent."""
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
-
-    vocab_path = tmp_path / "emotion_vocabulary.json"
-    base = {"name": "x2_feel", "description": "real", "category": "persona_extension", "decay_half_life_days": "NaN"}
-    copies = [base, {"name": "x2_feel", "decay_half_life_days": None}]
-    vocab_path.write_text(json.dumps({"version": 1, "emotions": copies}).replace('"NaN"', "NaN"), encoding="utf-8")
-    vocabulary._unregister("x2_feel")
-    load_persona_vocabulary(vocab_path)
-
-    assert vocabulary.get("x2_feel").decay_half_life_days == PLACEHOLDER_DECAY_DAYS
-
-
-def test_the_first_copy_that_states_a_half_life_decides_whether_the_word_decays(tmp_path: Path) -> None:
-    """The base states nothing; the first copy that does states a number (NaN), so a later copy's null can't win."""
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
-
+def test_a_corrupt_half_life_counts_for_nothing_as_the_engine_ignores_it(tmp_path: Path) -> None:
+    """The engine skips the copy with no half-life and the NaN one, and reads the null: the repair keeps the null."""
     vocab_path = tmp_path / "emotion_vocabulary.json"
     copies = [
         {"name": "m2_feel", "description": "real", "category": "persona_extension"},
@@ -341,9 +325,9 @@ def test_the_first_copy_that_states_a_half_life_decides_whether_the_word_decays(
     vocabulary._unregister("m2_feel")
     load_persona_vocabulary(vocab_path)
 
-    assert vocabulary.get("m2_feel").decay_half_life_days == PLACEHOLDER_DECAY_DAYS
+    assert vocabulary.get("m2_feel").decay_half_life_days is None
     (m2,) = [e for e in _entries(vocab_path) if e["name"] == "m2_feel"]
-    assert m2["decay_half_life_days"] == PLACEHOLDER_DECAY_DAYS and m2["description"] == "real"
+    assert m2["decay_half_life_days"] is None and m2["description"] == "real"
     assert persona_loader._repair_broken_entries(json.loads(vocab_path.read_text(encoding="utf-8"))) == []
 
 
@@ -380,8 +364,8 @@ def test_a_non_finite_description_or_category_becomes_placeholder_text_not_the_w
 
 @pytest.mark.parametrize("bad", [0, -2, True, "3"])
 def test_a_whole_entry_with_a_half_life_the_engine_ignores_is_repaired(tmp_path: Path, bad: object) -> None:
-    """The entry registers, but the engine refuses this half-life, so the registry and the engine would disagree."""
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
+    """The entry registers, but the engine refuses this half-life and uses its built-in one, so the repair writes that."""
+    from brain import dev_constants
 
     vocab_path = tmp_path / "emotion_vocabulary.json"
     entry = {"name": "w2_feel", "description": "real", "category": "persona_extension", "decay_half_life_days": bad}
@@ -389,7 +373,7 @@ def test_a_whole_entry_with_a_half_life_the_engine_ignores_is_repaired(tmp_path:
     vocabulary._unregister("w2_feel")
     load_persona_vocabulary(vocab_path)
 
-    expected = 3.0 if bad == "3" else PLACEHOLDER_DECAY_DAYS
+    expected = dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS  # even for "3": the engine ignores a string
     assert vocabulary.get("w2_feel").decay_half_life_days == expected
     (w2,) = _entries(vocab_path)
     assert w2["decay_half_life_days"] == expected and w2["description"] == "real"
@@ -411,8 +395,9 @@ def test_a_null_description_or_category_becomes_placeholder_text_not_the_word_no
 
     v2, u2 = vocabulary.get("v2_feel"), vocabulary.get("u2_feel")
     assert (v2.description, v2.category) == (PLACEHOLDER_DESCRIPTION, "persona_extension")
-    # Both u2 copies are broken: the base is the one with the real description, and it states no decay first.
-    assert (u2.description, u2.category, u2.decay_half_life_days) == ("the real meaning", "complex", None)
+    # Both u2 copies are broken: the base is the one with the real description, but the half-life is the 3 days the
+    # engine reads from the first copy.
+    assert (u2.description, u2.category, u2.decay_half_life_days) == ("the real meaning", "complex", 3.0)
     assert [(e["name"], e["description"]) for e in _entries(vocab_path)] == [
         ("v2_feel", PLACEHOLDER_DESCRIPTION),
         ("u2_feel", "the real meaning"),
@@ -470,6 +455,111 @@ def test_register_new_word_writes_a_numeric_half_life_as_a_number(tmp_path: Path
 
     assert [e["decay_half_life_days"] for e in _entries(vocab_path)] == [3.0]
     assert persona_loader._repair_broken_entries(json.loads(vocab_path.read_text(encoding="utf-8"))) == []
+
+
+def _engine_half_life(persona_dir: Path, name: str) -> float:
+    """What the emotion engine decays `name` by, read from the file as `EmotionEngine.half_life` does."""
+    from brain import dev_constants
+    from brain.emotion.engine_files import VocabularyHalfLives
+
+    days = VocabularyHalfLives(persona_dir).get(name)  # a fresh cache: it reads the file as it is now
+    if days is not None:
+        return days
+    return dev_constants.EMOTION_HALF_LIFE_DAYS.get(name, dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS)
+
+
+@pytest.mark.parametrize(
+    ("copies", "registered"),
+    [
+        # The engine reads the first copy's null (the built-in half-life applies); the later whole copy says 9 days.
+        (
+            [
+                {"name": "tw_feel", "description": "the real meaning", "category": None, "decay_half_life_days": None},
+                {"name": "tw_feel", "description": "(reconstructed from memory)", "category": "persona_extension",
+                 "decay_half_life_days": 9.0},
+            ],
+            None,
+        ),
+        # The engine reads the first copy's 3 days; the copy with the real description says no decay.
+        (
+            [
+                {"name": "tw_feel", "description": None, "category": "complex", "decay_half_life_days": 3.0},
+                {"name": "tw_feel", "description": "the real meaning", "category": None, "decay_half_life_days": None},
+            ],
+            3.0,
+        ),
+    ],
+    ids=["whole_twin_later", "real_description_later"],
+)
+def test_a_repair_never_changes_the_half_life_the_engine_decays_a_word_by(
+    tmp_path: Path, copies: list[dict], registered: float | None
+) -> None:
+    """The repair keeps the half-life of the first copy, in file order, that the engine accepts, on every copy it keeps."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": copies}), encoding="utf-8")
+    before = _engine_half_life(tmp_path, "tw_feel")
+    vocabulary._unregister("tw_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert _engine_half_life(tmp_path, "tw_feel") == before
+    assert vocabulary.get("tw_feel").decay_half_life_days == registered
+    assert {e["decay_half_life_days"] for e in _entries(vocab_path) if e["name"] == "tw_feel"} == {registered}
+    assert vocabulary.get("tw_feel").description == "the real meaning"
+    assert persona_loader._repair_broken_entries(json.loads(vocab_path.read_text(encoding="utf-8"))) == []
+
+
+def test_a_read_only_load_of_deeply_nested_json_still_registers_its_words(tmp_path: Path) -> None:
+    """JSON reads about 1000 levels of nesting; copying it for the repair runs out of stack about halfway there."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    entry = {"name": "deep_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 3.0}
+    raw = json.dumps({"version": 1, "emotions": [entry]})
+    nested = "[" * 800 + "]" * 800
+    vocab_path.write_text(raw.replace('"decay_half_life_days"', f'"extra": {nested}, "decay_half_life_days"'), encoding="utf-8")
+    vocabulary._unregister("deep_feel")
+    load_persona_vocabulary(vocab_path, read_only=True)
+
+    assert vocabulary.get("deep_feel").decay_half_life_days == 3.0
+
+
+def test_a_writing_load_of_deeply_nested_json_still_registers_its_words(tmp_path: Path) -> None:
+    """The check for whether a load would write copies the file too: too deep to copy, it can't need a repair."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    entry = {"name": "deeper_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 3.0}
+    raw = json.dumps({"version": 1, "emotions": [entry]})
+    nested = "[" * 800 + "]" * 800
+    vocab_path.write_text(raw.replace('"decay_half_life_days"', f'"extra": {nested}, "decay_half_life_days"'), encoding="utf-8")
+    vocabulary._unregister("deeper_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert vocabulary.get("deeper_feel").decay_half_life_days == 3.0
+
+
+def test_a_read_only_load_warns_about_entries_it_registered_repaired(tmp_path: Path, caplog) -> None:
+    """It leaves the file as it is, so the warning is the only sign that the file needs a writing load to fix it."""
+    import logging
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [{"name": "warn_feel"}]}), encoding="utf-8")
+    vocabulary._unregister("warn_feel")
+    with caplog.at_level(logging.WARNING, logger="brain.emotion.persona_loader"):
+        load_persona_vocabulary(vocab_path, read_only=True)
+
+    assert any("warn_feel" in r.getMessage() and "read-only" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("read_only", [True, False])
+def test_an_entry_whose_name_is_not_text_names_no_word(tmp_path: Path, read_only: bool) -> None:
+    """The repair leaves such an entry alone, so registering it as the word "5" would register what it never checked."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    entry = {"name": 5, "description": "NaN", "category": "persona_extension", "decay_half_life_days": "NaN"}
+    ok = {"name": "fine_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 3.0}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [entry, ok]}).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("5")
+    vocabulary._unregister("fine_feel")
+    load_persona_vocabulary(vocab_path, read_only=read_only)
+
+    assert vocabulary.get("5") is None
+    assert vocabulary.get("fine_feel") is not None
 
 
 def test_an_integer_too_large_for_a_float_is_repaired_instead_of_crashing_the_load_and_new_words(tmp_path: Path) -> None:

@@ -86,7 +86,12 @@ def _load_may_write(path: Path, *, store: MemoryStore | None) -> bool:
         data = read_json(path, default=_default_vocab_factory, recover=Recovery.RAISE, validate=_vocab_schema_validator)
     except JsonFileError:
         return True
-    return bool(_repair_broken_entries(copy.deepcopy(data)))  # the repair's own rule, run on a copy
+    try:
+        return bool(_repair_broken_entries(copy.deepcopy(data)))  # the repair's own rule, run on a copy
+    except RecursionError:
+        # Nested deeper than the copy can go (JSON reads deeper): the repair can't run on it either, so loading it
+        # read-only does all a writing load could.
+        return False
 
 
 def _vocab_backups(path: Path) -> int:
@@ -184,8 +189,20 @@ def _load_vocabulary(
     if read_only:
         # Registered from a repaired copy, never written: the registry skips words it already holds, so a value the
         # repair would replace must not get in first and outlive the file's repair.
-        to_register = copy.deepcopy(data)
-        _repair_broken_entries(to_register)
+        try:
+            to_register = copy.deepcopy(data)
+            needs_repair = _repair_broken_entries(to_register)
+            if needs_repair:
+                logger.warning(
+                    "emotion_vocabulary.json has entries that need repair %s; registered them repaired, and a read-only "
+                    "load leaves the file for the next writing load to fix",
+                    sorted(needs_repair),
+                )
+        except RecursionError:
+            # Nested deeper than the copy can go (JSON reads deeper): register the file as it reads, as a read-only
+            # load did before the repair; an entry it can't register is skipped below.
+            logger.warning("emotion_vocabulary.json is nested too deeply to check for repairs; registering it as it is")
+            to_register = data
     else:
         repaired = _repair_broken_entries(data)
         if repaired:
@@ -381,6 +398,9 @@ def _entry_to_emotion(entry: dict) -> Emotion:
     for key in required:
         if key not in entry:
             raise KeyError(f"missing required field {key!r}")
+    if not isinstance(entry["name"], str):
+        # A name that isn't text names no word: the repair leaves such an entry alone, so it is never registered.
+        raise TypeError("name must be text")
 
     try:
         half_life = None if entry["decay_half_life_days"] is None else float(entry["decay_half_life_days"])
@@ -466,14 +486,13 @@ def _repair_broken_entries(data: dict) -> list[str]:
       - a real description from any entry of the word fills a placeholder base, so dropping a twin never deletes it;
       - a broken base takes each unusable field (missing, the wrong type, a NaN or infinite number, which JSON can't
         write back, or an integer too large for a float) from the first other entry where it's usable, else the
-        placeholder's value. For the half-life, the first entry that states one decides whether the word decays: None
-        means no decay, and any other value, even a corrupt one, means it decays at the first number above 0 stated;
-      - the word's other broken entries are dropped; its other whole entries are kept.
+        placeholder's value;
+      - the word's other broken entries are dropped; its other whole entries are kept;
+      - the half-life the engine decays the word by never changes: every copy kept gets the half-life of the first copy
+        in file order the engine accepts, else the built-in one the engine falls back to.
     Then any other field of any named entry holding NaN or infinity, at any depth, becomes null, so the file can be
     written again. Outside any named entry, such a value becomes null too, reported by place.
     """
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
-
     entries = data.get("emotions", [])
     groups: dict[str, list[dict]] = {}
     for entry in entries:
@@ -485,9 +504,13 @@ def _repair_broken_entries(data: dict) -> list[str]:
         description = entry.get("description")
         return isinstance(description, str) and description != PLACEHOLDER_DESCRIPTION
 
+    # The engine's own rule for which half-life it reads, so the repair can't drift from it (no import cycle: engine_files
+    # doesn't import the loader).
+    from brain.emotion.engine_files import _classify, _Fault
+
     repaired: list[str] = []
     dropped: set[int] = set()
-    for group in groups.values():
+    for word, group in groups.items():
         broken = [e for e in group if not _is_sound(e)]
         if not broken:
             continue
@@ -506,23 +529,23 @@ def _repair_broken_entries(data: dict) -> list[str]:
                 base["category"] = next(
                     (e["category"] for e in others if isinstance(e.get("category"), str)), "persona_extension"
                 )
-            # The first copy, base first, that states a half-life (a missing field is not a statement) decides whether
-            # the word decays. If it states None, the word doesn't decay. If it states anything else, even a corrupt
-            # number or a non-number, the word decays, so a later copy's None can't make it permanent: the half-life is
-            # the first finite number above 0 stated, else the placeholder's.
-            stated = [e["decay_half_life_days"] for e in [base, *others] if "decay_half_life_days" in e]
-            half_life: float | None
-            if stated and stated[0] is None:
-                half_life = None
-            else:
-                # Only a number above 0: the engine ignores any other half-life (engine_files._classify).
-                positive = [v for v in stated if v is not None and _finite_or(v, 0.0) > 0]
-                half_life = _first_usable_number(positive, PLACEHOLDER_DECAY_DAYS)
-            base["decay_half_life_days"] = half_life
             base["intensity_clamp"] = _first_usable_number(
                 [base.get("intensity_clamp")] + [e.get("intensity_clamp") for e in others], 10.0
             )
+        # The half-life the engine decays the word by stays as it is: the first copy in file order the engine accepts
+        # decides (a null there means the built-in half-life applies), else the built-in value the engine falls back
+        # to. Every copy kept gets it, so whichever the loader and the engine read first, they read this.
+        accepted = (_classify(e) for e in group)
+        decided = next((p for p in accepted if not isinstance(p, _Fault)), None)
+        half_life = (
+            decided.days
+            if decided is not None
+            else dev_constants.EMOTION_HALF_LIFE_DAYS.get(word, dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS)
+        )
         dropped.update(id(e) for e in broken if e is not base)
+        for kept in group:
+            if id(kept) not in dropped:
+                kept["decay_half_life_days"] = half_life
         repaired.append(base["name"])
 
     def _null_non_finite(value: object) -> tuple[object, bool]:
