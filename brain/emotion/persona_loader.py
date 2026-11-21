@@ -473,12 +473,17 @@ def _repair_broken_entries(data: dict) -> list[str]:
                     (e["category"] for e in others if isinstance(e.get("category"), str)), "persona_extension"
                 )
             # The first copy, base first, that states a usable half-life: None (no decay) or a finite number. A missing
-            # field is not a statement; NaN, infinity and non-numbers are unusable.
+            # field is not a statement; NaN, infinity and non-numbers are unusable. A base that states a number, even a
+            # corrupt one, meant the word decays, so another copy's None can't make it permanent: it falls back to a
+            # finite number from another copy, else the placeholder.
+            base_states_decay = "decay_half_life_days" in base and base["decay_half_life_days"] is not None
             half_life: float | None = PLACEHOLDER_DECAY_DAYS
             for copy_entry in [base, *others]:
                 if "decay_half_life_days" not in copy_entry:
                     continue
                 if copy_entry["decay_half_life_days"] is None:
+                    if base_states_decay:
+                        continue
                     half_life = None
                     break
                 number = _finite_or(copy_entry["decay_half_life_days"], math.nan)
@@ -524,10 +529,13 @@ def _repair_broken_entries(data: dict) -> list[str]:
                 repaired.append(entry["name"])
     # Outside any named entry (an unnamed entry, or a top-level field): such a value names no word, but JSON can't write
     # it back either, so every write of the file would raise. Reported by place, since there is no word to name.
-    for entry in entries:
-        if _entry_canonical_name(entry) is None and _null_non_finite(entry)[1]:
-            if "(an entry with no name)" not in repaired:
-                repaired.append("(an entry with no name)")
+    for index, entry in enumerate(entries):
+        if _entry_canonical_name(entry) is not None:
+            continue
+        # Assigned back by index: a bare NaN element is not an object, so it can't be changed in place.
+        entries[index], changed = _null_non_finite(entry)
+        if changed and "(an entry with no name)" not in repaired:
+            repaired.append("(an entry with no name)")
     for key, value in data.items():
         if key == "emotions":
             continue

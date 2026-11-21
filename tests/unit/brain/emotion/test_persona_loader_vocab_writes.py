@@ -313,6 +313,33 @@ def test_a_non_finite_value_outside_any_named_entry_becomes_null_so_the_heal_can
     assert "psi2_feel" in {e.get("name") for e in written["emotions"]}
 
 
+def test_a_corrupt_stated_half_life_keeps_the_word_decaying_despite_a_no_decay_copy(tmp_path: Path) -> None:
+    """The base stated a number (NaN): it meant the word decays, so another copy's null mustn't make it permanent."""
+    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    base = {"name": "x2_feel", "description": "real", "category": "persona_extension", "decay_half_life_days": "NaN"}
+    copies = [base, {"name": "x2_feel", "decay_half_life_days": None}]
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": copies}).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("x2_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert vocabulary.get("x2_feel").decay_half_life_days == PLACEHOLDER_DECAY_DAYS
+
+
+def test_a_bare_non_finite_number_in_the_emotions_list_becomes_null_and_the_file_loads(tmp_path: Path) -> None:
+    """A bare NaN element isn't an object, so it can't be changed in place: it must be replaced in the list itself."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    ok = {"name": "ok_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 3.0}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": ["NaN", ok]}).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("ok_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert vocabulary.get("ok_feel") is not None
+    assert json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"] == [None, ok]
+    assert persona_loader._repair_broken_entries(json.loads(vocab_path.read_text(encoding="utf-8"))) == []
+
+
 def test_register_new_word_repairs_a_non_finite_entry_instead_of_being_blocked_by_it(tmp_path: Path) -> None:
     """JSON can't write NaN back, so an unrepaired NaN entry for another word would refuse every new word for good."""
     import math
