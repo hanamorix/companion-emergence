@@ -3341,3 +3341,23 @@ def test_list_recent_light_newest_first_with_limit() -> None:
         assert memory_feelings(got[0], None, None, None).feelings == {"joy": 7.0}
     finally:
         store.close()
+
+
+def test_list_recent_light_skips_inactive_rows() -> None:
+    """A deactivated memory takes no place in the window: the next active one fills it."""
+    store = MemoryStore(":memory:")
+    try:
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        made = []
+        for n in range(3):
+            m = Memory.create_new(content=f"m{n}", memory_type="conversation", domain="us", emotions={"joy": 5.0})
+            m.created_at = base + timedelta(days=n)
+            store.create(m)
+            made.append(m)
+        store.deactivate(made[2].id)
+
+        got = store.list_recent_light(2)
+
+        assert [m.id for m in got] == [made[1].id, made[0].id]
+    finally:
+        store.close()

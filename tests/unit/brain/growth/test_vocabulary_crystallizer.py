@@ -163,5 +163,32 @@ def test_crystallized_blend_half_life_is_parent_mean() -> None:
     assert _half_life_of_blend({"joy": 8, "grief": 7}) == (3.0 + 60.0) / 2
 
 
+def test_crystallizer_skips_a_refused_blend_name_and_proposes_the_next_cluster() -> None:
+    """A top cluster whose blend name the gate refuses must not block every other blend each tick."""
+    store = MemoryStore(":memory:")
+    try:
+        for n in range(4):
+            store.create(_mem(f"digit moment {n}", {"grief2": 9, "love": 8}))
+        for n in range(3):
+            store.create(_mem(f"bright moment {n}", {"joy": 8, "awe": 7}))
+
+        result = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
+
+        assert [p.name for p in result] == ["awe_joy_blend"]
+    finally:
+        store.close()
+
+
+def test_crystallized_blend_parent_uses_its_registered_half_life() -> None:
+    """Without an engine, a registered persona-extension parent lends its own half-life, not the default."""
+    from brain.emotion import vocabulary
+    from brain.emotion.vocabulary import Emotion
+
+    vocabulary.register(
+        Emotion(name="ember_feel", description="d", category="persona_extension", decay_half_life_days=40.0)
+    )
+    assert _half_life_of_blend({"ember_feel": 8, "joy": 7}) == (40.0 + 3.0) / 2
+
+
 def test_crystallized_blend_with_love_uses_its_dev_half_life() -> None:
     assert _half_life_of_blend({"love": 8, "joy": 7}) == (730.0 + 3.0) / 2

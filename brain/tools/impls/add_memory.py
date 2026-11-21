@@ -92,15 +92,24 @@ def add_memory(
         for raw, value in emotion_half_lives.items()
         if isinstance(raw, str)
     }
+    unregistered: list[str] = []
     for name in emotions:
         if vocabulary.get(name) is None:
-            register_new_word(
+            registered_as = register_new_word(
                 persona_dir / "emotion_vocabulary.json",
                 name,
                 half_life_days=_valid_half_life(
                     emotion_half_lives.get(name, canonical_half_lives.get(name))
                 ),
             )
+            if registered_as is None:
+                unregistered.append(name)
+    unregistered.sort()
+    if unregistered:
+        # The memory still keeps these feelings; only the vocabulary entry is missing.
+        logger.warning(
+            "add_memory could not register new emotion word(s) %s in the vocabulary", unregistered
+        )
 
     # Build the memory with importance as a float (Memory.create_new normalises
     # importance to score/10 if None, but we've already calculated it — pass
@@ -174,6 +183,7 @@ def add_memory(
         "importance": effective_importance,
         "auto_linked_to": related_ids,
         "refused_emotions": refused,
+        "unregistered_emotions": unregistered,
     }
     if auto_link_error is not None:
         result["auto_link_error"] = auto_link_error

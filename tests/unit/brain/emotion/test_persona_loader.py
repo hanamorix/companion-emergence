@@ -401,3 +401,42 @@ def test_refresh_if_changed_never_writes_a_corrupt_file(tmp_path: Path, monkeypa
     )
     assert refresh_if_changed(path) == 0
     assert calls == []
+
+
+def test_refresh_if_changed_on_a_missing_file_returns_zero_and_writes_nothing(tmp_path: Path) -> None:
+    from brain.emotion.persona_loader import refresh_if_changed
+
+    path = tmp_path / "emotion_vocabulary.json"
+    assert refresh_if_changed(path) == 0
+    assert refresh_if_changed(path) == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_load_skips_a_word_another_thread_registered_after_the_check(tmp_path: Path, monkeypatch):
+    """The registry gains the word between the loader's check and its register: the load does not raise."""
+    from brain.emotion.persona_loader import refresh_if_changed
+    from brain.emotion.vocabulary import Emotion
+
+    entry = {
+        "name": "racing_word",
+        "description": "d",
+        "category": "persona_extension",
+        "decay_half_life_days": 14.0,
+        "intensity_clamp": 10.0,
+    }
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": [entry]}), encoding="utf-8")
+    real_get = vocabulary.get
+
+    def get_then_lose_the_race(name: str):
+        found = real_get(name)
+        if name == "racing_word" and found is None:
+            vocabulary.register(
+                Emotion(name="racing_word", description="d", category="persona_extension", decay_half_life_days=14.0)
+            )
+        return found
+
+    monkeypatch.setattr(vocabulary, "get", get_then_lose_the_race)
+
+    assert refresh_if_changed(path) == 0
+    assert real_get("racing_word") is not None

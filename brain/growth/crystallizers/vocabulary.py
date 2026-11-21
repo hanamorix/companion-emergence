@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from brain import dev_constants
+from brain.emotion import vocabulary
 from brain.emotion.engine_utils import feelings_of
-from brain.emotion.vocabulary import canonical_name
+from brain.emotion.vocabulary import canonical_name, validate_new_name
 from brain.growth.proposal import EmotionProposal
 from brain.memory.store import Memory, MemoryStore
 
@@ -58,9 +59,10 @@ def crystallize_vocabulary(
         if len(cluster.memories) < _MIN_EVIDENCE_MEMORIES:
             continue
         first, second = cluster.display_order
-        # #174: mint the canonical spelling so a reversed pair can never be a new name.
-        name = canonical_name(f"{first}_{second}_blend")
-        if name in current_names:
+        # #174: mint the canonical spelling so a reversed pair can never be a new name. A name the
+        # gate refuses is skipped, so it cannot block the next cluster's blend on every tick.
+        name = validate_new_name(f"{first}_{second}_blend")
+        if name is None or name in current_names:
             continue
         evidence = tuple(mem.id for mem in sorted(cluster.memories, key=lambda m: m.created_at))[
             :_MAX_EVIDENCE_MEMORIES
@@ -88,6 +90,11 @@ def _parent_half_life(name: str, eng: EmotionEngine | None) -> float:
     parent = canonical_name(name)
     if eng is not None:
         return eng.half_life(parent)
+    # No engine: the parent's registered half-life when it has a usable one, else the dev table, else the default.
+    registered = vocabulary.get(parent)
+    days = None if registered is None else registered.decay_half_life_days
+    if isinstance(days, (int, float)) and not isinstance(days, bool) and math.isfinite(days) and days > 0:
+        return float(days)
     return dev_constants.EMOTION_HALF_LIFE_DAYS.get(parent, dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS)
 
 

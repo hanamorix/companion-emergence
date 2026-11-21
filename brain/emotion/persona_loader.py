@@ -231,13 +231,8 @@ def register_new_word(
             except OSError:
                 logger.warning("could not write %s; not registering %r", vocab_path, name, exc_info=True)
                 return None
-        try:
-            _register_from_data(
-                {"emotions": [e for e in entries if isinstance(e, dict) and e.get("name") == name]}
-            )
-        except ValueError:
-            # Another thread registered the same word between the check and here: it is registered.
-            pass
+        # A word another thread registered meanwhile is skipped there, not raised.
+        _register_from_data({"emotions": [e for e in entries if isinstance(e, dict) and e.get("name") == name]})
     return name
 
 
@@ -290,7 +285,11 @@ def _register_from_data(data: dict) -> int:
             # Already registered — idempotent skip.
             continue
 
-        vocabulary.register(emotion)
+        try:
+            vocabulary.register(emotion)
+        except ValueError:
+            # Another thread registered it between the check above and here: it is registered.
+            continue
         registered += 1
     return registered
 
