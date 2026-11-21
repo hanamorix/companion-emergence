@@ -1065,6 +1065,8 @@ def _load_command_vocabulary(persona_dir: Path, store: MemoryStore, dry_run: boo
 
     A real run loads with the store, which may heal or rebuild the file and writes the one-time heal marker. A dry run loads
     `read_only=True`: no heal, rebuild, quarantine or marker, and a corrupt file is left as it is with a warning on stderr.
+    The cost, accepted on purpose: a dry run sees only the file's words, so on a persona whose one-time heal hasn't run
+    yet (or whose file is missing or corrupt) it can know fewer words than the real run would.
     """
     vocab_path = persona_dir / "emotion_vocabulary.json"
     if not dry_run:

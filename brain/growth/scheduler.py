@@ -40,7 +40,7 @@ from brain.growth.crystallizers.vocabulary import (
 )
 from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
-from brain.health.json_io import Recovery, read_json_result
+from brain.health.json_io import JsonFileError, Recovery, read_json, read_json_result
 from brain.memory.store import MemoryStore
 from brain.paths import cadence_state_path
 from brain.utils.file_lock import file_lock
@@ -108,7 +108,7 @@ def run_growth_tick(
     vocab_path = persona_dir / "emotion_vocabulary.json"
     log_path = persona_dir / "emotion_growth.log.jsonl"
 
-    current_names, vocab_anomaly = _read_current_vocabulary_names(vocab_path)
+    current_names, vocab_anomaly = _read_current_vocabulary_names(vocab_path, dry_run=dry_run)
     if vocab_anomaly is not None and anomalies_collector is not None:
         anomalies_collector.append(vocab_anomaly)
 
@@ -199,6 +199,8 @@ def run_growth_tick(
 
 def _read_current_vocabulary_names(
     vocab_path: Path,
+    *,
+    dry_run: bool = False,
 ) -> tuple[set[str], BrainAnomaly | None]:
     """Return (set of emotion names, optional anomaly) for the vocabulary file.
 
@@ -216,6 +218,17 @@ def _read_current_vocabulary_names(
     def _schema_validator(data: object) -> None:
         if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
             raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
+
+    if dry_run:
+        # A dry run writes nothing: it reads, and leaves a damaged file (and the heal marker) for a real run to repair.
+        try:
+            data = read_json(vocab_path, default=lambda: {"version": 1, "emotions": []}, recover=Recovery.RAISE, validate=_schema_validator)
+        except JsonFileError:
+            # Not reported as an anomaly: a dry run repairs nothing, so a real run will report it when it heals the file.
+            # The words this process holds stand in for the file's, so a word already known isn't counted as one to add.
+            logger.warning("growth scheduler: dry run left the unreadable %s as it is", vocab_path, exc_info=True)
+            return {e.name for e in vocabulary.list_all()}, None
+        return {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}, None
 
     # The heal can restore or reset the file: it holds the lock register_new_word and the loader take, so a word added
     # meanwhile is kept.

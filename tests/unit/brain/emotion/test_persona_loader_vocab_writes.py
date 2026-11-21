@@ -67,6 +67,53 @@ def test_every_loader_write_holds_the_vocabulary_lock_and_uses_the_files_backups
     assert "omicron_feel" in {e["name"] for e in _entries(vocab_path)}
 
 
+@pytest.mark.no_base_failure(
+    reason="guards _vocab_backups' fallback: the base wrote with a fixed 3 backups and never read the audit log"
+)
+def test_an_unreadable_audit_log_falls_back_to_three_backups_instead_of_failing_the_write(tmp_path: Path) -> None:
+    """The backup count reads heartbeats.log.jsonl; a bad line there must not stop the rebuild from memories."""
+    (tmp_path / "heartbeats.log.jsonl").write_text('{"anomalies": 5}\n', encoding="utf-8")
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    vocabulary._unregister("eta_feel")
+    store = _store_with("eta_feel")
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    assert "eta_feel" in {e["name"] for e in _entries(vocab_path)}
+
+
+def test_a_load_with_nothing_to_write_takes_no_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every command and bridge start loads with a store; a healthy, already-healed file is only read, so none waits on a writer."""
+    from contextlib import contextmanager
+
+    from brain.health.json_io import write_json
+    from brain.paths import cadence_state_path
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    entry = {"name": "zeta_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 9.0}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [entry]}), encoding="utf-8")
+    write_json(cadence_state_path(tmp_path, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+    locked: list[Path] = []
+
+    @contextmanager
+    def recording_lock(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        locked.append(Path(path))
+        yield True
+
+    monkeypatch.setattr(persona_loader, "file_lock", recording_lock)
+    vocabulary._unregister("zeta_feel")
+    store = _store_with("zeta_feel")
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    assert locked == []
+    assert vocabulary.get("zeta_feel") is not None
+
+
 def test_a_malformed_entry_does_not_hide_its_word_from_the_heal(tmp_path: Path) -> None:
     """`{"name": x}` can't be registered; the heal replaces it with a whole entry rather than counting it as present."""
     vocab_path = tmp_path / "emotion_vocabulary.json"
@@ -122,16 +169,147 @@ def test_a_file_entry_with_a_non_finite_number_is_not_registered_and_is_healed(t
     assert math.isfinite(sigma["decay_half_life_days"])
 
 
-def test_register_new_word_refuses_softly_when_the_file_holds_a_non_finite_number(tmp_path: Path) -> None:
-    """The file can't be written back as JSON, so the word is refused (None) and the file left as it is, not raised."""
+def test_a_broken_entry_no_memory_carries_is_repaired_in_place_keeping_its_description(tmp_path: Path) -> None:
+    """A NaN entry for a word no memory carries would make every heal write raise; it's fixed in place, not dropped."""
+    import math
+
+    from brain.paths import cadence_state_path
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    bad = {"name": "chi_feel", "description": "a crystallized meaning", "category": "persona_extension", "decay_half_life_days": "NaN"}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [bad]}).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("chi_feel")
+    vocabulary._unregister("phi_feel")
+    store = _store_with("phi_feel")
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    by_name = {e["name"]: e for e in _entries(vocab_path)}
+    assert by_name["chi_feel"]["description"] == "a crystallized meaning"
+    assert math.isfinite(by_name["chi_feel"]["decay_half_life_days"])
+    assert "phi_feel" in by_name
+    assert vocabulary.get("chi_feel") is not None
+    assert cadence_state_path(tmp_path, "vocab_heal_final.json").exists()
+
+
+def test_a_non_finite_value_in_an_extra_field_becomes_null_so_the_heal_can_write(tmp_path: Path) -> None:
+    """A NaN outside the core fields leaves the entry registrable but the file unwritable: every heal would raise."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    entry = {"name": "lambda_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 9.0, "score": "NaN"}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [entry]}).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("lambda_feel")
+    vocabulary._unregister("mu2_feel")
+    store = _store_with("mu2_feel")
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    by_name = {e["name"]: e for e in _entries(vocab_path)}
+    assert "mu2_feel" in by_name
+    assert by_name["lambda_feel"]["score"] is None and by_name["lambda_feel"]["description"] == "d"
+
+
+def test_a_broken_entry_with_a_whole_twin_is_dropped_not_repaired(tmp_path: Path) -> None:
+    """A repaired `{"name": x}` ahead of the whole entry would win the registry with placeholder values."""
+    from brain.health.json_io import write_json
+    from brain.paths import cadence_state_path
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    whole = {"name": "kappa_feel", "description": "the real meaning", "category": "persona_extension", "decay_half_life_days": 30.0}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [{"name": "kappa_feel"}, whole]}), encoding="utf-8")
+    write_json(cadence_state_path(tmp_path, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+    vocabulary._unregister("kappa_feel")
+    store = _store_with()
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    assert vocabulary.get("kappa_feel").description == "the real meaning"
+    assert [e for e in _entries(vocab_path) if e["name"] == "kappa_feel"] == [whole]
+
+
+def test_a_broken_entry_gives_its_real_description_to_a_placeholder_twin(tmp_path: Path) -> None:
+    """Dropping the broken twin must not delete the only real description the word has."""
+    from brain.health.json_io import write_json
+    from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
+    from brain.paths import cadence_state_path
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    broken = {"name": "nu_feel", "description": "the real meaning", "category": "persona_extension", "decay_half_life_days": "NaN"}
+    whole = {"name": "Nu_Feel", "description": PLACEHOLDER_DESCRIPTION, "category": "persona_extension", "decay_half_life_days": 14.0}
+    text = json.dumps({"version": 1, "emotions": [broken, whole]}).replace('"NaN"', "NaN")
+    vocab_path.write_text(text, encoding="utf-8")
+    write_json(cadence_state_path(tmp_path, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+    vocabulary._unregister("nu_feel")
+    store = _store_with()
+    try:
+        load_persona_vocabulary(vocab_path, store=store)
+    finally:
+        store.close()
+
+    assert vocabulary.get("nu_feel").description == "the real meaning"
+    nu = [e for e in _entries(vocab_path) if vocabulary.canonical_name(e["name"]) == "nu_feel"]
+    assert len(nu) == 1 and nu[0]["description"] == "the real meaning" and nu[0]["decay_half_life_days"] == 14.0
+
+
+def test_two_broken_copies_of_a_word_become_one_keeping_the_real_description(tmp_path: Path) -> None:
+    """With no whole entry, the copy with a real description is the one kept, so the placeholder can't win the registry."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    vocab_path.write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "xi_feel"}, {"name": "xi_feel", "description": "the real meaning"}]}),
+        encoding="utf-8",
+    )
+    vocabulary._unregister("xi_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert vocabulary.get("xi_feel").description == "the real meaning"
+    assert [e["description"] for e in _entries(vocab_path) if e["name"] == "xi_feel"] == ["the real meaning"]
+
+
+def test_a_nested_non_finite_value_becomes_null_so_the_file_can_be_written(tmp_path: Path) -> None:
+    """A NaN inside an extra field's object would make every write of the file raise, the same as a top-level one."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    entry = {"name": "rho2_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": 9.0, "meta": {"score": "NaN"}}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [entry]}).replace('"NaN"', "NaN"), encoding="utf-8")
+    vocabulary._unregister("rho2_feel")
+    load_persona_vocabulary(vocab_path)
+
+    (rho,) = _entries(vocab_path)
+    assert rho["meta"] == {"score": None}
+
+
+def test_register_new_word_repairs_a_non_finite_entry_instead_of_being_blocked_by_it(tmp_path: Path) -> None:
+    """JSON can't write NaN back, so an unrepaired NaN entry for another word would refuse every new word for good."""
+    import math
+
     from brain.emotion.persona_loader import register_new_word
 
     vocab_path = tmp_path / "emotion_vocabulary.json"
-    bad = {"name": "upsilon_feel", "description": "d", "category": "persona_extension", "decay_half_life_days": "NaN"}
-    text = json.dumps({"version": 1, "emotions": [bad]}).replace('"NaN"', "NaN")
-    vocab_path.write_text(text, encoding="utf-8")
+    bad = {"name": "upsilon_feel", "description": "kept", "category": "persona_extension", "decay_half_life_days": "NaN"}
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [bad]}).replace('"NaN"', "NaN"), encoding="utf-8")
     vocabulary._unregister("tau_feel")
 
-    assert register_new_word(vocab_path, "tau_feel") is None
-    assert vocab_path.read_text(encoding="utf-8") == text
-    assert vocabulary.get("tau_feel") is None
+    assert register_new_word(vocab_path, "tau_feel") == "tau_feel"
+    assert vocabulary.get("tau_feel") is not None
+    by_name = {e["name"]: e for e in _entries(vocab_path)}
+    assert "tau_feel" in by_name
+    assert by_name["upsilon_feel"]["description"] == "kept"
+    assert math.isfinite(by_name["upsilon_feel"]["decay_half_life_days"])
+
+
+def test_register_new_word_repairs_a_malformed_entry_for_the_same_word(tmp_path: Path) -> None:
+    """`{"name": x}` must not count as present: the word would be reported registered while the loader skips it."""
+    from brain.emotion.persona_loader import register_new_word
+
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": [{"name": "omega_feel", "description": "kept"}]}), encoding="utf-8")
+    vocabulary._unregister("omega_feel")
+
+    assert register_new_word(vocab_path, "omega_feel") == "omega_feel"
+    assert vocabulary.get("omega_feel") is not None
+    (omega,) = [e for e in _entries(vocab_path) if e["name"] == "omega_feel"]
+    assert omega["description"] == "kept" and "decay_half_life_days" in omega

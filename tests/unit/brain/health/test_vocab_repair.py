@@ -565,6 +565,33 @@ def test_vocab_repair_search_does_not_bump(tmp_path: Path) -> None:
         store.close()
 
 
+def test_vocab_repair_writes_with_the_files_own_backup_count(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """Every writer of the vocabulary file keeps the same backups: more after repeated anomalies, not a fixed three."""
+    from types import SimpleNamespace
+
+    from brain.emotion import persona_loader
+    from brain.health import vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("wistful")])
+    monkeypatch.setattr(persona_loader, "compute_treatment", lambda *_a, **_k: SimpleNamespace(backup_count=7))
+    backups: list[object] = []
+    real_write = vocab_repair.write_json
+
+    def spy(path, data, **kwargs):  # noqa: ANN001, ANN202
+        if Path(path).name == "emotion_vocabulary.json":
+            backups.append(kwargs.get("backups"))
+        return real_write(path, data, **kwargs)
+
+    monkeypatch.setattr(vocab_repair, "write_json", spy)
+    store = _make_store(tmp_path)
+    try:
+        vocab_repair.run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    assert backups and set(backups) == {7}
+
+
 def test_vocab_repair_stops_when_the_file_cannot_be_re_read_mid_run(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     """A file that goes unreadable after the first read is not repaired from the stale snapshot or marked complete."""
     from brain.health import vocab_repair

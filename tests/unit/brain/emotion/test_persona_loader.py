@@ -105,7 +105,7 @@ def test_load_idempotent_on_re_register(tmp_path: Path):
 
 
 def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
-    """One bad entry + one good → 1 registered, 1 warning logged."""
+    """One bad entry + one good → 1 registered, 1 warning logged, on a read-only load (a writing one repairs it, #784)."""
     path = tmp_path / "emotion_vocabulary.json"
     path.write_text(
         json.dumps(
@@ -127,7 +127,7 @@ def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
     )
     try:
         with caplog.at_level(logging.WARNING, logger="brain.emotion.persona_loader"):
-            result = load_persona_vocabulary(path)
+            result = load_persona_vocabulary(path, read_only=True)
         assert result == 1
         assert vocabulary.get("test_good_entry") is not None
         assert vocabulary.get("test_bad_entry") is None

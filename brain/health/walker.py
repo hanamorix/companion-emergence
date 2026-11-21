@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
-from brain.health.json_io import Recovery, read_json_result
+from brain.health.json_io import JsonFileError, Recovery, read_json, read_json_result
 from brain.paths import cadence_state_path
 from brain.utils.file_lock import file_lock
 
@@ -45,6 +45,17 @@ _AUTO_CREATE_TEXT_FILES: tuple[str, ...] = ("voice.md",)
 _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 
 
+def _vocabulary_needs_repair(path: Path) -> bool:
+    """True when the file exists and a plain read fails, so the heal that follows will write it."""
+    if not path.exists():
+        return False
+    try:
+        read_json(path, default=lambda: None, recover=Recovery.RAISE)
+    except JsonFileError:
+        return True
+    return False
+
+
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
@@ -60,7 +71,8 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
         # The vocabulary's repair holds the lock register_new_word and the loader take, so a word added meanwhile is kept.
-        guard = file_lock(path) if name == "emotion_vocabulary.json" and path.exists() else nullcontext()
+        # A healthy file is only read, without the lock: `GET /health` walks on every probe and must not wait on a writer.
+        guard = file_lock(path) if name == "emotion_vocabulary.json" and _vocabulary_needs_repair(path) else nullcontext()
         with guard:
             _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
         _, anomaly = _res.data, _res.anomaly

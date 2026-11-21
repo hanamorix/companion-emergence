@@ -326,7 +326,10 @@ def _update_vocab(vocab_path: Path, mutate: Callable[[dict], bool]) -> dict | No
             logger.warning("vocab_repair: %s is missing; nothing to update", vocab_path)
             return None
         if mutate(fresh):
-            write_json(vocab_path, fresh, backups=3)
+            # The one backup rule for the vocabulary file, shared with the loader and register_new_word.
+            from brain.emotion.persona_loader import _vocab_backups
+
+            write_json(vocab_path, fresh, backups=_vocab_backups(vocab_path))
         return fresh
 
 

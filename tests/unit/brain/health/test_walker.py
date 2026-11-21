@@ -287,6 +287,28 @@ def test_walker_keeps_going_when_the_heal_marker_cannot_be_removed(tmp_path: Pat
     assert any(r.name == "brain.health.walker" and "vocab_heal_final.json" in r.getMessage() for r in caplog.records)
 
 
+def test_walker_takes_no_vocabulary_lock_for_a_healthy_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`GET /health` walks on every probe: a healthy file must not wait behind a writer that holds the lock."""
+    import json
+    from contextlib import contextmanager
+
+    from brain.health import walker
+
+    persona = _setup_persona(tmp_path)
+    (persona / "emotion_vocabulary.json").write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+    locked: list[Path] = []
+
+    @contextmanager
+    def recording_lock(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        locked.append(Path(path))
+        yield True
+
+    monkeypatch.setattr(walker, "file_lock", recording_lock)
+
+    assert walk_persona(persona) == []
+    assert locked == []
+
+
 def test_walker_repairs_the_vocabulary_under_its_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The walker's repair of the vocabulary file holds the lock register_new_word takes, so a word added meanwhile isn't lost."""
     from brain.health import walker

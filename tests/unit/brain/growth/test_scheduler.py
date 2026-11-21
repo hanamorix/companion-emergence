@@ -144,6 +144,49 @@ def test_run_growth_tick_rejects_proposal_with_invalid_chars(
         assert result.proposals_rejected == 1
 
 
+def test_a_dry_growth_tick_leaves_a_corrupt_vocabulary_and_the_heal_marker_as_they_are(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """`nell heartbeat --dry-run` runs a dry tick: it reads, and must not quarantine, repair, lock or re-arm anything."""
+    from brain.health.json_io import write_json
+    from brain.paths import cadence_state_path
+
+    vocab_path = persona_dir / "emotion_vocabulary.json"
+    vocab_path.write_text("{not json", encoding="utf-8")
+    write_json(cadence_state_path(persona_dir, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+    before = {p.relative_to(persona_dir).as_posix() for p in persona_dir.rglob("*")}
+
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[]):
+        run_growth_tick(persona_dir, store, datetime.now(UTC), dry_run=True)
+
+    assert vocab_path.read_text(encoding="utf-8") == "{not json"
+    assert {p.relative_to(persona_dir).as_posix() for p in persona_dir.rglob("*")} == before
+
+
+def test_a_dry_tick_on_an_unreadable_vocabulary_does_not_count_a_held_word_as_new(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """With the file unreadable, the dry tick falls back to the words this process holds, not to none at all."""
+    from brain.emotion import vocabulary
+    from brain.emotion.vocabulary import Emotion
+
+    (persona_dir / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    vocabulary._unregister("calm_joy_blend")
+    vocabulary.register(Emotion("calm_joy_blend", "calm and joy together", "persona_extension", 14.0))
+    proposal = EmotionProposal(
+        name="calm_joy_blend",
+        description="calm and joy together",
+        decay_half_life_days=14.0,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC), dry_run=True)
+
+    assert result.emotions_added == 0
+
+
 @pytest.mark.no_base_failure(
     reason="guards register_new_word's held-word path: the base scheduler appended to the file itself, so it held there"
 )
