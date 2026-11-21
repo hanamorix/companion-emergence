@@ -508,6 +508,7 @@ def test_a_repair_never_changes_the_half_life_the_engine_decays_a_word_by(
     assert persona_loader._repair_broken_entries(json.loads(vocab_path.read_text(encoding="utf-8"))) == []
 
 
+@pytest.mark.no_base_failure(reason="guards a regression this branch's repair copy introduced; main never copied the file")
 def test_a_read_only_load_of_deeply_nested_json_still_registers_its_words(tmp_path: Path) -> None:
     """JSON reads about 1000 levels of nesting; copying it for the repair runs out of stack about halfway there."""
     vocab_path = tmp_path / "emotion_vocabulary.json"
@@ -521,6 +522,7 @@ def test_a_read_only_load_of_deeply_nested_json_still_registers_its_words(tmp_pa
     assert vocabulary.get("deep_feel").decay_half_life_days == 3.0
 
 
+@pytest.mark.no_base_failure(reason="guards a regression this branch's write check introduced; main never copied the file")
 def test_a_writing_load_of_deeply_nested_json_still_registers_its_words(tmp_path: Path) -> None:
     """The check for whether a load would write copies the file too: too deep to copy, it can't need a repair."""
     vocab_path = tmp_path / "emotion_vocabulary.json"
