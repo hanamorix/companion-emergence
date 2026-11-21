@@ -10,6 +10,7 @@ from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
 from brain.health.json_io import Recovery, read_json_result
+from brain.paths import cadence_state_path
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
 #
@@ -58,6 +59,11 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
         _, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             anomalies.append(anomaly)
+            if name == "emotion_vocabulary.json":
+                # This heal has no store: a restored .bak or a reset can drop words only the
+                # memories still carry. Delete the one-time heal marker so the next load that
+                # has a store re-registers them (#784).
+                cadence_state_path(persona_dir, "vocab_heal_final.json").unlink(missing_ok=True)
 
     # Auto-creating text identity scan (voice.md). load_voice() owns the
     # default template and the attempt_heal_text invocation.

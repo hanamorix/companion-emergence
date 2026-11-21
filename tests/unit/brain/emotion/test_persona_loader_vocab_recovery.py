@@ -201,6 +201,36 @@ def test_heal_runs_once_then_marker_stops_it(tmp_path: Path):
         store.close()
 
 
+def test_anomaly_on_a_store_load_heals_even_with_the_marker(tmp_path: Path):
+    """A repaired vocabulary file can lose words only memories still carry, so an anomaly re-runs the heal."""
+    from brain.health.json_io import write_json
+    from brain.paths import cadence_state_path
+
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="a", memory_type="conversation", domain="us", emotions={"iota_feel": 8.0}
+            )
+        )
+        write_json(cadence_state_path(tmp_path, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        (tmp_path / "emotion_vocabulary.json.bak1").write_text(
+            json.dumps({"version": 1, "emotions": []}), encoding="utf-8"
+        )
+        vocab_path.write_text("{corrupt{{", encoding="utf-8")
+        _cleanup_emotion("iota_feel")
+
+        _count, anomaly = load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert anomaly is not None
+        assert vocabulary.get("iota_feel") is not None
+        names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+        assert "iota_feel" in names
+    finally:
+        store.close()
+
+
 def test_missing_file_still_reconstructs_after_heal_marker(tmp_path: Path):
     store = MemoryStore(":memory:")
     try:

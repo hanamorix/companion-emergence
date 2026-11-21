@@ -146,3 +146,80 @@ def test_walk_corrupt_voicecraft_no_bak_resets_to_empty(tmp_path: Path) -> None:
     voicecraft_anomalies = [a for a in anomalies if a.file == "voicecraft.md"]
     assert len(voicecraft_anomalies) == 1
     assert voicecraft_anomalies[0].action == "reset_to_default"
+
+
+def _persona_with_heal_marker_and_words(tmp_path: Path, words: list[str]) -> Path:
+    """A persona whose memories carry ``words`` and whose one-time vocabulary heal has already run."""
+    from brain.health.json_io import write_json
+    from brain.memory.store import Memory
+    from brain.paths import cadence_state_path
+
+    persona = _setup_persona(tmp_path)
+    store = MemoryStore(db_path=persona / "memories.db")
+    try:
+        for word in words:
+            store.create(
+                Memory.create_new(content=word, memory_type="conversation", domain="us", emotions={word: 8.0})
+            )
+    finally:
+        store.close()
+    write_json(cadence_state_path(persona, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+    return persona
+
+
+def _load_with_store(persona: Path) -> None:
+    from brain.emotion.persona_loader import load_persona_vocabulary
+
+    store = MemoryStore(db_path=persona / "memories.db")
+    try:
+        load_persona_vocabulary(persona / "emotion_vocabulary.json", store=store)
+    finally:
+        store.close()
+
+
+def test_walker_reset_of_vocabulary_re_arms_the_heal(tmp_path: Path) -> None:
+    """The walker resets a corrupt vocabulary with no store; the next store-carrying load re-learns the words."""
+    from brain.emotion import vocabulary
+
+    persona = _persona_with_heal_marker_and_words(tmp_path, ["kappa_feel"])
+    (persona / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    vocabulary._unregister("kappa_feel")
+
+    anomalies = walk_persona(persona)
+    assert any(a.file == "emotion_vocabulary.json" and a.action == "reset_to_default" for a in anomalies)
+
+    _load_with_store(persona)
+
+    assert vocabulary.get("kappa_feel") is not None
+
+
+def test_walker_bak_restore_re_arms_the_heal(tmp_path: Path) -> None:
+    """The walker restores an older .bak1 that lacks the newest word; the next store-carrying load re-learns it."""
+    import json
+
+    from brain.emotion import vocabulary
+
+    persona = _persona_with_heal_marker_and_words(tmp_path, ["lambda_feel", "mu_feel"])
+    old_entry = {
+        "name": "lambda_feel",
+        "description": "d",
+        "category": "persona_extension",
+        "decay_half_life_days": 14.0,
+        "intensity_clamp": 10.0,
+    }
+    (persona / "emotion_vocabulary.json.bak1").write_text(
+        json.dumps({"version": 1, "emotions": [old_entry]}), encoding="utf-8"
+    )
+    (persona / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    vocabulary._unregister("lambda_feel")
+    vocabulary._unregister("mu_feel")
+
+    anomalies = walk_persona(persona)
+    assert any(a.file == "emotion_vocabulary.json" and a.action == "restored_from_bak1" for a in anomalies)
+
+    _load_with_store(persona)
+
+    assert vocabulary.get("lambda_feel") is not None
+    assert vocabulary.get("mu_feel") is not None
+    names = {e["name"] for e in json.loads((persona / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]}
+    assert names == {"lambda_feel", "mu_feel"}

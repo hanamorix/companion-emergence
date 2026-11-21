@@ -136,9 +136,12 @@ def load_persona_vocabulary_with_anomaly(
 
     if store is not None:
         # One-time backfill: new words now register when written, so the scan of every active
-        # memory runs only until its marker exists. Reconstruction above is not gated by it.
+        # memory runs only until its marker exists. Reconstruction above is not gated by it, and
+        # a file this load repaired (an older .bak restored, or a reset) may lack words only the
+        # memories still carry, so an anomaly runs the scan again. The health walker, which
+        # repairs with no store, deletes the marker for the same reason.
         marker = cadence_state_path(path.parent, "vocab_heal_final.json")
-        if not marker.exists():
+        if anomaly is not None or not marker.exists():
             healed = _heal_referenced_but_unregistered(path, data, store)
             registered += healed
             write_json(
