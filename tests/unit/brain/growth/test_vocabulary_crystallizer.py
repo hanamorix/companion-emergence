@@ -55,6 +55,27 @@ def test_crystallizer_proposes_recurring_unnamed_emotional_configuration() -> No
         store.close()
 
 
+def test_crystallizer_evidence_keeps_write_order_when_times_tie() -> None:
+    """Windows' coarse clock gives memories made in a row the same created_at; evidence is still oldest first."""
+    from datetime import UTC, datetime
+
+    store = MemoryStore(":memory:")
+    try:
+        same = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
+        written = []
+        for content in ("love and grief braided", "another love-grief evening", "grief softened by love"):
+            memory = _mem(content, {"love": 9, "grief": 8})
+            memory.created_at = same
+            store.create(memory)
+            written.append(memory.id)
+
+        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief"}, eng=None)
+
+        assert [p.evidence_memory_ids for p in result] == [tuple(written)]
+    finally:
+        store.close()
+
+
 def test_crystallizer_skips_configuration_when_name_already_exists() -> None:
     store = MemoryStore(":memory:")
     try:

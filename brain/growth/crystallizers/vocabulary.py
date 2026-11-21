@@ -51,7 +51,10 @@ def crystallize_vocabulary(
     ``eng`` is the live emotion engine, whose faded values pick and score the
     two strongest emotions, or None for the stored values.
     """
-    clusters = _cluster_active_memories(store.list_recent_light(_SCAN_LIMIT), eng=eng)
+    # The window comes newest first; reversed, it is oldest first with write order kept on tied times (Windows'
+    # coarse clock), which the stable created_at sorts below then preserve.
+    window = list(reversed(store.list_recent_light(_SCAN_LIMIT)))
+    clusters = _cluster_active_memories(window, eng=eng)
     current_names = {canonical_name(name) for name in current_vocabulary_names}
 
     proposals: list[EmotionProposal] = []
