@@ -104,36 +104,27 @@ def test_load_idempotent_on_re_register(tmp_path: Path):
         _cleanup_emotion("test_idempotent")
 
 
-def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
-    """One bad entry + one good → 1 registered, 1 warning logged, on a read-only load (a writing one repairs it, #784)."""
+def test_read_only_load_skips_only_entries_with_no_word_and_registers_a_broken_ones_repair(tmp_path: Path, caplog):
+    """A read-only load registers the repaired copy a writing load would write; it skips, with a warning, only what
+    names no word (#784)."""
+    from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
+
     path = tmp_path / "emotion_vocabulary.json"
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "emotions": [
-                    {
-                        "name": "test_good_entry",
-                        "description": "ok",
-                        "category": "persona_extension",
-                        "decay_half_life_days": 5.0,
-                        "intensity_clamp": 10.0,
-                    },
-                    {"name": "test_bad_entry"},  # missing required fields
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    good = {"name": "test_good_entry", "description": "ok", "category": "persona_extension", "decay_half_life_days": 5.0}
+    emotions = [good, {"name": "test_bad_entry"}, {"description": "no name"}, "not an object"]
+    path.write_text(json.dumps({"version": 1, "emotions": emotions}), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
     try:
         with caplog.at_level(logging.WARNING, logger="brain.emotion.persona_loader"):
             result = load_persona_vocabulary(path, read_only=True)
-        assert result == 1
+        assert result == 2
         assert vocabulary.get("test_good_entry") is not None
-        assert vocabulary.get("test_bad_entry") is None
-        assert any("test_bad_entry" in r.message for r in caplog.records)
+        assert vocabulary.get("test_bad_entry").description == PLACEHOLDER_DESCRIPTION
+        assert sum("skipping emotion entry" in r.message for r in caplog.records) == 2
+        assert path.read_text(encoding="utf-8") == before
     finally:
         _cleanup_emotion("test_good_entry")
+        _cleanup_emotion("test_bad_entry")
 
 
 # ---- Health T10: json_io HEAL wiring ----

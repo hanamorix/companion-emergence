@@ -23,7 +23,8 @@ def _valid_half_life(value: object) -> float | None:
     """A real finite number with 0 < v <= 3650, else None (the default applies). bool is not a number here."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or not 0 < value <= _MAX_HALF_LIFE_DAYS:
+    # The range first: comparing works on any int, while math.isfinite raises OverflowError on one too large for a float.
+    if not 0 < value <= _MAX_HALF_LIFE_DAYS or not math.isfinite(value):
         return None
     return float(value)
 

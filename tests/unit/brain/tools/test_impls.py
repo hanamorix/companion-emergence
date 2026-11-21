@@ -554,6 +554,25 @@ def test_add_memory_bad_half_life_falls_back_to_default(tmp_path: Path, bad) -> 
     assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
 
 
+def test_add_memory_half_life_too_large_for_a_float_falls_back_to_default(tmp_path: Path) -> None:
+    """A 400-digit integer in the tool call: math.isfinite raises OverflowError on it rather than answering False."""
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="a word with a huge half-life",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives={"quiet_ache": 10**400},
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
+
+
 def test_add_memory_non_dict_half_lives_is_ignored(tmp_path: Path) -> None:
     from brain.emotion import vocabulary
     from brain.tools.impls.add_memory import add_memory

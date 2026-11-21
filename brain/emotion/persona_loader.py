@@ -181,13 +181,19 @@ def _load_vocabulary(
             anomaly.file,
         )
 
-    if not read_only:
+    if read_only:
+        # Registered from a repaired copy, never written: the registry skips words it already holds, so a value the
+        # repair would replace must not get in first and outlive the file's repair.
+        to_register = copy.deepcopy(data)
+        _repair_broken_entries(to_register)
+    else:
         repaired = _repair_broken_entries(data)
         if repaired:
             write_json(path, data, backups=_vocab_backups(path))
-            logger.warning("emotion_vocabulary.json had entries the loader couldn't register %s; repaired them in place", sorted(repaired))
+            logger.warning("emotion_vocabulary.json had entries that needed repair %s; repaired them in place", sorted(repaired))
+        to_register = data
 
-    registered = _register_from_data(data)
+    registered = _register_from_data(to_register)
 
     if store is not None:
         # One-time backfill: new words now register when written, so the scan of every active
@@ -221,8 +227,8 @@ def load_persona_vocabulary(
 
     Missing `path` → returns 0 silently. Fresh personas don't need a file.
     Corrupt JSON → quarantine + heal from .bak, log a warning.
-    Per-entry validation failure → that entry skipped + warning,
-    other entries proceed.
+    A broken entry → its repaired copy is registered (and, unless read-only,
+    written); an entry that names no word is skipped with a warning.
 
     If `store` is provided, after registration the loader heals any emotion
     names referenced in memories but absent from the vocabulary — registering
@@ -253,11 +259,13 @@ def register_new_word(
     name = vocabulary.validate_new_name(raw_name)
     if name is None:
         return None
+    default_days = dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS
     held = vocabulary.get(name)
     if held is not None:
         held_half_life = held.decay_half_life_days
-        if held_half_life is not None and not math.isfinite(held_half_life):
-            held_half_life = dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS
+        # JSON has no NaN or infinity, and the engine ignores a half-life of 0 or below: either is written as the default.
+        if held_half_life is not None and not _finite_or(held_half_life, 0.0) > 0:
+            held_half_life = default_days
         new_entry = {
             "name": name,
             "description": held.description,
@@ -266,11 +274,12 @@ def register_new_word(
             "intensity_clamp": held.intensity_clamp if math.isfinite(held.intensity_clamp) else 10.0,
         }
     else:
+        days = _finite_or(half_life_days, 0.0)  # as a float, so the entry written is sound
         new_entry = {
             "name": name,
             "description": description,
             "category": "persona_extension",
-            "decay_half_life_days": half_life_days or dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS,
+            "decay_half_life_days": days if days > 0 else default_days,
             "intensity_clamp": 10.0,
         }
     with file_lock(vocab_path):
@@ -373,8 +382,12 @@ def _entry_to_emotion(entry: dict) -> Emotion:
         if key not in entry:
             raise KeyError(f"missing required field {key!r}")
 
-    half_life = None if entry["decay_half_life_days"] is None else float(entry["decay_half_life_days"])
-    clamp = float(entry.get("intensity_clamp", 10.0))
+    try:
+        half_life = None if entry["decay_half_life_days"] is None else float(entry["decay_half_life_days"])
+        clamp = float(entry.get("intensity_clamp", 10.0))
+    except OverflowError as exc:
+        # JSON reads a huge number as an int, which float() refuses rather than returning infinity.
+        raise ValueError("decay_half_life_days and intensity_clamp must be finite") from exc
     # Python's JSON reads NaN and Infinity; registered, they would poison decay and make every write of the file raise.
     if (half_life is not None and not math.isfinite(half_life)) or not math.isfinite(clamp):
         raise ValueError("decay_half_life_days and intensity_clamp must be finite")
@@ -396,6 +409,24 @@ def _is_registrable(entry: object) -> bool:
     return True
 
 
+def _is_sound(entry: object) -> bool:
+    """True when the entry registers and everything reads it the same way, so the repair leaves it alone.
+
+    The loader registers more than the rest of the brain accepts: `str()` turns a null description or category into the
+    text "None", and `float()` takes a numeric string, a bool, 0 or a negative half-life, all of which the engine ignores
+    (engine_files._classify). Such an entry still registers on a read-only load; a writing load repairs it.
+    """
+    if not isinstance(entry, dict) or not _is_registrable(entry):
+        return False
+    if not isinstance(entry["description"], str) or not isinstance(entry["category"], str):
+        return False
+    half_life = entry["decay_half_life_days"]
+    if half_life is None:
+        return True
+    # Registrable, so already finite and small enough for a float.
+    return isinstance(half_life, (int, float)) and not isinstance(half_life, bool) and half_life > 0
+
+
 def _entry_canonical_name(entry: object) -> str | None:
     """The entry's name, canonical; None when it has no string name."""
     if isinstance(entry, dict) and isinstance(entry.get("name"), str):
@@ -409,7 +440,7 @@ def _finite_or(value: object, fallback: float) -> float:
         return fallback
     try:
         number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return fallback
     return number if math.isfinite(number) else fallback
 
@@ -424,19 +455,22 @@ def _first_usable_number(values: list[object], fallback: float) -> float:
 
 
 def _repair_broken_entries(data: dict) -> list[str]:
-    """Fix in place every word whose entries the loader can't all register; return the names of the words changed.
+    """Fix in place every word with an entry that isn't sound; return the names of the words changed.
 
+    An entry is broken when `_is_sound` refuses it: the loader can't register it, or it registers something the rest of
+    the brain reads differently (a null description, a half-life the engine ignores).
     Entries are grouped by canonical name. A group with no broken entry is left as it is (plain spelling twins are vocab
     repair's to merge). A group with one becomes one entry, so a repaired copy can never come first and win the registry:
       - the base is the first whole entry with a real description, else the first whole one, else the first broken one
         with a real description, else the first broken one;
       - a real description from any entry of the word fills a placeholder base, so dropping a twin never deletes it;
-      - a broken base takes each unusable field (missing, the wrong type, or a NaN or infinite number, which JSON can't
-        write back) from the first other entry where it's usable, else the placeholder's value. A half-life of None (no
-        decay) is usable;
+      - a broken base takes each unusable field (missing, the wrong type, a NaN or infinite number, which JSON can't
+        write back, or an integer too large for a float) from the first other entry where it's usable, else the
+        placeholder's value. For the half-life, the first entry that states one decides whether the word decays: None
+        means no decay, and any other value, even a corrupt one, means it decays at the first number above 0 stated;
       - the word's other broken entries are dropped; its other whole entries are kept.
     Then any other field of any named entry holding NaN or infinity, at any depth, becomes null, so the file can be
-    written again. An entry with no string name is left alone: it names no word, so it hides none.
+    written again. Outside any named entry, such a value becomes null too, reported by place.
     """
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
 
@@ -454,10 +488,10 @@ def _repair_broken_entries(data: dict) -> list[str]:
     repaired: list[str] = []
     dropped: set[int] = set()
     for group in groups.values():
-        broken = [e for e in group if not _is_registrable(e)]
+        broken = [e for e in group if not _is_sound(e)]
         if not broken:
             continue
-        whole = [e for e in group if _is_registrable(e)]
+        whole = [e for e in group if _is_sound(e)]
         pool = whole or broken
         base = next((e for e in pool if _real(e)), pool[0])
         others = [e for e in group if e is not base]
@@ -472,24 +506,18 @@ def _repair_broken_entries(data: dict) -> list[str]:
                 base["category"] = next(
                     (e["category"] for e in others if isinstance(e.get("category"), str)), "persona_extension"
                 )
-            # The first copy, base first, that states a usable half-life: None (no decay) or a finite number. A missing
-            # field is not a statement; NaN, infinity and non-numbers are unusable. A base that states a number, even a
-            # corrupt one, meant the word decays, so another copy's None can't make it permanent: it falls back to a
-            # finite number from another copy, else the placeholder.
-            base_states_decay = "decay_half_life_days" in base and base["decay_half_life_days"] is not None
-            half_life: float | None = PLACEHOLDER_DECAY_DAYS
-            for copy_entry in [base, *others]:
-                if "decay_half_life_days" not in copy_entry:
-                    continue
-                if copy_entry["decay_half_life_days"] is None:
-                    if base_states_decay:
-                        continue
-                    half_life = None
-                    break
-                number = _finite_or(copy_entry["decay_half_life_days"], math.nan)
-                if not math.isnan(number):
-                    half_life = number
-                    break
+            # The first copy, base first, that states a half-life (a missing field is not a statement) decides whether
+            # the word decays. If it states None, the word doesn't decay. If it states anything else, even a corrupt
+            # number or a non-number, the word decays, so a later copy's None can't make it permanent: the half-life is
+            # the first finite number above 0 stated, else the placeholder's.
+            stated = [e["decay_half_life_days"] for e in [base, *others] if "decay_half_life_days" in e]
+            half_life: float | None
+            if stated and stated[0] is None:
+                half_life = None
+            else:
+                # Only a number above 0: the engine ignores any other half-life (engine_files._classify).
+                positive = [v for v in stated if v is not None and _finite_or(v, 0.0) > 0]
+                half_life = _first_usable_number(positive, PLACEHOLDER_DECAY_DAYS)
             base["decay_half_life_days"] = half_life
             base["intensity_clamp"] = _first_usable_number(
                 [base.get("intensity_clamp")] + [e.get("intensity_clamp") for e in others], 10.0
