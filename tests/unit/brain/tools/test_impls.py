@@ -572,6 +572,9 @@ def test_add_memory_non_dict_half_lives_is_ignored(tmp_path: Path) -> None:
     assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
 
 
+@pytest.mark.no_base_failure(
+    reason="pins Decision 2 against the new registration: the base never registers words, so a refused write mints none there"
+)
 def test_add_memory_refused_write_registers_no_word(tmp_path: Path) -> None:
     from brain.emotion import vocabulary
     from brain.tools.impls.add_memory import add_memory

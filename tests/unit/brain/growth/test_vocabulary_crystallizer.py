@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from brain.growth.crystallizers.vocabulary import crystallize_vocabulary
 from brain.memory.store import Memory, MemoryStore
 
@@ -55,6 +57,9 @@ def test_crystallizer_proposes_recurring_unnamed_emotional_configuration() -> No
         store.close()
 
 
+@pytest.mark.no_base_failure(
+    reason="guards list_recent_light's newest-first window: the base's list_active kept write order on tied times"
+)
 def test_crystallizer_evidence_keeps_write_order_when_times_tie() -> None:
     """Windows' coarse clock gives memories made in a row the same created_at; evidence is still oldest first."""
     from datetime import UTC, datetime

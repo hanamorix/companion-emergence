@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -177,6 +179,9 @@ def _load_with_store(persona: Path) -> None:
         store.close()
 
 
+@pytest.mark.no_base_failure(
+    reason="guards the new heal marker: the base has no marker and heals on every store load, so it passes there"
+)
 def test_walker_reset_of_vocabulary_re_arms_the_heal(tmp_path: Path) -> None:
     """The walker resets a corrupt vocabulary with no store; the next store-carrying load re-learns the words."""
     from brain.emotion import vocabulary
@@ -193,6 +198,9 @@ def test_walker_reset_of_vocabulary_re_arms_the_heal(tmp_path: Path) -> None:
     assert vocabulary.get("kappa_feel") is not None
 
 
+@pytest.mark.no_base_failure(
+    reason="guards the new heal marker: the base has no marker and heals on every store load, so it passes there"
+)
 def test_walker_bak_restore_re_arms_the_heal(tmp_path: Path) -> None:
     """The walker restores an older .bak1 that lacks the newest word; the next store-carrying load re-learns it."""
     import json

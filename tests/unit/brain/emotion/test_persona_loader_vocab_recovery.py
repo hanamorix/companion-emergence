@@ -15,6 +15,8 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from brain.emotion import vocabulary
 from brain.emotion.persona_loader import load_persona_vocabulary_with_anomaly
 from brain.memory.store import Memory, MemoryStore
@@ -201,6 +203,9 @@ def test_heal_runs_once_then_marker_stops_it(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.no_base_failure(
+    reason="guards the new heal marker: the base has no marker and heals on every store load, so it passes there"
+)
 def test_anomaly_on_a_store_load_heals_even_with_the_marker(tmp_path: Path):
     """A repaired vocabulary file can lose words only memories still carry, so an anomaly re-runs the heal."""
     from brain.health.json_io import write_json

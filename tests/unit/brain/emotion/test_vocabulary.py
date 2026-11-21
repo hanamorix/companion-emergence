@@ -333,6 +333,9 @@ def test_by_category_survives_a_register_during_iteration(monkeypatch: pytest.Mo
     assert len(vocabulary.by_category("core")) == 2
 
 
+@pytest.mark.no_base_failure(
+    reason="guards the registry lock: CPython makes a lone dict store atomic, so the unlocked base doesn't lose a register"
+)
 def test_register_is_safe_across_threads() -> None:
     import threading
 
