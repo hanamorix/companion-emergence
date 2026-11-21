@@ -42,6 +42,8 @@ from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
 from brain.health.json_io import Recovery, read_json_result
 from brain.memory.store import MemoryStore
+from brain.paths import cadence_state_path
+from brain.utils.file_lock import file_lock
 
 if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
@@ -215,13 +217,24 @@ def _read_current_vocabulary_names(
         if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
             raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
 
-    res = read_json_result(
-        vocab_path,
-        default=lambda: {"version": 1, "emotions": []},
-        recover=Recovery.HEAL,
-        validate=_schema_validator,
-    )
+    # The heal can restore or reset the file: it holds the lock register_new_word and the loader take, so a word added
+    # meanwhile is kept.
+    with file_lock(vocab_path):
+        res = read_json_result(
+            vocab_path,
+            default=lambda: {"version": 1, "emotions": []},
+            recover=Recovery.HEAL,
+            validate=_schema_validator,
+        )
     data, anomaly = res.data, res.anomaly
+    if anomaly is not None:
+        # This repair has no store: a restored .bak or a reset can drop words only the memories still carry. Delete the
+        # one-time heal marker so the next load with a store re-registers them, as the health walker does (#784).
+        marker = cadence_state_path(vocab_path.parent, "vocab_heal_final.json")
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove %s after repairing %s; the vocabulary heal may not re-run", marker, vocab_path.name, exc_info=True)
 
     if anomaly is not None:
         logger.warning(

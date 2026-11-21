@@ -285,3 +285,27 @@ def test_walker_keeps_going_when_the_heal_marker_cannot_be_removed(tmp_path: Pat
 
     assert {"emotion_vocabulary.json", "voicecraft.md"} <= {a.file for a in anomalies}
     assert any(r.name == "brain.health.walker" and "vocab_heal_final.json" in r.getMessage() for r in caplog.records)
+
+
+def test_walker_repairs_the_vocabulary_under_its_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The walker's repair of the vocabulary file holds the lock register_new_word takes, so a word added meanwhile isn't lost."""
+    from brain.health import walker
+    from brain.utils.file_lock import file_lock
+
+    persona = _setup_persona(tmp_path)
+    vocab_path = persona / "emotion_vocabulary.json"
+    vocab_path.write_text("{not json", encoding="utf-8")
+    held: list[bool] = []
+    real_read = walker.read_json_result
+
+    def spy(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        if Path(path) == vocab_path:
+            with file_lock(vocab_path, blocking=False) as acquired:
+                held.append(not acquired)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(walker, "read_json_result", spy)
+
+    walk_persona(persona)
+
+    assert held == [True]

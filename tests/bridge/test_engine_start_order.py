@@ -63,13 +63,8 @@ def cli_persona(tmp_path: Path) -> Path:
     make_persona(persona, [row(T35, emotions={"joy": 6.0}, mid="seed")])
     (persona / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}', encoding="utf-8")
     (persona / "emotion_vocabulary.json").write_text('{"version": 1, "emotions": []}', encoding="utf-8")
-    # A persona whose one-time vocabulary heal has already run: the marker is pre-written so the refused dry runs below stay
-    # write-free on an already-upgraded persona. A load with a store can also write through the heal or the rebuild from
-    # memories; this valid file with baseline-only memories gives neither anything to do (#784).
-    from brain.paths import cadence_state_path
-
-    cadence_state_path(persona, "vocab_heal_final.json").parent.mkdir(parents=True, exist_ok=True)
-    cadence_state_path(persona, "vocab_heal_final.json").write_text('{"healed_at": "2026-01-01T00:00:00+00:00", "count": 0}', encoding="utf-8")
+    # No vocabulary heal marker: a dry run loads the vocabulary read-only (no store), so even a persona whose one-time heal
+    # hasn't run yet stays write-free (#784).
     return persona
 
 

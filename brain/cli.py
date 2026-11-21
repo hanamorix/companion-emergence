@@ -1000,7 +1000,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
     try:
         from brain.soul.store import SoulStore
 
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        _load_command_vocabulary(persona_dir, store, args.dry_run)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1060,6 +1060,22 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
     emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
 
 
+def _load_command_vocabulary(persona_dir: Path, store: MemoryStore, dry_run: bool) -> None:
+    """The vocabulary load before a command's work. A dry run writes nothing, so it reads the file only (#784).
+
+    A real run loads with the store, which may heal or rebuild the file and writes the one-time heal marker. A dry run loads
+    `read_only=True`: no heal, rebuild, quarantine or marker, and a corrupt file is left as it is with a warning on stderr.
+    """
+    vocab_path = persona_dir / "emotion_vocabulary.json"
+    if not dry_run:
+        load_persona_vocabulary(vocab_path, store=store)
+        return
+    try:
+        load_persona_vocabulary(vocab_path, read_only=True)
+    except JsonFileError as exc:
+        print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
+
+
 def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
     """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
 
@@ -1111,7 +1127,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        _load_command_vocabulary(persona_dir, store, args.dry_run)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1237,7 +1253,7 @@ def _reflex_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        _load_command_vocabulary(persona_dir, store, args.dry_run)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1296,7 +1312,7 @@ def _research_handler(args: argparse.Namespace) -> int:
     provider_name, searcher_name = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        _load_command_vocabulary(persona_dir, store, args.dry_run)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1936,7 +1952,7 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     provider_name, _ = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        _load_command_vocabulary(persona_dir, store, args.dry_run)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused

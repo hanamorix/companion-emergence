@@ -144,6 +144,63 @@ def test_run_growth_tick_rejects_proposal_with_invalid_chars(
         assert result.proposals_rejected == 1
 
 
+@pytest.mark.no_base_failure(
+    reason="guards register_new_word's held-word path: the base scheduler appended to the file itself, so it held there"
+)
+def test_growth_tick_writes_a_word_this_process_holds_but_the_file_lost(persona_dir: Path, store: MemoryStore) -> None:
+    """A repair can drop a word the process still holds; the logged emotion_added must leave the word in the file."""
+    from brain.emotion import vocabulary
+    from brain.emotion.vocabulary import Emotion
+
+    _seed_vocab(persona_dir)
+    vocabulary._unregister("hope_joy_blend")
+    vocabulary.register(Emotion("hope_joy_blend", "hope and joy together", "persona_extension", 20.0))
+    proposal = EmotionProposal(
+        name="hope_joy_blend",
+        description="hope and joy together",
+        decay_half_life_days=20.0,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        run_growth_tick(persona_dir, store, datetime.now(UTC))
+
+    in_file = {e["name"] for e in json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]}
+    assert _added_names(persona_dir) == ["hope_joy_blend"]
+    assert "hope_joy_blend" in in_file
+
+
+def test_growth_tick_repairs_the_vocabulary_under_its_lock_and_re_arms_the_heal(
+    persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler's own repair of a corrupt file holds register_new_word's lock and deletes the heal marker, as the walker does."""
+    from brain.growth import scheduler
+    from brain.health.json_io import write_json
+    from brain.paths import cadence_state_path
+    from brain.utils.file_lock import file_lock
+
+    vocab_path = persona_dir / "emotion_vocabulary.json"
+    vocab_path.write_text("{not json", encoding="utf-8")
+    marker = cadence_state_path(persona_dir, "vocab_heal_final.json")
+    write_json(marker, {"healed_at": "x", "count": 0})
+    held: list[bool] = []
+    real_read = scheduler.read_json_result
+
+    def spy(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        if Path(path) == vocab_path:
+            with file_lock(vocab_path, blocking=False) as acquired:
+                held.append(not acquired)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "read_json_result", spy)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[]):
+        run_growth_tick(persona_dir, store, datetime.now(UTC))
+
+    assert held == [True]
+    assert not marker.exists()
+
+
 def test_growth_tick_registers_word_immediately(persona_dir: Path, store: MemoryStore) -> None:
     """The crystallized word is usable in this process at once, with no registry reload."""
     from brain.emotion import vocabulary

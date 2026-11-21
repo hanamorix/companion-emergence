@@ -563,3 +563,28 @@ def test_vocab_repair_search_does_not_bump(tmp_path: Path) -> None:
         assert store.get(mem.id).recall_count == 0.0
     finally:
         store.close()
+
+
+def test_vocab_repair_stops_when_the_file_cannot_be_re_read_mid_run(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """A file that goes unreadable after the first read is not repaired from the stale snapshot or marked complete."""
+    from brain.health import vocab_repair
+    from brain.health.json_io import Recovery
+
+    vocab_path = _write_vocab(tmp_path, [_stub_entry("wistful")])
+    real_read = vocab_repair.read_json
+
+    def corrupting_read(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        if kwargs.get("recover") is Recovery.RAISE:  # the locked re-read
+            Path(path).write_text("{not json", encoding="utf-8")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(vocab_repair, "read_json", corrupting_read)
+    store = _make_store(tmp_path)
+    try:
+        report = vocab_repair.run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    assert report.status == "skipped"
+    assert not (tmp_path / "vocab_repair_state.json").exists()
+    assert vocab_path.read_text(encoding="utf-8") == "{not json"

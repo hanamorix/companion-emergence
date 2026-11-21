@@ -137,7 +137,10 @@ The design is in `2026-11-07-emotion-rework-b1-writers-design.md`. Names used el
 | `FeltTimeState.weather_baselines` field | Saved state may only change by adding fields | #388 |
 | `peer_emotion_window` table | Same, for `kindled_link.db` | #388 |
 | Junk words the old heal scan already registered | The gate only stops new ones | Bugs-ledger sweep at the end |
-| Dry-run loads still take a store, so a refused dry run can write the heal marker | They should load with `read_only=True` and no store (#784 final review) | Issue to be filed |
-| The load-time heal and rebuild, and the json_io/walker HEAL repairs, write the vocabulary file without `file_lock(vocab_path)` | Only `register_new_word` and vocab repair take the lock in #784 | Issue to be filed |
-| `vocab_repair._update_vocab`'s `or data` fallback uses the stale first-read snapshot when the locked re-read fails or returns `{}` | Out of #784's scope | Issue to be filed |
-| The growth scheduler logs `emotion_added` when the registry and the file have drifted (word in the file, not in this process's registry) | Out of #784's scope | Issue to be filed |
+| Dry-run loads still take a store, so a refused dry run can write the heal marker | The five dry-run commands now load with `read_only=True` and no store (`cli._load_command_vocabulary`) | Resolved in #786 |
+| The load-time heal and rebuild, and the json_io/walker HEAL repairs, write the vocabulary file without `file_lock(vocab_path)` | A writing load now runs under the lock, reading the file inside it; the walker's and the growth scheduler's repairs take it too, and the scheduler's deletes the heal marker as the walker's does | Resolved in #786 |
+| `vocab_repair._update_vocab`'s `or data` fallback uses the stale first-read snapshot when the locked re-read fails or returns `{}` | A failed re-read now stops the run as `"skipped"` with no state written, so the next run retries | Resolved in #786 |
+| The growth scheduler logs `emotion_added` when the registry and the file have drifted (word in this process's registry, missing from the file) | `register_new_word` now checks the file for a word the process holds and writes it back with its registered fields | Resolved in #786 |
+| A malformed file entry (`{"name": x}`) hides its word from the heal for good | Only an entry the loader can register counts as present; the heal replaces a malformed one | Resolved in #786 |
+| A non-finite half-life or clamp (Python's JSON reads `NaN`) makes the heal's write-back raise on every store load | The loader no longer registers non-finite numbers, the heal writes only finite values, and `register_new_word` refuses softly when the file holds one | Resolved in #786 |
+| The heal and rebuilds write with `backups=3`, not the file's own treatment | They use `compute_treatment(...).backup_count`, as `register_new_word` does | Resolved in #786 |

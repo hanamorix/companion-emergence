@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
 from brain.health.json_io import Recovery, read_json_result
 from brain.paths import cadence_state_path
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)  # the heal-marker unlink warning in walk_persona
 
@@ -58,7 +59,10 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     # to avoid Python's late-binding closure gotcha.
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
-        _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
+        # The vocabulary's repair holds the lock register_new_word and the loader take, so a word added meanwhile is kept.
+        guard = file_lock(path) if name == "emotion_vocabulary.json" and path.exists() else nullcontext()
+        with guard:
+            _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
         _, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             anomalies.append(anomaly)

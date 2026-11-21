@@ -153,7 +153,10 @@ def run_vocab_repair(
         merged[:] = _merge_variant_entries(fresh)
         return bool(merged)
 
-    data = _update_vocab(vocab_path, _merge) or data
+    fresh = _update_vocab(vocab_path, _merge)
+    if fresh is None:
+        return _stopped_mid_run(prior_repaired, prior_described)
+    data = fresh
     if merged:
         logger.info("vocab_repair: merged %d variant twin(s): %s", len(merged), merged)
 
@@ -186,7 +189,10 @@ def run_vocab_repair(
                 repaired += 1
         return repaired > 0
 
-    data = _update_vocab(vocab_path, _bump) or data
+    fresh = _update_vocab(vocab_path, _bump)
+    if fresh is None:
+        return _stopped_mid_run(prior_repaired, prior_described)
+    data = fresh
     # Step 2 target: every placeholder, whatever its half-life (#173).
     stub_names = [
         entry["name"]
@@ -235,6 +241,15 @@ def run_vocab_repair(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _stopped_mid_run(repaired: int, described: int) -> RepairReport:
+    """The file went missing or unreadable after the run's first read: stop, write no state, so the next run retries.
+
+    Going on would repair from the stale first snapshot, and marking the run complete would retire Step 1 for good.
+    """
+    logger.warning("vocab_repair: the vocabulary file could not be re-read mid-run; stopping, the next run retries")
+    return RepairReport(repaired=repaired, described=described, status="skipped", completed_at="")
+
 
 def _write_and_return(persona_dir: Path, *, repaired: int, described: int) -> RepairReport:
     completed_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -10,6 +10,7 @@ Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +60,26 @@ def load_persona_vocabulary_with_anomaly(
     """
     if read_only and store is not None:
         raise ValueError("read_only takes no store: the store's rebuild and heal both write")
+    if read_only or (store is None and not path.exists()):
+        return _load_vocabulary(path, store=store, read_only=read_only)
+    # Every write below (the json_io heal, a rebuild from memories, the heal of referenced words) happens under the lock
+    # register_new_word and vocab repair take, on data read inside it, so a word they add meanwhile is never dropped.
+    with file_lock(path):
+        return _load_vocabulary(path, store=store, read_only=False)
+
+
+def _vocab_backups(path: Path) -> int:
+    """The backup count for a write of the vocabulary file: the file's own treatment (more after repeated anomalies)."""
+    return compute_treatment(path.parent, path.name).backup_count
+
+
+def _load_vocabulary(
+    path: Path,
+    *,
+    store: MemoryStore | None,
+    read_only: bool,
+) -> tuple[int, BrainAnomaly | None]:
+    """The body of `load_persona_vocabulary_with_anomaly`; a writing load runs it under `file_lock(path)`."""
     if not path.exists():
         if store is not None:
             # Recover-dropped-vocab self-heal: `nell recover` backs up only
@@ -76,7 +97,7 @@ def load_persona_vocabulary_with_anomaly(
                 e for e in recon_data["emotions"] if e["category"] == "persona_extension"
             ]
             if extensions:
-                write_json(path, recon_data, backups=3)
+                write_json(path, recon_data, backups=_vocab_backups(path))
                 registered = _register_from_data(recon_data)
                 logger.warning(
                     "emotion_vocabulary.json was missing but memories reference "
@@ -103,7 +124,7 @@ def load_persona_vocabulary_with_anomaly(
         from brain.health.reconstruct import reconstruct_vocabulary_from_memories
 
         recon_data = reconstruct_vocabulary_from_memories(store)
-        write_json(path, recon_data, backups=3)
+        write_json(path, recon_data, backups=_vocab_backups(path))
         data = recon_data
         # Replace the anomaly with one whose action reflects the reconstruction.
         # Same kind (json_parse_error / schema_mismatch — that's why we needed
@@ -190,15 +211,34 @@ def register_new_word(
     """Register a new emotion word in this process and persist it to the vocabulary file.
 
     Returns the canonical name, or None when the gate refuses the name or the file cannot be
-    read safely (a corrupt file is left untouched). A word already registered returns its
-    name and touches nothing. The file is re-read under the cross-process lock so an entry
-    another process wrote is kept.
+    read or written safely (a corrupt file is left untouched). The file is re-read under the
+    cross-process lock so an entry another process wrote is kept. A word this process already
+    holds is still checked against the file: a repair can drop it there, and it is then written
+    back with its registered fields, so the scheduler's `emotion_added` is true of the file.
     """
     name = vocabulary.validate_new_name(raw_name)
     if name is None:
         return None
-    if vocabulary.get(name) is not None:
-        return name
+    held = vocabulary.get(name)
+    if held is not None:
+        held_half_life = held.decay_half_life_days
+        if held_half_life is not None and not math.isfinite(held_half_life):
+            held_half_life = dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS
+        new_entry = {
+            "name": name,
+            "description": held.description,
+            "category": held.category,
+            "decay_half_life_days": held_half_life,
+            "intensity_clamp": held.intensity_clamp if math.isfinite(held.intensity_clamp) else 10.0,
+        }
+    else:
+        new_entry = {
+            "name": name,
+            "description": description,
+            "category": "persona_extension",
+            "decay_half_life_days": half_life_days or dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS,
+            "intensity_clamp": 10.0,
+        }
     with file_lock(vocab_path):
         try:
             data = read_json(
@@ -216,19 +256,11 @@ def register_new_word(
         entries = data["emotions"]
         known = {e.get("name") for e in entries if isinstance(e, dict)}
         if name not in known:
-            entries.append(
-                {
-                    "name": name,
-                    "description": description,
-                    "category": "persona_extension",
-                    "decay_half_life_days": half_life_days or dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS,
-                    "intensity_clamp": 10.0,
-                }
-            )
+            entries.append(new_entry)
             try:
-                backups = compute_treatment(vocab_path.parent, vocab_path.name).backup_count
-                write_json(vocab_path, data, backups=backups)
-            except OSError:
+                write_json(vocab_path, data, backups=_vocab_backups(vocab_path))
+            except (OSError, ValueError):
+                # ValueError: an entry already in the file holds NaN or infinity, which JSON can't write back.
                 logger.warning("could not write %s; not registering %r", vocab_path, name, exc_info=True)
                 return None
         # A word another thread registered meanwhile is skipped there, not raised.
@@ -303,14 +335,17 @@ def _entry_to_emotion(entry: dict) -> Emotion:
         if key not in entry:
             raise KeyError(f"missing required field {key!r}")
 
+    half_life = None if entry["decay_half_life_days"] is None else float(entry["decay_half_life_days"])
+    clamp = float(entry.get("intensity_clamp", 10.0))
+    # Python's JSON reads NaN and Infinity; registered, they would poison decay and make every write of the file raise.
+    if (half_life is not None and not math.isfinite(half_life)) or not math.isfinite(clamp):
+        raise ValueError("decay_half_life_days and intensity_clamp must be finite")
     return Emotion(
         name=str(entry["name"]),
         description=str(entry["description"]),
         category=str(entry["category"]),  # type: ignore[arg-type]
-        decay_half_life_days=(
-            None if entry["decay_half_life_days"] is None else float(entry["decay_half_life_days"])
-        ),
-        intensity_clamp=float(entry.get("intensity_clamp", 10.0)),
+        decay_half_life_days=half_life,
+        intensity_clamp=clamp,
     )
 
 
@@ -330,10 +365,21 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     """
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
 
+    def _is_registrable(entry: object) -> bool:
+        try:
+            _entry_to_emotion(entry)  # type: ignore[arg-type]
+        except (KeyError, ValueError, TypeError):
+            return False
+        return True
+
+    def _entry_canonical_name(entry: object) -> str | None:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            return vocabulary.canonical_name(entry["name"])
+        return None
+
     entries = data.setdefault("emotions", [])
-    in_file = {
-        vocabulary.canonical_name(e["name"]) for e in entries if isinstance(e, dict) and isinstance(e.get("name"), str)
-    }
+    # Only an entry the loader can register counts as present: a malformed one (`{"name": x}`) would hide its word for good.
+    in_file = {_entry_canonical_name(e) for e in entries if _is_registrable(e)}
     skip = in_file | {e.name for e in vocabulary._BASELINE}
     new_entries: list[dict] = []
     for mem in store.list_active(limit=None):
@@ -347,13 +393,18 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
             skip.add(name)
             known = vocabulary.get(name)
             if known is not None:
+                # JSON has no NaN or infinity: a non-finite registered number is written as the placeholder's.
+                half_life = known.decay_half_life_days
+                if half_life is not None and not math.isfinite(half_life):
+                    half_life = PLACEHOLDER_DECAY_DAYS
+                clamp = known.intensity_clamp if math.isfinite(known.intensity_clamp) else 10.0
                 new_entries.append(
                     {
                         "name": name,
                         "description": known.description,
                         "category": known.category,
-                        "decay_half_life_days": known.decay_half_life_days,
-                        "intensity_clamp": known.intensity_clamp,
+                        "decay_half_life_days": half_life,
+                        "intensity_clamp": clamp,
                     }
                 )
             else:
@@ -372,8 +423,11 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
 
     # Registers only the words missing from the registry; one another thread registered meanwhile is skipped there.
     healed = _register_from_data({"emotions": new_entries})
-    entries.extend(new_entries)
-    write_json(path, data, backups=3)
+    written = {e["name"] for e in new_entries}
+    # A malformed entry for a word written here is replaced, not left beside the whole one.
+    data["emotions"] = [e for e in entries if _is_registrable(e) or _entry_canonical_name(e) not in written]
+    data["emotions"].extend(new_entries)
+    write_json(path, data, backups=_vocab_backups(path))
     logger.warning(
         "emotion_vocabulary.json was missing %d referenced emotion(s) %s — "
         "appended them to %s (extractor-minted words the vocabulary crystallizer hadn't added, "
