@@ -66,9 +66,11 @@ def _load_vocabulary(persona_dir: Path) -> None:
     """Register the persona's own emotion names in this process before any tool runs (#689).
 
     The brain tools (record_monologue, add_memory, the emotion reads) run in this per-turn process, and the registry is
-    per process; without this every name outside the baseline is unknown here. Read-only: nothing is written on a
-    turn's path, and a corrupt file is left as it is (logged, baseline names only) for the bridge's start-up load to
-    repair, since that load has the store and rebuilds from memories. Fail-soft: the tools must still serve.
+    per process; without this every name outside the baseline is unknown here. This load is read-only, and a
+    corrupt file is left as it is (logged, baseline names only) for the bridge's start-up load to
+    repair, since that load has the store and rebuilds from memories. The one exception to "this process never writes
+    the vocabulary file" is add_memory, which appends a new emotion word through register_new_word (#784). Fail-soft:
+    the tools must still serve.
     """
     try:
         from brain.emotion.persona_loader import load_persona_vocabulary

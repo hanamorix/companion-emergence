@@ -84,6 +84,16 @@ def test_add_memory_required_fields() -> None:
     assert "emotions" in required
 
 
+def test_add_memory_schema_has_optional_half_lives() -> None:
+    params = SCHEMAS["add_memory"]["parameters"]
+    assert params["properties"]["emotion_half_lives"] == {
+        "type": "object",
+        "description": params["properties"]["emotion_half_lives"]["description"],
+        "additionalProperties": {"type": "number"},
+    }
+    assert "emotion_half_lives" not in params["required"]
+
+
 def test_search_memories_required_fields() -> None:
     """search_memories requires only 'query'; emotion and limit are optional."""
     schema = SCHEMAS["search_memories"]

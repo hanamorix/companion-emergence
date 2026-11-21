@@ -361,3 +361,32 @@ def test_dispatch_recall_arc(tmp_path):
     ctx = _make_ctx(tmp_path)
     result = dispatch("recall_arc", {"query": "nonexistent"}, **ctx)
     assert result["match_type"] == "none"
+
+
+def test_dispatch_add_memory_carries_emotion_half_lives_into_the_vocabulary(tmp_path: Path) -> None:
+    """The half-life an add_memory tool call names reaches the registry and the vocabulary file through the dispatcher."""
+    import json
+
+    from brain.emotion import vocabulary
+
+    ctx = _make_ctx(tmp_path)
+    try:
+        result = dispatch(
+            "add_memory",
+            {
+                "content": "a slow tide of missing her",
+                "memory_type": "event",
+                "domain": "relationship",
+                "emotions": {"love": 9, "Tide-Ache": 8},
+                "emotion_half_lives": {"tide_ache": 21},
+                "importance": 8,
+            },
+            **ctx,
+        )
+    finally:
+        ctx["store"].close()
+
+    assert result["created"] is True
+    assert vocabulary.get("tide_ache").decay_half_life_days == 21.0
+    entries = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]
+    assert [(e["name"], e["decay_half_life_days"]) for e in entries] == [("tide_ache", 21.0)]

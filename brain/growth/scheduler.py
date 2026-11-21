@@ -1,12 +1,21 @@
 """Growth scheduler — orchestrates crystallizers + applies decisions atomically.
 
 The scheduler is the primary mutator of `emotion_vocabulary.json` during a
-growth tick, but two other paths also write to that file:
-- `brain/emotion/persona_loader.py` — `_heal_referenced_but_unregistered`
-  registers extractor-minted emotions the scheduler never saw, at load time.
-- `brain/health/vocab_repair.py` — one-time startup migration that fills in
-  missing descriptions for stub entries; idempotent (guarded by
-  ``vocab_repair_state.json``).
+growth tick, but other paths also write to that file:
+- `brain/tools/impls/add_memory.py` — a new emotion word in a kept memory is
+  registered at once, through `persona_loader.register_new_word` (the same
+  call the scheduler uses for a crystallized word).
+- `brain/emotion/persona_loader.py` — at load time, `_heal_referenced_but_unregistered`
+  registers emotions memories use but the file lacks, and a missing or reset
+  file is rebuilt from memories.
+- `brain/health/vocab_repair.py` — merges spelling-variant twins, bumps legacy
+  stub half-lives and fills in placeholder descriptions; runs at startup and
+  every 6 hours.
+- `brain/health/walker.py` and `brain/health/json_io` — repair a corrupt file
+  (restore a `.bak` or reset to empty).
+Only `register_new_word` (so the scheduler and `add_memory`) and vocab repair
+take the file's cross-process lock (`file_lock(vocab_path)`) and re-read the
+file under it; the load-time heal and rebuild and the json_io/walker repairs do not.
 
 No engine writes `emotion_growth.log.jsonl` except through `run_growth_tick`.
 
@@ -23,24 +32,23 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.emotion import vocabulary
+from brain.emotion.persona_loader import register_new_word
 from brain.growth.crystallizers.vocabulary import (
     VOCABULARY_CRYSTALLIZER_STATUS,
     crystallize_vocabulary,
 )
 from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
-from brain.health.json_io import Recovery, read_json, read_json_result, write_json
+from brain.health.json_io import JsonFileError, Recovery, read_json, read_json_result
 from brain.memory.store import MemoryStore
+from brain.paths import cadence_state_path
+from brain.utils.file_lock import file_lock
 
 if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
 
 logger = logging.getLogger(__name__)
-
-# Same character allowlist as brain.paths.get_persona_dir — names that
-# could appear as filesystem path components or trip JSON parsing get
-# rejected before they reach disk.
-_INVALID_NAME_CHARS = ("/", "\\", "{", "}")
 
 
 @dataclass(frozen=True)
@@ -82,9 +90,10 @@ def run_growth_tick(
     For each proposal:
       1. Skip silently if name already in current vocabulary (re-proposing
          is normal; not a rejection).
-      2. Reject (with warning) if name fails character validation.
-      3. Else: append to {persona_dir}/emotion_vocabulary.json (atomic
-         `.new + os.replace`) and append a GrowthLogEvent to
+      2. Reject (with warning) if the name fails the new-word gate or the
+         vocabulary file cannot be written safely.
+      3. Else: register it through `register_new_word` (this process and
+         {persona_dir}/emotion_vocabulary.json, under the file lock) and append a GrowthLogEvent to
          {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`).
 
     `dry_run=True` calls the crystallizer but skips both writes; the
@@ -99,7 +108,7 @@ def run_growth_tick(
     vocab_path = persona_dir / "emotion_vocabulary.json"
     log_path = persona_dir / "emotion_growth.log.jsonl"
 
-    current_names, vocab_anomaly = _read_current_vocabulary_names(vocab_path)
+    current_names, vocab_anomaly = _read_current_vocabulary_names(vocab_path, dry_run=dry_run)
     if vocab_anomaly is not None and anomalies_collector is not None:
         anomalies_collector.append(vocab_anomaly)
 
@@ -119,18 +128,26 @@ def run_growth_tick(
         if proposal.name in current_names:
             # Idempotent skip — re-proposal is normal, not a rejection.
             continue
-        if not _is_valid_name(proposal.name):
-            logger.warning(
-                "growth scheduler: rejecting proposal with invalid name %r", proposal.name
-            )
+        if dry_run:
+            # Would-have-added: counted when the gate accepts the name; nothing is written.
+            if vocabulary.validate_new_name(proposal.name) is None:
+                proposals_rejected += 1
+            else:
+                emotions_added += 1
+            continue
+
+        registered = register_new_word(
+            vocab_path,
+            proposal.name,
+            half_life_days=proposal.decay_half_life_days,
+            description=proposal.description,
+        )
+        if registered is None:
+            # Refused by the gate, or the file could not be read or written safely (logged there).
             proposals_rejected += 1
             continue
 
         emotions_added += 1
-        if dry_run:
-            continue
-
-        _append_to_vocabulary(vocab_path, proposal)
         current_names.add(proposal.name)
         append_growth_event(
             log_path,
@@ -182,6 +199,8 @@ def run_growth_tick(
 
 def _read_current_vocabulary_names(
     vocab_path: Path,
+    *,
+    dry_run: bool = False,
 ) -> tuple[set[str], BrainAnomaly | None]:
     """Return (set of emotion names, optional anomaly) for the vocabulary file.
 
@@ -200,13 +219,35 @@ def _read_current_vocabulary_names(
         if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
             raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
 
-    res = read_json_result(
-        vocab_path,
-        default=lambda: {"version": 1, "emotions": []},
-        recover=Recovery.HEAL,
-        validate=_schema_validator,
-    )
+    if dry_run:
+        # A dry run writes nothing: it reads, and leaves a damaged file (and the heal marker) for a real run to repair.
+        try:
+            data = read_json(vocab_path, default=lambda: {"version": 1, "emotions": []}, recover=Recovery.RAISE, validate=_schema_validator)
+        except JsonFileError:
+            # Not reported as an anomaly: a dry run repairs nothing, so a real run will report it when it heals the file.
+            # The words this process holds stand in for the file's, so a word already known isn't counted as one to add.
+            logger.warning("growth scheduler: dry run left the unreadable %s as it is", vocab_path, exc_info=True)
+            return {e.name for e in vocabulary.list_all()}, None
+        return {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}, None
+
+    # The heal can restore or reset the file: it holds the lock register_new_word and the loader take, so a word added
+    # meanwhile is kept.
+    with file_lock(vocab_path):
+        res = read_json_result(
+            vocab_path,
+            default=lambda: {"version": 1, "emotions": []},
+            recover=Recovery.HEAL,
+            validate=_schema_validator,
+        )
     data, anomaly = res.data, res.anomaly
+    if anomaly is not None:
+        # This repair has no store: a restored .bak or a reset can drop words only the memories still carry. Delete the
+        # one-time heal marker so the next load with a store re-registers them, as the health walker does (#784).
+        marker = cadence_state_path(vocab_path.parent, "vocab_heal_final.json")
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove %s after repairing %s; the vocabulary heal may not re-run", marker, vocab_path.name, exc_info=True)
 
     if anomaly is not None:
         logger.warning(
@@ -219,29 +260,6 @@ def _read_current_vocabulary_names(
 
     names = {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}
     return names, anomaly
-
-
-def _is_valid_name(name: str) -> bool:
-    if not name:
-        return False
-    return not any(c in name for c in _INVALID_NAME_CHARS)
-
-
-def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
-    """Atomic append to emotion_vocabulary.json via json_io.write_json (.bak rotation)."""
-    from brain.health.adaptive import compute_treatment
-    data = read_json(vocab_path, default=lambda: {"version": 1, "emotions": []}, recover=Recovery.RAISE)
-    data["emotions"].append(
-        {
-            "name": proposal.name,
-            "description": proposal.description,
-            "category": "persona_extension",
-            "decay_half_life_days": proposal.decay_half_life_days,
-            "intensity_clamp": 10.0,
-        }
-    )
-    treatment = compute_treatment(vocab_path.parent, vocab_path.name)
-    write_json(vocab_path, data, backups=treatment.backup_count)
 
 
 def _emit_vocabulary_initiate_candidate(

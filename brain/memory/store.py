@@ -3923,6 +3923,25 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
+    def list_recent_light(self, limit: int) -> list[Memory]:
+        """The newest `limit` active memories, newest `created_at` first, with no embedding. Bumps nothing.
+
+        A bounded window for scans that need feelings and ids but not vectors (the vocabulary crystallizer). Stored times are
+        ISO text, so the order is the text order: right for the writer's own UTC stamps, approximate across mixed offsets.
+        A row whose columns cannot be parsed is logged and skipped.
+        """
+        sql = (
+            f"SELECT {self._ENGINE_WINDOW_COLUMNS} FROM memories WHERE active = 1 "  # noqa: S608
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        )
+        found: list[Memory] = []
+        for row in self._conn.execute(sql, (limit,)).fetchall():
+            try:
+                found.append(_row_to_memory(row))
+            except Exception as exc:  # noqa: BLE001 - one damaged row must not stop the scan
+                logger.warning("MemoryStore.list_recent_light: row %s skipped, its columns cannot be read (%s)", row["id"], exc)
+        return found
+
     def has_active_without_emotions(self) -> bool:
         """True when some active memory has an empty stored emotion vector.
 

@@ -16,9 +16,14 @@ Decay half-lives per spec Section 10.1:
 
 from __future__ import annotations
 
+import logging
+import re
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
 # files in the wild may still contain entries with this category. New baseline
@@ -119,14 +124,18 @@ _BASELINE: tuple[Emotion, ...] = (
 )
 
 
-# NOT thread-safe. All extension register() calls must happen at startup
-# before any concurrent reader (e.g. the async bridge) is running. The
-# framework enforces this by loading extensions in main() before the
-# bridge starts its event loop.
+# Writers (register / _unregister) take _REGISTRY_LOCK, so words may be
+# registered at runtime from more than one thread. Readers do not lock: get is
+# one dict lookup and list_all is one C-level copy of the values, both atomic
+# under the GIL. Any reader that loops over the registry must loop over a
+# list_all() snapshot, never the live dict (a register mid-loop would raise
+# "dictionary changed size"). A reader may see a word added a moment late.
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
+_REGISTRY_LOCK = threading.Lock()
 
 
 _BLEND_SUFFIX = "_blend"
+_NEW_NAME_PATTERN = re.compile(r"[a-z][a-z_]{0,99}")
 
 
 def canonical_name(name: str) -> str:
@@ -140,6 +149,20 @@ def canonical_name(name: str) -> str:
     if key.endswith(_BLEND_SUFFIX):
         parts = key[: -len(_BLEND_SUFFIX)].split("_")
         key = "_".join(sorted(parts)) + _BLEND_SUFFIX
+    return key
+
+
+def validate_new_name(raw: str) -> str | None:
+    """The one gate for a new emotion word: its canonical name, or None if unusable.
+
+    Canonicalises, then requires 1-100 lowercase ASCII letters/underscores
+    starting with a letter. Logs a WARNING on rejection. Does not check
+    whether the name is already registered.
+    """
+    key = canonical_name(raw)
+    if _NEW_NAME_PATTERN.fullmatch(key) is None:
+        logger.warning("rejecting invalid emotion name %r", raw)
+        return None
     return key
 
 
@@ -169,7 +192,7 @@ def list_all() -> list[Emotion]:
 
 def by_category(category: str) -> list[Emotion]:
     """Return every Emotion with the given category."""
-    return [e for e in _REGISTRY.values() if e.category == category]
+    return [e for e in list_all() if e.category == category]
 
 
 def register(emotion: Emotion) -> None:
@@ -178,11 +201,12 @@ def register(emotion: Emotion) -> None:
     Raises ValueError if an emotion with the same name is already registered.
     """
     key = canonical_name(emotion.name)
-    if key in _REGISTRY:
-        raise ValueError(f"Emotion {emotion.name!r} already registered")
-    if key != emotion.name:
-        emotion = replace(emotion, name=key)
-    _REGISTRY[key] = emotion
+    with _REGISTRY_LOCK:
+        if key in _REGISTRY:
+            raise ValueError(f"Emotion {emotion.name!r} already registered")
+        if key != emotion.name:
+            emotion = replace(emotion, name=key)
+        _REGISTRY[key] = emotion
 
 
 def _unregister(name: str) -> None:
@@ -190,4 +214,5 @@ def _unregister(name: str) -> None:
 
     The framework does not support runtime removal of vocabulary entries.
     """
-    _REGISTRY.pop(canonical_name(name), None)
+    with _REGISTRY_LOCK:
+        _REGISTRY.pop(canonical_name(name), None)

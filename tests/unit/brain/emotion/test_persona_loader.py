@@ -12,6 +12,7 @@ from brain.emotion import vocabulary
 from brain.emotion.persona_loader import (
     load_persona_vocabulary,
     load_persona_vocabulary_with_anomaly,
+    register_new_word,
 )
 from brain.memory.store import Memory, MemoryStore
 
@@ -104,7 +105,7 @@ def test_load_idempotent_on_re_register(tmp_path: Path):
 
 
 def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
-    """One bad entry + one good → 1 registered, 1 warning logged."""
+    """One bad entry + one good → 1 registered, 1 warning logged, on a read-only load (a writing one repairs it, #784)."""
     path = tmp_path / "emotion_vocabulary.json"
     path.write_text(
         json.dumps(
@@ -126,7 +127,7 @@ def test_load_per_entry_failure_skips_only_bad_entry(tmp_path: Path, caplog):
     )
     try:
         with caplog.at_level(logging.WARNING, logger="brain.emotion.persona_loader"):
-            result = load_persona_vocabulary(path)
+            result = load_persona_vocabulary(path, read_only=True)
         assert result == 1
         assert vocabulary.get("test_good_entry") is not None
         assert vocabulary.get("test_bad_entry") is None
@@ -303,3 +304,139 @@ def test_read_only_with_a_store_is_refused(tmp_path: Path):
     finally:
         store.close()
     assert not (tmp_path / "emotion_vocabulary.json").exists()
+
+
+def test_register_new_word_appends_and_registers(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    assert register_new_word(path, "gleam_word") == "gleam_word"
+    names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
+    assert "gleam_word" in names
+    emotion = vocabulary.get("gleam_word")
+    assert emotion is not None
+    assert emotion.decay_half_life_days == 14.0
+
+
+def test_register_new_word_uses_given_half_life(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    assert register_new_word(path, "slow_word", half_life_days=2.5) == "slow_word"
+    emotion = vocabulary.get("slow_word")
+    assert emotion is not None
+    assert emotion.decay_half_life_days == 2.5
+
+
+def test_register_new_word_refuses_invalid_name(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text('{"version": 1, "emotions": []}', encoding="utf-8")
+    before = path.read_bytes()
+    assert register_new_word(path, "Love!!") is None
+    assert path.read_bytes() == before
+
+
+def test_register_new_word_creates_the_file_for_a_fresh_persona(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    assert not path.exists()
+    assert register_new_word(path, "fresh_word") == "fresh_word"
+    names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
+    assert names == ["fresh_word"]
+
+
+def test_register_new_word_keeps_entry_written_by_another_process(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    assert register_new_word(path, "alpha_word") == "alpha_word"
+    vocabulary._unregister("alpha_word")  # as if another process had written it
+    assert register_new_word(path, "beta_word") == "beta_word"
+    names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
+    assert names == ["alpha_word", "beta_word"]
+
+
+def test_register_new_word_refuses_on_corrupt_file(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_bytes(b"{not json")
+    assert register_new_word(path, "ghost_word") is None
+    assert path.read_bytes() == b"{not json"
+    assert vocabulary.get("ghost_word") is None
+
+
+def test_refresh_if_changed_picks_up_other_process_write(tmp_path: Path):
+    from brain.emotion.persona_loader import refresh_if_changed
+    from brain.health.json_io import write_json
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text('{"version": 1, "emotions": []}', encoding="utf-8")
+    load_persona_vocabulary(path)
+    entry = {
+        "name": "outside_word",
+        "description": "d",
+        "category": "persona_extension",
+        "decay_half_life_days": 14.0,
+        "intensity_clamp": 10.0,
+    }
+    write_json(path, {"version": 1, "emotions": [entry]})
+    assert vocabulary.get("outside_word") is None
+    assert refresh_if_changed(path) == 1
+    assert vocabulary.get("outside_word") is not None
+    assert refresh_if_changed(path) == 0
+
+
+def test_refresh_if_changed_never_writes_a_corrupt_file(tmp_path: Path, monkeypatch):
+    from brain.emotion import persona_loader
+    from brain.emotion.persona_loader import refresh_if_changed
+    from brain.health.json_io import JsonFileError
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_bytes(b"{not json")
+    with pytest.raises(JsonFileError):
+        refresh_if_changed(path)
+    assert path.read_bytes() == b"{not json"
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != "emotion_vocabulary.json.lock") == [
+        "emotion_vocabulary.json"
+    ]
+
+    calls: list[Path] = []
+    real = persona_loader.load_persona_vocabulary
+    monkeypatch.setattr(
+        persona_loader,
+        "load_persona_vocabulary",
+        lambda p, **kw: calls.append(p) or real(p, **kw),
+    )
+    assert refresh_if_changed(path) == 0
+    assert calls == []
+
+
+def test_refresh_if_changed_on_a_missing_file_returns_zero_and_writes_nothing(tmp_path: Path) -> None:
+    from brain.emotion.persona_loader import refresh_if_changed
+
+    path = tmp_path / "emotion_vocabulary.json"
+    assert refresh_if_changed(path) == 0
+    assert refresh_if_changed(path) == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_load_skips_a_word_another_thread_registered_after_the_check(tmp_path: Path, monkeypatch):
+    """The registry gains the word between the loader's check and its register: the load does not raise."""
+    from brain.emotion.persona_loader import refresh_if_changed
+    from brain.emotion.vocabulary import Emotion
+
+    entry = {
+        "name": "racing_word",
+        "description": "d",
+        "category": "persona_extension",
+        "decay_half_life_days": 14.0,
+        "intensity_clamp": 10.0,
+    }
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": [entry]}), encoding="utf-8")
+    real_get = vocabulary.get
+
+    def get_then_lose_the_race(name: str):
+        found = real_get(name)
+        if name == "racing_word" and found is None:
+            vocabulary.register(
+                Emotion(name="racing_word", description="d", category="persona_extension", decay_half_life_days=14.0)
+            )
+        return found
+
+    monkeypatch.setattr(vocabulary, "get", get_then_lose_the_race)
+
+    assert refresh_if_changed(path) == 0
+    assert real_get("racing_word") is not None

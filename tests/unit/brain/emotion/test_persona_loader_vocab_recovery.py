@@ -15,6 +15,8 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from brain.emotion import vocabulary
 from brain.emotion.persona_loader import load_persona_vocabulary_with_anomaly
 from brain.memory.store import Memory, MemoryStore
@@ -167,5 +169,120 @@ def test_reconstruct_mints_canonical_names(tmp_path: Path):
         data = reconstruct_vocabulary_from_memories(store)
         ext = [e["name"] for e in data["emotions"] if e["category"] == "persona_extension"]
         assert ext == ["grief_love_blend"]
+    finally:
+        store.close()
+
+
+def test_heal_runs_once_then_marker_stops_it(tmp_path: Path):
+    """The referenced-but-unregistered scan is a one-time backfill: a marker stops later loads rerunning it."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="a", memory_type="conversation", domain="us", emotions={"zeta_feel": 8.0}
+            )
+        )
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert vocabulary.get("zeta_feel") is not None
+        marker = tmp_path / "cadence" / "vocab_heal_final.json"
+        assert marker.exists()
+
+        store.create(
+            Memory.create_new(
+                content="b", memory_type="conversation", domain="us", emotions={"eta_feel": 8.0}
+            )
+        )
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert vocabulary.get("eta_feel") is None
+    finally:
+        store.close()
+
+
+@pytest.mark.no_base_failure(
+    reason="guards the new heal marker: the base has no marker and heals on every store load, so it passes there"
+)
+def test_anomaly_on_a_store_load_heals_even_with_the_marker(tmp_path: Path):
+    """A repaired vocabulary file can lose words only memories still carry, so an anomaly re-runs the heal."""
+    from brain.health.json_io import write_json
+    from brain.paths import cadence_state_path
+
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="a", memory_type="conversation", domain="us", emotions={"iota_feel": 8.0}
+            )
+        )
+        write_json(cadence_state_path(tmp_path, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        (tmp_path / "emotion_vocabulary.json.bak1").write_text(
+            json.dumps({"version": 1, "emotions": []}), encoding="utf-8"
+        )
+        vocab_path.write_text("{corrupt{{", encoding="utf-8")
+        _cleanup_emotion("iota_feel")
+
+        _count, anomaly = load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert anomaly is not None
+        assert vocabulary.get("iota_feel") is not None
+        names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+        assert "iota_feel" in names
+    finally:
+        store.close()
+
+
+def test_bak_restore_in_the_same_process_writes_the_word_back(tmp_path: Path):
+    """The loader restores an older .bak1 while this process's registry still holds the word: the file gets it back."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(content="a", memory_type="conversation", domain="us", emotions={"xi_feel": 8.0})
+        )
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+        assert vocabulary.get("xi_feel") is not None
+
+        (tmp_path / "emotion_vocabulary.json.bak1").write_text(
+            json.dumps({"version": 1, "emotions": []}), encoding="utf-8"
+        )
+        vocab_path.write_text("{corrupt{{", encoding="utf-8")
+
+        _count, anomaly = load_persona_vocabulary_with_anomaly(vocab_path, store=store)  # same process: no _unregister
+
+        assert anomaly is not None and "bak1" in anomaly.action
+        names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+        assert "xi_feel" in names
+        marker = json.loads((tmp_path / "cadence" / "vocab_heal_final.json").read_text(encoding="utf-8"))
+        assert marker["count"] == 1
+    finally:
+        store.close()
+
+
+def test_missing_file_still_reconstructs_after_heal_marker(tmp_path: Path):
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="a", memory_type="conversation", domain="us", emotions={"theta_feel": 8.0}
+            )
+        )
+        vocab_path = tmp_path / "emotion_vocabulary.json"
+        vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+        assert (tmp_path / "cadence" / "vocab_heal_final.json").exists()
+
+        vocab_path.unlink()
+        _cleanup_emotion("theta_feel")
+        load_persona_vocabulary_with_anomaly(vocab_path, store=store)
+
+        assert vocabulary.get("theta_feel") is not None
+        names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+        assert "theta_feel" in names
     finally:
         store.close()

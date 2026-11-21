@@ -333,6 +333,15 @@ SCHEMAS: dict[str, dict] = {
                     "type": "integer",
                     "description": "Optional manual importance override (1-10). Auto-calculated from emotions if omitted.",
                 },
+                # wording: final pass
+                "emotion_half_lives": {
+                    "type": "object",
+                    "description": (
+                        "Optional. For an emotion word that is new to you, how many days it takes to fade by half, "
+                        'e.g. {"quiet_ache": 30}. Between 0 and 3650; ignored for words you already have.'
+                    ),
+                    "additionalProperties": {"type": "number"},
+                },
             },
             "required": ["content", "memory_type", "domain", "emotions"],
         },

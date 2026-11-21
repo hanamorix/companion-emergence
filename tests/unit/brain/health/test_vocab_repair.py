@@ -519,3 +519,99 @@ def test_repair_records_a_non_object_reply_and_keeps_placeholders(tmp_path: Path
     assert report.described == 0
     rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
     assert [r["site"] for r in rows] == ["vocab_repair"]
+
+
+def test_vocab_repair_keeps_a_word_added_during_the_provider_call(tmp_path: Path) -> None:
+    """Another writer registers a word while the provider call is in flight; repair's rewrite must keep it."""
+    from brain.health.json_io import read_json, write_json
+    from brain.health.vocab_repair import run_vocab_repair
+
+    vocab_path = _write_vocab(tmp_path, [_stub_entry("body_grief")])
+
+    class _AddingProvider:
+        def generate(self, prompt: str, *, system: str | None = None, persona_dir: Path | None = None) -> str:
+            data = read_json(vocab_path, default=lambda: None, expect=dict)
+            data["emotions"].append(_proper_entry("wistful", "added mid-run"))
+            write_json(vocab_path, data)
+            return json.dumps({"body_grief": "grief held in the body"})
+
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=_AddingProvider())
+    finally:
+        store.close()
+
+    by_name = {e["name"]: e for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+    assert report.described == 1
+    assert by_name["body_grief"]["description"] == "grief held in the body"
+    assert by_name["wistful"]["description"] == "added mid-run"
+
+
+def test_vocab_repair_search_does_not_bump(tmp_path: Path) -> None:
+    """Looking up excerpts for a name is bookkeeping, not recall: it must not raise recall_count."""
+    from brain.health.vocab_repair import _excerpts_for_name
+
+    store = _make_store(tmp_path)
+    try:
+        mem = Memory.create_new(
+            content="a joyful afternoon", memory_type="conversation", domain="us", emotions={"joy": 7.0}
+        )
+        store.create(mem)
+
+        assert _excerpts_for_name("joy", store) == ["a joyful afternoon"]
+
+        assert store.get(mem.id).recall_count == 0.0
+    finally:
+        store.close()
+
+
+def test_vocab_repair_writes_with_the_files_own_backup_count(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """Every writer of the vocabulary file keeps the same backups: more after repeated anomalies, not a fixed three."""
+    from types import SimpleNamespace
+
+    from brain.emotion import persona_loader
+    from brain.health import vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("wistful")])
+    monkeypatch.setattr(persona_loader, "compute_treatment", lambda *_a, **_k: SimpleNamespace(backup_count=7))
+    backups: list[object] = []
+    real_write = vocab_repair.write_json
+
+    def spy(path, data, **kwargs):  # noqa: ANN001, ANN202
+        if Path(path).name == "emotion_vocabulary.json":
+            backups.append(kwargs.get("backups"))
+        return real_write(path, data, **kwargs)
+
+    monkeypatch.setattr(vocab_repair, "write_json", spy)
+    store = _make_store(tmp_path)
+    try:
+        vocab_repair.run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    assert backups and set(backups) == {7}
+
+
+def test_vocab_repair_stops_when_the_file_cannot_be_re_read_mid_run(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """A file that goes unreadable after the first read is not repaired from the stale snapshot or marked complete."""
+    from brain.health import vocab_repair
+    from brain.health.json_io import Recovery
+
+    vocab_path = _write_vocab(tmp_path, [_stub_entry("wistful")])
+    real_read = vocab_repair.read_json
+
+    def corrupting_read(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        if kwargs.get("recover") is Recovery.RAISE:  # the locked re-read
+            Path(path).write_text("{not json", encoding="utf-8")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(vocab_repair, "read_json", corrupting_read)
+    store = _make_store(tmp_path)
+    try:
+        report = vocab_repair.run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    assert report.status == "skipped"
+    assert not (tmp_path / "vocab_repair_state.json").exists()
+    assert vocab_path.read_text(encoding="utf-8") == "{not json"
