@@ -226,7 +226,11 @@ def _real_descriptions(data: dict, word: str) -> set[str]:
 
 def _engine_half_life(persona_dir: Path, word: str) -> float:
     """What the emotion engine decays `word` by, reading the file as `EmotionEngine.half_life` does."""
-    days = VocabularyHalfLives(persona_dir).get(word)  # a fresh cache: it reads the file as it is now
+    return _with_built_in(VocabularyHalfLives(persona_dir).get(word), word)  # a fresh cache reads the file as it is now
+
+
+def _with_built_in(days: float | None, word: str) -> float:
+    """The engine's lookup after the file: the file's number, else `EMOTION_HALF_LIFE_DAYS`, else the default."""
     if days is not None:
         return days
     return dev_constants.EMOTION_HALF_LIFE_DAYS.get(word, dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS)
@@ -238,18 +242,17 @@ def _write(path: Path, data: dict) -> None:
 
 def test_the_repair_never_changes_the_half_life_the_engine_decays_a_word_by(tmp_path: Path) -> None:
     """The engine reads the file itself; a repair that changed what it reads would change how fast a feeling fades."""
-    before_dir, after_dir = tmp_path / "before", tmp_path / "after"
-    before_dir.mkdir()
-    after_dir.mkdir()
+    # The engine's own parser, on the data in memory: writing and re-reading two files per case cost most of this test's
+    # time, and the suite's CPU budget is 2 s. The tests below still go through the real file.
+    engine = VocabularyHalfLives(tmp_path)
     for seed in range(_PURE_CASES):
         original = _random_vocabulary(random.Random(seed))
         data = copy.deepcopy(original)
         persona_loader._repair_broken_entries(data)
-        _write(before_dir / "emotion_vocabulary.json", original)
-        _write(after_dir / "emotion_vocabulary.json", data)
+        table_before, table_after = engine._parse(original), engine._parse(data)
         for word in sorted(_text_words(original)):
-            before = _engine_half_life(before_dir, word)
-            after = _engine_half_life(after_dir, word)
+            before = _with_built_in(table_before.get(word), word)
+            after = _with_built_in(table_after.get(word), word)
             if before != after:
                 _fail(seed, original, f"the engine's half-life for {word} went from {before} to {after}")
 
