@@ -440,6 +440,9 @@ def _is_sound(entry: object) -> bool:
         return False
     if not isinstance(entry["description"], str) or not isinstance(entry["category"], str):
         return False
+    clamp = entry.get("intensity_clamp", 10.0)
+    if isinstance(clamp, bool) or not isinstance(clamp, (int, float)) or clamp <= 0:
+        return False  # at 0 or below every intensity exceeds the clamp, so the word could never be felt
     half_life = entry["decay_half_life_days"]
     if half_life is None:
         return True
@@ -502,7 +505,8 @@ def _repair_broken_entries(data: dict) -> list[str]:
 
     def _real(entry: dict) -> bool:
         description = entry.get("description")
-        return isinstance(description, str) and description != PLACEHOLDER_DESCRIPTION
+        # A blank description says no more than the placeholder does.
+        return isinstance(description, str) and description.strip() != "" and description != PLACEHOLDER_DESCRIPTION
 
     # The engine's own rule for which half-life it reads, so the repair can't drift from it (no import cycle: engine_files
     # doesn't import the loader).
@@ -529,9 +533,9 @@ def _repair_broken_entries(data: dict) -> list[str]:
                 base["category"] = next(
                     (e["category"] for e in others if isinstance(e.get("category"), str)), "persona_extension"
                 )
-            base["intensity_clamp"] = _first_usable_number(
-                [base.get("intensity_clamp")] + [e.get("intensity_clamp") for e in others], 10.0
-            )
+            clamps = [base.get("intensity_clamp")] + [e.get("intensity_clamp") for e in others]
+            # Only a clamp above 0: at 0 or below every intensity exceeds it.
+            base["intensity_clamp"] = _first_usable_number([c for c in clamps if _finite_or(c, 0.0) > 0], 10.0)
         # The half-life the engine decays the word by stays as it is: the first copy in file order the engine accepts
         # decides (a null there means the built-in half-life applies), else the built-in value the engine falls back
         # to. Every copy kept gets it, so whichever the loader and the engine read first, they read this.

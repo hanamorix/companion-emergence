@@ -564,6 +564,22 @@ def test_an_entry_whose_name_is_not_text_names_no_word(tmp_path: Path, read_only
     assert vocabulary.get("fine_feel") is not None
 
 
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_description_never_wins_over_a_real_one(tmp_path: Path, blank: str) -> None:
+    """A blank description says no more than the placeholder: as the base, it would drop the twin that says something."""
+    vocab_path = tmp_path / "emotion_vocabulary.json"
+    copies = [
+        {"name": "blank_feel", "description": blank, "decay_half_life_days": 3.0},
+        {"name": "Blank_Feel", "description": "another meaning", "decay_half_life_days": 3.0},
+    ]
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": copies}), encoding="utf-8")
+    vocabulary._unregister("blank_feel")
+    load_persona_vocabulary(vocab_path)
+
+    assert vocabulary.get("blank_feel").description == "another meaning"
+    assert [e["description"] for e in _entries(vocab_path)] == ["another meaning"]
+
+
 def test_an_integer_too_large_for_a_float_is_repaired_instead_of_crashing_the_load_and_new_words(tmp_path: Path) -> None:
     """JSON reads a 400-digit number as an int, and `float()` of it raises OverflowError rather than returning inf."""
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS
