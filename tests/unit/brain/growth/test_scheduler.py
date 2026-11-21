@@ -144,6 +144,25 @@ def test_run_growth_tick_rejects_proposal_with_invalid_chars(
         assert result.proposals_rejected == 1
 
 
+def test_growth_tick_registers_word_immediately(persona_dir: Path, store: MemoryStore) -> None:
+    """The crystallized word is usable in this process at once, with no registry reload."""
+    from brain.emotion import vocabulary
+
+    _seed_vocab(persona_dir)
+    proposal = EmotionProposal(
+        name="grief_joy_blend",
+        description="grief and joy together",
+        decay_half_life_days=31.5,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    assert vocabulary.get("grief_joy_blend") is None
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert vocabulary.get("grief_joy_blend") is not None
+
+
 def test_run_growth_tick_dry_run_does_not_write(persona_dir: Path, store: MemoryStore) -> None:
     """dry_run=True calls crystallizer but writes neither vocabulary nor log."""
     _seed_vocab(persona_dir)
@@ -168,14 +187,14 @@ def test_run_growth_tick_handles_multiple_proposals(persona_dir: Path, store: Me
     _seed_vocab(persona_dir)
     proposals = [
         EmotionProposal(
-            name=f"p{i}",
-            description=f"desc {i}",
+            name=f"p_{letter}",  # the new-word gate allows letters and underscores only, no digits
+            description=f"desc {letter}",
             decay_half_life_days=float(i),
             evidence_memory_ids=(),
             score=0.5,
             relational_context=None,
         )
-        for i in range(3)
+        for i, letter in enumerate("abc")
     ]
     with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=proposals):
         result = run_growth_tick(persona_dir, store, datetime.now(UTC))

@@ -8,9 +8,11 @@ safe, testable, and cheap in private/local development.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from brain import dev_constants
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.vocabulary import canonical_name
 from brain.growth.proposal import EmotionProposal
@@ -23,6 +25,7 @@ VOCABULARY_CRYSTALLIZER_STATUS = "implemented"
 _MIN_EVIDENCE_MEMORIES = 3
 _MIN_EMOTION_INTENSITY = 6.0
 _MAX_EVIDENCE_MEMORIES = 5
+_SCAN_LIMIT = 2000
 
 
 @dataclass
@@ -47,7 +50,7 @@ def crystallize_vocabulary(
     ``eng`` is the live emotion engine, whose faded values pick and score the
     two strongest emotions, or None for the stored values.
     """
-    clusters = _cluster_active_memories(store.list_active(), eng=eng)
+    clusters = _cluster_active_memories(store.list_recent_light(_SCAN_LIMIT), eng=eng)
     current_names = {canonical_name(name) for name in current_vocabulary_names}
 
     proposals: list[EmotionProposal] = []
@@ -70,7 +73,7 @@ def crystallize_vocabulary(
                     f"A recurring blend of {first} and {second}: moments where both "
                     "emotions are strongly present together rather than appearing alone."
                 ),
-                decay_half_life_days=45.0,
+                decay_half_life_days=_blend_half_life(first, second, eng),
                 evidence_memory_ids=evidence,
                 score=score,
                 relational_context="recurring emotional configuration in us memories",
@@ -79,6 +82,21 @@ def crystallize_vocabulary(
         break
 
     return proposals
+
+
+def _parent_half_life(name: str, eng: EmotionEngine | None) -> float:
+    parent = canonical_name(name)
+    if eng is not None:
+        return eng.half_life(parent)
+    return dev_constants.EMOTION_HALF_LIFE_DAYS.get(parent, dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS)
+
+
+def _blend_half_life(first: str, second: str, eng: EmotionEngine | None) -> float:
+    """A blend lasts as long as the mean of its two parents; a non-finite or non-positive result falls back to the default."""
+    mean = (_parent_half_life(first, eng) + _parent_half_life(second, eng)) / 2.0
+    if math.isfinite(mean) and mean > 0:
+        return mean
+    return dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS
 
 
 def _cluster_active_memories(

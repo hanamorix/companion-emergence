@@ -120,3 +120,22 @@ def test_crystallizer_treats_hyphen_and_case_variants_as_existing() -> None:
         assert result == []
     finally:
         store.close()
+
+
+def _half_life_of_blend(emotions: dict[str, float]) -> float:
+    store = MemoryStore(":memory:")
+    try:
+        for n in range(3):
+            store.create(_mem(f"blend moment {n}", dict(emotions)))
+        (proposal,) = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
+        return proposal.decay_half_life_days
+    finally:
+        store.close()
+
+
+def test_crystallized_blend_half_life_is_parent_mean() -> None:
+    assert _half_life_of_blend({"joy": 8, "grief": 7}) == (3.0 + 60.0) / 2
+
+
+def test_crystallized_blend_with_love_uses_its_dev_half_life() -> None:
+    assert _half_life_of_blend({"love": 8, "joy": 7}) == (730.0 + 3.0) / 2

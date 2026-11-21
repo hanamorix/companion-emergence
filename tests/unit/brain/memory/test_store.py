@@ -3317,3 +3317,27 @@ def test_existing_reranker_floor_calibration_migrates_in_score_scale_column(tmp_
         "a migrated-in raw-scale row must be detected as stale"
     )
     store.close()
+
+
+def test_list_recent_light_newest_first_with_limit() -> None:
+    """The bounded window: newest `created_at` first, at most `limit`, feelings readable, no embedding."""
+    from brain.emotion.engine_utils import memory_feelings
+
+    store = MemoryStore(":memory:")
+    try:
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        made = []
+        for n in range(3):
+            m = Memory.create_new(
+                content=f"m{n}", memory_type="conversation", domain="us", emotions={"joy": 5.0 + n}
+            )
+            m.created_at = base + timedelta(days=n)
+            store.create(m)
+            made.append(m)
+
+        got = store.list_recent_light(2)
+
+        assert [m.id for m in got] == [made[2].id, made[1].id]
+        assert memory_feelings(got[0], None, None, None).feelings == {"joy": 7.0}
+    finally:
+        store.close()

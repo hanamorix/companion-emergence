@@ -519,3 +519,21 @@ def test_repair_records_a_non_object_reply_and_keeps_placeholders(tmp_path: Path
     assert report.described == 0
     rows = [json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
     assert [r["site"] for r in rows] == ["vocab_repair"]
+
+
+def test_vocab_repair_search_does_not_bump(tmp_path: Path) -> None:
+    """Looking up excerpts for a name is bookkeeping, not recall: it must not raise recall_count."""
+    from brain.health.vocab_repair import _excerpts_for_name
+
+    store = _make_store(tmp_path)
+    try:
+        mem = Memory.create_new(
+            content="a joyful afternoon", memory_type="conversation", domain="us", emotions={"joy": 7.0}
+        )
+        store.create(mem)
+
+        assert _excerpts_for_name("joy", store) == ["a joyful afternoon"]
+
+        assert store.get(mem.id).recall_count == 0.0
+    finally:
+        store.close()

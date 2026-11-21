@@ -26,6 +26,7 @@ from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import MemoryStore
+from brain.utils.file_lock import file_lock
 from brain.utils.llm_output import extract_json_object
 
 if TYPE_CHECKING:
@@ -87,8 +88,8 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
     half-life bump). Placeholders keep being minted afterwards by
     reconstruct.py / persona_loader.py (already at 14.0), so Step 2 (describe)
     must be allowed to run again whenever any placeholder exists. The
-    supervisor only asks at startup, so the retry cadence is once per bridge
-    start, bounded by _DESCRIBE_BATCH per run.
+    supervisor asks at startup and then every 6 hours, bounded by
+    _DESCRIBE_BATCH per run.
     """
     data = read_json(
         persona_dir / "emotion_vocabulary.json",
@@ -274,15 +275,19 @@ def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
 
 
 def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
-    """Atomic JSON write with .bak rotation via json_io.write_json."""
-    write_json(vocab_path, data, backups=3)
+    """Atomic JSON write with .bak rotation via json_io.write_json, under the vocabulary file's cross-process lock.
+
+    The lock is held for the write only, never across the provider call that fills in `data`.
+    """
+    with file_lock(vocab_path):
+        write_json(vocab_path, data, backups=3)
 
 
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
     """Return up to _MAX_EXCERPTS_PER_NAME memory excerpts mentioning name."""
     try:
         # F3: cap the search so a high-frequency name doesn't pull all rows.
-        candidates = store.search_text(name, limit=10)
+        candidates = store.search_text(name, limit=10, bump=False)  # bookkeeping read: not a recall
         excerpts = []
         wanted = canonical_name(name)
         for mem in candidates:

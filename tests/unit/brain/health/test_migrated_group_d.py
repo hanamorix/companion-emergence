@@ -310,25 +310,18 @@ def test_group_d_kit_source_manifest_and_best_effort_writes(tmp_path: Path) -> N
     )
 
 
-def test_group_d_scheduler_appends_to_the_vocabulary_and_raises_on_a_corrupt_one(tmp_path: Path) -> None:
-    from brain.growth.proposal import EmotionProposal
-    from brain.growth.scheduler import _append_to_vocabulary
+def test_group_d_scheduler_registers_into_the_vocabulary_and_leaves_a_corrupt_one_alone(tmp_path: Path) -> None:
+    from brain.emotion.persona_loader import register_new_word
 
     vocab = tmp_path / "emotion_vocabulary.json"
-    prop = EmotionProposal(
-        name="wistful",
-        description="a soft longing",
-        decay_half_life_days=7.0,
-        evidence_memory_ids=(),
-        score=0.5,
-        relational_context=None,
-    )
-    _append_to_vocabulary(vocab, prop)  # missing file: starts a fresh vocabulary
-    _append_to_vocabulary(vocab, prop)
-    assert [e["name"] for e in json.loads(vocab.read_text())["emotions"]] == ["wistful", "wistful"]
+    assert register_new_word(vocab, "wistful", half_life_days=7.0, description="a soft longing") == "wistful"
+    # missing file: starts a fresh vocabulary; a second registration is a no-op (once, not twice)
+    assert register_new_word(vocab, "wistful", half_life_days=7.0, description="a soft longing") == "wistful"
+    assert [e["name"] for e in json.loads(vocab.read_text())["emotions"]] == ["wistful"]
     vocab.write_bytes(b"\xff{torn")
-    with pytest.raises(ValueError):  # RAISE: a corrupt vocabulary is never silently replaced
-        _append_to_vocabulary(vocab, prop)
+    # RAISE-style read: a corrupt vocabulary is never silently replaced; the word is refused
+    assert register_new_word(vocab, "yearning", half_life_days=7.0) is None
+    assert vocab.read_bytes() == b"\xff{torn"
 
 
 def test_group_d_interest_spawn_state_is_read_with_a_fresh_day_fallback_and_written_back(tmp_path: Path) -> None:
