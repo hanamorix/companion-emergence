@@ -438,7 +438,7 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
     """After vocabulary crystallization commits, emit a candidate.
 
     Phase 4.2 — the emit fires inside scheduler.run_growth_tick immediately
-    after _append_to_vocabulary + append_growth_event, so it lives at the
+    after register_new_word + append_growth_event, so it lives at the
     actual SoulStore-commit point for vocabulary changes.
     """
     from brain.initiate.emit import read_candidates

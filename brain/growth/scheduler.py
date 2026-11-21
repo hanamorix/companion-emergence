@@ -1,13 +1,21 @@
 """Growth scheduler — orchestrates crystallizers + applies decisions atomically.
 
 The scheduler is the primary mutator of `emotion_vocabulary.json` during a
-growth tick, but two other paths also write to that file:
-- `brain/emotion/persona_loader.py` — `_heal_referenced_but_unregistered`
-  registers extractor-minted emotions the scheduler never saw, at load time.
-- `brain/health/vocab_repair.py` — fills in missing descriptions for stub
-  entries and merges spelling-variant twins; runs at startup and every 6
-  hours, and is idempotent.
-All writers take the vocabulary file's cross-process lock.
+growth tick, but other paths also write to that file:
+- `brain/tools/impls/add_memory.py` — a new emotion word in a kept memory is
+  registered at once, through `persona_loader.register_new_word` (the same
+  call the scheduler uses for a crystallized word).
+- `brain/emotion/persona_loader.py` — at load time, `_heal_referenced_but_unregistered`
+  registers emotions memories use but the file lacks, and a missing or reset
+  file is rebuilt from memories.
+- `brain/health/vocab_repair.py` — merges spelling-variant twins, bumps legacy
+  stub half-lives and fills in placeholder descriptions; runs at startup and
+  every 6 hours.
+- `brain/health/walker.py` and `brain/health/json_io` — repair a corrupt file
+  (restore a `.bak` or reset to empty).
+Only `register_new_word` (so the scheduler and `add_memory`) and vocab repair
+take the file's cross-process lock (`file_lock(vocab_path)`) and re-read the
+file under it; the load-time heal and rebuild and the json_io/walker repairs do not.
 
 No engine writes `emotion_growth.log.jsonl` except through `run_growth_tick`.
 

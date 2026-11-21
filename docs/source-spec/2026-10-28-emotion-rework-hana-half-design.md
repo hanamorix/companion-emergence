@@ -11,10 +11,10 @@ Verified against `origin/main` @ `44af2447` on 2026-10-27/28. #321 is merged (20
 | A1 writer-side safety net | Merged: #671 (2026-11-10), closing #670. Its pins now pass on the live path: none still carries `_flipped_by`. |
 | A2a cleanup | Merged: #673 (2026-11-10), closing #672. |
 | A2b weather-shift anchor | Not started. It waits on #385 (ThinkerOfThoughts' draft, last updated 2026-11-06). |
-| A4 vocabulary | Partly built. Shipped: `add_memory` sets `last_accessed_at` and its auto-link search passes `bump=False` (#745, 2026-11-16); the MCP server loads the persona's vocabulary at start (#691, closing #689); the CLI's interest list loads it read-only (#713, closing #708). Not built: the new-word gate (`validate_new_name`), the lock in `register()`, `refresh_if_changed`, `add_memory`'s write-time registration and `emotion_half_lives`, the crystallizer's register-on-write, parent half-lives and `list_recent_emotions`, vocab repair's `bump=False`, and the one-time final heal. |
+| A4 vocabulary | Built on branch `hana/784-a4-vocabulary` (#784), awaiting merge (2026-11-21). Shipped earlier: `add_memory` sets `last_accessed_at` and its auto-link search passes `bump=False` (#745, 2026-11-16); the MCP server loads the persona's vocabulary at start (#691, closing #689); the CLI's interest list loads it read-only (#713, closing #708). The branch adds the new-word gate (`validate_new_name`), the registry lock, `register_new_word` (one locked read-modify-write of the file), the read-only `refresh_if_changed` that `EmotionEngine.read()` calls, `add_memory`'s write-time registration with `emotion_half_lives`, the crystallizer's register-on-write with parent-mean half-lives over a bounded window (`MemoryStore.list_recent_light`, in place of the planned `list_recent_emotions`), vocab repair's `bump=False` and locked re-read, and the one-time final heal behind `cadence/vocab_heal_final.json`, re-armed after any repair of the file. Plan: `2026-11-20-784-a4-vocabulary-plan.md`. |
 | B1 writers | Done: all seven PRs are merged. See the Status section of `2026-11-07-emotion-rework-b1-writers-design.md`. |
 
-So §1's "done" isn't met yet: A2b and most of A4 are open. §6 item 5 (the engine's read calling `refresh_if_changed`) waits on A4.
+So §1's "done" isn't met yet: A2b is open and A4 waits on #784's merge. §6 item 5 (the engine's read calling `refresh_if_changed`) is met on that branch.
 
 ## 1. Outcome
 
@@ -98,7 +98,7 @@ New file `tests/unit/brain/emotion/test_rework_writer_pins.py`, temp `KINDLED_HO
   - half-life = the mean of the parents' half-lives (a parent with none uses the default);
   - read the emotion column only, newest first, with a limit, through a new additive getter `MemoryStore.list_recent_emotions(limit)`.
 - **Vocab repair:** `_excerpts_for_name` passes `bump=False` (`health/vocab_repair.py:280`). Its stale "startup only" docstring is fixed.
-- **Final heal:** `load_persona_vocabulary_with_anomaly` runs `_heal_referenced_but_unregistered` only while the marker `cadence/vocab_heal_final.json` (resolved through `brain.paths.cadence_state_path`) is absent, then writes the marker. So the first store-carrying load after the upgrade heals once, and never again. The `store=` parameter and its 10 callers stay: it also drives the reconstruct-from-memories recovery for a missing or corrupt vocabulary file. *(Corrected while planning, 2026-10-28; the first draft routed this through vocab repair and dropped `store=`.)*
+- **Final heal:** `load_persona_vocabulary_with_anomaly` runs `_heal_referenced_but_unregistered` only while the marker `cadence/vocab_heal_final.json` (resolved through `brain.paths.cadence_state_path`) is absent, then writes the marker. So the first store-carrying load after the upgrade heals once, and never again unless the file is repaired: a load that finds an anomaly on it heals again, and the health walker (which repairs with no store) deletes the marker *(added 2026-11-21, #784 final review)*. The `store=` parameter and its 10 callers stay: it also drives the reconstruct-from-memories recovery for a missing or corrupt vocabulary file. *(Corrected while planning, 2026-10-28; the first draft routed this through vocab repair and dropped `store=`.)*
 - **Half-life source:** the per-persona vocabulary file keeps `decay_half_life_days` per word. The dev-file default and the baseline table are ThinkerOfThoughts' step 0 / dev-constants work; A4 reads the default through his lookup (stubbed until it lands).
 
 ### B1 — writers (after the step 0 stub; every change gated on the switch)
@@ -137,3 +137,7 @@ The design is in `2026-11-07-emotion-rework-b1-writers-design.md`. Names used el
 | `FeltTimeState.weather_baselines` field | Saved state may only change by adding fields | #388 |
 | `peer_emotion_window` table | Same, for `kindled_link.db` | #388 |
 | Junk words the old heal scan already registered | The gate only stops new ones | Bugs-ledger sweep at the end |
+| Dry-run loads still take a store, so a refused dry run can write the heal marker | They should load with `read_only=True` and no store (#784 final review) | Issue to be filed |
+| The load-time heal and rebuild, and the json_io/walker HEAL repairs, write the vocabulary file without `file_lock(vocab_path)` | Only `register_new_word` and vocab repair take the lock in #784 | Issue to be filed |
+| `vocab_repair._update_vocab`'s `or data` fallback uses the stale first-read snapshot when the locked re-read fails or returns `{}` | Out of #784's scope | Issue to be filed |
+| The growth scheduler logs `emotion_added` when the registry and the file have drifted (word in the file, not in this process's registry) | Out of #784's scope | Issue to be filed |

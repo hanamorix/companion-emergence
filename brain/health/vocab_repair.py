@@ -1,15 +1,21 @@
-"""One-time startup migration repairing already-stubbed emotion_vocabulary.json.
+"""Vocabulary repair for emotion_vocabulary.json: runs at startup and then every 6 hours.
 
-Step 1 (sync, provider-free): entries with the OLD bad decay_half_life_days==1.0
-AND the placeholder description → bumped to 14.0. Atomic write. Stops ongoing
-damage immediately.
+Step 0 (provider-free, every run): collapse spelling-variant twins into one
+canonical entry (#174).
 
-Step 2 (Haiku, budget-capped, fail-soft): for repaired stub names, derive
-one-line descriptions and replace the placeholder. Batch into ONE prompt per
-≤_DESCRIBE_BATCH names (name + up to 3 memory excerpts each). On any provider
-failure/parse failure: keep placeholders — Step 1 already landed.
+Step 1 (provider-free, one-time): entries with the OLD bad
+decay_half_life_days==1.0 AND the placeholder description → bumped to 14.0.
+Retired by the state file ``<persona_dir>/vocab_repair_state.json`` once it
+says ``complete``.
 
-State file ``<persona_dir>/vocab_repair_state.json`` → idempotent skip.
+Step 2 (Haiku, budget-capped, fail-soft): runs while placeholder descriptions
+exist (#173), deriving one-line descriptions in batches of ≤_DESCRIBE_BATCH
+names (name + up to 3 memory excerpts each). On any provider or parse failure
+the placeholders stay for a later run.
+
+Every write to the vocabulary file is a locked re-read (`_update_vocab`, under `file_lock(vocab_path)`),
+so a word another writer added since this run's first read is kept. The lock is
+never held across a provider call.
 """
 
 from __future__ import annotations

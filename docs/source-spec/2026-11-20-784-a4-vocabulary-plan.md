@@ -1,5 +1,7 @@
 # Emotion rework A4: vocabulary (#784) Implementation Plan
 
+**Status (2026-11-21):** all four tasks built on `hana/784-a4-vocabulary`, with the final whole-branch review's fixes; awaiting merge. Decision 7 was refined in review: without an engine, a parent's half-life is its registered vocabulary half-life when that is a positive number, before the dev table.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the rest of A4. New emotion words pass one gate and register the moment they're written. The registry is thread-safe. Every process picks up another process's new words. The old heal scan runs once more, then never again.
