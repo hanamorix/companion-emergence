@@ -521,6 +521,32 @@ def test_repair_records_a_non_object_reply_and_keeps_placeholders(tmp_path: Path
     assert [r["site"] for r in rows] == ["vocab_repair"]
 
 
+def test_vocab_repair_keeps_a_word_added_during_the_provider_call(tmp_path: Path) -> None:
+    """Another writer registers a word while the provider call is in flight; repair's rewrite must keep it."""
+    from brain.health.json_io import read_json, write_json
+    from brain.health.vocab_repair import run_vocab_repair
+
+    vocab_path = _write_vocab(tmp_path, [_stub_entry("body_grief")])
+
+    class _AddingProvider:
+        def generate(self, prompt: str, *, system: str | None = None, persona_dir: Path | None = None) -> str:
+            data = read_json(vocab_path, default=lambda: None, expect=dict)
+            data["emotions"].append(_proper_entry("wistful", "added mid-run"))
+            write_json(vocab_path, data)
+            return json.dumps({"body_grief": "grief held in the body"})
+
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=_AddingProvider())
+    finally:
+        store.close()
+
+    by_name = {e["name"]: e for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+    assert report.described == 1
+    assert by_name["body_grief"]["description"] == "grief held in the body"
+    assert by_name["wistful"]["description"] == "added mid-run"
+
+
 def test_vocab_repair_search_does_not_bump(tmp_path: Path) -> None:
     """Looking up excerpts for a name is bookkeeping, not recall: it must not raise recall_count."""
     from brain.health.vocab_repair import _excerpts_for_name

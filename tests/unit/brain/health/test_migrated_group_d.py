@@ -255,7 +255,7 @@ def test_group_d_writers_roundtrip_and_leave_no_temp(tmp_path: Path) -> None:
     from brain.attunement import budget
     from brain.chat import pass2_queue, reflection_gate
     from brain.forgetting import _persist_forgetting_state
-    from brain.health.vocab_repair import _atomic_write_vocab
+    from brain.health.vocab_repair import _update_vocab
     from brain.memory.embedding_backfill import _load_cursor, _save_cursor
     from brain.self_model import articulate, resolve
     from brain.soul import cadence as soul_cadence
@@ -267,7 +267,8 @@ def test_group_d_writers_roundtrip_and_leave_no_temp(tmp_path: Path) -> None:
     _persist_forgetting_state(pd, {"m1": 3})
     assert json.loads((pd / "forgetting_state.json").read_text()) == {"m1": 3}
     assert json.loads((pd / "forgetting_state.json.bak1").read_text()) == {"m1": 2}
-    _atomic_write_vocab(pd / "emotion_vocabulary.json", {"version": 1, "emotions": [{"name": "café"}]})
+    (pd / "emotion_vocabulary.json").write_text('{"version": 1, "emotions": []}', encoding="utf-8")
+    _update_vocab(pd / "emotion_vocabulary.json", lambda d: d["emotions"].append({"name": "café"}) or True)
     assert (pd / "emotion_vocabulary.json").read_bytes().isascii()
     budget._save(pd, {"date": "d", "count": 1})
     assert json.loads(budget._budget_path(pd).read_text()) == {"date": "d", "count": 1}

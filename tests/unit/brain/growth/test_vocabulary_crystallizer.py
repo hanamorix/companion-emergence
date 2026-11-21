@@ -133,6 +133,32 @@ def _half_life_of_blend(emotions: dict[str, float]) -> float:
         store.close()
 
 
+def test_crystallizer_scans_only_the_newest_window(monkeypatch) -> None:
+    """A cluster older than the scan window forms no proposal; one inside it does."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.growth.crystallizers import vocabulary as crystallizer
+
+    monkeypatch.setattr(crystallizer, "_SCAN_LIMIT", 3)
+    store = MemoryStore(":memory:")
+    try:
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        # Oldest: a grief/love cluster, then the three newest: a joy/awe cluster.
+        for n, emotions in enumerate([{"grief": 8, "love": 7}] * 3 + [{"joy": 8, "awe": 7}] * 3):
+            m = _mem(f"moment {n}", dict(emotions))
+            m.created_at = base + timedelta(days=n)
+            store.create(m)
+
+        result = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
+
+        assert [p.name for p in result] == ["awe_joy_blend"]  # canonical sorted spelling
+
+        monkeypatch.setattr(crystallizer, "_SCAN_LIMIT", 2)
+        assert crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None) == []
+    finally:
+        store.close()
+
+
 def test_crystallized_blend_half_life_is_parent_mean() -> None:
     assert _half_life_of_blend({"joy": 8, "grief": 7}) == (3.0 + 60.0) / 2
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from brain import prompt_strings
 from brain.emotion.vocabulary import canonical_name
-from brain.health.json_io import Recovery, read_json, write_json
+from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import MemoryStore
 from brain.utils.file_lock import file_lock
@@ -140,9 +141,14 @@ def run_vocab_repair(
     # (love_grief_blend / grief_love_blend, anticipatory-grief / Anticipatory_Grief)
     # into one canonical entry. A twin with a real description beats a placeholder.
     # ------------------------------------------------------------------
-    merged = _merge_variant_entries(data)
+    merged: list[tuple[str, str]] = []
+
+    def _merge(fresh: dict) -> bool:
+        merged[:] = _merge_variant_entries(fresh)
+        return bool(merged)
+
+    data = _update_vocab(vocab_path, _merge) or data
     if merged:
-        _atomic_write_vocab(vocab_path, data)
         logger.info("vocab_repair: merged %d variant twin(s): %s", len(merged), merged)
 
     if prior_complete and provider is None:
@@ -154,26 +160,34 @@ def run_vocab_repair(
             completed_at=existing.get("completed_at", ""),
         )
 
-    emotions = data.get("emotions", [])
-
     # ------------------------------------------------------------------
-    # Step 1: bump half-life for stub entries (sync, provider-free)
+    # Step 1: bump half-life for stub entries (sync, provider-free), on the freshly re-read file
     # ------------------------------------------------------------------
-    stub_names: list[str] = []
     repaired = 0
-    for entry in emotions:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("description") != PLACEHOLDER_DESCRIPTION:
-            continue
-        # Step 2 target: every placeholder, whatever its half-life (#173).
-        stub_names.append(entry["name"])
-        if not prior_complete and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS:
-            entry["decay_half_life_days"] = _REPAIRED_DECAY_DAYS
-            repaired += 1
 
+    def _bump(fresh: dict) -> bool:
+        nonlocal repaired
+        repaired = 0
+        if prior_complete:
+            return False
+        for entry in fresh.get("emotions", []):
+            if (
+                isinstance(entry, dict)
+                and entry.get("description") == PLACEHOLDER_DESCRIPTION
+                and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS
+            ):
+                entry["decay_half_life_days"] = _REPAIRED_DECAY_DAYS
+                repaired += 1
+        return repaired > 0
+
+    data = _update_vocab(vocab_path, _bump) or data
+    # Step 2 target: every placeholder, whatever its half-life (#173).
+    stub_names = [
+        entry["name"]
+        for entry in data.get("emotions", [])
+        if isinstance(entry, dict) and entry.get("description") == PLACEHOLDER_DESCRIPTION
+    ]
     if repaired > 0:
-        _atomic_write_vocab(vocab_path, data)
         logger.info(
             "vocab_repair: bumped half-life to %.1f for %d stub entries: %s",
             _REPAIRED_DECAY_DAYS,
@@ -192,7 +206,6 @@ def run_vocab_repair(
             described = _describe_stubs(
                 persona_dir=persona_dir,
                 vocab_path=vocab_path,
-                data=data,
                 stub_names=stub_names,
                 store=store,
                 provider=provider,
@@ -274,13 +287,26 @@ def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
     return dropped + renamed
 
 
-def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
-    """Atomic JSON write with .bak rotation via json_io.write_json, under the vocabulary file's cross-process lock.
+def _update_vocab(vocab_path: Path, mutate: Callable[[dict], bool]) -> dict | None:
+    """Locked read-modify-write of the vocabulary file; returns the fresh data, or None when it cannot be read.
 
-    The lock is held for the write only, never across the provider call that fills in `data`.
+    Under `file_lock(vocab_path)` the file is re-read, `mutate(fresh)` edits it in place and returns True when it changed
+    something, and only then is it written (`.bak` rotation via `write_json`). Re-reading means a word another writer
+    registered since this run's first read is kept. A missing or unreadable file is logged and left alone (None). The lock
+    is never held across a provider call.
     """
     with file_lock(vocab_path):
-        write_json(vocab_path, data, backups=3)
+        try:
+            fresh = read_json(vocab_path, default=lambda: None, recover=Recovery.RAISE, expect=dict)
+        except JsonFileError:
+            logger.warning("vocab_repair: %s is unreadable; leaving it untouched", vocab_path, exc_info=True)
+            return None
+        if fresh is None:
+            logger.warning("vocab_repair: %s is missing; nothing to update", vocab_path)
+            return None
+        if mutate(fresh):
+            write_json(vocab_path, fresh, backups=3)
+        return fresh
 
 
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
@@ -307,12 +333,11 @@ def _describe_stubs(
     *,
     persona_dir: Path,
     vocab_path: Path,
-    data: dict,
     stub_names: list[str],
     store: MemoryStore,
     provider: LLMProvider,
 ) -> int:
-    """Call provider in batches to derive descriptions; patch data in-place.
+    """Call provider in batches to derive descriptions; each batch is applied to a fresh re-read of the file under the lock.
 
     Returns the number of descriptions successfully replaced.
     """
@@ -382,21 +407,29 @@ def _describe_stubs(
                 )
                 continue
 
-            # Patch entries in data
+            # Patch the freshly re-read entries: only one that is still a placeholder takes a description.
             batch_set = set(batch)
             patched = 0
-            for entry in data.get("emotions", []):
-                if not isinstance(entry, dict):
-                    continue
-                n = entry.get("name")
-                if n not in batch_set:
-                    continue
-                desc = mapping.get(n)
-                if not desc or not isinstance(desc, str):
-                    continue
-                if entry.get("description") == PLACEHOLDER_DESCRIPTION:
-                    entry["description"] = desc.strip()
-                    patched += 1
+
+            def _patch(fresh: dict, batch_set: set[str] = batch_set, mapping: dict = mapping) -> bool:
+                nonlocal patched
+                patched = 0
+                for entry in fresh.get("emotions", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    n = entry.get("name")
+                    if n not in batch_set:
+                        continue
+                    desc = mapping.get(n)
+                    if not desc or not isinstance(desc, str):
+                        continue
+                    if entry.get("description") == PLACEHOLDER_DESCRIPTION:
+                        entry["description"] = desc.strip()
+                        patched += 1
+                return patched > 0
+
+            if _update_vocab(vocab_path, _patch) is None:
+                patched = 0
 
             if patched == 0:
                 logger.warning(
@@ -406,7 +439,6 @@ def _describe_stubs(
                     batch,
                 )
             if patched > 0:
-                _atomic_write_vocab(vocab_path, data)
                 described += patched
                 logger.info(
                     "vocab_repair: described %d stubs in batch starting at index %d",
