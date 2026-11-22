@@ -1980,7 +1980,7 @@ def _derive_intensity_drivers(
 
     Chat activity uses a fixed 6 turns/h baseline for the supervisor
     tick window. Phase 9.2 follow-up will tighten to a rolling baseline
-    once weather_shift per-channel baselines are proven stable.
+    once `weather_shift.update_baseline` per-channel baselines are proven stable.
     """
     # Best-effort body strain from exhaustion / energy.
     body_strain = 0.0
@@ -2683,7 +2683,7 @@ def _run_narrative_memory_pass(
     from brain.forgetting.salience import score as forgetting_salience
 
     # Map felt-time anchor type -> JSONL filename (matches
-    # brain.felt_time.anchors._SOURCES; v1 skips weather_shift per spec).
+    # brain.felt_time.anchors._SOURCES for dream / growth / soul).
     anchor_sources: dict[str, tuple[str, str]] = {
         "dream": ("dreams.log.jsonl", "summary"),
         "growth": ("growth.log.jsonl", "title"),
@@ -2737,7 +2737,7 @@ def _run_narrative_memory_pass(
 
         Iterates the underlying JSONL once per source so we can pluck
         per-entry seed_memory_ids + lived_age_hours alongside the matched
-        anchor. v1 covers dream / growth / soul; weather_shift skipped.
+        anchor. Covers dream / growth / soul.
         """
         felt_anchors = anchors_scan_since(persona_dir, last_pass_ts)
         # Index felt anchors by (filename, idx_1based) for fast match.

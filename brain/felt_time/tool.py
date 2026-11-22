@@ -58,7 +58,7 @@ def felt_time_now(*, persona_dir: Path) -> dict[str, Any]:
 def pressure_since(*, arguments: dict[str, Any], persona_dir: Path) -> dict[str, Any]:
     """Return the pressure vector since the latest anchor of a given type.
 
-    anchor_type ∈ {"dream", "growth", "soul", "weather_shift"}.
+    anchor_type ∈ ANCHOR_TYPES ("dream", "growth", "soul", "arc").
     """
     anchor_type = arguments.get("anchor_type")
     if anchor_type not in ANCHOR_TYPES:

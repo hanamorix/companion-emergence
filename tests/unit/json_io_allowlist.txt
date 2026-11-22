@@ -19,7 +19,6 @@ brain/felt_time/chat_log.py::write::1   # held: felt-time audit first (Roy 2026-
 brain/felt_time/state.py::legacy:iter_jsonl_skipping_corrupt::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::legacy:save_with_backup::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/felt_time/state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
-brain/felt_time/weather_shift.py::write::1   # held: felt-time audit first (Roy 2026-10-14)
 brain/growth/crystallizers/creative_dna.py::not-file-io::4   # not-file: model-reply
 brain/growth/crystallizers/reflex.py::not-file-io::2   # not-file: model-reply
 brain/health/attempt_heal.py::write::1   # held: save_with_backup is kept byte-identical for the held felt-time files

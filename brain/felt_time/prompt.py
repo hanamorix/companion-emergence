@@ -15,7 +15,6 @@ _ANCHOR_PRETTY_NAME = {
     "dream": "last dream",
     "growth": "last crystallization",
     "soul": "last soul moment",
-    "weather_shift": "last weather shift",
 }
 
 # Short names used in the pressure-line parenthetical.
@@ -23,7 +22,6 @@ _ANCHOR_SHORT_NAME = {
     "dream": "dream",
     "growth": "crystallization",
     "soul": "soul moment",
-    "weather_shift": "weather shift",
     "arc": "arc",
 }
 
@@ -143,7 +141,7 @@ def render_prompt_context(state: FeltTimeState, *, now: datetime | None = None) 
     # TODO(v0.0.15): replace hard-coded "baseline pace" with real qualitative tag once 30-day
     # lived_age/wall_clock_age ratio is in state (spec §5 deferred — coefficient tuning).
 
-    for a_type in ("dream", "growth", "soul", "weather_shift"):
+    for a_type in ("dream", "growth", "soul"):
         a = state.anchors.get(a_type)
         if a is None:
             continue

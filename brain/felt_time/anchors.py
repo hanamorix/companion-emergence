@@ -1,6 +1,7 @@
 """anchors.py — unified anchor stream from existing JSONL sources.
 
-Spec §2 anchors.py + §4 anchor types: dream, growth, soul, weather_shift.
+Spec §2 anchors.py + §4 anchor types: dream, growth, soul, arc. (The
+weather_shift anchor never fired and was removed in #785.)
 Pure functions; no side effects.
 
 Line numbers in source_ref are valid-entry-index (1-based count of dicts
@@ -36,7 +37,6 @@ _SOURCES: dict[str, _Source] = {
     "dream": _Source("dreams.log.jsonl", "summary"),
     "growth": _Source("growth.log.jsonl", "title"),
     "soul": _Source("soul.log.jsonl", "moment_label"),
-    "weather_shift": _Source("weather_shifts.log.jsonl", "label"),
     "arc": _Source(
         "arcs.log.jsonl",
         "title",
