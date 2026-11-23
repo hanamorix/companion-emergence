@@ -19,6 +19,11 @@ from tests.no_base_failure import marker_problems
 
 REPO = Path(__file__).resolve().parents[2]
 _REASON = "test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code"
+_LOG_REASON = (
+    "test-suite machinery (#790): the fix is in tests/conftest.py and tests/slow_budget.py, which the base check keeps at "
+    "the PR head; before the fix these ended in an INTERNALERROR (FileNotFoundError from the patched open, IsADirectoryError) "
+    "or an AttributeError (no log_min_s)"
+)
 
 # The number of `@pytest.mark.slow(...)` decorators under tests/. It can only go down: when a slow test is made fast and its
 # mark removed, lower this number to the count the failure message shows. Raising it is a one-number edit that shows in the
@@ -46,6 +51,7 @@ def test_the_budget_is_on_only_when_asked_and_can_be_shrunk() -> None:
     assert slow_budget.budget_s({"KINDLED_SLOW_BUDGET_S": "nonsense"}) == 2.0
 
 
+@pytest.mark.no_base_failure(reason=_LOG_REASON)
 def test_the_cpu_log_threshold_is_half_a_second_and_can_be_lowered() -> None:
     """#790: the planted log tests lower it, so they need not burn half a second of CPU each."""
     assert slow_budget.log_min_s({}) == 0.5
@@ -194,6 +200,7 @@ def _run_logged(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, log:
         return pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly", "-p", "no:tdd-guard")
 
 
+@pytest.mark.no_base_failure(reason=_LOG_REASON)
 def test_a_test_that_patches_open_cannot_break_the_cpu_log(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
     """#790: the log is written while the test's monkeypatch is still on. Through a patched `builtins.open` the write
     raised, pytest reported an INTERNALERROR and the rest of the CI shard never ran."""
@@ -205,6 +212,7 @@ def test_a_test_that_patches_open_cannot_break_the_cpu_log(pytester: pytest.Pyte
     assert json.loads(line)["id"].endswith("::test_patches_open_and_burns_cpu")
 
 
+@pytest.mark.no_base_failure(reason=_LOG_REASON)
 def test_a_cpu_log_that_cannot_be_written_warns_and_the_run_goes_on(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
     """#790: a measurement log may not end the session. A path that cannot be opened (here a folder) is a warning."""
     log = pytester.mkdir("not-a-file")
