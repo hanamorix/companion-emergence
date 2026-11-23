@@ -55,11 +55,24 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
 
     ``vocab`` is the "vocabulary loaded" signal: empty means it could not be loaded, and every name is then kept as the model
     spelled it (no lookup).
+
+    "Could not be loaded" covers two cases, and both give an empty set: `_load_vocab` caught an exception from
+    `vocabulary.list_all()` (it logs a warning), or the registry holds no emotions. In either case every name is kept, including
+    one that is empty or only separators (it is stored as spelled if its intensity passes the number filter).
+
+    The lookup (`vocabulary.get`) reads the live registry at the time of each call. ``vocab`` is only the set `_load_vocab` read
+    at the start of the tagger call, and it is what the prompt's name list is built from. Here it is only tested for empty or not
+    (to choose between the lookup and the cannot-load branch); it is not used to check whether a name is a member.
+
+    If `vocabulary.get` or `vocabulary.pool_by_canonical_name` raises, the exception is not caught here. It reaches the catch-all
+    in `_tagger`, which logs `emotion_tagger.tagger_error` (throttled) and returns `{}`.
     """
     usable: dict[str, float] = {}
     for name, intensity in raw.items():
         spelling = name
         if vocab:
+            # An empty spelling is skipped (`s and ...`) without a lookup. So an empty name is dropped, and a name of only separators
+            # is dropped unless the as-spelled lookup finds a registered name.
             spelling = next((s for s in (name, _SEPARATOR_RUN.sub("_", name).strip("_")) if s and vocabulary.get(s) is not None), "")
             if not spelling:
                 continue
@@ -70,6 +83,7 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
         if not math.isfinite(v) or v <= 0.0:
             continue
         # Two raw names can share one spelling here (they differ only in separators): keep the larger, as the pooling below does.
+        # Clamping to 10 before pooling gives the same value as clamping after: min(v, 10) never reverses the order of two values (it can only tie them).
         usable[spelling] = max(min(v, 10.0), usable.get(spelling, 0.0))
     return vocabulary.pool_by_canonical_name(usable) if vocab else usable
 
