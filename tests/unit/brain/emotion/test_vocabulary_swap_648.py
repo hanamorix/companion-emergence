@@ -32,7 +32,7 @@ def _entry(name: str, description: str, days: float | None, category: str = "per
 def _write_vocab(persona: Path, entries: list) -> bytes:
     persona.mkdir(parents=True, exist_ok=True)
     text = json.dumps({"version": 1, "emotions": entries}, indent=2) + "\n"
-    (persona / VOCAB).write_text(text, encoding="utf-8")
+    (persona / VOCAB).write_bytes(text.encode("utf-8"))
     return text.encode("utf-8")
 
 
@@ -289,7 +289,7 @@ def test_another_writer_changing_the_file_between_the_read_and_the_write_aborts_
     ids=["malformed", "empty", "emotions-not-a-list", "no-emotions", "not-an-object"],
 )
 def test_a_vocabulary_file_that_cannot_be_read_is_left_alone_with_no_marker_and_a_warning(persona, text, caplog):
-    (persona / VOCAB).write_text(text, encoding="utf-8")
+    (persona / VOCAB).write_bytes(text.encode("utf-8"))
     with caplog.at_level(logging.WARNING, logger="brain.emotion.vocabulary_swap"):
         run_vocabulary_swap_648(persona)  # does not raise
     assert (persona / VOCAB).read_text(encoding="utf-8") == text
@@ -301,7 +301,7 @@ def test_a_vocabulary_file_that_cannot_be_read_is_left_alone_with_no_marker_and_
 @pytest.mark.parametrize("text", ["{ not json", "", "null"], ids=["malformed", "empty", "null"])
 def test_a_marker_that_cannot_be_read_stops_the_swap_and_the_vocabulary_file_is_left_alone(persona, text, caplog):
     original = _write_vocab(persona, _mixed_entries())
-    (persona / MARKER).write_text(text, encoding="utf-8")
+    (persona / MARKER).write_bytes(text.encode("utf-8"))
     with caplog.at_level(logging.WARNING, logger="brain.emotion.vocabulary_swap"):
         run_vocabulary_swap_648(persona)
     assert (persona / VOCAB).read_bytes() == original
