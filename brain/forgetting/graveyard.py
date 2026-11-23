@@ -4,7 +4,7 @@ Mirrors brain/growth/arc_storage.py removed_arcs.jsonl exactly:
   - file_lock + os.fsync atomic append (Windows-safe)
   - brain.health.json_io read_jsonl/iter_jsonl for reads (a bad line is skipped with a warning)
 
-Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md §5
+Spec: the 2026-05-18 forgetting design (§5), never committed and lost (#797).
 """
 
 from __future__ import annotations

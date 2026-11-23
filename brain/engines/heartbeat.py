@@ -1,6 +1,6 @@
 """Heartbeat — event-driven orchestrator tick.
 
-See docs/superpowers/specs/2026-04-23-week-4-heartbeat-engine-design.md.
+Its design (the 2026-04-23 week-4 heartbeat design) was never committed and is lost (#797).
 Each `nell heartbeat` invocation applies Hebbian decay, maybe-dreams (rate-limited
 by config.dream_every_hours), and persists timing state. No daemon —
 the hosting application (or CI) calls this on app open/close.

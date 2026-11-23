@@ -62,6 +62,5 @@ def current_backend() -> ModuleType:
         return windows_service
     raise UnsupportedPlatformError(
         f"No service backend for sys.platform={platform!r}. "
-        "See docs/superpowers/plans/2026-05-08-launchd-supervisor-agent.md "
-        "for the supported targets."
+        "The supported targets are macOS (launchd), Linux (systemd --user) and Windows."
     )

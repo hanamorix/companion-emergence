@@ -7,7 +7,7 @@ as conversation turns; the energy formula needs the raw turn-level data.
 
 Fails-safe to 0 on any exception so chat composition never breaks.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.2.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §3.2.
 """
 
 from __future__ import annotations
