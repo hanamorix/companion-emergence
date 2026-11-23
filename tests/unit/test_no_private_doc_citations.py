@@ -10,6 +10,7 @@ The files allowed to name the folder are the ones that keep it private, and the 
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -61,4 +62,47 @@ def test_no_tracked_file_cites_a_document_in_the_private_folder(private_citation
     assert not private_citations, (
         f"{len(private_citations)} lines name a document under docs/superpowers/, which is never committed (#797). Point at "
         f"a committed doc (docs/source-spec/), an issue or the module instead: {private_citations}"
+    )
+
+
+# `docs/audits/` and `docs/guarded-change/` are gitignored and refused by the leak guard too, but some of their files were
+# committed anyway and are cited correctly. So a citation under them is checked against what git tracks, not refused.
+_PARTLY_PRIVATE = re.compile(rb"docs/(?:audits|guarded-change)/[A-Za-z0-9_./-]+")
+
+
+def _untracked_citations() -> list[str]:
+    """`file:line: path` for every path under the partly-private folders that names no tracked file or folder."""
+    listed = subprocess.run(["git", "ls-files", "-z"], cwd=REPO, check=True, capture_output=True).stdout
+    tracked = {raw.decode("utf-8") for raw in listed.split(b"\0") if raw}
+    found: list[str] = []
+    for rel in sorted(tracked):
+        path = REPO / rel
+        if path.suffix not in _TEXT_SUFFIXES:  # no exemptions: the leak guard's files cite these folders by name only
+            continue
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:  # deleted in the working tree, not yet committed
+            continue
+        if b"docs/audits/" not in data and b"docs/guarded-change/" not in data:
+            continue
+        for lineno, line in enumerate(data.splitlines(), start=1):
+            for match in _PARTLY_PRIVATE.finditer(line):
+                cited = match.group(0).decode("utf-8").rstrip(".")
+                folder = cited.rstrip("/") + "/"
+                if cited in tracked or any(name.startswith(folder) for name in tracked):
+                    continue
+                found.append(f"{rel}:{lineno}: {cited}")
+    return found
+
+
+@pytest.fixture(scope="module")
+def untracked_citations() -> list[str]:
+    """Scanned once in setup, for the same reason as `private_citations`."""
+    return _untracked_citations()
+
+
+def test_every_citation_under_audits_or_guarded_change_names_a_tracked_file(untracked_citations: list[str]) -> None:
+    assert not untracked_citations, (
+        f"{len(untracked_citations)} citations under docs/audits/ or docs/guarded-change/ name a file that is not "
+        f"committed (#797). Name the document and say it is private or lost instead: {untracked_citations}"
     )

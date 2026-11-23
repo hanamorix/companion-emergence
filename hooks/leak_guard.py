@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Leak guard — multi-arm scanner for the public repo boundary.
 
-The one lasting piece of the public-sync re-root design
-(docs/guarded-change/public-sync-reroot/2-plan.md step 7). Engine behind
+The one lasting piece of the public-sync re-root design (step 7 of its
+plan, a private guarded-change record that is not committed, #797). Engine behind
 hooks/pre-push (local, plaintext rules) and CI marker-scan (hashed
 fingerprints). Stdlib only: runs as a bare git hook, no venv.
 """

@@ -1,6 +1,6 @@
 # Organ Maturity Manifest
 
-> **Living doc.** The single answer to "is this organ stable, experimental, or dormant?" — without re-auditing. Update it **once per minor release, after feature merge, before tag** (the standing wire-back cadence, see bottom). Established by the v0.0.30 stable-base pass (spec: the 2026-06-03 v0.0.30 stable-base design, never committed and lost, #797; source audit `docs/audits/2026-06-02-hygiene-investigation.md`).
+> **Living doc.** The single answer to "is this organ stable, experimental, or dormant?" — without re-auditing. Update it **once per minor release, after feature merge, before tag** (the standing wire-back cadence, see bottom). Established by the v0.0.30 stable-base pass (spec: the 2026-06-03 v0.0.30 stable-base design, never committed and lost, #797; source audit: the 2026-06-02 hygiene investigation, also never committed and lost).
 
 An "organ" is a brain subsystem with a producer and a consumer. The **wire-back invariant** (CLAUDE.md Hard rules): an organ is *done* only when it both **reads from** and **feeds into** the emotional/memory loops. This manifest records where each organ sits on that line.
 
