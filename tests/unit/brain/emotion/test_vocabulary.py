@@ -222,6 +222,31 @@ def test_canonical_name_sorts_blend_parts() -> None:
     assert canonical_name("Love-Grief_blend") == "grief_love_blend"
 
 
+@pytest.mark.no_base_failure(reason="pins canonical_name's existing outputs (HC2 leaves it unchanged and does the separator step in the tagger), so it passes on the old code by design")
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("joy", "joy"),
+        ("Joy", "joy"),
+        (" Present-ness ", "present_ness"),
+        ("Anticipatory-Grief", "anticipatory_grief"),
+        ("love_grief_blend", "grief_love_blend"),
+        ("Love-Grief_blend", "grief_love_blend"),
+        ("grief_love_blend", "grief_love_blend"),
+        ("comfort_seeking", "comfort_seeking"),
+        ("grief love blend", "grief love blend"),
+        ("love/grief_blend", "love/grief_blend"),
+        ("love_grief__blend", "_grief_love_blend"),
+        ("blend", "blend"),
+        ("", ""),
+    ],
+)
+def test_canonical_name_outputs_are_pinned(name: str, expected: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(name) == expected
+
+
 def test_get_resolves_variant_spellings_to_registered_entry() -> None:
     from brain.emotion import vocabulary
 

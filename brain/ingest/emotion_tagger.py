@@ -16,10 +16,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings
+from brain.emotion import vocabulary
 from brain.utils.llm_output import find_json_object_block
 from brain.utils.log_throttle import warn_throttled
 
@@ -31,30 +33,45 @@ logger = logging.getLogger(__name__)
 
 EmotionTagger = Callable[["Memory"], dict[str, float]]
 
+_SEPARATOR_RUN = re.compile(r"[\W_]+")  # a run of characters that are not letters or digits
+
 
 def _load_vocab() -> frozenset[str]:
     try:
-        from brain.emotion.vocabulary import list_all
-        return frozenset(e.name for e in list_all())
+        return frozenset(e.name for e in vocabulary.list_all())
     except Exception:  # noqa: BLE001
         logger.warning("emotion_tagger: failed to load vocab; all names allowed")
         return frozenset()
 
 
 def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
-    """Keep only registered names with a finite intensity above 0; clamp to 10. NaN and inf are dropped."""
-    result: dict[str, float] = {}
+    """Keep only registered emotions with a finite intensity above 0; clamp to 10. NaN and inf are dropped.
+
+    A name matches the vocabulary in any spelling its lookup accepts (`vocabulary.get`: case, hyphens, the order of a blend's parts),
+    and also when each run of characters that are not letters or digits (space, slash, plus, several hyphens, one before "blend")
+    is read as a single underscore, with leading and trailing ones stripped. A name is looked up as the model spelled it first, so
+    a registered name that itself holds such a character still matches. The stored key is the registered name; spellings of one
+    emotion in one reply are pooled by `vocabulary.pool_by_canonical_name` (larger value kept).
+
+    ``vocab`` is the "vocabulary loaded" signal: empty means it could not be loaded, and every name is then kept as the model
+    spelled it (no lookup).
+    """
+    usable: dict[str, float] = {}
     for name, intensity in raw.items():
-        if vocab and name not in vocab:
-            continue
+        spelling = name
+        if vocab:
+            spelling = next((s for s in (name, _SEPARATOR_RUN.sub("_", name).strip("_")) if s and vocabulary.get(s) is not None), "")
+            if not spelling:
+                continue
         try:
             v = float(intensity)
         except (TypeError, ValueError):
             continue
         if not math.isfinite(v) or v <= 0.0:
             continue
-        result[name] = min(v, 10.0)
-    return result
+        # Two raw names can share one spelling here (they differ only in separators): keep the larger, as the pooling below does.
+        usable[spelling] = max(min(v, 10.0), usable.get(spelling, 0.0))
+    return vocabulary.pool_by_canonical_name(usable) if vocab else usable
 
 
 # Text externalized to prompt_strings.toml [ingest.emotion_tagger] (issue #129 stage 2a).
