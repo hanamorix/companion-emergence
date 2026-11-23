@@ -1,7 +1,7 @@
 # Body state — design
 
-**Status: rebuilt on 2026-11-23 from the code on `main` at `58a05251` (#797).** The original spec of 2026-04-29 sat in the
-gitignored `docs/superpowers/specs/`, so it was never committed and is lost. This document describes what the code does, not
+**Status: rebuilt on 2026-11-23 from the code on `main` at `58a05251` (#797).** The original spec of 2026-04-29 sat in a private,
+gitignored specs folder, so it was never committed and is lost. This document describes what the code does, not
 what the original said. Its section numbers are the ones the code already cites (§2.1, §3.1, §3.2, §3.3, §4, §7, §7.3), and
 the "inviolate properties" keep the numbers the code cites (#4, #5, #8). Where the original's intent can't be recovered, this
 says so instead of guessing. When the code and this document disagree, the code is right, and this document should be fixed.

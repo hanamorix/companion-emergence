@@ -1,6 +1,6 @@
 """#797: every citation of the body-state spec names a file that is in the repo.
 
-The spec was cited from nine files under a gitignored folder (`docs/superpowers/`), so it was never committed and was lost.
+The spec was cited from nine files under a private, gitignored folder, so it was never committed and was lost.
 A citation has to name a tracked file, and every section number the code cites has to be a heading in that file.
 """
 
