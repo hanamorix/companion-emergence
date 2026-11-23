@@ -224,29 +224,12 @@ def test_canonical_name_sorts_blend_parts() -> None:
 
 @pytest.mark.parametrize(
     "spelling",
-    ["love_grief__blend", "love__grief_blend", "_love_grief_blend", "Love__Grief_Blend", "-love-grief--blend"],
-)
-def test_two_part_blend_with_a_doubled_or_leading_separator_has_no_stray_underscore(spelling: str) -> None:
-    from brain.emotion.vocabulary import canonical_name
-
-    assert canonical_name(spelling) == "grief_love_blend"
-
-
-@pytest.mark.parametrize(
-    "spelling",
     ["c__b_a_blend", "_c_b__a_blend", "c_b_a__blend", "a_c__b_blend", "__a_b_c__blend"],
 )
 def test_three_part_blend_with_doubled_leading_or_trailing_separators_sorts_its_real_parts(spelling: str) -> None:
     from brain.emotion.vocabulary import canonical_name
 
     assert canonical_name(spelling) == "a_b_c_blend"
-
-
-def test_a_blend_with_no_real_parts_keeps_one_underscore_before_blend() -> None:
-    from brain.emotion.vocabulary import canonical_name
-
-    assert canonical_name("_blend") == "_blend"
-    assert canonical_name("__blend") == "_blend"
 
 
 def test_get_finds_a_registered_blend_by_a_doubled_separator_spelling() -> None:
@@ -276,7 +259,25 @@ def test_pool_by_canonical_name_pools_a_doubled_separator_spelling_with_its_twin
     assert pool_by_canonical_name(values) == {"grief_love_blend": 6.0, "gold_iron_blend": 4.0}
 
 
-@pytest.mark.no_base_failure(reason="every row but love_grief__blend pins canonical_name's existing outputs, which the fix leaves unchanged, so those rows pass on the old code by design; the love_grief__blend row is covered by test_two_part_blend_with_a_doubled_or_leading_separator_has_no_stray_underscore, which fails on base")
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("love_grief__blend", "grief_love_blend"),
+        ("love__grief_blend", "grief_love_blend"),
+        ("_love_grief_blend", "grief_love_blend"),
+        ("Love__Grief_Blend", "grief_love_blend"),
+        ("-love-grief--blend", "grief_love_blend"),
+        # no parts left once the empty ones are dropped: one underscore before _blend (was __blend)
+        ("__blend", "_blend"),
+    ],
+)
+def test_canonical_name_changed_outputs_are_pinned(name: str, expected: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(name) == expected
+
+
+@pytest.mark.no_base_failure(reason="pins canonical_name's outputs for names without an empty blend part, which the #800 fix leaves unchanged, so every row passes on the old code by design; the rows the fix changes are in test_canonical_name_changed_outputs_are_pinned")
 @pytest.mark.parametrize(
     "name, expected",
     [
@@ -290,7 +291,7 @@ def test_pool_by_canonical_name_pools_a_doubled_separator_spelling_with_its_twin
         ("comfort_seeking", "comfort_seeking"),
         ("grief love blend", "grief love blend"),
         ("love/grief_blend", "love/grief_blend"),
-        ("love_grief__blend", "grief_love_blend"),
+        ("_blend", "_blend"),
         ("blend", "blend"),
         ("", ""),
     ],

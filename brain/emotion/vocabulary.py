@@ -166,7 +166,8 @@ def canonical_name(name: str) -> str:
     ``love_grief_blend`` and ``grief_love_blend`` are the same channel. Empty
     parts (a doubled, leading or trailing underscore before ``_blend``) are
     dropped first, so ``love_grief__blend`` and ``_love_grief_blend`` give
-    ``grief_love_blend`` too (#800). Other names keep their underscores as spelled.
+    ``grief_love_blend`` too (#800). A name with no parts left (``_blend``,
+    ``__blend``) gives ``_blend``. Other names keep their underscores as spelled.
     """
     key = name.strip().lower().replace("-", "_")
     if key.endswith(_BLEND_SUFFIX):
