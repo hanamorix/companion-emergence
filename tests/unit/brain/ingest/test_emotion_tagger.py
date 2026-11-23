@@ -45,7 +45,7 @@ def store(tmp_path):
 
 
 def test_the_tagger_sends_the_backfills_exact_system_prompt_and_prompt(monkeypatch):
-    # A literal copy of the strings as they stood in prompt_strings.toml [ingest.emotion_backfill] before the move.
+    # A literal copy of the strings as they stood in prompt_strings.toml [ingest.emotion_backfill] before the move (the section is now [ingest.emotion_tagger]).
     system = (
         "You are an emotion-tagging assistant. Return a JSON object mapping emotion names to intensities (0–10). "
         "Omit emotions with intensity 0. Return ONLY the JSON object, no prose, no markdown fences."

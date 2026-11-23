@@ -57,10 +57,10 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
     return result
 
 
-# Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2a).
-_TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_backfill.tagger_system_prompt")
-# Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2b).
-_TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backfill.tagger_prompt_segments")
+# Text externalized to prompt_strings.toml [ingest.emotion_tagger] (issue #129 stage 2a).
+_TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_tagger.tagger_system_prompt")
+# Text externalized to prompt_strings.toml [ingest.emotion_tagger] (issue #129 stage 2b).
+_TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_tagger.tagger_prompt_segments")
 
 
 def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
