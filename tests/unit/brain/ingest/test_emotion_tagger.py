@@ -101,6 +101,72 @@ def test_a_provider_that_fails_on_every_call_warns_once_not_on_every_write(caplo
     assert levels == [logging.WARNING, logging.DEBUG, logging.DEBUG]
 
 
+# --- HC3: a reply with no usable object says which kind of failure it was ------------------------------------------------
+
+
+def _reply_records(caplog, reply, memory=None):
+    """Run one tagging call on ``reply`` and return the records of the two no-object lines."""
+    log_throttle._last.clear()
+    memory = memory or _memory()
+    with caplog.at_level(logging.DEBUG, logger="brain.ingest.emotion_tagger"):
+        assert make_emotion_tagger(_Provider(reply))(memory) == {}
+    return memory, [r for r in caplog.records if "empty reply" in r.getMessage() or "no JSON object" in r.getMessage()]
+
+
+@pytest.mark.parametrize("reply", ["", "  \n\t "], ids=["empty", "whitespace-only"])
+def test_an_empty_reply_logs_the_empty_reply_line(caplog, reply):
+    memory, records = _reply_records(caplog, reply)
+    assert [(r.levelno, r.getMessage(), bool(r.exc_info)) for r in records] == [
+        (logging.WARNING, f"emotion_tagger: empty reply for memory {memory.id}", False)
+    ]
+
+
+@pytest.mark.parametrize("reply", ["I cannot tag this.", "{not json", "[1, 2]", '{"joy": 4'], ids=["prose", "unclosed", "array", "truncated"])
+def test_a_reply_with_no_json_object_logs_the_no_object_line_with_its_length_and_none_of_its_text(caplog, reply):
+    memory, records = _reply_records(caplog, reply)
+    assert [(r.levelno, r.getMessage(), bool(r.exc_info)) for r in records] == [
+        (logging.WARNING, f"emotion_tagger: reply held no JSON object for memory {memory.id} ({len(reply)} characters)", False)
+    ]
+    assert reply not in records[0].getMessage()
+
+
+def test_the_two_kinds_have_their_own_throttle_keys(caplog):
+    log_throttle._last.clear()
+    with caplog.at_level(logging.DEBUG, logger="brain.ingest.emotion_tagger"):
+        for reply in ("", "prose", "", "prose"):
+            assert make_emotion_tagger(_Provider(reply))(_memory()) == {}
+    levels = [(r.getMessage().split(" for memory")[0], r.levelno) for r in caplog.records]
+    assert levels == [
+        ("emotion_tagger: empty reply", logging.WARNING),
+        ("emotion_tagger: reply held no JSON object", logging.WARNING),
+        ("emotion_tagger: empty reply", logging.DEBUG),
+        ("emotion_tagger: reply held no JSON object", logging.DEBUG),
+    ]
+
+
+@pytest.mark.no_base_failure(reason="pins that a reply with an object logs no failure line; base logs nothing there either. Bites a mutant that logs on every reply (checked by hand)")
+@pytest.mark.parametrize(
+    "reply",
+    ["{}", '{"joy": 4}', '```json\n{"joy": 4}\n```', 'Feelings: {"joy": 4} done', '{"joy": 0}'],
+    ids=["empty-object", "bare", "fenced", "prose-around", "zero-intensity"],
+)
+def test_a_reply_that_holds_an_object_logs_no_failure_line(caplog, reply):
+    log_throttle._last.clear()
+    with caplog.at_level(logging.DEBUG, logger="brain.ingest.emotion_tagger"):
+        make_emotion_tagger(_Provider(reply))(_memory())
+    assert [r for r in caplog.records if "empty reply" in r.getMessage() or "no JSON object" in r.getMessage()] == []
+
+
+@pytest.mark.no_base_failure(reason="pins that a failed call or an invalid object keeps the one tagger error line and gets no new line; base does the same. Bites a mutant that logs on every reply (checked by hand)")
+def test_a_balanced_invalid_object_and_a_provider_failure_log_only_the_tagger_error_line(caplog):
+    for reply in ("{not json}", RuntimeError("connection reset"), None):
+        log_throttle._last.clear()
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="brain.ingest.emotion_tagger"):
+            assert make_emotion_tagger(_Provider(reply))(_memory()) == {}
+        assert [r.getMessage().split(":")[1].strip() for r in caplog.records] == ["tagger error"]
+
+
 def test_normalize_drops_names_that_are_not_registered_and_values_that_are_not_finite_positive_numbers():
     vocab = _loaded()  # the registry decides what is registered; `vocab` only says it loaded
     raw = {"joy": float("nan"), "awe": float("inf"), "x": 3, "ok": "5"}

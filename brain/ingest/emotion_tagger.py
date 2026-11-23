@@ -85,6 +85,10 @@ def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
 
     ``provider`` is the background-classifier tier provider the consolidation gate already holds. The reply is read with the
     shared `find_json_object_block` (a fenced reply or a reply with prose around the object is read), then `_normalize`.
+
+    A reply with no JSON object tags nothing and logs one throttled warning naming the kind: an empty (or whitespace-only) reply, or
+    a reply that held no object (its length is logged, never its text). Each kind has its own throttle key. A valid `{}` logs nothing.
+    A failed call (an exception from ``provider.generate``, or an invalid object) logs the `tagger error` line instead.
     """
 
     def _tagger(memory: Memory) -> dict[str, float]:
@@ -96,6 +100,19 @@ def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
             raw_text = provider.generate(prompt, system=_TAGGER_SYSTEM_PROMPT)
             block = find_json_object_block(raw_text)
             if block is None:
+                # No object at all: a reply that is empty or only prose points at something else going wrong (a model that
+                # answered nothing or only prose; a failed call raises instead), so it is logged, one throttle key per kind. A valid `{}` is not here: it is the model's answer.
+                if not raw_text.strip():
+                    warn_throttled(logger, "emotion_tagger.empty_reply", "emotion_tagger: empty reply for memory %s", memory.id, exc_info=False)
+                else:
+                    warn_throttled(
+                        logger,
+                        "emotion_tagger.no_json_object",
+                        "emotion_tagger: reply held no JSON object for memory %s (%d characters)",
+                        memory.id,
+                        len(raw_text),
+                        exc_info=False,
+                    )
                 return {}
             return _normalize(json.loads(block), vocab)
         except Exception as exc:  # noqa: BLE001
