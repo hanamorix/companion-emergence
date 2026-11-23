@@ -22,6 +22,9 @@ workflows that run pytest (release gate, mutation testing, the weekly timing rep
 it, and a developer sets the variable to try the budget locally.
 `KINDLED_SLOW_BUDGET_S` overrides the 2.0 s (the planted tests use a small one). `KINDLED_SLOW_BUDGET_LOG=<file>` appends
 one JSON line per test that used more than 0.5 s of CPU (node id, CPU seconds, wall seconds): the data the marks come from.
+`KINDLED_SLOW_BUDGET_LOG_MIN_S` overrides that 0.5 s (the planted log tests use a small one). The line is written with the
+`open` the session started with, so a test that patches `builtins.open` cannot break it, and a log that cannot be written
+is a warning, never an end to the session (#790).
 
 What is not budgeted: the setup and teardown phases (a fixture that does the heavy work, such as loading a model, is
 not a slow test); a test that failed, skipped or xfailed (its own result stands); a test that carries a marker saying it
@@ -34,6 +37,7 @@ import os
 from collections.abc import Mapping
 
 BUDGET_S = 2.0
+LOG_MIN_S = 0.5
 EXEMPT_MARKERS = ("requires_network", "requires_models", "requires_claude_cli", "live")
 
 
@@ -47,6 +51,15 @@ def budget_s(environ: Mapping[str, str] | None = None) -> float:
         return float(raw) if raw else BUDGET_S
     except ValueError:
         return BUDGET_S
+
+
+def log_min_s(environ: Mapping[str, str] | None = None) -> float:
+    """The CPU seconds over which a call phase is logged: `KINDLED_SLOW_BUDGET_LOG_MIN_S`, else 0.5 (the planted tests lower it)."""
+    raw = (os.environ if environ is None else environ).get("KINDLED_SLOW_BUDGET_LOG_MIN_S")
+    try:
+        return float(raw) if raw else LOG_MIN_S
+    except ValueError:
+        return LOG_MIN_S
 
 
 def over_budget(cpu_seconds: float, budget: float, *, has_slow_mark: bool, exempt: bool) -> str | None:

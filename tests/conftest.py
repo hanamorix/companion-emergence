@@ -67,6 +67,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 
 _CALL_CPU = pytest.StashKey[float]()
+# the builtin `open` as it is when the session starts, for the slow-test log (#790)
+_REAL_OPEN = open
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -89,11 +91,17 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Itera
         return
     cpu = item.stash.get(_CALL_CPU, 0.0)
     log = os.environ.get("KINDLED_SLOW_BUDGET_LOG")
-    if log and cpu > 0.5:  # collected on every OS, whether or not the budget is enforced there
+    if log and cpu > slow_budget.log_min_s():  # collected on every OS, whether or not the budget is enforced there
         import json
+        import warnings
 
-        with open(log, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"id": item.nodeid, "cpu": round(cpu, 3), "wall": round(call.duration, 3)}) + "\n")
+        # the test's monkeypatch is still on here, and some tests replace `builtins.open` with a fake that raises (#790)
+        line = json.dumps({"id": item.nodeid, "cpu": round(cpu, 3), "wall": round(call.duration, 3)}) + "\n"
+        try:
+            with _REAL_OPEN(log, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError as exc:  # a measurement log may not end the session
+            warnings.warn(f"the slow-test CPU log {log} could not be written ({exc}), so {item.nodeid} is missing from it", stacklevel=1)
     if not slow_budget.enabled():
         return
     report = outcome.get_result()
