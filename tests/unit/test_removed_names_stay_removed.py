@@ -817,6 +817,12 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
     ),
     Removed(
+        names=("ingest.emotion_backfill",),
+        why="the tagger's prompt-string section is `[ingest.emotion_tagger]`; the old section name belonged to the removed backfill job",
+        ref="#747 (draft PR #656)",
+        scope=("brain/prompt_strings.toml", "brain/ingest/emotion_tagger.py"),
+    ),
+    Removed(
         names=("brain/ingest/emotion_backfill.py",),
         why="the emotion backfill module was deleted with the job (#747)",
         ref="#747 (draft PR #656)",
