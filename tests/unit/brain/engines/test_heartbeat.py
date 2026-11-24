@@ -1625,6 +1625,10 @@ def test_heartbeat_run_tick_calls_growth_after_research(tmp_path: Path) -> None:
     """Growth tick fires when due; heartbeat reports the count."""
     from unittest.mock import patch
 
+    from brain.emotion import vocabulary
+
+    vocabulary.set_bridge_owner(True)  # the heartbeat of the bridge, the owner: only it adds a name (tests/conftest.py restores the flag)
+
     from brain.engines.heartbeat import HeartbeatEngine
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
@@ -2077,6 +2081,9 @@ def test_heartbeat_growth_anomaly_surfaces_in_audit_log(tmp_path: Path) -> None:
 
     Followup F3 from the brain-health module.
     """
+    from brain.emotion import vocabulary
+
+    vocabulary.set_bridge_owner(True)  # the heartbeat of the bridge, the owner: only it heals her file (tests/conftest.py restores the flag)
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
 

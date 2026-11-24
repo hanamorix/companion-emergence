@@ -20,6 +20,13 @@ from brain.growth.scheduler import (
 from brain.memory.store import MemoryStore
 
 
+@pytest.fixture(autouse=True)
+def _the_tick_runs_in_the_bridge() -> None:
+    """The growth tick runs in the bridge, which owns her vocabulary (the conftest fixture puts the flag back); the cases of
+    another process are the tests named `..._another_process_...` below, which clear it."""
+    vocabulary.set_bridge_owner(True)
+
+
 def _seed_vocab(persona_dir: Path, names: list[str] | None = None) -> None:
     """Seed an emotion_vocabulary.json with the given names as core emotions."""
     if names is None:
@@ -100,6 +107,65 @@ def test_run_growth_tick_applies_proposal_atomically(persona_dir: Path, store: M
     assert parsed["type"] == "emotion_added"
     assert parsed["name"] == "lingering"
     assert parsed["relational_context"] == "recurred during Hana's tender messages"
+
+
+def _proposal(name: str = "lingering") -> EmotionProposal:
+    return EmotionProposal(
+        name=name, description="the slow trail of warmth", decay_half_life_days=7.0,
+        evidence_memory_ids=("mem_a", "mem_b"), score=0.78, relational_context=None,
+    )
+
+
+def test_run_growth_tick_in_another_process_with_no_bridge_adds_nothing_and_leaves_her_file(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """Only the bridge writes her vocabulary: a tick in a `nell` command with no bridge adds no name, logs none, and leaves the file."""
+    _seed_vocab(persona_dir, names=["love", "joy"])
+    path = persona_dir / "emotion_vocabulary.json"
+    before = path.read_bytes()
+    vocabulary.set_bridge_owner(False)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_proposal("lingering"), _proposal("another_one")]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert path.read_bytes() == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+    assert vocabulary.get("lingering") is None
+
+
+def test_run_growth_tick_in_another_process_does_not_heal_a_damaged_file(persona_dir: Path, store: MemoryStore) -> None:
+    """The health read of the names heals (quarantines and resets) a damaged file, which only the bridge may do."""
+    path = persona_dir / "emotion_vocabulary.json"
+    path.write_text("{corrupt{{", encoding="utf-8")
+    vocabulary.set_bridge_owner(False)
+    anomalies: list = []
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[]):
+        run_growth_tick(persona_dir, store, datetime.now(UTC), anomalies_collector=anomalies)
+    assert path.read_text(encoding="utf-8") == "{corrupt{{"
+    assert anomalies == []
+    assert list(persona_dir.glob("emotion_vocabulary.json.corrupt-*")) == []
+
+
+def test_run_growth_tick_in_another_process_adds_through_the_bridge(
+    persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.emotion import vocabulary_access
+
+    asked: list[tuple[str, dict]] = []
+
+    def bridge(persona_dir_: Path, route: str, body: dict, *, timeout: float) -> dict:
+        asked.append((route, body))
+        return {"results": [{"name": "lingering", "spelling": "lingering", "outcome": "used", "changed": True}]}
+
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", bridge)
+    vocabulary.set_bridge_owner(False)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_proposal("lingering")]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 1
+    assert [route for route, _body in asked if route == "/vocabulary/add"] == ["/vocabulary/add"]
+    add_body = next(body for route, body in asked if route == "/vocabulary/add")
+    assert add_body["items"][0]["name"] == "lingering" and add_body["items"][0]["fields"]["decay_half_life_days"] == 7.0
+    assert not (persona_dir / "emotion_vocabulary.json").exists()  # this process wrote nothing
+    assert (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
 def test_run_growth_tick_skips_proposal_with_existing_name(
@@ -344,12 +410,12 @@ def test_run_growth_tick_handles_multiple_proposals(persona_dir: Path, store: Me
         EmotionProposal(
             name=f"p{i}",
             description=f"desc {i}",
-            decay_half_life_days=float(i),
+            decay_half_life_days=float(i),  # from 1: a half-life of 0 is not a number of days the engine can use (the add refuses it)
             evidence_memory_ids=(),
             score=0.5,
             relational_context=None,
         )
-        for i in range(3)
+        for i in range(1, 4)
     ]
     with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=proposals):
         result = run_growth_tick(persona_dir, store, datetime.now(UTC))

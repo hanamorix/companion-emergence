@@ -168,6 +168,8 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
         load_persona_vocabulary(path, store=store)
         if path.exists():
             merged = vocabulary_file.merge(path)
+            if merged.cannot_write:
+                logger.warning("startup: the twin merge of %s could not be written (the writer logged why); the twins stay until the next start", path.name)
             if merged.pairs:
                 logger.warning("startup: merged %d twin entr(ies) in %s under their first spelling", len(merged.pairs), path.name)
     except Exception:
@@ -1136,11 +1138,7 @@ class VocabularyLookupReq(BaseModel):
 
 def _vocabulary_add_blocking(persona_dir: Path, req: VocabularyAddReq) -> dict:
     """Run the batch through the shared writer (the bridge is the owner); blocks on the vocabulary file's lock."""
-    items = [
-        (item.name, {k: v for k, v in (item.fields or {}).items() if k in vocabulary_access.ENTRY_FIELDS})
-        for item in req.items
-    ]
-    results = vocabulary_file.add(vocabulary_file.vocabulary_path(persona_dir), items)
+    results = vocabulary_access.add_local(persona_dir, [(item.name, item.fields) for item in req.items])
     return {"results": [vocabulary_access.result_to_wire(r) for r in results]}
 
 

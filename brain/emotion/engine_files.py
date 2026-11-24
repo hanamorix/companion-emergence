@@ -57,7 +57,6 @@ import atexit
 import logging
 import math
 import reprlib
-import threading
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime, timedelta
@@ -103,14 +102,12 @@ class VocabularyHalfLives:
 
     In the bridge the lookup is the registry; any other process asks the bridge (and, with no bridge, reads her file read-only for
     the run). A framework (core, complex, body) name is answered by the caller's built-in table, never from here, so it costs no
-    call. In the bridge it reads the registry on every call. Elsewhere an entry found is remembered for the life of this object, so a
-    process makes one call per name; a name not found is asked again (a name the bridge added since is seen without a restart).
+    call. Nothing is kept between calls: a process holds no copy of her vocabulary (spec section 5), so a change made in the bridge
+    is seen by the next call.
     """
 
     def __init__(self, persona_dir: Path) -> None:
         self._persona_dir = Path(persona_dir)
-        self._lock = threading.Lock()
-        self._found: dict[str, float | None] = {}  # tidied name -> numeric half-life, or None for a null entry
 
     def get(self, name: str) -> float | None:
         """Her vocabulary's numeric half-life for the canonical `name`, or None.
@@ -120,18 +117,8 @@ class VocabularyHalfLives:
         """
         if vocabulary.is_baseline(name):
             return None
-        if vocabulary.is_bridge_owner():
-            found = vocabulary_access.lookup_local([name])[name]  # the registry itself: always current, nothing to remember
-            return None if found is None else self._usable(name, found.half_life_days)
-        with self._lock:
-            if name in self._found:
-                return self._found[name]
-            found = vocabulary_access.lookup(self._persona_dir, [name]).get(name)
-            if found is None:
-                return None
-            days = self._usable(name, found.half_life_days)
-            self._found[name] = days
-            return days
+        found = vocabulary_access.lookup(self._persona_dir, [name]).get(name)
+        return None if found is None else self._usable(name, found.half_life_days)
 
     @staticmethod
     def _usable(name: str, days: float | None) -> float | None:

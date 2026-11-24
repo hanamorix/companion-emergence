@@ -1,8 +1,9 @@
 """Growth scheduler — orchestrates crystallizers + applies decisions atomically.
 
-The scheduler adds names to `emotion_vocabulary.json` during a growth tick, through
-`brain/emotion/vocabulary_file.py`, the one writer of that file (the persona loader's
-memory heal and the vocabulary repair use it too).
+The scheduler adds names to her vocabulary during a growth tick, through
+`brain/emotion/vocabulary_access.py` `check`: in the bridge that is `brain/emotion/vocabulary_file.py`, the one writer of
+`emotion_vocabulary.json` (the persona loader's memory heal and the vocabulary repair use it too); any other process asks
+the bridge to add the name, and with no bridge adds nothing.
 
 No engine writes `emotion_growth.log.jsonl` except through `run_growth_tick`.
 
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from brain.emotion import vocabulary_access, vocabulary_file
+from brain.emotion import vocabulary, vocabulary_access, vocabulary_file
 from brain.emotion.vocabulary import gate_name
 from brain.growth.crystallizers.vocabulary import (
     VOCABULARY_CRYSTALLIZER_STATUS,
@@ -77,12 +78,13 @@ def run_growth_tick(
          one used from here on.
       2. Skip silently if name already in current vocabulary (re-proposing
          is normal; not a rejection).
-      3. Else: add it to {persona_dir}/emotion_vocabulary.json through
-         `vocabulary_file.add` and, when that wrote it, append a GrowthLogEvent to
-         {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`). A name the
-         file could not take (`cannot_write`, logged by the writer) is neither
-         counted nor logged as added, and the tick adds no further name (no
-         second wait on the same lock); the crystallizer proposes it again.
+      3. Else: add it to her vocabulary through `vocabulary_access.check` and,
+         when that wrote it, append a GrowthLogEvent to
+         {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`). A name that
+         could not be added (`cannot_write`, logged by the writer, or `missing`: no
+         bridge to add through) is neither counted nor logged as added, and the
+         tick adds no further name (no second wait on the same lock or bridge);
+         the crystallizer proposes it again.
 
     `dry_run=True` calls the crystallizer but skips both writes; the
     returned `emotions_added` reflects "would-have-added" semantics.
@@ -93,7 +95,6 @@ def run_growth_tick(
     audit log + compact CLI alongside heartbeat-engine anomalies. Pass None
     when calling `run_growth_tick` standalone (e.g., from tests).
     """
-    vocab_path = persona_dir / "emotion_vocabulary.json"
     log_path = persona_dir / "emotion_growth.log.jsonl"
 
     current_names, vocab_anomaly = _read_current_vocabulary_names(persona_dir)
@@ -128,9 +129,11 @@ def run_growth_tick(
             emotions_added += 1
             continue
 
-        result = vocabulary_file.add(vocab_path, [(proposal.name, _entry_fields(proposal))])[0]
-        if result.outcome == "cannot_write":
-            break  # the writer has logged why and nothing was written: no further wait for the lock this tick
+        result = vocabulary_access.check(persona_dir, [(proposal.name, _entry_fields(proposal))])[0]
+        if result.outcome in ("cannot_write", "missing"):
+            # Nothing was written, and the cause is logged by the writer (`cannot_write`) or is that this process has no bridge to
+            # add through (`missing`: only the bridge writes her vocabulary): no further wait for the lock or the bridge this tick.
+            break
         current_names.add(proposal.name)
         if not result.changed:
             continue  # the file took the name from another writer since the read: nothing to record
@@ -189,14 +192,15 @@ def _read_current_vocabulary_names(
     """Return (set of emotion names in their tidied form, optional anomaly) for her vocabulary.
 
     The names come from the lookup (`vocabulary_access.lookup`, "all": every entry of her vocabulary, the framework's own
-    included), tidied, because the dedupe compares tidied names. The file is read only for its health: a damaged file is
-    quarantined and healed from a backup or reset to the default (json_io's own recovery), and the anomaly is returned so
-    the caller (run_growth_tick) feeds it into its `anomalies_collector` and it surfaces in the heartbeat audit log. Logs
-    WARNING locally too. A missing file gives no anomaly (fresh persona; expected).
+    included), tidied, because the dedupe compares tidied names. In the bridge (the owner) the file is also read for its health:
+    a damaged file is quarantined and healed from a backup or reset to the default (json_io's own recovery), and the anomaly is
+    returned so the caller (run_growth_tick) feeds it into its `anomalies_collector` and it surfaces in the heartbeat audit log.
+    Logs WARNING locally too. A missing file gives no anomaly (fresh persona; expected). Another process does not read it for
+    health: it must not quarantine or reset a file the bridge owns.
     """
     vocab_path = vocabulary_file.vocabulary_path(persona_dir)
     anomaly = None
-    if vocab_path.exists():
+    if vocabulary.is_bridge_owner() and vocab_path.exists():
         anomaly = vocabulary_file.read(vocab_path, recover=Recovery.HEAL).anomaly
         if anomaly is not None:
             logger.warning(

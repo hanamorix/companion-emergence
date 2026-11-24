@@ -7,6 +7,7 @@ The two-process case with a real bridge is in tests/bridge/test_vocabulary_two_p
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -196,6 +197,140 @@ def test_an_answer_with_the_wrong_number_of_results_is_not_trusted(tmp_path: Pat
 def test_an_empty_batch_adds_nothing_and_makes_no_call(tmp_path: Path, bridge_calls: list) -> None:
     assert vocabulary_access.check(tmp_path, []) == []
     assert bridge_calls == []
+
+
+# ---------------------------------------------------------------------------------------------
+# a failure is reported unless the bridge is simply not running
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The report is throttled per kind for the whole process; let each test see its own."""
+    monkeypatch.setattr(vocabulary_access, "warn_throttled", lambda logger, key, msg, *a, **k: logger.warning(msg, *a))
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == vocabulary_access.logger.name and r.levelno >= logging.WARNING]
+
+
+def test_a_bridge_that_is_not_running_is_the_quiet_case(tmp_path: Path, bridge_calls: _Calls, no_throttle: None, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        vocabulary_access.lookup(tmp_path, ["joy"])
+        vocabulary_access.check(tmp_path, [("brand_new", None)])
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{"error": "bridge error 401"}, {"error": "bridge error 500"}, {"error": "bridge timeout"}, {"entries": "wrong shape", "results": 5}],
+)
+def test_any_other_failure_is_reported_once_with_its_kind(tmp_path: Path, bridge_calls: _Calls, no_throttle: None, caplog: pytest.LogCaptureFixture, answer: dict) -> None:
+    bridge_calls.answer = answer
+    with caplog.at_level(logging.WARNING):
+        vocabulary_access.lookup(tmp_path, ["joy"])
+        vocabulary_access.check(tmp_path, [("brand_new", None)])
+    messages = _warnings(caplog)
+    assert len(messages) == 2 and all("read-only" in m for m in messages)
+    assert any(answer.get("error", "not a vocabulary reply") in m for m in messages) or "entries" in answer
+
+
+def test_a_timeout_on_an_add_says_the_bridge_may_still_have_added_the_names(tmp_path: Path, bridge_calls: _Calls, no_throttle: None, caplog: pytest.LogCaptureFixture) -> None:
+    bridge_calls.answer = {"error": "bridge timeout"}
+    with caplog.at_level(logging.WARNING):
+        results = vocabulary_access.check(tmp_path, [("brand_new", None)])
+    assert [r.outcome for r in results] == ["missing"]
+    assert "may still have added" in _warnings(caplog)[0]
+
+
+def test_a_body_that_is_not_json_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_throttle: None, caplog: pytest.LogCaptureFixture) -> None:
+    def post(*_a, **_k):
+        raise json.JSONDecodeError("bad", "", 0)
+
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", post)
+    with caplog.at_level(logging.WARNING):
+        vocabulary_access.lookup(tmp_path, ["joy"])
+    assert "not JSON" in _warnings(caplog)[0]
+
+
+# ---------------------------------------------------------------------------------------------
+# the read-only file is read once per version of the file
+# ---------------------------------------------------------------------------------------------
+
+
+def test_with_no_bridge_the_file_is_read_once_while_it_is_unchanged_and_again_when_it_changes(
+    tmp_path: Path, bridge_calls: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.emotion import persona_loader
+
+    path = _write(tmp_path, [_entry("Quiet Dread")])
+    loads: list[Path] = []
+    real = persona_loader.load_persona_vocabulary
+    monkeypatch.setattr(persona_loader, "load_persona_vocabulary", lambda p, **k: (loads.append(p), real(p, **k))[1])
+    for _ in range(5):
+        assert vocabulary_access.lookup(tmp_path, ["no_such_word"])["no_such_word"] is None  # misses: the file is still read once
+    assert loads == [path]
+    _write(tmp_path, [_entry("Quiet Dread"), _entry("A Longer Name Now")])
+    assert vocabulary_access.lookup(tmp_path, ["a_longer_name_now"])["a_longer_name_now"] is not None
+    assert loads == [path, path]
+
+
+def test_with_no_bridge_a_file_that_cannot_be_read_is_reported_once_and_read_once(
+    tmp_path: Path, bridge_calls: _Calls, monkeypatch: pytest.MonkeyPatch, no_throttle: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    from brain.emotion import persona_loader
+
+    (tmp_path / FILE).write_text("{not json", encoding="utf-8")
+    loads: list[Path] = []
+    real = persona_loader.load_persona_vocabulary
+    monkeypatch.setattr(persona_loader, "load_persona_vocabulary", lambda p, **k: (loads.append(p), real(p, **k))[1])
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            vocabulary_access.lookup(tmp_path, ["no_such_word"])
+    assert len(loads) == 1
+    assert len([m for m in _warnings(caplog) if "cannot be read" in m]) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# the owner's add takes entry fields only, and only valid ones
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_owner_add_ignores_any_key_that_is_not_an_entry_field(tmp_path: Path) -> None:
+    vocabulary.set_bridge_owner(True)
+    results = vocabulary_access.check(tmp_path, [("word_a", {"name": "other", "description": "d", "extra": 1})])
+    assert results == [NameResult("word_a", "word_a", "used", True)]
+    entry = json.loads((tmp_path / FILE).read_text(encoding="utf-8"))["emotions"][0]
+    assert entry["name"] == "word_a" and entry["description"] == "d" and "extra" not in entry
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"description": 5},
+        {"category": None},
+        {"decay_half_life_days": "7"},
+        {"decay_half_life_days": True},
+        {"decay_half_life_days": 0},
+        {"decay_half_life_days": -1.0},
+        {"decay_half_life_days": float("nan")},
+        {"decay_half_life_days": 10**400},
+        {"intensity_clamp": None},
+        {"intensity_clamp": float("inf")},
+    ],
+)
+def test_the_owner_add_refuses_an_item_with_an_invalid_field_and_writes_nothing_for_it(tmp_path: Path, fields: dict) -> None:
+    vocabulary.set_bridge_owner(True)
+    results = vocabulary_access.check(tmp_path, [("bad_one", fields), ("good_one", {"decay_half_life_days": None, "intensity_clamp": 8})])
+    assert [(r.raw, r.outcome) for r in results] == [("bad_one", "refused"), ("good_one", "used")]
+    assert [e["name"] for e in json.loads((tmp_path / FILE).read_text(encoding="utf-8"))["emotions"]] == ["good_one"]
+    assert vocabulary.get("bad_one") is None
+
+
+def test_the_owner_add_with_only_invalid_items_makes_no_file(tmp_path: Path) -> None:
+    vocabulary.set_bridge_owner(True)
+    assert [r.outcome for r in vocabulary_access.check(tmp_path, [("bad_one", {"description": 5})])] == ["refused"]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_the_bridge_timeout_is_a_named_dev_constant() -> None:

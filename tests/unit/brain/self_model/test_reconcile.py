@@ -124,6 +124,9 @@ def test_name_grows_vocab_only_via_crystalliser_not_placeholder_stub(tmp_path: P
     """
     import json
 
+    from brain.emotion import vocabulary
+
+    vocabulary.set_bridge_owner(True)  # as in the bridge, the one process that adds a name (tests/conftest.py restores the flag)
     _seed_open_gap(tmp_path, per_channel={}, magnitude=0.0, unnamed_pressure=0.6)
     _seed_blend_memories(tmp_path, "grief", "loneliness", n=3)
 

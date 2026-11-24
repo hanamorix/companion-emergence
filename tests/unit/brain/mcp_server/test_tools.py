@@ -399,7 +399,7 @@ def test_search_via_bridge_success_posts_and_returns_body(
     from brain import dev_constants
     from brain.mcp_server import tools as tools_mod
 
-    monkeypatch.setattr(bridge_client.state_file, "read",lambda _pd: _fake_bridge_state())
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda _pd: _fake_bridge_state())
 
     captured: dict = {}
 
@@ -417,7 +417,7 @@ def test_search_via_bridge_success_posts_and_returns_body(
         captured["trust_env"] = trust_env
         return _FakeResp()
 
-    monkeypatch.setattr(bridge_client.httpx, "post",_fake_post)
+    monkeypatch.setattr(bridge_client.httpx, "post", _fake_post)
 
     result = tools_mod._search_via_bridge(persona_dir, {"query": "x", "limit": 5})
 
@@ -432,7 +432,7 @@ def test_search_via_bridge_success_posts_and_returns_body(
 def test_search_via_bridge_no_state_file_is_unreachable(persona_dir: Path, monkeypatch) -> None:
     from brain.mcp_server import tools as tools_mod
 
-    monkeypatch.setattr(bridge_client.state_file, "read",lambda _pd: None)
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda _pd: None)
     result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
     assert result == {"error": "bridge unreachable"}
 
@@ -440,7 +440,7 @@ def test_search_via_bridge_no_state_file_is_unreachable(persona_dir: Path, monke
 def test_search_via_bridge_no_port_is_unreachable(persona_dir: Path, monkeypatch) -> None:
     from brain.mcp_server import tools as tools_mod
 
-    monkeypatch.setattr(bridge_client.state_file, "read",lambda _pd: _fake_bridge_state(port=None))
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda _pd: _fake_bridge_state(port=None))
     result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
     assert result == {"error": "bridge unreachable"}
 
@@ -448,12 +448,12 @@ def test_search_via_bridge_no_port_is_unreachable(persona_dir: Path, monkeypatch
 def test_search_via_bridge_connect_error_is_unreachable(persona_dir: Path, monkeypatch) -> None:
     from brain.mcp_server import tools as tools_mod
 
-    monkeypatch.setattr(bridge_client.state_file, "read",lambda _pd: _fake_bridge_state())
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda _pd: _fake_bridge_state())
 
     def _raise_connect(*_a, **_kw):
         raise bridge_client.httpx.ConnectError("refused")
 
-    monkeypatch.setattr(bridge_client.httpx, "post",_raise_connect)
+    monkeypatch.setattr(bridge_client.httpx, "post", _raise_connect)
     result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
     assert result == {"error": "bridge unreachable"}
 
@@ -462,12 +462,12 @@ def test_search_via_bridge_timeout_is_distinct_error(persona_dir: Path, monkeypa
     """S39: timeout must be a DIFFERENT error string from unreachable."""
     from brain.mcp_server import tools as tools_mod
 
-    monkeypatch.setattr(bridge_client.state_file, "read",lambda _pd: _fake_bridge_state())
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda _pd: _fake_bridge_state())
 
     def _raise_timeout(*_a, **_kw):
         raise bridge_client.httpx.TimeoutException("too slow")
 
-    monkeypatch.setattr(bridge_client.httpx, "post",_raise_timeout)
+    monkeypatch.setattr(bridge_client.httpx, "post", _raise_timeout)
     result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
     assert result == {"error": "bridge timeout"}
     assert result != {"error": "bridge unreachable"}
@@ -476,7 +476,7 @@ def test_search_via_bridge_timeout_is_distinct_error(persona_dir: Path, monkeypa
 def test_search_via_bridge_non_200_reports_status(persona_dir: Path, monkeypatch) -> None:
     from brain.mcp_server import tools as tools_mod
 
-    monkeypatch.setattr(bridge_client.state_file, "read",lambda _pd: _fake_bridge_state())
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda _pd: _fake_bridge_state())
 
     class _FakeResp:
         status_code = 401
@@ -484,7 +484,7 @@ def test_search_via_bridge_non_200_reports_status(persona_dir: Path, monkeypatch
         def json(self):  # pragma: no cover — not reached on non-200
             raise AssertionError("json() must not be called on a non-200 response")
 
-    monkeypatch.setattr(bridge_client.httpx, "post",lambda *a, **kw: _FakeResp())
+    monkeypatch.setattr(bridge_client.httpx, "post", lambda *a, **kw: _FakeResp())
     result = tools_mod._search_via_bridge(persona_dir, {"query": "x"})
     assert result == {"error": "bridge error 401"}
 

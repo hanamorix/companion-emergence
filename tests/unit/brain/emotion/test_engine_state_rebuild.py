@@ -188,7 +188,7 @@ def test_no_bridge_and_an_unreadable_file_leave_the_built_in_answer(tmp_path: Pa
     assert (tmp_path / VOCAB).read_text(encoding="utf-8") == "{not json"  # read-only: nothing quarantined or reset
 
 
-def test_the_bridge_answers_the_lookup_for_a_process_that_keeps_no_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_bridge_answers_the_lookup_for_a_process_that_keeps_no_copy_and_each_call_asks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from brain.emotion import vocabulary_access
 
     asked: list[tuple[Path, str, dict]] = []
@@ -203,7 +203,31 @@ def test_the_bridge_answers_the_lookup_for_a_process_that_keeps_no_copy(tmp_path
     assert vocabulary.get("far_off_word") is None  # no copy of her vocabulary kept in this process
     assert asked == [(tmp_path, "/vocabulary/lookup", {"names": ["far_off_word"]})]
     assert engine.half_life("far_off_word") == 8.5
-    assert len(asked) == 1  # an entry found is remembered: one call per name
+    assert len(asked) == 2  # nothing is remembered between calls: no copy of her vocabulary is kept (spec section 5)
+
+
+def test_a_change_made_in_the_bridge_is_seen_by_the_next_call_of_a_running_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.emotion import vocabulary_access
+
+    state = {"days": 8.5}
+
+    def bridge(*_a: object, **_k: object) -> dict:
+        return {"entries": [{"name": "far_off_word", "spelling": "far_off_word", "category": "persona_extension", "description": "d", "half_life_days": state["days"]}]}
+
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", bridge)
+    engine = _engine(tmp_path)
+    assert engine.half_life("far_off_word") == 8.5
+    state["days"] = 2.0  # the vocabulary repair changed it in the bridge
+    assert engine.half_life("far_off_word") == 2.0
+
+
+@pytest.mark.parametrize("days", [0, -3.0, float("nan"), float("inf")])
+def test_a_bad_half_life_that_arrives_over_the_wire_takes_the_built_in_answer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, days: float) -> None:
+    from brain.emotion import vocabulary_access
+
+    entry = {"name": "wire_word", "spelling": "wire_word", "category": "persona_extension", "description": "d", "half_life_days": days}
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", lambda *a, **k: {"entries": [entry]})
+    assert _engine(tmp_path).half_life("wire_word") == 14.0
 
 
 def test_a_name_not_found_is_asked_again_so_one_added_since_is_seen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
