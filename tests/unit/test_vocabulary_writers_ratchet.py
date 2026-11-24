@@ -4,11 +4,13 @@
 name and mentions no vocabulary path). This test scans every call in `brain/` that writes a file (`write_json`,
 `write_text`, `os.replace`, `shutil.copy`, `open(..., "w")` and the like) and flags one whose arguments, keywords or receiver
 mention `vocab` (a `vocab_path`, a `vocabulary_path(...)`, `emotion_vocabulary.json`). A hit outside the
-shared module is a failure unless the file is in `KNOWN_EXCEPTIONS`: the writer that #801 moves in a later step. Each exception
-must still hold a hit, so the list cannot go stale: when step 8 moves the migrator, the test fails until its line is removed here.
+shared module is a failure unless the file is in `KNOWN_EXCEPTIONS`. The list is empty: every writer, the rebuild step's removal of
+core entries and the migrator's first vocabulary file included, calls the shared module (spec section 9). A file added to the list
+must still hold a hit, so the list cannot go stale.
 
-The scan is by name: a write whose arguments never mention `vocab` (a bare `path` parameter) is not seen. The spy on `write_json` for
-the rebuild step and the migrator (spec criterion 10) is the complement, in step 8.
+The scan is by name: a write whose arguments never mention `vocab` (a bare `path` parameter) is not seen. The spies on `write_json`
+for the rebuild step and the migrator (spec criterion 10) are the complement:
+`tests/unit/brain/migrator/test_migrator_vocabulary_first.py` and `tests/bridge/test_core_entries_removed_startup.py`.
 """
 
 from __future__ import annotations
@@ -23,9 +25,7 @@ from tests.source_tree import tree_asts
 SHARED_MODULE = "brain/emotion/vocabulary_file.py"
 
 # file -> why it may still write her vocabulary file (removed by the step named).
-KNOWN_EXCEPTIONS: dict[str, str] = {
-    "brain/migrator/cli.py": "the OG migrator writes the first vocabulary file itself; moves onto the shared function in step 8 (spec section 9)",
-}
+KNOWN_EXCEPTIONS: dict[str, str] = {}
 
 # Calls that write a file or put one in place.
 _WRITE_NAMES = frozenset(

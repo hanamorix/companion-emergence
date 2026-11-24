@@ -203,7 +203,7 @@ _ALLOWED_DIRECT = {
     ("grief/breadcrumb.py", "return store.create(memory)"),
     ("kindled_link/relationship.py", "mem_store.create(mem)"),
     ("memory/pending.py", "return store.create(mem)"),
-    ("migrator/cli.py", "store.create(mem, fold=False, check_names=False)"),
+    ("migrator/cli.py", "store.create(mem, fold=False, check_names=names_in_file)"),
     ("migrator/cli.py", "soul_store.create(crystal)"),
     ("migrator/emergence_kit.py", "soul_store.create(crystal)"),
     ("migrator/emergence_kit.py", "store.create(mem, fold=False, check_names=False)"),

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from brain import process_identity
 from brain.emotion import vocabulary as _vocabulary
+from brain.emotion import vocabulary_file
 from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -160,10 +161,40 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
 
     started = time.monotonic()
 
+    og_memories = reader.read_memories()
+
+    # ---- vocabulary (written BEFORE the memories) ----
+    # One of the two noted exceptions to "only the bridge writes her vocabulary" (#801 section 9; the other is the rebuild step in
+    # brain/cli.py). The migrator acts as the owner of this work folder: a fresh `<name>.new` (the install path refused a persona in
+    # use before any work) or a cleared `--output` folder, which no bridge serves. It writes the new persona's first vocabulary file
+    # through the shared function, so the memories created below are checked against that file and a new name is added, not
+    # discarded. The folder is always empty here (`_ensure_clobber_safe` clears an `--output` folder under `--force`, and `<name>.new`
+    # is removed and re-created), so the file never exists yet. `add` writes no file when no name is accepted (a source with only
+    # core feelings), and refuses core feelings, which the framework holds.
+    # `vocabulary_emotions_migrated` counts the entries written.
+    vocab_target = vocabulary_file.vocabulary_path(work_dir)
+    vocabulary_emotions_migrated = 0
+    vocabulary_skipped_reason: str | None = None
+    names_in_file = False  # True once her file holds the migrated names: only then can the memories' names be checked against it
+    try:
+        framework_baseline_names = {e.name for e in _vocabulary._BASELINE}
+        vocab_entries = extract_persona_vocabulary(og_memories, framework_baseline_names=framework_baseline_names)
+        results = vocabulary_file.add(
+            vocab_target,
+            [(entry["name"], {k: v for k, v in entry.items() if k != "name"}) for entry in vocab_entries],
+        )
+        failed = [r.raw for r in results if r.outcome == "cannot_write"]
+        if failed:
+            vocabulary_skipped_reason = f"migrate_error: the vocabulary file could not be written ({len(failed)} names)"
+        else:
+            names_in_file = True
+            vocabulary_emotions_migrated = sum(1 for r in results if r.changed)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        vocabulary_skipped_reason = f"migrate_error: {exc}"
+
     # ---- memories ----
     # try/finally around store.close() so a mid-loop exception on disk-backed
     # DBs doesn't leak a .db-wal file for the next run to recover from.
-    og_memories = reader.read_memories()
     store = MemoryStore(db_path=work_dir / "memories.db")
     migrated_count = 0
     skipped: list[SkippedMemory] = []
@@ -186,8 +217,9 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            # the migrated memories keep their names: the migrated vocabulary is not written before them yet (spec section 9)
-            store.create(mem, fold=False, check_names=False)
+            # Checked against the vocabulary written above; if that file could not be written the names stay as given, since a
+            # check against no file would discard every name outside the core set from the migrated row.
+            store.create(mem, fold=False, check_names=names_in_file)
             migrated_count += 1
     finally:
         store.close()
@@ -201,26 +233,6 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
             edges_migrated += 1
     finally:
         hebbian.close()
-
-    # ---- vocabulary ----
-    vocab_target = work_dir / "emotion_vocabulary.json"
-    vocabulary_emotions_migrated = 0
-    vocabulary_skipped_reason: str | None = None
-
-    if vocab_target.exists() and not args.force:
-        vocabulary_skipped_reason = "existing_file_not_overwritten"
-    else:
-        try:
-            framework_baseline_names = {e.name for e in _vocabulary._BASELINE}
-            og_memories_for_vocab = reader.read_memories()
-            vocab_entries = extract_persona_vocabulary(
-                og_memories_for_vocab,
-                framework_baseline_names=framework_baseline_names,
-            )
-            write_json(vocab_target, {"version": 1, "emotions": vocab_entries}, fsync=False)
-            vocabulary_emotions_migrated = len(vocab_entries)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            vocabulary_skipped_reason = f"migrate_error: {exc}"
 
     # ---- reflex arcs ----
     # --input points at OG's data/ dir, but reflex_engine.py sits one level

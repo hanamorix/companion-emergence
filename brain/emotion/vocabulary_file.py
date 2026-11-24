@@ -2,8 +2,9 @@
 
 `emotion_vocabulary.json` is changed by this module and by nothing else: adding a name, changing an entry's fields, merging two
 entries that tidy to the same name, and removing an entry are `add`, `replace_fields`, `merge` and `remove`. (json_io's own
-recovery of a corrupt file, which adds no name, and the migrator until step 8 of #801 (section 9), are the only other code that
-writes it.) `load` registers what the file holds into the registry and writes nothing.
+recovery of a corrupt file, which adds no name, is the only other code that writes it. The rebuild step and the OG migrator, the
+two noted exceptions to "only the bridge calls this" (section 9), call this module too.) `load` registers what the file holds
+into the registry and writes nothing.
 
 A core feeling (one of the framework's 30, `vocabulary.is_baseline`) is never written to her file (#801 section 8): `add` and
 `replace_fields` refuse it, and `remove_core_entries` takes out any entry the file holds for one, at every bridge start-up and in

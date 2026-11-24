@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,31 @@ def test_the_rebuild_child_removes_the_core_entries_before_its_rebuild(cli_perso
     _file_names_seen_by_ensure(monkeypatch, seen, cli_persona)
     assert brain_cli._supervisor_rebuild_handler(argparse.Namespace(persona="nell")) == 0
     assert seen == [["her own word"]]
+
+
+@pytest.mark.no_base_failure(
+    reason="step 7 already made the rebuild child's removal go through the shared writer; this pins criterion 10 for it (every write of her file comes from vocabulary_file)"
+)
+def test_the_rebuild_child_writes_her_vocabulary_only_through_the_shared_function(cli_persona, monkeypatch):
+    from brain.health import json_io
+
+    real = json_io.write_json
+    writers: list[tuple[str, str]] = []
+
+    def make_spy(module_name: str):
+        def spy(path, *args, **kwargs):
+            writers.append((module_name, Path(path).name))
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    for name, module in list(sys.modules.items()):
+        if name.startswith("brain") and getattr(module, "write_json", None) is real:
+            monkeypatch.setattr(module, "write_json", make_spy(name))
+    assert brain_cli._supervisor_rebuild_handler(argparse.Namespace(persona="nell")) == 0
+    vocabulary_writes = {module for module, name in writers if name == VOCAB}
+    assert vocabulary_writes == {"brain.emotion.vocabulary_file"}
+    assert _names(cli_persona) == ["her own word"]
 
 
 def test_a_removal_that_raises_does_not_stop_the_rebuild_child(cli_persona, monkeypatch, caplog):
