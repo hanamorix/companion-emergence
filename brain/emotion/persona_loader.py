@@ -153,6 +153,10 @@ def reload_copy(path: Path) -> None:
         except JsonFileError as damaged:
             if not owner or damaged.kind == "io":
                 raise
+            # Accepted edge (#803 step 16, Q1): after a RESET the copy matches the reset file, which holds none of her own feeling names.
+            # The names her memories use come back at the supervisor heartbeat's next explicit load (every 900 s by default, skipped while
+            # a reply is in flight; the soul-review load, every 6 hours when its cadence is clean, re-adds them too). Until then her own
+            # names are missing from the copy.
             res, _changes = vocabulary_file.repair(path)  # the owner repairs; it logged and raised if it could not
             _log_anomaly(res.anomaly)
     except (OSError, ValueError) as exc:  # JsonFileError is both

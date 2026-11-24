@@ -58,6 +58,8 @@ def _read_vocabulary(path: Path, default: dict) -> BrainAnomaly | None:
     from brain.emotion import vocabulary, vocabulary_file
 
     if vocabulary.is_bridge_owner():
+        # Accepted edge (#803 step 16, Q3): this raises on an unreadable file (as before) and, new in step 16, on a timeout waiting for
+        # the vocabulary lock. Either raise ends this walk, so /health or the heartbeat's walk loses its later checks for that run.
         return vocabulary_file.repair(path)[0].anomaly
     try:
         res = read_json_result(path, default=lambda d=default: d, recover=Recovery.CONTENT, validate=vocabulary_file.validate_schema)
