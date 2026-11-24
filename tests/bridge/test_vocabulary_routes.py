@@ -107,6 +107,7 @@ def test_add_on_a_file_damaged_under_the_running_bridge_heals_it_and_then_writes
     assert list(persona_dir.glob(f"{FILE}.corrupt-*"))
 
 
+@pytest.mark.no_base_failure(reason="the pin of the old cannot_write answer on a damaged file, kept for the case where the repair itself fails: on base nothing repaired on an add, so the add was cannot_write as well")
 def test_add_where_the_repair_of_a_damaged_file_is_refused_is_cannot_write_and_leaves_the_file(
     persona_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
