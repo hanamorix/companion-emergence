@@ -171,13 +171,13 @@ def canonical_name(name: str) -> str:
 
     Lowercase; every run of characters that are not letters or digits becomes one underscore (so ``name____name`` and
     ``name_name`` are the same); underscores are trimmed from both ends. A ``<a>_<b>_blend`` name (any number of parts) has its
-    parts sorted, empty parts dropped, so ``love_grief_blend``, ``Grief Love Blend`` and ``love_grief__blend`` all give
-    ``grief_love_blend``. Lowercasing comes first so that tidying a tidied name changes nothing.
+    parts sorted, so ``love_grief_blend``, ``Grief Love Blend`` and ``love_grief__blend`` all give ``grief_love_blend``
+    (a doubled, leading or trailing separator makes no empty part, because a run of separators is one underscore and the ends are
+    trimmed: #800). Lowercasing comes first so that tidying a tidied name changes nothing.
     """
     key = _SEPARATOR_RUN.sub("_", name.lower()).strip("_")
     if key.endswith(_BLEND_SUFFIX):
-        parts = [part for part in key[: -len(_BLEND_SUFFIX)].split("_") if part]
-        key = "_".join(sorted(parts)) + _BLEND_SUFFIX
+        key = "_".join(sorted(key[: -len(_BLEND_SUFFIX)].split("_"))) + _BLEND_SUFFIX
     return key
 
 

@@ -328,7 +328,11 @@ def test_gate_name_refuses_an_empty_or_too_long_name_and_logs_why(raw: str, capl
     log_throttle._last.clear()
     with caplog.at_level("DEBUG", logger="brain.emotion.vocabulary"):
         assert vocabulary.gate_name(raw) is None
-    assert any(r.name == "brain.emotion.vocabulary" for r in caplog.records)
+    records = [r for r in caplog.records if r.name == "brain.emotion.vocabulary"]
+    assert len(records) == 1 and records[0].levelname == "WARNING"
+    message = records[0].getMessage()
+    assert "refused" in message and ("empty" in message or "over the limit of 100" in message)
+    assert raw.strip() == "" or raw not in message  # the length is logged, never the name
 
 
 def test_gate_name_accepts_a_100_character_name_and_returns_the_tidied_form() -> None:
