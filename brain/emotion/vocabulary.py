@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 from brain.dev_constants import EMOTION_HALF_LIFE_DAYS, EMOTION_NAME_MAX_CHARS
@@ -41,7 +41,8 @@ class Emotion:
     """A typed emotion in the framework's vocabulary.
 
     Attributes:
-        name: Canonical identifier (lowercase, underscore-separated).
+        name: The entry's own spelling: the framework's names are tidied (lowercase, underscore-separated); a persona entry
+            keeps the spelling in her vocabulary file. `canonical_name(name)` is the tidied form every lookup matches by.
         description: Human-readable meaning — the "intended use" per Section 5.2.
         category: One of "core", "complex", "nell_specific", "persona_extension"
             (enforced at edit time via the EmotionCategory Literal annotation).
@@ -153,6 +154,8 @@ _BASELINE: tuple[Emotion, ...] = (
 )
 
 
+# Keyed by the tidied form (`canonical_name`); each value is the entry with its own spelling in `.name`, so the key is the
+# index from a tidied form to the entry and its spelling (#801 section 3).
 # NOT thread-safe. All extension register() calls must happen at startup
 # before any concurrent reader (e.g. the async bridge) is running. The
 # framework enforces this by loading extensions in main() before the
@@ -234,20 +237,21 @@ def by_category(category: str) -> list[Emotion]:
 
 
 def register(emotion: Emotion) -> None:
-    """Register a persona-specific emotion extension.
+    """Register a persona-specific emotion extension, under the spelling it carries.
 
-    Raises ValueError if an emotion with the same name is already registered.
+    The entry keeps its own spelling (`Emotion.name`, the spelling in her vocabulary file); it is stored under the tidied form
+    of that name, so `get` finds it by any spelling that tidies the same (#801 section 3).
+
+    Raises ValueError if an emotion whose name tidies the same is already registered.
     """
     key = canonical_name(emotion.name)
     if key in _REGISTRY:
         raise ValueError(f"Emotion {emotion.name!r} already registered")
-    if key != emotion.name:
-        emotion = replace(emotion, name=key)
     _REGISTRY[key] = emotion
 
 
 def _unregister(name: str) -> None:
-    """Remove an emotion from the registry. Private: test-cleanup only.
+    """Remove an emotion from the registry, by any spelling. Private: test-cleanup only.
 
     The framework does not support runtime removal of vocabulary entries.
     """

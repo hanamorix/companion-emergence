@@ -395,7 +395,8 @@ def test_get_resolves_variant_spellings_to_registered_entry() -> None:
         vocabulary._unregister("anticipatory_grief")
 
 
-def test_register_stores_under_canonical_name() -> None:
+def test_register_keeps_the_entrys_own_spelling_and_get_finds_it_by_any_spelling() -> None:
+    """#801 section 3: an entry keeps the spelling it was registered with (her file's spelling); a lookup matches by the tidied form."""
     from brain.emotion import vocabulary
 
     e = vocabulary.Emotion(
@@ -408,10 +409,55 @@ def test_register_stores_under_canonical_name() -> None:
     vocabulary.register(e)
     try:
         stored = vocabulary.get("grief_love_blend")
-        assert stored is not None
-        assert stored.name == "grief_love_blend"
+        assert stored is e
+        assert stored.name == "love_grief_blend"
+        assert vocabulary.get("Love Grief Blend") is e
     finally:
         vocabulary._unregister("grief_love_blend")
+    assert vocabulary.get("love_grief_blend") is None
+
+
+def test_an_entry_with_a_non_tidied_spelling_is_listed_and_found_as_spelled() -> None:
+    from brain.emotion import vocabulary
+
+    e = vocabulary.Emotion(
+        name="Comfort Seeking Two",
+        description="x",
+        category="persona_extension",
+        decay_half_life_days=14.0,
+        intensity_clamp=10.0,
+    )
+    vocabulary.register(e)
+    try:
+        assert [x.name for x in vocabulary.list_all() if x is e] == ["Comfort Seeking Two"]
+        assert [x.name for x in vocabulary.by_category("persona_extension") if x is e] == ["Comfort Seeking Two"]
+        for spelling in ("comfort_seeking_two", "COMFORT-SEEKING-TWO", "Comfort Seeking Two", " comfort  seeking two "):
+            assert vocabulary.get(spelling) is e
+    finally:
+        vocabulary._unregister("comfort_seeking_two")
+    assert vocabulary.get("Comfort Seeking Two") is None
+
+
+def test_a_second_spelling_of_a_registered_name_is_refused_and_the_first_stays() -> None:
+    from brain.emotion import vocabulary
+
+    first = vocabulary.Emotion("Quiet Dread", "first", "persona_extension", 3.0)
+    second = vocabulary.Emotion("quiet_dread", "second", "persona_extension", 4.0)
+    vocabulary.register(first)
+    try:
+        with pytest.raises(ValueError, match="already registered"):
+            vocabulary.register(second)
+        assert vocabulary.get("quiet_dread") is first
+    finally:
+        vocabulary._unregister("quiet_dread")
+
+
+def test_the_baseline_entries_keep_their_names() -> None:
+    from brain.emotion import vocabulary
+
+    for e in vocabulary._BASELINE:
+        assert vocabulary.get(e.name) is e
+        assert e.name == vocabulary.canonical_name(e.name)
 
 
 def test_pool_by_canonical_name_collapses_spellings_to_the_max() -> None:

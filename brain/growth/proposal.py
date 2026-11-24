@@ -21,7 +21,7 @@ class EmotionProposal:
     written and tested with injected fakes.
 
     Attributes:
-        name: Canonical identifier (lowercase, underscore-separated).
+        name: The tidied name (`vocabulary.canonical_name`) the scheduler adds to the vocabulary.
         description: Human-readable meaning.
         decay_half_life_days: Time for intensity to halve. None = identity-level.
         evidence_memory_ids: Memories that drove the proposal. May be empty.

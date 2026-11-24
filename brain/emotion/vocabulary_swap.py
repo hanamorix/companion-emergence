@@ -120,9 +120,9 @@ def _swap_file(path: Path) -> int | None:
         if baseline is None:
             continue
         # Only the three fields of the definition change. The name keeps its spelling: the reflex crystallizer's gate 4 compares
-        # the file's names as written (brain/growth/crystallizers/reflex.py:630), and the swap leaves renaming to the vocabulary
-        # repair (`_merge_variant_entries`, brain/health/vocab_repair.py:237), which renames a lone variant to the canonical
-        # name on its next tick. Any other key of the entry stays.
+        # the file's names as written (brain/growth/crystallizers/reflex.py:630), and an entry keeps the spelling in her file
+        # (a lone entry is never renamed; the vocabulary repair merges twins, `_merge_variant_entries` in
+        # brain/health/vocab_repair.py). Any other key of the entry stays.
         definition = {
             "category": baseline.category,
             "description": baseline.description,

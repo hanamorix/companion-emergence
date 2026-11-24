@@ -137,7 +137,8 @@ def run_vocab_repair(
     # ------------------------------------------------------------------
     # Step 0 (#174, provider-free, every run): collapse spelling-variant twins
     # (love_grief_blend / grief_love_blend, anticipatory-grief / Anticipatory_Grief)
-    # into one canonical entry. A twin with a real description beats a placeholder.
+    # into one entry under the spelling that comes first in the file. A twin with a real
+    # description gives the fields (it beats a placeholder).
     # ------------------------------------------------------------------
     merged = _merge_variant_entries(data)
     if merged:
@@ -234,43 +235,47 @@ def _write_and_return(persona_dir: Path, *, repaired: int, described: int) -> Re
 
 
 def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
-    """Collapse entries whose names canonicalise to the same key (#174).
+    """Merge entries whose names tidy to the same key (`canonical_name`) into one (#174, #801 section 3).
 
-    Mutates ``data["emotions"]`` in place. Returns ``(dropped_name, kept_name)``
-    pairs; empty when nothing changed. Survivor: the first entry with a real
-    description, else the first seen. The survivor is renamed to the canonical key.
+    Mutates ``data["emotions"]`` in place. Returns ``(dropped_name, kept_spelling)`` pairs, one per entry dropped; empty when
+    nothing was merged, and then ``data`` is untouched (a lone entry keeps its spelling: nothing is renamed). The merged entry
+    takes its fields from the first twin with a real description, else from the first; its name is the spelling of the twin that
+    comes first in the file. It sits where that first twin sat. Entries that are not dicts, have no string name, or have a name
+    that tidies to nothing pass through unchanged and in place.
     """
     from brain.emotion.vocabulary import canonical_name
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
     emotions = data.get("emotions", [])
-    survivors: dict[str, dict] = {}
-    order: list[str] = []
-    dropped: list[tuple[str, str]] = []
+    groups: dict[str, list[dict]] = {}
     for entry in emotions:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
             continue
         key = canonical_name(entry["name"])
-        current = survivors.get(key)
-        if current is None:
-            survivors[key] = entry
-            order.append(key)
-            continue
-        current_is_stub = current.get("description") == PLACEHOLDER_DESCRIPTION
-        entry_is_stub = entry.get("description") == PLACEHOLDER_DESCRIPTION
-        if current_is_stub and not entry_is_stub:
-            dropped.append((current["name"], entry["name"]))
-            survivors[key] = entry
-        else:
-            dropped.append((entry["name"], current["name"]))
-
-    renamed = [(survivors[k]["name"], k) for k in order if survivors[k]["name"] != k]
-    if not dropped and not renamed:
+        if key:
+            groups.setdefault(key, []).append(entry)
+    if all(len(twins) == 1 for twins in groups.values()):
         return []
-    for key in order:
-        survivors[key]["name"] = key
-    data["emotions"] = [survivors[k] for k in order]
-    return dropped + renamed
+
+    dropped: list[tuple[str, str]] = []
+    merged: list = []
+    done: set[str] = set()
+    for entry in emotions:
+        key = canonical_name(entry["name"]) if isinstance(entry, dict) and isinstance(entry.get("name"), str) else ""
+        if not key:
+            merged.append(entry)
+            continue
+        if key in done:
+            continue
+        done.add(key)
+        twins = groups[key]
+        first_spelling = twins[0]["name"]
+        donor = next((t for t in twins if t.get("description") != PLACEHOLDER_DESCRIPTION), twins[0])
+        dropped.extend((t["name"], first_spelling) for t in twins if t is not donor)
+        donor["name"] = first_spelling
+        merged.append(donor)
+    data["emotions"] = merged
+    return dropped
 
 
 def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:

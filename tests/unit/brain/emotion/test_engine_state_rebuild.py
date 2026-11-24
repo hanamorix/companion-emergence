@@ -1861,3 +1861,12 @@ def test_fold_change_queues_its_event_and_read_is_still_empty(tmp_path: Path) ->
     engine_files.save_state(tmp_path, _switched_state())
     assert engine.is_live() is True
     assert engine.read() == {}  # a switched state with no feelings: nothing to read
+
+
+@pytest.mark.no_base_failure(reason="the half-life table was already keyed by the tidied name, so this passes on the old code by design")
+def test_the_half_life_of_an_entry_with_a_non_tidied_file_spelling_is_found_by_any_spelling(tmp_path: Path) -> None:
+    """#801 section 3: internal tables keep tidied keys while her file keeps its own spelling."""
+    _write_vocab(tmp_path, [_entry("Quiet Dread", 6.5)])
+    engine = _engine(tmp_path)
+    for spelling in ("Quiet Dread", "quiet dread", "quiet_dread", "QUIET-DREAD"):
+        assert engine.half_life(spelling) == 6.5

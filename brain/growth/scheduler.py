@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from brain.emotion.vocabulary import gate_name
+from brain.emotion.vocabulary import canonical_name, gate_name
 from brain.growth.crystallizers.vocabulary import (
     VOCABULARY_CRYSTALLIZER_STATUS,
     crystallize_vocabulary,
@@ -181,7 +181,9 @@ def run_growth_tick(
 def _read_current_vocabulary_names(
     vocab_path: Path,
 ) -> tuple[set[str], BrainAnomaly | None]:
-    """Return (set of emotion names, optional anomaly) for the vocabulary file.
+    """Return (set of emotion names in their tidied form, optional anomaly) for the vocabulary file.
+
+    The tidied form (`vocabulary.canonical_name`), because an entry keeps the spelling in her file and the dedupe compares tidied names.
 
     Distinguishes three load outcomes:
       - Missing file → (empty set, None) silently (fresh persona; expected).
@@ -215,7 +217,11 @@ def _read_current_vocabulary_names(
             anomaly.action,
         )
 
-    names = {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}
+    names = {
+        canonical_name(e["name"])
+        for e in data.get("emotions", [])
+        if isinstance(e, dict) and isinstance(e.get("name"), str)
+    }
     return names, anomaly
 
 

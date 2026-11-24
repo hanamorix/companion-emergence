@@ -398,8 +398,8 @@ def test_repair_describes_new_placeholders_after_state_complete(tmp_path: Path) 
 
 
 def test_repair_merges_variant_entries_keeping_the_described_one(tmp_path: Path) -> None:
-    """#174 reopen: permutation and hyphen/case twins collapse to one canonical entry.
-    The entry with a real description wins; a placeholder twin is dropped."""
+    """#174 reopen, #801 section 3: permutation and hyphen/case twins collapse to one entry under the spelling that comes
+    first in the file. The entry with a real description gives the fields; a placeholder twin is dropped."""
     from brain.health.vocab_repair import run_vocab_repair
 
     _write_vocab(tmp_path, [
@@ -417,9 +417,9 @@ def test_repair_merges_variant_entries_keeping_the_described_one(tmp_path: Path)
 
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
-    assert set(by_name) == {"grief_love_blend", "anticipatory_grief", "love"}
-    assert by_name["grief_love_blend"]["description"] == "braided"
-    assert by_name["anticipatory_grief"]["description"] == "dread ahead"
+    assert [e["name"] for e in data["emotions"]] == ["love_grief_blend", "anticipatory-grief", "love"]
+    assert by_name["love_grief_blend"]["description"] == "braided"
+    assert by_name["anticipatory-grief"]["description"] == "dread ahead"
 
 
 def test_repair_merges_a_stray_underscore_blend_key_with_its_twin(tmp_path: Path) -> None:
@@ -444,8 +444,8 @@ def test_repair_merges_a_stray_underscore_blend_key_with_its_twin(tmp_path: Path
     assert by_name["grief_love_blend"]["description"] == "braided"
 
 
-def test_repair_renames_a_lone_stray_underscore_blend_key(tmp_path: Path) -> None:
-    """#800: with no twin, the stray key is renamed to the canonical one and keeps its description."""
+def test_repair_keeps_the_spelling_of_a_lone_entry(tmp_path: Path) -> None:
+    """#801 section 3: with no twin, an entry keeps the spelling in her file (it is no longer renamed to its tidied key)."""
     from brain.health.vocab_repair import run_vocab_repair
 
     _write_vocab(tmp_path, [_proper_entry("_grief_love_blend", "braided"), _stub_entry("emergence")])
@@ -457,8 +457,72 @@ def test_repair_renames_a_lone_stray_underscore_blend_key(tmp_path: Path) -> Non
 
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
-    assert set(by_name) == {"grief_love_blend", "emergence"}
-    assert by_name["grief_love_blend"]["description"] == "braided"
+    assert set(by_name) == {"_grief_love_blend", "emergence"}
+    assert by_name["_grief_love_blend"]["description"] == "braided"
+
+
+def _names(data: dict) -> list:
+    return [e["name"] if isinstance(e, dict) and "name" in e else e for e in data["emotions"]]
+
+
+def test_merge_keeps_the_first_in_file_spelling_with_the_later_real_description() -> None:
+    from brain.health.vocab_repair import _merge_variant_entries
+
+    data = {"emotions": [_stub_entry("comfort seeking"), _proper_entry("comfort_seeking", "held still")]}
+    pairs = _merge_variant_entries(data)
+    assert pairs == [("comfort seeking", "comfort seeking")]  # the dropped placeholder, and the spelling that stays
+    assert [e["name"] for e in data["emotions"]] == ["comfort seeking"]
+    assert data["emotions"][0]["description"] == "held still"
+    assert data["emotions"][0]["decay_half_life_days"] == 45.0
+
+
+def test_merge_of_two_real_twins_keeps_the_first_entry_whole() -> None:
+    from brain.health.vocab_repair import _merge_variant_entries
+
+    first, second = _proper_entry("comfort seeking", "one"), _proper_entry("comfort_seeking", "two")
+    data = {"emotions": [first, second]}
+    assert _merge_variant_entries(data) == [("comfort_seeking", "comfort seeking")]
+    assert data["emotions"] == [_proper_entry("comfort seeking", "one")]
+
+
+def test_merge_of_three_twins_remembers_the_first_spelling_not_the_donors() -> None:
+    from brain.health.vocab_repair import _merge_variant_entries
+
+    data = {"emotions": [_stub_entry("Comfort Seeking"), _stub_entry("comfort_seeking"), _proper_entry("COMFORT-SEEKING", "held")]}
+    pairs = _merge_variant_entries(data)
+    assert [e["name"] for e in data["emotions"]] == ["Comfort Seeking"]
+    assert data["emotions"][0]["description"] == "held"
+    assert pairs == [("Comfort Seeking", "Comfort Seeking"), ("comfort_seeking", "Comfort Seeking")]
+
+
+def test_merge_leaves_a_lone_entry_alone_and_reports_nothing() -> None:
+    from brain.health.vocab_repair import _merge_variant_entries
+
+    entries = [_proper_entry("comfort seeking"), _proper_entry("_grief_love_blend"), _proper_entry("Quiet Dread")]
+    data = {"emotions": [dict(e) for e in entries]}
+    assert _merge_variant_entries(data) == []
+    assert data["emotions"] == entries
+
+
+def test_merge_keeps_non_dict_nameless_and_empty_tidied_entries_in_place() -> None:
+    from brain.health.vocab_repair import _merge_variant_entries
+
+    nameless = {"description": "no name"}
+    data = {
+        "emotions": [
+            "not an entry",
+            _proper_entry("comfort seeking", "one"),
+            nameless,
+            _proper_entry("---"),
+            7,
+            _proper_entry("comfort_seeking", "two"),
+            _proper_entry("___"),
+        ]
+    }
+    _merge_variant_entries(data)
+    assert _names(data) == ["not an entry", "comfort seeking", nameless, "---", 7, "___"]
+    assert data["emotions"][2] is nameless
+    assert data["emotions"][1]["description"] == "one"
 
 
 def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:

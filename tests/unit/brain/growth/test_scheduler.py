@@ -123,7 +123,38 @@ def test_run_growth_tick_skips_proposal_with_existing_name(
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-_OLD_GATE_ALSO_REFUSED = "the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
+def test_run_growth_tick_skips_a_proposal_whose_tidied_name_matches_an_entry_spelled_otherwise(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """#801 section 3: the dedupe compares tidied forms, so her file's spelling `Quiet Dread` matches the proposal `quiet_dread`."""
+    _seed_vocab(persona_dir, names=["Quiet Dread"])
+    before = (persona_dir / "emotion_vocabulary.json").read_bytes()
+    proposal = EmotionProposal(
+        name="quiet_dread",
+        description="dup",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert (persona_dir / "emotion_vocabulary.json").read_bytes() == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
+def test_read_current_vocabulary_names_gives_the_tidied_form_and_skips_a_non_string_name(persona_dir: Path) -> None:
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "Quiet Dread"}, {"name": 5}, {"name": "joy"}, "x"]}),
+        encoding="utf-8",
+    )
+    names, anomaly = _read_current_vocabulary_names(persona_dir / "emotion_vocabulary.json")
+    assert anomaly is None
+    assert names == {"quiet_dread", "joy"}
+
+
+_OLD_GATE_ALSO_REFUSED ="the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
 _OLD_GATE_ALSO_ACCEPTED = "the scheduler's old name check already accepted this name, so the row passes on the old code by design"
 
 

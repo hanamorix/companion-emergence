@@ -303,3 +303,61 @@ def test_read_only_with_a_store_is_refused(tmp_path: Path):
     finally:
         store.close()
     assert not (tmp_path / "emotion_vocabulary.json").exists()
+
+
+def _entry(name: str) -> dict:
+    return {
+        "name": name,
+        "description": f"the feeling of {name}",
+        "category": "persona_extension",
+        "decay_half_life_days": 5.0,
+        "intensity_clamp": 10.0,
+    }
+
+
+def test_load_registers_an_entry_under_the_spelling_in_the_file(tmp_path: Path):
+    """#801 section 3: the file's spelling is the entry's name; lookups match by the tidied form."""
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": [_entry("Quiet Dread Load")]}), encoding="utf-8")
+    try:
+        assert load_persona_vocabulary(path) == 1
+        found = vocabulary.get("quiet_dread_load")
+        assert found is not None
+        assert found.name == "Quiet Dread Load"
+    finally:
+        _cleanup_emotion("quiet_dread_load")
+
+
+def test_load_of_two_spellings_in_one_file_registers_the_first_in_the_file(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(
+        json.dumps({"version": 1, "emotions": [_entry("comfort seeking load"), _entry("comfort_seeking_load")]}),
+        encoding="utf-8",
+    )
+    try:
+        assert load_persona_vocabulary(path) == 1
+        found = vocabulary.get("comfort_seeking_load")
+        assert found is not None
+        assert found.name == "comfort seeking load"
+    finally:
+        _cleanup_emotion("comfort_seeking_load")
+
+
+@pytest.mark.no_base_failure(reason="the memory heal already looks a memory's key up by any spelling, so it passes on the old code by design")
+def test_the_memory_heal_mints_no_twin_for_an_entry_with_a_non_tidied_spelling(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": [_entry("Quiet Dread Heal")]}), encoding="utf-8")
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="x", memory_type="conversation", domain="us", emotions={"quiet_dread_heal": 4.0}
+            ),
+            fold=False,
+        )
+        assert load_persona_vocabulary(path, store=store) == 1
+        names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
+        assert names == ["Quiet Dread Heal"]
+    finally:
+        store.close()
+        _cleanup_emotion("quiet_dread_heal")
