@@ -62,6 +62,10 @@ def append(
         "memory_type": memory.memory_type,
         "created_at_iso": memory.created_at.isoformat() if memory.created_at else None,
         "summary": memory.content,  # the fading body IS the summary at drop time
+        # The feeling names come from the checked read (check_names defaults on). That relies on the forgetting pass running only in
+        # the bridge (its one caller is the supervisor), where the owner flag is set: the check there uses a name the copy holds,
+        # adds a new one that passes the gate, and keeps a name whose add could not be written. So the record holds every name but
+        # a gate-refused one (#803, GY5).
         "emotion_at_ingest": dict(live_engine.memory_feelings(memory).feelings),
         "salience_at_drop": salience_at_drop,
         "salience_inputs_at_drop": asdict(inputs),

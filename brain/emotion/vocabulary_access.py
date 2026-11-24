@@ -171,6 +171,10 @@ def _result_from_wire(item: Any) -> NameResult:
 # from `--mcp-config`, `brain.bridge.provider.brain_tools_mcp_entry`, once per `claude -p` call) and ends with that run; the
 # interactive `nell chat --no-bridge` loop calls `start_turn` at the top of each turn. The websocket chat path (`nell chat` with a
 # bridge) makes no vocabulary call in the client process: the bridge, the owner, does them.
+# Accepted edge (#803 step 9): there is no lock around this flag. Threads already waiting on the bridge when the first call times
+# out each wait out their own timeout, and a late one can set the flag just after `start_turn` cleared it. That puts the new turn
+# on the read-only file, where a new name is discarded (S18). No measured figure for such timeouts exists; #645 carries
+# `VOCABULARY_BRIDGE_TIMEOUT_S` for measurement.
 _BRIDGE_TIMED_OUT: dict[Path, bool] = {}
 
 

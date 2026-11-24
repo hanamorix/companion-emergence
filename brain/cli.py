@@ -2377,6 +2377,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
                     floor_startup.start_requested_ram_figure()
             finally:
+                # Accepted edge (#803 step 9): this exit save does not call `vocabulary_access.start_turn`, so it keeps the last turn's
+                # skip flag. If the bridge timed out in that turn, the new feeling names this save checks are discarded (the
+                # read-only file path). The exit save is the end of that turn, and the flag clears only at the start of a turn.
                 # Flush conversation through ingest pipeline (best-effort)
                 try:
                     flush_session(
