@@ -127,7 +127,7 @@ def test_a_start_with_no_vocabulary_file_creates_none(persona_dir):
     make_persona(persona_dir, [row(T35, emotions={"joy": 6.0}, mid="seed")])
     assert not (persona_dir / VOCAB).exists()
     _start_bridge(persona_dir)
-    assert not (persona_dir / VOCAB).exists() or "joy" not in _names(persona_dir)
+    assert not (persona_dir / VOCAB).exists()
 
 
 def test_a_removal_that_raises_is_logged_and_the_twin_merge_and_the_start_go_on(persona_dir, monkeypatch, caplog):

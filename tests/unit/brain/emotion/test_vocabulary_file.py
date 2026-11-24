@@ -132,16 +132,13 @@ def test_add_dedupes_against_the_file_not_the_registry(tmp_path: Path) -> None:
         vocabulary._unregister("held in registry")
 
 
-@pytest.mark.parametrize("raw", ["joy", "Joy", "  JOY  ", "love_grief_blend_not_core", "contentment"])
+@pytest.mark.parametrize("raw", ["joy", "Joy", "  JOY  ", "contentment"])
 def test_add_refuses_a_core_feeling_and_writes_nothing(tmp_path: Path, raw: str, writes) -> None:
-    """Spec section 8, criterion 9: a core feeling is never written to her file (`refused`); a name that is not core is added."""
+    """Spec section 8, criterion 9: a core feeling is never written to her file (`refused`)."""
     path = _write(tmp_path, [_entry("other keep")])
     [res] = vocabulary_file.add(path, [(raw, {"description": "mine"})])
-    if vocabulary.is_baseline(raw):
-        assert res == NameResult(raw, None, "refused")
-        assert writes == [] and [e["name"] for e in _read(path)] == ["other keep"]
-    else:
-        assert res.outcome == "used" and res.changed
+    assert res == NameResult(raw, None, "refused")
+    assert writes == [] and [e["name"] for e in _read(path)] == ["other keep"]
 
 
 def test_a_mixed_add_writes_the_new_name_and_refuses_the_core_one(tmp_path: Path) -> None:

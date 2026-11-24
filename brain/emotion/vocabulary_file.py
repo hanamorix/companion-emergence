@@ -248,7 +248,7 @@ def add(path: Path, items: Sequence[tuple[str, Mapping[str, Any] | None]]) -> li
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
 
     gated = [(raw, _writable_key(raw), dict(fields or {})) for raw, fields in items]
-    accepted =[(i, raw, key, fields) for i, (raw, key, fields) in enumerate(gated) if key is not None]
+    accepted = [(i, raw, key, fields) for i, (raw, key, fields) in enumerate(gated) if key is not None]
     if not accepted:
         return [NameResult(raw, None, "refused") for raw, _key, _fields in gated]
 
