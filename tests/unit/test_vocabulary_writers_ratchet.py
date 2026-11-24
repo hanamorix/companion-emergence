@@ -24,7 +24,7 @@ from tests.source_tree import tree_asts
 
 SHARED_MODULE = "brain/emotion/vocabulary_file.py"
 
-# file -> why it may still write her vocabulary file (removed by the step named).
+# file -> why it may write her vocabulary file outside the shared module. Empty: none does.
 KNOWN_EXCEPTIONS: dict[str, str] = {}
 
 # Calls that write a file or put one in place.

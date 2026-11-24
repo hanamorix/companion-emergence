@@ -81,6 +81,9 @@ def vocabulary_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     Every module that bound the real `write_json` gets its own spy (a `from ... import write_json` is a separate name), plus
     json_io itself; the real write still happens.
     """
+    import brain.bridge.server  # noqa: F401  bound before patching, so no module is first imported (and binds a spy) during the test
+    import brain.cli  # noqa: F401
+
     real = json_io.write_json
     calls: list[tuple[str, str]] = []
 

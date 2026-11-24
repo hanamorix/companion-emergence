@@ -170,7 +170,7 @@ def test_the_rebuild_child_removes_the_core_entries_before_its_rebuild(cli_perso
 def test_the_rebuild_child_writes_her_vocabulary_only_through_the_shared_function(cli_persona, monkeypatch):
     from brain.health import json_io
 
-    real = json_io.write_json
+    real = json_io.write_json  # every brain module that binds it is already imported (this file imports the bridge and the cli)
     writers: list[tuple[str, str]] = []
 
     def make_spy(module_name: str):
