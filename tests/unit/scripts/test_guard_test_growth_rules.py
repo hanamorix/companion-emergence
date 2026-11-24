@@ -1,0 +1,69 @@
+"""The counts and grid rules of the test-growth guard (#746): pure functions, tested directly."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[3]
+_spec = importlib.util.spec_from_file_location(
+    "guard_test_growth_rules", REPO / "scripts" / "guard_test_growth_rules.py"
+)
+rules = importlib.util.module_from_spec(_spec)
+sys.modules["guard_test_growth_rules"] = rules
+_spec.loader.exec_module(rules)
+
+
+def test_count_files_counts_functions_ids_and_changes():
+    base = {"tests/test_a.py::t[1]", "tests/test_a.py::old"}
+    head = {"tests/test_a.py::t[1]", "tests/test_a.py::t[2]", "tests/test_a.py::u"}
+    got = rules.count_files(["tests/test_a.py"], base, head)
+    assert got == [rules.FileCount("tests/test_a.py", 2, 2, 2, 3, 2, 1)]
+
+
+def test_count_files_new_file_has_zero_base_counts():
+    got = rules.count_files(["tests/test_n.py"], set(), {"tests/test_n.py::t[1]", "tests/test_n.py::t[2]"})
+    assert got == [rules.FileCount("tests/test_n.py", 0, 1, 0, 2, 2, 0)]
+
+
+def test_count_files_deleted_file_has_zero_head_counts():
+    got = rules.count_files(["tests/test_d.py"], {"tests/test_d.py::t"}, set())
+    assert got == [rules.FileCount("tests/test_d.py", 1, 0, 1, 0, 0, 1)]
+
+
+def test_is_cross_product_true_when_ids_exceed_sum_of_axes():
+    assert rules.is_cross_product(6, {"a": 2, "b": 3}) is True
+
+
+def test_is_cross_product_false_for_two_by_two_with_four_ids():
+    assert rules.is_cross_product(4, {"a": 2, "b": 2}) is False
+
+
+def test_is_cross_product_false_for_zipped_tuple_axes():
+    assert rules.is_cross_product(3, {"a": 3, "b": 3}) is False
+
+
+def test_single_axis_over_budget_when_new_ids_exceed_budget():
+    assert rules.is_single_axis_over_budget(3, {"x": 3}, 2) is True
+
+
+def test_single_axis_within_budget_is_not_flagged():
+    assert rules.is_single_axis_over_budget(2, {"x": 2}, 2) is False
+
+
+def test_single_id_is_not_a_grid():
+    assert rules.is_single_axis_over_budget(1, {"x": 1}, 0) is False
+
+
+def test_two_axes_are_not_a_single_axis_grid():
+    assert rules.is_single_axis_over_budget(6, {"a": 2, "b": 3}, 0) is False
+
+
+def test_axes_counts_distinct_reprs_per_param_name():
+    rows = [
+        {"nodeid": "t[1-x]", "params": {"a": "1", "b": "'x'"}},
+        {"nodeid": "t[1-y]", "params": {"a": "1", "b": "'y'"}},
+        {"nodeid": "t[2-x]", "params": {"a": "2", "b": "'x'"}},
+    ]
+    assert rules.axes(rows) == {"a": 2, "b": 2}
