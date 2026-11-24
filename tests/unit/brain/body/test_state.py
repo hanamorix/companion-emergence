@@ -1,6 +1,6 @@
 """Unit tests for brain/body/state.py: the body projection rules shared by every body state.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §3.1.
 
 The session, words and contact-gap rules, the clamps and the exhaustion derivation are tested here through
 `body_state_from_short`, the one function that builds a body state. Which feelings count as high is the engine's

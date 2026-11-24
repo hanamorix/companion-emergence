@@ -1,6 +1,6 @@
 """Tests for brain.bridge.pronoun_nudge — one-time pronoun-setting nudge.
 
-Spec: docs/superpowers/specs/2026-06-11-user-pronouns-design.md §5.
+Spec: the 2026-06-11 user-pronouns design (§5), never committed and lost (#797).
 """
 from __future__ import annotations
 

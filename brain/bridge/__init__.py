@@ -1,7 +1,7 @@
 """LLM provider abstraction for companion-emergence engines.
 
 Exports LLMProvider ABC + three concrete providers + factory.
-See docs/superpowers/specs/2026-04-23-week-4-dream-engine-design.md.
+Its design (the 2026-04-23 week-4 dream-engine design) was never committed and is lost (#797).
 """
 
 from brain.bridge.provider import (

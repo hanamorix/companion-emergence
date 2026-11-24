@@ -1,7 +1,6 @@
 """Tests for soul-audit fan-out reader spanning archives.
 
-Spec: docs/superpowers/specs/2026-05-11-jsonl-log-retention-design.md
-Plan: docs/superpowers/plans/2026-05-11-jsonl-log-retention.md (Phase 3)
+Spec and plan (Phase 3): the 2026-05-11 JSONL log-retention design and plan, never committed and lost (#797).
 """
 
 from __future__ import annotations

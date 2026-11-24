@@ -5,7 +5,7 @@ system message gets a calibration block prepended summarising the
 companion's recent editorial track record. Default behaviour is
 `"stateless"` — no calibration block, D behaves exactly as in v0.0.10.
 
-Spec: docs/superpowers/specs/2026-05-13-v0.0.11-design.md
+Spec: the 2026-05-13 v0.0.11 design, never committed and lost (#797).
 """
 
 from __future__ import annotations

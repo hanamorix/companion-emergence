@@ -4,7 +4,7 @@ Loads a persona's `emotion_vocabulary.json` at engine startup and
 registers each entry with the vocabulary registry. Idempotent on
 re-register so multiple loaders in the same process don't fail.
 
-Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md
+Spec: the 2026-04-25 vocabulary-split design, never committed and lost (#797).
 """
 
 from __future__ import annotations

@@ -4,8 +4,8 @@ Third member of the Memory & time cluster (Tier 1 #1). Public surface:
     run_pass(persona_dir, *, event_bus, ...) — ArcUpdatePass orchestrator
 
 Inherits substrate from felt-time (FeltTimeState anchors + lived_age) and
-forgetting (policy.is_exempt + salience.score). See spec
-docs/superpowers/specs/2026-05-19-narrative-memory-design.md.
+forgetting (policy.is_exempt + salience.score). Its spec (the 2026-05-19
+narrative-memory design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations

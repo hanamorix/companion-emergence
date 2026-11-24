@@ -1,6 +1,7 @@
 """Research — autonomous exploration of developed interests.
 
-See docs/superpowers/specs/2026-04-24-week-4-research-engine-design.md.
+See docs/source-spec/2026-07-13-research-engine-redesign-design.md (the 2026-04-24 week-4 design it replaced was never
+committed, #797).
 This module ships the types + engine scaffold. run_tick body lands in Task 3.
 """
 

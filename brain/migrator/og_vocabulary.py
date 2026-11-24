@@ -10,7 +10,7 @@ classes uniformly:
 - Power users with runtime-registered customs — placeholder entries
   the user can refine later
 
-Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md §6
+Spec: the 2026-04-25 vocabulary-split design (§6), never committed and lost (#797).
 """
 
 from __future__ import annotations

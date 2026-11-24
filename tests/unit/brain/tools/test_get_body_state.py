@@ -1,6 +1,6 @@
 """Unit tests for the real get_body_state tool impl.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.3.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §3.3.
 """
 
 from __future__ import annotations
