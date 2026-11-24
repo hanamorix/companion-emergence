@@ -994,11 +994,16 @@ def _vocabulary_registry_restore() -> Iterator[None]:
     from brain.emotion import vocabulary
 
     saved_registry = dict(vocabulary._REGISTRY)
-    saved_owner = vocabulary.is_bridge_owner()  # a bridge app started in a test marks this process the owner
+    # The bridge-owner flag exists only in the new product code. The CI gate "new tests must fail on the old code" runs this
+    # conftest against main's product code, where the two names are absent; setup must still work there.
+    is_owner = getattr(vocabulary, "is_bridge_owner", None)
+    set_owner = getattr(vocabulary, "set_bridge_owner", None)
+    saved_owner = is_owner() if is_owner is not None else False  # a bridge app started in a test marks this process the owner
     yield
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
-    vocabulary.set_bridge_owner(saved_owner)
+    if set_owner is not None:
+        set_owner(saved_owner)
 
 
 @pytest.fixture
