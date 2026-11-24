@@ -981,6 +981,9 @@ def test_a_name_the_check_discards_is_left_out_of_the_read(tmp_path: Path, monke
     assert memory._stored_emotions == {"joy": 8.0, "stray_word": 8.0}  # the row is not rewritten
 
 
+@pytest.mark.no_base_failure(
+    reason="pins spec section 7 against the new check: the replay already kept an unknown stored name and asked nobody before the check existed; this guards that the check does not reach it"
+)
 def test_the_replay_keeps_an_unknown_stored_name_and_asks_nobody(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Spec section 7: during the replay (under the engine's lock) an unknown name on a stored memory is kept, and no call is made."""
     checks = _count_checks(monkeypatch, outcome="missing")

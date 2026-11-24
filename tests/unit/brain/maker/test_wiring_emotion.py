@@ -6,6 +6,9 @@ from brain.maker.maker import Making
 from brain.maker.wiring import making_emotion_delta
 
 
+@pytest.mark.no_base_failure(
+    reason="pins the source accent of the delta, which the filtered test it replaces already pinned; only the filter went, so this passes on the old code by design"
+)
 def test_emotion_delta_is_source_varied():
     """The delta is not filtered here (the engine's fold checks the names against her vocabulary): it is the base nudge plus the source's accent."""
     grief = making_emotion_delta(Making("elegy", "t", "c", "private", None), dominant_source="grief")
