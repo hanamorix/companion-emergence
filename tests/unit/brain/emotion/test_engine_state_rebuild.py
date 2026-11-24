@@ -161,7 +161,6 @@ def test_table_and_default_answer_under_a_variant_spelling(tmp_path: Path) -> No
     assert engine.half_life("Totally-Unknown Word") == 14.0
 
 
-@pytest.mark.no_base_failure(reason="a pin of the framework rule: on base the file entry won, so this changes with the lookup (#801 section 8)")
 def test_a_framework_name_answers_from_the_table_whatever_her_file_holds(tmp_path: Path) -> None:
     """Section 8: a core feeling takes its half-life from the framework, so a file entry for `joy` (read-only fallback) is not used."""
     _write_vocab(tmp_path, [_entry("joy", 9.0), _entry("comfort_seeking", 6.0)])
@@ -170,6 +169,7 @@ def test_a_framework_name_answers_from_the_table_whatever_her_file_holds(tmp_pat
     assert engine.half_life("comfort_seeking") == 1.0
 
 
+@pytest.mark.no_base_failure(reason="a pin that the read-only fallback leaves the file as it was: on base the engine read the same file and wrote nothing either")
 def test_no_bridge_her_file_is_read_read_only_for_the_run(tmp_path: Path) -> None:
     path = _write_vocab(tmp_path, [_entry("persona_only_word", 4.5)])
     before = path.read_bytes()
@@ -178,6 +178,7 @@ def test_no_bridge_her_file_is_read_read_only_for_the_run(tmp_path: Path) -> Non
     assert sorted(p.name for p in tmp_path.iterdir()) == [VOCAB]
 
 
+@pytest.mark.no_base_failure(reason="a pin of the old fault behavior kept: on base a file that was not JSON also left the built-in answer and was not touched")
 def test_no_bridge_and_an_unreadable_file_leave_the_built_in_answer(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     (tmp_path / VOCAB).write_text("{not json", encoding="utf-8")
     engine = _engine(tmp_path)
@@ -244,6 +245,7 @@ def test_a_half_life_that_is_not_a_finite_number_above_zero_takes_the_built_in_a
     assert name in warnings[0].getMessage()
 
 
+@pytest.mark.no_base_failure(reason="a pin of the old no-raise rule for the new source of the numbers: on base the engine had no bridge call and never raised either")
 def test_half_life_never_raises_on_a_bridge_that_answers_nonsense(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from brain.emotion import vocabulary_access
 

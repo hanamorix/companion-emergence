@@ -142,6 +142,7 @@ def test_start_up_merges_two_entries_of_one_name_under_the_first_spelling(person
     assert seen["spelling"] == "quiet dread"
 
 
+@pytest.mark.no_base_failure(reason="the other half of the twin merge: with no twin nothing is written, which is also what the code before the start-up merge did")
 def test_start_up_with_no_twin_rewrites_nothing(persona_dir: Path) -> None:
     path = persona_dir / FILE
     path.write_text(json.dumps({"version": 1, "emotions": [_entry("one_word"), _entry("Two Words")]}), encoding="utf-8")
