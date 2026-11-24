@@ -123,7 +123,19 @@ def test_run_growth_tick_skips_proposal_with_existing_name(
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-@pytest.mark.parametrize("bad_name", ["", "---", " / ", "x" * 101])
+_OLD_GATE_ALSO_REFUSED = "the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
+_OLD_GATE_ALSO_ACCEPTED = "the scheduler's old name check already accepted this name, so the row passes on the old code by design"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        pytest.param("", marks=pytest.mark.no_base_failure(reason=_OLD_GATE_ALSO_REFUSED)),
+        "---",
+        pytest.param(" / ", marks=pytest.mark.no_base_failure(reason=_OLD_GATE_ALSO_REFUSED)),
+        "x" * 101,
+    ],
+)
 def test_run_growth_tick_rejects_a_name_the_gate_refuses(persona_dir: Path, store: MemoryStore, bad_name: str) -> None:
     """A name that is empty once tidied or longer than the cap is rejected, counted, and never written."""
     _seed_vocab(persona_dir)
@@ -144,7 +156,14 @@ def test_run_growth_tick_rejects_a_name_the_gate_refuses(persona_dir: Path, stor
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-@pytest.mark.parametrize("raw_name, written", [("bad/name", "bad_name"), ("Bad Name", "bad_name"), ("x" * 100, "x" * 100)])
+@pytest.mark.parametrize(
+    "raw_name, written",
+    [
+        ("bad/name", "bad_name"),
+        ("Bad Name", "bad_name"),
+        pytest.param("x" * 100, "x" * 100, marks=pytest.mark.no_base_failure(reason=_OLD_GATE_ALSO_ACCEPTED)),
+    ],
+)
 def test_run_growth_tick_writes_an_accepted_name_in_its_tidied_form(
     persona_dir: Path, store: MemoryStore, raw_name: str, written: str
 ) -> None:

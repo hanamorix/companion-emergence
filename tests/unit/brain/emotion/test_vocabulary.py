@@ -281,7 +281,6 @@ def test_pool_by_canonical_name_pools_a_doubled_separator_spelling_with_its_twin
         ("comfort seeking", "comfort_seeking"),
         ("a+b/c", "a_b_c"),
         ("Grün Gefühl", "grün_gefühl"),
-        ("joy2", "joy2"),
     ],
 )
 def test_canonical_name_changed_outputs_are_pinned(name: str, expected: str) -> None:
@@ -307,6 +306,7 @@ def test_canonical_name_leaves_the_baseline_names_unchanged() -> None:
         assert canonical_name(emotion.name) == emotion.name
 
 
+@pytest.mark.no_base_failure(reason="tidying a tidied name changing nothing is a property the old tidier also had for these inputs and the new one must keep, so it passes on the old code by design")
 @pytest.mark.parametrize(
     "name",
     ["Grief Love Blend", "name____name", "İyi", "  _a-b ", "love_grief__blend", "---", "", "x/y_blend", "__blend", "Á b"],
@@ -363,6 +363,7 @@ def test_the_cap_is_the_dev_constant() -> None:
         ("grief_love_blend", "grief_love_blend"),
         ("comfort_seeking", "comfort_seeking"),
         ("blend", "blend"),
+        ("joy2", "joy2"),
         ("", ""),
     ],
 )
