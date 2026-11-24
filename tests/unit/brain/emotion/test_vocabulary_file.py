@@ -368,31 +368,61 @@ def _names(data: dict) -> list:
 
 
 def test_merge_keeps_the_first_in_file_spelling_with_the_later_real_description() -> None:
-    data = {"emotions": [_stub("comfort seeking"), _entry("comfort_seeking", "held still")]}
+    data = {"emotions": [_stub("tender longing"), _entry("tender_longing", "held still")]}
     pairs = vocabulary_file.merge_twin_entries(data)
-    assert pairs == [("comfort seeking", "comfort seeking")]  # the dropped placeholder, and the spelling that stays
-    assert [e["name"] for e in data["emotions"]] == ["comfort seeking"]
+    assert pairs == [("tender longing", "tender longing")]  # the dropped placeholder, and the spelling that stays
+    assert [e["name"] for e in data["emotions"]] == ["tender longing"]
     assert data["emotions"][0]["description"] == "held still"
     assert data["emotions"][0]["decay_half_life_days"] == 45.0
 
 
 def test_merge_of_two_real_twins_keeps_the_first_entry_whole() -> None:
-    first, second = _entry("comfort seeking", "one"), _entry("comfort_seeking", "two")
+    first, second = _entry("tender longing", "one"), _entry("tender_longing", "two")
     data = {"emotions": [first, second]}
-    assert vocabulary_file.merge_twin_entries(data) == [("comfort_seeking", "comfort seeking")]
-    assert data["emotions"] == [_entry("comfort seeking", "one")]
+    assert vocabulary_file.merge_twin_entries(data) == [("tender_longing", "tender longing")]
+    assert data["emotions"] == [_entry("tender longing", "one")]
 
 
 def test_merge_of_three_twins_remembers_the_first_spelling_not_the_donors() -> None:
-    data = {"emotions": [_stub("Comfort Seeking"), _stub("comfort_seeking"), _entry("COMFORT-SEEKING", "held")]}
+    data = {"emotions": [_stub("Tender Longing"), _stub("tender_longing"), _entry("TENDER-LONGING", "held")]}
     pairs = vocabulary_file.merge_twin_entries(data)
-    assert [e["name"] for e in data["emotions"]] == ["Comfort Seeking"]
+    assert [e["name"] for e in data["emotions"]] == ["Tender Longing"]
     assert data["emotions"][0]["description"] == "held"
-    assert pairs == [("Comfort Seeking", "Comfort Seeking"), ("comfort_seeking", "Comfort Seeking")]
+    assert pairs == [("Tender Longing", "Tender Longing"), ("tender_longing", "Tender Longing")]
+
+
+def test_merge_refuses_a_core_name_and_leaves_its_twins_where_they_are() -> None:
+    """A core feeling is never merged into her file (#801 section 8; SV8): the entries stay in place for the start-up removal, while
+    a non-core pair beside them still merges."""
+    core_pair = [_entry("comfort seeking", "mine"), _entry("comfort_seeking", "also mine")]
+    joy_pair = [_entry("joy", "one"), _entry("Joy", "two")]
+    data = {"emotions": [core_pair[0], _entry("tender longing", "one"), joy_pair[0], core_pair[1], _entry("tender_longing", "two"), joy_pair[1]]}
+    assert vocabulary_file.merge_twin_entries(data) == [("tender_longing", "tender longing")]
+    assert _names(data) == ["comfort seeking", "tender longing", "joy", "comfort_seeking", "Joy"]
+    assert data["emotions"][0] is core_pair[0] and data["emotions"][2] is joy_pair[0]
+
+
+def test_merge_of_a_file_holding_only_core_twins_changes_nothing_and_writes_nothing(tmp_path: Path, writes) -> None:
+    path = _write(tmp_path, [_entry("joy", "one"), _entry("Joy", "two"), _entry("comfort seeking"), _entry("comfort_seeking")])
+    before = path.read_bytes()
+    for names in (None, ["Joy"], ["comfort seeking"]):
+        result = vocabulary_file.merge(path, names)
+        assert result.pairs == [] and not result.cannot_write
+    assert path.read_bytes() == before and writes == []
+    assert vocabulary.get("joy").description == "happiness, delight, warmth"  # the registry still holds the framework's entry
+
+
+def test_merge_still_merges_a_name_over_the_gate_length(tmp_path: Path) -> None:
+    """The check is `is_baseline` only, not the writer's gate: a twin pair whose tidied name is over 100 characters merges as before."""
+    long_name = "x" * 101
+    path = _write(tmp_path, [_entry(long_name, "one"), _entry(long_name.upper(), "two")])
+    result = vocabulary_file.merge(path)
+    assert result.pairs == [(long_name.upper(), long_name)]
+    assert [e["name"] for e in _read(path)] == [long_name]
 
 
 def test_merge_leaves_a_lone_entry_alone_and_reports_nothing() -> None:
-    entries = [_entry("comfort seeking"), _entry("_grief_love_blend"), _entry("Quiet Dread")]
+    entries = [_entry("tender longing"), _entry("_grief_love_blend"), _entry("Quiet Dread")]
     data = {"emotions": [dict(e) for e in entries]}
     assert vocabulary_file.merge_twin_entries(data) == []
     assert data["emotions"] == entries
@@ -403,17 +433,17 @@ def test_merge_keeps_non_dict_nameless_and_empty_tidied_entries_in_place() -> No
     data = {
         "emotions": [
             "not an entry",
-            _entry("comfort seeking", "one"),
+            _entry("tender longing", "one"),
             nameless,
             _entry("---"),
             7,
-            _entry("comfort_seeking", "two"),
+            _entry("tender_longing", "two"),
             _entry("___"),
         ]
     }
-    assert vocabulary_file.merge_twin_entries(data) == [("comfort_seeking", "comfort seeking")]
-    assert _names(data) == ["not an entry", "comfort seeking", nameless, "---", 7, "___"]
-    assert data["emotions"][1] == _entry("comfort seeking", "one")
+    assert vocabulary_file.merge_twin_entries(data) == [("tender_longing", "tender longing")]
+    assert _names(data) == ["not an entry", "tender longing", nameless, "---", 7, "___"]
+    assert data["emotions"][1] == _entry("tender longing", "one")
     assert data["emotions"][2] is nameless
 
 

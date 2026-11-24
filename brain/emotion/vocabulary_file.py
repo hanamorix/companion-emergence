@@ -7,8 +7,8 @@ two noted exceptions to "only the bridge calls this" (section 9), call this modu
 into the registry and writes nothing.
 
 A core feeling (one of the framework's 30, `vocabulary.is_baseline`) is never written to her file (#801 section 8): `add` and
-`replace_fields` refuse it, and `remove_core_entries` takes out any entry the file holds for one, at every bridge start-up and in
-the rebuild step.
+`replace_fields` refuse it, `merge` leaves a core entry where it is (never merged into her file), and `remove_core_entries` takes
+out any entry the file holds for one, at every bridge start-up and in the rebuild step.
 
 Each change is ONE read-check-write, built once in `_transact`: the cross-process sidecar lock of the file taken with a bounded
 wait (`dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S`), the file re-read, the change applied to what was just read, a verified
@@ -350,8 +350,10 @@ def merge_twin_entries(data: dict, only: set[str] | None = None) -> list[tuple[s
     nothing was merged, and then ``data`` is untouched (a lone entry keeps its spelling: nothing is renamed). The merged entry
     takes all its fields (every key of that entry, not a mix of twins) from the first twin with a real description, else from the
     first; its name is the spelling of the twin that comes first in the file. It sits where that first twin sat. Entries that are
-    not dicts, have no string name, or have a name that tidies to nothing pass through unchanged and in place. `only`, when given,
-    is a set of tidied names: twins of any other name are left as they are.
+    not dicts, have no string name, or have a name that tidies to nothing pass through unchanged and in place. So does an entry
+    for a core feeling (`vocabulary.is_baseline` only, the check `add` and `replace_fields` use, not the gate: a name over the gate's
+    length is merged as before): a core twin is never merged into her file, it stays for the start-up removal (#801 section 8).
+    `only`, when given, is a set of tidied names: twins of any other name are left as they are.
     """
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
@@ -361,6 +363,8 @@ def merge_twin_entries(data: dict, only: set[str] | None = None) -> list[tuple[s
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
             return ""
         key = vocabulary.canonical_name(entry["name"])
+        if vocabulary.is_baseline(key):
+            return ""  # a core feeling is never merged into her file (the same check as `add`'s); the start-up removal takes it out
         return key if only is None or key in only else ""
 
     groups: dict[str, list[dict]] = {}

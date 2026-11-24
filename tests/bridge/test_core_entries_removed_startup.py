@@ -143,6 +143,26 @@ def test_a_removal_that_raises_is_logged_and_the_twin_merge_and_the_start_go_on(
     assert "the removal of core feelings" in caplog.text
 
 
+@pytest.mark.parametrize("failure", ["raises", "cannot_write"])
+def test_a_core_twin_the_failed_removal_left_is_not_merged_and_stays_for_the_next_start(persona_dir, monkeypatch, failure):
+    """SV8: the twin merge refuses a core name, so a core pair left behind by a removal that failed is never merged into her file.
+    The non-core pair beside it still merges, and the next start's removal takes the core pair out."""
+    real_remove = vocabulary_file.remove_core_entries
+
+    def failing(path):
+        if failure == "raises":
+            raise RuntimeError("a bug")
+        return vocabulary_file.CoreRemoval([], cannot_write=True)
+
+    monkeypatch.setattr(vocabulary_file, "remove_core_entries", failing)
+    _write_vocab(persona_dir, [_entry("joy", "one"), _entry("tender longing"), _entry("Joy", "two"), _entry("tender_longing")])
+    _start_bridge(persona_dir)
+    assert _names(persona_dir) == ["joy", "tender longing", "Joy"]  # the core pair is left as it was, the other pair merged
+    monkeypatch.setattr(vocabulary_file, "remove_core_entries", real_remove)
+    _start_bridge(persona_dir)
+    assert _names(persona_dir) == ["tender longing"]
+
+
 # --- the rebuild child and the nell commands ---------------------------------------------------------------------------
 
 

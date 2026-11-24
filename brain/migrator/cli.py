@@ -129,9 +129,15 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         lock_target = get_persona_dir(args.install_as)
     lock_path = _migrate_lock_path(lock_target)
     lock_fd = _acquire_migrate_lock(lock_path)
+    # The migrator is the vocabulary owner for its run (#801 section 9, SV8): no bridge serves the new work folder, so the store's
+    # owner-side check (`MemoryStore.checked`) adds the migrated memories' names to that folder's file instead of asking a bridge.
+    # The flag is put back to the value it had (False in the CLI process) on every way out, the error path included.
+    was_owner = _vocabulary.is_bridge_owner()
+    _vocabulary.set_bridge_owner(True)
     try:
         return _run_migrate_locked(args, reader)
     finally:
+        _vocabulary.set_bridge_owner(was_owner)
         _release_migrate_lock(lock_path, lock_fd)
 
 
@@ -171,11 +177,12 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
     # discarded. The folder is always empty here (`_ensure_clobber_safe` clears an `--output` folder under `--force`, and `<name>.new`
     # is removed and re-created), so the file never exists yet. `add` writes no file when no name is accepted (a source with only
     # core feelings), and refuses core feelings, which the framework holds.
-    # `vocabulary_emotions_migrated` counts the entries written.
+    # `vocabulary_emotions_migrated` counts the entries written (0 when the file could not be written).
+    # Accepted edge: when the file could not be written, the extracted descriptions, categories and half-lives are lost; the store's
+    # owner-side check keeps each name tidied on its row and later reads add plain entries for them.
     vocab_target = vocabulary_file.vocabulary_path(work_dir)
     vocabulary_emotions_migrated = 0
     vocabulary_skipped_reason: str | None = None
-    names_in_file = False  # True once her file holds the migrated names: only then can the memories' names be checked against it
     try:
         framework_baseline_names = {e.name for e in _vocabulary._BASELINE}
         vocab_entries = extract_persona_vocabulary(og_memories, framework_baseline_names=framework_baseline_names)
@@ -187,7 +194,6 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
         if failed:
             vocabulary_skipped_reason = f"migrate_error: the vocabulary file could not be written ({len(failed)} names)"
         else:
-            names_in_file = True
             vocabulary_emotions_migrated = sum(1 for r in results if r.changed)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         vocabulary_skipped_reason = f"migrate_error: {exc}"
@@ -217,9 +223,8 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            # Checked against the vocabulary written above; if that file could not be written the names stay as given, since a
-            # check against no file would discard every name outside the core set from the migrated row.
-            store.create(mem, fold=False, check_names=names_in_file)
+            # Always checked, by the store's owner-side check (this process is the owner for the run, `run_migrate`), on every path.
+            store.create(mem, fold=False)
             migrated_count += 1
     finally:
         store.close()

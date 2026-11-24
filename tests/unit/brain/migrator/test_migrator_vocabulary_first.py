@@ -171,19 +171,68 @@ def test_a_name_the_gate_refuses_is_dropped_from_the_migrated_row(home, tmp_path
     assert _stored_names(persona) == {"m1": ["held_word_vx"]}
 
 
-def test_a_vocabulary_that_cannot_be_written_loses_no_name_from_the_migrated_rows(home, tmp_path, monkeypatch) -> None:
-    """With no file the check would discard every name outside the core set, so the rows keep their names as given."""
+def _cannot_write(path, items):
+    return [vocabulary_file.NameResult(raw, None, "cannot_write") for raw, _fields in items]
 
-    def cannot_write(path, items):
-        return [vocabulary_file.NameResult(raw, None, "cannot_write") for raw, _fields in items]
 
-    monkeypatch.setattr(vocabulary_file, "add", cannot_write)
-    og = _og_source(tmp_path, [_mem("m1", {"Odd Word VX": 3.0, "joy": 1.0})])
+def test_a_vocabulary_that_cannot_be_written_still_checks_the_rows_and_keeps_the_names_tidied(home, tmp_path, monkeypatch) -> None:
+    """SV8 B1: the rows are checked on every path. With no file written the owner's check keeps each name tidied on the row (the next
+    read of that memory adds it), two spellings of one name carry their mean, a name the gate refuses is dropped with its value
+    from the stored peak and score, and nothing is lost but the extracted descriptions, categories and half-lives."""
+    monkeypatch.setattr(vocabulary_file, "add", _cannot_write)
+    og = _og_source(tmp_path, [_mem("m1", {"Odd Word VX": 3.0, "odd_word_vx": 1.0, "---": 9.0, "joy": 1.0})])
     report = _migrate(og)
     persona = get_persona_dir("testpersona")
     assert report.vocabulary_skipped_reason is not None and report.vocabulary_skipped_reason.startswith("migrate_error")
     assert report.vocabulary_emotions_migrated == 0
-    assert _stored_names(persona) == {"m1": ["Odd Word VX", "joy"]}
+    assert not (persona / VOCAB).exists()
+    assert _stored_names(persona) == {"m1": ["joy", "odd_word_vx"]}
+    conn = sqlite3.connect(persona / "memories.db")
+    try:
+        emotions_json, score, peak = conn.execute("SELECT emotions_json, score, peak_emotion_intensity FROM memories").fetchone()
+    finally:
+        conn.close()
+    assert json.loads(emotions_json) == {"joy": 1.0, "odd_word_vx": 2.0}
+    assert (score, peak) == (3.0, 2.0)
+
+
+def test_the_migrator_is_the_vocabulary_owner_while_it_creates_the_memories_and_not_after(home, tmp_path, monkeypatch) -> None:
+    og = _og_source(tmp_path, [_mem("m1", {"owner_word_vx": 3.0}), _mem("m2", {"owner_word_vx": 1.0})])
+    assert vocabulary.is_bridge_owner() is False
+    seen: list[bool] = []
+    real_create = MemoryStore.create
+
+    def spy(self, memory, **kwargs):
+        seen.append(vocabulary.is_bridge_owner())
+        return real_create(self, memory, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "create", spy)
+    _migrate(og)
+    assert seen == [True, True]
+    assert vocabulary.is_bridge_owner() is False
+
+
+def test_the_owner_flag_is_put_back_when_the_run_raises(home, tmp_path, monkeypatch) -> None:
+    og = _og_source(tmp_path, [_mem("m1", {"owner_word_vx": 3.0})])
+    seen: list[bool] = []
+
+    def boom(self, memory, **kwargs):
+        seen.append(vocabulary.is_bridge_owner())
+        raise RuntimeError("a bug mid-run")
+
+    monkeypatch.setattr(MemoryStore, "create", boom)
+    with pytest.raises(RuntimeError):
+        _migrate(og)
+    assert seen == [True]
+    assert vocabulary.is_bridge_owner() is False
+
+
+def test_the_owner_flag_goes_back_to_the_value_it_had(home, tmp_path) -> None:
+    """The flag is restored, not forced off: a caller that was the owner before the run is still the owner after it."""
+    og = _og_source(tmp_path, [_mem("m1", {"owner_word_vx": 3.0})])
+    vocabulary.set_bridge_owner(True)  # tests/conftest.py puts the flag back
+    _migrate(og)
+    assert vocabulary.is_bridge_owner() is True
 
 
 @pytest.mark.no_base_failure(reason="pins that a re-run with --force replaces the old file (the folder is cleared first); the base overwrote it too")
