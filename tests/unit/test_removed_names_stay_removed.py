@@ -907,6 +907,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="#741 / #801 (draft PR #803), build step 7",
         kind="code",
     ),
+    # --- the merge of saved feelings is one function over all the twins (#801 step 10) ---------------------------------------------
+    Removed(
+        names=("merge_emotion_states", "_merged_average"),
+        why="saved keys that land on one name are merged by one function over the list of twins (`engine_utils.merge_twin_emotion_states`), not pairwise in file order, so no twin weighs more for its place in the file; the window cut and the per-day run build it shares with `close_days` are `cut_snapshot_window` and `run_record_after`",
+        ref="#741 / #801 (draft PR #803), build step 10 (SV6)",
+        kind="code",
+    ),
 )
 
 

@@ -4,7 +4,8 @@ A feeling found only in the saved state does not exist: it is registered or drop
 runs `check_state_names` once, under the engine's state lock: every saved key gets the outcome of `vocabulary_access.names_used`
 (the section 3 outcome: a name her vocabulary holds is used under that entry, a new name that passes the gate is added through the
 shared writer, a name the gate refuses is dropped), and the key is saved as the tidied form of the matched or added name (the
-state file keys by the tidied form). Keys that land on one name are merged by `engine_utils.merge_emotion_states`.
+state file keys by the tidied form). The keys are grouped by tidied name first, and all the keys that land on one name are merged in
+one step by `engine_utils.merge_twin_emotion_states`.
 
 The pass changes names only. It writes nothing when no key changes, and it carries every other field of the state unchanged,
 `saved_at` included (the roll-forward check compares rows to `saved_at`, so a newer stamp would hide rows nobody folded). It leaves a
@@ -24,14 +25,15 @@ from pathlib import Path
 from typing import NamedTuple
 
 from brain.emotion import engine_files, vocabulary, vocabulary_access
-from brain.emotion.engine_utils import EmotionState, merge_emotion_states
+from brain.emotion.engine_utils import EmotionState, merge_twin_emotion_states
 from brain.utils.file_lock import LockTimeoutError
 
 logger = logging.getLogger(__name__)
 
 
 class StateNamesResult(NamedTuple):
-    """What the pass did: the keys it renamed to their tidied entry, merged into another key, dropped, and whether it wrote."""
+    """What the pass did: the keys it renamed to their tidied entry, the twins it folded into another key (a name held by three keys
+    counts 2), the keys it dropped, and whether it wrote."""
 
     renamed: int = 0
     merged: int = 0
@@ -58,7 +60,7 @@ def check_state_names(persona_dir: Path) -> StateNamesResult:
             return StateNamesResult()
         keys = list(state.emotions)
         spellings = vocabulary_access.names_used(persona_dir, keys)
-        emotions: dict[str, EmotionState] = {}
+        groups: dict[str, list[EmotionState]] = {}
         renamed = merged = dropped = 0
         for key in keys:
             spelling = spellings.get(key)
@@ -69,12 +71,14 @@ def check_state_names(persona_dir: Path) -> StateNamesResult:
             tidied = vocabulary.canonical_name(spelling)
             if tidied != key:
                 renamed += 1
-            held = emotions.get(tidied)
-            if held is None:
-                emotions[tidied] = state.emotions[key]
+            groups.setdefault(tidied, []).append(state.emotions[key])
+        emotions: dict[str, EmotionState] = {}
+        for tidied, twins in groups.items():
+            if len(twins) == 1:
+                emotions[tidied] = twins[0]
             else:
-                emotions[tidied] = merge_emotion_states(held, state.emotions[key])
-                merged += 1
+                emotions[tidied] = merge_twin_emotion_states(twins)
+                merged += len(twins) - 1  # the twins folded into the first, not the names merged
         if not (renamed or merged or dropped):
             return StateNamesResult()
         if not engine_files.save_state(persona_dir, replace(state, emotions=emotions), verify=True):

@@ -1,6 +1,6 @@
 """The check on the feeling names in `emotion_state.json` at bridge start-up (#801 section 7, acceptance criterion 8).
 
-`engine_utils.merge_emotion_states` (the merge of two saved feelings that land on one name) and
+`engine_utils.merge_twin_emotion_states` (the merge of the saved feelings that land on one name) and
 `engine_state_names.check_state_names` / `run_state_names_pass` (the pass), on synthetic personas in tmp. The pass is the owner's, so
 the tests set the bridge-owner flag (the registry is restored after each test by the autouse fixture in tests/conftest.py).
 """
@@ -23,7 +23,7 @@ from brain.emotion.engine_utils import (
     RepeatEntry,
     RunRecord,
     SnapshotDay,
-    merge_emotion_states,
+    merge_twin_emotion_states,
 )
 from tests.unit.brain.emotion._engine_support import NOW, OtherHolder, save_as_backup
 
@@ -39,37 +39,42 @@ def _snap(day: str, short: float, long: float, felt: bool = False, run: RunRecor
     return SnapshotDay(day, short, long, felt, run)
 
 
+def _pair(first: EmotionState, second: EmotionState) -> EmotionState:
+    """The merge of a pair: the list function over two twins (the pair is the case of two)."""
+    return merge_twin_emotion_states([first, second])
+
+
 # ---------------------------------------------------------------------------------------------
 # The merge of two saved feelings
 # ---------------------------------------------------------------------------------------------
 
 
 def test_the_averages_are_the_weighted_means_with_the_weights_added() -> None:
-    merged = merge_emotion_states(_emotion((4.0, 1.0), (2.0, 1.0)), _emotion((8.0, 3.0), (6.0, 1.0)))
+    merged = _pair(_emotion((4.0, 1.0), (2.0, 1.0)), _emotion((8.0, 3.0), (6.0, 1.0)))
     assert merged.short == Average(7.0, 4.0)
     assert merged.long == Average(4.0, 2.0)
 
 
 def test_two_weights_of_zero_keep_the_first_and_a_first_weight_of_zero_takes_the_second() -> None:
-    both_zero = merge_emotion_states(_emotion((4.0, 0.0), (2.0, 0.0)), _emotion((8.0, 0.0), (6.0, 0.0)))
+    both_zero = _pair(_emotion((4.0, 0.0), (2.0, 0.0)), _emotion((8.0, 0.0), (6.0, 0.0)))
     assert both_zero.short == Average(4.0, 0.0)
     assert both_zero.long == Average(2.0, 0.0)
-    first_zero = merge_emotion_states(_emotion((4.0, 0.0), (2.0, 0.0)), _emotion((8.0, 2.0), (6.0, 2.0)))
+    first_zero = _pair(_emotion((4.0, 0.0), (2.0, 0.0)), _emotion((8.0, 2.0), (6.0, 2.0)))
     assert first_zero.short == Average(8.0, 2.0)
     assert first_zero.long == Average(6.0, 2.0)
 
 
 def test_the_later_last_entry_day_is_kept_and_a_missing_one_loses() -> None:
-    assert merge_emotion_states(_emotion((1.0, 1.0), (1.0, 1.0), D[3]), _emotion((1.0, 1.0), (1.0, 1.0), D[9])).last_entry_day == D[9]
-    assert merge_emotion_states(_emotion((1.0, 1.0), (1.0, 1.0), D[9]), _emotion((1.0, 1.0), (1.0, 1.0), D[3])).last_entry_day == D[9]
-    assert merge_emotion_states(_emotion((1.0, 1.0), (1.0, 1.0), None), _emotion((1.0, 1.0), (1.0, 1.0), D[3])).last_entry_day == D[3]
-    assert merge_emotion_states(_emotion((1.0, 1.0), (1.0, 1.0), None), _emotion((1.0, 1.0), (1.0, 1.0), None)).last_entry_day is None
+    assert _pair(_emotion((1.0, 1.0), (1.0, 1.0), D[3]), _emotion((1.0, 1.0), (1.0, 1.0), D[9])).last_entry_day == D[9]
+    assert _pair(_emotion((1.0, 1.0), (1.0, 1.0), D[9]), _emotion((1.0, 1.0), (1.0, 1.0), D[3])).last_entry_day == D[9]
+    assert _pair(_emotion((1.0, 1.0), (1.0, 1.0), None), _emotion((1.0, 1.0), (1.0, 1.0), D[3])).last_entry_day == D[3]
+    assert _pair(_emotion((1.0, 1.0), (1.0, 1.0), None), _emotion((1.0, 1.0), (1.0, 1.0), None)).last_entry_day is None
 
 
 def test_a_snapshot_day_in_both_is_averaged_and_felt_if_either_and_the_runs_are_recomputed() -> None:
     first = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 1.0, 1.0), _snap(D[1], 2.0, 2.0, felt=True), _snap(D[2], 3.0, 3.0)])
     second = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[1], 6.0, 4.0), _snap(D[3], 5.0, 5.0, felt=True)])
-    merged = merge_emotion_states(first, second)
+    merged = _pair(first, second)
     assert [(d.day, d.short, d.long, d.felt) for d in merged.snapshot] == [
         (D[0], 1.0, 1.0, False),
         (D[1], 4.0, 3.0, True),
@@ -88,7 +93,7 @@ def test_a_snapshot_day_in_both_is_averaged_and_felt_if_either_and_the_runs_are_
 def test_a_calendar_day_between_two_snapshot_days_is_a_zero_move_in_the_recomputed_run() -> None:
     first = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 1.0, 1.0), _snap(D[1], 2.0, 2.0)])
     second = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[4], 3.0, 3.0)])
-    merged = merge_emotion_states(first, second)
+    merged = _pair(first, second)
     assert [d.day for d in merged.snapshot] == [D[0], D[1], D[4]]
     # D1 starts a rising run; D2 and D3 (off days) are two zero moves against it, which end it; D4 starts a new run.
     assert [d.run for d in merged.snapshot] == [None, RunRecord(D[1], 1, D[1]), RunRecord(D[4], 1, D[4])]
@@ -99,10 +104,10 @@ def test_the_oldest_kept_day_keeps_the_run_it_was_stored_with_the_first_ones_bef
     other = RunRecord(D[1], -1, D[2])
     first = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0, run=stored)])
     second = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0, run=other), _snap(D[3], 2.0, 2.0)])
-    merged = merge_emotion_states(first, second)
+    merged = _pair(first, second)
     assert merged.snapshot[0].run == stored
     assert merged.snapshot[1].run == RunRecord(D[0], 1, D[3])  # the carried run goes on from the stored record
-    only_second = merge_emotion_states(_emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0)]), second)
+    only_second = _pair(_emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0)]), second)
     assert only_second.snapshot[0].run == other
 
 
@@ -110,7 +115,7 @@ def test_the_window_is_applied_to_the_merged_snapshot_from_its_latest_day() -> N
     window = int(dev_constants.EMOTION_LONG_HALF_LIFE_D)
     first = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 1.0, 1.0), _snap(D[window - 1], 1.0, 1.0)])
     second = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[window], 1.0, 1.0)])
-    merged = merge_emotion_states(first, second)
+    merged = _pair(first, second)
     # D[window] is the latest day: D[0] is `window` days before it and goes; D[window - 1] stays.
     assert [d.day for d in merged.snapshot] == [D[window - 1], D[window]]
 
@@ -119,8 +124,108 @@ def test_the_merge_changes_neither_input() -> None:
     first = _emotion((4.0, 1.0), (2.0, 1.0), D[1], [_snap(D[0], 1.0, 1.0), _snap(D[1], 2.0, 2.0)])
     second = _emotion((8.0, 3.0), (6.0, 1.0), D[2], [_snap(D[1], 4.0, 4.0)])
     before = (repr(first), repr(second))
-    merge_emotion_states(first, second)
+    _pair(first, second)
     assert (repr(first), repr(second)) == before
+
+
+# SV6 item 3: one merge over the list of twins (the pair is the case of two).
+
+
+def test_three_twins_are_the_weighted_mean_over_all_of_them() -> None:
+    merged = merge_twin_emotion_states([_emotion((2.0, 1.0), (1.0, 1.0)), _emotion((4.0, 1.0), (3.0, 1.0)), _emotion((6.0, 2.0), (5.0, 2.0))])
+    assert merged.short == Average(4.5, 4.0)  # (2 + 4 + 6 x 2) / 4
+    assert merged.long == Average(3.5, 4.0)  # (1 + 3 + 5 x 2) / 4
+
+
+def test_a_snapshot_day_held_by_three_twins_is_the_plain_mean_of_all_three_and_felt_if_any_was() -> None:
+    twins = [
+        _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 3.0, 3.0)]),
+        _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 6.0, 6.0, felt=True)]),
+        _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 9.0, 9.0)]),
+    ]
+    merged = merge_twin_emotion_states(twins)
+    # Folding pairwise in file order would give ((3 + 6) / 2 + 9) / 2 = 6.75: the later twin would weigh more.
+    assert [(d.day, d.short, d.long, d.felt) for d in merged.snapshot] == [(D[0], 6.0, 6.0, True)]
+
+
+def test_a_weight_of_zero_adds_nothing_to_the_averages_but_its_snapshot_days_count_in_the_plain_mean() -> None:
+    zero = _emotion((9.0, 0.0), (9.0, 0.0), snapshot=[_snap(D[0], 9.0, 9.0)])
+    live = _emotion((2.0, 1.0), (2.0, 1.0), snapshot=[_snap(D[0], 3.0, 3.0)])
+    merged = merge_twin_emotion_states([live, zero, _emotion((4.0, 1.0), (4.0, 1.0))])
+    assert merged.short == Average(3.0, 2.0)
+    assert merged.long == Average(3.0, 2.0)
+    assert [(d.short, d.long) for d in merged.snapshot] == [(6.0, 6.0)]  # (3 + 9) / 2: the zero-weight twin's day counts
+
+
+def test_three_weights_of_zero_keep_the_first_twin() -> None:
+    merged = merge_twin_emotion_states([_emotion((4.0, 0.0), (2.0, 0.0)), _emotion((8.0, 0.0), (6.0, 0.0)), _emotion((1.0, 0.0), (1.0, 0.0))])
+    assert merged.short == Average(4.0, 0.0)
+    assert merged.long == Average(2.0, 0.0)
+
+
+def test_the_latest_last_entry_day_across_three_twins_is_kept() -> None:
+    twins = [_emotion((1.0, 1.0), (1.0, 1.0), day) for day in (D[3], D[9], None)]
+    assert merge_twin_emotion_states(twins).last_entry_day == D[9]
+    assert merge_twin_emotion_states([twins[2], twins[0], twins[2]]).last_entry_day == D[3]
+
+
+def test_the_oldest_kept_day_keeps_the_first_stored_run_among_the_twins_holding_that_day() -> None:
+    mine = RunRecord(D[0], 1, D[2])
+    later = RunRecord(D[1], -1, D[2])
+    twins = [
+        _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0)]),
+        _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0, run=mine)]),
+        _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[2], 1.0, 1.0, run=later)]),
+    ]
+    assert merge_twin_emotion_states(twins).snapshot[0].run == mine
+
+
+def test_a_later_day_gets_its_run_from_the_tracker_not_from_the_one_it_was_stored_with() -> None:
+    stale = RunRecord(D[0], -1, D[1])
+    first = _emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 1.0, 1.0), _snap(D[1], 2.0, 2.0, run=stale)])
+    merged = merge_twin_emotion_states([first, _emotion((1.0, 1.0), (1.0, 1.0))])
+    assert merged.snapshot[1].run == RunRecord(D[1], 1, D[1])
+
+
+def test_the_list_merge_changes_no_input_and_takes_at_least_one_twin() -> None:
+    twins = [
+        _emotion((4.0, 1.0), (2.0, 1.0), D[1], [_snap(D[0], 1.0, 1.0), _snap(D[1], 2.0, 2.0)]),
+        _emotion((8.0, 3.0), (6.0, 1.0), D[2], [_snap(D[1], 4.0, 4.0)]),
+        _emotion((1.0, 2.0), (1.0, 2.0), D[3], [_snap(D[1], 5.0, 5.0)]),
+    ]
+    before = [repr(t) for t in twins]
+    merge_twin_emotion_states(twins)
+    assert [repr(t) for t in twins] == before
+    with pytest.raises(ValueError):
+        merge_twin_emotion_states([])
+
+
+# SV6 item 2: the window cut and the per-day run build are one helper each, called by close_days and by the merge.
+
+
+def test_close_days_and_the_merge_use_the_same_two_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.emotion import engine_utils
+
+    calls: list[str] = []
+    real_cut = engine_utils.cut_snapshot_window
+    real_run = engine_utils.run_record_after
+    monkeypatch.setattr(engine_utils, "cut_snapshot_window", lambda *a, **k: (calls.append("cut"), real_cut(*a, **k))[1])
+    monkeypatch.setattr(engine_utils, "run_record_after", lambda *a, **k: (calls.append("run"), real_run(*a, **k))[1])
+
+    state = EngineState(
+        last_update=NOW,
+        active_day=D[1],
+        emotions={"joy": _emotion((1.0, 1.0), (2.0, 1.0), D[1], [_snap(D[0], 1.0, 1.0)])},
+    )
+    engine_utils.close_days(state, engine_utils._day_start(D[2]))
+    assert sorted(set(calls)) == ["cut", "run"]
+    assert [d.day for d in state.emotions["joy"].snapshot] == [D[0], D[1]]
+
+    calls.clear()
+    merge_twin_emotion_states(
+        [_emotion((1.0, 1.0), (1.0, 1.0), snapshot=[_snap(D[0], 1.0, 1.0), _snap(D[1], 2.0, 2.0)]), _emotion((1.0, 1.0), (1.0, 1.0))]
+    )
+    assert sorted(set(calls)) == ["cut", "run"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -178,6 +283,45 @@ def test_a_saved_state_with_joy_and_Joy_ends_with_one_joy_key_holding_the_weight
     assert emotions["joy"].short == Average(7.0, 4.0)
     assert emotions["joy"].long == Average(4.0, 2.0)
     assert emotions["joy"].last_entry_day == D[4]
+
+
+def test_three_keys_on_one_name_are_merged_in_one_step_and_the_merged_count_counts_the_twins_folded(tmp_path: Path) -> None:
+    persona = _persona(
+        tmp_path,
+        {
+            "joy": _emotion((2.0, 1.0), (1.0, 1.0), D[2], [_snap(D[0], 3.0, 3.0)]),
+            "Joy": _emotion((4.0, 1.0), (3.0, 1.0), D[3], [_snap(D[0], 6.0, 6.0)]),
+            "JOY": _emotion((6.0, 2.0), (5.0, 2.0), D[1], [_snap(D[0], 9.0, 9.0)]),
+            "grief": _emotion((1.0, 1.0), (1.0, 1.0)),
+        },
+    )
+    result = engine_state_names.check_state_names(persona)
+    assert (result.renamed, result.merged, result.dropped, result.written) == (2, 2, 0, True)
+    emotions = _state(persona).emotions
+    assert list(emotions) == ["joy", "grief"]
+    assert emotions["joy"].short == Average(4.5, 4.0)
+    assert emotions["joy"].long == Average(3.5, 4.0)
+    assert emotions["joy"].last_entry_day == D[3]
+    assert [(d.short, d.long) for d in emotions["joy"].snapshot] == [(6.0, 6.0)]
+
+
+def test_keys_are_grouped_by_their_tidied_name_before_the_merge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    persona = _persona(
+        tmp_path,
+        {
+            "Comfort Seeking": _emotion((2.0, 1.0), (2.0, 1.0)),
+            "grief": _emotion((1.0, 1.0), (1.0, 1.0)),
+            "comfort_seeking": _emotion((4.0, 1.0), (4.0, 1.0)),
+        },
+    )
+    groups: list[int] = []
+    real = engine_state_names.merge_twin_emotion_states
+    monkeypatch.setattr(engine_state_names, "merge_twin_emotion_states", lambda twins: (groups.append(len(twins)), real(twins))[1])
+    result = engine_state_names.check_state_names(persona)
+    assert groups == [2]  # one call, with both twins of the one name; a name held once is not merged
+    assert (result.merged, result.written) == (1, True)
+    assert list(_state(persona).emotions) == ["comfort_seeking", "grief"]
+    assert _state(persona).emotions["comfort_seeking"].short == Average(3.0, 2.0)
 
 
 def test_a_key_the_gate_refuses_is_dropped_and_the_others_stay(tmp_path: Path) -> None:
