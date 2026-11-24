@@ -1,6 +1,6 @@
 """Pronoun core — presets, resolve fallback, verb agreement.
 
-Spec: docs/superpowers/specs/2026-06-11-user-pronouns-design.md §1.
+Spec: the 2026-06-11 user-pronouns design (§1), never committed and lost (#797).
 """
 from brain.pronouns import DEFAULT_KEY, PRESETS, resolve
 

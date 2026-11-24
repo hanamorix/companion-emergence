@@ -13,7 +13,7 @@ Idempotent in the simple sense: re-running overwrites with the same content.
 The migrator's --force flag handles the broader install-rerun case at a
 higher level (backup + atomic rename of the whole persona dir).
 
-See docs/superpowers/specs/2026-05-04-migrator-legacy-preservation-design.md.
+Its design (the 2026-05-04 migrator legacy-preservation design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations

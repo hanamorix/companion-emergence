@@ -1,6 +1,6 @@
 """brain.forgetting — composite salience + state machine + graveyard.
 
-Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md
+Spec: the 2026-05-18 forgetting design, never committed and lost (#797).
 """
 
 from __future__ import annotations

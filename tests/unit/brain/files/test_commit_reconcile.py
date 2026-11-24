@@ -2,7 +2,8 @@
 """#344 — a record stranded in 'committing' (crash between the #101 claim and the
 final 'committed' mark) is reconciled against the target file, never retried.
 
-Criteria are docs/guarded-change/pending-committing-recovery/1.5-criteria.md.
+The criteria are the #344 guarded-change criteria, a private record that is not
+committed (#797).
 The through-the-supervisor tests (C1, C2, C11, C15) live in
 tests/bridge/test_supervisor_pending_sweep.py.
 """

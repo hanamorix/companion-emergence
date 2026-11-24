@@ -18,7 +18,7 @@ Schema deltas handled:
 Skipping rule: candidates without a memory_id are skipped (cannot link
 to source memory). Counted in skipped_missing_memory_id tally.
 
-See docs/superpowers/specs/2026-05-05-migrator-soul-candidates-and-reflex-log-design.md.
+Its design (the 2026-05-05 migrator soul-candidates and reflex-log design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations

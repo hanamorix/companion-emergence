@@ -5,7 +5,7 @@ handle_recall_touch is wired into:
   - tools.dispatch._dispatch_recall_forgotten (Nell's own tool calls)
   - narrative_memory.__init__ membership refresh (internal arc touch)
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md §3 + §6
+Spec: the 2026-05-19 grief design (§3 + §6), never committed and lost (#797).
 """
 
 from __future__ import annotations

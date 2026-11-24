@@ -1,6 +1,6 @@
 # 1 — Spec (persisted-cadence, defer #21)
 
-Full design: `docs/superpowers/specs/2026-06-23-persisted-cadence-design.md`.
+Full design: the 2026-06-23 persisted-cadence design, never committed and lost (#797). This spec is the record.
 
 **Problem.** `run_folded` (`brain/bridge/supervisor.py`) paces the
 `voice_reflection`, `maintenance` (forgetting+narrative), and `finalize`

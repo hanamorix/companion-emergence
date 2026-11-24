@@ -1561,8 +1561,8 @@ def test_timeout_is_still_the_error_when_the_audit_itself_fails(tmp_path, tools,
 # ---------------------------------------------------------------------------
 
 # Captured from `origin/main` (87d68621) on 2026-10-15 by running the text branch with a
-# stubbed `subprocess.run` (see docs/guarded-change/provider-audit-356-358-380/8-harness/
-# c2-argv-old.json); the system-prompt file path is normalised to <TMPFILE>. The budget is
+# stubbed `subprocess.run` (the capture was kept with the #356/#358/#380 guarded-change harness
+# record, never committed and lost, #797); the system-prompt file path is normalised to <TMPFILE>. The budget is
 # derived, so retuning it does not break this pin; every other token is pinned.
 def _old_text_argv() -> list[str]:
     return [

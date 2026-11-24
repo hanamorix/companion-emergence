@@ -5,7 +5,7 @@ The brain has a body. Body emotions live in the emotion vocabulary
 The *projections* (energy, temperature, exhaustion) are computed
 fresh on each call — no persistence, no cache, no parallel state.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.1.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §3.1.
 """
 
 from __future__ import annotations

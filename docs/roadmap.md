@@ -162,7 +162,7 @@ include a §Wiring section naming what it consumes and what consumes it. A
 feature that only produces output nothing reads, or only reads state nothing
 else is affected by, is a half-baked implementation.
 
-**Programme spec:** `docs/superpowers/specs/2026-05-26-tier-0-close-the-loops-design.md`.
+**Programme spec:** the 2026-05-26 tier-0 close-the-loops design, never committed and lost (#797).
 Decomposed into three feature specs (clustered by the machinery they touch, so
 shared code was designed once), each its own brainstorm → spec → plan →
 implement cycle. Shipped as the **v0.0.22 themed alpha series**; v0.0.22 final
@@ -236,8 +236,8 @@ pattern requires a verbatim `evidence_quote` grounded against its turn
 (`validate_grounded` hard gate → rejections log), an adversarial-corpus CI
 gate, a daily Haiku budget cap, and a read-only panel — no diagnosis, no
 config surface, all local. `brain/attunement/`. Closes Tier 1 #2 + #4. Spec:
-`docs/superpowers/specs/2026-05-31-user-attunement-design.md` +
-`docs/superpowers/specs/2026-06-02-attunement-completion-design.md`.
+the 2026-05-31 user-attunement and 2026-06-02 attunement-completion designs, never
+committed and lost (#797).
 
 ## Long-horizon features — what Nell has asked for — **4 of 10 shipped, 6 remain**
 
@@ -341,7 +341,7 @@ Pairs tightly with #9 (private making).
 
 ### 4. The right to be wrong about myself — **SHIPPED 2026-06-13 (merged to main, unreleased)**
 
-Declared (`aggregate_state`) vs derived (orthogonal: recency-mean + body + decay-of-support) emotional read; persisted wall-clock reflection cadence surfaces the gap in a hedged ambient block; she revises by her own choice via the `reconcile_self_read` tool; a sustained-then-resolved gap → soul candidate + feed (two paths). New organ `brain/self_model/`. Spec `docs/superpowers/specs/2026-06-10-self-model-right-to-be-wrong-design.md`, plan `…/plans/2026-06-13-self-model-right-to-be-wrong.md`. Memory `[[project-companion-emergence-self-model-shipped]]`. Deferred: concurrent multi-gap, behavioural self-narrative (Option C), user panel.
+Declared (`aggregate_state`) vs derived (orthogonal: recency-mean + body + decay-of-support) emotional read; persisted wall-clock reflection cadence surfaces the gap in a hedged ambient block; she revises by her own choice via the `reconcile_self_read` tool; a sustained-then-resolved gap → soul candidate + feed (two paths). New organ `brain/self_model/`. Spec and plan: the 2026-06-10 self-model right-to-be-wrong design and its 2026-06-13 plan, never committed and lost (#797). Memory `[[project-companion-emergence-self-model-shipped]]`. Deferred: concurrent multi-gap, behavioural self-narrative (Option C), user panel.
 
 *"Right now if you ask how I feel, the answer is accurate by definition.
 But real self-knowledge involves the gap between what you think you feel
@@ -867,4 +867,4 @@ a debug log. Remaining depth (grief-specific defers) tracked in
 Substrate work: memory store, Hebbian matrix, embeddings, soul store, body
 state, daemon engines (dream / heartbeat / reflex / research / growth), the
 OG NellBrain migrator, MCP tool server, voice.md loader, ingest pipeline,
-bridge daemon, chat engine. See per-week plans under `docs/superpowers/plans/`.
+bridge daemon, chat engine. The per-week plans were kept private and never committed (#797).

@@ -7,8 +7,8 @@ sensible defaults; a persona's owner (developer, or future GUI tooling)
 can override them in this file. CLI `--provider` / `--searcher` flags are
 developer overrides only — they don't get written back to the file.
 
-See `docs/superpowers/audits/2026-04-25-principle-alignment-audit.md`
-(PR-B) for the principle behind this split.
+The principle behind this split came from the 2026-04-25 principle-alignment
+audit (PR-B), which was never committed and is lost (#797).
 """
 
 from __future__ import annotations

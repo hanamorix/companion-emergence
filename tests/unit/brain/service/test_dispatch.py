@@ -48,9 +48,12 @@ def test_current_backend_returns_windows_service_on_windows(monkeypatch) -> None
 
 
 def test_current_backend_unknown_platform_raises(monkeypatch) -> None:
-    """Anything outside darwin/linux/win* raises with a hint."""
+    """Anything outside darwin/linux/win* raises with a hint: the supported targets, named in the message itself (the plan it
+    used to point at was never committed, #797)."""
     monkeypatch.setattr(service_pkg, "current_platform", lambda: "freebsd13")
     with pytest.raises(UnsupportedPlatformError) as exc:
         current_backend()
-    assert "freebsd13" in str(exc.value)
-    assert "plan" in str(exc.value).lower()
+    message = str(exc.value)
+    assert "freebsd13" in message
+    for target in ("macOS (launchd)", "Linux (systemd --user)", "Windows"):
+        assert target in message

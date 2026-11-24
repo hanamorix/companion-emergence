@@ -4,7 +4,7 @@
  * already visible. Owns no state; defers to useRestartBridge for the
  * full restart choreography.
  *
- * Spec: docs/superpowers/specs/2026-05-17-bridge-restart-button-design.md
+ * Spec: the 2026-05-17 bridge-restart-button design, never committed and lost (#797).
  * §3 (frontend), §5 (labels), §6 (re-entry guard).
  */
 

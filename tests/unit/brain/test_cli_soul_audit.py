@@ -1,6 +1,6 @@
 """Tests for `nell soul audit` and `nell soul audit --full`.
 
-Spec: docs/superpowers/specs/2026-05-11-jsonl-log-retention-design.md (Phase 5)
+Spec: the 2026-05-11 JSONL log-retention design (Phase 5), never committed and lost (#797).
 """
 
 from __future__ import annotations
