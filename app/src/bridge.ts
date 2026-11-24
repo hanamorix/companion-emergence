@@ -137,6 +137,9 @@ export interface PersonaState {
     reflex: InteriorEntry | null;
   };
   soul_highlight: SoulHighlight | null;
+  /** The highest-resonance crystallization, when it is not soul_highlight (which is the newest, #637).
+   *  Optional so an older bridge build, which does not send it, shows no strongest line. */
+  soul_strongest?: SoulHighlight | null;
   connection: {
     provider: string | null;
     /** The model the chat job runs right now (the install-wide setting, or its shipped default after a rejection),

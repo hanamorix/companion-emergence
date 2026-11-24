@@ -30,6 +30,7 @@ def test_build_persona_state_fresh_persona_returns_safe_shape(tmp_path: Path) ->
         "reflex": None,
     }
     assert state["soul_highlight"] is None
+    assert state["soul_strongest"] is None
     assert state["mode"] == "live"
 
 
@@ -163,41 +164,78 @@ def test_build_persona_state_interior_corrupt_daemon_state_fails_soft(tmp_path: 
     }
 
 
-def test_build_persona_state_soul_highlight_picks_highest_resonance(tmp_path: Path) -> None:
-    """Highlight = highest-resonance crystallization, ties broken by recency."""
+def _crystallize(persona_dir: Path, *moments: tuple[str, int, datetime]) -> None:
+    """Store one active crystallization per (moment, resonance, crystallized_at)."""
     import uuid
 
     from brain.soul.crystallization import Crystallization
     from brain.soul.store import SoulStore
 
+    store = SoulStore(persona_dir / "crystallizations.db")
+    try:
+        for moment, resonance, when in moments:
+            store.create(
+                Crystallization(
+                    id=str(uuid.uuid4()),
+                    moment=moment,
+                    love_type="belonging",
+                    why_it_matters="x",
+                    who_or_what="hana",
+                    resonance=resonance,
+                    crystallized_at=when,
+                )
+            )
+    finally:
+        store.close()
+
+
+def test_637_the_soul_highlight_is_the_newest_crystallization_and_the_strongest_is_shown_beside_it(tmp_path: Path) -> None:
+    """#637: an old resonance-10 moment kept the Soul tab on itself for good. The highlight is now the newest moment, and
+    the strongest (highest resonance, the most recent of a tie) is returned beside it."""
     persona_dir = tmp_path / "nell"
     persona_dir.mkdir()
-    store = SoulStore(persona_dir / "crystallizations.db")
-    older = datetime(2026, 1, 1, tzinfo=UTC)
-    newer = datetime(2026, 5, 5, tzinfo=UTC)
-    for moment, love_type, resonance, when in [
-        ("low resonance memory", "platonic", 7, older),
-        ("old high resonance", "romantic", 9, older),
-        ("recent high resonance — winner", "belonging", 9, newer),
-    ]:
-        store.create(
-            Crystallization(
-                id=str(uuid.uuid4()),
-                moment=moment,
-                love_type=love_type,
-                why_it_matters="x",
-                who_or_what="hana",
-                resonance=resonance,
-                crystallized_at=when,
-            )
-        )
-    store.close()
+    _crystallize(
+        persona_dir,
+        ("an earlier resonance-10 moment", 10, datetime(2026, 9, 1, tzinfo=UTC)),
+        ("the later resonance-10 moment", 10, datetime(2026, 9, 10, tzinfo=UTC)),
+        ("a newer resonance-7 moment", 7, datetime(2026, 11, 22, tzinfo=UTC)),
+        ("a resonance-8 moment in between", 8, datetime(2026, 10, 15, tzinfo=UTC)),
+    )
 
     state = build_persona_state(persona_dir)
-    highlight = state["soul_highlight"]
-    assert highlight is not None
-    assert highlight["resonance"] == 9
-    assert "winner" in highlight["moment"]
+
+    assert state["soul_highlight"]["moment"] == "a newer resonance-7 moment"
+    assert state["soul_highlight"]["resonance"] == 7
+    assert state["soul_strongest"]["moment"] == "the later resonance-10 moment"
+    assert state["soul_strongest"]["resonance"] == 10
+    assert set(state["soul_strongest"]) == set(state["soul_highlight"])
+
+
+def test_637_no_strongest_moment_when_the_newest_is_also_the_strongest(tmp_path: Path) -> None:
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    _crystallize(
+        persona_dir,
+        ("an older moment", 6, datetime(2026, 9, 1, tzinfo=UTC)),
+        ("the newest moment, also the strongest", 9, datetime(2026, 11, 22, tzinfo=UTC)),
+    )
+
+    state = build_persona_state(persona_dir)
+
+    assert state["soul_highlight"]["moment"] == "the newest moment, also the strongest"
+    assert state["soul_strongest"] is None
+
+
+def test_637_two_moments_crystallized_at_the_same_time_show_the_stronger_one(tmp_path: Path) -> None:
+    persona_dir = tmp_path / "nell"
+    persona_dir.mkdir()
+    when = datetime(2026, 11, 22, tzinfo=UTC)
+    _crystallize(persona_dir, ("the weaker one", 6, when), ("the stronger one", 8, when))
+
+    state = build_persona_state(persona_dir)
+
+    assert state["soul_highlight"]["moment"] == "the stronger one"
+    assert state["soul_strongest"] is None
 
 
 def test_build_persona_state_does_not_raise_on_corrupt_dbs(tmp_path: Path) -> None:
@@ -212,6 +250,7 @@ def test_build_persona_state_does_not_raise_on_corrupt_dbs(tmp_path: Path) -> No
     assert "body" in state
     assert "interior" in state
     assert "soul_highlight" in state
+    assert state["soul_strongest"] is None
     assert state["mode"] == "live"
 
 
