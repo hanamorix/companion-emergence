@@ -163,7 +163,11 @@ def reload_copy(path: Path) -> None:
 
 def _load_followed(path: Path, *, store: MemoryStore | None, read_only: bool) -> tuple[int, BrainAnomaly | None]:
     """The body of `load_persona_vocabulary_with_anomaly`, run with the check off and the copy already followed (stale)."""
-    if file_ops.stat_path(path) is None:
+    try:
+        present = file_ops.stat_path(path) is not None
+    except OSError:
+        return 0, None  # cannot say whether the file is there (what `path.exists()` answered before): nothing loaded, the copy stays stale
+    if not present:
         # An absent file: the copy matches that too (every non-framework entry goes), then the rebuild from memories when a store is given.
         registered = vocabulary_file.reload_entries(vocabulary_file.default_vocabulary())
         vocabulary.note_copy_key(path, None)

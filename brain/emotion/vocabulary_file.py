@@ -262,12 +262,19 @@ def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
                 # A registry error is kept apart from the file errors handled below: the file is written, so it is not a
                 # `cannot_write`, and it is raised once the lock is released.
                 with _REGISTRY_LOCK:
-                    try:
-                        registry_step()
-                    except Exception as exc:  # noqa: BLE001  re-raised below, after the file lock is released
-                        registry_error = exc
-                    else:
-                        _note_written_key(path, None if res.outcome == "missing" else res.sig, data)
+                    # Decided HERE, under the registry lock (D6 M1): the copy still matches the file this write started from
+                    # (`res.sig`, the key of the bytes read under the file lock; None for an absent file), or no copy of it is
+                    # followed. A reader thread's reload that ran after the read above noted its own key inside this lock, so the
+                    # check sees the mismatch. Then the step is SKIPPED, not only the key: the copy was rebuilt from the file
+                    # after this write's read (or was already behind it), so it already holds, or the next read reloads, what the
+                    # file now holds, this write included; applying the step would put an entry in the copy the file may lack.
+                    if vocabulary.copy_matches(path, None if res.outcome == "missing" else res.sig):
+                        try:
+                            registry_step()
+                        except Exception as exc:  # noqa: BLE001  re-raised below, after the file lock is released
+                            registry_error = exc
+                        else:
+                            _note_written_key(path, data)
     except (OSError, ValueError) as exc:
         logger.warning("vocabulary: %s of %s failed (%s: %s); the file and the registry are as they were", action, path.name, type(exc).__name__, exc)
         return None, False
@@ -276,21 +283,18 @@ def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
     return payload, True
 
 
-def _note_written_key(path: Path, read_key: tuple[int, int, int] | None, written: dict) -> None:
+def _note_written_key(path: Path, written: dict) -> None:
     """After a verified write and its registry step, in the same registry-lock block: the copy matches the file again.
 
-    Only when the copy matched the file this write started from (`read_key`, from the handle of the read under the file lock): that
-    is decided HERE, under the registry lock, not earlier. A reader thread's reload that ran after the write's read noted its own key
-    inside that lock, so the check sees the mismatch, the key is not advanced, and the next read reloads (a copy never holds a
-    hand edit the file no longer has under the file's current key). When the copy was already behind the file, the key stays as it is:
-    the next read reloads and sees this write too.
+    Called only when the copy matched the file this write started from (the caller decided that under the registry lock, see
+    `_transact`), and only when a copy of this file is followed.
 
     The file is read back (its own `try`: a failure here never reaches the caller of a write that succeeded) and the key noted is the
     one of that read's handle, and only when the bytes parse to what was written: a hand edit between the write and the read makes
     the data differ, the key is not advanced, and the next read reloads. One extra read per write: a write is rare, and the read-back
     is what lets the saved key come from a handle that read exactly what was written.
     """
-    if vocabulary.followed_path() != Path(path) or not vocabulary.copy_matches(path, read_key):
+    if vocabulary.followed_path() != Path(path):
         return
     try:
         back = read(path, recover=Recovery.RAISE)

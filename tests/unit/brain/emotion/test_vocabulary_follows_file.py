@@ -442,6 +442,34 @@ def test_a_reload_between_the_writers_read_and_its_registry_step_leaves_no_stale
     assert _registry_extensions() == set(_file_names(path)), "the copy holds an entry the file lacks"
 
 
+@pytest.mark.no_base_failure(
+    reason="the base never reloads a copy, so no reload can interleave with a write there and its registry holds the written name by construction; this pins that the registry step is skipped, not only the key, when a reload got in first"
+)
+def test_a_reload_after_the_write_and_before_its_registry_step_does_not_leave_the_written_name_in_the_copy(path, owner, monkeypatch):
+    """Review 1 of the code: the hand edit lands after the writer's file write and removes the written name; a reader thread reloads
+    that file (and notes its key, which is the file's real key) before the writer's registry step. The step must not put the name
+    back into the copy: nothing would reload it while the file's key stays the same."""
+    _hand_edit(path, [_entry("one")])
+    persona_loader.load_persona_vocabulary(path)
+    real_write = vocabulary_file.write_json
+
+    def interleaved(p, data, **kwargs):
+        ok = real_write(p, data, **kwargs)  # the writer's file now holds "written"
+        _hand_edit(p, [_entry("one")])  # then a hand edit takes it out again
+        reader = threading.Thread(target=lambda: vocabulary.get("one"), daemon=True)  # a reader's reload sees only the hand edit
+        reader.start()
+        reader.join(10)
+        assert not reader.is_alive()
+        return ok
+
+    monkeypatch.setattr(vocabulary_file, "write_json", interleaved)
+    vocabulary_file.add(path, [("written", None)])
+    monkeypatch.setattr(vocabulary_file, "write_json", real_write)
+    assert _file_names(path) == ["one"]
+    assert vocabulary.get("written") is None
+    assert _registry_extensions() == {"one"}, "the copy holds a name the file lacks under the file's current key"
+
+
 def test_a_hand_edit_between_the_pre_lock_check_and_the_in_lock_read_does_not_advance_the_key_and_loses_nothing(path, owner, monkeypatch):
     _hand_edit(path, [_entry("one")])
     persona_loader.load_persona_vocabulary(path)

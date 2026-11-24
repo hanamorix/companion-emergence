@@ -291,7 +291,11 @@ def followed_path() -> Path | None:
 
 
 def note_copy_key(path: Path, key: tuple[int, int, int] | None) -> None:
-    """The copy now matches the file whose stat key is `key` (None: no such file). Ignored when `path` is not the followed file."""
+    """The copy now matches the file whose stat key is `key` (None: no such file). Ignored when `path` is not the followed file.
+
+    No lock: the copy is replaced as a whole object (one name binding), and a racing `set_file_copy` or `note_copy_key` can only
+    leave an older key or a stale flag, which makes the next check reload once more, never a key newer than the data.
+    """
     global _FILE_COPY
     copy = _FILE_COPY
     if copy is not None and copy.path == Path(path):
