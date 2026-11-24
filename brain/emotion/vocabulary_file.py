@@ -15,7 +15,8 @@ Each change is ONE read-check-write, built once in `_transact`: the cross-proces
 wait (`dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S`), the file re-read, the change applied to what was just read, a verified
 `json_io.write_json` with the shared backup count, then the registry changed under one `threading.Lock` (still inside the file
 lock, so registry changes follow file changes in the same order). The file comes first and the registry second, so a write that
-fails leaves the registry as it was. An error in the registry step itself (a bug, not a file problem) is raised to the caller
+fails leaves the registry as it was. (When a reader's reload got in between the write and the registry step, the step is skipped
+and the next read reloads from the file: see `_transact`.) An error in the registry step itself (a bug, not a file problem) is raised to the caller
 after the lock is released; the file is already written and the next read reloads what it holds. The lock is not re-entrant, so the
 public operations never call each other. Lock order for any later caller: `engine_files.state_lock` is the OUTER lock, this file's
 lock the next and `_REGISTRY_LOCK` the INNER one; a reload takes the registry lock only.
@@ -160,7 +161,7 @@ def _match_registry(data: dict) -> int:
         if held is None:
             vocabulary.register(emotion)
             changes += 1
-        elif held != emotion:
+        elif held != emotion and repr(held) != repr(emotion):  # repr: a NaN field is never equal to itself, but an unchanged file changes nothing
             vocabulary.replace_entry(emotion)
             changes += 1
     for held in vocabulary.list_all():
@@ -243,6 +244,10 @@ def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
     The copy follows the file (#803 step 15): before anything else the owner's copy is checked against the file
     (`vocabulary.follow_file`), so a hand edit is in the registry before this change is applied to it. The file-lock body runs with
     the check switched off (the file lock is not re-entrant, and the registry step reads the registry under the registry lock).
+
+    The registry step runs after a verified write only when the copy still matches the file the write started from, decided under the
+    registry lock (a reload by another thread in between rebuilt the copy from the file, or it is behind it: the step is skipped and
+    the next read reloads, this write included). Then the file is read back and the copy's key advanced (`_note_written_key`).
 
     The backup count is computed before the lock is taken (it scans the audit log). Any OSError or ValueError from the lock, the
     read or the write, a write that did not verify, and a lock wait that ran out are all `cannot_write`; the cause is logged.

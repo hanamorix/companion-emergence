@@ -283,6 +283,12 @@ def test_a_reload_of_an_unchanged_file_reports_zero_and_a_changed_one_reports_th
     assert vocabulary_file.reload(path)[0] == 0
 
 
+def test_a_reload_of_an_unchanged_file_with_a_nan_half_life_reports_zero(path):
+    _hand_edit(path, [_entry("odd one", days=float("nan"))])
+    persona_loader.load_persona_vocabulary(path, read_only=True)
+    assert vocabulary_file.reload(path)[0] == 0
+
+
 def test_an_exact_load_removes_a_name_the_file_no_longer_holds(path):
     _hand_edit(path, [_entry("one"), _entry("two")])
     persona_loader.load_persona_vocabulary(path, read_only=True)
