@@ -262,7 +262,7 @@ def test_the_owner_reads_the_registry_on_every_call(tmp_path: Path) -> None:
 @pytest.mark.no_base_failure(reason="step 15 moved the setup from the registry to her file (a non-owner's copy now follows the file); the base engine already read that file's half-life and answered the built-in one with one warning for a number that is not finite and above zero, so this is unchanged by design")
 @pytest.mark.parametrize(
     ("name", "days"),
-    [("odd_zero", 0),("odd_negative", -3), ("odd_nan", float("nan")), ("odd_inf", float("inf"))],
+    [("odd_zero", 0), ("odd_negative", -3), ("odd_nan", float("nan")), ("odd_inf", float("inf"))],
 )
 def test_a_half_life_that_is_not_a_finite_number_above_zero_takes_the_built_in_answer_with_one_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, name: str, days: float
