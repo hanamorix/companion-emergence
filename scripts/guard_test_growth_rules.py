@@ -58,6 +58,39 @@ def is_cross_product(ids: int, axis_sizes: dict[str, int]) -> bool:
     return len(axis_sizes) >= 2 and ids > sum(axis_sizes.values())
 
 
+PRODUCT_SUFFIXES = (".py", ".ts", ".tsx", ".rs")
+
+
+def is_product_path(path: str) -> bool:
+    """A product source file: .py/.ts/.tsx/.rs, outside tests/, *.test.* files and __tests__/ dirs."""
+    if not path.endswith(PRODUCT_SUFFIXES):
+        return False
+    parts = path.split("/")
+    if parts[0] == "tests" or "__tests__" in parts[:-1]:
+        return False
+    return ".test." not in parts[-1]
+
+
+def product_lines(diff_u0: str) -> int:
+    """Non-blank added/removed lines in product files of a ``git diff -U0`` text."""
+    total = 0
+    path = ""
+    in_hunk = False
+    for line in diff_u0.splitlines():
+        if line.startswith("diff --git "):
+            path, in_hunk = "", False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif not in_hunk:
+            if line.startswith("--- a/"):
+                path = line[len("--- a/") :]
+            elif line.startswith("+++ b/"):
+                path = line[len("+++ b/") :]
+        elif line[:1] in "+-" and line[1:].strip() and is_product_path(path):
+            total += 1
+    return total
+
+
 def is_single_axis_over_budget(new_ids: int, axis_sizes: dict[str, int], budget: int) -> bool:
     """Exactly one axis, at least two new ids, and more new ids than the budget (changed product lines)."""
     return len(axis_sizes) == 1 and new_ids >= 2 and new_ids > budget

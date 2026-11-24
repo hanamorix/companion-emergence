@@ -67,3 +67,50 @@ def test_axes_counts_distinct_reprs_per_param_name():
         {"nodeid": "t[2-x]", "params": {"a": "2", "b": "'x'"}},
     ]
     assert rules.axes(rows) == {"a": 2, "b": 2}
+
+
+def test_is_product_path_true_for_brain_and_app_sources():
+    assert rules.is_product_path("brain/x.py") is True
+    assert rules.is_product_path("app/src/a.tsx") is True
+
+
+def test_is_product_path_false_for_tests_docs_and_test_files():
+    assert rules.is_product_path("tests/unit/x.py") is False
+    assert rules.is_product_path("app/src/a.test.tsx") is False
+    assert rules.is_product_path("app/src/__tests__/b.ts") is False
+    assert rules.is_product_path("docs/x.md") is False
+
+
+def test_product_lines_counts_non_blank_changes_in_product_files_only():
+    diff = (
+        "diff --git a/brain/x.py b/brain/x.py\n"
+        "index 111..222 100644\n"
+        "--- a/brain/x.py\n"
+        "+++ b/brain/x.py\n"
+        "@@ -3 +3,3 @@\n"
+        "-old = 1\n"
+        "+new = 1\n"
+        "+\n"
+        "+other = 2\n"
+        "diff --git a/tests/test_x.py b/tests/test_x.py\n"
+        "index 333..444 100644\n"
+        "--- a/tests/test_x.py\n"
+        "+++ b/tests/test_x.py\n"
+        "@@ -0,0 +1,5 @@\n"
+        "+a\n+b\n+c\n+d\n+e\n"
+    )
+    assert rules.product_lines(diff) == 3
+
+
+def test_product_lines_counts_removed_lines_of_a_deleted_file():
+    diff = (
+        "diff --git a/brain/gone.py b/brain/gone.py\n"
+        "deleted file mode 100644\n"
+        "index 555..000\n"
+        "--- a/brain/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-one\n"
+        "-two\n"
+    )
+    assert rules.product_lines(diff) == 2
