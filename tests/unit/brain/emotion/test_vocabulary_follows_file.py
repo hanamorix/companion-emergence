@@ -329,9 +329,9 @@ def test_an_explicit_load_with_the_file_changed_by_hand_returns_and_matches_the_
     vocabulary.set_bridge_owner(is_owner)
     _hand_edit(path, [_entry("one")])
     persona_loader.load_persona_vocabulary(path, read_only=not is_owner)
-    _hand_edit(path, [_entry("one"), _entry("two")])
+    _hand_edit(path, [_entry("two")])  # one removed, two added: the load must match the file exactly
     assert _within(10, lambda: persona_loader.load_persona_vocabulary(path, read_only=not is_owner)), "the explicit load deadlocked"
-    assert _registry_extensions() == {"one", "two"}
+    assert _registry_extensions() == {"two"}
 
 
 @pytest.mark.parametrize("is_owner", [True, False])
@@ -416,6 +416,9 @@ def test_set_file_copy_stale_reloads_at_the_next_read_and_a_noted_key_clears_it(
 # ----------------------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.no_base_failure(
+    reason="the base never reloads a copy, so no reload can interleave with a write there and its copy equals its file by construction; this pins the new rule that the key advances only when the copy still matched at the registry step (D6 M1)"
+)
 def test_a_reload_between_the_writers_read_and_its_registry_step_leaves_no_stale_copy_m1(path, owner, monkeypatch):
     """D6 M1: a hand edit lands after the writer read the file, a reader thread reloads it into the copy, then the writer's
     replace lands. The writer must not advance the key (the copy then holds the hand edit the file lost): the next read reloads."""
@@ -474,6 +477,8 @@ def test_a_read_back_that_raises_leaves_the_write_standing_and_the_next_read_rel
     assert result.outcome == "used" and result.changed
     assert _file_names(path) == ["one", "two"]
     assert vocabulary.get("two") is not None
+    _hand_edit(path, [_entry("one"), _entry("two"), _entry("hand")])  # the copy still follows the file after the failed read-back
+    assert vocabulary.get("hand") is not None
 
 
 # ----------------------------------------------------------------------------------------------------------------
