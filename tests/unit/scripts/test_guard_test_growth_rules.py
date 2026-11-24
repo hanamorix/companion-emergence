@@ -114,3 +114,42 @@ def test_product_lines_counts_removed_lines_of_a_deleted_file():
         "-two\n"
     )
     assert rules.product_lines(diff) == 2
+
+
+def test_product_lines_counts_hunk_content_that_looks_like_a_header():
+    diff = (
+        "diff --git a/brain/x.py b/brain/x.py\n"
+        "index 111..222 100644\n"
+        "--- a/brain/x.py\n"
+        "+++ b/brain/x.py\n"
+        "@@ -1 +1 @@\n"
+        "--- a/not/a/header.py\n"
+        "+++ b/not/a/header.py\n"
+    )
+    assert rules.product_lines(diff) == 2
+
+
+def test_product_lines_handles_a_c_quoted_non_ascii_path():
+    diff = (
+        'diff --git "a/\\303\\251.py" "b/\\303\\251.py"\n'
+        "index 111..222 100644\n"
+        '--- "a/\\303\\251.py"\n'
+        '+++ "b/\\303\\251.py"\n'
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    assert rules.product_lines(diff) == 2
+
+
+def test_product_lines_handles_a_path_with_a_space_and_trailing_tab():
+    diff = (
+        "diff --git a/x y.py b/x y.py\n"
+        "index 111..222 100644\n"
+        "--- a/x y.py\t\n"
+        "+++ b/x y.py\t\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    assert rules.product_lines(diff) == 2

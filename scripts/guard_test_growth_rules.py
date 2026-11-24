@@ -71,6 +71,41 @@ def is_product_path(path: str) -> bool:
     return ".test." not in parts[-1]
 
 
+_C_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34}
+
+
+def _unquote_c(text: str) -> str:
+    """Decode a git C-quoted path body (octal bytes and simple escapes) to text."""
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch != "\\" or i + 1 >= len(text):
+            out += ch.encode("utf-8")
+            i += 1
+        elif text[i + 1] in _C_ESCAPES:
+            out.append(_C_ESCAPES[text[i + 1]])
+            i += 2
+        elif text[i + 1 : i + 4].isdigit():
+            out.append(int(text[i + 1 : i + 4], 8) & 0xFF)
+            i += 4
+        else:
+            out += text[i : i + 2].encode("utf-8")
+            i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def _header_path(line: str, marker: str, prefix: str) -> str | None:
+    """The path of a ``--- ``/``+++ `` header line (plain or C-quoted), without its a/ or b/ prefix."""
+    rest = line[len(marker) :]
+    if rest.startswith('"'):
+        end = rest.rfind('"')
+        path = _unquote_c(rest[1:end] if end > 0 else rest[1:])
+    else:
+        path = rest.rstrip("\t")
+    return path[len(prefix) :] if path.startswith(prefix) else None
+
+
 def product_lines(diff_u0: str) -> int:
     """Non-blank added/removed lines in product files of a ``git diff -U0`` text."""
     total = 0
@@ -82,10 +117,11 @@ def product_lines(diff_u0: str) -> int:
         elif line.startswith("@@"):
             in_hunk = True
         elif not in_hunk:
-            if line.startswith("--- a/"):
-                path = line[len("--- a/") :]
-            elif line.startswith("+++ b/"):
-                path = line[len("+++ b/") :]
+            for marker, prefix in (("--- ", "a/"), ("+++ ", "b/")):
+                if line.startswith(marker):
+                    found = _header_path(line, marker, prefix)
+                    if found is not None:
+                        path = found
         elif line[:1] in "+-" and line[1:].strip() and is_product_path(path):
             total += 1
     return total
