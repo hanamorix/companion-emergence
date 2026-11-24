@@ -452,6 +452,7 @@ def test_a_second_spelling_of_a_registered_name_is_refused_and_the_first_stays()
         vocabulary._unregister("quiet_dread")
 
 
+@pytest.mark.no_base_failure(reason="the baseline names were already tidied, so the registry returned them unchanged on the old code too; this pins that they stay so")
 def test_the_baseline_entries_keep_their_names() -> None:
     from brain.emotion import vocabulary
 

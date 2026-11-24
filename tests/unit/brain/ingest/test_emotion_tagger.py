@@ -231,12 +231,14 @@ def test_reordered_blend_parts_match_the_registered_blend(extensions, spelling):
     assert _normalize({spelling: 3}, _loaded()) == {"grief_love_blend": 3.0}
 
 
-def test_the_stored_key_is_the_registered_name(extensions):
+def test_the_stored_key_is_the_tidied_form_of_a_registered_name(extensions):
+    """The tagger still stores the tidied form; an entry keeps its own spelling (#801 section 3), so the key is the tidied form of it
+    (the memory check of step 5 moves the stored spelling onto the entry's)."""
     kept = _normalize({"Love Grief Blend": 2, "Comfort-Seeking": 3}, _loaded())
     assert set(kept) == {"grief_love_blend", "comfort_seeking"}
     for key in kept:
         found = vocabulary.get(key)
-        assert found is not None and found.name == key
+        assert found is not None and vocabulary.canonical_name(found.name) == key
 
 
 @pytest.mark.parametrize(
