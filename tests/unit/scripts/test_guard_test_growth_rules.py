@@ -153,3 +153,84 @@ def test_product_lines_handles_a_path_with_a_space_and_trailing_tab():
         "+new\n"
     )
     assert rules.product_lines(diff) == 2
+
+
+def test_scanner_tests_flags_a_glob_fed_parametrize():
+    src = (
+        "import pytest\n"
+        "from pathlib import Path\n"
+        "@pytest.mark.parametrize('p', sorted(Path('x').glob('*.py')))\n"
+        "def test_a(p):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == {"test_a"}
+
+
+def test_scanner_tests_flags_each_scanner_source():
+    sources = [
+        "os.walk('.')",
+        "os.listdir('.')",
+        "Path('.').iterdir()",
+        "Path('.').rglob('*.py')",
+        "subprocess.run(['git', 'ls-files'])",
+    ]
+    for values in sources:
+        src = f"@pytest.mark.parametrize('p', {values})\ndef test_a(p):\n    pass\n"
+        assert rules.scanner_tests(src) == {"test_a"}, values
+
+
+def test_scanner_tests_ignores_a_literal_list():
+    src = "@pytest.mark.parametrize('n', [1, 2, 3])\ndef test_a(n):\n    pass\n"
+    assert rules.scanner_tests(src) == set()
+
+
+def test_scanner_tests_resolves_a_module_level_name():
+    src = (
+        "FILES = list(Path('.').rglob('*.json'))\n"
+        "@pytest.mark.parametrize('f', FILES)\n"
+        "def test_a(f):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == {"test_a"}
+
+
+def test_scanner_tests_resolves_a_same_file_function_call():
+    src = (
+        "def _discover():\n"
+        "    return os.listdir('.')\n"
+        "@pytest.mark.parametrize('f', _discover())\n"
+        "def test_a(f):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == {"test_a"}
+
+
+def test_scanner_tests_does_not_follow_an_imported_function():
+    src = (
+        "from helpers import discover\n"
+        "@pytest.mark.parametrize('f', discover())\n"
+        "def test_a(f):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == set()
+
+
+def test_scanner_tests_names_a_method_with_its_class():
+    src = (
+        "from pytest import mark\n"
+        "class TestX:\n"
+        "    @mark.parametrize('p', Path('.').glob('*'))\n"
+        "    def test_m(self, p):\n"
+        "        pass\n"
+    )
+    assert rules.scanner_tests(src) == {"TestX::test_m"}
+
+
+def test_scanner_tests_reads_the_argvalues_keyword():
+    src = "@pytest.mark.parametrize('p', argvalues=os.listdir('.'))\ndef test_a(p):\n    pass\n"
+    assert rules.scanner_tests(src) == {"test_a"}
+
+
+def test_scanner_tests_treats_a_literal_list_as_never_a_scan():
+    src = "@pytest.mark.parametrize('p', ['ls-files', 'glob'])\ndef test_a(p):\n    pass\n"
+    assert rules.scanner_tests(src) == set()

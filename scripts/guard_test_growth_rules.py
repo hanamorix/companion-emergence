@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 
 
@@ -125,6 +126,77 @@ def product_lines(diff_u0: str) -> int:
         elif line[:1] in "+-" and line[1:].strip() and is_product_path(path):
             total += 1
     return total
+
+
+SCANNER_CALLS = frozenset({"glob", "rglob", "iterdir", "listdir", "scandir", "walk"})
+
+
+def _is_scan(node: ast.AST) -> bool:
+    """True when the subtree calls a filesystem scanner or names ``ls-files``."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            func = sub.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name in SCANNER_CALLS:
+                return True
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and "ls-files" in sub.value:
+            return True
+    return False
+
+
+def _parametrize_values(dec: ast.expr) -> ast.expr | None:
+    """The values argument of a ``*.parametrize(...)`` decorator, else None."""
+    if not (isinstance(dec, ast.Call) and getattr(dec.func, "attr", None) == "parametrize"):
+        return None
+    if len(dec.args) >= 2:
+        return dec.args[1]
+    for kw in dec.keywords:
+        if kw.arg == "argvalues":
+            return kw.value
+    return None
+
+
+def _resolved(
+    values: ast.expr, assigns: dict[str, ast.expr], funcs: dict[str, ast.AST]
+) -> list[ast.AST]:
+    """The values expression plus, one level down, each module-level name's value and same-file callee's body."""
+    if isinstance(values, (ast.List, ast.Tuple, ast.Set)):
+        return []
+    nodes: list[ast.AST] = [values]
+    for sub in ast.walk(values):
+        if isinstance(sub, ast.Name) and sub.id in assigns:
+            nodes.append(assigns[sub.id])
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in funcs:
+            nodes.append(funcs[sub.func.id])
+    return nodes
+
+
+def scanner_tests(source: str) -> set[str]:
+    """Qualnames (``func`` or ``Class::func``) of tests whose parametrize values scan the filesystem."""
+    tree = ast.parse(source)
+    assigns: dict[str, ast.expr] = {}
+    funcs: dict[str, ast.AST] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs[stmt.name] = stmt
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    assigns[target.id] = stmt.value
+    found: set[str] = set()
+
+    def visit(body: list[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                visit(node.body, f"{prefix}{node.name}::")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    values = _parametrize_values(dec)
+                    if values is not None and any(_is_scan(n) for n in _resolved(values, assigns, funcs)):
+                        found.add(f"{prefix}{node.name}")
+
+    visit(tree.body, "")
+    return found
 
 
 def is_single_axis_over_budget(new_ids: int, axis_sizes: dict[str, int], budget: int) -> bool:
