@@ -496,6 +496,21 @@ def test_repair_patches_a_stub_spelled_otherwise_when_the_reply_names_it_tidied(
     assert [(e["name"], e["description"]) for e in data["emotions"]] == [("Quiet Dread", "the held breath before bad news")]
 
 
+@pytest.mark.no_base_failure(reason="the old repair read a file with no emotions list as no entries and finished; the new early return keeps that, so this pins it through the refactor")
+def test_repair_finishes_quietly_on_a_file_without_an_emotions_list(tmp_path: Path) -> None:
+    from brain.health.vocab_repair import run_vocab_repair
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+    assert report.status == "complete" and report.repaired == 0
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1}
+
+
 @pytest.mark.no_base_failure(reason="the old repair merged in memory and so never prompted for a dropped twin; the merge now writes the file first, and this pins that the prompt still holds one name")
 def test_repair_does_not_describe_a_twin_that_the_merge_dropped(tmp_path: Path) -> None:
     """The steps after the merge work from the merged file: the dropped twin is not in the provider's prompt."""

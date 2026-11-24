@@ -263,6 +263,28 @@ def test_run_growth_tick_counts_and_logs_nothing_when_the_file_cannot_be_written
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
+def test_run_growth_tick_stops_adding_after_the_first_name_the_file_cannot_take(persona_dir: Path, store: MemoryStore) -> None:
+    from brain.emotion.vocabulary_file import NameResult
+
+    _seed_vocab(persona_dir)
+    second = EmotionProposal(
+        name="another one",
+        description="x",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.4,
+        relational_context=None,
+    )
+    refused = NameResult("wistful_scheduler", None, "cannot_write")
+    with (
+        patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful(), second]),
+        patch("brain.growth.scheduler.vocabulary_file.add", return_value=[refused]) as add,
+    ):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert add.call_count == 1  # no second wait on a lock that just timed out
+    assert result.emotions_added == 0
+
+
 def test_run_growth_tick_records_nothing_when_another_writer_added_the_name_since_the_read(
     persona_dir: Path, store: MemoryStore
 ) -> None:

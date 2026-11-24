@@ -130,9 +130,10 @@ def register_entries(data: dict) -> int:
             continue
         if vocabulary.gate_name(emotion.name) is None:
             continue  # the gate has logged why
-        if vocabulary.get(emotion.name) is not None:
-            continue
-        vocabulary.register(emotion)
+        with _REGISTRY_LOCK:  # the same lock the registry steps of the file operations take: no check-then-register race
+            if vocabulary.get(emotion.name) is not None:
+                continue
+            vocabulary.register(emotion)
         registered += 1
     return registered
 
@@ -181,16 +182,17 @@ def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
                 path, default=default_vocabulary, recover=Recovery.RAISE, validate=validate_schema
             ).data
             payload, registry_step = mutate(data)
-            if registry_step is None:
-                return payload, True
-            if not write_json(path, data, backups=count, verify=True):
+            if registry_step is not None and not write_json(path, data, backups=count, verify=True):
                 raise OSError("the write did not verify (the previous file was restored)")
-            with _REGISTRY_LOCK:
-                registry_step()
-            return payload, True
     except (OSError, ValueError) as exc:
         logger.warning("vocabulary: %s of %s failed (%s: %s); the file and the registry are as they were", action, path.name, type(exc).__name__, exc)
         return None, False
+    # The file is written (or there was nothing to write). The registry follows, outside the file errors above, so a registry
+    # problem is never reported as a failed write of a file that was written.
+    if registry_step is not None:
+        with _REGISTRY_LOCK:
+            registry_step()
+    return payload, True
 
 
 def _entries_by_key(emotions: Iterable[Any]) -> dict[str, dict]:

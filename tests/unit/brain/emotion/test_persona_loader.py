@@ -413,6 +413,27 @@ def test_the_memory_heal_writes_once_through_the_shared_writer_and_leaves_the_na
         store.close()
 
 
+def test_a_corrupt_file_rebuild_the_file_cannot_take_registers_nothing_and_keeps_the_reset_anomaly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from brain import dev_constants
+    from brain.utils import file_lock
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_bytes(b"\xff{torn")
+    monkeypatch.setattr(dev_constants, "EMOTION_VOCABULARY_LOCK_WAIT_S", 0.2)
+    store = _store_with({"unwritten feeling": 3.0})
+    try:
+        with file_lock.file_lock(path):
+            count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
+        assert count == 0
+        assert anomaly is not None and anomaly.action == "reset_to_default"
+        assert vocabulary.get("unwritten_feeling") is None
+        assert json.loads(path.read_text(encoding="utf-8"))["emotions"] == []
+    finally:
+        store.close()
+
+
 def test_the_rebuild_of_a_missing_file_writes_through_the_shared_writer_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from brain.emotion import vocabulary_file
 

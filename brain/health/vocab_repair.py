@@ -86,7 +86,7 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
 
     #173: the completed-state file only retires Step 1 (the one-time 1.0 → 14.0
     half-life bump). Placeholders keep being minted afterwards by
-    reconstruct.py / persona_loader.py (already at 14.0), so Step 2 (describe)
+    the memory heal and the rebuild (`vocabulary_file.add`, already at 14.0), so Step 2 (describe)
     must be allowed to run again whenever any placeholder exists. The
     supervisor only asks at startup, so the retry cadence is once per bridge
     start, bounded by _DESCRIBE_BATCH per run.
@@ -132,7 +132,8 @@ def run_vocab_repair(
 
     vocab_path = persona_dir / "emotion_vocabulary.json"
     data = read_json(vocab_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
-    if data is None:  # missing, or corrupt (the module logged it): skip, as before
+    if data is None or not isinstance(data.get("emotions"), list):
+        # missing, corrupt (the module logged it), or a file with no emotions list: skip, as before
         return _write_and_return(persona_dir, repaired=0, described=0)
 
     # ------------------------------------------------------------------
@@ -140,8 +141,9 @@ def run_vocab_repair(
     # (love_grief_blend / grief_love_blend, anticipatory-grief / Anticipatory_Grief)
     # into one entry under the spelling that comes first in the file. A twin with a real
     # description gives the fields (it beats a placeholder). Every change to the file below
-    # goes through `vocabulary_file`; a change it could not write raises, so the state file
-    # is not rewritten and the repair runs again at the next start.
+    # goes through `vocabulary_file`. A merge or half-life bump it could not write raises, so the state
+    # file is not rewritten and the repair runs again at the next start; a description batch it could not
+    # write raises into Step 2's fail-soft handler (placeholders kept, retried at the next start).
     # ------------------------------------------------------------------
     merge_result = vocabulary_file.merge(vocab_path)
     if merge_result.cannot_write:

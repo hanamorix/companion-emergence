@@ -90,6 +90,23 @@ def test_add_of_a_name_already_in_the_file_is_used_under_the_file_spelling_and_w
     assert writes == []
 
 
+def test_the_registry_is_changed_after_the_file_is_written_and_not_inside_its_lock(tmp_path: Path, monkeypatch) -> None:
+    path = _write(tmp_path, [])
+    seen: dict = {}
+    real = vocabulary_file._register_new
+
+    def probe(entry: dict) -> None:
+        seen["file_had_it"] = [e["name"] for e in _read(path)] == [entry["name"]]
+        with file_lock.file_lock(path, blocking=False) as acquired:  # the file lock is free again
+            seen["lock_free"] = acquired
+        real(entry)
+
+    monkeypatch.setattr(vocabulary_file, "_register_new", probe)
+    vocabulary_file.add(path, [("ordered one", None)])
+    assert seen == {"file_had_it": True, "lock_free": True}
+    assert vocabulary.get("ordered_one") is not None
+
+
 def test_add_dedupes_against_the_file_not_the_registry(tmp_path: Path) -> None:
     """A framework name that her file does not hold is added (core refusal is a later step); the registry keeps its entry."""
     path = _write(tmp_path, [])

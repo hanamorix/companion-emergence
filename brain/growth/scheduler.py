@@ -81,8 +81,8 @@ def run_growth_tick(
          `vocabulary_file.add` and, when that wrote it, append a GrowthLogEvent to
          {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`). A name the
          file could not take (`cannot_write`, logged by the writer) is neither
-         counted nor logged as added; the tick goes on and the crystallizer
-         proposes it again.
+         counted nor logged as added, and the tick adds no further name (no
+         second wait on the same lock); the crystallizer proposes it again.
 
     `dry_run=True` calls the crystallizer but skips both writes; the
     returned `emotions_added` reflects "would-have-added" semantics.
@@ -130,7 +130,7 @@ def run_growth_tick(
 
         result = vocabulary_file.add(vocab_path, [(proposal.name, _entry_fields(proposal))])[0]
         if result.outcome == "cannot_write":
-            continue  # the writer has logged why; nothing was written
+            break  # the writer has logged why and nothing was written: no further wait for the lock this tick
         current_names.add(proposal.name)
         if not result.changed:
             continue  # the file took the name from another writer since the read: nothing to record

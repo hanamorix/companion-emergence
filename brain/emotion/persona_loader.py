@@ -101,27 +101,30 @@ def load_persona_vocabulary_with_anomaly(
         from brain.health.reconstruct import reconstruct_vocabulary_from_memories
 
         recon_data = reconstruct_vocabulary_from_memories(store)
-        rebuilt, _written = _rebuild_from_memories(path, recon_data)
-        registered += rebuilt
-        data = recon_data
-        # Replace the anomaly with one whose action reflects the reconstruction.
-        # Same kind (json_parse_error / schema_mismatch — that's why we needed
-        # to reconstruct) and same forensic quarantine path; the heal path
-        # advanced beyond reset.
-        from brain.health.anomaly import BrainAnomaly
+        rebuilt, written = _rebuild_from_memories(path, recon_data)
+        if written:
+            registered += rebuilt
+            data = recon_data
+            # Replace the anomaly with one whose action reflects the reconstruction.
+            # Same kind (json_parse_error / schema_mismatch — that's why we needed
+            # to reconstruct) and same forensic quarantine path; the heal path
+            # advanced beyond reset.
+            from brain.health.anomaly import BrainAnomaly
 
-        anomaly = BrainAnomaly(
-            timestamp=anomaly.timestamp,
-            file=anomaly.file,
-            kind=anomaly.kind,
-            action="reconstructed_from_memories",
-            quarantine_path=anomaly.quarantine_path,
-            likely_cause=anomaly.likely_cause,
-            detail=(
-                f"{anomaly.detail}; reconstructed "
-                f"{len(recon_data['emotions'])} entries from memories"
-            ),
-        )
+            anomaly = BrainAnomaly(
+                timestamp=anomaly.timestamp,
+                file=anomaly.file,
+                kind=anomaly.kind,
+                action="reconstructed_from_memories",
+                quarantine_path=anomaly.quarantine_path,
+                likely_cause=anomaly.likely_cause,
+                detail=(
+                    f"{anomaly.detail}; reconstructed "
+                    f"{len(recon_data['emotions'])} entries from memories"
+                ),
+            )
+        # A rebuild the file could not take (the writer logged why) registers nothing and leaves the anomaly as the heal
+        # reported it: the registry never holds what the file does not.
 
     if anomaly is not None:
         logger.warning(
