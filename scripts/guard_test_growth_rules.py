@@ -146,7 +146,13 @@ def _is_scan(node: ast.AST) -> bool:
 
 def _parametrize_values(dec: ast.expr) -> ast.expr | None:
     """The values argument of a ``*.parametrize(...)`` decorator, else None."""
-    if not (isinstance(dec, ast.Call) and getattr(dec.func, "attr", None) == "parametrize"):
+    if not isinstance(dec, ast.Call):
+        return None
+    func = dec.func
+    if not (
+        getattr(func, "attr", None) == "parametrize"
+        or (isinstance(func, ast.Name) and func.id == "parametrize")
+    ):
         return None
     if len(dec.args) >= 2:
         return dec.args[1]
@@ -171,31 +177,47 @@ def _resolved(
     return nodes
 
 
-def scanner_tests(source: str) -> set[str]:
-    """Qualnames (``func`` or ``Class::func``) of tests whose parametrize values scan the filesystem."""
-    tree = ast.parse(source)
+def _scope(body: list[ast.stmt]) -> tuple[dict[str, ast.expr], dict[str, ast.AST]]:
+    """The assignments (plain and annotated) and function defs directly in a body."""
     assigns: dict[str, ast.expr] = {}
     funcs: dict[str, ast.AST] = {}
-    for stmt in tree.body:
+    for stmt in body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs[stmt.name] = stmt
         elif isinstance(stmt, ast.Assign):
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
                     assigns[target.id] = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            if isinstance(stmt.target, ast.Name):
+                assigns[stmt.target.id] = stmt.value
+    return assigns, funcs
+
+
+def scanner_tests(source: str) -> set[str]:
+    """Qualnames (``func`` or ``Class::func``) of tests whose parametrize values scan the filesystem."""
+    tree = ast.parse(source)
+    module_assigns, module_funcs = _scope(tree.body)
     found: set[str] = set()
 
-    def visit(body: list[ast.stmt], prefix: str) -> None:
+    def visit(body: list[ast.stmt], prefix: str, assigns: dict, funcs: dict) -> None:
         for node in body:
             if isinstance(node, ast.ClassDef):
-                visit(node.body, f"{prefix}{node.name}::")
+                class_assigns, class_funcs = _scope(node.body)
+                # The enclosing class body is looked up first, then the module.
+                visit(
+                    node.body,
+                    f"{prefix}{node.name}::",
+                    {**module_assigns, **class_assigns},
+                    {**module_funcs, **class_funcs},
+                )
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for dec in node.decorator_list:
                     values = _parametrize_values(dec)
                     if values is not None and any(_is_scan(n) for n in _resolved(values, assigns, funcs)):
                         found.add(f"{prefix}{node.name}")
 
-    visit(tree.body, "")
+    visit(tree.body, "", module_assigns, module_funcs)
     return found
 
 

@@ -194,6 +194,37 @@ def test_scanner_tests_resolves_a_module_level_name():
     assert rules.scanner_tests(src) == {"test_a"}
 
 
+def test_scanner_tests_resolves_an_annotated_module_level_name():
+    src = (
+        "FILES: list[Path] = list(Path('.').glob('*'))\n"
+        "@pytest.mark.parametrize('f', FILES)\n"
+        "def test_a(f):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == {"test_a"}
+
+
+def test_scanner_tests_recognises_a_bare_parametrize_name():
+    src = (
+        "from pytest.mark import parametrize\n"
+        "@parametrize('p', os.listdir('.'))\n"
+        "def test_a(p):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == {"test_a"}
+
+
+def test_scanner_tests_resolves_a_class_body_constant():
+    src = (
+        "class TestT:\n"
+        "    F = list(Path('.').glob('*'))\n"
+        "    @pytest.mark.parametrize('p', F)\n"
+        "    def test_m(self, p):\n"
+        "        pass\n"
+    )
+    assert rules.scanner_tests(src) == {"TestT::test_m"}
+
+
 def test_scanner_tests_resolves_a_same_file_function_call():
     src = (
         "def _discover():\n"
