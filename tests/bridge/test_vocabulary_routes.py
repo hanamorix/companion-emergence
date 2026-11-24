@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
 from brain.emotion import vocabulary
+from brain.health import json_io
 
 FILE = "emotion_vocabulary.json"
 AUTH = {"Authorization": "Bearer secret"}
@@ -96,14 +97,29 @@ def test_add_ignores_any_field_that_is_not_an_entry_field(persona_dir: Path) -> 
     assert entry["name"] == "word_a" and entry["description"] == "d" and "extra" not in entry
 
 
-def test_add_of_a_name_the_file_cannot_take_is_cannot_write_and_leaves_the_file(persona_dir: Path) -> None:
-    (persona_dir / FILE).write_text(json.dumps({"version": 1, "emotions": "not a list"}), encoding="utf-8")
+def test_add_on_a_file_damaged_under_the_running_bridge_heals_it_and_then_writes_the_name(persona_dir: Path) -> None:
+    # The owner's write first follows the file, and the owner's reload repairs a damaged file (the quarantine copy keeps the bad bytes).
     with _client(persona_dir) as c:
-        # the start-up load healed the file (quarantine + reset); break it again under the running bridge
         (persona_dir / FILE).write_text(json.dumps({"version": 1, "emotions": "not a list"}), encoding="utf-8")
+        r = c.post("/vocabulary/add", json={"items": [{"name": "word_a"}]}, headers=AUTH)
+    assert r.json()["results"][0]["outcome"] == "used"
+    assert [e["name"] for e in _entries(persona_dir)] == ["word_a"]
+    assert list(persona_dir.glob(f"{FILE}.corrupt-*"))
+
+
+def test_add_where_the_repair_of_a_damaged_file_is_refused_is_cannot_write_and_leaves_the_file(
+    persona_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*_a: object, **_k: object) -> None:
+        raise OSError("no room for the quarantine copy")
+
+    with _client(persona_dir) as c:
+        (persona_dir / FILE).write_text(json.dumps({"version": 1, "emotions": "not a list"}), encoding="utf-8")
+        monkeypatch.setattr(json_io, "_quarantine_copy", refuse)  # the repair cannot start, so the file stays as found
         r = c.post("/vocabulary/add", json={"items": [{"name": "word_a"}]}, headers=AUTH)
     assert r.json()["results"][0]["outcome"] == "cannot_write"
     assert json.loads((persona_dir / FILE).read_text(encoding="utf-8"))["emotions"] == "not a list"
+    assert not list(persona_dir.glob(f"{FILE}.corrupt-*"))
 
 
 def test_the_bridge_is_the_owner_while_it_runs_and_not_after(persona_dir: Path) -> None:
