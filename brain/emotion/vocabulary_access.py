@@ -363,8 +363,18 @@ def names_known(persona_dir: Path | None, raw_names: Iterable[str]) -> dict[str,
     return out
 
 
+def finite_number(value: Any) -> bool:
+    """True for an int or float that is finite (a bool, a string, NaN, inf and an integer too large for a float are not)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
 def _mean_of_numbers(values: list[Any]) -> Any:
-    numbers = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)]
+    numbers = [v for v in values if finite_number(v)]
     if len(values) == 1 or not numbers:
         return values[0]
     return sum(numbers) / len(numbers)

@@ -163,7 +163,7 @@ def _run_dream_and_promote(persona: Path) -> list[Memory]:
     store = MemoryStore(db_path=persona / "memories.db")
     try:
         run_consolidation(store, persona_dir=store.persona_dir, classifier=lambda _c, _ctx: Decision("new"))
-        return [m for m in store.list_by_type("dream")]
+        return list(store.list_by_type("dream"))
     finally:
         store.close()
 

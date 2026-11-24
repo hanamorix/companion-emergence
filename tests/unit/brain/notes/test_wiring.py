@@ -60,6 +60,5 @@ def test_note_memory_carries_emotion_delta(tmp_path, monkeypatch):
         store.close()
     note_mems = [m for m in mems if "note" in (m.tags or [])]
     assert note_mems
-    # vocab-filtered tenderness delta seeded onto the memory (if tenderness is
-    # registered for this persona; on the empty default vocab it filters to {}).
+    # tenderness delta seeded onto the memory (the write checks it against her vocabulary).
     assert isinstance(note_mems[0]._stored_emotions, dict)

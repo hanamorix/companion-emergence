@@ -96,13 +96,16 @@ def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) ->
     is checked against her vocabulary by the engine's fold (``fold_change``), which discards a channel she does not have
     when no bridge can add it.
 
-    Returns True if a change was handed to the engine, False if the delta was effectively zero.
+    Returns True if a change was folded, False if the channel was one her vocabulary cannot hold or the delta was effectively zero
+    (the channel is checked here too, so the answer the tool reports is true; the fold's own check then finds the name in place).
     """
     from brain.chat.extractor import signed_change_values
-    from brain.emotion import engine
+    from brain.emotion import engine, vocabulary_access
 
     changes = signed_change_values({channel: _clamp_delta(delta)})
     if not changes:
+        return False
+    if vocabulary_access.names_used(persona_dir, [channel])[channel] is None:
         return False
     engine.engine_for(persona_dir).fold_change(changes, None, "self_model_reconcile")
     return True

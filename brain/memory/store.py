@@ -1354,7 +1354,9 @@ class MemoryStore:
         kept = self.checked_emotions(memory._stored_emotions)
         if kept == memory._stored_emotions:
             return memory
-        numbers = [float(v) for v in kept.values() if isinstance(v, (int, float)) and math.isfinite(v)]
+        from brain.emotion.vocabulary_access import finite_number
+
+        numbers = [float(v) for v in kept.values() if finite_number(v)]
         return replace(memory, _stored_emotions=kept, _stored_score=float(sum(numbers)), _stored_peak=max(numbers, default=0.0))
 
     def create(self, memory: Memory, *, fold: bool = True, check_names: bool = True) -> str:

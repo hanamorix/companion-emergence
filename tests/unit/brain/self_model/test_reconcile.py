@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 from brain.self_model.gap import Gap
 from brain.self_model.reconcile import reconcile_self_read
 from brain.self_model.state import SelfModelState, load_or_recover, save
@@ -345,6 +344,6 @@ def test_live_revise_off_vocab_channel_folds_nothing(tmp_path: Path) -> None:
     eng = _go_live(tmp_path, joy=5.0)
     before = _settled(eng)
     result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="zorblesque", delta=0.5)
-    assert result["delta_written"] is True  # the change was handed to the engine; whether it kept the name is the engine's check
+    assert result["delta_written"] is False  # a channel her vocabulary cannot hold is not folded, and the tool says so
     assert _settled(eng) == before
     assert _reconcile_rows(tmp_path) == []

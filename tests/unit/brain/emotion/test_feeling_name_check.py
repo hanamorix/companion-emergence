@@ -189,6 +189,12 @@ def test_check_feelings_drops_a_refused_name_and_a_key_that_is_not_text(tmp_path
     assert got == {"joy": 1.0}
 
 
+def test_a_value_too_large_for_a_float_does_not_raise_in_the_check(tmp_path: Path, bridge: _Bridge) -> None:
+    assert vocabulary_access.finite_number(10**400) is False
+    got = vocabulary_access.check_feelings(tmp_path, {"Joy": 10**400, "joy": 4.0})
+    assert got == {"joy": 4.0}
+
+
 def test_check_feelings_keeps_a_lone_value_that_is_not_a_number_as_given(tmp_path: Path, bridge: _Bridge) -> None:
     assert vocabulary_access.check_feelings(tmp_path, {"joy": "high"}) == {"joy": "high"}
 
