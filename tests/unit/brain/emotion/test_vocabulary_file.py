@@ -122,11 +122,39 @@ def test_an_error_in_the_registry_step_is_raised_and_is_not_reported_as_a_failed
 
 
 def test_add_dedupes_against_the_file_not_the_registry(tmp_path: Path) -> None:
-    """A framework name that her file does not hold is added (core refusal is a later step); the registry keeps its entry."""
+    """A name the registry holds (a persona extension) that her file does not hold is added to the file."""
+    vocabulary.register(vocabulary.Emotion("held in registry", "d", "persona_extension", 5.0))
+    try:
+        path = _write(tmp_path, [])
+        [res] = vocabulary_file.add(path, [("held in registry", None)])
+        assert res.changed and [e["name"] for e in _read(path)] == ["held_in_registry"]
+    finally:
+        vocabulary._unregister("held in registry")
+
+
+@pytest.mark.parametrize("raw", ["joy", "Joy", "  JOY  ", "love_grief_blend_not_core", "contentment"])
+def test_add_refuses_a_core_feeling_and_writes_nothing(tmp_path: Path, raw: str, writes) -> None:
+    """Spec section 8, criterion 9: a core feeling is never written to her file (`refused`); a name that is not core is added."""
+    path = _write(tmp_path, [_entry("other keep")])
+    [res] = vocabulary_file.add(path, [(raw, {"description": "mine"})])
+    if vocabulary.is_baseline(raw):
+        assert res == NameResult(raw, None, "refused")
+        assert writes == [] and [e["name"] for e in _read(path)] == ["other keep"]
+    else:
+        assert res.outcome == "used" and res.changed
+
+
+def test_a_mixed_add_writes_the_new_name_and_refuses_the_core_one(tmp_path: Path) -> None:
     path = _write(tmp_path, [])
-    [res] = vocabulary_file.add(path, [("joy", None)])
-    assert res.changed and [e["name"] for e in _read(path)] == ["joy"]
-    assert vocabulary.get("joy").description == "happiness, delight, warmth"
+    results = vocabulary_file.add(path, [("joy", None), ("new one", None)])
+    assert [r.outcome for r in results] == ["refused", "used"]
+    assert [e["name"] for e in _read(path)] == ["new_one"]
+
+
+def test_add_of_a_core_name_alone_creates_no_file(tmp_path: Path) -> None:
+    path = tmp_path / "emotion_vocabulary.json"
+    assert vocabulary_file.add(path, [("calm", None)])[0].outcome == "refused"
+    assert not path.exists()
 
 
 @pytest.mark.parametrize("bad", ["", "---", "x" * 101])
@@ -275,10 +303,12 @@ def test_replace_fields_reports_a_refused_name_and_a_missing_one(tmp_path: Path)
     assert [r.outcome for r in results] == ["refused", "missing"]
 
 
-def test_replace_fields_never_replaces_a_framework_entry_in_the_registry(tmp_path: Path) -> None:
+def test_replace_fields_refuses_a_core_feeling_and_leaves_the_file_byte_identical(tmp_path: Path, writes) -> None:
     path = _write(tmp_path, [_entry("joy", "my own joy")])
-    vocabulary_file.replace_fields(path, {"joy": {"description": "changed in the file"}})
-    assert _read(path)[0]["description"] == "changed in the file"
+    before = path.read_bytes()
+    [res] = vocabulary_file.replace_fields(path, {"Joy": {"description": "changed in the file"}})
+    assert res == NameResult("Joy", None, "refused")
+    assert path.read_bytes() == before and writes == []
     assert vocabulary.get("joy").description == "happiness, delight, warmth"
 
 
@@ -423,6 +453,89 @@ def test_remove_refuses_a_name_that_tidies_to_nothing(tmp_path: Path, writes) ->
     path = _write(tmp_path, [{"description": "nameless"}])
     assert vocabulary_file.remove(path, "---").outcome == "refused"
     assert writes == []
+
+
+# ---------------------------------------------------------------------------------------------
+# remove_core_entries (#801 section 8, criterion 9)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_remove_core_entries_takes_out_every_core_entry_and_keeps_the_rest_in_order(tmp_path: Path, writes) -> None:
+    """Both #648 names and an older core name go (any spelling, twins included); everything else stays, in its order."""
+    odd = {"description": "nameless"}
+    path = _write(
+        tmp_path,
+        [_entry("keep one"), _entry("contentment"), "not a dict", _entry("Joy"), odd, _entry("joy"), _entry("keep two"), _entry("calm")],
+    )
+    result = vocabulary_file.remove_core_entries(path)
+    assert result.removed == ["contentment", "Joy", "joy", "calm"] and not result.cannot_write
+    assert _read(path) == [_entry("keep one"), "not a dict", odd, _entry("keep two")]
+    assert len(writes) == 1 and writes[0]["verify"] is True  # one verified write for all of them
+    assert all(vocabulary.get(n) is not None for n in ("joy", "contentment", "calm"))  # the framework keeps them registered
+
+
+def test_a_second_run_finds_nothing_and_writes_nothing(tmp_path: Path, writes) -> None:
+    path = _write(tmp_path, [_entry("joy"), _entry("keep one")])
+    assert vocabulary_file.remove_core_entries(path).removed == ["joy"]
+    after_first = path.read_bytes()
+    assert vocabulary_file.remove_core_entries(path).removed == []
+    assert path.read_bytes() == after_first and len(writes) == 1
+
+
+def test_a_file_with_no_core_entry_is_not_locked_scanned_or_written(tmp_path: Path, monkeypatch, writes) -> None:
+    path = _write(tmp_path, [_entry("keep one")])
+    before = path.read_bytes()
+
+    def fail(*_a, **_k):
+        raise AssertionError("a no-op must not take the lock or scan the audit log")
+
+    monkeypatch.setattr(vocabulary_file.file_lock, "locked_within", fail)
+    monkeypatch.setattr(vocabulary_file, "backup_count", fail)
+    assert vocabulary_file.remove_core_entries(path) == vocabulary_file.CoreRemoval([])
+    assert path.read_bytes() == before and writes == []
+
+
+def test_a_missing_file_gives_nothing_and_creates_nothing(tmp_path: Path, writes) -> None:
+    path = tmp_path / "emotion_vocabulary.json"
+    assert vocabulary_file.remove_core_entries(path) == vocabulary_file.CoreRemoval([])
+    assert list(tmp_path.iterdir()) == [] and writes == []
+
+
+def test_a_corrupt_file_is_logged_and_left_as_it_is(tmp_path: Path, caplog) -> None:
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_bytes(b"\xff{torn")
+    result = vocabulary_file.remove_core_entries(path)
+    assert result == vocabulary_file.CoreRemoval([], cannot_write=True)
+    assert path.read_bytes() == b"\xff{torn"
+    assert "could not read" in caplog.text
+
+
+def test_a_file_without_an_emotions_list_is_cannot_write_and_left_as_it_is(tmp_path: Path) -> None:
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": "nope"}), encoding="utf-8")
+    before = path.read_bytes()
+    assert vocabulary_file.remove_core_entries(path).cannot_write
+    assert path.read_bytes() == before
+
+
+def test_a_removal_that_does_not_verify_is_cannot_write_and_the_file_is_as_it_was(tmp_path: Path, monkeypatch) -> None:
+    path = _write(tmp_path, [_entry("joy"), _entry("keep one")])
+    before = path.read_bytes()
+    monkeypatch.setattr(vocabulary_file, "write_json", lambda *a, **k: False)
+    result = vocabulary_file.remove_core_entries(path)
+    assert result == vocabulary_file.CoreRemoval([], cannot_write=True)
+    assert path.read_bytes() == before
+
+
+def test_a_lock_held_past_the_wait_leaves_the_core_entries_for_the_next_run(tmp_path: Path, monkeypatch, writes) -> None:
+    monkeypatch.setattr(dev_constants, "EMOTION_VOCABULARY_LOCK_WAIT_S", 0.2)
+    path = _write(tmp_path, [_entry("joy")])
+    before = path.read_bytes()
+    with file_lock.file_lock(path):
+        result = vocabulary_file.remove_core_entries(path)
+    assert result.cannot_write and result.removed == []
+    assert path.read_bytes() == before and writes == []
+    assert vocabulary_file.remove_core_entries(path).removed == ["joy"]  # the next run finds it and removes it
 
 
 # ---------------------------------------------------------------------------------------------

@@ -19,7 +19,7 @@ from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
-from brain.emotion import engine_files, vocabulary_access, vocabulary_swap
+from brain.emotion import engine_files, vocabulary_access, vocabulary_file
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
@@ -211,11 +211,17 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
         from brain.bridge import runner
 
         runner._setup_runtime_logging(persona_dir)
-        # The one-time vocabulary swap (#648) comes first, so this rebuild already uses the swapped half-lives (a start has no other
-        # step before the rebuild). It logs and never raises; the marker makes a second run a no-op. If the swap fails here, this
-        # first rebuild runs on the old half-lives and is not redone when a later swap succeeds: the #648 failure rule is "warn,
-        # start-up continues, retry at the next start".
-        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
+        # One of the two noted exceptions to "only the bridge writes her vocabulary" (#801 section 9): this rebuild step, which runs
+        # only with no bridge (the check above), takes any core feeling out of her vocabulary file through the shared writer before
+        # its replay, because the replay must use the framework's definitions of the core feelings (#801 section 8). It writes
+        # nothing else to her vocabulary. A failure is logged and the rebuild goes on: the engine takes a core feeling's half-life
+        # from the framework whether or not the file still holds an entry for it, and the next start retries the removal.
+        try:
+            vocabulary_file.remove_core_entries(vocabulary_file.vocabulary_path(persona_dir))
+        except Exception as exc:  # noqa: BLE001 - a bug in the removal must not stop the rebuild
+            logging.getLogger(__name__).warning(
+                "the removal of core feelings from her vocabulary file stopped on %s: %s; the rebuild goes on", type(exc).__name__, exc, exc_info=True
+            )
         emotion_engine.ensure_engine_ready(persona_dir)
         # Hana's 11-18b point 4: the ready step returned (a completed switch-over, no rebuild needed, or a skip or logged failure
         # that returns), so the notice an earlier attempt left is cleared here, whichever process completed the switch-over. The
@@ -1068,11 +1074,11 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
 def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
     """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
 
-    Called by the six commands that touch the engine, right after their own vocabulary load. A real run first runs the one-time
-    vocabulary swap (#648), then no longer rebuilds in-process: it registers the command (`engine_files.register_command_run`, so a
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run does not rebuild
+    in-process: it registers the command (`engine_files.register_command_run`, so a
     start that needs a rebuild can end it) and runs the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a
     rebuild needed it takes the start lock, ends every other running command and runs the rebuild as its own process
-    (`nell supervisor rebuild`, which runs the swap again before its rebuild; the marker makes that a no-op), then goes on. Its code
+    (`nell supervisor rebuild`, which first takes any core feeling out of her vocabulary file), then goes on. Its code
     is returned: 1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was
     run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
     not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
@@ -1080,9 +1086,6 @@ def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
     on a switched persona it goes on as today.
     """
     if not dry_run:
-        # The one-time vocabulary swap for contentment, calm, peace and groundedness (#648) comes first, so a rebuild the step runs
-        # uses the swapped half-lives. It logs and never raises; a dry run (below) writes nothing and never calls it.
-        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
         from brain.bridge import daemon
 
         engine_files.register_command_run(persona_dir)  # through the module: the tests' fixture replaces the name

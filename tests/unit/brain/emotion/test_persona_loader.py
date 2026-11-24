@@ -231,7 +231,7 @@ def test_load_corrupt_no_bak_with_store_reconstructs_from_memories(tmp_path: Pat
         # File on disk now has the reconstructed content
         on_disk = json.loads(vocab_path.read_text(encoding="utf-8"))
         names = {e["name"] for e in on_disk["emotions"]}
-        assert "love" in names  # baseline
+        assert "love" not in names  # a core feeling is never written to her file (#801 section 8)
         assert "emergence" in names  # reconstructed extension
         assert "creative_hunger" in names  # reconstructed extension
 
@@ -450,8 +450,22 @@ def test_the_rebuild_of_a_missing_file_writes_through_the_shared_writer_once(tmp
     try:
         assert load_persona_vocabulary(path, store=store) == 1
         names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
-        assert "rebuilt_feeling" in names and "joy" in names  # baseline entries are written still (a later step stops that)
+        assert names == ["rebuilt_feeling"]  # no core entry is written (#801 section 8)
         assert len(calls) == 1
+    finally:
+        store.close()
+
+
+def test_the_rebuild_of_a_corrupt_file_for_a_persona_with_only_core_feelings_writes_no_entry(tmp_path: Path):
+    """The reset branch with nothing but core names in memory: no entry is written, the anomaly still reads as a rebuild."""
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text("{not json", encoding="utf-8")
+    store = _store_with({"joy": 3.0, "love": 2.0})
+    try:
+        count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
+        assert anomaly is not None and anomaly.action == "reconstructed_from_memories"
+        assert count == 0
+        assert json.loads(path.read_text(encoding="utf-8"))["emotions"] == []
     finally:
         store.close()
 

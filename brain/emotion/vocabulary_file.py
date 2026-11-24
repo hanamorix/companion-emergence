@@ -2,9 +2,12 @@
 
 `emotion_vocabulary.json` is changed by this module and by nothing else: adding a name, changing an entry's fields, merging two
 entries that tidy to the same name, and removing an entry are `add`, `replace_fields`, `merge` and `remove`. (json_io's own
-recovery of a corrupt file, which adds no name, and the two listed exceptions of #801 section 9, `vocabulary_swap.py` until step
-7 and the migrator until step 8, are the only other code that writes it.) `load` registers what the file holds into the registry
-and writes nothing.
+recovery of a corrupt file, which adds no name, and the migrator until step 8 of #801 (section 9), are the only other code that
+writes it.) `load` registers what the file holds into the registry and writes nothing.
+
+A core feeling (one of the framework's 30, `vocabulary.is_baseline`) is never written to her file (#801 section 8): `add` and
+`replace_fields` refuse it, and `remove_core_entries` takes out any entry the file holds for one, at every bridge start-up and in
+the rebuild step.
 
 Each change is ONE read-check-write, built once in `_transact`: the cross-process sidecar lock of the file taken with a bounded
 wait (`dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S`), the file re-read, the change applied to what was just read, a verified
@@ -18,7 +21,8 @@ this file's lock the INNER one.
 A name is matched by its tidied form (`vocabulary.canonical_name`) and the spelling used is the one already in the file. A new
 name passes `vocabulary.gate_name` first and is added under its tidied form.
 
-Each name gets a `NameResult`: `used` (with the spelling used), `refused` (the gate refused the name), `missing` (no entry carries
+Each name gets a `NameResult`: `used` (with the spelling used), `refused` (the gate refused the name, or it is a core feeling,
+which `add` and `replace_fields` never write), `missing` (no entry carries
 the name: `replace_fields`, `remove`) or `cannot_write` (the file could not be read or written, its schema is wrong, or the lock
 wait ran out; the cause is logged). `changed` says this call wrote that entry.
 """
@@ -225,18 +229,26 @@ def _entries_by_key(emotions: Iterable[Any]) -> dict[str, dict]:
 # ------------------------------------------------------------------------------------------------
 
 
+def _writable_key(raw: str) -> str | None:
+    """The tidied name an `add` or `replace_fields` may write, or None (`refused`): the gate refused it, or it is a core feeling."""
+    key = vocabulary.gate_name(raw)
+    if key is None or vocabulary.is_baseline(key):
+        return None  # a core feeling is never written to her file (#801 section 8): the framework holds its definition
+    return key
+
+
 def add(path: Path, items: Sequence[tuple[str, Mapping[str, Any] | None]]) -> list[NameResult]:
     """Add names to her vocabulary file: one result per `(raw_name, fields_or_None)` item, in order.
 
-    A name the gate refuses is `refused`. A name whose tidied form is already in the FILE is `used` under the spelling there and
+    A name the gate refuses, and a core feeling, is `refused`. A name whose tidied form is already in the FILE is `used` under the spelling there and
     nothing is written for it (the registry is not consulted: the file is the record). Any other name is appended under its
     tidied form with the given fields over the defaults (placeholder description, `persona_extension`, the placeholder half-life,
     clamp 10.0) and registered. One locked write for the whole list.
     """
     from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
 
-    gated = [(raw, vocabulary.gate_name(raw), dict(fields or {})) for raw, fields in items]
-    accepted = [(i, raw, key, fields) for i, (raw, key, fields) in enumerate(gated) if key is not None]
+    gated = [(raw, _writable_key(raw), dict(fields or {})) for raw, fields in items]
+    accepted =[(i, raw, key, fields) for i, (raw, key, fields) in enumerate(gated) if key is not None]
     if not accepted:
         return [NameResult(raw, None, "refused") for raw, _key, _fields in gated]
 
@@ -287,9 +299,10 @@ def replace_fields(
 
     The entry found (by tidied name) is updated in place, so any other key it carries is kept; its name is never changed.
     `only_if(entry)`, when given, is asked about the entry as it is in the file now: False leaves that entry alone (`used`, not
-    `changed`), so a caller never overwrites a value another writer set since it looked. A name no entry carries is `missing`.
+    `changed`), so a caller never overwrites a value another writer set since it looked. A name no entry carries is `missing`; a
+    core feeling is `refused` (its definition is the framework's).
     """
-    gated = [(raw, vocabulary.gate_name(raw), dict(fields)) for raw, fields in changes.items()]
+    gated = [(raw, _writable_key(raw), dict(fields)) for raw, fields in changes.items()]
     wanted = [(raw, key, fields) for raw, key, fields in gated if key is not None]
     if not wanted:
         return [NameResult(raw, None, "refused") for raw, _key, _fields in gated]
@@ -406,20 +419,75 @@ def remove(path: Path, name: str) -> NameResult:
     key = vocabulary.canonical_name(name)
     if not key:
         return NameResult(name, None, "refused")
+    removed, ok = _remove_where(path, lambda tidied: tidied == key, "remove")
+    if not ok:
+        return NameResult(name, None, "cannot_write")
+    return NameResult(name, key, "used", True) if removed else NameResult(name, None, "missing")
 
-    def mutate(data: dict) -> tuple[NameResult, Callable[[], None] | None]:
-        kept = [
-            e
-            for e in data["emotions"]
-            if not (isinstance(e, dict) and isinstance(e.get("name"), str) and vocabulary.canonical_name(e["name"]) == key)
-        ]
-        if len(kept) == len(data["emotions"]):
-            return NameResult(name, None, "missing"), None
+
+def _remove_where(path: Path, wanted: Callable[[str], bool], action: str) -> tuple[list[str], bool]:
+    """The one removal: drop every dict entry whose tidied name satisfies `wanted`, in one verified locked write.
+
+    Returns (the spellings removed, ok); ok False = `cannot_write`. Entries that are not dicts, have no string name or tidy to
+    nothing stay, in their order. Nothing is written when none matches. A framework (baseline) entry stays registered.
+    """
+    def mutate(data: dict) -> tuple[list[str], Callable[[], None] | None]:
+        kept: list = []
+        gone: list[str] = []
+        for e in data["emotions"]:
+            if isinstance(e, dict) and isinstance(e.get("name"), str):
+                tidied = vocabulary.canonical_name(e["name"])
+                if tidied and wanted(tidied):
+                    gone.append(e["name"])
+                    continue
+            kept.append(e)
+        if not gone:
+            return gone, None
         data["emotions"] = kept
-        return NameResult(name, key, "used", True), lambda: None if vocabulary.is_baseline(key) else vocabulary._unregister(key)
+        keys = {vocabulary.canonical_name(s) for s in gone}
 
-    result, ok = _transact(path, mutate, "remove")
-    return result if ok else NameResult(name, None, "cannot_write")
+        def registry_step() -> None:
+            for k in keys:
+                if not vocabulary.is_baseline(k):  # a core entry stays registered: the framework holds it
+                    vocabulary._unregister(k)
+
+        return gone, registry_step
+
+    gone, ok = _transact(path, mutate, action)
+    return (gone if ok else []), ok
+
+
+@dataclass(frozen=True)
+class CoreRemoval:
+    removed: list[str]  # the spellings removed from her file
+    cannot_write: bool = False
+
+
+def remove_core_entries(path: Path) -> CoreRemoval:
+    """Remove every entry her file holds for a core feeling (#801 section 8), with a verified write; run at each bridge start-up and
+    in the rebuild step. After the first run it finds nothing and writes nothing.
+
+    A missing file, or a file with no core entry, returns at once: no lock, no write, no backup-count scan, no file created. The
+    unlocked read that decides this is safe because a core feeling can no longer be added (`add` and `replace_fields` refuse it) and
+    the file is replaced atomically, so a "none found" cannot hide a core entry that is still there; the removal itself re-reads
+    under the lock. A file that cannot be read or written is logged and left as it is (`cannot_write`); nothing here raises for a file
+    problem. The framework's own entries stay in the registry.
+    """
+    if not path.exists():
+        return CoreRemoval([])
+    try:
+        emotions = read(path, recover=Recovery.RAISE).data["emotions"]
+    except (OSError, ValueError) as exc:
+        logger.warning("vocabulary: the check for core feelings in %s could not read it (%s: %s); it is left as it is", path.name, type(exc).__name__, exc)
+        return CoreRemoval([], cannot_write=True)
+    if not any(
+        isinstance(e, dict) and isinstance(e.get("name"), str) and vocabulary.is_baseline(e["name"]) for e in emotions
+    ):
+        return CoreRemoval([])
+    removed, ok = _remove_where(path, vocabulary.is_baseline, "remove core entries")
+    if removed:
+        logger.warning("vocabulary: removed core feeling entries %s from %s (the framework holds their definitions)", sorted(removed), path.name)
+    return CoreRemoval(removed, cannot_write=not ok)
 
 
 def load(path: Path, *, recover: Recovery = Recovery.HEAL) -> tuple[int, BrainAnomaly | None]:

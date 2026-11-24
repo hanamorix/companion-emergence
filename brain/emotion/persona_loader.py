@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 def _rebuild_from_memories(path: Path, recon_data: dict) -> tuple[int, bool]:
     """Write the reconstructed entries through the shared writer.
 
-    Returns (count newly registered (the baseline entries are registered already), whether the file was written).
+    The reconstructed entries are persona extensions only (a core feeling is never written to her file). Returns (count newly
+    registered, whether the file was written).
     """
     before = len(vocabulary.list_all())
     results = vocabulary_file.add(

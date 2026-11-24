@@ -80,13 +80,13 @@ def test_add_writes_through_the_shared_writer_and_the_next_lookup_sees_it(person
         assert r.json() == {
             "results": [
                 {"name": "Fresh Word", "spelling": "fresh_word", "outcome": "used", "changed": True},
-                {"name": "joy", "spelling": "joy", "outcome": "used", "changed": True},
+                {"name": "joy", "spelling": None, "outcome": "refused", "changed": False},  # a core feeling is never written
                 {"name": "---", "spelling": None, "outcome": "refused", "changed": False},
             ]
         }
         seen = c.post("/vocabulary/lookup", json={"names": ["Fresh Word"]}, headers=AUTH).json()["entries"][0]
     assert seen["spelling"] == "fresh_word" and seen["description"] == "new" and seen["half_life_days"] == 3.0
-    assert [e["name"] for e in _entries(persona_dir)] == ["fresh_word", "joy"]
+    assert [e["name"] for e in _entries(persona_dir)] == ["fresh_word"]
 
 
 def test_add_ignores_any_field_that_is_not_an_entry_field(persona_dir: Path) -> None:
@@ -114,19 +114,19 @@ def test_the_bridge_is_the_owner_while_it_runs_and_not_after(persona_dir: Path) 
 
 
 def test_start_up_merges_two_entries_of_one_name_under_the_first_spelling(persona_dir: Path) -> None:
-    """Criterion 7 (in-process app): `comfort seeking` and `comfort_seeking` end as one entry under `comfort seeking`.
+    """Criterion 7 (in-process app): `tender longing` and `tender_longing` end as one entry under `tender longing`.
 
-    (`comfort_seeking` is also a framework name, so the registry keeps the framework's entry: that is checked on a name that is
-    only hers, `quiet dread`.)
+    (The spec's own example, `comfort seeking`, is a core feeling, so since #801 section 8 its entries are removed, not merged:
+    see `test_core_entries_removed_startup.py`.) The registry holds the first spelling, checked on `quiet dread`.
     """
     (persona_dir / FILE).write_text(
         json.dumps(
             {
                 "version": 1,
                 "emotions": [
-                    _entry("comfort seeking", "first"),
+                    _entry("tender longing", "first"),
                     _entry("other_word"),
-                    _entry("comfort_seeking", "second"),
+                    _entry("tender_longing", "second"),
                     _entry("quiet dread", "first"),
                     _entry("Quiet_Dread", "second"),
                 ],
@@ -136,7 +136,7 @@ def test_start_up_merges_two_entries_of_one_name_under_the_first_spelling(person
     )
     with _client(persona_dir) as c:
         entries = _entries(persona_dir)
-        assert [e["name"] for e in entries] == ["comfort seeking", "other_word", "quiet dread"]
+        assert [e["name"] for e in entries] == ["tender longing", "other_word", "quiet dread"]
         assert [e["description"] for e in entries] == ["first", "a real description", "first"]
         seen = c.post("/vocabulary/lookup", json={"names": ["quiet_dread"]}, headers=AUTH).json()["entries"][0]
     assert seen["spelling"] == "quiet dread"

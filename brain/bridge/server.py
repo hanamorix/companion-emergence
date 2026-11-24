@@ -86,7 +86,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
-from brain.emotion import vocabulary, vocabulary_access, vocabulary_file, vocabulary_swap
+from brain.emotion import vocabulary, vocabulary_access, vocabulary_file
 from brain.emotion.engine_state_names import run_state_names_pass
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
@@ -161,8 +161,9 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
     the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
-    Once it has loaded, two entries in her file whose names tidy the same are merged under the spelling that comes first in the
-    file (#801 section 3), through the shared writer. A load that failed skips the merge.
+    Once it has loaded, any entry her file holds for a core feeling is removed (#801 section 8; a second start finds none), then two
+    entries whose names tidy the same are merged under the spelling that comes first in the file (#801 section 3), both through the
+    shared writer. A load that failed skips both.
 
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
     Any exception → logged and swallowed so bridge startup is never blocked.
@@ -174,6 +175,13 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
         path = vocabulary_file.vocabulary_path(persona_dir)
         _count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
         loaded = anomaly is None or anomaly.action != "reset_to_default"
+        # Core feelings are never in her file (#801 section 8): any entry it holds for one is removed, first, so the twin merge
+        # below sees a file without them. Its own try: a bug in the removal must not skip the merge. A load that raised above skips
+        # both (a file the load cannot read cannot be removed from either).
+        try:
+            vocabulary_file.remove_core_entries(path)
+        except Exception:
+            logger.exception("startup: the removal of core feelings from %s stopped; the twin merge goes on", path.name)
         if path.exists():
             merged = vocabulary_file.merge(path)
             if merged.cannot_write:
@@ -1473,12 +1481,6 @@ def build_app(
         # loaded (a failed load drops nothing), before the start-up drain below. It never raises.
         if _vocabulary_loaded:
             run_state_names_pass(persona_dir)
-
-        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648). A start that needs a
-        # rebuild has already run it in the rebuild child (`_supervisor_rebuild_handler`), right before that rebuild; this call covers
-        # a start that needs none and a bridge started around the supervisor. The marker makes the second run a no-op. Fail-soft: it
-        # logs and never raises.
-        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
 
         # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
         # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.

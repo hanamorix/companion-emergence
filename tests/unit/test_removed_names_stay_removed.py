@@ -900,6 +900,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="#801 (draft PR #803), build step 5",
         kind="code",
     ),
+    # --- core feelings are never in her file; the #648 swap is gone (#801 step 7) --------------------------------------------------
+    Removed(
+        names=("vocabulary_swap", "run_vocabulary_swap_648", "_SWAPPED_NAMES", "_swap_file", "vocabulary_swap_648.json"),
+        why="the one-time #648 swap of four entries is replaced by section 8 of #801: a core feeling is never written to her vocabulary file, and `vocabulary_file.remove_core_entries` removes any entry the file holds for one at every bridge start-up and in the rebuild step; no marker file is kept, and an old `vocabulary_swap_648.json` is left on disk and never read",
+        ref="#741 / #801 (draft PR #803), build step 7",
+        kind="code",
+    ),
 )
 
 

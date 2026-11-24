@@ -110,16 +110,16 @@ def test_a_command_adds_a_name_through_the_bridge_and_the_bridge_is_the_only_wri
 
 
 def test_a_real_bridge_start_merges_two_entries_of_one_name_under_the_first_spelling(tmp_path: Path, bridges: list) -> None:
-    """Criterion 7 at a real bridge start: `comfort seeking` and `comfort_seeking` end as one entry under `comfort seeking`."""
+    """Criterion 7 at a real bridge start: `tender longing` and `tender_longing` end as one entry under `tender longing`."""
 
     def prepare(pd: Path) -> None:
         (pd / FILE).write_text(
-            json.dumps({"version": 1, "emotions": [_entry("comfort seeking", "first"), _entry("other_word"), _entry("comfort_seeking", "second")]}),
+            json.dumps({"version": 1, "emotions": [_entry("tender longing", "first"), _entry("other_word"), _entry("tender_longing", "second")]}),
             encoding="utf-8",
         )
 
     b = Bridge(tmp_path, prepare=prepare)
     bridges.append(b)
     entries = json.loads((b.pd / FILE).read_text(encoding="utf-8"))["emotions"]
-    assert [e["name"] for e in entries] == ["comfort seeking", "other_word"]
+    assert [e["name"] for e in entries] == ["tender longing", "other_word"]
     assert entries[0]["description"] == "first"
