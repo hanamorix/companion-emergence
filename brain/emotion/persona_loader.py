@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain.emotion import vocabulary, vocabulary_file
-from brain.health.json_io import Recovery
+from brain.health.json_io import JsonFileError, Recovery
 from brain.memory.store import MemoryStore
 from brain.utils import file_ops
 
@@ -108,14 +108,28 @@ def _rebuild_missing_file(path: Path, store: MemoryStore) -> int:
     return registered
 
 
+def _log_anomaly(anomaly: BrainAnomaly | None) -> None:
+    """The one log line for a repair of her vocabulary file (the start-up load and the owner's reload both write it)."""
+    if anomaly is not None:
+        logger.warning(
+            "emotion_vocabulary anomaly detected: %s action=%s file=%s",
+            anomaly.kind,
+            anomaly.action,
+            anomaly.file,
+        )
+
+
 def reload_copy(path: Path) -> None:
     """What `vocabulary.follow_file` runs when the file changed under this process's copy: make the copy match the file again.
 
     Everyone: read the file without repairing it (`Recovery.RAISE`) and match the registry to it exactly (`vocabulary_file.reload`).
     A file that cannot be read leaves the copy as it was, is logged once, and the saved key becomes the key of the file as found
     (stat taken BEFORE the read, the safe direction), so it is not read and logged again until it changes. A stat that fails cannot
-    say which file was found: no key is saved. Owner interim (step 16 not built): a damaged file is logged and left as found here;
-    step 16 (VC1) puts the repair through the accessor at this point.
+    say which file was found: no key is saved. The owner repairs a damaged file (bad content, not an io error) through
+    `vocabulary_file.repair` (VC1: quarantine, restore a backup or reset to the default, under the file's lock, ending with the copy
+    matching the file), logs the anomaly as the start-up load does, and goes on with the steps below on what the repair left; a repair
+    that fails is logged and the file and the copy stay as they were. After a RESET the owner's reload does not rebuild names from
+    memories (the start-up load does); the heartbeat's explicit load heals names that memories reference.
 
     Owner only, after a successful read: an absent file with a `memories.db` beside it takes the start-up's missing-file path with a
     short-lived store (opened here, closed when done, none kept); a file holding a core name or twins gets the start-up clean-up
@@ -134,11 +148,16 @@ def reload_copy(path: Path) -> None:
     except OSError:
         found_key, found_known = None, False
     try:
-        # Interim until step 16 (VC1): the owner reads with Recovery.RAISE here and a damaged file is only logged; VC1 adds the repair.
-        _count, res = vocabulary_file.reload(path)
+        try:
+            _count, res = vocabulary_file.reload(path)
+        except JsonFileError as damaged:
+            if not owner or damaged.kind == "io":
+                raise
+            res, _changes = vocabulary_file.repair(path)  # the owner repairs; it logged and raised if it could not
+            _log_anomaly(res.anomaly)
     except (OSError, ValueError) as exc:  # JsonFileError is both
         logger.warning(
-            "emotion_vocabulary.json cannot be read (%s: %s); the copy stays as it was until the file changes",
+            "emotion_vocabulary.json cannot be read or repaired (%s: %s); the copy stays as it was until the file changes",
             type(exc).__name__,
             exc,
         )
@@ -175,10 +194,13 @@ def _load_followed(path: Path, *, store: MemoryStore | None, read_only: bool) ->
             registered += _rebuild_missing_file(path, store)
         return registered, None
 
-    recover = Recovery.RAISE if read_only else Recovery.HEAL
-    _res = vocabulary_file.read(path, recover=recover)
+    if read_only:
+        _res, registered = vocabulary_file.read(path, recover=Recovery.RAISE), 0
+    else:
+        # The owner's load repairs a damaged file through the accessor, which ends with the registry matching the repaired file;
+        # its count of registry changes is part of this load's count.
+        _res, registered = vocabulary_file.repair(path)
     data, anomaly = _res.data, _res.anomaly
-    registered = 0
 
     # Reconstruct from memories when reset_to_default fires on vocabulary.
     # The default factory writes empty `{"version":1,"emotions":[]}` — that's
@@ -214,13 +236,7 @@ def _load_followed(path: Path, *, store: MemoryStore | None, read_only: bool) ->
         # A rebuild the file could not take (the writer logged why) registers nothing and leaves the anomaly as the heal
         # reported it: the registry never holds what the file does not.
 
-    if anomaly is not None:
-        logger.warning(
-            "emotion_vocabulary anomaly detected: %s action=%s file=%s",
-            anomaly.kind,
-            anomaly.action,
-            anomaly.file,
-        )
+    _log_anomaly(anomaly)
 
     registered += vocabulary_file.reload_entries(data)
     if _res.outcome == "ok" and _res.sig is not None:

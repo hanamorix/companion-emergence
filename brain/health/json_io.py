@@ -648,13 +648,17 @@ def _quarantine_copy(path: Path, stamp: str) -> Path:
     raise OSError(errno.EEXIST, f"no free quarantine name for {path}")
 
 
+def anomaly_kind_for(read_kind: str) -> str:
+    """The anomaly kind a bad read kind is reported as: empty, malformed and encoding are json_parse_error; shape and schema are
+    schema_mismatch. The one mapping, used by the heal and by a caller that reports damage without healing it."""
+    return "json_parse_error" if read_kind in ("encoding", "empty", "malformed") else "schema_mismatch"
+
+
 def _heal_locked(path, bad, sig, default, recover, expect, validate, fallbacks) -> JsonRead:
     now = datetime.now(UTC)
     stamp = _filename_safe_timestamp(now)
     likely_cause = _classify_cause(path)
-    anomaly_kind = (
-        "json_parse_error" if bad.kind in ("encoding", "empty", "malformed") else "schema_mismatch"
-    )
+    anomaly_kind = anomaly_kind_for(bad.kind)
     detail = _short_detail(bad.cause)
     chosen_bak, chosen_fallback, walked_corrupt = _pick(path, expect, validate, fallbacks)
 

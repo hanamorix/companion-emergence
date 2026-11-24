@@ -3,13 +3,17 @@ and triggered automatically when a heartbeat tick produces >=2 anomalies."""
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
-from brain.health.json_io import Recovery, read_json_result
+from brain.health.attempt_heal import _classify_cause
+from brain.health.json_io import JsonFileError, Recovery, anomaly_kind_for, read_json_result
+
+logger = logging.getLogger(__name__)
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
 #
@@ -40,13 +44,50 @@ _AUTO_CREATE_TEXT_FILES: tuple[str, ...] = ("voice.md",)
 _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 
 
+_VOCABULARY_FILE = "emotion_vocabulary.json"
+
+
+def _read_vocabulary(path: Path, default: dict) -> BrainAnomaly | None:
+    """Check her vocabulary file; the anomaly, if any (#803 step 16, VC1).
+
+    Only the owner of her vocabulary (the bridge: `/health`, the supervisor's heartbeat) repairs it, through the accessor
+    (`vocabulary_file.repair`, which ends with the owner's copy matching the file). Any other process (`nell health check`,
+    `nell heartbeat`) reads it with `Recovery.CONTENT`: the default in memory, no quarantine, no write; it builds the anomaly itself,
+    `alarmed_unrecoverable` (the file is damaged and this process does not repair it), with the kind json_io's heal gives the same
+    damage. The bridge repairs it at its next read of its copy or at its next start. A file that cannot be read at all (kind io)
+    builds no anomaly: it is logged and the walk goes on.
+    """
+    from brain.emotion import vocabulary, vocabulary_file
+
+    if vocabulary.is_bridge_owner():
+        return vocabulary_file.repair(path)[0].anomaly
+    try:
+        res = read_json_result(path, default=lambda d=default: d, recover=Recovery.CONTENT, validate=vocabulary_file.validate_schema)
+    except JsonFileError as exc:
+        logger.warning("walk_persona: %s could not be read (%s); no anomaly is built for it", path.name, exc)
+        return None
+    if res.outcome != "defaulted":
+        return None
+    kind = res.kind or "malformed"
+    return BrainAnomaly(
+        timestamp=datetime.now(UTC),
+        file=path.name,
+        kind=anomaly_kind_for(kind),  # type: ignore[arg-type]
+        action="alarmed_unrecoverable",
+        quarantine_path=None,
+        likely_cause=_classify_cause(path),
+        detail=f"{kind}: damaged, and this process does not repair her vocabulary file (the bridge does)",
+    )
+
+
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
     Iterates atomic-rewrite files via read_json_result (HEAL) (captures corruption +
     repairs in one shot) then opens each SQLite store so the constructor's
     PRAGMA integrity_check runs. Returns an empty list when everything is
-    healthy.
+    healthy. The one exception is her vocabulary file (`emotion_vocabulary.json`),
+    which only the bridge repairs (#803 step 16): see `_read_vocabulary`.
     """
     anomalies: list[BrainAnomaly] = []
 
@@ -54,8 +95,11 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     # to avoid Python's late-binding closure gotcha.
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
-        _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
-        _, anomaly = _res.data, _res.anomaly
+        if name == _VOCABULARY_FILE:
+            anomaly = _read_vocabulary(path, default)
+        else:
+            _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
+            anomaly = _res.anomaly
         if anomaly is not None:
             anomalies.append(anomaly)
 

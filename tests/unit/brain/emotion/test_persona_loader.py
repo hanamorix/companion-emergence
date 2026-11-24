@@ -421,16 +421,16 @@ def test_the_memory_heal_writes_once_through_the_shared_writer_and_leaves_the_na
 def test_a_corrupt_file_rebuild_the_file_cannot_take_registers_nothing_and_keeps_the_reset_anomaly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    from brain import dev_constants
-    from brain.utils import file_lock
+    from brain.emotion import vocabulary_file
 
     path = tmp_path / "emotion_vocabulary.json"
     path.write_bytes(b"\xff{torn")
-    monkeypatch.setattr(dev_constants, "EMOTION_VOCABULARY_LOCK_WAIT_S", 0.2)
+    # The repair (json_io's reset) succeeds; the rebuild's own write does not verify, so it is `cannot_write` (a held lock would fail
+    # the repair itself, which holds the file's lock: see test_vocabulary_repair_accessor.py).
+    monkeypatch.setattr(vocabulary_file, "write_json", lambda *a, **k: False)
     store = _store_with({"unwritten feeling": 3.0})
     try:
-        with file_lock.file_lock(path):
-            count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
+        count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
         assert count == 0
         assert anomaly is not None and anomaly.action == "reset_to_default"
         assert vocabulary.get("unwritten_feeling") is None

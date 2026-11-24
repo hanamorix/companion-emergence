@@ -1,11 +1,13 @@
 """The one writer of her vocabulary file (#741, #801 section 4).
 
 `emotion_vocabulary.json` is changed by this module and by nothing else: adding a name, changing an entry's fields, merging two
-entries that tidy to the same name, and removing an entry are `add`, `replace_fields`, `merge` and `remove`. (json_io's own
-recovery of a corrupt file, which adds no name, is the only other code that writes it. The rebuild step and the OG migrator, the
-two noted exceptions to "only the bridge calls this" (section 9), call this module too.) `reload_entries` and `reload` make the
-registry match what the file holds, exactly (names the file no longer holds are removed), and write nothing: every load of the file
-uses them, and `reload` is what a process's copy runs when the file changed under it (`vocabulary.follow_file`, #803 step 15).
+entries that tidy to the same name, and removing an entry are `add`, `replace_fields`, `merge` and `remove`. The repair of a damaged
+file (`repair`, which `read`'s HEAL default is) runs json_io's own recovery (quarantine, restore a backup or reset to the default),
+which adds no name, under this module's file lock, and makes the copy match the repaired file (#803 step 16); nothing else writes
+the file. The rebuild step and the OG migrator, the two noted exceptions to "only the bridge calls this" (section 9), call this module
+too. `reload_entries` and `reload` make the registry match what the file holds, exactly (names the file no longer holds are removed),
+and write nothing: every load of the file uses them, and `reload` is what a process's copy runs when the file changed under it
+(`vocabulary.follow_file`, #803 step 15).
 
 A core feeling (one of the framework's 30, `vocabulary.is_baseline`) is never written to her file (#801 section 8): `add` and
 `replace_fields` refuse it, `merge` leaves a core entry where it is (never merged into her file), and `remove_core_entries` takes
@@ -19,7 +21,8 @@ fails leaves the registry as it was. (When a reader's reload got in between the 
 and the next read reloads from the file: see `_transact`.) An error in the registry step itself (a bug, not a file problem) is raised to the caller
 after the lock is released; the file is already written and the next read reloads what it holds. The lock is not re-entrant, so the
 public operations never call each other. Lock order for any later caller: `engine_files.state_lock` is the OUTER lock, this file's
-lock the next and `_REGISTRY_LOCK` the INNER one; a reload takes the registry lock only.
+lock the next, json_io's `<name>.heal.lock` inside it (only `repair` takes it) and `_REGISTRY_LOCK` the INNER one; a reload takes the
+registry lock only.
 
 A name is matched by its tidied form (`vocabulary.canonical_name`) and the spelling used is the one already in the file. A new
 name passes `vocabulary.gate_name` first and is added under its tidied form.
@@ -44,7 +47,7 @@ from brain import dev_constants
 from brain.emotion import vocabulary
 from brain.emotion.vocabulary import Emotion
 from brain.health.adaptive import DEFAULT_BACKUP_COUNT, compute_treatment
-from brain.health.json_io import JsonRead, Recovery, read_json_result, write_json
+from brain.health.json_io import JsonFileError, JsonRead, Recovery, read_json_result, write_json
 from brain.utils import file_lock
 
 if TYPE_CHECKING:
@@ -94,8 +97,51 @@ def validate_schema(data: object) -> None:
 
 
 def read(path: Path, *, recover: Recovery = Recovery.HEAL) -> JsonRead:
-    """Read her vocabulary file under a recovery policy (see `json_io.read_json_result`); a missing file reads as no entries."""
+    """Read her vocabulary file under a recovery policy (see `json_io.read_json_result`); a missing file reads as no entries.
+
+    HEAL (the default) is `repair`: the one way a damaged file of hers is repaired. Every other policy reads and writes nothing.
+    """
+    if recover is Recovery.HEAL:
+        return repair(path)[0]
     return read_json_result(path, default=default_vocabulary, recover=recover, validate=validate_schema)
+
+
+def repair(path: Path) -> tuple[JsonRead, int]:
+    """Repair a damaged vocabulary file through this module (#803 step 16, VC1): json_io's own heal for the file, whole (quarantine the
+    bad file, restore a good backup or reset to the default), run under this file's lock and ending with the copy matching the file.
+
+    Only the owner calls this (the bridge: the loader's HEAL read, the growth scheduler, `walk_persona`, the owner's reload); a process
+    that is not the owner reads with `Recovery.RAISE` or `Recovery.CONTENT` and never repairs.
+
+    A healthy or missing file is returned as read: no lock, no write. A file whose content is bad takes the file lock with the bounded
+    wait, and inside it json_io's heal runs (it re-validates under its own `<name>.heal.lock`, so a file another actor fixed in between
+    comes back as it is, `outcome` "ok", no anomaly), then `reload` makes the copy match the file (read, exact sync, key noted). Lock
+    order: this file's lock OUTER, json_io's `.heal.lock` inside it (nothing takes the heal lock and then this one: the heal calls no
+    vocabulary function), `_REGISTRY_LOCK` innermost (the reload). Callers hold neither this lock nor the registry lock.
+
+    Returns (the heal's `JsonRead`, the count of registry changes the reload made; 0 when nothing was repaired): the `anomaly` says
+    what was done. A repair that fails (the lock wait ran out, the heal could not
+    quarantine or install) logs one warning, leaves the file as found and the copy as it was, and raises what the heal raised
+    (`JsonFileError`, `LockTimeoutError`: both OSError); an unreadable file (kind io) raises as the heal's read did. A reload that
+    cannot read the repaired file is logged and left: the file changed, so the next read's stat check reloads.
+    """
+    try:
+        return read_json_result(path, default=default_vocabulary, recover=Recovery.RAISE, validate=validate_schema), 0
+    except JsonFileError as damaged:
+        if damaged.kind == "io":
+            raise
+    try:
+        with file_lock.locked_within(path, dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S), vocabulary.suspended():
+            res = read_json_result(path, default=default_vocabulary, recover=Recovery.HEAL, validate=validate_schema)
+            changes = 0
+            try:
+                changes, _read = reload(path)
+            except (OSError, ValueError) as exc:
+                logger.warning("vocabulary: the copy could not be matched to the repaired %s (%s: %s); the next read reloads it", path.name, type(exc).__name__, exc)
+            return res, changes
+    except (OSError, ValueError) as exc:
+        logger.warning("vocabulary: the repair of %s failed (%s: %s); the file and the copy are as they were", path.name, type(exc).__name__, exc)
+        raise
 
 
 def backup_count(path: Path) -> int:

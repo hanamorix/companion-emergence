@@ -196,8 +196,8 @@ def _read_current_vocabulary_names(
 
     The names come from the lookup (`vocabulary_access.lookup`, "all": every entry of her vocabulary, the framework's own
     included), tidied, because the dedupe compares tidied names. In the bridge (the owner) the file is also read for its health:
-    a damaged file is quarantined and healed from a backup or reset to the default (json_io's own recovery), and the anomaly is
-    returned so the caller (run_growth_tick) feeds it into its `anomalies_collector` and it surfaces in the heartbeat audit log.
+    a damaged file is repaired through the accessor (`vocabulary_file.repair`: quarantined and restored from a backup or reset to
+    the default under the file's lock, the registry then matching the file), and the anomaly is returned so the caller (run_growth_tick) feeds it into its `anomalies_collector` and it surfaces in the heartbeat audit log.
     Logs WARNING locally too. A missing file gives no anomaly (fresh persona; expected). Another process does not read it for
     health: it must not quarantine or reset a file the bridge owns.
     """

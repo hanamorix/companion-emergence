@@ -174,11 +174,11 @@ def test_the_copy_matches_the_file_after_a_write_so_the_next_read_does_not_reloa
 # ----------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("is_owner", [True, False])
-def test_an_unreadable_file_leaves_the_copy_and_is_logged_once_until_it_changes(path, caplog, is_owner):
-    vocabulary.set_bridge_owner(is_owner)
+def test_an_unreadable_file_leaves_the_copy_and_is_logged_once_until_it_changes(path, caplog):
+    """A process that is not the owner never repairs (the owner does, `test_vocabulary_repair_accessor.py`, VC1)."""
+    vocabulary.set_bridge_owner(False)
     _hand_edit(path, [_entry("kept one")])
-    persona_loader.load_persona_vocabulary(path, read_only=not is_owner)
+    persona_loader.load_persona_vocabulary(path, read_only=True)
     path.write_text("{ not json", encoding="utf-8")
     with caplog.at_level(logging.WARNING):
         for _ in range(4):
