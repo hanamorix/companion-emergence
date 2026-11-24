@@ -60,6 +60,7 @@ def test_a_discarded_feeling_with_a_low_importance_given_is_refused(store: Memor
     assert store.count() == 0
 
 
+@pytest.mark.no_base_failure(reason="control: with importance 7 given the old order also passed the gate and the store's check dropped the name, so the stored row was already right")
 def test_a_discarded_feeling_with_importance_seven_given_stores_only_the_kept_feelings(store: MemoryStore) -> None:
     result = _add(store, {"joy": 4, UNKNOWN: 16}, importance=7)
     assert result["created"] is True
@@ -97,6 +98,7 @@ def test_two_spellings_of_one_feeling_are_scored_as_their_mean(store: MemoryStor
     assert row.importance == 5
 
 
+@pytest.mark.no_base_failure(reason="control: a memory with only kept feelings was unchanged by the old order too")
 def test_a_memory_with_only_kept_feelings_is_unchanged(store: MemoryStore) -> None:
     result = _add(store, {"love": 9, "joy": 8})
     assert result["created"] is True
@@ -104,6 +106,7 @@ def test_a_memory_with_only_kept_feelings_is_unchanged(store: MemoryStore) -> No
     assert _only_row(store)._stored_emotions == {"love": 9.0, "joy": 8.0}
 
 
+@pytest.mark.no_base_failure(reason="guard: the old order also ran the check once (inside create); this pins that moving it into add_memory did not double it")
 def test_the_check_runs_once_per_add_memory(store: MemoryStore, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict] = []
     real = vocabulary_access.check_feelings
