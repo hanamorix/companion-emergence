@@ -341,20 +341,16 @@ def run_relationship_reflection(
         try:
             memory_summary = str(data.get("memory_summary", "")).strip()
             if memory_summary and live:
-                from brain.chat.extractor import _filter_to_registered
-
                 write_kindled_peer_memory(
                     mem_store, peer_id=peer_id, session_id=session_id,
                     speaker=persona_name, stage=state.stage,
-                    content=memory_summary, emotions=_filter_to_registered(_live_peer_values(data.get("emotion"))),
+                    content=memory_summary, emotions=_live_peer_values(data.get("emotion")),
                 )
             elif memory_summary and engine_scale:
                 # 0-10 values, but the engine is not reading (a switched persona whose state cannot be read, or one the
                 # x10 fix rescaled before its switch-over), so the peer cap still holds her, as on today's path. The cap
                 # and its bucket count on today's small scale, so the values go in at a tenth and are stored at 0-10.
-                from brain.chat.extractor import _filter_to_registered
-
-                values = _filter_to_registered(_live_peer_values(data.get("emotion")))
+                values = _check_peer_values(mem_store, _live_peer_values(data.get("emotion")))
                 applied = apply_peer_emotion(store, peer_id, {k: v / 10.0 for k, v in values.items()}, now)
                 write_kindled_peer_memory(
                     mem_store, peer_id=peer_id, session_id=session_id,
@@ -367,11 +363,11 @@ def run_relationship_reflection(
                     {str(k): float(v) for k, v in emotion_raw.items()}
                     if isinstance(emotion_raw, dict) else {}
                 )
-                # Vocab-filter BEFORE the cap (M1): apply_peer_emotion charges the
-                # per-peer leaky bucket on raw magnitude, so an unregistered name the
-                # model invents would consume headroom while seeding no felt state.
-                from brain.chat.extractor import _filter_to_registered
-                emotion_delta = _filter_to_registered(emotion_delta)
+                # Check the names BEFORE the cap (M1): apply_peer_emotion charges the
+                # per-peer leaky bucket on raw magnitude, so a name her vocabulary
+                # cannot hold, which the model invented, would consume headroom
+                # while seeding no felt state.
+                emotion_delta = _check_peer_values(mem_store, emotion_delta)
                 applied = apply_peer_emotion(store, peer_id, emotion_delta, now)
                 write_kindled_peer_memory(
                     mem_store, peer_id=peer_id, session_id=session_id,
@@ -415,6 +411,11 @@ def save_reflection_cadence(persona_dir, now: datetime) -> None:
     )
 
 
+def _check_peer_values(mem_store, values: dict[str, float]) -> dict[str, float]:
+    """The peer's feelings with each name checked against her vocabulary (`MemoryStore.checked_emotions`), before the cap charges them."""
+    return mem_store.checked_emotions(values)
+
+
 def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: datetime) -> dict[str, float]:
     """Scale `delta` so the peer's cumulative windowed influence stays ≤ cap
     (parent §14.3, anti love-bomb). Returns the delta actually applied ({} if the
@@ -445,9 +446,8 @@ def write_kindled_peer_memory(
     """Write a provenance-marked peer memory (parent §14). Permanently
     peer-sourced: recalled in user chat it surfaces as 'something a peer said',
     never as the user's words or as fact (see the _build_recall_block guard)."""
-    from brain.chat.extractor import _filter_to_registered
     from brain.memory.store import Memory
-    seeded = _filter_to_registered(emotions or {}) or None
+    seeded = dict(emotions or {}) or None  # `create` checks the names against her vocabulary
     mem = Memory.create_new(
         content=content, memory_type="kindled_peer", domain="kindled_peer",
         tags=["kindled_peer", f"peer:{peer_id}"], emotions=seeded,

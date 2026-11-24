@@ -140,6 +140,12 @@ EMOTION_VOCABULARY_LOCK_WAIT_S: float = 5.0
 # tool-silence kill that the search call is sized against. A call that runs out is the same "bridge timeout" as for search, and
 # the process goes on with the read-only file.
 VOCABULARY_BRIDGE_TIMEOUT_S: float = 10.0
+# Seconds a feeling name whose add could not be written (`cannot_write`: the file's lock wait ran out, or the disk is full) is left
+# alone before the check asks again (`brain.emotion.vocabulary_access.names_used`). One failed add costs up to
+# `EMOTION_VOCABULARY_LOCK_WAIT_S`, so without this a loop over the memories that hold the name would wait that long on every one
+# of them; with it the loop waits at most once in six. The name is kept tidied meanwhile and the next read after the window
+# tries again (spec section 4: "added by the next read of that memory").
+EMOTION_VOCABULARY_ADD_RETRY_S: float = 30.0
 # The longest a feeling name may be, in characters, once tidied (`vocabulary.gate_name`). A longer name is refused and
 # dropped with its values. The owner's reason: "somethings clearly gone wrong if a name's that long".
 EMOTION_NAME_MAX_CHARS: int = 100

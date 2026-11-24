@@ -6,13 +6,12 @@ from brain.maker.maker import Making
 from brain.maker.wiring import making_emotion_delta
 
 
-def test_emotion_delta_is_vocab_filtered_and_source_varied(monkeypatch):
-    # registered vocab present
-    import brain.chat.extractor as ext
-    monkeypatch.setattr(ext, "_filter_to_registered", lambda d: {k: v for k, v in d.items() if k in {"tenderness", "satisfaction"}})
-    d = making_emotion_delta(Making("elegy", "t", "c", "private", None), dominant_source="grief")
-    assert set(d).issubset({"tenderness", "satisfaction"})
-    assert all(v > 0 for v in d.values())
+def test_emotion_delta_is_source_varied():
+    """The delta is not filtered here (the engine's fold checks the names against her vocabulary): it is the base nudge plus the source's accent."""
+    grief = making_emotion_delta(Making("elegy", "t", "c", "private", None), dominant_source="grief")
+    plain = making_emotion_delta(Making("elegy", "t", "c", "private", None), dominant_source=None)
+    assert all(v > 0 for v in grief.values())
+    assert grief != plain
 
 
 # ---- #720: a persona without "satisfaction" or "wonder" feels the closest baseline name instead ----

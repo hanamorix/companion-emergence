@@ -33,7 +33,8 @@ def test_missing_file_with_store_reconstructs_persona_extensions(tmp_path: Path)
                 memory_type="monologue_emotion",
                 domain="monologue",
                 emotions={"warmth": 8.0},
-            )
+            ),
+            check_names=False,  # a row an older version stored, with a name her vocabulary lacks
         )
         _cleanup_emotion("warmth")  # clean registry for a meaningful assertion
 
@@ -69,7 +70,8 @@ def test_existing_file_heals_referenced_unregistered_emotion(tmp_path: Path):
                 memory_type="monologue_emotion",
                 domain="monologue",
                 emotions={"warmth": 8.0},
-            )
+            ),
+            check_names=False,
         )
         _cleanup_emotion("warmth")
 
@@ -97,7 +99,8 @@ def test_heal_mints_canonical_name_for_variant_memory_key(tmp_path: Path):
                 memory_type="conversation",
                 domain="us",
                 emotions={"present-ness": 8.0},
-            )
+            ),
+            check_names=False,
         )
         _cleanup_emotion("present_ness")
 
@@ -132,6 +135,7 @@ def test_heal_names_a_non_finite_valued_emotion_and_logs_no_drop(tmp_path: Path,
                 emotions={"Nan-Ache": float("nan"), "finite_ache": 6.0},
             ),
             fold=False,
+            check_names=False,
         )
         _cleanup_emotion("nan_ache")
         _cleanup_emotion("finite_ache")
@@ -162,7 +166,8 @@ def test_reconstruct_mints_canonical_names(tmp_path: Path):
             store.create(
                 Memory.create_new(
                     content="x", memory_type="conversation", domain="us", emotions={key: 8.0}
-                )
+                ),
+                check_names=False,
             )
         data = reconstruct_vocabulary_from_memories(store)
         ext = [e["name"] for e in data["emotions"] if e["category"] == "persona_extension"]

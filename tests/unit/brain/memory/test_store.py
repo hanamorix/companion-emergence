@@ -328,17 +328,6 @@ def test_store_list_by_type(store: MemoryStore) -> None:
     assert all(m.memory_type == "conversation" for m in convs)
 
 
-def test_store_list_by_emotion_filters_by_intensity(store: MemoryStore) -> None:
-    """list_by_emotion returns memories where that emotion >= min_intensity."""
-    store.create(_mem("a", emotions={"love": 9.0}))
-    store.create(_mem("b", emotions={"love": 3.0}))
-    store.create(_mem("c", emotions={"grief": 8.0}))
-
-    strong_love = store.list_by_emotion("love", min_intensity=5.0)
-    assert len(strong_love) == 1
-    assert strong_love[0].content == "a"
-
-
 def test_store_list_excludes_inactive_by_default(store: MemoryStore) -> None:
     """list_by_domain excludes deactivated memories by default."""
     m1 = _mem("active", domain="us")
@@ -836,26 +825,6 @@ def test_store_search_text_escapes_like_wildcards(store: MemoryStore) -> None:
     assert len(store.search_text("_")) == 1  # only the one with literal _
     assert store.search_text("%")[0].content == "50% cream"
     assert store.search_text("_")[0].content == "under_score"
-
-
-def test_store_list_by_emotion_skips_non_numeric_values(store: MemoryStore) -> None:
-    """If a memory's emotions_json has a non-numeric value for the queried
-    emotion (e.g. from a malformed migration), skip it without raising.
-    """
-    m = _mem("corrupt", emotions={"love": 9.0})
-    store.create(m)
-    # Manually corrupt the stored JSON to simulate bad migrator output.
-    import json as _json
-
-    store._conn.execute(
-        "UPDATE memories SET emotions_json = ? WHERE id = ?",
-        (_json.dumps({"love": "high"}), m.id),
-    )
-    store._conn.commit()
-
-    # Must not raise TypeError from the >= comparison.
-    results = store.list_by_emotion("love", min_intensity=5.0)
-    assert results == []
 
 
 def test_store_create_and_get_preserves_metadata(store: MemoryStore) -> None:

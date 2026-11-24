@@ -235,7 +235,7 @@ class EmotionEngine:
         if kind is None:
             self._apply_start_if_needed(memory.created_at)
             return
-        emotions = self._resolved_faded(memory)
+        emotions = self._resolved_faded(memory, check_names=False)  # the store checked the row before writing it
         if not emotions:  # nothing to fold, but the row's date still reaches the persona's start (B02.6)
             self._apply_start_if_needed(memory.created_at)
             return
@@ -256,7 +256,7 @@ class EmotionEngine:
         kind = counted_kind(memory)
         if kind is None:
             return
-        emotions = self._resolved_faded(memory)
+        emotions = self._resolved_faded(memory, check_names=False)  # the store checked the emotions before writing them
         if not emotions:
             return
         self._apply(
@@ -272,7 +272,7 @@ class EmotionEngine:
 
     @_never_raises
     def fold_change(self, emotions: Mapping[str, float], at: datetime | None, source: str) -> None:
-        amounts = resolve_emotions(emotions, signed=True)
+        amounts = resolve_emotions(emotions, signed=True, check=self.persona_dir)
         if not amounts:  # an empty change folds nothing
             return
         self._queue(Event(kind="change", at=at if at is not None else self._now(), emotions=amounts, source=source))
@@ -295,19 +295,21 @@ class EmotionEngine:
             )
         )
 
-    def _resolved_faded(self, memory: Memory) -> dict[str, float]:
+    def _resolved_faded(self, memory: Memory, *, check_names: bool = True) -> dict[str, float]:
         """The memory's emotions as the engine folds them: faded, names canonical, each held to 0-10, bad values dropped.
 
         A name whose faded value cannot be worked out is left out with a log line, so one bad name does not stop the others.
-        The memory is read, never changed. This is `memory_feelings(memory).feelings`, as a copy.
+        The memory is read, never changed. This is `memory_feelings(memory, check_names=check_names).feelings`, as a copy.
+        `check_names=False` is for a row the store has just checked, and for a stored row replayed under the lock (spec section 7:
+        an unknown name on a stored memory is kept, and no call to the bridge is made under the lock).
         """
-        return dict(self.memory_feelings(memory).feelings)
+        return dict(self.memory_feelings(memory, check_names=check_names).feelings)
 
     @staticmethod
     def _stored_climax(memory: Memory) -> float:
         """The memory's STORED climax value (the climax test is on the stored value, the fold uses the faded one), 0.0 if none."""
         stored = {name: value for name, value in memory._stored_emotions.items() if isinstance(name, str) and vocabulary.canonical_name(name) == "climax"}
-        return resolve_emotions(stored).get("climax", 0.0)
+        return resolve_emotions(stored, check="tidy").get("climax", 0.0)  # `climax` is a framework name: nothing to ask
 
     def _modifier(self, memory: Memory, kind: str, *, trust_memo: dict[str, float] | None = None) -> float:
         """The source modifier: trust is asked for a peer memory that names its peer, and is 0.0 otherwise.
@@ -495,7 +497,7 @@ class EmotionEngine:
 
     def _replay_emotions(self, memory: Memory) -> Mapping[str, float]:
         """What the catch-up folds for a stored row: its faded emotions when it counts, nothing when it does not."""
-        return self._resolved_faded(memory) if counted_kind(memory) is not None else {}
+        return self._resolved_faded(memory, check_names=False) if counted_kind(memory) is not None else {}
 
     def _replay_modifier_with_memo(self) -> Callable[[Memory], float]:
         """The `modifier_of` of ONE catch-up or rebuild: a peer's trust is asked once, the memo is a dict of this call.
@@ -846,17 +848,21 @@ class EmotionEngine:
         """
         switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
         value = faded_emotion(memory, emotion, self._half_lives_for(memory), switched, self._now())
-        return resolve_emotions({emotion: value}).get(vocabulary.canonical_name(emotion), 0.0)
+        return resolve_emotions({emotion: value}, check=self.persona_dir).get(vocabulary.canonical_name(emotion), 0.0)
 
-    def memory_feelings(self, memory: Memory) -> MemoryFeelings:
+    def memory_feelings(self, memory: Memory, *, check_names: bool = True) -> MemoryFeelings:
         """The one read of a memory's feelings, peak and score, with this engine's half-lives, switch time and clock.
 
         `engine_utils.memory_feelings` with `half_life`, the switch-over time this instance has seen (None before the switch
         and when the state cannot be read: nothing fades) and the clock as it is now. The feelings are worked out on first
         access, at the time read here. The memory is read, never changed, and no store is read.
+
+        The names of the memory are checked against her vocabulary (`resolve_emotions`, one lookup for the whole memory) unless
+        `check_names` is False (see `_resolved_faded`).
         """
         switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
-        return memory_feelings(memory, self._half_lives_for(memory), switched, self._now())
+        check = self.persona_dir if check_names else "tidy"
+        return memory_feelings(memory, self._half_lives_for(memory), switched, self._now(), check)
 
     def feels_high(self, name: str) -> bool:
         """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.

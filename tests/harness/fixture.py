@@ -192,7 +192,7 @@ def build_persona(
                 tags=seed.tags,
                 importance=seed.importance,
             )
-            store.create(m)
+            store.create(m, check_names=False)  # a seeded row stands for a stored one: its names are the persona's to start with
     finally:
         store.close()
 

@@ -19,7 +19,7 @@ from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
-from brain.emotion import engine_files, vocabulary_swap
+from brain.emotion import engine_files, vocabulary_access, vocabulary_swap
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
@@ -784,7 +784,7 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
     try:
         # No bridge is running here, so nothing has registered the persona's own emotions in this process: without this the
         # extraction would drop every emotion that is not in the baseline vocabulary (524-1).
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             eb.run_foreground(
@@ -1005,7 +1005,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
     try:
         from brain.soul.store import SoulStore
 
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1121,7 +1121,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1247,7 +1247,7 @@ def _reflex_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1306,7 +1306,7 @@ def _research_handler(args: argparse.Namespace) -> int:
     provider_name, searcher_name = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1355,7 +1355,7 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    # Listing only reads (#708): a corrupt vocabulary is left as it is for a load that has the store and can rebuild it.
+    # Listing only reads (#708): a corrupt vocabulary is left as it is for the bridge's start-up, which has the store and can rebuild it.
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
     except JsonFileError as exc:
@@ -1948,7 +1948,7 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     provider_name, _ = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -2293,9 +2293,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             # integrity-checked the file, so the two never create the file and schema at once
             # (#414).
             _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=False)
-        from brain.emotion.persona_loader import load_persona_vocabulary
-
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but the rebuild step can still refuse (1 or 2)
         if refused is not None:
             return refused

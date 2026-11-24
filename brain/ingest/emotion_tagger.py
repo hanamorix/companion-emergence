@@ -1,7 +1,7 @@
 """Tag a memory that has no feelings but should: the temp gate's emotion tagging.
 
 A memory about to be written through the consolidation gate (a promoted candidate, a merge target, a recalled row) that carries
-no stored emotions is sent to one background-tier model call, and the registered emotions it returns are written onto the row
+no stored emotions is sent to one background-tier model call, and the emotions it returns are written onto the row (the write checks each name against her vocabulary)
 (`tag_if_feelingless`). This replaces the idle emotion backfill job with its cursor, daily cap, pacing and state files: a row is
 tagged when the gate touches it, so the database is fixed in time by the rows that are written and recalled.
 
@@ -37,35 +37,24 @@ def _load_vocab() -> frozenset[str]:
     try:
         return frozenset(e.name for e in vocabulary.list_all())
     except Exception:  # noqa: BLE001
-        logger.warning("emotion_tagger: failed to load vocab; all names allowed")
+        logger.warning("emotion_tagger: failed to load vocab; the prompt asks for any emotion name")
         return frozenset()
 
 
-def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
-    """Keep only registered emotions with a finite intensity above 0; clamp to 10. NaN and inf are dropped.
+def _normalize(raw: dict[str, Any]) -> dict[str, float]:
+    """Keep the emotions with a finite intensity above 0; clamp to 10. NaN and inf are dropped.
 
-    A name matches the vocabulary in any spelling `vocabulary.get` accepts, which is the spelling `vocabulary.canonical_name` tidies
-    to a registered name (case, any run of characters that are not letters or digits, the order of a blend's parts). The stored
-    key is the tidied name; spellings of one emotion in one reply are pooled by `vocabulary.pool_by_canonical_name` (larger value kept).
+    The names are NOT filtered here: the store's write checks each against her vocabulary (`MemoryStore.update`), which adds a
+    name that passes the gate and discards one that cannot be held (spec section 6). The stored key is the tidied name
+    (`vocabulary.canonical_name`); spellings of one emotion in one reply are averaged, as `resolve_emotions` averages two
+    spellings on a memory. A name that tidies to nothing is dropped.
 
-    ``vocab`` is the "vocabulary loaded" signal: empty means it could not be loaded, and every name is then kept as the model
-    spelled it (no lookup).
-
-    "Could not be loaded" covers two cases, and both give an empty set: `_load_vocab` caught an exception from
-    `vocabulary.list_all()` (it logs a warning), or the registry holds no emotions. In either case every name is kept, including
-    one that is empty or only separators (it is stored as spelled if its intensity passes the number filter).
-    A name the lookup does not find is dropped.
-
-    The lookup (`vocabulary.get`) reads the live registry at the time of each call. ``vocab`` is only the set `_load_vocab` read
-    at the start of the tagger call, and it is what the prompt's name list is built from. Here it is only tested for empty or not
-    (to choose between the lookup and the cannot-load branch); it is not used to check whether a name is a member.
-
-    If `vocabulary.get` or `vocabulary.pool_by_canonical_name` raises, the exception is not caught here. It reaches the catch-all
-    in `_tagger`, which logs `emotion_tagger.tagger_error` (throttled) and returns `{}`.
+    If a value cannot be read as a number it is skipped; nothing here raises for a bad reply.
     """
-    usable: dict[str, float] = {}
+    values: dict[str, list[float]] = {}
     for name, intensity in raw.items():
-        if vocab and vocabulary.get(name) is None:
+        key = vocabulary.canonical_name(name) if isinstance(name, str) else ""
+        if not key:
             continue
         try:
             v = float(intensity)
@@ -73,8 +62,8 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
             continue
         if not math.isfinite(v) or v <= 0.0:
             continue
-        usable[name] = min(v, 10.0)
-    return vocabulary.pool_by_canonical_name(usable) if vocab else usable
+        values.setdefault(key, []).append(min(v, 10.0))
+    return {key: sum(v) / len(v) for key, v in values.items()}
 
 
 # Text externalized to prompt_strings.toml [ingest.emotion_tagger] (issue #129 stage 2a).
@@ -117,7 +106,7 @@ def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
                         exc_info=False,
                     )
                 return {}
-            return _normalize(json.loads(block), vocab)
+            return _normalize(json.loads(block))
         except Exception as exc:  # noqa: BLE001
             from brain.bridge.cli_throttle import ThrottleDeferred
 

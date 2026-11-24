@@ -112,7 +112,7 @@ def make_note_and_wire(*, persona_dir: Path, config: Any, provider: Any,
 
     # --- Phase 4 wiring (Task 9): wire the note back into her loops ---
     # A note-state initiate memory names the folder so she mentions it next chat,
-    # and carries a small tenderness delta (vocab-filtered inside the writer). The
+    # and carries a small tenderness delta (its names checked against her vocabulary by the memory write). The
     # feed reads these note-state memories via brain.bridge.feed.build_note_entries.
     _wire_note_back(persona_dir, note=note, folder=folder, user_name=user_name, now=now)
 

@@ -200,7 +200,8 @@ def test_load_corrupt_no_bak_with_store_reconstructs_from_memories(tmp_path: Pat
                 memory_type="conversation",
                 domain="us",
                 emotions={"love": 9.0, "emergence": 5.0},
-            )
+            ),
+            check_names=False,  # rows an older version stored, with names her vocabulary lacks
         )
         store.create(
             Memory.create_new(
@@ -208,7 +209,8 @@ def test_load_corrupt_no_bak_with_store_reconstructs_from_memories(tmp_path: Pat
                 memory_type="conversation",
                 domain="us",
                 emotions={"creative_hunger": 7.0},
-            )
+            ),
+            check_names=False,
         )
 
         # Pre-cleanup so the test is repeatable
@@ -277,7 +279,8 @@ def test_missing_file_with_store_reconstructs_referenced_emotion(tmp_path: Path,
                 memory_type="conversation",
                 domain="us",
                 emotions={"emergence": 5.0},
-            )
+            ),
+            check_names=False,
         )
         _cleanup_emotion("emergence")  # clean registry for a meaningful assertion
 
@@ -354,6 +357,7 @@ def test_the_memory_heal_mints_no_twin_for_an_entry_with_a_non_tidied_spelling(t
                 content="x", memory_type="conversation", domain="us", emotions={"quiet_dread_heal": 4.0}
             ),
             fold=False,
+            check_names=False,
         )
         assert load_persona_vocabulary(path, store=store) == 1
         names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
@@ -368,6 +372,7 @@ def _store_with(emotions: dict[str, float]) -> MemoryStore:
     store.create(
         Memory.create_new(content="x", memory_type="conversation", domain="us", emotions=emotions),
         fold=False,
+        check_names=False,
     )
     return store
 

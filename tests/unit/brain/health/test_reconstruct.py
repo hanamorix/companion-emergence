@@ -36,7 +36,8 @@ def test_reconstructs_persona_extensions_from_memories() -> None:
                 memory_type="conversation",
                 domain="us",
                 emotions={"emergence": 8.0, "love": 9.0},
-            )
+            ),
+            check_names=False,  # rows an older version stored, with names her vocabulary lacks
         )
         store.create(
             Memory.create_new(
@@ -44,7 +45,8 @@ def test_reconstructs_persona_extensions_from_memories() -> None:
                 memory_type="conversation",
                 domain="us",
                 emotions={"creative_hunger": 7.0},
-            )
+            ),
+            check_names=False,
         )
 
         result = reconstruct_vocabulary_from_memories(store)
@@ -99,7 +101,8 @@ def test_reconstructed_entry_gets_persona_typical_half_life() -> None:
                 memory_type="conversation",
                 domain="us",
                 emotions={"emergence": 8.0},
-            )
+            ),
+            check_names=False,
         )
         result = reconstruct_vocabulary_from_memories(store)
         emergence = next(e for e in result["emotions"] if e["name"] == "emergence")
@@ -126,6 +129,7 @@ def test_non_finite_valued_emotion_name_still_gets_a_placeholder(caplog) -> None
                 emotions={"nan_ache": float("nan"), "inf_ache": float("inf"), "love": 9.0},
             ),
             fold=False,
+            check_names=False,
         )
         with caplog.at_level(logging.DEBUG):
             result = reconstruct_vocabulary_from_memories(store)
@@ -150,6 +154,7 @@ def test_a_memory_key_the_gate_refuses_makes_no_entry() -> None:
                 emotions={"---": 2.0, "q" * 101: 1.0, "kept key": 3.0},
             ),
             fold=False,
+            check_names=False,
         )
         names = [e["name"] for e in reconstruct_vocabulary_from_memories(store)["emotions"]]
         assert "kept_key" in names
@@ -168,7 +173,8 @@ def test_returned_shape_matches_persona_loader_expectation() -> None:
                 memory_type="conversation",
                 domain="us",
                 emotions={"x_emotion": 5.0},
-            )
+            ),
+            check_names=False,
         )
         result = reconstruct_vocabulary_from_memories(store)
         assert "version" in result

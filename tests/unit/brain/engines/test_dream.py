@@ -489,10 +489,11 @@ def test_dream_completion_emits_initiate_candidate(tmp_path: Path) -> None:
     assert candidates[0].kind == "message"
 
 
-def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path) -> None:
+def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path, register_feelings) -> None:
     """v0.0.9: dream candidates carry the aggregated dream-memory emotions
     in `emotional_snapshot.vector`, not a zero-filled dict.
     """
+    register_feelings("longing")  # a feeling her vocabulary holds beyond the framework's own
     from brain.engines.dream import DreamEngine
     from brain.initiate.emit import read_candidates
 

@@ -192,16 +192,25 @@ def _build_corpus(
     growth_path = persona_dir / "emotion_growth.log.jsonl"
     growth_in_window = []
     try:
-        for ev in read_growth_log(growth_path):
-            if ev.timestamp >= growth_cutoff:
-                growth_in_window.append(
-                    {
-                        "timestamp": ev.timestamp.isoformat(),
-                        "type": ev.type,
-                        "name": ev.name,
-                        "reasoning": ev.reason,
-                    }
-                )
+        window = [ev for ev in read_growth_log(growth_path) if ev.timestamp >= growth_cutoff]
+        # An `emotion_added` event names a feeling: it is checked when read (spec section 6), shown in the spelling her vocabulary
+        # uses, and left out when her vocabulary no longer holds it. Other event types name arcs, not feelings. Reading the
+        # biography adds no name.
+        feelings = vocabulary_access.names_known(persona_dir, [ev.name for ev in window if ev.type == "emotion_added"])
+        for ev in window:
+            name = ev.name
+            if ev.type == "emotion_added":
+                name = feelings.get(ev.name)
+                if name is None:
+                    continue
+            growth_in_window.append(
+                {
+                    "timestamp": ev.timestamp.isoformat(),
+                    "type": ev.type,
+                    "name": name,
+                    "reasoning": ev.reason,
+                }
+            )
     except Exception as exc:
         logger.warning("growth log load failed (non-fatal): %s", exc)
 

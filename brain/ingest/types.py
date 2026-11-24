@@ -28,7 +28,7 @@ class ExtractedItem:
                      Clamped on normalization; defaults to 5.
         emotions:    Emotion name → intensity mapping from the extraction LLM.
                      Normalized by normalize() — values clamped to [0, 10],
-                     entries with intensity <= 0 or unknown names dropped.
+                     entries with intensity <= 0 dropped.
     """
 
     text: str
@@ -36,14 +36,12 @@ class ExtractedItem:
     importance: int = 5
     emotions: dict[str, float] = field(default_factory=dict)
 
-    def normalize(
-        self, valid_emotions: set[str] | None = None, *, source: str = ""
-    ) -> ExtractedItem:
-        """Coerce label, clamp importance, strip text whitespace, filter emotions.
+    def normalize(self, *, source: str = "") -> ExtractedItem:
+        """Coerce label, clamp importance, strip text whitespace, clean emotions.
 
-        valid_emotions:
-            When provided, emotion names not in this set are dropped.
-            Values are coerced to float, clamped to (0, 10]; <= 0 and non-finite dropped.
+        Emotion values are coerced to float, clamped to (0, 10]; <= 0 and non-finite dropped. The names are not
+        filtered here: the memory write checks them against her vocabulary (spec section 6).
+
         source:
             Where the item came from (e.g. ``session=<id>``), named in the warning
             when a non-finite strength is dropped.
@@ -77,8 +75,6 @@ class ExtractedItem:
                 continue
             if value > 10.0:
                 value = 10.0
-            if valid_emotions is not None and name not in valid_emotions:
-                continue
             cleaned[name] = value
         self.emotions = cleaned
         return self

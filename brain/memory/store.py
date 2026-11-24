@@ -151,8 +151,9 @@ def _merge_emotions(target_emotions: dict, cand_emotions: dict) -> dict[str, flo
     """
     from brain.emotion.engine_utils import resolve_emotions
 
-    merged = resolve_emotions(target_emotions)
-    for name, value in resolve_emotions(cand_emotions).items():
+    # "tidy": a merge moves feelings the rows already hold, so it makes no check on her vocabulary (spec section 6: rows keep their keys).
+    merged = resolve_emotions(target_emotions, check="tidy")
+    for name, value in resolve_emotions(cand_emotions, check="tidy").items():
         merged[name] = (merged[name] + value) / 2 if name in merged else value
     return merged
 
@@ -1326,8 +1327,42 @@ class MemoryStore:
                 self._conn.rollback()
             raise
 
-    def create(self, memory: Memory, *, fold: bool = True) -> str:
+    def checked_emotions(self, emotions: dict[str, Any]) -> dict[str, Any]:
+        """The map of feelings checked against her vocabulary (see `checked`): the names to store, under her spellings, with their values."""
+        if not emotions:
+            return emotions
+        from brain.emotion import vocabulary_access
+
+        try:
+            persona_dir: Path | None = self.persona_dir
+        except ValueError:
+            persona_dir = None
+        return vocabulary_access.check_feelings(persona_dir, emotions)
+
+    def checked(self, memory: Memory) -> Memory:
+        """The memory with its feelings checked against her vocabulary (spec section 6): the one place a write runs the check.
+
+        Each name is used under the spelling her vocabulary has for it, a new name that passes the gate is added (by the owner, or
+        through the bridge), and a name that cannot be used is dropped with its value; two spellings of one feeling carry their mean
+        (`vocabulary_access.check_feelings`). A memory the check changes in no way is returned as it is. Otherwise a copy comes back
+        with the checked feelings and with `_stored_score` and `_stored_peak` worked out from them, so a dropped name leaves no peak or
+        score behind. An in-memory store has no persona folder, so only this process's registry answers.
+
+        It runs BEFORE any write transaction (it may ask the bridge or take the vocabulary file's lock): called inside a transaction
+        the caller already has open, it runs under that transaction's lock.
+        """
+        kept = self.checked_emotions(memory._stored_emotions)
+        if kept == memory._stored_emotions:
+            return memory
+        numbers = [float(v) for v in kept.values() if isinstance(v, (int, float)) and math.isfinite(v)]
+        return replace(memory, _stored_emotions=kept, _stored_score=float(sum(numbers)), _stored_peak=max(numbers, default=0.0))
+
+    def create(self, memory: Memory, *, fold: bool = True, check_names: bool = True) -> str:
         """Insert a memory. Returns the id. Raises on duplicate id.
+
+        The memory's feelings are checked against her vocabulary first (`checked`), before the write transaction and before the peak
+        is worked out; the engine is told the checked memory. `check_names=False` keeps the names as given: for a write that moves
+        feelings the memory already holds (a restore, an import), which must not lose a name.
 
         A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
         had open is left as it was), so a failure does not leave one open for the next writer.
@@ -1364,6 +1399,8 @@ class MemoryStore:
         full backfill reasoning (Stage 2 of the local semantic-retrieval
         build).
         """
+        if check_names:
+            memory = self.checked(memory)
         with self._rolls_back_on_error():
             rowid = self._insert_memory_row(memory)
             self._conn.commit()
@@ -1422,7 +1459,7 @@ class MemoryStore:
         """
         fields: dict[str, Any] = {"content": merged_content}
         if engine_live:
-            fields.update(emotions=_merge_emotions(target._stored_emotions, candidate._stored_emotions), fold=False)
+            fields.update(emotions=_merge_emotions(target._stored_emotions, candidate._stored_emotions), fold=False, check_names=False)
         self.update(target.id, **fields)
 
     def emotion_engine(self) -> Any | None:
@@ -3071,35 +3108,15 @@ class MemoryStore:
         """Return memories of the given type, ordered by created_at desc."""
         return self._list_filter("memory_type", memory_type, active_only, limit)
 
-    def list_by_emotion(
-        self,
-        emotion_name: str,
-        min_intensity: float = 5.0,
-        active_only: bool = True,
-        limit: int | None = None,
-    ) -> list[Memory]:
-        """Return memories where `emotion_name` is present at >= min_intensity."""
-        sql = "SELECT * FROM memories WHERE 1=1"
-        if active_only:
-            sql += " AND active = 1"
-        sql += " ORDER BY created_at DESC"
-        rows = self._conn.execute(sql).fetchall()
-
-        results: list[Memory] = []
-        for row in rows:
-            emotions = json.loads(row["emotions_json"])
-            intensity = emotions.get(emotion_name, 0.0)
-            if isinstance(intensity, (int, float)) and intensity >= min_intensity:
-                results.append(_row_to_memory(row))
-                if limit is not None and len(results) >= limit:
-                    break
-        return results
-
-    def update(self, memory_id: str, *, fold: bool = True, **fields: Any) -> None:
+    def update(self, memory_id: str, *, fold: bool = True, check_names: bool = True, **fields: Any) -> None:
         """Update the given fields on an existing memory.
 
         Accepts: content, memory_type, domain, emotions (dict), tags (list),
         importance, score, last_accessed_at, active.
+
+        `emotions` is checked against her vocabulary first (spec section 6; `checked`, before the write and before the peak is
+        worked out); the engine hook and the peak use the checked map. `check_names=False` keeps the names as given, for a write
+        that moves feelings the row already holds (the consolidation merge).
 
         `fold` is not a field. When true and `emotions` is among the fields, a row that had no emotions and gets some now
         is reported to the emotion engine (`on_emotions_assigned`), once the update, and the re-embed of a changed content,
@@ -3114,6 +3131,8 @@ class MemoryStore:
             raise KeyError(f"Unknown memory id: {memory_id!r}")
         if "content" in fields:
             fields["content"] = carry_date_prefix(before.content, fields["content"])
+        if check_names and fields.get("emotions"):
+            fields["emotions"] = self.checked_emotions(dict(fields["emotions"]))
 
         column_map: dict[str, tuple[str, Any]] = {}
         extra_clauses: list[str] = []
@@ -4100,6 +4119,7 @@ class MemoryStore:
             raise RuntimeError("grief touch: cannot write inside an open transaction")
         if self._recent_grief_touch_exists(referent_id, hours):
             return None
+        memory = self.checked(memory)  # before the write lock is taken, and only when a touch will be written
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             if self._recent_grief_touch_exists(referent_id, hours):

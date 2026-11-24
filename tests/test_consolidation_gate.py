@@ -38,6 +38,12 @@ from brain.memory.store import Memory, MemoryStore, _merge_emotions
 from brain.utils.file_lock import file_lock
 
 
+@pytest.fixture(autouse=True)
+def _her_feelings(register_feelings):
+    """The tests here write memories under `trust`, a feeling her vocabulary holds beyond the framework's own."""
+    register_feelings("trust")
+
+
 @pytest.fixture
 def persona(tmp_path):
     """A persona dir with a MemoryStore + HebbianMatrix + PendingQueue."""
@@ -591,7 +597,7 @@ def _merge_run(persona, target_emotions, cand_emotions, *, merged="Bob likes tea
     # Distinct texts per call: a candidate whose text equals a stored row is dropped by the gate's exact-duplicate pass.
     n = next(_RUN_COUNTER)
     target = _mem(f"Bob likes tea number {n}", "conversation", emotions=target_emotions)
-    target_id = store.create(target, fold=False)
+    target_id = store.create(target, fold=False, check_names=False)  # a stored row keeps the spelling it was written with
     cand = _mem(f"Bob likes tea with honey, take {n}", "conversation", emotions=cand_emotions)
     queue.enqueue(cand, source="x")
     result = run_consolidation(
@@ -844,7 +850,7 @@ def test_e5_live_merge_of_a_target_deleted_before_the_write_defers_the_candidate
     _target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     # The live write is the one that failed: it carried the merged emotions and fold=False.
     assert failing_call_fields == [
-        {"content": "Bob likes tea with honey", "emotions": {"joy": 6.0}, "fold": False}
+        {"content": "Bob likes tea with honey", "emotions": {"joy": 6.0}, "fold": False, "check_names": False}
     ]
     assert res.deferred == 1
     assert res.merged == 0

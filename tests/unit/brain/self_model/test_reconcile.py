@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from brain.self_model.gap import Gap
 from brain.self_model.reconcile import reconcile_self_read
@@ -341,13 +340,11 @@ def test_live_revise_lowers_the_feeling_and_writes_no_row(tmp_path: Path) -> Non
     assert _reconcile_rows(tmp_path) == []
 
 
-@pytest.mark.no_base_failure(
-    reason="pins that the live fold keeps the vocabulary filter (B1 PR 2); main answers False for an off-vocabulary channel too"
-)
 def test_live_revise_off_vocab_channel_folds_nothing(tmp_path: Path) -> None:
+    """The engine's fold checks the channel against her vocabulary (#801 section 6): with no bridge a channel she lacks is discarded."""
     eng = _go_live(tmp_path, joy=5.0)
     before = _settled(eng)
     result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="zorblesque", delta=0.5)
-    assert result["delta_written"] is False
+    assert result["delta_written"] is True  # the change was handed to the engine; whether it kept the name is the engine's check
     assert _settled(eng) == before
     assert _reconcile_rows(tmp_path) == []

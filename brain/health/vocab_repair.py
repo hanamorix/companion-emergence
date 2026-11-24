@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
-from brain.emotion import vocabulary_file
+from brain.emotion import vocabulary_access, vocabulary_file
 from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
@@ -270,13 +270,19 @@ def _is_placeholder(entry: dict) -> bool:
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
     """Return up to _MAX_EXCERPTS_PER_NAME memory excerpts mentioning name."""
     try:
+        try:
+            persona_dir: Path | None = store.persona_dir
+        except ValueError:
+            persona_dir = None
         # F3: cap the search so a high-frequency name doesn't pull all rows.
         candidates = store.search_text(name, limit=10)
         excerpts = []
         wanted = canonical_name(name)
         for mem in candidates:
-            # Names only: a stored emotion whose value is not finite still counts as evidence for its name.
-            if wanted in {canonical_name(n) for n in MemoryStore.stored_emotion_names(mem)}:
+            # Names only: a stored emotion whose value is not finite still counts as evidence for its name. The repair runs in the
+            # owner, so the check is answered from the registry (a name it cannot hold does not count, spec section 6).
+            used = vocabulary_access.names_used(persona_dir, MemoryStore.stored_emotion_names(mem))
+            if wanted in {canonical_name(s) for s in used.values() if s is not None}:
                 text = mem.content[:_EXCERPT_CHAR_LIMIT]
                 excerpts.append(text)
                 if len(excerpts) >= _MAX_EXCERPTS_PER_NAME:

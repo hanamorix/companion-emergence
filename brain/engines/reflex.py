@@ -173,6 +173,27 @@ class ReflexResult:
 # ---------- Storage ----------
 
 
+def _arcs_with_known_names(arcs: list[ReflexArc], persona_dir: Path) -> tuple[ReflexArc, ...]:
+    """The arcs whose trigger names her vocabulary can hold (spec section 6: trigger names are checked when read), in one batch.
+
+    A name her vocabulary has passes; reading a trigger adds no name (`names_known`: a default arc names a feeling a persona may
+    not have grown, and that must not mint an entry). An arc with a trigger name her vocabulary lacks is left out of this load
+    with one warning: dropping only the name would make the arc fire on fewer conditions than the file says. Such an arc could
+    not fire anyway (the engine's read hides a name outside her vocabulary). The file is not rewritten.
+    """
+    from brain.emotion import vocabulary_access
+
+    used = vocabulary_access.names_known(persona_dir, [name for arc in arcs for name in arc.trigger])
+    kept: list[ReflexArc] = []
+    for arc in arcs:
+        refused = sorted(name for name in arc.trigger if used.get(name) is None)
+        if refused:
+            logger.warning("reflex arc %r left out: its trigger names %s are not in her vocabulary and cannot be added", arc.name, ", ".join(refused))
+            continue
+        kept.append(arc)
+    return tuple(kept)
+
+
 @dataclass(frozen=True)
 class ReflexArcSet:
     """Loaded set of ReflexArc definitions."""
@@ -223,7 +244,7 @@ class ReflexArcSet:
             except (KeyError, ValueError, TypeError) as exc:
                 logger.warning("reflex arc %r failed to load: %s", raw.get("name"), exc)
                 continue
-        return cls(arcs=tuple(arcs)), anomaly
+        return cls(arcs=_arcs_with_known_names(arcs, path.parent)), anomaly
 
     @classmethod
     def load(cls, path: Path, *, default_path: Path) -> ReflexArcSet:

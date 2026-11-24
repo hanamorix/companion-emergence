@@ -13,10 +13,10 @@ from brain.ingest.types import ExtractedItem
 def test_extracteditem_carries_and_clamps_emotions():
     it = ExtractedItem(text="hi", label="feeling", importance=5,
                        emotions={"longing": 12.0, "peace": -1.0, "bogus": 3.0})
-    it.normalize(valid_emotions={"longing", "peace"})
+    it.normalize()
     assert it.emotions["longing"] == 10.0     # clamped to <=10
     assert "peace" not in it.emotions          # <=0 dropped
-    assert "bogus" not in it.emotions          # unregistered dropped
+    assert it.emotions["bogus"] == 3.0         # names are not filtered here: the memory write checks them
 
 
 def test_parse_extraction_reads_emotions():
@@ -55,13 +55,13 @@ def test_commit_item_passes_emotions_to_memory(tmp_path):
         text="she seemed wistful today",
         label="observation",
         importance=6,
-        emotions={"longing": 7.0, "nostalgia": 5.0},
+        emotions={"desire": 7.0, "nostalgia": 5.0},  # names her vocabulary holds: the queue check keeps them
     )
     mem_id = commit_item(item, session_id="sess_w7", store=store, hebbian=hebbian)
 
     assert mem_id is not None
     memory = PendingQueue(store.persona_dir).read_recent("observation", limit=1)[0]
-    assert memory._stored_emotions == {"longing": 7.0, "nostalgia": 5.0}
+    assert memory._stored_emotions == {"desire": 7.0, "nostalgia": 5.0}
 
 
 def test_close_session_commits_memories_with_emotions_and_aggregate_is_non_empty(

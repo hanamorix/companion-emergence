@@ -639,7 +639,7 @@ class EmotionEngineStub:
         from brain.emotion.vocabulary import canonical_name
 
         value = self.faded.get((memory.id, emotion), memory._stored_emotions[emotion])
-        return resolve_emotions({emotion: value}).get(canonical_name(emotion), 0.0)
+        return resolve_emotions({emotion: value}, check="registry").get(canonical_name(emotion), 0.0)
 
     def memory_feelings(self, memory: Any) -> Any:
         """The real pure read over the memory with each emotion's value replaced by what this stub's `faded_value` answers."""
@@ -999,6 +999,25 @@ def _vocabulary_registry_restore() -> Iterator[None]:
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
     vocabulary.set_bridge_owner(saved_owner)
+
+
+@pytest.fixture
+def register_feelings() -> Callable[..., None]:
+    """Register feelings her vocabulary holds beyond the framework's 30, for a test that writes or reads a memory under them.
+
+    A memory write checks each name against her vocabulary (#801 section 6), so a name outside the framework must be registered
+    first or it is discarded. `_vocabulary_registry_restore` (autouse) puts the registry back after the test.
+    """
+    from brain.emotion import vocabulary
+
+    def register(*names: str) -> None:
+        for name in names:
+            if vocabulary.get(name) is None:
+                vocabulary.register(
+                    vocabulary.Emotion(name=name, description="test feeling", category="persona_extension", decay_half_life_days=14.0, intensity_clamp=10.0)
+                )
+
+    return register
 
 
 @pytest.fixture(autouse=True)

@@ -439,9 +439,16 @@ def search_memories(
         # Partition: emotion-matching memories first, then the rest.
         # Use id-set membership (O(n)) rather than object identity (O(n²)).
         emotion_key = canonical_name(emotion_lower)
-        # Names only: a stored emotion whose value is not finite still names the emotion the memory carries.
+        # Names only: a stored emotion whose value is not finite still names the emotion the memory carries. The names are checked
+        # against her vocabulary in ONE batch for all the candidates (spec section 6); a name it discards does not count.
+        from brain.emotion import vocabulary_access
+
+        names_of = {m.id: MemoryStore.stored_emotion_names(m) for m in candidates}
+        used = vocabulary_access.names_used(persona_dir, [n for names in names_of.values() for n in names])
         boosted = [
-            m for m in candidates if emotion_key in {canonical_name(n) for n in MemoryStore.stored_emotion_names(m)}
+            m
+            for m in candidates
+            if emotion_key in {canonical_name(s) for n in names_of[m.id] if (s := used.get(n)) is not None}
         ]
         boosted_ids = {m.id for m in boosted}
         rest = [m for m in candidates if m.id not in boosted_ids]

@@ -188,7 +188,6 @@ def run_chunk_stages(
     report: IngestReport,
     user_name: str | None,
     assistant_name: str | None,
-    valid_emotions: set[str],
     emotion_vocab: str,
     user_pronouns: dict | None,
     queue_soul: bool = True,
@@ -230,7 +229,7 @@ def run_chunk_stages(
         )
         return ChunkResult.FAILED
 
-    items = [it.normalize(valid_emotions=valid_emotions, source=f"session={session_id}") for it in extraction.items if it.text]
+    items = [it.normalize(source=f"session={session_id}") for it in extraction.items if it.text]
     report.extracted += len(items)
 
     dedup_threshold = float(cfg.get("dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
@@ -319,7 +318,7 @@ def _run_chunks(
     mark_chunked_extraction(persona_dir, session_id, min(stamps) if stamps else None)
     user_name = load_user_name(persona_dir)
     assistant_name = persona_dir.name
-    valid_emotions, emotion_vocab = load_emotion_vocab()
+    emotion_vocab = load_emotion_vocab()
     user_pronouns = load_user_pronouns(persona_dir)
     max_chars = extraction_chunk_chars()
     chunks = chunk_turns(turns, max_chars=max_chars, user_name=user_name, assistant_name=assistant_name)
@@ -355,7 +354,6 @@ def _run_chunks(
                 report=report,
                 user_name=user_name,
                 assistant_name=assistant_name,
-                valid_emotions=valid_emotions,
                 emotion_vocab=emotion_vocab,
                 user_pronouns=user_pronouns,
             )

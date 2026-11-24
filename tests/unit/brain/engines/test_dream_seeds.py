@@ -230,7 +230,8 @@ def test_congruence_matches_a_variant_spelled_candidate_against_the_aggregate_mo
         {"Comfort_Seeking": 2.0, "comfort-seeking": 4.0},
     ],
 )
-def test_congruence_counts_two_spellings_once_and_ignores_look_alikes(memory_emotions):
+def test_congruence_counts_two_spellings_once_and_ignores_look_alikes(memory_emotions, register_feelings):
+    register_feelings("not_a_real_emotion")  # her vocabulary holds the mood's channel, so the check keeps a spelling of it
     mood = EmotionalState(emotions={"comfort_seeking": 6.0, "not_a_real_emotion": 5.0})
     look_alikes = {"comfort": 9.0, "comfort_seeking_extra": 9.0, "not-a-real-emotion-2": 9.0}
     mem = _mem("a", emotions={**memory_emotions, **look_alikes})

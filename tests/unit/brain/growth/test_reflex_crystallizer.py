@@ -1207,3 +1207,26 @@ def test_corpus_fire_log_excerpt_does_not_count_as_a_recall(persona_dir: Path, s
     assert corpus["fire_log_30d"][0]["output_excerpt"] == "a journal entry the arc wrote"
     row = store.get(mem.id, bump=False)
     assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+
+
+def test_corpus_growth_log_shows_an_added_feeling_in_her_spelling_and_leaves_out_one_her_vocabulary_lacks(persona_dir: Path, store: MemoryStore):
+    """#801 section 6: the names of `emotion_added` events are checked when read; reading the biography adds no name."""
+    from brain.emotion import vocabulary
+    from brain.growth.log import GrowthLogEvent, append_growth_event
+
+    vocabulary.register(vocabulary.Emotion("Quiet Dread Zz", "dread, still", "persona_extension", 6.0))
+    when = datetime(2026, 4, 20, tzinfo=UTC)
+    for kind, name in (("emotion_added", "quiet-dread-zz"), ("emotion_added", "gone_word_zz"), ("arc_added", "some_arc")):
+        append_growth_event(
+            persona_dir / "emotion_growth.log.jsonl",
+            GrowthLogEvent(
+                timestamp=when, type=kind, name=name, description="d", decay_half_life_days=None, reason="r",
+                evidence_memory_ids=(), score=0.5, relational_context=None,
+            ),
+        )
+    corpus = _build_corpus(
+        store=store, persona_dir=persona_dir, persona_name="nell", persona_pronouns="she/her", current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(), emotion_vocabulary=["love"], now=datetime(2026, 4, 28, tzinfo=UTC), look_back_days=30,
+    )
+    assert [(e["type"], e["name"]) for e in corpus["growth_log_90d"]] == [("emotion_added", "Quiet Dread Zz"), ("arc_added", "some_arc")]
+    assert vocabulary.get("gone_word_zz") is None and not (persona_dir / "emotion_vocabulary.json").exists()

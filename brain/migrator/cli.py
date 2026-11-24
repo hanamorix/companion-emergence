@@ -186,7 +186,8 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem, fold=False)
+            # the migrated memories keep their names: the migrated vocabulary is not written before them yet (spec section 9)
+            store.create(mem, fold=False, check_names=False)
             migrated_count += 1
     finally:
         store.close()

@@ -485,7 +485,7 @@ def run_one_chunk(
     created_at = _backdate(persona_dir, chunk.turns, chunk.cursor_ts, now)
     marker = {"extraction_backfill": {"from": chunk.turns[0]["ts"], "to": chunk.turns[-1]["ts"]}}
     report = IngestReport(session_id=target["sid"])
-    valid_emotions, emotion_vocab = load_emotion_vocab()
+    emotion_vocab = load_emotion_vocab()
     user_pronouns = load_user_pronouns(persona_dir)
     try:
         # One call per piece (one for a normal chunk; an over-long single exchange goes in pieces within the limit, all in
@@ -503,7 +503,6 @@ def run_one_chunk(
                 report=report,
                 user_name=user_name,
                 assistant_name=assistant_name,
-                valid_emotions=valid_emotions,
                 emotion_vocab=emotion_vocab,
                 user_pronouns=user_pronouns,
                 queue_soul=mode == "heads",

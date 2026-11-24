@@ -906,6 +906,8 @@ def _count_lookups(monkeypatch: pytest.MonkeyPatch, answer: dict) -> list[list[s
     asked: list[list[str]] = []
 
     def bridge(_persona: Path, route: str, body: dict, *, timeout: float) -> dict:
+        if route == vocabulary_access.ADD_ROUTE:  # the check on the feelings' names (#801 section 6): her vocabulary holds them all
+            return {"results": [{"name": i["name"], "spelling": i["name"], "outcome": "used", "changed": False} for i in body["items"]]}
         asked.append(body["names"])
         return {"entries": [
             {"name": n, "spelling": n, "category": "persona_extension", "description": "d", "half_life_days": answer[n]} for n in body["names"]
@@ -943,6 +945,58 @@ def test_faded_value_of_one_name_asks_once_for_the_memory(tmp_path: Path, monkey
     memory = _memory(T[0], {"warm_ache": 8.0, "slow_dread": 8.0})
     assert instance.faded_value(memory, "warm_ache") == pytest.approx(2.0)
     assert asked == [["slow_dread", "warm_ache"]]
+
+
+def _count_checks(monkeypatch: pytest.MonkeyPatch, outcome: str = "used") -> list[list[str]]:
+    """Every batch of names this process sends to the bridge's add route (the check on feeling names), in order."""
+    from brain.emotion import vocabulary_access
+
+    checks: list[list[str]] = []
+
+    def bridge(_persona: Path, route: str, body: dict, *, timeout: float) -> dict:
+        if route == vocabulary_access.ADD_ROUTE:
+            checks.append([i["name"] for i in body["items"]])
+            return {"results": [{"name": i["name"], "spelling": i["name"], "outcome": outcome, "changed": False} for i in body["items"]]}
+        return {"entries": [{"name": n, "spelling": n, "category": "persona_extension", "description": "d", "half_life_days": 6.0} for n in body["names"]]}
+
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", bridge)
+    return checks
+
+
+def test_a_memory_read_checks_its_names_once_for_the_memory_never_once_per_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec section 5/6: one call per memory; framework names are never asked."""
+    checks = _count_checks(monkeypatch)
+    instance, _clock = _live_engine(tmp_path, T[0], T[12])
+    memory = _memory(T[0], {"joy": 8.0, "Warm Ache": 8.0, "slow_dread": 8.0, "third_word": 8.0})
+    feelings = instance.memory_feelings(memory).feelings
+    assert checks == [["Warm Ache", "slow_dread", "third_word"]]
+    assert set(feelings) == {"joy", "warm_ache", "slow_dread", "third_word"}
+
+
+def test_a_name_the_check_discards_is_left_out_of_the_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _count_checks(monkeypatch, outcome="missing")
+    instance, _clock = _live_engine(tmp_path, T[0], T[12])
+    memory = _memory(T[0], {"joy": 8.0, "stray_word": 8.0})
+    assert set(instance.memory_feelings(memory).feelings) == {"joy"}
+    assert memory._stored_emotions == {"joy": 8.0, "stray_word": 8.0}  # the row is not rewritten
+
+
+def test_the_replay_keeps_an_unknown_stored_name_and_asks_nobody(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec section 7: during the replay (under the engine's lock) an unknown name on a stored memory is kept, and no call is made."""
+    checks = _count_checks(monkeypatch, outcome="missing")
+    instance, _clock = _live_engine(tmp_path, T[0], T[12])
+    memory = _memory(T[0], {"joy": 8.0, "stray_word": 8.0})
+    assert set(instance._replay_emotions(memory)) == {"joy", "stray_word"}
+    assert set(engine_rebuild._stored_emotions(memory)) == {"joy", "stray_word"}
+    assert checks == []
+
+
+def test_the_hooks_for_a_row_the_store_just_checked_ask_nobody(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checks = _count_checks(monkeypatch, outcome="missing")
+    instance, _clock = _live_engine(tmp_path, T[0], T[12])
+    memory = _memory(T[0], {"joy": 8.0, "warm_ache": 8.0})
+    assert set(instance._resolved_faded(memory, check_names=False)) == {"joy", "warm_ache"}
+    assert checks == []
 
 
 def test_faded_value_needs_no_store_so_it_serves_a_row_that_hard_delete_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

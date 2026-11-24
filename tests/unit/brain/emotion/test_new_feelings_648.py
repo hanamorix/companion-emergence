@@ -72,11 +72,11 @@ def test_the_engine_knows_the_half_life_of_each_without_a_persona_file(tmp_path)
         assert engine.half_life(name) == days
 
 
-def test_the_extractor_keeps_the_four_names_instead_of_dropping_them():
-    from brain.chat.extractor import _filter_to_registered
+def test_the_check_keeps_the_four_names_instead_of_dropping_them():
+    from brain.emotion import vocabulary_access
 
-    asked = {"contentment": 3.0, "peace": 2.0, "calm": 4.0, "groundedness": 5.0, "not_a_feeling_zz": 1.0}
-    assert _filter_to_registered(asked) == {"contentment": 3.0, "peace": 2.0, "calm": 4.0, "groundedness": 5.0}
+    used = vocabulary_access.names_used(None, ["contentment", "peace", "calm", "groundedness", "not_a_feeling_zz"])
+    assert used == {"contentment": "contentment", "peace": "peace", "calm": "calm", "groundedness": "groundedness", "not_a_feeling_zz": None}
 
 
 def _days(*shorts: float) -> list[SnapshotDay]:

@@ -893,6 +893,13 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/emotion/engine_files.py",),
     ),
+    # --- the check on feeling names replaces the old filters (#801 step 5) ---------------------------------------------------
+    Removed(
+        names=("_filter_to_registered", "list_by_emotion", "valid_emotions", "_load_read_only"),
+        why="the registered-name filters of the extractor, the tagger and ingest are replaced by the check on a memory's feeling names (`MemoryStore.checked`, `resolve_emotions`, `vocabulary_access.names_used`), which adds a name that passes the gate; `list_by_emotion` had no caller; the read-only load is the public `vocabulary_access.load_read_only`",
+        ref="#801 (draft PR #803), build step 5",
+        kind="code",
+    ),
 )
 
 

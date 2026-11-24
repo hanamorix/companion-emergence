@@ -173,6 +173,9 @@ def test_the_handler_opens_no_store_and_loads_no_vocabulary_itself(persona: Path
     monkeypatch.setattr(brain_cli, "MemoryStore", forbidden, raising=False)
     monkeypatch.setattr(brain_cli, "load_persona_vocabulary", forbidden)
     monkeypatch.setattr(persona_loader, "load_persona_vocabulary", forbidden)
+    from brain.emotion import vocabulary_access
+
+    monkeypatch.setattr(vocabulary_access, "load_read_only", forbidden)
     assert main(ARGV) == 0
 
 

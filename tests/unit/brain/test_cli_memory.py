@@ -136,8 +136,10 @@ def test_memory_show_prints_full_memory_details(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    register_feelings,
 ) -> None:
     """`nell memory show` prints one complete memory record by id."""
+    register_feelings("trust", "focus")  # feelings her vocabulary holds beyond the framework's own
     persona_dir = _make_persona_with_memories(tmp_path, monkeypatch)
     memory_id = _store_memory(
         persona_dir,

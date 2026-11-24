@@ -384,23 +384,6 @@ def _apply_memory_writes(writes: list[MemoryWrite], persona_dir: Path) -> None:
         store.close()
 
 
-def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
-    """Drop channels whose names are not in the process-global emotion registry.
-
-    Mirrors the pattern in brain/ingest/emotion_tagger.py::_normalize.
-    Fail-soft: on ANY error the input dict is returned unchanged so extraction
-    never breaks on a vocab read error.  A debug log is emitted so the failure
-    is visible without surfacing into the chat path.
-    """
-    from brain.emotion.vocabulary import get as _vocab_get
-
-    try:
-        return {name: v for name, v in emotions.items() if _vocab_get(name) is not None}
-    except Exception:  # noqa: BLE001
-        logger.debug("_filter_to_registered: vocab lookup raised; passing through unfiltered")
-        return emotions
-
-
 # Ceiling on the intensity one pass-2 emotion_delta can give a channel, on the 0..10 scale (the validated [-1.0, 1.0]
 # delta times 10, capped). test_extractor_schema.py already states the intent, "so a malformed extractor can't slam the
 # vector", but bounds the delta, not what the delta becomes. Sustained feeling still climbs across turns; one turn cannot
@@ -427,8 +410,8 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     0..10 scale (x10, capped at +/-_MAX_DELTA_INTENSITY), so a negative delta lowers the feeling and one extraction
     can't peg a channel (#94).
 
-    Channel names are constrained to the registered emotion vocabulary first: LLM-invented names are dropped here
-    (mirrors the _normalize pattern in brain/ingest/emotion_tagger.py).
+    The channel names are checked against her vocabulary by the engine's fold (`EmotionEngine.fold_change`): a name she does not
+    have is added if it passes the gate (by the bridge), and discarded when no bridge can add it.
     """
     # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
     # pass2_queue.py's drain_all_locked pop-after-process step) can call
@@ -438,7 +421,7 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     # (emotion-system untangle) for the durable fix.
     from brain.emotion import engine
 
-    changes = signed_change_values(_filter_to_registered(delta))
+    changes = signed_change_values(delta)
     if changes:
         engine.engine_for(persona_dir).fold_change(changes, None, "monologue_emotion")
 

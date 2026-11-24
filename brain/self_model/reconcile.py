@@ -7,8 +7,8 @@ choice, never anyone else's insistence.
 Actions:
   accept / revise  — fold a self-authored emotion delta for one channel into the
                      emotion engine as a signed change (bounded [-1, 1] + clamped,
-                     routed through the registered vocabulary filter; off-vocab
-                     channels are dropped; no memory row is written). The gap
+                     checked against her vocabulary by the engine's fold; a channel
+                     it cannot hold is dropped; no memory row is written). The gap
                      is marked ``acknowledged`` and the channel gets a cooldown
                      (R-B2 anti-oscillation).
   dismiss          — let the gap pass; mark it ``dismissed`` + channel cooldown.
@@ -91,16 +91,17 @@ def is_channel_in_cooldown(gap, channel: str, *, now: datetime | None = None) ->
 def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) -> bool:
     """Fold a self-authored revision into the emotion engine as a signed change; no row is written.
 
-    The delta is clamped to [-1, 1] and routed through ``_filter_to_registered`` (off-vocab channel → dropped); the
-    signed change is the delta times 10, capped at ``extractor._MAX_DELTA_INTENSITY`` (``signed_change_values``), so
-    one reconcile can't peg a channel any more than one chat-turn extraction can.
+    The delta is clamped to [-1, 1]; the signed change is the delta times 10, capped at ``extractor._MAX_DELTA_INTENSITY``
+    (``signed_change_values``), so one reconcile can't peg a channel any more than one chat-turn extraction can. The channel
+    is checked against her vocabulary by the engine's fold (``fold_change``), which discards a channel she does not have
+    when no bridge can add it.
 
-    Returns True if a change was folded, False if the channel was off-vocab or the delta was effectively zero.
+    Returns True if a change was handed to the engine, False if the delta was effectively zero.
     """
-    from brain.chat.extractor import _filter_to_registered, signed_change_values
+    from brain.chat.extractor import signed_change_values
     from brain.emotion import engine
 
-    changes = signed_change_values(_filter_to_registered({channel: _clamp_delta(delta)}))
+    changes = signed_change_values({channel: _clamp_delta(delta)})
     if not changes:
         return False
     engine.engine_for(persona_dir).fold_change(changes, None, "self_model_reconcile")

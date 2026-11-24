@@ -87,7 +87,8 @@ def test_arc_skipped_and_reflex_result_construction():
 # ---- ReflexArcSet ----
 
 
-def test_reflex_arc_set_load_missing_falls_back_to_defaults(tmp_path: Path):
+def test_reflex_arc_set_load_missing_falls_back_to_defaults(tmp_path: Path, register_feelings):
+    register_feelings("creative_hunger")  # the default `creative_pitch` arc triggers on it; her vocabulary holds it
     missing = tmp_path / "nope.json"
     loaded = ReflexArcSet.load(missing, default_path=DEFAULT_ARCS_PATH)
     assert len(loaded.arcs) == 4
@@ -165,9 +166,10 @@ def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Pat
     assert len(corrupt_files) == 1
 
 
-def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path, caplog):
+def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path, caplog, register_feelings):
     """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default; the public
     `load` returns the same default arcs and logs the anomaly."""
+    register_feelings("creative_hunger")
     path = tmp_path / "reflex_arcs.json"
     path.write_text("{corrupt{{", encoding="utf-8")
 
@@ -1025,7 +1027,8 @@ def _variant_arc_dict(name: str, trigger: dict, template: str = "t") -> dict:
     }
 
 
-def test_reflex_arc_from_dict_keys_trigger_by_canonical_name(tmp_path: Path):
+def test_reflex_arc_from_dict_keys_trigger_by_canonical_name(tmp_path: Path, register_feelings):
+    register_feelings("not_a_real_emotion")  # her vocabulary holds it, so the load keeps the arc
     trigger = {"comfort-seeking": 5, "not_a_real_emotion": 6}
     expected = {"comfort_seeking": 5.0, "not_a_real_emotion": 6.0}  # an unknown name in canonical form is kept as is
 
@@ -1079,9 +1082,8 @@ def test_run_tick_fires_a_variant_triggered_arc_on_the_canonical_channel(
 
         assert [f.arc_name for f in result.arcs_fired] == ["variant_arc"]
         assert result.arcs_fired[0].trigger_state == {"comfort_seeking": 8.0}
-        assert any(
-            s.arc_name == "look_alike_arc" and s.reason == "trigger_not_met" for s in result.arcs_skipped
-        )
+        # the look-alike's trigger name is not in her vocabulary: the arc is left out of the load (it could not fire), not merged
+        assert all(s.arc_name != "look_alike_arc" for s in result.arcs_skipped)
         assert arcs_path.read_bytes() == arcs_before  # arcs file untouched
     finally:
         store.close()
@@ -1237,7 +1239,7 @@ def test_live_every_emotion_a_trigger_names_must_be_high(tmp_path: Path, emotion
     "arc_name", ["creative_pitch", "loneliness_journal", "self_check", "defiance_burst"]
 )
 def test_live_each_default_arc_fires_on_the_engine_saying_high_not_on_a_level(
-    tmp_path: Path, emotion_engine_stub, arc_name: str
+    tmp_path: Path, emotion_engine_stub, arc_name: str, register_feelings
 ):
     arcs = [
         a
@@ -1245,6 +1247,7 @@ def test_live_each_default_arc_fires_on_the_engine_saying_high_not_on_a_level(
         if a["name"] == arc_name
     ]
     assert len(arcs) == 1
+    register_feelings(*arcs[0]["trigger"])  # her vocabulary holds the arc's trigger names
     arcs[0]["days_since_human_min"] = 0  # the day-count gate is not what is under test
     emotion = next(iter(arcs[0]["trigger"]))
     (tmp_path / "low").mkdir()
@@ -1441,3 +1444,34 @@ def test_a_tick_that_gets_no_background_slot_loads_no_memories(tmp_path: Path, e
     assert result.arcs_fired == ()
     assert calls == []
     assert prompts == []
+
+
+# ---- #801 section 6: trigger names are checked when the arcs are read ----
+
+
+def test_an_arc_with_a_trigger_name_her_vocabulary_lacks_is_left_out_of_the_load_and_the_file_is_not_rewritten(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    path = tmp_path / "arcs.json"
+    payload = {"version": 1, "arcs": [_variant_arc_dict("known", {"Joy": 5}), _variant_arc_dict("stray", {"joy": 5, "stray_zz_word": 4})]}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    before = path.read_bytes()
+    with caplog.at_level(logging.WARNING, logger="brain.engines.reflex"):
+        loaded = ReflexArcSet.load(path, default_path=DEFAULT_ARCS_PATH)
+    assert [a.name for a in loaded.arcs] == ["known"]
+    assert any("stray" in r.getMessage() and "stray_zz_word" in r.getMessage() for r in caplog.records)
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["arcs.json"]  # reading the arcs added no name to her vocabulary
+
+
+def test_reading_the_arcs_never_adds_a_name_even_in_the_owner(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+
+    vocabulary.set_bridge_owner(True)  # tests/conftest.py puts the flag back
+    path = tmp_path / "arcs.json"
+    path.write_text(json.dumps({"version": 1, "arcs": [_variant_arc_dict("stray", {"stray_zz_word": 4})]}), encoding="utf-8")
+    assert ReflexArcSet.load(path, default_path=DEFAULT_ARCS_PATH).arcs == ()
+    assert vocabulary.get("stray_zz_word") is None
+    assert not (tmp_path / "emotion_vocabulary.json").exists()

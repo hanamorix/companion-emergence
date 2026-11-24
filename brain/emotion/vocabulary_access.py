@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -81,10 +82,10 @@ def lookup_local(names: Sequence[str] | Literal["all"]) -> dict[str, Found | Non
 _READ_ONLY_LOADED: dict[Path, tuple[int, int, int]] = {}
 
 
-def _load_read_only(persona_dir: Path) -> None:
+def load_read_only(persona_dir: Path) -> None:
     """Register what her file holds into this process's registry for this run; a file that cannot be read adds nothing.
 
-    Never writes: a damaged file raises (json_io `Recovery.RAISE`) instead of being quarantined and reset, and is reported once.
+    The load every command process makes (spec section 5): no memory heal, no rebuild, no quarantine. Never writes: a damaged file raises (json_io `Recovery.RAISE`) instead of being quarantined and reset, and is reported once.
     """
     from brain.emotion.persona_loader import load_persona_vocabulary
 
@@ -200,7 +201,7 @@ def lookup(persona_dir: Path, names: Sequence[str] | Literal["all"]) -> dict[str
         return dict(_found_from_wire(item) for item in reply["entries"])
     except (KeyError, TypeError, ValueError, AttributeError):
         _note_failure(LOOKUP_ROUTE, reply)
-    _load_read_only(persona_dir)
+    load_read_only(persona_dir)
     return lookup_local(names)
 
 
@@ -263,7 +264,7 @@ def check(
     except (KeyError, TypeError, ValueError, AttributeError):
         pass
     _note_failure(ADD_ROUTE, reply)
-    _load_read_only(persona_dir)
+    load_read_only(persona_dir)
     out: list[NameResult] = []
     for raw, _fields in items:
         if vocabulary.gate_name(raw) is None:
@@ -272,3 +273,116 @@ def check(
         emotion = vocabulary.get(raw)
         out.append(NameResult(raw, None, "missing") if emotion is None else NameResult(raw, emotion.name, "used"))
     return out
+
+
+# ------------------------------------------------------------------------------------------------
+# The check on a memory's feeling names (spec section 6)
+# ------------------------------------------------------------------------------------------------
+
+# (persona dir, tidied name) -> time.monotonic() before which the name is not asked about again, after an add that was `cannot_write`.
+_ADD_RETRY_AFTER: dict[tuple[Path, str], float] = {}
+
+
+def names_used(persona_dir: Path | None, raw_names: Iterable[str]) -> dict[str, str | None]:
+    """The spelling to use for each raw feeling name, or None when the name is discarded (spec section 3 outcome, one batch).
+
+    A framework name is answered from the registry with nothing asked and nothing written. With no `persona_dir` (an in-memory
+    store, a reader with no engine) only this process's registry answers. Otherwise the owner answers a name its registry holds
+    without any file work and adds the rest through the shared writer; any other process makes ONE `check` for all of the
+    non-framework names (the bridge, else her file read-only, else the name is `missing` and discarded). A name that could not be
+    written (`cannot_write`) is kept tidied, and is not asked about again for `dev_constants.EMOTION_VOCABULARY_ADD_RETRY_S`.
+    """
+    unique = list(dict.fromkeys(n for n in raw_names if isinstance(n, str)))
+    out: dict[str, str | None] = {}
+    ask: list[str] = []
+    for raw in unique:
+        if vocabulary.is_baseline(raw):
+            emotion = vocabulary.get(raw)
+            out[raw] = None if emotion is None else emotion.name
+            continue
+        if persona_dir is None:
+            emotion = vocabulary.get(raw)
+            out[raw] = None if emotion is None else emotion.name
+            continue
+        if vocabulary.is_bridge_owner() and (emotion := vocabulary.get(raw)) is not None:
+            out[raw] = emotion.name
+            continue
+        tidied = vocabulary.gate_name(raw)
+        if tidied is None:
+            out[raw] = None
+            continue
+        if _ADD_RETRY_AFTER.get((persona_dir, tidied), 0.0) > time.monotonic():
+            out[raw] = tidied
+            continue
+        ask.append(raw)
+    if ask and persona_dir is not None:
+        results = check(persona_dir, [(raw, None) for raw in ask])
+        for raw, result in zip(ask, results, strict=True):
+            tidied = vocabulary.canonical_name(raw)
+            if result.outcome == "used":
+                out[raw] = result.spelling
+                _ADD_RETRY_AFTER.pop((persona_dir, tidied), None)
+            elif result.outcome == "cannot_write":
+                out[raw] = tidied
+                _ADD_RETRY_AFTER[(persona_dir, tidied)] = time.monotonic() + dev_constants.EMOTION_VOCABULARY_ADD_RETRY_S
+            else:
+                out[raw] = None
+                if result.outcome == "missing":
+                    warn_throttled(
+                        logger,
+                        "vocabulary_access:discarded_missing",
+                        "vocabulary: a feeling name is not in her vocabulary and no bridge can add it; it is discarded here (first seen: %r)",
+                        raw,
+                        exc_info=False,
+                    )
+    return out
+
+
+def names_known(persona_dir: Path | None, raw_names: Iterable[str]) -> dict[str, str | None]:
+    """The spelling her vocabulary has for each raw name, or None when it holds no such entry: a lookup that never adds a name.
+
+    For a reader of another file's feeling names (a reflex arc's trigger, a growth-log event) whose names say what the file
+    refers to, not what is felt now: such a read must not mint a stub entry in her vocabulary for a name she does not have. One
+    `lookup` for the batch (the owner answers from its registry, another process asks the bridge, else the read-only file); with
+    no `persona_dir` only this process's registry answers. A framework name is answered from the registry.
+    """
+    unique = list(dict.fromkeys(n for n in raw_names if isinstance(n, str)))
+    out: dict[str, str | None] = {}
+    ask: list[str] = []
+    for raw in unique:
+        if persona_dir is None or vocabulary.is_baseline(raw):
+            emotion = vocabulary.get(raw)
+            out[raw] = None if emotion is None else emotion.name
+        else:
+            ask.append(raw)
+    if ask and persona_dir is not None:
+        found = lookup(persona_dir, ask)
+        for raw in ask:
+            entry = found.get(raw)
+            out[raw] = None if entry is None else entry.spelling
+    return out
+
+
+def _mean_of_numbers(values: list[Any]) -> Any:
+    numbers = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)]
+    if len(values) == 1 or not numbers:
+        return values[0]
+    return sum(numbers) / len(numbers)
+
+
+def check_feelings(persona_dir: Path | None, raw: Mapping[str, Any]) -> dict[str, Any]:
+    """The check of spec section 6 on a map of feelings that is about to be WRITTEN: each kept name under the spelling her vocabulary uses.
+
+    A name the check discards is left out; two raw names that land on one spelling carry the mean of their numeric values (a value
+    that is not a number is kept as given for a lone name). A key that is not text is dropped with a log line. Returns a new dict.
+    """
+    texts = {name: value for name, value in raw.items() if isinstance(name, str)}
+    if len(texts) < len(raw):
+        logger.warning("dropping an emotion whose name is not text")
+    spellings = names_used(persona_dir, texts)
+    groups: dict[str, list[Any]] = {}
+    for name, value in texts.items():
+        spelling = spellings.get(name)
+        if spelling is not None:
+            groups.setdefault(spelling, []).append(value)
+    return {spelling: _mean_of_numbers(values) for spelling, values in groups.items()}

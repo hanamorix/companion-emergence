@@ -75,9 +75,10 @@ def test_a_fenced_or_wrapped_reply_is_parsed(reply):
     assert make_emotion_tagger(_Provider(reply))(_memory()) == {"joy": 6.0, "awe": 2.5}
 
 
-def test_only_registered_names_with_a_usable_intensity_are_kept():
+def test_names_are_not_filtered_but_values_must_be_usable():
+    """The registered-name filter is gone (#801 section 6): the store's write checks a name against her vocabulary."""
     reply = '{"joy": 12, "trust": "high", "not_a_feeling": 5, "awe": 0, "grief": -2}'
-    assert make_emotion_tagger(_Provider(reply))(_memory()) == {"joy": 10.0}
+    assert make_emotion_tagger(_Provider(reply))(_memory()) == {"joy": 10.0, "not_a_feeling": 5.0}
 
 
 @pytest.mark.parametrize("reply", ["no object here", "{not json", "[1, 2]", ""], ids=["prose", "broken", "array", "empty"])
@@ -167,18 +168,14 @@ def test_a_balanced_invalid_object_and_a_provider_failure_log_only_the_tagger_er
         assert [r.getMessage().split(":")[1].strip() for r in caplog.records] == ["tagger error"]
 
 
-def test_normalize_drops_names_that_are_not_registered_and_values_that_are_not_finite_positive_numbers():
-    vocab = _loaded()  # the registry decides what is registered; `vocab` only says it loaded
+def test_normalize_drops_values_that_are_not_finite_positive_numbers_and_keeps_every_name():
     raw = {"joy": float("nan"), "awe": float("inf"), "x": 3, "ok": "5"}
-    assert _normalize(raw, vocab) == {}
-    assert _normalize({"joy": "5", "awe": 11.5}, vocab) == {"joy": 5.0, "awe": 10.0}
-    assert _normalize({"anything": 3}, frozenset()) == {"anything": 3.0}  # no vocabulary loaded: every name allowed
+    assert _normalize(raw) == {"x": 3.0, "ok": 5.0}
+    assert _normalize({"joy": "5", "awe": 11.5}) == {"joy": 5.0, "awe": 10.0}
+    assert _normalize({"anything": 3}) == {"anything": 3.0}
 
 
 # --- the name matching (HC2): case, separators between a blend's parts, part order, pooling ----------------------------------
-
-_KEEPS_TODAYS_BEHAVIOUR = "pins behaviour HC2 keeps unchanged (the exact-match test it replaces already gave this result), so it passes on the old code by design"
-
 
 def _extension(name):
     return vocabulary.Emotion(name=name, description="x", category="persona_extension", decay_half_life_days=14.0, intensity_clamp=10.0)
@@ -203,7 +200,7 @@ def _loaded():
 
 @pytest.mark.parametrize("spelling", ["Joy", "JOY", "jOy"])
 def test_a_feeling_name_matches_whatever_its_case(spelling):
-    assert _normalize({spelling: 4}, _loaded()) == {"joy": 4.0}
+    assert _normalize({spelling: 4}) == {"joy": 4.0}
 
 
 @pytest.mark.parametrize(
@@ -223,78 +220,66 @@ def test_a_feeling_name_matches_whatever_its_case(spelling):
     ],
 )
 def test_any_run_of_separators_between_a_blends_parts_and_before_blend_matches(extensions, spelling):
-    assert _normalize({spelling: 6}, _loaded()) == {"grief_love_blend": 6.0}
+    assert _normalize({spelling: 6}) == {"grief_love_blend": 6.0}
 
 
 @pytest.mark.parametrize("spelling", ["love_grief_blend", "love-grief blend", "LOVE / GRIEF / BLEND", "love__grief--blend"])
 def test_reordered_blend_parts_match_the_registered_blend(extensions, spelling):
-    assert _normalize({spelling: 3}, _loaded()) == {"grief_love_blend": 3.0}
+    assert _normalize({spelling: 3}) == {"grief_love_blend": 3.0}
 
 
-def test_the_stored_key_is_the_tidied_form_of_a_registered_name(extensions):
-    """The tagger still stores the tidied form; an entry keeps its own spelling (#801 section 3), so the key is the tidied form of it
-    (the memory check of step 5 moves the stored spelling onto the entry's)."""
-    kept = _normalize({"Love Grief Blend": 2, "Comfort-Seeking": 3}, _loaded())
+def test_the_stored_key_is_the_tidied_form_of_the_name(extensions):
+    """The tagger keys by the tidied form; the store's write moves the stored spelling onto the entry's (#801 section 6)."""
+    kept = _normalize({"Love Grief Blend": 2, "Comfort-Seeking": 3})
     assert set(kept) == {"grief_love_blend", "comfort_seeking"}
-    for key in kept:
-        found = vocabulary.get(key)
-        assert found is not None and vocabulary.canonical_name(found.name) == key
 
 
 @pytest.mark.parametrize(
     "raw, expected",
     [
-        ({"joy": 2, "Joy": 7}, {"joy": 7.0}),
-        ({"Joy": 7, "joy": 2}, {"joy": 7.0}),
-        ({"grief love blend": 2, "love_grief_blend": 5}, {"grief_love_blend": 5.0}),
-        ({"grief love blend": 5, "grief_love_blend": 2}, {"grief_love_blend": 5.0}),
-        ({"joy-": 2, "joy!": 9}, {"joy": 9.0}),
-        ({"joy-": 8, "joy": 3, "-joy": 4}, {"joy": 8.0}),
+        ({"joy": 2, "Joy": 7}, {"joy": 4.5}),
+        ({"Joy": 7, "joy": 2}, {"joy": 4.5}),
+        ({"grief love blend": 2, "love_grief_blend": 5}, {"grief_love_blend": 3.5}),
+        ({"grief love blend": 5, "grief_love_blend": 2}, {"grief_love_blend": 3.5}),
+        ({"joy-": 2, "joy!": 8}, {"joy": 5.0}),
+        ({"joy-": 8, "joy": 3, "-joy": 4}, {"joy": 5.0}),
         ({"Joy": 15, "JOY": 11}, {"joy": 10.0}),
     ],
     ids=["case-first-smaller", "case-first-larger", "order", "separator-first-larger", "same-stepped-name-later-larger", "same-stepped-name-three", "clamped"],
 )
-def test_two_spellings_of_one_emotion_pool_and_the_larger_value_is_kept(extensions, raw, expected):
-    assert _normalize(raw, _loaded()) == expected
+def test_two_spellings_of_one_emotion_are_averaged(extensions, raw, expected):
+    """Two spellings of one feeling in one reply carry their mean (#801 section 6, S8), not the larger value."""
+    assert _normalize(raw) == expected
 
 
 def test_a_spelling_with_an_unusable_value_does_not_hide_a_valid_one(extensions):
-    assert _normalize({"Joy": "high", "JOY": 4, "joy-": float("nan"), "joy ": 0}, _loaded()) == {"joy": 4.0}
+    assert _normalize({"Joy": "high", "JOY": 4, "joy-": float("nan"), "joy ": 0}) == {"joy": 4.0}
 
 
-@pytest.mark.parametrize("name", ["not_a_feeling", "---", "", "blend", "_blend_", "joy2", "joy joy", "love_grief_grief_blend", "gr1ef love blend"])
-def test_a_name_that_is_not_registered_whatever_its_spelling_is_dropped(extensions, name):
-    assert _normalize({name: 5, "Joy": 1}, _loaded()) == {"joy": 1.0}
+@pytest.mark.parametrize("name", ["---", "", "_", "  "])
+def test_a_name_that_tidies_to_nothing_is_dropped(name):
+    assert _normalize({name: 5, "Joy": 1}) == {"joy": 1.0}
 
 
-def test_an_extension_registered_with_a_space_or_double_underscore_is_stored_under_its_tidied_name(extensions):
-    assert _normalize({"odd name": 2, "odd__pair": 3, "Odd-Name": 1}, _loaded()) == {"odd_name": 2.0, "odd_pair": 3.0}
+def test_the_docstring_no_longer_says_the_larger_value_is_kept():
+    assert "larger" not in (_normalize.__doc__ or "")
 
 
-@pytest.mark.no_base_failure(reason=_KEEPS_TODAYS_BEHAVIOUR)
-def test_with_no_vocabulary_loaded_names_are_kept_as_given_and_the_lookup_is_not_called(monkeypatch):
-    def boom(name):
-        raise AssertionError("the vocabulary lookup must not run when the vocabulary could not be loaded")
-
-    monkeypatch.setattr(vocabulary, "get", boom)
-    raw = {"Grief-Love Blend": 2, "joy": 20, "x": "no", "nan": float("nan"), "---": 1}
-    assert _normalize(raw, frozenset()) == {"Grief-Love Blend": 2.0, "joy": 10.0, "---": 1.0}
-
-
-def test_the_tagger_stores_registered_names_for_a_reply_with_variant_spellings(monkeypatch):
+def test_the_tagger_returns_variant_spellings_pooled_by_mean(monkeypatch):
     monkeypatch.setattr(emotion_tagger, "_load_vocab", _loaded)
     reply = '{"Joy": 3, "joy": 5, "Comfort-Seeking": 2}'
-    assert make_emotion_tagger(_Provider(reply))(_memory()) == {"joy": 5.0, "comfort_seeking": 2.0}
+    assert make_emotion_tagger(_Provider(reply))(_memory()) == {"joy": 4.0, "comfort_seeking": 2.0}
 
 
-@pytest.mark.no_base_failure(reason=_KEEPS_TODAYS_BEHAVIOUR)
-def test_a_tagger_whose_vocabulary_cannot_load_keeps_every_name(monkeypatch):
+def test_a_tagger_whose_vocabulary_cannot_load_still_asks_for_any_name(monkeypatch):
     def broken():
         raise RuntimeError("no vocabulary")
 
     monkeypatch.setattr("brain.emotion.vocabulary.list_all", broken)
     assert emotion_tagger._load_vocab() == frozenset()
-    assert make_emotion_tagger(_Provider('{"Anything Goes": 3}'))(_memory()) == {"Anything Goes": 3.0}
+    provider = _Provider('{"Anything Goes": 3}')
+    assert make_emotion_tagger(provider)(_memory()) == {"anything_goes": 3.0}
+    assert "(any emotion name)" in provider.calls[0][0]
 
 
 # --- tag_if_feelingless --------------------------------------------------------------------------------------------------
@@ -334,12 +319,12 @@ def test_the_tags_mood_event_carries_the_rows_rowid(store, emotion_engine_stub):
 
 
 def test_a_row_with_feelings_is_not_sent_to_the_tagger(store):
-    row = _memory(emotions={"trust": 3.0})
+    row = _memory(emotions={"awe": 3.0})
     store.create(row, fold=False)
     tagger = _tagger({"joy": 6.0})
     assert tag_if_feelingless(store, tagger, row) is False
     assert tagger.calls == []
-    assert store.get(row.id, bump=False)._stored_emotions == {"trust": 3.0}
+    assert store.get(row.id, bump=False)._stored_emotions == {"awe": 3.0}
 
 
 def test_no_tagger_means_nothing_happens(store):
@@ -365,11 +350,11 @@ def test_feelings_written_while_the_tagger_was_working_are_kept(store):
     store.create(row, fold=False)
 
     def tagger(memory):
-        store.update(memory.id, emotions={"trust": 2.0}, fold=False)  # another writer lands during the slow call
+        store.update(memory.id, emotions={"awe": 2.0}, fold=False)  # another writer lands during the slow call
         return {"joy": 9.0}
 
     assert tag_if_feelingless(store, tagger, row) is False
-    assert store.get(row.id, bump=False)._stored_emotions == {"trust": 2.0}
+    assert store.get(row.id, bump=False)._stored_emotions == {"awe": 2.0}
 
 
 def test_a_row_deleted_while_the_tagger_was_working_is_not_written(store):
