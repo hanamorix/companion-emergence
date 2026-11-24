@@ -430,6 +430,7 @@ def test_the_rebuild_of_a_missing_file_writes_through_the_shared_writer_once(tmp
         store.close()
 
 
+@pytest.mark.no_base_failure(reason="the loader already refused a bad schema on a read-only load; the check only moved into the shared validator, so this pins that behaviour through the refactor")
 def test_a_read_only_load_of_a_file_without_an_emotions_list_raises(tmp_path: Path):
     from brain.health.json_io import JsonFileError
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 from brain.memory.store import Memory, MemoryStore
 
@@ -494,6 +496,7 @@ def test_repair_patches_a_stub_spelled_otherwise_when_the_reply_names_it_tidied(
     assert [(e["name"], e["description"]) for e in data["emotions"]] == [("Quiet Dread", "the held breath before bad news")]
 
 
+@pytest.mark.no_base_failure(reason="the old repair merged in memory and so never prompted for a dropped twin; the merge now writes the file first, and this pins that the prompt still holds one name")
 def test_repair_does_not_describe_a_twin_that_the_merge_dropped(tmp_path: Path) -> None:
     """The steps after the merge work from the merged file: the dropped twin is not in the provider's prompt."""
     from brain.health.vocab_repair import run_vocab_repair
@@ -510,8 +513,6 @@ def test_repair_does_not_describe_a_twin_that_the_merge_dropped(tmp_path: Path) 
 
 def test_repair_raises_and_retires_nothing_when_the_half_life_bump_cannot_be_written(tmp_path: Path, monkeypatch) -> None:
     """A write the shared writer could not make must not retire Step 1: it raises, and no state file is written."""
-    import pytest
-
     from brain.emotion import vocabulary_file
     from brain.health.vocab_repair import run_vocab_repair
 

@@ -80,6 +80,7 @@ def test_only_the_shared_module_writes_her_vocabulary_file() -> None:
     assert not stale, f"these known exceptions no longer write her vocabulary file, remove them from KNOWN_EXCEPTIONS: {stale}"
 
 
+@pytest.mark.no_base_failure(reason="a self-test of the scanner function on synthetic trees; it does not read the product tree, so it passes on any base that has this file")
 def test_the_scanner_finds_a_synthetic_offender_and_ignores_a_state_file_write() -> None:
     offender = ast.parse("from x import write_json\ndef f(vocab_path, data):\n    write_json(vocab_path, data, backups=3)\n")
     keyword_only = ast.parse("def g(path, data):\n    write_json(path, data, backups=_VOCABULARY_BACKUPS)\n")
