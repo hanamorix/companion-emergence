@@ -28,33 +28,38 @@ export function VoiceEditPanel({ proposal, persona, onAccept, onReject }: Props)
   return (
     <aside className="voice-edit-panel" role="dialog" aria-label="Voice edit proposal">
       <h2>{capitalize(persona)} proposed an edit to her voice</h2>
-      <p className="voice-edit-panel__rationale">{proposal.rationale}</p>
-      <p className="voice-edit-panel__evidence">
-        Evidence: {proposal.evidence.join(", ")}
-      </p>
-
-      <pre className="voice-edit-panel__diff">
-        {targetIdx === -1 ? (
-          <div>
-            <div className="diff-line diff-line--remove">- {proposal.oldText}</div>
-            <div className="diff-line diff-line--add">+ {proposal.newText}</div>
-          </div>
-        ) : (
-          lines.map((line, i) => {
-            if (i === targetIdx) {
-              return (
-                <div key={i}>
-                  <div className="diff-line diff-line--remove">- {line}</div>
-                  <div className="diff-line diff-line--add">+ {proposal.newText}</div>
-                </div>
-              );
-            }
-            return (
-              <div key={i} className="diff-line diff-line--context">{"  "}{line}</div>
-            );
-          })
+      {/* #532: the text scrolls inside a capped body, so a long rationale never pushes the buttons below it out of view. */}
+      <div className="voice-edit-panel__body">
+        <p className="voice-edit-panel__rationale">{proposal.rationale}</p>
+        {proposal.evidence.length > 0 && (
+          <p className="voice-edit-panel__evidence">
+            Evidence: {proposal.evidence.join(", ")}
+          </p>
         )}
-      </pre>
+
+        <pre className="voice-edit-panel__diff">
+          {targetIdx === -1 ? (
+            <div>
+              <div className="diff-line diff-line--remove">- {proposal.oldText}</div>
+              <div className="diff-line diff-line--add">+ {proposal.newText}</div>
+            </div>
+          ) : (
+            lines.map((line, i) => {
+              if (i === targetIdx) {
+                return (
+                  <div key={i}>
+                    <div className="diff-line diff-line--remove">- {line}</div>
+                    <div className="diff-line diff-line--add">+ {proposal.newText}</div>
+                  </div>
+                );
+              }
+              return (
+                <div key={i} className="diff-line diff-line--context">{"  "}{line}</div>
+              );
+            })
+          )}
+        </pre>
+      </div>
 
       <div className="voice-edit-panel__actions">
         {!editMode ? (

@@ -964,42 +964,57 @@ export function ChatPanel({ persona, onSpeakingChange, recovering = false, feltT
           </div>
         )}
       </div>
-      {activeBanners.length > 0 && (
+      {(activeBanners.length > 0 || activeVoiceEdits.length > 0) && (
         <div
-          data-testid="initiate-banner-list"
-          style={{ display: "flex", flexDirection: "column", gap: 6, padding: "0 16px 8px" }}
+          data-testid="chat-cards"
+          // #532: the cards can shrink to their cap and scroll, so a long one never pushes the input row out of the
+          // fixed-height panel. Half the panel leaves the messages room to stay readable.
+          style={{
+            flex: "0 1 auto",
+            minHeight: 0,
+            maxHeight: "50%",
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            padding: "0 16px 8px",
+          }}
         >
-          {activeBanners.map((b) => (
-            <InitiateBanner
-              key={`${b.auditId}:${bannerDrafts[b.auditId]?.n ?? 0}`}
-              message={b}
-              companionName={capitalize(persona)}
-              onSendReply={onCardSendReply}
-              onDismiss={onBannerDismiss}
-              onMounted={onBannerMounted}
-              isStreaming={streaming}
-              initialDraft={bannerDrafts[b.auditId]?.text}
+          {activeBanners.length > 0 && (
+            <div data-testid="initiate-banner-list" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {activeBanners.map((b) => (
+                <InitiateBanner
+                  key={`${b.auditId}:${bannerDrafts[b.auditId]?.n ?? 0}`}
+                  message={b}
+                  companionName={capitalize(persona)}
+                  onSendReply={onCardSendReply}
+                  onDismiss={onBannerDismiss}
+                  onMounted={onBannerMounted}
+                  isStreaming={streaming}
+                  initialDraft={bannerDrafts[b.auditId]?.text}
+                />
+              ))}
+            </div>
+          )}
+          {activeVoiceEdits.map((p) => (
+            <VoiceEditPanel
+              key={p.auditId}
+              proposal={p}
+              persona={persona}
+              onAccept={(id, withEdits) => {
+                void acceptVoiceEdit(persona, id, withEdits)
+                  .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
+                  .catch((e) => console.error("voice-edit accept failed", e));
+              }}
+              onReject={(id) => {
+                void rejectVoiceEdit(persona, id)
+                  .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
+                  .catch((e) => console.error("voice-edit reject failed", e));
+              }}
             />
           ))}
         </div>
       )}
-      {activeVoiceEdits.map((p) => (
-        <VoiceEditPanel
-          key={p.auditId}
-          proposal={p}
-          persona={persona}
-          onAccept={(id, withEdits) => {
-            void acceptVoiceEdit(persona, id, withEdits)
-              .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
-              .catch((e) => console.error("voice-edit accept failed", e));
-          }}
-          onReject={(id) => {
-            void rejectVoiceEdit(persona, id)
-              .then(() => setActiveVoiceEdits((prev) => prev.filter((v) => v.auditId !== id)))
-              .catch((e) => console.error("voice-edit reject failed", e));
-          }}
-        />
-      ))}
       {stagedFiles.length > 0 && (
         <div style={{ padding: "0 16px" }}>
           {stagedFiles.map((f) => (
