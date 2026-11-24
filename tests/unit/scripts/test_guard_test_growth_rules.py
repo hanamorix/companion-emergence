@@ -265,3 +265,72 @@ def test_scanner_tests_reads_the_argvalues_keyword():
 def test_scanner_tests_treats_a_literal_list_as_never_a_scan():
     src = "@pytest.mark.parametrize('p', ['ls-files', 'glob'])\ndef test_a(p):\n    pass\n"
     assert rules.scanner_tests(src) == set()
+
+
+_DUP_A = (
+    "def test_a():\n"
+    '    """First."""\n'
+    "    box = make(1, 2, name='x')\n"
+    "    box.fill(3)\n"
+    "    assert box.total == 6\n"
+    "    assert box.name == 'x'\n"
+)
+_DUP_B = (
+    "def test_b():\n"
+    "    crate = make(7, 8, name='yy')\n"
+    "    crate.fill(9)\n"
+    "    assert crate.total == 24\n"
+    "    assert crate.name == 'yy'\n"
+)
+_DUP_C = (
+    "def test_c():\n"
+    "    for item in load():\n"
+    "        if item.ok:\n"
+    "            print(item)\n"
+    "        else:\n"
+    "            raise ValueError(item.reason)\n"
+)
+
+
+def test_likely_duplicates_pairs_tests_that_differ_only_in_names_and_values():
+    a = rules.test_bodies(_DUP_A)["test_a"]
+    b = rules.test_bodies(_DUP_B)["test_b"]
+    got = rules.likely_duplicates({"x.py::test_a": a}, {"y.py::test_b": b})
+    assert len(got) == 1
+    assert got[0][:2] == ("x.py::test_a", "y.py::test_b")
+    assert got[0][2] >= 0.9
+
+
+def test_likely_duplicates_ignores_tests_with_different_call_structure():
+    a = rules.test_bodies(_DUP_A)["test_a"]
+    c = rules.test_bodies(_DUP_C)["test_c"]
+    assert rules.likely_duplicates({"x.py::test_a": a}, {"y.py::test_c": c}) == []
+
+
+def test_likely_duplicates_skips_bodies_under_the_token_minimum_even_when_identical():
+    short = rules.test_bodies("def test_s():\n    pass\n")["test_s"]
+    assert len(short) < 20
+    assert rules.likely_duplicates({"x.py::test_s": short}, {"y.py::test_s": short}) == []
+
+
+def test_likely_duplicates_never_pairs_a_test_with_itself_or_repeats_a_pair():
+    a = rules.test_bodies(_DUP_A)["test_a"]
+    b = rules.test_bodies(_DUP_B)["test_b"]
+    both = {"x.py::test_a": a, "y.py::test_b": b}
+    got = rules.likely_duplicates(both, both)
+    assert [t[:2] for t in got] == [("x.py::test_a", "y.py::test_b")]
+
+
+def test_test_bodies_names_a_method_with_its_class_and_includes_async_tests():
+    src = (
+        "class TestX:\n"
+        "    def test_m(self):\n"
+        "        pass\n"
+        "    def helper(self):\n"
+        "        pass\n"
+        "async def test_n():\n"
+        "    pass\n"
+        "def not_a_test():\n"
+        "    pass\n"
+    )
+    assert set(rules.test_bodies(src)) == {"TestX::test_m", "test_n"}

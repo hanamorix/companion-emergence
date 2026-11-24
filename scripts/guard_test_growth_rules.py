@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import ast
+import copy
+import difflib
+import re
 from dataclasses import dataclass
+
+_TOKEN = re.compile(r"\w+|[^\w\s]")
 
 
 def function_of(nodeid: str) -> str:
@@ -219,6 +224,77 @@ def scanner_tests(source: str) -> set[str]:
 
     visit(tree.body, "", module_assigns, module_funcs)
     return found
+
+
+def _normalised_tokens(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    body = copy.deepcopy(func.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    names: dict[str, str] = {}
+
+    def rename(ident: str) -> str:
+        return names.setdefault(ident, f"v{len(names)}")
+
+    tokens: list[str] = []
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name):
+                node.id = rename(node.id)
+            elif isinstance(node, ast.arg):
+                node.arg = rename(node.arg)
+            elif isinstance(node, ast.Attribute):
+                node.attr = rename(node.attr)
+            elif isinstance(node, ast.keyword) and node.arg is not None:
+                node.arg = rename(node.arg)
+            elif isinstance(node, ast.Constant):
+                node.value = f"c:{type(node.value).__name__}"
+        tokens += _TOKEN.findall(ast.dump(stmt, include_attributes=False))
+    return tokens
+
+
+def test_bodies(source: str) -> dict[str, list[str]]:
+    """Qualname to normalised body tokens for every ``test*`` function or method."""
+    tree = ast.parse(source)
+    out: dict[str, list[str]] = {}
+
+    def visit(body: list[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                visit(node.body, f"{prefix}{node.name}::")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                out[f"{prefix}{node.name}"] = _normalised_tokens(node)
+
+    visit(tree.body, "")
+    return out
+
+
+def likely_duplicates(
+    new: dict[str, list[str]],
+    pool: dict[str, list[str]],
+    *,
+    threshold: float = 0.9,
+    min_tokens: int = 20,
+) -> list[tuple[str, str, float]]:
+    """Pairs of tests (keys ``path::qualname``) whose normalised bodies match at least ``threshold``."""
+    found = []
+    seen: set[frozenset[str]] = set()
+    for a, a_tokens in new.items():
+        if len(a_tokens) < min_tokens:
+            continue
+        for b, b_tokens in pool.items():
+            pair = frozenset((a, b))
+            if a == b or pair in seen or len(b_tokens) < min_tokens:
+                continue
+            seen.add(pair)
+            ratio = difflib.SequenceMatcher(None, a_tokens, b_tokens, autojunk=False).ratio()
+            if ratio >= threshold:
+                found.append((a, b, ratio))
+    return sorted(found, key=lambda t: -t[2])
 
 
 def is_single_axis_over_budget(new_ids: int, axis_sizes: dict[str, int], budget: int) -> bool:
