@@ -154,7 +154,7 @@ def test_read_current_vocabulary_names_gives_the_tidied_form_and_skips_a_non_str
     assert names == {"quiet_dread", "joy"}
 
 
-_OLD_GATE_ALSO_REFUSED ="the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
+_OLD_GATE_ALSO_REFUSED = "the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
 _OLD_GATE_ALSO_ACCEPTED = "the scheduler's old name check already accepted this name, so the row passes on the old code by design"
 
 

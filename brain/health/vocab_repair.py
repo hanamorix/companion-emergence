@@ -239,7 +239,8 @@ def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
 
     Mutates ``data["emotions"]`` in place. Returns ``(dropped_name, kept_spelling)`` pairs, one per entry dropped; empty when
     nothing was merged, and then ``data`` is untouched (a lone entry keeps its spelling: nothing is renamed). The merged entry
-    takes its fields from the first twin with a real description, else from the first; its name is the spelling of the twin that
+    takes all its fields (every key of that entry, not a mix of twins) from the first twin with a real description, else from the
+    first; its name is the spelling of the twin that
     comes first in the file. It sits where that first twin sat. Entries that are not dicts, have no string name, or have a name
     that tidies to nothing pass through unchanged and in place.
     """

@@ -519,8 +519,9 @@ def test_merge_keeps_non_dict_nameless_and_empty_tidied_entries_in_place() -> No
             _proper_entry("___"),
         ]
     }
-    _merge_variant_entries(data)
+    assert _merge_variant_entries(data) == [("comfort_seeking", "comfort seeking")]
     assert _names(data) == ["not an entry", "comfort seeking", nameless, "---", 7, "___"]
+    assert data["emotions"][1] == _proper_entry("comfort seeking", "one")
     assert data["emotions"][2] is nameless
     assert data["emotions"][1]["description"] == "one"
 
