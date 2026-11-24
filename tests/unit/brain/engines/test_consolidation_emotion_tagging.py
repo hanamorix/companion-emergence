@@ -182,8 +182,8 @@ def test_a_target_gone_after_the_merge_write_is_left_alone(persona, monkeypatch)
 
 
 def test_a_recalled_row_without_feelings_is_tagged_before_the_write_back_re_reads_it(persona, emotion_engine_stub, monkeypatch, register_feelings):
-    register_feelings("trust")  # a feeling her vocabulary holds beyond the framework's own
     _tmp, store, _heb, _queue = persona
+    register_feelings("trust", persona_dir=_tmp)  # a feeling her vocabulary holds beyond the framework's own (in her file too)
     emotion_engine_stub.live = True
     row = _mem("Bob's address", importance=3.0)
     store.create(row, fold=False)

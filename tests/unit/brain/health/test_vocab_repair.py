@@ -589,7 +589,7 @@ def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:
     assert data["emotions"][0]["description"] == "the weight of it"
 
 
-def test_excerpt_evidence_counts_a_non_finite_valued_emotion_and_logs_no_drop(tmp_path: Path, caplog, register_feelings) -> None:
+def test_excerpt_evidence_counts_a_non_finite_valued_emotion_and_logs_no_drop(tmp_path: Path, caplog) -> None:
     """A memory whose stored value for the name is NaN still names that emotion, so it is evidence and nothing is logged.
 
     `create_new` drops non-finite values, so the memory is built the way a loaded row is.
@@ -599,7 +599,12 @@ def test_excerpt_evidence_counts_a_non_finite_valued_emotion_and_logs_no_drop(tm
 
     from brain.health.vocab_repair import _excerpts_for_name
 
-    register_feelings("ache_of_nan")  # the repair describes a name her vocabulary holds (a stub entry)
+    # The repair describes a name her vocabulary holds (a stub entry). The entry is in her file, not only in the registry: the memory
+    # check of a process that is not the owner reads her file and its copy follows it (#803 step 15), so a registry-only entry is dropped.
+    (tmp_path / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "ache_of_nan", "description": "d", "category": "persona_extension", "decay_half_life_days": 5.0}]}),
+        encoding="utf-8",
+    )
     store = _make_store(tmp_path)
     try:
         store.create(

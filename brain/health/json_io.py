@@ -206,6 +206,9 @@ class JsonRead:
     outcome: Literal["ok", "missing", "defaulted", "restored", "reset"]
     kind: str | None = None
     anomaly: BrainAnomaly | None = None
+    # The stat key (inode, mtime ns, size) of the bytes the "ok" read parsed, taken from the same open handle (`read_bytes_stat`),
+    # so a change between the read and a later stat is never missed. None for every other outcome.
+    sig: tuple[int, int, int] | None = None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -327,7 +330,7 @@ def _read(path, default, recover, expect, validate, fallbacks, waited: bool) -> 
             return JsonRead(default(), "defaulted", "io")
         raise JsonFileError(path, "io", _short(exc)) from exc
     try:
-        return JsonRead(_check(raw, expect, validate), "ok")
+        return JsonRead(_check(raw, expect, validate), "ok", sig=sig)
     except _BadContentError as bad:
         if recover in (Recovery.DEFAULT, Recovery.CONTENT):
             _report(path, bad.kind, bad.cause, "using the default")

@@ -914,6 +914,13 @@ REMOVED: tuple[Removed, ...] = (
         ref="#741 / #801 (draft PR #803), build step 10 (SV6)",
         kind="code",
     ),
+    # --- every process's copy of her vocabulary follows the file (#803 step 15, VC2) ------------------------------------------------
+    Removed(
+        names=("register_entries", "_READ_ONLY_LOADED"),
+        why="every load of her vocabulary file is one exact reload (`vocabulary_file.reload_entries`, `reload`: names the file no longer holds are removed, an unchanged file changes nothing), and the read-only copy's own stat-key dict is folded into the one check every copy goes through (`vocabulary.follow_file`)",
+        ref="#741 / #801 (draft PR #803), build step 15 (VC2)",
+        kind="code",
+    ),
 )
 
 

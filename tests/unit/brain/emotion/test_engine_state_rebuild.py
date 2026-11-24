@@ -88,12 +88,12 @@ def test_a_persona_entry_wins_over_the_table(tmp_path: Path) -> None:
     # `emergence` is in the table (60.0) and is not a framework entry; her entry says 9.0: a reversed order would answer 60.0.
     # (A framework name never takes her file's number: see the section 8 test below.)
     assert dev_constants.EMOTION_HALF_LIFE_DAYS["emergence"] == 60.0
-    _register("emergence", 9.0)
+    _put_in_her_file(tmp_path, "emergence", 9.0)
     assert _engine(tmp_path).half_life("emergence") == 9.0
 
 
 def test_table_wins_over_the_default_and_unknown_gets_the_default(tmp_path: Path) -> None:
-    _register("something_else", 4.0)
+    _put_in_her_file(tmp_path, "something_else", 4.0)
     engine = _engine(tmp_path)
     assert engine.half_life("grief") == 60.0
     assert engine.half_life("not_in_table_or_file") == 14.0
@@ -101,7 +101,7 @@ def test_table_wins_over_the_default_and_unknown_gets_the_default(tmp_path: Path
 
 
 def test_a_persona_only_name_returns_the_persona_value(tmp_path: Path) -> None:
-    _register("persona_only_word", 4.5)
+    _put_in_her_file(tmp_path, "persona_only_word", 4.5)
     assert _engine(tmp_path).half_life("persona_only_word") == 4.5
 
 
@@ -132,14 +132,20 @@ def test_every_table_key_is_a_canonical_name() -> None:
 
 
 def _register(name: str, days: float | None, category: str = "persona_extension") -> None:
-    """Put an entry of her vocabulary in the registry (the conftest fixture restores the registry after the test)."""
+    """Put an entry of her vocabulary in the registry (the conftest fixture restores the registry after the test). Only for a test
+    that makes this process the owner: a non-owner's lookup follows her file (#803 step 15) and drops what the file lacks."""
     vocabulary.register(vocabulary.Emotion(name=name, description="d", category=category, decay_half_life_days=days))  # type: ignore[arg-type]
+
+
+def _put_in_her_file(persona_dir: Path, name: str, days: float | None) -> None:
+    """An entry of her vocabulary in her file: a process that is not the owner reads it from there and its copy follows the file."""
+    _write_vocab(persona_dir, [_entry(name, days, category="persona_extension")])
 
 
 def test_a_null_persona_entry_falls_to_the_table_then_the_default(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    _register("neither_word", None)
+    _put_in_her_file(tmp_path, "neither_word", None)
     engine = _engine(tmp_path)
     with caplog.at_level(logging.DEBUG):
         assert engine.half_life("love") == 730.0  # a framework name: the table
@@ -148,7 +154,7 @@ def test_a_null_persona_entry_falls_to_the_table_then_the_default(
 
 
 def test_the_entry_matches_across_spellings(tmp_path: Path) -> None:
-    _register("Quiet Dread", 6.0)
+    _put_in_her_file(tmp_path, "Quiet Dread", 6.0)
     engine = _engine(tmp_path)
     assert engine.half_life("quiet_dread") == 6.0
     assert engine.half_life("Quiet-Dread") == 6.0
@@ -259,7 +265,7 @@ def test_the_owner_reads_the_registry_on_every_call(tmp_path: Path) -> None:
 def test_a_half_life_that_is_not_a_finite_number_above_zero_takes_the_built_in_answer_with_one_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, name: str, days: float
 ) -> None:
-    _register(name, days)  # one name per case: the warning is throttled per name
+    _put_in_her_file(tmp_path, name, days)  # one name per case: the warning is throttled per name
     engine = _engine(tmp_path)
     with caplog.at_level(logging.WARNING):
         assert engine.half_life(name) == 14.0

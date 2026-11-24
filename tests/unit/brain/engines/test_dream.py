@@ -493,12 +493,15 @@ def test_dream_initiate_candidate_carries_real_emotion_vector(tmp_path: Path, re
     """v0.0.9: dream candidates carry the aggregated dream-memory emotions
     in `emotional_snapshot.vector`, not a zero-filled dict.
     """
-    register_feelings("longing")  # a feeling her vocabulary holds beyond the framework's own
     from brain.engines.dream import DreamEngine
     from brain.initiate.emit import read_candidates
 
     persona_dir = tmp_path / "p"
     persona_dir.mkdir()
+    # A feeling her vocabulary holds beyond the framework's own, in the file of both folders this test reads (the store's and the
+    # engine's): a process that is not the owner reads it from there.
+    register_feelings("longing", persona_dir=tmp_path)
+    register_feelings("longing", persona_dir=persona_dir)
 
     store = MemoryStore(tmp_path / "memories.db")
     hm = HebbianMatrix(db_path=":memory:")

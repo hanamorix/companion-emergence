@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal
 
 from brain.dev_constants import EMOTION_HALF_LIFE_DAYS, EMOTION_NAME_MAX_CHARS
+from brain.utils import file_ops
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -156,10 +160,10 @@ _BASELINE: tuple[Emotion, ...] = (
 
 # Keyed by the tidied form (`canonical_name`); each value is the entry with its own spelling in `.name`, so the key is the
 # index from a tidied form to the entry and its spelling (#801 section 3).
-# NOT thread-safe. All extension register() calls must happen at startup
-# before any concurrent reader (e.g. the async bridge) is running. The
-# framework enforces this by loading extensions in main() before the
-# bridge starts its event loop.
+# Changed while readers run (#803 step 15: a copy follows its file, so a read can reload it). Every change is made under
+# `vocabulary_file._REGISTRY_LOCK`, one dict operation at a time; the readers below take no lock: `get` is one dict lookup and
+# `list_all` / `by_category` iterate a list copy, so a reader sees the registry before or after any single change, never a torn
+# one. A reader that needs a consistent picture across several changes does not exist.
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 
 
@@ -240,19 +244,124 @@ def is_bridge_owner() -> bool:
     return _BRIDGE_OWNER
 
 
+# The copy of her vocabulary file this process keeps follows the file (#803 step 15, S26, P19). The loader of the copy hands the
+# file's path and a function that reloads the copy as a plain module setting (`set_file_copy`, the same kind of setting as the owner
+# flag): this module imports neither the file module nor the access module. The copy remembers the stat key of the file it came from;
+# every read below, and every write of the file module (`follow_file`), stats the file first and reloads the copy when the key differs.
+#
+# Valid states of a `_FileCopy`: `stale` True (the key is unknown and unused: the next check reloads), or `stale` False with `key`
+# the stat key of the file the copy matches, or None when the copy matches an ABSENT file. `stale` False with any other key is
+# not a state: only `note_copy_key` clears `stale`, with the key a load or write observed. `key` None with `stale` True does not mean
+# "absent", only "unknown".
+@dataclass(frozen=True)
+class _FileCopy:
+    path: Path
+    reload: Callable[[], object]
+    key: tuple[int, int, int] | None
+    stale: bool
+
+
+_FILE_COPY: _FileCopy | None = None
+
+# Per thread: the depth of "the check is switched off" (a reload, and the writes it makes, must not check again: they read the
+# registry while the registry lock is held, and the lock is not re-entrant).
+_CHECK_OFF = threading.local()
+
+
+def set_file_copy(path: Path, reload: Callable[[], object], key: tuple[int, int, int] | None = None, *, stale: bool = True) -> None:
+    """Follow `path`: this process's copy came from that file and `reload()` makes it match the file again.
+
+    Called by the loader of the copy. `stale` (the default) says the copy is not known to match, so the next check reloads;
+    pass `stale=False` with the stat key (None for an absent file) of the file the copy was just made to match.
+    """
+    global _FILE_COPY
+    _FILE_COPY = _FileCopy(Path(path), reload, None if stale else key, stale)
+
+
+def clear_file_copy() -> None:
+    """Stop following any file (the registry test restore; a process that ends needs no clearing)."""
+    global _FILE_COPY
+    _FILE_COPY = None
+
+
+def followed_path() -> Path | None:
+    """The file this process's copy follows, or None."""
+    copy = _FILE_COPY
+    return None if copy is None else copy.path
+
+
+def note_copy_key(path: Path, key: tuple[int, int, int] | None) -> None:
+    """The copy now matches the file whose stat key is `key` (None: no such file). Ignored when `path` is not the followed file."""
+    global _FILE_COPY
+    copy = _FILE_COPY
+    if copy is not None and copy.path == Path(path):
+        _FILE_COPY = replace(copy, key=key, stale=False)
+
+
+def copy_matches(path: Path, key: tuple[int, int, int] | None) -> bool:
+    """True when no copy of `path` is followed, or the followed copy is known to match the file whose stat key is `key`."""
+    copy = _FILE_COPY
+    if copy is None or copy.path != Path(path):
+        return True
+    return not copy.stale and copy.key == key
+
+
+@contextmanager
+def suspended() -> Iterator[None]:
+    """Switch the check off in this thread: a reload and the writes it makes read the registry without checking the file again."""
+    _CHECK_OFF.depth = getattr(_CHECK_OFF, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _CHECK_OFF.depth -= 1
+
+
+def follow_file() -> None:
+    """Make the copy match its file: stat the file, and reload the copy when the key differs from the one it came from.
+
+    Nothing happens when no file is followed or the check is off in this thread. A stat that fails for a reason other than a missing
+    file cannot say whether the file changed, so no reload is made. A reload that raises is logged once and the saved key becomes the
+    key observed (the file as found), so it is not run and logged again until the file changes; the copy stays as it was and the
+    read goes on.
+
+    Accepted edge (a file system with coarse modified times, e.g. FAT32, 1 to 2 seconds): a same-size edit inside that window can be
+    missed until the next change. Where the inode reads as 0 the key still holds the modified time and the size. One stat per read,
+    no further constant.
+    """
+    copy = _FILE_COPY
+    if copy is None or getattr(_CHECK_OFF, "depth", 0) > 0:
+        return
+    try:
+        seen = file_ops.stat_path(copy.path)
+    except OSError:
+        return
+    key = None if seen is None else seen.key
+    if not copy.stale and key == copy.key:
+        return
+    try:
+        with suspended():
+            copy.reload()
+    except Exception:  # noqa: BLE001  a bug in the reload must not stop the read; logged once, then the key is noted
+        logger.warning("vocabulary: reloading the copy of %s failed; the copy stays as it was", copy.path.name, exc_info=True)
+        note_copy_key(copy.path, key)
+
+
 def get(name: str) -> Emotion | None:
     """Return the Emotion with the given name (any spelling variant), or None."""
+    follow_file()
     return _REGISTRY.get(canonical_name(name))
 
 
 def list_all() -> list[Emotion]:
     """Return every registered Emotion (baseline + extensions)."""
+    follow_file()
     return list(_REGISTRY.values())
 
 
 def by_category(category: str) -> list[Emotion]:
     """Return every Emotion with the given category."""
-    return [e for e in _REGISTRY.values() if e.category == category]
+    follow_file()
+    return [e for e in list(_REGISTRY.values()) if e.category == category]
 
 
 def register(emotion: Emotion) -> None:

@@ -33,10 +33,8 @@ def _write(persona: Path, entries: list) -> Path:
 @pytest.fixture(autouse=True)
 def _retry_window_clean():
     vocabulary_access._ADD_RETRY_AFTER.clear()
-    vocabulary_access._READ_ONLY_LOADED.clear()
     yield
     vocabulary_access._ADD_RETRY_AFTER.clear()
-    vocabulary_access._READ_ONLY_LOADED.clear()
 
 
 class _Bridge(list):

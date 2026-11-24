@@ -88,7 +88,7 @@ def test_arc_skipped_and_reflex_result_construction():
 
 
 def test_reflex_arc_set_load_missing_falls_back_to_defaults(tmp_path: Path, register_feelings):
-    register_feelings("creative_hunger")  # the default `creative_pitch` arc triggers on it; her vocabulary holds it
+    register_feelings("creative_hunger", persona_dir=tmp_path)  # the default `creative_pitch` arc triggers on it; her vocabulary (file) holds it
     missing = tmp_path / "nope.json"
     loaded = ReflexArcSet.load(missing, default_path=DEFAULT_ARCS_PATH)
     assert len(loaded.arcs) == 4
@@ -169,7 +169,7 @@ def test_reflex_arc_set_load_corrupt_quarantines_restores_from_bak(tmp_path: Pat
 def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path, caplog, register_feelings):
     """Corrupt arcs file + no .bak → falls back to default_path arcs, anomaly with reset_to_default; the public
     `load` returns the same default arcs and logs the anomaly."""
-    register_feelings("creative_hunger")
+    register_feelings("creative_hunger", persona_dir=tmp_path)
     path = tmp_path / "reflex_arcs.json"
     path.write_text("{corrupt{{", encoding="utf-8")
 
@@ -182,6 +182,7 @@ def test_reflex_arc_set_load_corrupt_no_bak_uses_defaults(tmp_path: Path, caplog
 
     public = tmp_path / "public" / "reflex_arcs.json"
     public.parent.mkdir()
+    register_feelings("creative_hunger", persona_dir=public.parent)  # the arcs file's folder is the persona folder the names are read from
     public.write_text("not valid json{{{", encoding="utf-8")
     with caplog.at_level("WARNING"):
         loaded = ReflexArcSet.load(public, default_path=DEFAULT_ARCS_PATH)
@@ -1028,7 +1029,7 @@ def _variant_arc_dict(name: str, trigger: dict, template: str = "t") -> dict:
 
 
 def test_reflex_arc_from_dict_keys_trigger_by_canonical_name(tmp_path: Path, register_feelings):
-    register_feelings("not_a_real_emotion")  # her vocabulary holds it, so the load keeps the arc
+    register_feelings("not_a_real_emotion", persona_dir=tmp_path)  # her vocabulary (file) holds it, so the load keeps the arc
     trigger = {"comfort-seeking": 5, "not_a_real_emotion": 6}
     expected = {"comfort_seeking": 5.0, "not_a_real_emotion": 6.0}  # an unknown name in canonical form is kept as is
 
@@ -1247,15 +1248,17 @@ def test_live_each_default_arc_fires_on_the_engine_saying_high_not_on_a_level(
         if a["name"] == arc_name
     ]
     assert len(arcs) == 1
-    register_feelings(*arcs[0]["trigger"])  # her vocabulary holds the arc's trigger names
+    register_feelings(*arcs[0]["trigger"], persona_dir=tmp_path)  # her vocabulary (file) holds the arc's trigger names
     arcs[0]["days_since_human_min"] = 0  # the day-count gate is not what is under test
     emotion = next(iter(arcs[0]["trigger"]))
     (tmp_path / "low").mkdir()
+    register_feelings(*arcs[0]["trigger"], persona_dir=tmp_path / "low")
     fired, _ = _live_reflex(
         tmp_path / "low", emotion_engine_stub, {emotion: 0.5}, arcs, stored={}, high={emotion}
     )
     assert [f.arc_name for f in fired.arcs_fired] == [arc_name]
     (tmp_path / "top").mkdir()
+    register_feelings(*arcs[0]["trigger"], persona_dir=tmp_path / "top")
     quiet, _ = _live_reflex(
         tmp_path / "top", emotion_engine_stub, {emotion: 10.0}, arcs, stored={}, high=set()
     )

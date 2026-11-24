@@ -22,7 +22,6 @@ FILE = "emotion_vocabulary.json"
 def _no_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(vocabulary_access, "post_to_bridge", lambda *a, **k: {"error": "bridge unreachable"})
     vocabulary_access._ADD_RETRY_AFTER.clear()
-    vocabulary_access._READ_ONLY_LOADED.clear()
 
 
 @pytest.fixture

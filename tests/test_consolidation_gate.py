@@ -39,9 +39,10 @@ from brain.utils.file_lock import file_lock
 
 
 @pytest.fixture(autouse=True)
-def _her_feelings(register_feelings):
-    """The tests here write memories under `trust`, a feeling her vocabulary holds beyond the framework's own."""
-    register_feelings("trust")
+def _her_feelings(register_feelings, tmp_path):
+    """The tests here write memories under `trust`, a feeling her vocabulary holds beyond the framework's own (in the persona
+    folder's file too: a process that is not the owner reads it from there)."""
+    register_feelings("trust", persona_dir=tmp_path)
 
 
 @pytest.fixture

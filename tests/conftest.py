@@ -1007,6 +1007,11 @@ def _vocabulary_registry_restore() -> Iterator[None]:
     is_owner = getattr(vocabulary, "is_bridge_owner", None)
     set_owner = getattr(vocabulary, "set_bridge_owner", None)
     saved_owner = is_owner() if is_owner is not None else False  # a bridge app started in a test marks this process the owner
+    # The file the registry's copy follows (#803 step 15) is process state too: a test that loads a persona's vocabulary makes the
+    # registry follow that tmp file, and the next test must start with no file followed. Same guard: absent on main's product code.
+    clear_copy = getattr(vocabulary, "clear_file_copy", None)
+    if clear_copy is not None:
+        clear_copy()
     # The "bridge timed out this turn" flag (#803 step 9) is per process: no test may leave it set for the next. Same guard: the module
     # and the flag are absent on main's product code.
     try:
@@ -1020,6 +1025,8 @@ def _vocabulary_registry_restore() -> Iterator[None]:
     yield
     if timed_out is not None:
         timed_out.clear()
+    if clear_copy is not None:
+        clear_copy()  # before the registry is put back: the restore must not trigger a reload of a followed file
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
     if set_owner is not None:
@@ -1032,10 +1039,29 @@ def register_feelings() -> Callable[..., None]:
 
     A memory write checks each name against her vocabulary (#801 section 6), so a name outside the framework must be registered
     first or it is discarded. `_vocabulary_registry_restore` (autouse) puts the registry back after the test.
+
+    A process that is not the owner keeps a copy that follows her file (#803 step 15): a read of a persona folder reloads the registry
+    from that folder's file, and a name the file lacks is dropped. A test that reads or writes memories of a persona folder gives
+    it as `persona_dir`: the names are then also written into that folder's `emotion_vocabulary.json` (stub entries, added to any the
+    file holds), so the copy keeps them.
     """
+    import json
+
     from brain.emotion import vocabulary
 
-    def register(*names: str) -> None:
+    def register(*names: str, persona_dir=None) -> None:
+        if persona_dir is not None:
+            from pathlib import Path
+
+            path = Path(persona_dir) / "emotion_vocabulary.json"
+            held = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"version": 1, "emotions": []}
+            known = {vocabulary.canonical_name(e["name"]) for e in held["emotions"]}
+            for name in names:
+                if vocabulary.canonical_name(name) not in known and not vocabulary.is_baseline(name):
+                    held["emotions"].append(
+                        {"name": name, "description": "test feeling", "category": "persona_extension", "decay_half_life_days": 14.0, "intensity_clamp": 10.0}
+                    )
+            path.write_text(json.dumps(held), encoding="utf-8")
         for name in names:
             if vocabulary.get(name) is None:
                 vocabulary.register(

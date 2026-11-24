@@ -3,8 +3,9 @@
 `emotion_vocabulary.json` is changed by this module and by nothing else: adding a name, changing an entry's fields, merging two
 entries that tidy to the same name, and removing an entry are `add`, `replace_fields`, `merge` and `remove`. (json_io's own
 recovery of a corrupt file, which adds no name, is the only other code that writes it. The rebuild step and the OG migrator, the
-two noted exceptions to "only the bridge calls this" (section 9), call this module too.) `load` registers what the file holds
-into the registry and writes nothing.
+two noted exceptions to "only the bridge calls this" (section 9), call this module too.) `reload_entries` and `reload` make the
+registry match what the file holds, exactly (names the file no longer holds are removed), and write nothing: every load of the file
+uses them, and `reload` is what a process's copy runs when the file changed under it (`vocabulary.follow_file`, #803 step 15).
 
 A core feeling (one of the framework's 30, `vocabulary.is_baseline`) is never written to her file (#801 section 8): `add` and
 `replace_fields` refuse it, `merge` leaves a core entry where it is (never merged into her file), and `remove_core_entries` takes
@@ -15,9 +16,9 @@ wait (`dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S`), the file re-read, the cha
 `json_io.write_json` with the shared backup count, then the registry changed under one `threading.Lock` (still inside the file
 lock, so registry changes follow file changes in the same order). The file comes first and the registry second, so a write that
 fails leaves the registry as it was. An error in the registry step itself (a bug, not a file problem) is raised to the caller
-after the lock is released; the file is already written and the next `load` registers what it holds. The lock is not re-entrant, so the public operations
-never call each other and `load` takes no lock. Lock order for any later caller: `engine_files.state_lock` is the OUTER lock and
-this file's lock the INNER one.
+after the lock is released; the file is already written and the next read reloads what it holds. The lock is not re-entrant, so the
+public operations never call each other. Lock order for any later caller: `engine_files.state_lock` is the OUTER lock, this file's
+lock the next and `_REGISTRY_LOCK` the INNER one; a reload takes the registry lock only.
 
 A name is matched by its tidied form (`vocabulary.canonical_name`) and the spelling used is the one already in the file. A new
 name passes `vocabulary.gate_name` first and is added under its tidied form.
@@ -30,6 +31,7 @@ wait ran out; the cause is logged). `changed` says this call wrote that entry.
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -126,13 +128,19 @@ def _entry_to_emotion(entry: dict) -> Emotion:
     )
 
 
-def register_entries(data: dict) -> int:
-    """Register the entries of a parsed vocabulary dict; the count newly registered.
+def _match_registry(data: dict) -> int:
+    """Make the registry hold exactly what a parsed vocabulary dict holds, plus the framework's own entries; the count of changes.
 
-    An entry already registered under any spelling is skipped (idempotent); an entry the gate refuses (empty once tidied, or too
-    long) is skipped with the gate's warning and stays in the file; an entry that fails validation is skipped with a warning.
+    The caller holds `_REGISTRY_LOCK` and has the check switched off in this thread (`vocabulary.suspended`): this reads the registry
+    with `vocabulary.get` while the lock, which is not re-entrant, is held.
+
+    An entry of the file is added, or has its fields replaced when its Emotion differs from the registered one; a registered name
+    the file no longer holds is removed. An entry the gate refuses (empty once tidied, or too long) is skipped with the gate's warning
+    and stays in the file; an entry that fails validation is skipped with a warning (so a registered name whose file entry has turned
+    invalid is removed, which is what a fresh load gives); a core name stays the framework's entry; of two entries that tidy the same
+    the first in the file wins. The framework's entries are never removed. An unchanged file changes nothing (0).
     """
-    registered = 0
+    wanted: dict[str, Emotion] = {}
     for entry in data.get("emotions", []):
         try:
             emotion = _entry_to_emotion(entry)
@@ -140,14 +148,62 @@ def register_entries(data: dict) -> int:
             entry_name = entry.get("name", "<unnamed>") if isinstance(entry, dict) else "<not a dict>"
             logger.warning("skipping emotion entry %r: %s", entry_name, exc)
             continue
-        if vocabulary.gate_name(emotion.name) is None:
+        key = vocabulary.gate_name(emotion.name)
+        if key is None:
             continue  # the gate has logged why
-        with _REGISTRY_LOCK:  # the same lock the registry steps of the file operations take: no check-then-register race
-            if vocabulary.get(emotion.name) is not None:
-                continue
+        if vocabulary.is_baseline(key) or key in wanted:
+            continue
+        wanted[key] = emotion
+    changes = 0
+    for key, emotion in wanted.items():
+        held = vocabulary.get(key)
+        if held is None:
             vocabulary.register(emotion)
-        registered += 1
-    return registered
+            changes += 1
+        elif held != emotion:
+            vocabulary.replace_entry(emotion)
+            changes += 1
+    for held in vocabulary.list_all():
+        key = vocabulary.canonical_name(held.name)
+        if not vocabulary.is_baseline(key) and key not in wanted:
+            vocabulary._unregister(key)
+            changes += 1
+    return changes
+
+
+def reload_entries(data: dict) -> int:
+    """Make the registry match a parsed vocabulary dict exactly (see `_match_registry`); the count of registry changes (added,
+    replaced, removed). An unchanged file, or an absent one with nothing to drop, returns 0. The one exact sync for an explicit load.
+    """
+    with _REGISTRY_LOCK, vocabulary.suspended():
+        return _match_registry(data)
+
+
+def reload(path: Path) -> tuple[int, JsonRead]:
+    """Read her file (never repairing it: `Recovery.RAISE`) and make the registry match it exactly, in ONE critical section under
+    `_REGISTRY_LOCK`; then note the stat key of the bytes read (from the same open handle) as the key the copy matches.
+
+    Returns (the count of registry changes, the read). A file that cannot be read raises (`JsonFileError`, which is both an OSError
+    and a ValueError) and the registry is untouched. An absent file reads as no entries: every non-framework entry is dropped and the
+    noted key is None. Lock order: the registry lock only (json_io's own read takes no file lock under RAISE); the writers take the file
+    lock and then the registry lock, so there is no cycle. The registry lock is held across the file read, so on Windows a read that
+    has to retry a sharing violation can make a writer's registry step wait for a moment.
+    """
+    with _REGISTRY_LOCK, vocabulary.suspended():
+        res = read(path, recover=Recovery.RAISE)
+        key = _key_of(res)  # before the sync: a read with no key raises with the registry untouched
+        count = _match_registry(res.data)
+        vocabulary.note_copy_key(path, key)
+    return count, res
+
+
+def _key_of(res: JsonRead) -> tuple[int, int, int] | None:
+    """The stat key a read's data matches: the key of the bytes read, None for an absent file."""
+    if res.outcome == "missing":
+        return None
+    if res.sig is None:
+        raise ValueError("a vocabulary read with no stat key")  # RAISE reads give one; the caller treats this as an unreadable file
+    return res.sig
 
 
 def _register_new(entry: dict) -> None:
@@ -184,16 +240,20 @@ _Mutation = Callable[[dict], tuple[Any, "Callable[[], None] | None"]]
 def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
     """Lock, re-read, mutate, write verified, then run the registry step. Returns (payload, ok); ok False = `cannot_write`.
 
+    The copy follows the file (#803 step 15): before anything else the owner's copy is checked against the file
+    (`vocabulary.follow_file`), so a hand edit is in the registry before this change is applied to it. The file-lock body runs with
+    the check switched off (the file lock is not re-entrant, and the registry step reads the registry under the registry lock).
+
     The backup count is computed before the lock is taken (it scans the audit log). Any OSError or ValueError from the lock, the
     read or the write, a write that did not verify, and a lock wait that ran out are all `cannot_write`; the cause is logged.
     """
+    vocabulary.follow_file()
     count = backup_count(path)
     registry_error: Exception | None = None
     try:
-        with file_lock.locked_within(path, dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S):
-            data = read_json_result(
-                path, default=default_vocabulary, recover=Recovery.RAISE, validate=validate_schema
-            ).data
+        with file_lock.locked_within(path, dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S), vocabulary.suspended():
+            res = read_json_result(path, default=default_vocabulary, recover=Recovery.RAISE, validate=validate_schema)
+            data = res.data
             payload, registry_step = mutate(data)
             if registry_step is not None:
                 if not write_json(path, data, backups=count, verify=True):
@@ -201,17 +261,43 @@ def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
                 # Still inside the file lock, so two writers' registry changes follow their file changes in the same order.
                 # A registry error is kept apart from the file errors handled below: the file is written, so it is not a
                 # `cannot_write`, and it is raised once the lock is released.
-                try:
-                    with _REGISTRY_LOCK:
+                with _REGISTRY_LOCK:
+                    try:
                         registry_step()
-                except Exception as exc:  # noqa: BLE001  re-raised below, after the file lock is released
-                    registry_error = exc
+                    except Exception as exc:  # noqa: BLE001  re-raised below, after the file lock is released
+                        registry_error = exc
+                    else:
+                        _note_written_key(path, None if res.outcome == "missing" else res.sig, data)
     except (OSError, ValueError) as exc:
         logger.warning("vocabulary: %s of %s failed (%s: %s); the file and the registry are as they were", action, path.name, type(exc).__name__, exc)
         return None, False
     if registry_error is not None:
         raise registry_error
     return payload, True
+
+
+def _note_written_key(path: Path, read_key: tuple[int, int, int] | None, written: dict) -> None:
+    """After a verified write and its registry step, in the same registry-lock block: the copy matches the file again.
+
+    Only when the copy matched the file this write started from (`read_key`, from the handle of the read under the file lock): that
+    is decided HERE, under the registry lock, not earlier. A reader thread's reload that ran after the write's read noted its own key
+    inside that lock, so the check sees the mismatch, the key is not advanced, and the next read reloads (a copy never holds a
+    hand edit the file no longer has under the file's current key). When the copy was already behind the file, the key stays as it is:
+    the next read reloads and sees this write too.
+
+    The file is read back (its own `try`: a failure here never reaches the caller of a write that succeeded) and the key noted is the
+    one of that read's handle, and only when the bytes parse to what was written: a hand edit between the write and the read makes
+    the data differ, the key is not advanced, and the next read reloads. One extra read per write: a write is rare, and the read-back
+    is what lets the saved key come from a handle that read exactly what was written.
+    """
+    if vocabulary.followed_path() != Path(path) or not vocabulary.copy_matches(path, read_key):
+        return
+    try:
+        back = read(path, recover=Recovery.RAISE)
+    except (OSError, ValueError):
+        return
+    if back.outcome == "ok" and back.sig is not None and back.data == written:
+        vocabulary.note_copy_key(path, back.sig)
 
 
 def _entries_by_key(emotions: Iterable[Any]) -> dict[str, dict]:
@@ -496,11 +582,56 @@ def remove_core_entries(path: Path) -> CoreRemoval:
     return CoreRemoval(removed, cannot_write=not ok)
 
 
+@dataclass(frozen=True)
+class OwnerCleanup:
+    core: CoreRemoval | None  # None: the removal stopped on an error (logged)
+    merged: MergeResult | None  # None: the merge stopped on an error (logged)
+    ran: bool = True  # False: the file held no core entry and no twin, so nothing was run
+
+
+def owner_file_needs_cleanup(data: dict) -> bool:
+    """True when the parsed file holds a core name or two entries that tidy the same (the one merge rule decides the twins)."""
+    emotions = data.get("emotions", [])
+    if any(isinstance(e, dict) and isinstance(e.get("name"), str) and vocabulary.is_baseline(e["name"]) for e in emotions):
+        return True
+    return bool(merge_twin_entries(copy.deepcopy(data)))
+
+
+def clean_owner_file(path: Path, data: dict) -> OwnerCleanup:
+    """The owner's start-up steps on her file (#801 sections 3 and 8), run at the bridge's start-up and by every owner load or reload
+    that finds a core name or twins in `data` (what was just read): remove any entry for a core feeling, then merge twins under the
+    first spelling, both through the shared writer. Nothing is run, and no lock taken, when `data` holds neither.
+
+    Each step has its own try: a bug in the removal does not skip the merge. A step that returns `cannot_write` is logged by the
+    writer and left; the owner's next explicit load (the heartbeat and soul-review loads, each tick) finds the same core name or twin
+    in the file and runs it again. Accepted edge: a reload by `vocabulary.get` that noted the file's key does not retry a failed clean-up
+    until the file changes or the next explicit load (the old start-up retried only at the next start).
+    """
+    if not owner_file_needs_cleanup(data):
+        return OwnerCleanup(None, None, ran=False)
+    core: CoreRemoval | None = None
+    merged: MergeResult | None = None
+    try:
+        core = remove_core_entries(path)  # through the module name: callers and tests may replace it
+    except Exception:
+        logger.exception("vocabulary: the removal of core feelings from %s stopped; the twin merge goes on", path.name)
+    try:
+        merged = merge(path)
+        if merged.cannot_write:
+            logger.warning("vocabulary: the twin merge of %s could not be written (the writer logged why); the twins stay until the next load", path.name)
+        if merged.pairs:
+            logger.warning("vocabulary: merged %d twin entr(ies) in %s under their first spelling", len(merged.pairs), path.name)
+    except Exception:
+        logger.exception("vocabulary: the twin merge of %s stopped", path.name)
+    return OwnerCleanup(core, merged)
+
+
 def load(path: Path, *, recover: Recovery = Recovery.HEAL) -> tuple[int, BrainAnomaly | None]:
-    """Register what her vocabulary file holds into the registry; no write of the vocabulary. Returns (count newly registered, anomaly).
+    """Make the registry match what her vocabulary file holds, exactly (see `reload_entries`); no write of the vocabulary. Returns
+    (count of registry changes, anomaly). Test-only API: no production code calls it (the loader reads and syncs itself).
 
     `recover` is the read policy (`read`): HEAL quarantines and restores a damaged file (json_io's own recovery), RAISE raises
     `JsonFileError` for it.
     """
     res = read(path, recover=recover)
-    return register_entries(res.data), res.anomaly
+    return reload_entries(res.data), res.anomaly

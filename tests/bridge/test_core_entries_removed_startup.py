@@ -137,10 +137,10 @@ def test_a_removal_that_raises_is_logged_and_the_twin_merge_and_the_start_go_on(
 
     monkeypatch.setattr(vocabulary_file, "remove_core_entries", boom)
     _write_vocab(persona_dir, [_entry("tender longing"), _entry("tender_longing")])
-    with caplog.at_level(logging.ERROR, logger="brain.bridge.server"):
+    with caplog.at_level(logging.ERROR, logger="brain.emotion.vocabulary_file"):  # the clean-up helper logs it (the loader runs it)
         _start_bridge(persona_dir)
     assert _names(persona_dir) == ["tender longing"]  # the merge still ran
-    assert "the removal of core feelings" in caplog.text
+    assert [r.name for r in caplog.records if "the removal of core feelings" in r.getMessage()] == ["brain.emotion.vocabulary_file"]
 
 
 @pytest.mark.parametrize("failure", ["raises", "cannot_write"])

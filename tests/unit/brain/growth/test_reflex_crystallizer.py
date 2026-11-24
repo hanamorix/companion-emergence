@@ -1214,7 +1214,11 @@ def test_corpus_growth_log_shows_an_added_feeling_in_her_spelling_and_leaves_out
     from brain.emotion import vocabulary
     from brain.growth.log import GrowthLogEvent, append_growth_event
 
-    vocabulary.register(vocabulary.Emotion("Quiet Dread Zz", "dread, still", "persona_extension", 6.0))
+    # Her vocabulary holds the entry in her file: a process that is not the owner reads the file and its copy follows it (#803 step 15).
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        _json.dumps({"version": 1, "emotions": [{"name": "Quiet Dread Zz", "description": "dread, still", "category": "persona_extension", "decay_half_life_days": 6.0}]}),
+        encoding="utf-8",
+    )
     when = datetime(2026, 4, 20, tzinfo=UTC)
     for kind, name in (("emotion_added", "quiet-dread-zz"), ("emotion_added", "gone_word_zz"), ("arc_added", "some_arc")):
         append_growth_event(
@@ -1229,4 +1233,4 @@ def test_corpus_growth_log_shows_an_added_feeling_in_her_spelling_and_leaves_out
         removed_arc_names=set(), emotion_vocabulary=["love"], now=datetime(2026, 4, 28, tzinfo=UTC), look_back_days=30,
     )
     assert [(e["type"], e["name"]) for e in corpus["growth_log_90d"]] == [("emotion_added", "Quiet Dread Zz"), ("arc_added", "some_arc")]
-    assert vocabulary.get("gone_word_zz") is None and not (persona_dir / "emotion_vocabulary.json").exists()
+    assert vocabulary.get("gone_word_zz") is None and [e["name"] for e in _json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]] == ["Quiet Dread Zz"]

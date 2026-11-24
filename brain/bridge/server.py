@@ -161,9 +161,10 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
     the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
-    Once it has loaded, any entry her file holds for a core feeling is removed (#801 section 8; a second start finds none), then two
-    entries whose names tidy the same are merged under the spelling that comes first in the file (#801 section 3), both through the
-    shared writer. A load that failed skips both.
+    The load itself (the bridge is the owner here, `vocabulary.set_bridge_owner(True)` came first) removes any entry her file holds for
+    a core feeling (#801 section 8; a second start finds none) and then merges two entries whose names tidy the same under the
+    spelling that comes first in the file (#801 section 3), both through the shared writer (`vocabulary_file.clean_owner_file`, run by
+    the loader on what it read, #803 step 15). A load that failed skips both.
 
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
     Any exception → logged and swallowed so bridge startup is never blocked.
@@ -175,19 +176,6 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
         path = vocabulary_file.vocabulary_path(persona_dir)
         _count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
         loaded = anomaly is None or anomaly.action != "reset_to_default"
-        # Core feelings are never in her file (#801 section 8): any entry it holds for one is removed, first, so the twin merge
-        # below sees a file without them. Its own try: a bug in the removal must not skip the merge. A load that raised above skips
-        # both (a file the load cannot read cannot be removed from either).
-        try:
-            vocabulary_file.remove_core_entries(path)
-        except Exception:
-            logger.exception("startup: the removal of core feelings from %s stopped; the twin merge goes on", path.name)
-        if path.exists():
-            merged = vocabulary_file.merge(path)
-            if merged.cannot_write:
-                logger.warning("startup: the twin merge of %s could not be written (the writer logged why); the twins stay until the next start", path.name)
-            if merged.pairs:
-                logger.warning("startup: merged %d twin entr(ies) in %s under their first spelling", len(merged.pairs), path.name)
     except Exception:
         logger.exception("startup persona-vocabulary load skipped")
     return loaded

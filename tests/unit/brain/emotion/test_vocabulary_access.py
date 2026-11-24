@@ -262,12 +262,12 @@ def test_a_body_that_is_not_json_is_reported(tmp_path: Path, monkeypatch: pytest
 def test_with_no_bridge_the_file_is_read_once_while_it_is_unchanged_and_again_when_it_changes(
     tmp_path: Path, bridge_calls: _Calls, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from brain.emotion import persona_loader
+    from brain.emotion import vocabulary_file
 
     path = _write(tmp_path, [_entry("Quiet Dread")])
     loads: list[Path] = []
-    real = persona_loader.load_persona_vocabulary
-    monkeypatch.setattr(persona_loader, "load_persona_vocabulary", lambda p, **k: (loads.append(p), real(p, **k))[1])
+    real = vocabulary_file.reload
+    monkeypatch.setattr(vocabulary_file, "reload", lambda p: (loads.append(p), real(p))[1])  # the copy's reload is the one read
     for _ in range(5):
         assert vocabulary_access.lookup(tmp_path, ["no_such_word"])["no_such_word"] is None  # misses: the file is still read once
     assert loads == [path]
@@ -279,17 +279,18 @@ def test_with_no_bridge_the_file_is_read_once_while_it_is_unchanged_and_again_wh
 def test_with_no_bridge_a_file_that_cannot_be_read_is_reported_once_and_read_once(
     tmp_path: Path, bridge_calls: _Calls, monkeypatch: pytest.MonkeyPatch, no_throttle: None, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from brain.emotion import persona_loader
+    from brain.emotion import vocabulary_file
 
     (tmp_path / FILE).write_text("{not json", encoding="utf-8")
     loads: list[Path] = []
-    real = persona_loader.load_persona_vocabulary
-    monkeypatch.setattr(persona_loader, "load_persona_vocabulary", lambda p, **k: (loads.append(p), real(p, **k))[1])
+    real = vocabulary_file.reload
+    monkeypatch.setattr(vocabulary_file, "reload", lambda p: (loads.append(p), real(p))[1])
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
             vocabulary_access.lookup(tmp_path, ["no_such_word"])
     assert len(loads) == 1
-    assert len([m for m in _warnings(caplog) if "cannot be read" in m]) == 1
+    # The failure is logged by the copy's reload (persona_loader.reload_copy), once.
+    assert len([r for r in caplog.records if r.name == "brain.emotion.persona_loader" and "cannot be read" in r.getMessage()]) == 1
 
 
 # ---------------------------------------------------------------------------------------------

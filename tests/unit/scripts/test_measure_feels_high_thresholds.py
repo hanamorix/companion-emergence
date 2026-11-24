@@ -201,7 +201,7 @@ def test_a_row_whose_only_emotion_is_non_finite_counts_as_having_emotions_and_lo
 
     db = tmp_path / "memories.db"
     _synthetic_db(db)
-    register_feelings("nan_ache")  # a memory write discards a name her vocabulary does not hold
+    register_feelings("nan_ache", persona_dir=tmp_path)  # a memory write discards a name her vocabulary (file) does not hold
     store = MemoryStore(db)
     try:
         store.create(

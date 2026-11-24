@@ -36,8 +36,6 @@ from brain.bridge.client import post_to_bridge
 from brain.emotion import vocabulary, vocabulary_file
 from brain.emotion.vocabulary import Emotion
 from brain.emotion.vocabulary_file import NameResult
-from brain.health.json_io import JsonFileError
-from brain.utils import file_ops
 from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
@@ -81,42 +79,19 @@ def lookup_local(names: Sequence[str] | Literal["all"]) -> dict[str, Found | Non
     return out
 
 
-# The stat key of her file at this process's last read-only load of it, by path: the same bytes are read once, not once per call
-# (a run with no bridge asks once per name). A changed file is read again.
-_READ_ONLY_LOADED: dict[Path, tuple[int, int, int]] = {}
-
-
 def load_read_only(persona_dir: Path) -> None:
-    """Register what her file holds into this process's registry for this run; a file that cannot be read adds nothing.
+    """Make this process's registry hold what her file holds for this run (read-only copy); a file that cannot be read adds nothing.
 
-    The load every command process makes (spec section 5): no memory heal, no rebuild, no quarantine. Never writes: a damaged file raises (json_io `Recovery.RAISE`) instead of being quarantined and reset, and is reported once.
+    The load every command process makes (spec section 5): no memory heal, no rebuild, no quarantine. Never writes: a damaged file is
+    not repaired (json_io `Recovery.RAISE`), the copy stays as it was and the failure is logged once. The copy follows the file
+    (`vocabulary.follow_file`, #803 step 15): the same bytes are read once, not once per call (a run with no bridge asks once per
+    name), and a changed file is read again. An absent file leaves no name outside the framework's own; a stat that fails reloads
+    nothing this call.
     """
-    from brain.emotion.persona_loader import load_persona_vocabulary
+    from brain.emotion import persona_loader
 
-    path = vocabulary_file.vocabulary_path(persona_dir)
-    try:
-        stat = file_ops.stat_path(path)
-    except OSError:
-        stat = None  # cannot say whether the file changed: read it (below) and remember nothing
-        key = None
-    else:
-        if stat is None:
-            return  # no file, nothing to load
-        key = stat.key
-    if key is not None and _READ_ONLY_LOADED.get(path) == key:
-        return
-    try:
-        load_persona_vocabulary(path, read_only=True)
-    except (JsonFileError, OSError, ValueError) as exc:
-        warn_throttled(
-            logger,
-            f"vocabulary_access:read_only:{path}",
-            "vocabulary: no bridge, and her vocabulary file cannot be read (%s: %s); every name outside the framework's own is unknown this run",
-            type(exc).__name__,
-            exc,
-        )
-    if key is not None:
-        _READ_ONLY_LOADED[path] = key  # the same bytes give the same fault: a bad file is not read again until it changes
+    persona_loader.adopt_copy(vocabulary_file.vocabulary_path(persona_dir))
+    vocabulary.follow_file()
 
 
 # ------------------------------------------------------------------------------------------------

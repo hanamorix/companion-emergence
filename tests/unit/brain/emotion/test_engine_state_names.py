@@ -346,7 +346,8 @@ def test_a_new_name_that_passes_the_gate_is_added_to_her_vocabulary_and_kept_und
 
 
 def test_a_key_matching_an_entry_with_a_non_tidied_spelling_is_kept_under_the_tidied_form_of_that_spelling(tmp_path: Path) -> None:
-    persona = _persona(tmp_path, {"comfort_seeking": _emotion((3.0, 1.0), (3.0, 1.0))}, entries=[_entry("Comfort Seeking")])
+    # A non-core name: a core name in her file is removed by the owner's load (#801 section 8), so it cannot carry this case.
+    persona = _persona(tmp_path, {"quiet_dread": _emotion((3.0, 1.0), (3.0, 1.0))}, entries=[_entry("Quiet Dread")])
     from brain.emotion.persona_loader import load_persona_vocabulary
 
     load_persona_vocabulary(persona / FILE)
@@ -354,21 +355,21 @@ def test_a_key_matching_an_entry_with_a_non_tidied_spelling_is_kept_under_the_ti
     result = engine_state_names.check_state_names(persona)
     assert result == engine_state_names.StateNamesResult()
     assert _bytes(persona) == before  # nothing changed, so nothing was written
-    assert list(_state(persona).emotions) == ["comfort_seeking"]
+    assert list(_state(persona).emotions) == ["quiet_dread"]
     names = [e["name"] for e in json.loads((persona / FILE).read_text(encoding="utf-8"))["emotions"]]
-    assert names == ["Comfort Seeking"]  # her file keeps its own spelling
+    assert names == ["Quiet Dread"]  # her file keeps its own spelling
 
 
 def test_a_key_spelled_another_way_is_saved_under_the_tidied_form_of_the_entry_spelling(tmp_path: Path) -> None:
-    persona = _persona(tmp_path, {"comfort seeking": _emotion((3.0, 1.0), (3.0, 1.0))}, entries=[_entry("Comfort Seeking")])
+    persona = _persona(tmp_path, {"quiet dread": _emotion((3.0, 1.0), (3.0, 1.0))}, entries=[_entry("Quiet Dread")])
     from brain.emotion.persona_loader import load_persona_vocabulary
 
     load_persona_vocabulary(persona / FILE)
     result = engine_state_names.check_state_names(persona)
     assert (result.renamed, result.merged, result.written) == (1, 0, True)
-    assert list(_state(persona).emotions) == ["comfort_seeking"]
+    assert list(_state(persona).emotions) == ["quiet_dread"]
     names = [e["name"] for e in json.loads((persona / FILE).read_text(encoding="utf-8"))["emotions"]]
-    assert names == ["Comfort Seeking"]
+    assert names == ["Quiet Dread"]
 
 
 def test_a_state_with_nothing_to_change_is_not_rewritten_and_makes_no_backup(tmp_path: Path) -> None:

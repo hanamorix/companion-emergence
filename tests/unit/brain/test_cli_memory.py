@@ -139,8 +139,9 @@ def test_memory_show_prints_full_memory_details(
     register_feelings,
 ) -> None:
     """`nell memory show` prints one complete memory record by id."""
-    register_feelings("trust", "focus")  # feelings her vocabulary holds beyond the framework's own
     persona_dir = _make_persona_with_memories(tmp_path, monkeypatch)
+    # feelings her vocabulary holds beyond the framework's own, in her file: the command's copy follows it (#803 step 15)
+    register_feelings("trust", "focus", persona_dir=persona_dir)
     memory_id = _store_memory(
         persona_dir,
         Memory.create_new(
