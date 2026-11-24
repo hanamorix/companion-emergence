@@ -117,7 +117,6 @@ def test_walk_persona_in_the_bridge_repairs_through_the_accessor(path, persona, 
     assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1, "emotions": []}
 
 
-@pytest.mark.no_base_failure(reason="control: the loader's HEAL branch already synced the copy to the healed data after its read; this pins that it still does")
 def test_the_loaders_heal_branch_leaves_the_copy_matching_the_repaired_file(path, owner):
     _write_file(path, [_entry("kept one")])
     persona_loader.load_persona_vocabulary(path)
