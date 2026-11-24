@@ -227,6 +227,7 @@ def test_the_owner_flag_is_put_back_when_the_run_raises(home, tmp_path, monkeypa
     assert vocabulary.is_bridge_owner() is False
 
 
+@pytest.mark.no_base_failure(reason="control: the base never touched the owner flag, so it also left it as it was; this pins that the restore does not force it off")
 def test_the_owner_flag_goes_back_to_the_value_it_had(home, tmp_path) -> None:
     """The flag is restored, not forced off: a caller that was the owner before the run is still the owner after it."""
     og = _og_source(tmp_path, [_mem("m1", {"owner_word_vx": 3.0})])

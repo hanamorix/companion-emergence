@@ -412,6 +412,7 @@ def test_merge_of_a_file_holding_only_core_twins_changes_nothing_and_writes_noth
     assert vocabulary.get("joy").description == "happiness, delight, warmth"  # the registry still holds the framework's entry
 
 
+@pytest.mark.no_base_failure(reason="control: the base merged every twin pair; this pins that the core check is not the writer's gate, which would skip a name over 100 characters")
 def test_merge_still_merges_a_name_over_the_gate_length(tmp_path: Path) -> None:
     """The check is `is_baseline` only, not the writer's gate: a twin pair whose tidied name is over 100 characters merges as before."""
     long_name = "x" * 101
