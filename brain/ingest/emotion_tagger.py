@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -33,8 +32,6 @@ logger = logging.getLogger(__name__)
 
 EmotionTagger = Callable[["Memory"], dict[str, float]]
 
-_SEPARATOR_RUN = re.compile(r"[\W_]+")  # a run of characters that are not letters or digits
-
 
 def _load_vocab() -> frozenset[str]:
     try:
@@ -47,11 +44,9 @@ def _load_vocab() -> frozenset[str]:
 def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
     """Keep only registered emotions with a finite intensity above 0; clamp to 10. NaN and inf are dropped.
 
-    A name matches the vocabulary in any spelling its lookup accepts (`vocabulary.get`: case, hyphens, the order of a blend's parts),
-    and also when each run of characters that are not letters or digits (space, slash, plus, several hyphens, one before "blend")
-    is read as a single underscore, with leading and trailing ones stripped. A name is looked up as the model spelled it first, so
-    a registered name that itself holds such a character still matches. The stored key is the registered name; spellings of one
-    emotion in one reply are pooled by `vocabulary.pool_by_canonical_name` (larger value kept).
+    A name matches the vocabulary in any spelling `vocabulary.get` accepts, which is the spelling `vocabulary.canonical_name` tidies
+    to a registered name (case, any run of characters that are not letters or digits, the order of a blend's parts). The stored
+    key is the tidied name; spellings of one emotion in one reply are pooled by `vocabulary.pool_by_canonical_name` (larger value kept).
 
     ``vocab`` is the "vocabulary loaded" signal: empty means it could not be loaded, and every name is then kept as the model
     spelled it (no lookup).
@@ -59,6 +54,7 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
     "Could not be loaded" covers two cases, and both give an empty set: `_load_vocab` caught an exception from
     `vocabulary.list_all()` (it logs a warning), or the registry holds no emotions. In either case every name is kept, including
     one that is empty or only separators (it is stored as spelled if its intensity passes the number filter).
+    A name the lookup does not find is dropped.
 
     The lookup (`vocabulary.get`) reads the live registry at the time of each call. ``vocab`` is only the set `_load_vocab` read
     at the start of the tagger call, and it is what the prompt's name list is built from. Here it is only tested for empty or not
@@ -69,22 +65,15 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
     """
     usable: dict[str, float] = {}
     for name, intensity in raw.items():
-        spelling = name
-        if vocab:
-            # An empty spelling is skipped (`s and ...`) without a lookup. So an empty name is dropped, and a name of only separators
-            # is dropped unless the as-spelled lookup finds a registered name.
-            spelling = next((s for s in (name, _SEPARATOR_RUN.sub("_", name).strip("_")) if s and vocabulary.get(s) is not None), "")
-            if not spelling:
-                continue
+        if vocab and vocabulary.get(name) is None:
+            continue
         try:
             v = float(intensity)
         except (TypeError, ValueError):
             continue
         if not math.isfinite(v) or v <= 0.0:
             continue
-        # Two raw names can share one spelling here (they differ only in separators): keep the larger, as the pooling below does.
-        # Clamping to 10 before pooling gives the same value as clamping after: min(v, 10) never reverses the order of two values (it can only tie them).
-        usable[spelling] = max(min(v, 10.0), usable.get(spelling, 0.0))
+        usable[name] = min(v, 10.0)
     return vocabulary.pool_by_canonical_name(usable) if vocab else usable
 
 

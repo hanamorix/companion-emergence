@@ -267,14 +267,87 @@ def test_pool_by_canonical_name_pools_a_doubled_separator_spelling_with_its_twin
         ("_love_grief_blend", "grief_love_blend"),
         ("Love__Grief_Blend", "grief_love_blend"),
         ("-love-grief--blend", "grief_love_blend"),
-        # no parts left once the empty ones are dropped: one underscore before _blend (was __blend)
-        ("__blend", "_blend"),
+        # the ends are trimmed first, so a bare "blend" is left and it has no "_blend" suffix to sort
+        ("__blend", "blend"),
+        ("_blend", "blend"),
+        # #801: every run of characters that are not letters or digits is one underscore, and the ends are trimmed
+        ("name____name", "name_name"),
+        ("name___name", "name_name"),
+        ("grief love blend", "grief_love_blend"),
+        ("Grief Love Blend", "grief_love_blend"),
+        ("love/grief_blend", "grief_love_blend"),
+        ("grief --/ love blend", "grief_love_blend"),
+        ("  _joy-- ", "joy"),
+        ("comfort seeking", "comfort_seeking"),
+        ("a+b/c", "a_b_c"),
+        ("Grün Gefühl", "grün_gefühl"),
+        ("joy2", "joy2"),
     ],
 )
 def test_canonical_name_changed_outputs_are_pinned(name: str, expected: str) -> None:
     from brain.emotion.vocabulary import canonical_name
 
     assert canonical_name(name) == expected
+
+
+def test_canonical_name_gives_one_name_to_every_spelling_the_issue_pins() -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name("name____name") == canonical_name("name_name")
+    assert canonical_name("Grief Love Blend") == canonical_name("grief_love_blend") == "grief_love_blend"
+    assert canonical_name("love_grief__blend") == canonical_name("grief_love_blend")
+
+
+@pytest.mark.no_base_failure(reason="pins the 30 baseline names, which the widening leaves unchanged, so it passes on the old code by design")
+def test_canonical_name_leaves_the_baseline_names_unchanged() -> None:
+    from brain.emotion.vocabulary import _BASELINE, canonical_name
+
+    assert len(_BASELINE) == 30
+    for emotion in _BASELINE:
+        assert canonical_name(emotion.name) == emotion.name
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Grief Love Blend", "name____name", "İyi", "  _a-b ", "love_grief__blend", "---", "", "x/y_blend", "__blend", "Á b"],
+)
+def test_canonical_name_is_idempotent(name: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    once = canonical_name(name)
+    assert canonical_name(once) == once
+
+
+# --- the gate (#801) ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["", "---", " / ", "___", "x" * 101, "x/" * 51])
+def test_gate_name_refuses_an_empty_or_too_long_name_and_logs_why(raw: str, caplog: pytest.LogCaptureFixture) -> None:
+    from brain.utils import log_throttle
+
+    log_throttle._last.clear()
+    with caplog.at_level("DEBUG", logger="brain.emotion.vocabulary"):
+        assert vocabulary.gate_name(raw) is None
+    assert any(r.name == "brain.emotion.vocabulary" for r in caplog.records)
+
+
+def test_gate_name_accepts_a_100_character_name_and_returns_the_tidied_form() -> None:
+    assert vocabulary.gate_name("x" * 100) == "x" * 100
+    assert vocabulary.gate_name("Comfort Seeking") == "comfort_seeking"
+    assert vocabulary.gate_name("joy") == "joy"
+    assert vocabulary.gate_name("grief_love__blend") == "grief_love_blend"
+
+
+def test_gate_name_measures_the_tidied_name_not_the_raw_one() -> None:
+    # 150 raw characters tidy to 99: the cap is on the name that would be stored
+    raw = "-" * 50 + "y" * 99 + "-" * 1
+    assert vocabulary.gate_name(raw) == "y" * 99
+
+
+def test_the_cap_is_the_dev_constant() -> None:
+    from brain import dev_constants
+
+    assert dev_constants.EMOTION_NAME_MAX_CHARS == 100
 
 
 @pytest.mark.no_base_failure(reason="pins canonical_name's outputs for names without an empty blend part, which the #800 fix leaves unchanged, so every row passes on the old code by design; the rows the fix changes are in test_canonical_name_changed_outputs_are_pinned")
@@ -289,9 +362,6 @@ def test_canonical_name_changed_outputs_are_pinned(name: str, expected: str) -> 
         ("Love-Grief_blend", "grief_love_blend"),
         ("grief_love_blend", "grief_love_blend"),
         ("comfort_seeking", "comfort_seeking"),
-        ("grief love blend", "grief love blend"),
-        ("love/grief_blend", "love/grief_blend"),
-        ("_blend", "_blend"),
         ("blend", "blend"),
         ("", ""),
     ],

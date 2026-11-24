@@ -863,6 +863,21 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 S107 HS8 (#633, Planning B55)",
         kind="code",
     ),
+    # --- one tidier and one gate for feeling names (#801) ----------------------------------------------------------------------
+    Removed(
+        names=("_is_valid_name", "_INVALID_NAME_CHARS"),
+        why="the growth scheduler's own name check (refused only / \\ { } and empty) is replaced by `vocabulary.gate_name`, the one gate of a feeling name",
+        ref="#801 (draft PR #803), build step 1",
+        kind="code",
+        scope=("brain/growth/scheduler.py",),
+    ),
+    Removed(
+        names=("_SEPARATOR_RUN",),
+        why="the tagger's own separator step is removed: `vocabulary.canonical_name` is the one tidier (the same name now lives in `brain/emotion/vocabulary.py`, so the scope is the tagger file alone)",
+        ref="#801 (draft PR #803), build step 1",
+        kind="code",
+        scope=("brain/ingest/emotion_tagger.py",),
+    ),
 )
 
 

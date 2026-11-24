@@ -186,7 +186,7 @@ def _extension(name):
 
 @pytest.fixture
 def extensions():
-    """A registered blend and two extensions whose own names hold a space or a double underscore (the registry validates nothing)."""
+    """A registered blend and two extensions registered with a space or a double underscore in their names (stored tidied)."""
     names = ["love_grief_blend", "odd name", "odd__pair"]
     for name in names:
         vocabulary.register(_extension(name))
@@ -265,9 +265,8 @@ def test_a_name_that_is_not_registered_whatever_its_spelling_is_dropped(extensio
     assert _normalize({name: 5, "Joy": 1}, _loaded()) == {"joy": 1.0}
 
 
-@pytest.mark.no_base_failure(reason=_KEEPS_TODAYS_BEHAVIOUR)
-def test_an_extension_whose_own_name_holds_a_space_or_double_underscore_still_matches_when_echoed(extensions):
-    assert _normalize({"odd name": 2, "odd__pair": 3}, _loaded()) == {"odd name": 2.0, "odd__pair": 3.0}
+def test_an_extension_registered_with_a_space_or_double_underscore_is_stored_under_its_tidied_name(extensions):
+    assert _normalize({"odd name": 2, "odd__pair": 3, "Odd-Name": 1}, _loaded()) == {"odd_name": 2.0, "odd_pair": 3.0}
 
 
 @pytest.mark.no_base_failure(reason=_KEEPS_TODAYS_BEHAVIOUR)

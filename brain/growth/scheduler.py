@@ -18,11 +18,12 @@ biographically. No human approval gate, no candidate queue.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.emotion.vocabulary import gate_name
 from brain.growth.crystallizers.vocabulary import (
     VOCABULARY_CRYSTALLIZER_STATUS,
     crystallize_vocabulary,
@@ -36,12 +37,6 @@ if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
 
 logger = logging.getLogger(__name__)
-
-# Same character allowlist as brain.paths.get_persona_dir — names that
-# could appear as filesystem path components or trip JSON parsing get
-# rejected before they reach disk.
-_INVALID_NAME_CHARS = ("/", "\\", "{", "}")
-
 
 @dataclass(frozen=True)
 class GrowthTickResult:
@@ -80,9 +75,11 @@ def run_growth_tick(
     """Run all crystallizers, apply their proposals atomically.
 
     For each proposal:
-      1. Skip silently if name already in current vocabulary (re-proposing
+      1. Tidy the name and reject it (the gate logs why) if it is empty once
+         tidied or too long (`vocabulary.gate_name`); the tidied name is the
+         one used from here on.
+      2. Skip silently if name already in current vocabulary (re-proposing
          is normal; not a rejection).
-      2. Reject (with warning) if name fails character validation.
       3. Else: append to {persona_dir}/emotion_vocabulary.json (atomic
          `.new + os.replace`) and append a GrowthLogEvent to
          {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`).
@@ -116,14 +113,15 @@ def run_growth_tick(
     proposals_rejected = 0
 
     for proposal in proposals:
+        tidied = gate_name(proposal.name)
+        if tidied is None:
+            # The gate has logged why.
+            proposals_rejected += 1
+            continue
+        if tidied != proposal.name:
+            proposal = replace(proposal, name=tidied)
         if proposal.name in current_names:
             # Idempotent skip — re-proposal is normal, not a rejection.
-            continue
-        if not _is_valid_name(proposal.name):
-            logger.warning(
-                "growth scheduler: rejecting proposal with invalid name %r", proposal.name
-            )
-            proposals_rejected += 1
             continue
 
         emotions_added += 1
@@ -219,12 +217,6 @@ def _read_current_vocabulary_names(
 
     names = {e["name"] for e in data.get("emotions", []) if isinstance(e, dict) and "name" in e}
     return names, anomaly
-
-
-def _is_valid_name(name: str) -> bool:
-    if not name:
-        return False
-    return not any(c in name for c in _INVALID_NAME_CHARS)
 
 
 def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:

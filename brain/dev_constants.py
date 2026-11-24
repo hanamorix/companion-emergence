@@ -130,6 +130,9 @@ EMOTION_REPEAT_FACTOR: float = 0.5
 # Seconds every acquisition of the engine's lock waits before giving up (`brain.utils.file_lock.locked_within`). Fixed here;
 # a wait that calibrates itself to the machine is #642.
 EMOTION_LOCK_WAIT_S: float = 5.0
+# The longest a feeling name may be, in characters, once tidied (`vocabulary.gate_name`). A longer name is refused and
+# dropped with its values. The owner's reason: "somethings clearly gone wrong if a name's that long".
+EMOTION_NAME_MAX_CHARS: int = 100
 # The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"

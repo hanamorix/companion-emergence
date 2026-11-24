@@ -123,25 +123,48 @@ def test_run_growth_tick_skips_proposal_with_existing_name(
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-def test_run_growth_tick_rejects_proposal_with_invalid_chars(
-    persona_dir: Path, store: MemoryStore
-) -> None:
-    """Names containing path-traversal chars or curly braces are rejected as schema-invalid."""
+@pytest.mark.parametrize("bad_name", ["", "---", " / ", "x" * 101])
+def test_run_growth_tick_rejects_a_name_the_gate_refuses(persona_dir: Path, store: MemoryStore, bad_name: str) -> None:
+    """A name that is empty once tidied or longer than the cap is rejected, counted, and never written."""
     _seed_vocab(persona_dir)
-    bad_names = ["bad/name", "bad\\name", "bad{name}", ""]
-    for bn in bad_names:
-        proposal = EmotionProposal(
-            name=bn,
-            description="x",
-            decay_half_life_days=None,
-            evidence_memory_ids=(),
-            score=0.5,
-            relational_context=None,
-        )
-        with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
-            result = run_growth_tick(persona_dir, store, datetime.now(UTC))
-        assert result.emotions_added == 0
-        assert result.proposals_rejected == 1
+    before = (persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8")
+    proposal = EmotionProposal(
+        name=bad_name,
+        description="x",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert result.proposals_rejected == 1
+    assert (persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8") == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
+@pytest.mark.parametrize("raw_name, written", [("bad/name", "bad_name"), ("Bad Name", "bad_name"), ("x" * 100, "x" * 100)])
+def test_run_growth_tick_writes_an_accepted_name_in_its_tidied_form(
+    persona_dir: Path, store: MemoryStore, raw_name: str, written: str
+) -> None:
+    _seed_vocab(persona_dir)
+    proposal = EmotionProposal(
+        name=raw_name,
+        description="x",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 1
+    assert result.proposals_rejected == 0
+    names = [e["name"] for e in json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]]
+    assert names == ["love", "joy", written]
+    log_lines = (persona_dir / "emotion_growth.log.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(log_lines[-1])["name"] == written
 
 
 def test_run_growth_tick_dry_run_does_not_write(persona_dir: Path, store: MemoryStore) -> None:

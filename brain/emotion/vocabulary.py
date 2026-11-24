@@ -17,11 +17,16 @@ Decay half-lives per spec Section 10.1:
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from brain.dev_constants import EMOTION_HALF_LIFE_DAYS
+from brain.dev_constants import EMOTION_HALF_LIFE_DAYS, EMOTION_NAME_MAX_CHARS
+from brain.utils.log_throttle import warn_throttled
+
+logger = logging.getLogger(__name__)
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
 # files in the wild may still contain entries with this category. New baseline
@@ -158,22 +163,45 @@ _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 _BLEND_SUFFIX = "_blend"
 
 
-def canonical_name(name: str) -> str:
-    """Collapse spelling variants of one emotion channel to a single key (#174).
+_SEPARATOR_RUN = re.compile(r"[\W_]+")  # a run of characters that are not letters or digits (`str.isalnum`)
 
-    Lowercase, hyphens to underscores, surrounding whitespace dropped. A
-    ``<a>_<b>_blend`` name (any number of parts) has its parts sorted so
-    ``love_grief_blend`` and ``grief_love_blend`` are the same channel. Empty
-    parts (a doubled, leading or trailing underscore before ``_blend``) are
-    dropped first, so ``love_grief__blend`` and ``_love_grief_blend`` give
-    ``grief_love_blend`` too (#800). A name with no parts left (``_blend``,
-    ``__blend``) gives ``_blend``. Other names keep their underscores as spelled.
+
+def canonical_name(name: str) -> str:
+    """The one tidier of a feeling name (#174, #800, #801): collapse spelling variants of one feeling to a single key.
+
+    Lowercase; every run of characters that are not letters or digits becomes one underscore (so ``name____name`` and
+    ``name_name`` are the same); underscores are trimmed from both ends. A ``<a>_<b>_blend`` name (any number of parts) has its
+    parts sorted, empty parts dropped, so ``love_grief_blend``, ``Grief Love Blend`` and ``love_grief__blend`` all give
+    ``grief_love_blend``. Lowercasing comes first so that tidying a tidied name changes nothing.
     """
-    key = name.strip().lower().replace("-", "_")
+    key = _SEPARATOR_RUN.sub("_", name.lower()).strip("_")
     if key.endswith(_BLEND_SUFFIX):
         parts = [part for part in key[: -len(_BLEND_SUFFIX)].split("_") if part]
         key = "_".join(sorted(parts)) + _BLEND_SUFFIX
     return key
+
+
+def gate_name(raw: str) -> str | None:
+    """The one gate of a feeling name (#801): the tidied name, or None when it must be refused.
+
+    A name that is empty once tidied, or longer than `dev_constants.EMOTION_NAME_MAX_CHARS`, is refused with a throttled warning
+    that says why (the length only, never the name).
+    """
+    name = canonical_name(raw)
+    if not name:
+        warn_throttled(logger, "vocabulary.gate_name.empty", "vocabulary: a feeling name is empty once tidied; refused", exc_info=False)
+        return None
+    if len(name) > EMOTION_NAME_MAX_CHARS:
+        warn_throttled(
+            logger,
+            "vocabulary.gate_name.too_long",
+            "vocabulary: a feeling name is %d characters once tidied, over the limit of %d; refused",
+            len(name),
+            EMOTION_NAME_MAX_CHARS,
+            exc_info=False,
+        )
+        return None
+    return name
 
 
 def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
