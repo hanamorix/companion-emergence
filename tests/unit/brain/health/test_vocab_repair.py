@@ -450,7 +450,8 @@ def test_repair_keeps_the_spelling_of_a_lone_entry(tmp_path: Path) -> None:
     """#801 section 3: with no twin, an entry keeps the spelling in her file (it is no longer renamed to its tidied key)."""
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_proper_entry("_grief_love_blend", "braided"), _stub_entry("emergence")])
+    # Parts out of sorted order: the old repair renamed this lone entry to "_grief_love_blend".
+    _write_vocab(tmp_path, [_proper_entry("_love_grief_blend", "braided"), _stub_entry("emergence")])
     store = _make_store(tmp_path)
     try:
         run_vocab_repair(tmp_path, store=store, provider=None)
@@ -459,8 +460,8 @@ def test_repair_keeps_the_spelling_of_a_lone_entry(tmp_path: Path) -> None:
 
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
-    assert set(by_name) == {"_grief_love_blend", "emergence"}
-    assert by_name["_grief_love_blend"]["description"] == "braided"
+    assert set(by_name) == {"_love_grief_blend", "emergence"}
+    assert by_name["_love_grief_blend"]["description"] == "braided"
 
 
 def test_repair_survives_a_nameless_placeholder_entry_and_keeps_it(tmp_path: Path) -> None:
