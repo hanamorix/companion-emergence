@@ -361,3 +361,86 @@ def test_the_memory_heal_mints_no_twin_for_an_entry_with_a_non_tidied_spelling(t
     finally:
         store.close()
         _cleanup_emotion("quiet_dread_heal")
+
+
+def _store_with(emotions: dict[str, float]) -> MemoryStore:
+    store = MemoryStore(":memory:")
+    store.create(
+        Memory.create_new(content="x", memory_type="conversation", domain="us", emotions=emotions),
+        fold=False,
+    )
+    return store
+
+
+def test_the_memory_heal_skips_a_key_the_gate_refuses_and_a_framework_name(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": [_entry("keep heal")]}), encoding="utf-8")
+    store = _store_with({"---": 3.0, "joy": 2.0, "z" * 101: 1.0, "healed gate": 4.0})
+    try:
+        assert load_persona_vocabulary(path, store=store) == 2  # keep heal + healed_gate
+        names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
+        assert names == ["keep heal", "healed_gate"]
+        assert "" not in vocabulary._REGISTRY
+    finally:
+        store.close()
+
+
+def test_the_memory_heal_writes_once_through_the_shared_writer_and_leaves_the_names_for_the_next_load_when_it_cannot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from brain import dev_constants
+    from brain.emotion import vocabulary_file
+    from brain.utils import file_lock
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+    before = path.read_bytes()
+    store = _store_with({"heal one": 1.0, "heal two": 1.0})
+    try:
+        monkeypatch.setattr(dev_constants, "EMOTION_VOCABULARY_LOCK_WAIT_S", 0.2)
+        with file_lock.file_lock(path):
+            assert load_persona_vocabulary(path, store=store) == 0
+        assert path.read_bytes() == before
+        assert vocabulary.get("heal_one") is None
+
+        calls = []
+        real = vocabulary_file.write_json
+        monkeypatch.setattr(vocabulary_file, "write_json", lambda *a, **k: calls.append(1) or real(*a, **k))
+        assert load_persona_vocabulary(path, store=store) == 2  # the next load heals them
+        assert len(calls) == 1
+        assert [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]] == ["heal_one", "heal_two"]
+    finally:
+        store.close()
+
+
+def test_the_rebuild_of_a_missing_file_writes_through_the_shared_writer_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from brain.emotion import vocabulary_file
+
+    calls = []
+    real = vocabulary_file.write_json
+    monkeypatch.setattr(vocabulary_file, "write_json", lambda *a, **k: calls.append(1) or real(*a, **k))
+    path = tmp_path / "emotion_vocabulary.json"
+    store = _store_with({"rebuilt feeling": 3.0})
+    try:
+        assert load_persona_vocabulary(path, store=store) == 1
+        names = [e["name"] for e in json.loads(path.read_text(encoding="utf-8"))["emotions"]]
+        assert "rebuilt_feeling" in names and "joy" in names  # baseline entries are written still (a later step stops that)
+        assert len(calls) == 1
+    finally:
+        store.close()
+
+
+def test_a_read_only_load_of_a_file_without_an_emotions_list_raises(tmp_path: Path):
+    from brain.health.json_io import JsonFileError
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": "no"}), encoding="utf-8")
+    with pytest.raises(JsonFileError):
+        load_persona_vocabulary(path, read_only=True)
+
+
+def test_a_file_entry_that_tidies_to_nothing_is_not_registered_under_the_empty_key(tmp_path: Path):
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1, "emotions": [_entry("---"), _entry("fine load")]}), encoding="utf-8")
+    assert load_persona_vocabulary(path) == 1
+    assert "" not in vocabulary._REGISTRY and vocabulary.get("---") is None

@@ -138,6 +138,26 @@ def test_non_finite_valued_emotion_name_still_gets_a_placeholder(caplog) -> None
         store.close()
 
 
+def test_a_memory_key_the_gate_refuses_makes_no_entry() -> None:
+    """#801 step 3: a key that tidies to nothing, or is over the length limit, never becomes a vocabulary entry."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"---": 2.0, "q" * 101: 1.0, "kept key": 3.0},
+            ),
+            fold=False,
+        )
+        names = [e["name"] for e in reconstruct_vocabulary_from_memories(store)["emotions"]]
+        assert "kept_key" in names
+        assert "" not in names and "q" * 101 not in names
+    finally:
+        store.close()
+
+
 def test_returned_shape_matches_persona_loader_expectation() -> None:
     """Output is loadable by load_persona_vocabulary."""
     store = MemoryStore(":memory:")

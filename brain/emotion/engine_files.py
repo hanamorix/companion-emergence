@@ -19,7 +19,7 @@ Everything lives under ``<persona_dir>/state/`` (``paths.state_dir``); no code o
   whole once it is complete.
 * ``emotion_changes/YYYY-MM-DD.jsonl``: the change log, one file a day, a crash-recovery record of chat-derived changes.
   Whole files are deleted once they are older than the retention boundary.
-* ``emotion_vocabulary.json`` (the persona's own file, owned by the persona loader and the growth code): only READ here, for
+* ``emotion_vocabulary.json`` (the persona's own file, written only through ``brain.emotion.vocabulary_file``): only READ here, for
   the half-life cache (``VocabularyHalfLives``, behind ``EmotionEngine.half_life``).
 * ``<persona_dir>/engine_progress.json`` (NOT under ``state/``, and outside the engine lock): the progress record the x10 fix
   and the first rebuild write while they run, so the app can show the wait (``EngineProgress`` writes it, ``read_engine_progress``

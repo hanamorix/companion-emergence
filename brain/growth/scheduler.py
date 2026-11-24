@@ -1,12 +1,8 @@
 """Growth scheduler — orchestrates crystallizers + applies decisions atomically.
 
-The scheduler is the primary mutator of `emotion_vocabulary.json` during a
-growth tick, but two other paths also write to that file:
-- `brain/emotion/persona_loader.py` — `_heal_referenced_but_unregistered`
-  registers extractor-minted emotions the scheduler never saw, at load time.
-- `brain/health/vocab_repair.py` — one-time startup migration that fills in
-  missing descriptions for stub entries; idempotent (guarded by
-  ``vocab_repair_state.json``).
+The scheduler adds names to `emotion_vocabulary.json` during a growth tick, through
+`brain/emotion/vocabulary_file.py`, the one writer of that file (the persona loader's
+memory heal and the vocabulary repair use it too).
 
 No engine writes `emotion_growth.log.jsonl` except through `run_growth_tick`.
 
@@ -23,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.emotion import vocabulary_file
 from brain.emotion.vocabulary import canonical_name, gate_name
 from brain.growth.crystallizers.vocabulary import (
     VOCABULARY_CRYSTALLIZER_STATUS,
@@ -30,7 +27,7 @@ from brain.growth.crystallizers.vocabulary import (
 )
 from brain.growth.log import GrowthLogEvent, append_growth_event
 from brain.growth.proposal import EmotionProposal
-from brain.health.json_io import Recovery, read_json, read_json_result, write_json
+from brain.health.json_io import Recovery
 from brain.memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -80,9 +77,12 @@ def run_growth_tick(
          one used from here on.
       2. Skip silently if name already in current vocabulary (re-proposing
          is normal; not a rejection).
-      3. Else: append to {persona_dir}/emotion_vocabulary.json (atomic
-         `.new + os.replace`) and append a GrowthLogEvent to
-         {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`).
+      3. Else: add it to {persona_dir}/emotion_vocabulary.json through
+         `vocabulary_file.add` and, when that wrote it, append a GrowthLogEvent to
+         {persona_dir}/emotion_growth.log.jsonl (atomic per `log.py`). A name the
+         file could not take (`cannot_write`, logged by the writer) is neither
+         counted nor logged as added; the tick goes on and the crystallizer
+         proposes it again.
 
     `dry_run=True` calls the crystallizer but skips both writes; the
     returned `emotions_added` reflects "would-have-added" semantics.
@@ -124,12 +124,17 @@ def run_growth_tick(
             # Idempotent skip — re-proposal is normal, not a rejection.
             continue
 
-        emotions_added += 1
         if dry_run:
+            emotions_added += 1
             continue
 
-        _append_to_vocabulary(vocab_path, proposal)
+        result = vocabulary_file.add(vocab_path, [(proposal.name, _entry_fields(proposal))])[0]
+        if result.outcome == "cannot_write":
+            continue  # the writer has logged why; nothing was written
         current_names.add(proposal.name)
+        if not result.changed:
+            continue  # the file took the name from another writer since the read: nothing to record
+        emotions_added += 1
         append_growth_event(
             log_path,
             GrowthLogEvent(
@@ -196,16 +201,7 @@ def _read_current_vocabulary_names(
     if not vocab_path.exists():
         return set(), None
 
-    def _schema_validator(data: object) -> None:
-        if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
-            raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
-
-    res = read_json_result(
-        vocab_path,
-        default=lambda: {"version": 1, "emotions": []},
-        recover=Recovery.HEAL,
-        validate=_schema_validator,
-    )
+    res = vocabulary_file.read(vocab_path, recover=Recovery.HEAL)
     data, anomaly = res.data, res.anomaly
 
     if anomaly is not None:
@@ -225,21 +221,14 @@ def _read_current_vocabulary_names(
     return names, anomaly
 
 
-def _append_to_vocabulary(vocab_path: Path, proposal: EmotionProposal) -> None:
-    """Atomic append to emotion_vocabulary.json via json_io.write_json (.bak rotation)."""
-    from brain.health.adaptive import compute_treatment
-    data = read_json(vocab_path, default=lambda: {"version": 1, "emotions": []}, recover=Recovery.RAISE)
-    data["emotions"].append(
-        {
-            "name": proposal.name,
-            "description": proposal.description,
-            "category": "persona_extension",
-            "decay_half_life_days": proposal.decay_half_life_days,
-            "intensity_clamp": 10.0,
-        }
-    )
-    treatment = compute_treatment(vocab_path.parent, vocab_path.name)
-    write_json(vocab_path, data, backups=treatment.backup_count)
+def _entry_fields(proposal: EmotionProposal) -> dict:
+    """The fields a new vocabulary entry takes from a proposal (the name is the writer's)."""
+    return {
+        "description": proposal.description,
+        "category": "persona_extension",
+        "decay_half_life_days": proposal.decay_half_life_days,
+        "intensity_clamp": 10.0,
+    }
 
 
 def _emit_vocabulary_initiate_candidate(

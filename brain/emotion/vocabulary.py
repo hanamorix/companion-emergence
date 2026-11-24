@@ -163,6 +163,8 @@ _BASELINE: tuple[Emotion, ...] = (
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 
 
+_BASELINE_KEYS: frozenset[str] = frozenset(e.name for e in _BASELINE)
+
 _BLEND_SUFFIX = "_blend"
 
 
@@ -250,9 +252,25 @@ def register(emotion: Emotion) -> None:
     _REGISTRY[key] = emotion
 
 
-def _unregister(name: str) -> None:
-    """Remove an emotion from the registry, by any spelling. Private: test-cleanup only.
+def is_baseline(name: str) -> bool:
+    """True when the name (any spelling) is one of the framework's own 30 entries."""
+    return canonical_name(name) in _BASELINE_KEYS
 
-    The framework does not support runtime removal of vocabulary entries.
+
+def replace_entry(emotion: Emotion) -> None:
+    """Put `emotion` in the registry in place of the entry whose name tidies the same (the vocabulary file's own change path).
+
+    Raises ValueError for a framework (baseline) name: those entries are never replaced from a file. Registers the entry
+    when none carries that name yet.
+    """
+    if is_baseline(emotion.name):
+        raise ValueError(f"Emotion {emotion.name!r} is a framework entry and is never replaced")
+    _REGISTRY[canonical_name(emotion.name)] = emotion
+
+
+def _unregister(name: str) -> None:
+    """Remove an emotion from the registry, by any spelling. Private: the vocabulary file module's `remove` and test cleanup.
+
+    The caller keeps framework (baseline) names registered (`is_baseline`).
     """
     _REGISTRY.pop(canonical_name(name), None)

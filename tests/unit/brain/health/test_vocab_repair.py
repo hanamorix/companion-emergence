@@ -461,69 +461,98 @@ def test_repair_keeps_the_spelling_of_a_lone_entry(tmp_path: Path) -> None:
     assert by_name["_grief_love_blend"]["description"] == "braided"
 
 
-def _names(data: dict) -> list:
-    return [e["name"] if isinstance(e, dict) and "name" in e else e for e in data["emotions"]]
+def test_repair_survives_a_nameless_placeholder_entry_and_keeps_it(tmp_path: Path) -> None:
+    """#801 step 3: a dict that carries the placeholder description but no name used to raise KeyError in Step 1."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    nameless = {"description": PLACEHOLDER_DESCRIPTION, "category": "persona_extension"}
+    _write_vocab(tmp_path, [nameless, _stub_entry("emergence")])
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+    assert report.repaired == 1
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    assert data["emotions"][0] == nameless
+    assert data["emotions"][1]["decay_half_life_days"] == 14.0
 
 
-def test_merge_keeps_the_first_in_file_spelling_with_the_later_real_description() -> None:
-    from brain.health.vocab_repair import _merge_variant_entries
+def test_repair_patches_a_stub_spelled_otherwise_when_the_reply_names_it_tidied(tmp_path: Path) -> None:
+    """#801 step 3: the reply is matched by tidied name, so a provider echoing `quiet_dread` describes `Quiet Dread`."""
+    from brain.health.vocab_repair import run_vocab_repair
 
-    data = {"emotions": [_stub_entry("comfort seeking"), _proper_entry("comfort_seeking", "held still")]}
-    pairs = _merge_variant_entries(data)
-    assert pairs == [("comfort seeking", "comfort seeking")]  # the dropped placeholder, and the spelling that stays
-    assert [e["name"] for e in data["emotions"]] == ["comfort seeking"]
-    assert data["emotions"][0]["description"] == "held still"
-    assert data["emotions"][0]["decay_half_life_days"] == 45.0
-
-
-def test_merge_of_two_real_twins_keeps_the_first_entry_whole() -> None:
-    from brain.health.vocab_repair import _merge_variant_entries
-
-    first, second = _proper_entry("comfort seeking", "one"), _proper_entry("comfort_seeking", "two")
-    data = {"emotions": [first, second]}
-    assert _merge_variant_entries(data) == [("comfort_seeking", "comfort seeking")]
-    assert data["emotions"] == [_proper_entry("comfort seeking", "one")]
+    _write_vocab(tmp_path, [_stub_entry("Quiet Dread")])
+    provider = _FakeProvider(response='{"quiet_dread": "the held breath before bad news"}')
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+    assert report.described == 1
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    assert [(e["name"], e["description"]) for e in data["emotions"]] == [("Quiet Dread", "the held breath before bad news")]
 
 
-def test_merge_of_three_twins_remembers_the_first_spelling_not_the_donors() -> None:
-    from brain.health.vocab_repair import _merge_variant_entries
+def test_repair_does_not_describe_a_twin_that_the_merge_dropped(tmp_path: Path) -> None:
+    """The steps after the merge work from the merged file: the dropped twin is not in the provider's prompt."""
+    from brain.health.vocab_repair import run_vocab_repair
 
-    data = {"emotions": [_stub_entry("Comfort Seeking"), _stub_entry("comfort_seeking"), _proper_entry("COMFORT-SEEKING", "held")]}
-    pairs = _merge_variant_entries(data)
-    assert [e["name"] for e in data["emotions"]] == ["Comfort Seeking"]
-    assert data["emotions"][0]["description"] == "held"
-    assert pairs == [("Comfort Seeking", "Comfort Seeking"), ("comfort_seeking", "Comfort Seeking")]
-
-
-def test_merge_leaves_a_lone_entry_alone_and_reports_nothing() -> None:
-    from brain.health.vocab_repair import _merge_variant_entries
-
-    entries = [_proper_entry("comfort seeking"), _proper_entry("_grief_love_blend"), _proper_entry("Quiet Dread")]
-    data = {"emotions": [dict(e) for e in entries]}
-    assert _merge_variant_entries(data) == []
-    assert data["emotions"] == entries
+    _write_vocab(tmp_path, [_stub_entry("Quiet Dread"), _stub_entry("quiet_dread")])
+    provider = _FakeProvider(response='{"Quiet Dread": "held breath"}')
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+    assert provider.calls[0]["prompt"].count("- ") == 1
 
 
-def test_merge_keeps_non_dict_nameless_and_empty_tidied_entries_in_place() -> None:
-    from brain.health.vocab_repair import _merge_variant_entries
+def test_repair_raises_and_retires_nothing_when_the_half_life_bump_cannot_be_written(tmp_path: Path, monkeypatch) -> None:
+    """A write the shared writer could not make must not retire Step 1: it raises, and no state file is written."""
+    import pytest
 
-    nameless = {"description": "no name"}
-    data = {
-        "emotions": [
-            "not an entry",
-            _proper_entry("comfort seeking", "one"),
-            nameless,
-            _proper_entry("---"),
-            7,
-            _proper_entry("comfort_seeking", "two"),
-            _proper_entry("___"),
-        ]
-    }
-    assert _merge_variant_entries(data) == [("comfort_seeking", "comfort seeking")]
-    assert _names(data) == ["not an entry", "comfort seeking", nameless, "---", 7, "___"]
-    assert data["emotions"][1] == _proper_entry("comfort seeking", "one")
-    assert data["emotions"][2] is nameless
-    assert data["emotions"][1]["description"] == "one"
+    from brain.emotion import vocabulary_file
+    from brain.health.vocab_repair import run_vocab_repair
+
+    path = _write_vocab(tmp_path, [_stub_entry("emergence")])
+    before = path.read_bytes()
+
+    def disk_full(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(vocabulary_file, "write_json", disk_full)
+    store = _make_store(tmp_path)
+    try:
+        with pytest.raises(OSError, match="half-life bump"):
+            run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+    assert path.read_bytes() == before
+    assert not (tmp_path / "vocab_repair_state.json").exists()
+
+
+def test_repair_never_overwrites_a_description_another_writer_set_since_it_looked(tmp_path: Path, monkeypatch) -> None:
+    from brain.emotion import vocabulary_file
+    from brain.health.vocab_repair import run_vocab_repair
+
+    path = _write_vocab(tmp_path, [_stub_entry("emergence")])
+    real = vocabulary_file.replace_fields
+
+    def another_writer_first(vocab_path, changes, *, only_if=None):
+        if "description" in next(iter(changes.values())):  # the description step: someone described it meanwhile
+            real(vocab_path, {"emergence": {"description": "described by someone else"}})
+        return real(vocab_path, changes, only_if=only_if)
+
+    monkeypatch.setattr(vocabulary_file, "replace_fields", another_writer_first)
+    provider = _FakeProvider(response='{"emergence": "the repair\'s words"}')
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+    assert report.described == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["emotions"][0]["description"] == "described by someone else"
 
 
 def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:

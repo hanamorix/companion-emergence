@@ -217,6 +217,68 @@ def test_run_growth_tick_writes_an_accepted_name_in_its_tidied_form(
     assert json.loads(log_lines[-1])["name"] == written
 
 
+def _wistful() -> EmotionProposal:
+    return EmotionProposal(
+        name="wistful scheduler",
+        description="a soft longing",
+        decay_half_life_days=7.0,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+
+
+def test_run_growth_tick_adds_through_the_shared_writer_with_the_proposals_fields(persona_dir: Path, store: MemoryStore) -> None:
+    _seed_vocab(persona_dir)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful()]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 1
+    entry = json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"][-1]
+    assert entry == {
+        "name": "wistful_scheduler",
+        "description": "a soft longing",
+        "category": "persona_extension",
+        "decay_half_life_days": 7.0,
+        "intensity_clamp": 10.0,
+    }
+    from brain.emotion import vocabulary
+
+    assert vocabulary.get("wistful_scheduler") is not None  # the writer registers it too
+
+
+def test_run_growth_tick_counts_and_logs_nothing_when_the_file_cannot_be_written(
+    persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain import dev_constants
+    from brain.utils import file_lock
+
+    _seed_vocab(persona_dir)
+    path = persona_dir / "emotion_vocabulary.json"
+    before = path.read_bytes()
+    monkeypatch.setattr(dev_constants, "EMOTION_VOCABULARY_LOCK_WAIT_S", 0.2)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful()]), file_lock.file_lock(path):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0 and result.proposals_rejected == 0
+    assert path.read_bytes() == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
+def test_run_growth_tick_records_nothing_when_another_writer_added_the_name_since_the_read(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    from brain.emotion.vocabulary_file import NameResult
+
+    _seed_vocab(persona_dir)
+    taken = NameResult("wistful_scheduler", "wistful_scheduler", "used", False)
+    with (
+        patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful()]),
+        patch("brain.growth.scheduler.vocabulary_file.add", return_value=[taken]),
+    ):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
 def test_run_growth_tick_dry_run_does_not_write(persona_dir: Path, store: MemoryStore) -> None:
     """dry_run=True calls crystallizer but writes neither vocabulary nor log."""
     _seed_vocab(persona_dir)
@@ -492,7 +554,7 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
     """After vocabulary crystallization commits, emit a candidate.
 
     Phase 4.2 — the emit fires inside scheduler.run_growth_tick immediately
-    after _append_to_vocabulary + append_growth_event, so it lives at the
+    after vocabulary_file.add + append_growth_event, so it lives at the
     actual SoulStore-commit point for vocabulary changes.
     """
     from brain.initiate.emit import read_candidates

@@ -21,7 +21,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.emotion import vocabulary
+from brain.emotion import vocabulary, vocabulary_file
 from brain.emotion.engine_files import vocabulary_path
 from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.utils import file_ops
@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 # The swap's target list: the four feelings #648 registers (matched with `vocabulary.canonical_name`).
 _SWAPPED_NAMES = ("contentment", "calm", "peace", "groundedness")
 _MARKER_FILENAME = "vocabulary_swap_648.json"
-# The vocabulary file keeps three backups, as every other writer of it does (`vocab_repair`, `persona_loader`).
-_VOCABULARY_BACKUPS = 3
 
 
 def run_vocabulary_swap_648(persona_dir: Path) -> None:
@@ -121,8 +119,8 @@ def _swap_file(path: Path) -> int | None:
             continue
         # Only the three fields of the definition change. The name keeps its spelling: the reflex crystallizer's gate 4 compares
         # the file's names as written (brain/growth/crystallizers/reflex.py:630), and an entry keeps the spelling in her file
-        # (a lone entry is never renamed; the vocabulary repair merges twins, `_merge_variant_entries` in
-        # brain/health/vocab_repair.py). Any other key of the entry stays.
+        # (a lone entry is never renamed; the vocabulary repair merges twins, `merge_twin_entries` in
+        # brain/emotion/vocabulary_file.py). Any other key of the entry stays.
         definition = {
             "category": baseline.category,
             "description": baseline.description,
@@ -145,7 +143,7 @@ def _swap_file(path: Path) -> int | None:
             path.name,
         )
         return None
-    if not write_json(path, data, backups=_VOCABULARY_BACKUPS, verify=True):
+    if not write_json(path, data, backups=vocabulary_file.backup_count(path), verify=True):
         logger.warning(
             "vocabulary swap (#648): the new vocabulary file %s did not verify; the old content was restored from its backup",
             path.name,

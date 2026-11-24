@@ -871,6 +871,13 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/growth/scheduler.py",),
     ),
+    # --- one shared writer of her vocabulary file (#741, #801 step 3) -----------------------------------------------------------
+    Removed(
+        names=("_append_to_vocabulary", "_atomic_write_vocab", "_merge_variant_entries", "_register_from_data", "_vocab_schema_validator", "_default_vocab_factory", "_DEFAULT_VOCAB", "_VOCABULARY_BACKUPS"),
+        why="every change to her vocabulary file goes through `brain/emotion/vocabulary_file.py`: the scheduler's append, the vocabulary repair's atomic write and twin merge (now `merge_twin_entries`), the loader's own register helper, schema validator and default factory, and the swap's bare backup count (the shared `backup_count`) went",
+        ref="#741 / #801 (draft PR #803), build step 3",
+        kind="code",
+    ),
     Removed(
         names=("_SEPARATOR_RUN",),
         why="the tagger's own separator step is removed: `vocabulary.canonical_name` is the one tidier (the same name now lives in `brain/emotion/vocabulary.py`, so the scope is the tagger file alone)",

@@ -4,6 +4,9 @@ Loads a persona's `emotion_vocabulary.json` at engine startup and
 registers each entry with the vocabulary registry. Idempotent on
 re-register so multiple loaders in the same process don't fail.
 
+Every write this loader makes to the file (the rebuild of a missing or corrupt file, the memory heal) goes through
+`brain.emotion.vocabulary_file`, the one writer of that file.
+
 Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md
 """
 
@@ -13,9 +16,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from brain.emotion import vocabulary
-from brain.emotion.vocabulary import Emotion
-from brain.health.json_io import Recovery, read_json_result, write_json
+from brain.emotion import vocabulary, vocabulary_file
+from brain.health.json_io import Recovery
 from brain.memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -23,16 +25,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_VOCAB: dict = {"version": 1, "emotions": []}
 
+def _rebuild_from_memories(path: Path, recon_data: dict) -> tuple[int, bool]:
+    """Write the reconstructed entries through the shared writer.
 
-def _default_vocab_factory() -> dict:
-    return {"version": 1, "emotions": []}
-
-
-def _vocab_schema_validator(data: object) -> None:
-    if not isinstance(data, dict) or not isinstance(data.get("emotions"), list):
-        raise ValueError("emotion_vocabulary schema invalid: missing 'emotions' list")
+    Returns (count newly registered (the baseline entries are registered already), whether the file was written).
+    """
+    before = len(vocabulary.list_all())
+    results = vocabulary_file.add(
+        path,
+        [(entry["name"], {k: v for k, v in entry.items() if k != "name"}) for entry in recon_data["emotions"]],
+    )
+    written = not any(r.outcome == "cannot_write" for r in results)
+    return len(vocabulary.list_all()) - before, written
 
 
 def load_persona_vocabulary_with_anomaly(
@@ -68,23 +73,24 @@ def load_persona_vocabulary_with_anomaly(
                 e for e in recon_data["emotions"] if e["category"] == "persona_extension"
             ]
             if extensions:
-                write_json(path, recon_data, backups=3)
-                registered = _register_from_data(recon_data)
-                logger.warning(
-                    "emotion_vocabulary.json was missing but memories reference "
-                    "persona emotions %s — reconstructed %d entries from memories "
-                    "and wrote %s. (If this followed `nell recover`, the recover "
-                    "backup omitted the vocabulary file.)",
-                    sorted(e["name"] for e in extensions),
-                    len(recon_data["emotions"]),
-                    path.name,
-                )
+                registered, written = _rebuild_from_memories(path, recon_data)
+                if written:
+                    logger.warning(
+                        "emotion_vocabulary.json was missing but memories reference "
+                        "persona emotions %s, reconstructed %d entries from memories "
+                        "and wrote %s. (If this followed `nell recover`, the recover "
+                        "backup omitted the vocabulary file.)",
+                        sorted(e["name"] for e in extensions),
+                        len(recon_data["emotions"]),
+                        path.name,
+                    )
                 return registered, None
         return 0, None
 
     recover = Recovery.RAISE if read_only else Recovery.HEAL
-    _res = read_json_result(path, default=_default_vocab_factory, recover=recover, validate=_vocab_schema_validator)
+    _res = vocabulary_file.read(path, recover=recover)
     data, anomaly = _res.data, _res.anomaly
+    registered = 0
 
     # Reconstruct from memories when reset_to_default fires on vocabulary.
     # The default factory writes empty `{"version":1,"emotions":[]}` — that's
@@ -95,7 +101,8 @@ def load_persona_vocabulary_with_anomaly(
         from brain.health.reconstruct import reconstruct_vocabulary_from_memories
 
         recon_data = reconstruct_vocabulary_from_memories(store)
-        write_json(path, recon_data, backups=3)
+        rebuilt, _written = _rebuild_from_memories(path, recon_data)
+        registered += rebuilt
         data = recon_data
         # Replace the anomaly with one whose action reflects the reconstruction.
         # Same kind (json_parse_error / schema_mismatch — that's why we needed
@@ -124,10 +131,10 @@ def load_persona_vocabulary_with_anomaly(
             anomaly.file,
         )
 
-    registered = _register_from_data(data)
+    registered += vocabulary_file.register_entries(data)
 
     if store is not None:
-        registered += _heal_referenced_but_unregistered(path, data, store)
+        registered += _heal_referenced_but_unregistered(path, store)
 
     return registered, anomaly
 
@@ -160,49 +167,7 @@ def load_persona_vocabulary(
     return count
 
 
-def _register_from_data(data: dict) -> int:
-    """Register emotions from a parsed vocab dict; return count of newly registered."""
-    registered = 0
-    for entry in data.get("emotions", []):
-        try:
-            emotion = _entry_to_emotion(entry)
-        except (KeyError, ValueError, TypeError) as exc:
-            entry_name = (
-                entry.get("name", "<unnamed>") if isinstance(entry, dict) else "<not a dict>"
-            )
-            logger.warning("skipping emotion entry %r: %s", entry_name, exc)
-            continue
-
-        if vocabulary.get(emotion.name) is not None:
-            # Already registered — idempotent skip.
-            continue
-
-        vocabulary.register(emotion)
-        registered += 1
-    return registered
-
-
-def _entry_to_emotion(entry: dict) -> Emotion:
-    """Build an Emotion from a JSON entry. Raises on missing/invalid fields."""
-    if not isinstance(entry, dict):
-        raise TypeError("entry must be a dict")
-    required = ("name", "description", "category", "decay_half_life_days")
-    for key in required:
-        if key not in entry:
-            raise KeyError(f"missing required field {key!r}")
-
-    return Emotion(
-        name=str(entry["name"]),
-        description=str(entry["description"]),
-        category=str(entry["category"]),  # type: ignore[arg-type]
-        decay_half_life_days=(
-            None if entry["decay_half_life_days"] is None else float(entry["decay_half_life_days"])
-        ),
-        intensity_clamp=float(entry.get("intensity_clamp", 10.0)),
-    )
-
-
-def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore) -> int:
+def _heal_referenced_but_unregistered(path: Path, store: MemoryStore) -> int:
     """Register + persist emotions referenced in active memories but absent from
     the vocabulary — e.g. extractor-minted channel names the growth crystallizer
     never added. Returns the count healed.
@@ -211,42 +176,36 @@ def _heal_referenced_but_unregistered(path: Path, data: dict, store: MemoryStore
     emotions broke the emotion readers and soul crystallization (the names
     were silently skipped). Healing them as persona_extension entries works for
     native and OG personas alike, and persists so the next load is clean.
-    """
-    from brain.health.reconstruct import PLACEHOLDER_DECAY_DAYS, PLACEHOLDER_DESCRIPTION
 
+    The file is written through `vocabulary_file.add` (file first, registry second): a write that cannot be made leaves the
+    names unregistered, and the next load heals them again.
+    """
     seen: set[str] = set()
-    new_entries: list[dict] = []
+    names: list[str] = []
     for mem in store.list_active(limit=None):
         # Names only: a stored emotion whose value is not finite still has a name the vocabulary needs.
         for raw_name in MemoryStore.stored_emotion_names(mem):
             # #174: heal under the canonical spelling so a variant memory key
-            # (present-ness, Love_Grief_blend) never mints a twin entry.
-            name = vocabulary.canonical_name(raw_name)
-            if name in seen or vocabulary.get(name) is not None:
+            # (present-ness, Love_Grief_blend) never mints a twin entry; #801: a name
+            # the gate refuses (empty once tidied, too long) is not healed.
+            name = vocabulary.gate_name(raw_name)
+            if name is None or name in seen or vocabulary.get(name) is not None:
                 continue
             seen.add(name)
-            new_entries.append(
-                {
-                    "name": name,
-                    "description": PLACEHOLDER_DESCRIPTION,
-                    "category": "persona_extension",
-                    "decay_half_life_days": PLACEHOLDER_DECAY_DAYS,
-                    "intensity_clamp": 10.0,
-                }
-            )
+            names.append(name)
 
-    if not new_entries:
+    if not names:
         return 0
 
-    healed = _register_from_data({"emotions": new_entries})
-    data.setdefault("emotions", []).extend(new_entries)
-    write_json(path, data, backups=3)
-    logger.warning(
-        "emotion_vocabulary.json was missing %d referenced emotion(s) %s — "
-        "registered them as persona_extension and appended to %s (extractor-"
-        "minted emotions the vocabulary crystallizer hadn't added yet).",
-        len(new_entries),
-        sorted(e["name"] for e in new_entries),
-        path.name,
-    )
+    results = vocabulary_file.add(path, [(name, None) for name in names])
+    healed = sum(1 for r in results if r.changed)
+    if healed:
+        logger.warning(
+            "emotion_vocabulary.json was missing %d referenced emotion(s) %s: "
+            "registered them as persona_extension and appended to %s (extractor-"
+            "minted emotions the vocabulary crystallizer hadn't added yet).",
+            healed,
+            sorted(r.spelling for r in results if r.changed and r.spelling),
+            path.name,
+        )
     return healed
