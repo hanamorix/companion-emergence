@@ -31,8 +31,12 @@ There are six body emotions (`brain.body.state.BODY_EMOTION_NAMES`):
 | `comfort_seeking` | 1 day | Wanting to be held still and anchored, the receiving side of being held. |
 | `rest_need` | 18 hours (0.75 days) | The body asking for slowness and recovery: the *want*, not the computed exhaustion. |
 
-The half-lives above are the vocabulary's. `brain.dev_constants.EMOTION_HALF_LIFE_DAYS` and a persona's own vocabulary file can
-override them, as for any feeling.
+The engine looks a half-life up in this order (`EmotionEngine.half_life`):
+1. the persona's own vocabulary file;
+2. `brain.dev_constants.EMOTION_HALF_LIFE_DAYS`, where the four values above live;
+3. the 14-day default, `dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS`.
+
+`_BASELINE` carries the same four values, but the engine never reads them.
 
 ## 3. The body readings
 
@@ -140,7 +144,13 @@ A failed body read must never break a chat turn or silence the kindled, and it m
 
 ### 7.2 The climax journal entry
 
-`record_climax_event` never raises into `add_memory`: a failure is logged as a warning, and the tool's answer is unchanged.
+`record_climax_event` catches only I/O, storage and parse errors:
+- **The journal write** catches `OSError`, `sqlite3.Error` and `ValueError`.
+- **The behavioural log append** catches `OSError` and `ValueError`.
+
+A caught error is logged as a warning, and `add_memory`'s answer is unchanged. A programming error (`TypeError`,
+`AttributeError`, `KeyError`) propagates into `add_memory` on purpose, so a bug shows (the comment in
+`brain/body/events.py` says so). Its docstring still says "never raises" (§9).
 
 ### 7.3 Readers
 
@@ -167,6 +177,7 @@ A failed body read must never break a chat turn or silence the kindled, and it m
 | The prompt body block (§4) | 0.0 | Shows it to her each turn. |
 | The `get_body_state` tool (§3.3) | the active run | Lets her look. |
 | The app's state panel (`brain.bridge.persona_state._build_body`) | the active run | Shows it to the user. |
+| The `boot` tool (`brain.tools.impls.boot`) | 0.0 | Calls `get_body_state` directly, not through the dispatcher, so no session length is injected. Puts the body in the session anchor and uses its days since contact in the anchor's prose. |
 | Supervisor `_derive_intensity_drivers` | 0.0 | Body strain = max(exhaustion / 9, 1 − energy / 10), one of the felt-time intensity drivers. |
 | Supervisor `_self_model_reflect` | 0.0 | `brain.self_model.derived.compute_unnamed_pressure`: a residual body signal when energy is 1 or less (or exhaustion is 8 or more) and no low-arousal feeling carries it. |
 | Supervisor `_run_initiate_review_tick` | 0.0 | The rest gate: energy 3 or less holds back recall-resonance outreach (`brain.initiate.review._rest_state_from_energy`), failing open when the body can't be read. |
@@ -177,9 +188,11 @@ These are recorded here, not fixed:
 - **`peace` is not registered** in any vocabulary, so the +1 energy for peace can never fire. #648 registers it, in #656.
 - **`body_grief` is no longer predefined** for new personas, but the temperature rule still reads it. #652 removes it from the
   rule, in #656. A persona whose own vocabulary file holds `body_grief` still feels it.
-- **Only two readers pass a real session length:** the tool and the state panel. The prompt block and the three supervisor
-  readers pass 0.0, so for them the session drains never apply and the writing window is the last hour. The prompt's comment
-  calls this "not tracked yet".
+- **Only two readers pass a real session length:** the `get_body_state` tool through the dispatcher, and the state panel. The
+  prompt block, the `boot` tool and the three supervisor readers pass 0.0. For them the session drains never apply, and the
+  writing window is the last hour. The prompt's comment calls this "not tracked yet".
+- **`record_climax_event`'s docstring says "never raises"**, but a programming error propagates into `add_memory` on purpose
+  (§7.2).
 - **Exhaustion is 0-6, but two readers assume a wider range:**
   - the supervisor divides it by 9;
   - the prompt shows it out of 10;
