@@ -512,42 +512,66 @@ def _receiver_methods(call: ast.Call) -> set[str]:
             return names
 
 
+def _re_function_aliases(tree: ast.Module) -> dict[str, str]:
+    """`from re import sub as _s` -> {"_s": "sub"}. (`import re as r` needs no entry: calls are matched by method name, `r.sub`.)"""
+    return {
+        (a.asname or a.name): a.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "re"
+        for a in node.names
+    }
+
+
+def _pattern_of(first: ast.expr, consts: Mapping[str, str]) -> bool:
+    """True when the first argument is a pattern (a string, or a same-file string constant) shaped like a name tidier's."""
+    pattern = first.value if isinstance(first, ast.Constant) else consts.get(first.id) if isinstance(first, ast.Name) else None
+    return isinstance(pattern, str) and bool(
+        _NEGATED_ALNUM_CLASS.search(pattern) or _NON_WORD.search(pattern) or _SPACE_JOINER_CLASS.search(pattern)
+    )
+
+
 def tidier_hits(trees: Mapping[str, ast.Module], exempt: frozenset[str]) -> list[tuple[str, int]]:
     """Code shaped like a name tidier, outside `exempt` (vocabulary.py, the one tidier): a strip of underscores; a regex whose pattern
     holds a negated alphanumeric class, `\\W`, or a class of whitespace with `_` or `-` (a string, or a module-level string constant of
-    the same file); `.replace` joined with
-    `.lower()` / `.casefold()`; `.replace(x, "_")` or `.replace(x, "-")`; any `.isalnum`.
+    the same file); `.replace` joined with `.lower()` / `.casefold()`; `.replace(x, "_")` or `.replace(x, "-")` (also the unbound
+    `str.replace(n, x, "_")`); `re.sub` / `re.subn` / a compiled `.sub` whose replacement is the constant `_` or `-`; any `.isalnum`.
+    The `re` functions are found under an alias too (`from re import sub as s`, `import re as r`).
 
     Not caught: a tidier written with `str.translate`, a character loop on another predicate, split-and-join, a pattern built at run
-    time or imported from another file, a replacement other than `_` or `-`, a name tidied by a prompt. It finds the usual shapes, not
-    intent: a hit says look, and today's hits are each pinned with the reason they are not feeling names.
+    time or imported from another file, a replacement other than `_` or `-` or one held in a variable, a regex function imported from
+    another module that re-exports it, a bound `.replace(x, "_", count)` with a count, `str.replace` reached through another alias of `str`, a name tidied by a prompt. It finds the
+    usual shapes, not intent: a hit says look, and today's hits are each pinned with the reason they are not feeling names.
     """
     hits: list[tuple[str, int]] = []
     for rel, tree in trees.items():
         if rel in exempt:
             continue
         consts = _module_string_constants(tree)
+        aliases = _re_function_aliases(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr == "isalnum":
                 hits.append((rel, node.lineno))
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            attr = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else "")
+            attr = func.attr if isinstance(func, ast.Attribute) else (aliases.get(func.id, func.id) if isinstance(func, ast.Name) else "")
             first = node.args[0] if node.args else None
+            if attr in ("sub", "subn") and not (first is not None and _pattern_of(first, consts)):
+                # `re.sub(pat, repl, s)` has the replacement second, a compiled `.sub(repl, s)` first: either position counts.
+                # (A call whose pattern is flagged below is one hit already, so it is not counted twice here.)
+                repls = [*node.args[:2], *(k.value for k in node.keywords if k.arg == "repl")]
+                if any(isinstance(a, ast.Constant) and a.value in ("_", "-") for a in repls):
+                    hits.append((rel, node.lineno))
             if attr in _STRIP_CALLS and isinstance(first, ast.Constant) and isinstance(first.value, str):
                 chars = set(first.value)
                 if "_" in chars and chars <= set("_- \t"):
                     hits.append((rel, node.lineno))
-            if attr in _REGEX_CALLS and first is not None:
-                pattern = first.value if isinstance(first, ast.Constant) else consts.get(first.id) if isinstance(first, ast.Name) else None
-                if isinstance(pattern, str) and (
-                    _NEGATED_ALNUM_CLASS.search(pattern) or _NON_WORD.search(pattern) or _SPACE_JOINER_CLASS.search(pattern)
-                ):
-                    hits.append((rel, node.lineno))
+            if attr in _REGEX_CALLS and first is not None and _pattern_of(first, consts):
+                hits.append((rel, node.lineno))
             if attr == "replace":
                 receiver = _receiver_methods(node)
-                second = node.args[1] if len(node.args) == 2 else None
+                unbound = isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "str"
+                second = node.args[1] if len(node.args) == 2 else node.args[2] if len(node.args) == 3 and unbound else None  # `str.replace(n, old, new)`
                 if receiver & {"lower", "casefold"} or (
                     isinstance(second, ast.Constant) and isinstance(second.value, str) and second.value in ("_", "-")
                 ):
@@ -561,6 +585,8 @@ def tidier_hits(trees: Mapping[str, ast.Module], exempt: frozenset[str]) -> list
 TIDIER_HITS: dict[tuple[str, str], tuple[int, str]] = {
     ("cli.py", 'name = value.replace("_", "-")'): (1, "not a feeling name: the job name of a model-tier argument (`background_generative` or `background-generative`)"),
     ("engines/research_notes.py", '_SAFE = re.compile(r"[^A-Za-z0-9._-]")'): (1, "not a feeling name: makes an interest id safe for a file name"),
+    ("engines/research_notes.py", 'safe = _SAFE.sub("_", interest_id) or "_"'): (1, "not a feeling name: makes an interest id safe for a file name"),
+    ("update/install.py", 'return re.sub(r"[-_.]+", "-", name).lower()'): (1, "not a feeling name: normalizes a pip requirement name (PEP 503 form)"),
     ("health/attempt_heal.py", 'return iso_utc(now).replace(":", "-")'): (1, "not a feeling name: a timestamp made safe for a quarantine file name"),
     ("memory/known_names.py", "if ch.isalnum():"): (1, "not a feeling name: the text as the full-text index's tokenizer sees it (words of letters and digits), for the known-names search"),
     ("memory/store.py", 'pieces = [p for token in query for p in re.split(r"[^A-Za-z0-9]+", token)]'): (1, "not a feeling name: splits a recall search query into words"),
@@ -595,12 +621,23 @@ def test_e_scanner_flags_each_tidier_shape_and_ignores_plain_text_work() -> None
         "brain/h.py": 'def f(n):\n    return n.replace("-", " ").lower()\n',
         "brain/i.py": 'def f(n):\n    return n.replace(" ", "-")\n',
         "brain/i2.py": 'import re\n_SEP = re.compile(r"[\\s_-]+")\n',
+        "brain/m.py": 'import re\ndef f(n):\n    return re.sub(r"\\s+", "_", n.strip().lower())\n',
+        "brain/m2.py": 'import re\ndef f(n):\n    return re.subn(r"\\s+", "-", n)[0]\n',
+        "brain/m3.py": 'import re\n_P = re.compile(r"\\s+")\ndef f(n):\n    return _P.sub("_", n)\n',
+        "brain/n.py": 'from re import sub as _s\ndef f(n):\n    return _s(r"[^a-z0-9]+", "_", n)\n',
+        "brain/n2.py": 'import re as r\ndef f(n):\n    return r.sub(r"\\s+", "_", n)\n',
+        "brain/n3.py": 'from re import sub as _s\ndef f(n):\n    return _s(r"\\s+", "_", n)\n',
+        "brain/o.py": 'def f(n):\n    return str.replace(n, " ", "_")\n',
     }
     plain = {
         "brain/emotion/vocabulary.py": 'def f(n):\n    return n.strip("_").lower().replace(" ", "_")\n',
         "brain/j.py": 'def f(n):\n    return n.strip().lower()\n',
         "brain/k.py": 'import re\ndef f(n):\n    return re.sub(r"\\s+", " ", n).replace("a", "b")\n',
         "brain/l.py": 'def f(n):\n    return n.strip("/ ")\n',
+        "brain/p.py": 'import re\ndef f(n):\n    return re.sub(r"\\s+", " ", n)\n',
+        "brain/q.py": 'from re import sub as _s\ndef f(n):\n    return _s(r"\\s+", " ", n)\n',
+        "brain/r.py": 'def f(n):\n    return str.replace(n, "a", "b")\n',
+        "brain/s.py": 'def f(n):\n    return n.replace("a", "b", 1)\n',
     }
     flagged = {rel for rel, _n in tidier_hits(_parse(tidiers | plain), frozenset({VOCABULARY}))}
     assert flagged == set(tidiers)
