@@ -279,13 +279,27 @@ def test_g6_guard_can_fail(tmp_path):
 # `MemoryStore.update` checks a memory's feeling names unless `check_names=False`. A write that turns the check off is pinned, like
 # the `.create(` writers above, by (relpath, exact stripped line) and a count, with a reason. The shapes looked at: an `.update(`
 # call, a `dict(...)` call, a dict literal and a subscript assignment that set `check_names` to anything but the constant True.
-# Not caught: a `**kwargs` dict built somewhere this scan does not look (a name, a function's return), a `check_names` set with
-# `setattr`, and the readers (`memory_feelings(..., check_names=False)`, which read and never write).
+# Any other callee (an alias of `update`, `functools.partial(s.update, ...)`, a reader such as `_resolved_faded`) is caught when it is
+# given the constant False; the readers that do are pinned as reads. Not caught: a `**kwargs` dict built somewhere this scan does not
+# look (a name, a function's return), a value held in a variable (`check_names=flag` into an `update`-named call is caught, into any
+# other callee it is not), a `check_names` set with `setattr`.
 _CHECK_NAMES_OFF_PINNED: dict[tuple[str, str], tuple[int, str]] = {
     ("memory/store.py", "fields.update(emotions=_merge_emotions(target._stored_emotions, candidate._stored_emotions), fold=False, check_names=False)"): (
         1,
         "the consolidation merge builds the kwargs dict that `self.update(target.id, **fields)` takes on the next line (this line is the "
         "dict, not the store call): the merged map comes from two stored rows whose names the store already wrote tidied",
+    ),
+    ("emotion/engine.py", "emotions = self._resolved_faded(memory, check_names=False)  # the store checked the emotions before writing them"): (
+        1,
+        "a READ of a row's feelings by the engine's hook after the store checked and wrote the row (`_resolved_faded`'s docstring); writes nothing",
+    ),
+    ("emotion/engine.py", "emotions = self._resolved_faded(memory, check_names=False)  # the store checked the row before writing it"): (
+        1,
+        "a READ of a row's feelings by the engine's hook after the store checked and wrote the row (`_resolved_faded`'s docstring); writes nothing",
+    ),
+    ("emotion/engine.py", "return self._resolved_faded(memory, check_names=False) if counted_kind(memory) is not None else {}"): (
+        1,
+        "a READ of a stored row's feelings replayed under the engine lock (spec section 7, `_resolved_faded`'s docstring); writes nothing",
     ),
 }
 
@@ -303,7 +317,13 @@ def _enumerate_check_names_off(files: Mapping[str, str]) -> Counter[tuple[str, s
             hit = False
             if isinstance(node, ast.Call):
                 name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ""
-                hit = name in ("update", "dict") and any(k.arg == "check_names" and not _is_true(k.value) for k in node.keywords)
+                # `update` and `dict` (the kwargs of an update) with any value but True; any other callee (an alias `u = s.update`,
+                # `functools.partial(s.update, ...)`, `getattr(s, "update")(...)`) with the constant False. `create` is G6's.
+                # A variable forwarded to a callee (`check_names=check_names`) is not turning the check off by itself.
+                hit = name != "create" and any(
+                    k.arg == "check_names" and (not _is_true(k.value) if name in ("update", "dict") else isinstance(k.value, ast.Constant) and not _is_true(k.value))
+                    for k in node.keywords
+                )
             elif isinstance(node, ast.Dict):
                 hit = any(isinstance(k, ast.Constant) and k.value == "check_names" and not _is_true(v) for k, v in zip(node.keys, node.values, strict=True))
             elif isinstance(node, ast.Assign):
@@ -335,6 +355,9 @@ def test_g6b_guard_can_fail():
         "c.py": "def f(s, i):\n    kw = dict(check_names=False)\n    s.update(i, **kw)\n",
         "d.py": "def f(s, i):\n    s.update(i, **{'check_names': False})\n",
         "e.py": "def f(s, i, fields):\n    fields['check_names'] = False\n    s.update(i, **fields)\n",
+        "f.py": "def f(s, i):\n    u = s.update\n    u(i, check_names=False)\n",
+        "g2.py": "import functools\ndef f(s):\n    return functools.partial(s.update, check_names=False)\n",
+        "g3.py": "def f(s, i):\n    getattr(s, 'update')(i, check_names=False)\n",
     }
     clean = {
         "g.py": "def f(s, i):\n    s.update(i, emotions={})\n    s.update(i, check_names=True)\n",

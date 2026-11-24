@@ -32,8 +32,8 @@ from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
-# The name of her vocabulary file: the one place the name is spelled in brain/ (tests/unit/test_vocabulary_bypass_guards.py fails on
-# the literal anywhere else). `vocabulary_file.vocabulary_path` joins it to a persona folder; a list of persona file names uses it.
+# The name of her vocabulary file: the one place the name is spelled as a file name in brain/ (tests/unit/test_vocabulary_bypass_guards.py
+# fails on the literal as a path token anywhere else). `vocabulary_file.vocabulary_path` joins it to a persona folder; a list of persona file names uses it.
 VOCABULARY_FILENAME = "emotion_vocabulary.json"
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona

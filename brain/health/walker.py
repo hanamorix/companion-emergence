@@ -84,7 +84,7 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     Iterates atomic-rewrite files via read_json_result (HEAL) (captures corruption +
     repairs in one shot) then opens each SQLite store so the constructor's
     PRAGMA integrity_check runs. Returns an empty list when everything is
-    healthy. The one exception is her vocabulary file (`VOCABULARY_FILENAME`),
+    healthy. The one exception is her vocabulary file (named by `VOCABULARY_FILENAME`),
     which only the bridge repairs (#803 step 16): see `_read_vocabulary`.
     """
     anomalies: list[BrainAnomaly] = []

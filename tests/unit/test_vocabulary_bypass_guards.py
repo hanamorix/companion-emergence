@@ -87,12 +87,17 @@ def _docstring_nodes(tree: ast.Module) -> set[int]:
 # ------------------------------------------------------------------------------------------------
 
 
-def literal_sites(trees: Mapping[str, ast.Module], defining: frozenset[str]) -> list[tuple[str, int]]:
-    """Every string constant that is the file's name as a path token (equal to it, or ending `/name` or `\\name`, an f-string's
-    literal part), outside `defining` and outside docstrings. Log text that mentions the name has spaces and is not a path token.
+_NAME_TOKEN = re.compile(r"(?:^|[/\\])" + re.escape(FILENAME))
 
-    Not caught: the name built with `+` or a format, `Path.glob("*vocabulary*")`, the stem `"emotion_vocabulary"` alone, a name read
-    from config. Two literals written side by side are one constant to the parser, so that shape is caught.
+
+def literal_sites(trees: Mapping[str, ast.Module], defining: frozenset[str]) -> list[tuple[str, int]]:
+    """Every string constant that is the file's name as a path token (it starts with the name, or the name follows `/` or `\\`, an
+    f-string's literal part; a suffix such as `.bak` or `.tmp` still counts), outside `defining` and outside docstrings. Log text that
+    mentions the name has spaces and is not a path token; `nell_emotion_vocabulary.json` (a legacy OG file) is another name.
+
+    Not caught: the name built with `+` or a format from pieces that are not themselves path tokens, `Path.glob("*vocabulary*")`, the
+    stem `"emotion_vocabulary"` alone, a name read from config. Two literals written side by side are one constant to the parser, so
+    that shape is caught.
     """
     hits: list[tuple[str, int]] = []
     for rel, tree in trees.items():
@@ -101,8 +106,7 @@ def literal_sites(trees: Mapping[str, ast.Module], defining: frozenset[str]) -> 
         docs = _docstring_nodes(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs:
-                v = node.value
-                if v == FILENAME or v.endswith("/" + FILENAME) or v.endswith("\\" + FILENAME):
+                if _NAME_TOKEN.search(node.value) and not any(c.isspace() for c in node.value):
                     hits.append((rel, node.lineno))
     return hits
 
@@ -126,11 +130,12 @@ def test_a_scanner_flags_the_literal_in_each_shape_and_ignores_prose() -> None:
             "brain/b.py": f'def f(d):\n    return f"{{d}}/{FILENAME}"\n',
             "brain/c.py": 'def f(d):\n    return d / "emotion_" "vocabulary.json"\n',
             "brain/d.py": f'def f(d):\n    return {{"{FILENAME}": 1}}\n',
+            "brain/d2.py": f'def f(d):\n    return d / "{FILENAME}.bak"\n',
             "brain/e.py": f'def f():\n    """About {FILENAME}."""\n    log("{FILENAME} was missing")\n    return "nell_{FILENAME}"\n',
         }
     )
     flagged = {rel for rel, _n in literal_sites(trees, frozenset({VOCABULARY}))}
-    assert flagged == {"brain/a.py", "brain/b.py", "brain/c.py", "brain/d.py"}
+    assert flagged == {"brain/a.py", "brain/b.py", "brain/c.py", "brain/d.py", "brain/d2.py"}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -186,7 +191,8 @@ PINNED_USES: dict[tuple[str, str], tuple[int, str]] = {
     ),
     ("emotion/engine.py", "refresh(vocabulary_file.vocabulary_path(self.persona_dir))"): (
         1,
-        "the engine's read: `persona_loader.refresh_if_changed` (the loader; the copy follows the file)",
+        "builds the path for `persona_loader.refresh_if_changed`, which does not exist, so `_refresh_vocabulary` is a no-op that reads nothing "
+        "(BYCATCH medium, step 15: the dead hook can go)",
     ),
     ("emotion/vocabulary_access.py", "persona_loader.adopt_copy(vocabulary_file.vocabulary_path(persona_dir))"): (
         1,
@@ -480,6 +486,7 @@ def test_d_scanner_flags_each_way_to_reach_the_registry() -> None:
 _REGEX_CALLS = frozenset({"compile", "sub", "subn", "split", "match", "search", "fullmatch", "findall", "finditer"})
 _NEGATED_ALNUM_CLASS = re.compile(r"\[\^[^\]]*(?:a-z|A-Z|0-9|\\w|\\d)")
 _NON_WORD = re.compile(r"\\W")
+_SPACE_JOINER_CLASS = re.compile(r"\[[^\]]*\\s[^\]]*[_-][^\]]*\]|\[[^\]]*[_-][^\]]*\\s[^\]]*\]")  # a class of whitespace and `_` or `-`
 _STRIP_CALLS = frozenset({"strip", "lstrip", "rstrip"})
 
 
@@ -507,7 +514,8 @@ def _receiver_methods(call: ast.Call) -> set[str]:
 
 def tidier_hits(trees: Mapping[str, ast.Module], exempt: frozenset[str]) -> list[tuple[str, int]]:
     """Code shaped like a name tidier, outside `exempt` (vocabulary.py, the one tidier): a strip of underscores; a regex whose pattern
-    holds a negated alphanumeric class or `\\W` (a string, or a module-level string constant of the same file); `.replace` joined with
+    holds a negated alphanumeric class, `\\W`, or a class of whitespace with `_` or `-` (a string, or a module-level string constant of
+    the same file); `.replace` joined with
     `.lower()` / `.casefold()`; `.replace(x, "_")` or `.replace(x, "-")`; any `.isalnum`.
 
     Not caught: a tidier written with `str.translate`, a character loop on another predicate, split-and-join, a pattern built at run
@@ -533,7 +541,9 @@ def tidier_hits(trees: Mapping[str, ast.Module], exempt: frozenset[str]) -> list
                     hits.append((rel, node.lineno))
             if attr in _REGEX_CALLS and first is not None:
                 pattern = first.value if isinstance(first, ast.Constant) else consts.get(first.id) if isinstance(first, ast.Name) else None
-                if isinstance(pattern, str) and (_NEGATED_ALNUM_CLASS.search(pattern) or _NON_WORD.search(pattern)):
+                if isinstance(pattern, str) and (
+                    _NEGATED_ALNUM_CLASS.search(pattern) or _NON_WORD.search(pattern) or _SPACE_JOINER_CLASS.search(pattern)
+                ):
                     hits.append((rel, node.lineno))
             if attr == "replace":
                 receiver = _receiver_methods(node)
@@ -584,6 +594,7 @@ def test_e_scanner_flags_each_tidier_shape_and_ignores_plain_text_work() -> None
         "brain/g.py": 'import re\n_PAT = r"[^A-Za-z0-9]"\ndef f(n):\n    return re.sub(_PAT, "", n)\n',
         "brain/h.py": 'def f(n):\n    return n.replace("-", " ").lower()\n',
         "brain/i.py": 'def f(n):\n    return n.replace(" ", "-")\n',
+        "brain/i2.py": 'import re\n_SEP = re.compile(r"[\\s_-]+")\n',
     }
     plain = {
         "brain/emotion/vocabulary.py": 'def f(n):\n    return n.strip("_").lower().replace(" ", "_")\n',
