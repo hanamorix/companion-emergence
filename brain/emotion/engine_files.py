@@ -57,7 +57,7 @@ import atexit
 import logging
 import math
 import reprlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -102,23 +102,29 @@ class VocabularyHalfLives:
 
     In the bridge the lookup is the registry; any other process asks the bridge (and, with no bridge, reads her file read-only for
     the run). A framework (core, complex, body) name is answered by the caller's built-in table, never from here, so it costs no
-    call. Nothing is kept between calls: a process holds no copy of her vocabulary (spec section 5), so a change made in the bridge
-    is seen by the next call.
+    call. The caller asks for a whole batch (one memory's names) in one lookup, never one call per name (spec section 5). Nothing is
+    kept between calls: a process holds no copy of her vocabulary, so a change made in the bridge is seen by the next call.
     """
 
     def __init__(self, persona_dir: Path) -> None:
         self._persona_dir = Path(persona_dir)
 
-    def get(self, name: str) -> float | None:
-        """Her vocabulary's numeric half-life for the canonical `name`, or None.
+    def get_many(self, names: Iterable[str]) -> dict[str, float]:
+        """Her vocabulary's numeric half-life for each of `names` that has one, keyed by the tidied name: ONE lookup for the batch.
 
-        None means her vocabulary has no usable number for it (a framework name, not listed, a null entry "never fades", a value
-        that is not a finite number above 0, or the lookup failed): the caller goes on to the built-in table.
+        A name missing from the answer has no usable number in her vocabulary (a framework name, not listed, a null entry
+        "never fades", a value that is not a finite number above 0, or the lookup failed): the caller goes on to the built-in
+        table. A framework name costs nothing (it is never asked), and a batch of only framework names makes no call.
         """
-        if vocabulary.is_baseline(name):
-            return None
-        found = vocabulary_access.lookup(self._persona_dir, [name]).get(name)
-        return None if found is None else self._usable(name, found.half_life_days)
+        wanted = sorted({vocabulary.canonical_name(n) for n in names if not vocabulary.is_baseline(n)})
+        if not wanted:
+            return {}
+        out: dict[str, float] = {}
+        for name, found in vocabulary_access.lookup(self._persona_dir, wanted).items():
+            days = None if found is None else self._usable(name, found.half_life_days)
+            if days is not None:
+                out[name] = days
+        return out
 
     @staticmethod
     def _usable(name: str, days: float | None) -> float | None:

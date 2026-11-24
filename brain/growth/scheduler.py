@@ -134,6 +134,9 @@ def run_growth_tick(
             # Nothing was written, and the cause is logged by the writer (`cannot_write`) or is that this process has no bridge to
             # add through (`missing`: only the bridge writes her vocabulary): no further wait for the lock or the bridge this tick.
             break
+        if result.outcome == "refused":
+            proposals_rejected += 1  # a field the entry cannot hold (the access has logged it): not added, not remembered as a name
+            continue
         current_names.add(proposal.name)
         if not result.changed:
             continue  # the file took the name from another writer since the read: nothing to record

@@ -899,6 +899,52 @@ def test_faded_value_numbers_for_importance_the_floor_a_vocabulary_half_life_and
     assert instance.faded_value(_memory(T[0], {"creative_hunger": 8.0}), "creative_hunger") == pytest.approx(2.0)
 
 
+def _count_lookups(monkeypatch: pytest.MonkeyPatch, answer: dict) -> list[list[str]]:
+    """Every batch of names this process asks the bridge for, in order; the bridge answers `answer` (tidied name -> half-life days)."""
+    from brain.emotion import vocabulary_access
+
+    asked: list[list[str]] = []
+
+    def bridge(_persona: Path, route: str, body: dict, *, timeout: float) -> dict:
+        asked.append(body["names"])
+        return {"entries": [
+            {"name": n, "spelling": n, "category": "persona_extension", "description": "d", "half_life_days": answer[n]} for n in body["names"]
+        ]}
+
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", bridge)
+    return asked
+
+
+def test_a_memory_with_her_own_feelings_asks_the_bridge_once_for_all_its_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec section 5: one call per memory, never one per name; framework names are never asked."""
+    asked = _count_lookups(monkeypatch, {"warm_ache": 6.0, "slow_dread": 12.0, "third_word": 3.0})
+    instance, clock = _live_engine(tmp_path, T[0], T[12])
+    memory = _memory(T[0], {"joy": 8.0, "Warm Ache": 8.0, "slow_dread": 8.0, "third_word": 8.0, "love": 8.0})
+    feelings = instance.memory_feelings(memory).feelings
+    assert asked == [["slow_dread", "third_word", "warm_ache"]]  # one call, tidied names, sorted, no framework name
+    assert feelings["warm_ache"] == pytest.approx(2.0)  # 12 days at 6 days
+    assert feelings["slow_dread"] == pytest.approx(4.0)  # one half-life of 12 days
+    assert feelings["third_word"] == pytest.approx(0.5)  # four half-lives of 3 days
+    assert feelings["joy"] == pytest.approx(0.5)  # the framework's 3 days, from the table
+    instance.faded_value(memory, "Warm Ache")  # the key as the memory stores it
+    assert len(asked) == 2  # a new read of the memory asks again: nothing is kept
+
+
+def test_a_memory_with_only_framework_feelings_asks_the_bridge_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    asked = _count_lookups(monkeypatch, {})
+    instance, clock = _live_engine(tmp_path, T[0], T[12])
+    assert instance.memory_feelings(_memory(T[0], {"joy": 8.0, "love": 8.0})).feelings["joy"] == pytest.approx(0.5)
+    assert asked == []
+
+
+def test_faded_value_of_one_name_asks_once_for_the_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    asked = _count_lookups(monkeypatch, {"warm_ache": 6.0, "slow_dread": 12.0})
+    instance, clock = _live_engine(tmp_path, T[0], T[12])
+    memory = _memory(T[0], {"warm_ache": 8.0, "slow_dread": 8.0})
+    assert instance.faded_value(memory, "warm_ache") == pytest.approx(2.0)
+    assert asked == [["slow_dread", "warm_ache"]]
+
+
 def test_faded_value_needs_no_store_so_it_serves_a_row_that_hard_delete_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     persona = make_persona(tmp_path, [_memory(T[0], {"joy": 8.0})])  # id "m", importance 0
     store = MemoryStore(persona / "memories.db")

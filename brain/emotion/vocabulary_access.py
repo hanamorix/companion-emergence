@@ -229,11 +229,15 @@ def add_local(persona_dir: Path, items: Sequence[tuple[str, Mapping[str, Any] | 
     """The owner's add: only entry fields are taken from a caller, and an item whose fields are not valid is `refused` (nothing is
     written for it); the rest go through the shared writer in one locked write. One result per item, in order."""
     kept = [(raw, None if fields is None else {k: v for k, v in fields.items() if k in ENTRY_FIELDS}) for raw, fields in items]
-    valid = [item for item in kept if item[1] is None or _fields_valid(item[1])]
-    if len(valid) < len(kept):
+    valid_at = [i for i, (_raw, fields) in enumerate(kept) if fields is None or _fields_valid(fields)]
+    if len(valid_at) < len(kept):
         warn_throttled(logger, "vocabulary_access:invalid_fields", "vocabulary: an add carried an entry field that is not valid; that name is refused", exc_info=False)
-    written = iter(vocabulary_file.add(vocabulary_file.vocabulary_path(persona_dir), valid) if valid else [])
-    return [next(written) if item in valid else NameResult(item[0], None, "refused") for item in kept]
+    results = [NameResult(raw, None, "refused") for raw, _fields in kept]
+    if valid_at:
+        written = vocabulary_file.add(vocabulary_file.vocabulary_path(persona_dir), [kept[i] for i in valid_at])
+        for i, result in zip(valid_at, written, strict=True):
+            results[i] = result
+    return results
 
 
 def check(

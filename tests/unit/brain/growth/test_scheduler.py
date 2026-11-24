@@ -116,6 +116,17 @@ def _proposal(name: str = "lingering") -> EmotionProposal:
     )
 
 
+def test_run_growth_tick_counts_a_proposal_the_add_refuses_as_rejected_and_adds_the_rest(persona_dir: Path, store: MemoryStore) -> None:
+    """A half-life of 0 days is not a number the engine can use: the add refuses that proposal, the tick counts it and goes on."""
+    bad = EmotionProposal(
+        name="no_time", description="d", decay_half_life_days=0.0, evidence_memory_ids=(), score=0.5, relational_context=None
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[bad, _proposal("lingering")]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert (result.emotions_added, result.proposals_rejected) == (1, 1)
+    assert [e["name"] for e in json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]] == ["lingering"]
+
+
 def test_run_growth_tick_in_another_process_with_no_bridge_adds_nothing_and_leaves_her_file(
     persona_dir: Path, store: MemoryStore
 ) -> None:

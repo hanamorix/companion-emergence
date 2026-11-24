@@ -845,7 +845,7 @@ class EmotionEngine:
         `KeyError` naming the memory id and the emotion when the memory has no such emotion: "absent" is for the caller to decide.
         """
         switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
-        value = faded_emotion(memory, emotion, self.half_life, switched, self._now())
+        value = faded_emotion(memory, emotion, self._half_lives_for(memory), switched, self._now())
         return resolve_emotions({emotion: value}).get(vocabulary.canonical_name(emotion), 0.0)
 
     def memory_feelings(self, memory: Memory) -> MemoryFeelings:
@@ -856,7 +856,7 @@ class EmotionEngine:
         access, at the time read here. The memory is read, never changed, and no store is read.
         """
         switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
-        return memory_feelings(memory, self.half_life, switched, self._now())
+        return memory_feelings(memory, self._half_lives_for(memory), switched, self._now())
 
     def feels_high(self, name: str) -> bool:
         """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.
@@ -895,13 +895,34 @@ class EmotionEngine:
         `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS`.
         """
         name = vocabulary.canonical_name(emotion)
-        persona = self._vocabulary.get(name)
+        return self._half_life_of(name, self._vocabulary.get_many([name]).get(name))
+
+    @staticmethod
+    def _half_life_of(name: str, persona: float | None) -> float:
+        """The order of `half_life` once her vocabulary has answered: that number, else the table, else the default."""
         if persona is not None:
             return persona
         table = dev_constants.EMOTION_HALF_LIFE_DAYS.get(name)
         if table is not None:
             return table
         return dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS
+
+    def _half_lives_for(self, memory: Memory) -> Callable[[str], float]:
+        """The half-life lookup for ONE memory's feelings: her vocabulary is asked once, for every name the memory holds.
+
+        The first call asks (one lookup for the whole memory, never one per name: spec section 5); a memory whose names are all
+        framework names, or whose feelings are never read, asks nothing. The answer is not kept past this memory.
+        """
+        persona: dict[str, float] | None = None
+
+        def half_life(emotion: str) -> float:
+            nonlocal persona
+            if persona is None:
+                persona = self._vocabulary.get_many(memory._stored_emotions)
+            name = vocabulary.canonical_name(emotion)
+            return self._half_life_of(name, persona.get(name))
+
+        return half_life
 
     # --- the daily pass and recovery ---------------------------------------------------------------
 
