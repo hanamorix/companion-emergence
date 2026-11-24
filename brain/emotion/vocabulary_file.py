@@ -399,7 +399,8 @@ def merge_twin_entries(data: dict, only: set[str] | None = None) -> list[tuple[s
 def merge(path: Path, names: Iterable[str] | None = None) -> MergeResult:
     """Merge twin entries in her vocabulary file (the rule of `merge_twin_entries`); `names` limits it to those names.
 
-    Nothing is written when there is no twin. The registered entry of each merged name becomes the merged entry.
+    Nothing is written when there is no twin. The registered entry of each merged name becomes the merged entry. A core feeling is
+    never merged (its entries stay where they are for the start-up removal), whether or not `names` lists it.
     """
     only = None if names is None else {vocabulary.canonical_name(n) for n in names}
 

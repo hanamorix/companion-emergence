@@ -140,7 +140,8 @@ def run_vocab_repair(
     # Step 0 (#174, provider-free, every run): collapse spelling-variant twins
     # (love_grief_blend / grief_love_blend, anticipatory-grief / Anticipatory_Grief)
     # into one entry under the spelling that comes first in the file. A twin with a real
-    # description gives the fields (it beats a placeholder). Every change to the file below
+    # description gives the fields (it beats a placeholder). A core feeling's twins are never merged (they stay for the
+    # start-up removal). Every change to the file below
     # goes through `vocabulary_file`. A merge or half-life bump it could not write raises, so the state
     # file is not rewritten and the repair runs again at the next start; a description batch it could not
     # write raises into Step 2's fail-soft handler (placeholders kept, retried at the next start).
