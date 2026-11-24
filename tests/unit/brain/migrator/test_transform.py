@@ -288,7 +288,6 @@ def test_a_row_whose_feelings_are_all_dropped_gets_four() -> None:
     assert mem.importance == 4.0
 
 
-@pytest.mark.no_base_failure(reason="control: a numeric importance was always kept as given; this pins that the check does not touch it")
 def test_a_numeric_importance_is_kept_as_given_when_a_feeling_is_dropped() -> None:
     mem, _ = transform_memory(_og(importance=8.0, emotions={"love": 4.0, "gone": 20.0}, emotion_score=24.0), checked=_keeping("love"))
     assert mem is not None
