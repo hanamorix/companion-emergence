@@ -4,7 +4,7 @@ Gate rule: the DEFAULT-relay fallback (and any outbound dial) fires only when
 the user has explicitly opted in — `kindled_link_enabled is True` OR
 `kindled_relay_url is not None`. Otherwise /self-test and /connect return a
 clear, non-dialling 400 instead of silently wiring + contacting the hosted
-relay. See docs/superpowers/specs/2026-06-30-kindled-link-mind-wiring-and-relay-gate.md §C.
+relay. Spec: the 2026-06-30 kindled-link mind-wiring and relay-gate design (§C), never committed and lost (#797).
 """
 from __future__ import annotations
 

@@ -284,6 +284,9 @@ html[data-reduced-motion="true"] *::after {
   line-height: 1.45;
   white-space: pre-wrap;
   color: var(--text);
+  /* #532: a long reach-out scrolls here, so Reply and Dismiss below it stay in view. */
+  max-height: 140px;
+  overflow-y: auto;
 }
 .initiate-banner__reply {
   display: flex;
@@ -410,4 +413,93 @@ html[data-reduced-motion="true"] *::after {
 .pending-write-card__actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* VoiceEditPanel: her proposal to change her own voice, the third "she's asking you something" card, on the same
+   rose-glass recipe. #532: the text scrolls inside a capped body, and the buttons sit in a footer below it. */
+.voice-edit-panel {
+  background:
+    linear-gradient(rgba(200, 152, 144, 0.14), rgba(200, 152, 144, 0.14)),
+    var(--panel);
+  border: 1px solid rgba(200, 152, 144, 0.4);
+  border-radius: 14px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.voice-edit-panel h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--rose);
+}
+.voice-edit-panel__body {
+  max-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.voice-edit-panel__rationale,
+.voice-edit-panel__evidence {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+.voice-edit-panel__evidence {
+  font-size: 11px;
+  color: var(--text-mute);
+}
+.voice-edit-panel__diff {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 6px;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.voice-edit-panel .diff-line--remove {
+  color: var(--text-mute);
+  text-decoration: line-through;
+}
+.voice-edit-panel .diff-line--add {
+  color: var(--text);
+}
+.voice-edit-panel .diff-line--context {
+  color: var(--text-mute);
+}
+.voice-edit-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: flex-end;
+  gap: 8px;
+}
+.voice-edit-panel__actions button {
+  background: transparent;
+  border: 1px solid var(--rose);
+  color: var(--rose);
+  border-radius: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.voice-edit-panel__actions textarea {
+  /* Shares the row with Confirm and Cancel, so editing doesn't make the card taller than the card stack. */
+  flex: 1 1 160px;
+  min-height: 48px;
+  max-height: 96px;
+  resize: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(200, 152, 144, 0.4);
+  border-radius: 6px;
+  padding: 6px 8px;
 }

@@ -84,7 +84,7 @@ def add_memory(
     # Body event hook: when an LLM-tagged memory commits with climax at or above
     # CLIMAX_THRESHOLD, auto-write a private journal_entry referencing this
     # originating memory. Fail-soft inside record_climax_event — never affects the
-    # add_memory return value. Per spec docs/superpowers/specs/2026-04-29-body-state-design.md.
+    # add_memory return value. Per spec docs/source-spec/2026-04-29-body-state-design.md §5.1.
     from brain.body.events import CLIMAX_THRESHOLD, record_climax_event
 
     # A memory created this instant has no age to fade: the pure read (no engine call, which could raise after the row is committed).

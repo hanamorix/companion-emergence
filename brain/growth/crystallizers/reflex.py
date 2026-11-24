@@ -1,7 +1,7 @@
 """Reflex crystallizer — emergence + pruning judgment via Claude CLI.
 
 Phase 2 of the reflex engine. Deferred — see
-`docs/superpowers/specs/2026-04-28-reflex-phase-2-emergent-arc-crystallization-design.md`
+the 2026-04-28 reflex phase-2 emergent-arc crystallization design (never committed and lost, #797)
 §14; chunks 7–8 (apply + acceptance gate) never landed, zero prod callers.
 
 This module currently exposes:

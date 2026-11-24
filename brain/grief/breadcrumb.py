@@ -10,7 +10,7 @@ Content phrases (§4) — all deterministic, zero LLM:
   - arc-close:    "the arc '{arc_name}' has closed"
   - recall-touch: "reached for {first_6_words_of_summary} — gone"
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md §3 + §4
+Spec: the 2026-05-19 grief design (§3 + §4), never committed and lost (#797).
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """Through-path test: the bridge lifespan runs the settings boot pass (``sync_file``).
 
-Spec: docs/superpowers/specs/2026-07-04-ops-tunables-design.md (reshaped in #529)
+Spec: the 2026-07-04 ops-tunables design (reshaped in #529), never committed and lost (#797).
 
 Contract: entering the real app lifespan (TestClient context manager) and hitting /health causes
 $KINDLED_HOME/tunables.toml to exist with one entry per registered setting, proving sync_file() actually fires through the

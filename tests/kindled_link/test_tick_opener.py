@@ -1,7 +1,7 @@
 """Kindled-link no-flow fix — autonomous content opener tests.
 
-Added one at a time per TDD discipline. See spec:
-  docs/superpowers/specs/2026-06-29-kindled-no-flow-opener-design.md
+Added one at a time per TDD discipline. Spec: the 2026-06-29 kindled no-flow
+opener design, never committed and lost (#797).
 """
 from __future__ import annotations
 

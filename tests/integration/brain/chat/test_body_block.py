@@ -1,6 +1,6 @@
 """Integration tests for the body block in the chat system message.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §4 + §7.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §4 + §7.
 
 Covers inviolate properties from §7.1:
 - #1 reset is idempotent across multiple aggregations

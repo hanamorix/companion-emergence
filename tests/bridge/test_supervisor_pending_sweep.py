@@ -86,7 +86,7 @@ def test_supervisor_sweeps_expired_pending_writes_on_maintenance(
 # ---------------------------------------------------------------------------
 # #344 — a write stranded in 'committing' is reconciled by the supervisor:
 # once at startup (1-minute gate) and on every maintenance tick (10-minute gate).
-# Criteria: docs/guarded-change/pending-committing-recovery/1.5-criteria.md
+# Criteria: the #344 guarded-change criteria, a private record that is not committed (#797).
 # ---------------------------------------------------------------------------
 
 

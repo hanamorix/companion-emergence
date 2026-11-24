@@ -7,7 +7,7 @@ re-register so multiple loaders in the same process don't fail.
 Every write this loader makes to the file (the rebuild of a missing or corrupt file, the memory heal) goes through
 `brain.emotion.vocabulary_file`, the one writer of that file.
 
-Spec: docs/superpowers/specs/2026-04-25-vocabulary-split-design.md
+Spec: the 2026-04-25 vocabulary-split design, never committed and lost (#797).
 """
 
 from __future__ import annotations

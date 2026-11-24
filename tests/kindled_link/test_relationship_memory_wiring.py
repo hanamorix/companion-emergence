@@ -1,6 +1,6 @@
 """§B — wire write_kindled_peer_memory + apply_peer_emotion into the live
-reflection pass (run_relationship_reflection). TDD per
-docs/superpowers/specs/2026-06-30-kindled-link-mind-wiring-and-relay-gate.md.
+reflection pass (run_relationship_reflection). TDD per the 2026-06-30
+kindled-link mind-wiring and relay-gate design, never committed and lost (#797).
 """
 import contextlib
 from datetime import UTC, datetime

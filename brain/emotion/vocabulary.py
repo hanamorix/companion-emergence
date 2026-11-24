@@ -118,7 +118,7 @@ _BASELINE: tuple[Emotion, ...] = (
         EMOTION_HALF_LIFE_DAYS["groundedness"],
     ),
     # ── body (4) ──
-    # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.
+    # Spec docs/source-spec/2026-04-29-body-state-design.md §2.1.
     # Existing `arousal` (core, 0.5d) and `desire` (core, 2.0d) reused;
     # they're already body-coded by description, no need to duplicate.
     Emotion(

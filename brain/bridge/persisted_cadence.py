@@ -10,7 +10,7 @@ Simpler than ``brain/soul/cadence.py``: pure next-due pacing, no failure-backoff
 or backlog-drain semantics (the cadences using this — voice reflection,
 forgetting+narrative maintenance, finalize — have no per-item backlog; finalize
 owns its own F-011 extraction backoff). See
-``docs/superpowers/specs/2026-06-23-persisted-cadence-design.md``.
+``docs/guarded-change/persisted-cadence/1-spec.md`` (the full 2026-06-23 design was never committed, #797).
 """
 from __future__ import annotations
 

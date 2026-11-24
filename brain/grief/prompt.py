@@ -5,7 +5,7 @@ prompt-builder call site. Names up to 2 specific losses (one memory,
 one arc), with deterministic lived-time stamps + heavy/medium/light
 weight labels.
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md §5
+Spec: the 2026-05-19 grief design (§5), never committed and lost (#797).
 """
 
 from __future__ import annotations

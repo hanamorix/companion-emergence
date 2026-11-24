@@ -1,7 +1,6 @@
 """Tests for brain.health.log_rotation — rolling-size + yearly-archive rotation.
 
-Spec: docs/superpowers/specs/2026-05-11-jsonl-log-retention-design.md
-Plan: docs/superpowers/plans/2026-05-11-jsonl-log-retention.md (Phase 2)
+Spec and plan (Phase 2): the 2026-05-11 JSONL log-retention design and plan, never committed and lost (#797).
 """
 
 from __future__ import annotations
