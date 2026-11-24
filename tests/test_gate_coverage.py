@@ -347,6 +347,7 @@ def test_g6b_no_unpinned_update_that_skips_the_name_check():
     assert all(reason.strip() for _count, reason in _CHECK_NAMES_OFF_PINNED.values())
 
 
+@pytest.mark.no_base_failure(reason="self-test of the guard on synthetic source; passes on any base by design")
 def test_g6b_guard_can_fail():
     """The REAL enumerator on synthetic bypasses: each shape is found, a checked write and a constant True are not."""
     bypasses = {
