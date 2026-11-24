@@ -508,7 +508,7 @@ def test_a_real_bridge_that_accepts_and_never_answers_costs_one_wait_per_turn(tm
         later = time.monotonic() - begin
         assert first["quiet_dread"] is not None and first["no_such_word"] is None
         assert [r.outcome for r in adds] == ["used", "missing"]
-        assert first_wait >= wait * 0.9 and later < wait * 0.5  # one wait, then no wait at all
+        assert first_wait >= wait * 0.9 and later < wait  # one wait, then no wait at all (the connection count below is the exact proof; this bound only catches a second wait)
         assert len(accepted) == 1  # one connection was ever made
     finally:
         server.close()

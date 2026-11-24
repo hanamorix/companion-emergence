@@ -232,7 +232,7 @@ def lookup(persona_dir: Path, names: Sequence[str] | Literal["all"]) -> dict[str
     """The entry of each raw name (None = unknown), or every entry keyed by tidied name for "all". One call for the whole batch.
 
     The owner answers from its registry; any other process asks the bridge and, when the bridge cannot be reached or answers
-    anything but a lookup, reads her file read-only for this run.
+    anything but a lookup, reads her file read-only for this run (after a timeout, for the rest of the turn without asking again).
     """
     names = ALL if names == ALL else list(names)
     if vocabulary.is_bridge_owner():
