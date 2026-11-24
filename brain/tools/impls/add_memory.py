@@ -27,8 +27,11 @@ def add_memory(
 ) -> dict:
     """Write a gated memory.
 
+    The emotions are checked against her vocabulary first (`MemoryStore.checked_emotions`); the gate scores and the row
+    stores the checked feelings, not the names the persona sent.
+
     Write gate (ported from OG nell_tools.py:add_memory):
-      - emotion_score = sum(emotions.values())
+      - emotion_score = sum of the checked emotions' values
       - effective_importance = importance if provided else auto-calculated
       - PASSES iff emotion_score >= 15 OR effective_importance >= 7
       - Else returns {"created": False, "reason": "..."} with below-threshold detail
@@ -45,6 +48,10 @@ def add_memory(
     dict — either a rejection dict (created=False) or a success dict (created=True).
     """
     tags = list(tags or [])
+
+    # The feelings are checked against her vocabulary once, here, so the gate scores what the store will keep (a name the
+    # check discards counts for nothing, two spellings of one feeling count as their mean).
+    emotions = store.checked_emotions(emotions)
 
     passes, effective_importance, emotion_score, rejection_reason = _write_gate_check(
         emotions, importance
@@ -71,7 +78,8 @@ def add_memory(
     )
     # She reaches this memory at the moment she makes it (emotion rework, Hana half, Task 6).
     memory.last_accessed_at = memory.created_at
-    store.create(memory)
+    # The names were checked above (one check, one bridge call per memory), so the store keeps them as given.
+    store.create(memory, check_names=False)
 
     # Body event hook: when an LLM-tagged memory commits with climax at or above
     # CLIMAX_THRESHOLD, auto-write a private journal_entry referencing this

@@ -210,7 +210,7 @@ _ALLOWED_DIRECT = {
     ("recovery/engine.py", "store.create(mem, fold=False, check_names=False)"),
     ("soul/review.py", "soul_store.create(c)"),
     ("tools/impls/add_journal.py", "store.create(memory)"),
-    ("tools/impls/add_memory.py", "store.create(memory)"),
+    ("tools/impls/add_memory.py", "store.create(memory, check_names=False)"),
     ("tools/impls/crystallize_soul.py", "soul_store.create(c)"),
 }
 _PINNED = _KNOWN_NON_MEMORY | _ALLOWED_DIRECT

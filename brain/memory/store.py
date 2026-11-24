@@ -1364,7 +1364,8 @@ class MemoryStore:
 
         The memory's feelings are checked against her vocabulary first (`checked`), before the write transaction and before the peak
         is worked out; the engine is told the checked memory. `check_names=False` keeps the names as given: for a write that moves
-        feelings the memory already holds (a restore, an import), which must not lose a name.
+        feelings the memory already holds (a restore, an import), which must not lose a name, and for a caller that has just run
+        `checked_emotions` itself (`add_memory`, which gates on the checked feelings) so the check runs once.
 
         A failed write is rolled back when this call opened the transaction it ran in (a transaction the caller already
         had open is left as it was), so a failure does not leave one open for the next writer.
