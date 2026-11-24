@@ -404,6 +404,7 @@ def test_the_next_turn_asks_the_bridge_again_and_only_for_the_persona_that_timed
     assert [c[0] for c in bridge_calls] == [tmp_path, other, tmp_path]
 
 
+@pytest.mark.no_base_failure(reason="a pin that the other failures keep asking each call, which the old code also did; it guards the new flag against being set too widely")
 @pytest.mark.parametrize("answer", [{"error": "bridge unreachable"}, {"error": "bridge error 500"}, {"entries": "wrong"}, ["no"]])
 def test_only_a_timeout_stops_the_calls(tmp_path: Path, bridge_calls: _Calls, answer: object) -> None:
     bridge_calls.answer = answer
