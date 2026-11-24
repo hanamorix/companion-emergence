@@ -236,6 +236,74 @@ def test_the_owner_flag_goes_back_to_the_value_it_had(home, tmp_path) -> None:
     assert vocabulary.is_bridge_owner() is True
 
 
+def _rows(persona_dir: Path) -> dict[str, tuple[dict, float, float, float]]:
+    """id -> (stored emotions, importance, score, peak) as stored."""
+    conn = sqlite3.connect(persona_dir / "memories.db")
+    try:
+        rows = conn.execute("SELECT id, emotions_json, importance, score, peak_emotion_intensity FROM memories").fetchall()
+    finally:
+        conn.close()
+    return {rid: (json.loads(raw or "{}"), imp, score, peak) for rid, raw, imp, score, peak in rows}
+
+
+def test_a_legacy_row_with_no_importance_gets_the_importance_of_its_kept_feelings(home, tmp_path) -> None:
+    """#803 step 13 (MG12): raw feelings sum to 11 (importance 5); the gate refuses `---`, so the kept sum is 2 (importance 3)."""
+    og = _og_source(tmp_path, [_mem("m1", {"---": 9.0, "held_word_vx": 2.0})])
+    _migrate(og)
+    emotions, importance, score, peak = _rows(get_persona_dir("testpersona"))["m1"]
+    assert emotions == {"held_word_vx": 2.0}
+    assert importance == 3.0
+    assert (score, peak) == (2.0, 2.0)
+
+
+def test_a_legacy_row_whose_feelings_are_all_dropped_gets_four(home, tmp_path) -> None:
+    og = _og_source(tmp_path, [_mem("m1", {"---": 12.0})])
+    _migrate(og)
+    emotions, importance, score, peak = _rows(get_persona_dir("testpersona"))["m1"]
+    assert emotions == {}
+    assert importance == 4.0
+    assert (score, peak) == (0.0, 0.0)
+
+
+@pytest.mark.no_base_failure(reason="control: a numeric legacy importance was always kept as given, and the base's create already held only kept feelings in score and peak")
+def test_a_numeric_legacy_importance_is_kept_and_score_and_peak_hold_only_kept_feelings(home, tmp_path) -> None:
+    row = _mem("m1", {"---": 9.0, "held_word_vx": 2.0})
+    row["importance"] = 8.0
+    og = _og_source(tmp_path, [row])
+    _migrate(og)
+    emotions, importance, score, peak = _rows(get_persona_dir("testpersona"))["m1"]
+    assert emotions == {"held_word_vx": 2.0}
+    assert importance == 8.0
+    assert (score, peak) == (2.0, 2.0)
+
+
+def test_two_spellings_average_before_the_importance_is_banded(home, tmp_path) -> None:
+    """Raw sum 24 bands to 7; the two spellings average to 4.0, which bands to 3."""
+    og = _og_source(tmp_path, [_mem("m1", {"Odd Word VX": 20.0, "odd_word_vx": 4.0})])
+    _migrate(og)
+    emotions, importance, score, peak = _rows(get_persona_dir("testpersona"))["m1"]
+    assert list(emotions.values()) == [12.0]
+    assert importance == 5.0
+    assert (score, peak) == (12.0, 12.0)
+
+
+def test_the_check_runs_once_per_row_and_before_the_duplicate_id_skip(home, tmp_path, monkeypatch) -> None:
+    """Each transformed row is checked once (a skipped duplicate costs its one check, before the skip); `create` does not check again."""
+    og = _og_source(tmp_path, [_mem("m1", {"held_word_vx": 2.0}), _mem("m2", {"held_word_vx": 3.0}), _mem("m1", {"held_word_vx": 4.0})])
+    calls: list[str] = []
+    real_checked = MemoryStore.checked
+
+    def spy(self, memory):
+        calls.append(memory.id)
+        return real_checked(self, memory)
+
+    monkeypatch.setattr(MemoryStore, "checked", spy)
+    report = _migrate(og)
+    assert calls == ["m1", "m2", "m1"]
+    assert report.memories_migrated == 2
+    assert [s.reason for s in report.memories_skipped] == ["duplicate_id"]
+
+
 @pytest.mark.no_base_failure(reason="pins that a re-run with --force replaces the old file (the folder is cleared first); the base overwrote it too")
 def test_a_forced_re_migration_holds_only_the_new_migrations_names(home, tmp_path) -> None:
     first = _og_source(tmp_path, [_mem("m1", {"first_run_vx": 3.0})])

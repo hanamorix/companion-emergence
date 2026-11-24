@@ -207,7 +207,10 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
     seen_ids: set[str] = set()
     try:
         for og_mem in og_memories:
-            mem, sk = transform_memory(og_mem)
+            # Checked here, once, by the store's owner-side check (this process is the owner for the run, `run_migrate`): the check runs
+            # inside `transform_memory`, before the legacy importance is derived (from the kept feelings) and before the duplicate-id
+            # skip below, which therefore still costs its one check.
+            mem, sk = transform_memory(og_mem, checked=store.checked)
             if sk is not None:
                 skipped.append(sk)
                 continue
@@ -223,8 +226,9 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            # Always checked, by the store's owner-side check (this process is the owner for the run, `run_migrate`), on every path.
-            store.create(mem, fold=False)
+            # The names were checked in `transform_memory` above (the importance is derived from what the check keeps), so the store
+            # does not run the check a second time: one check per memory, on every path.
+            store.create(mem, fold=False, check_names=False)
             migrated_count += 1
     finally:
         store.close()

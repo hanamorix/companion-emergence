@@ -783,6 +783,9 @@ REMOVED: tuple[Removed, ...] = (
             "brain/emotion/engine_rebuild.py",
             "brain/emotion/engine_utils.py",
             "brain/memory/store.py",
+            # the migrator's transform derives a legacy row's importance from the feelings the store's check KEPT on the memory it
+            # just built (#803 step 13, MG12): the unheld stored values, as the importance rule always read them, not a read-time view
+            "brain/migrator/transform.py",
         ),
     ),
     # --- the predefined `body_grief` feeling (#652) -----------------------------------------------------------------------
