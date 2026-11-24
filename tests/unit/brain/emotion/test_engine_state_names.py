@@ -215,6 +215,18 @@ def test_a_key_matching_an_entry_with_a_non_tidied_spelling_is_kept_under_the_ti
     assert names == ["Comfort Seeking"]  # her file keeps its own spelling
 
 
+def test_a_key_spelled_another_way_is_saved_under_the_tidied_form_of_the_entry_spelling(tmp_path: Path) -> None:
+    persona = _persona(tmp_path, {"comfort seeking": _emotion((3.0, 1.0), (3.0, 1.0))}, entries=[_entry("Comfort Seeking")])
+    from brain.emotion.persona_loader import load_persona_vocabulary
+
+    load_persona_vocabulary(persona / FILE)
+    result = engine_state_names.check_state_names(persona)
+    assert (result.renamed, result.merged, result.written) == (1, 0, True)
+    assert list(_state(persona).emotions) == ["comfort_seeking"]
+    names = [e["name"] for e in json.loads((persona / FILE).read_text(encoding="utf-8"))["emotions"]]
+    assert names == ["Comfort Seeking"]
+
+
 def test_a_state_with_nothing_to_change_is_not_rewritten_and_makes_no_backup(tmp_path: Path) -> None:
     persona = _persona(tmp_path, {"joy": _emotion((4.0, 1.0), (2.0, 1.0)), "grief": _emotion((1.0, 1.0), (1.0, 1.0))})
     before = _bytes(persona)
