@@ -189,7 +189,7 @@ def test_the_script_runs_end_to_end_on_the_engine_rule_alone(tmp_path):
     assert int(first_cell.split("/")[0]) > 0, love_row
 
 
-def test_a_row_whose_only_emotion_is_non_finite_counts_as_having_emotions_and_logs_no_drop(tmp_path, caplog):
+def test_a_row_whose_only_emotion_is_non_finite_counts_as_having_emotions_and_logs_no_drop(tmp_path, caplog, register_feelings):
     """The "with emotions" count asks whether a row names an emotion, not whether it has a finite value.
 
     The extra row is an "event" row, which the engine does not count, so the report's only read of it is that count.
@@ -201,6 +201,7 @@ def test_a_row_whose_only_emotion_is_non_finite_counts_as_having_emotions_and_lo
 
     db = tmp_path / "memories.db"
     _synthetic_db(db)
+    register_feelings("nan_ache")  # a memory write discards a name her vocabulary does not hold
     store = MemoryStore(db)
     try:
         store.create(
