@@ -172,7 +172,8 @@ def transform_memory(
     if checked is not None:
         mem = checked(mem)
         if not importance_given:
-            mem = replace(mem, importance=_derived_importance(mem._stored_emotions))
+            # the kept feelings as stored on the checked copy, through the memory's public serialised form
+            mem = replace(mem, importance=_derived_importance(mem.to_dict()["emotions"]))
     return mem, None
 
 

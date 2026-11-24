@@ -278,7 +278,7 @@ def test_a_numeric_legacy_importance_is_kept_and_score_and_peak_hold_only_kept_f
 
 
 def test_two_spellings_average_before_the_importance_is_banded(home, tmp_path) -> None:
-    """Raw sum 24 bands to 7; the two spellings average to 4.0, which bands to 3."""
+    """Raw sum 24 bands to 7; the two spellings average to 12.0, which bands to 5."""
     og = _og_source(tmp_path, [_mem("m1", {"Odd Word VX": 20.0, "odd_word_vx": 4.0})])
     _migrate(og)
     emotions, importance, score, peak = _rows(get_persona_dir("testpersona"))["m1"]
