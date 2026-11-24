@@ -8,8 +8,10 @@ and writes nothing.
 
 Each change is ONE read-check-write, built once in `_transact`: the cross-process sidecar lock of the file taken with a bounded
 wait (`dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S`), the file re-read, the change applied to what was just read, a verified
-`json_io.write_json` with the shared backup count, then the registry changed under one `threading.Lock`. The file comes first and
-the registry second, so a write that fails leaves the registry as it was. The lock is not re-entrant, so the public operations
+`json_io.write_json` with the shared backup count, then the registry changed under one `threading.Lock` (still inside the file
+lock, so registry changes follow file changes in the same order). The file comes first and the registry second, so a write that
+fails leaves the registry as it was. An error in the registry step itself (a bug, not a file problem) is raised to the caller
+after the lock is released; the file is already written and the next `load` registers what it holds. The lock is not re-entrant, so the public operations
 never call each other and `load` takes no lock. Lock order for any later caller: `engine_files.state_lock` is the OUTER lock and
 this file's lock the INNER one.
 
@@ -176,22 +178,29 @@ def _transact(path: Path, mutate: _Mutation, action: str) -> tuple[Any, bool]:
     read or the write, a write that did not verify, and a lock wait that ran out are all `cannot_write`; the cause is logged.
     """
     count = backup_count(path)
+    registry_error: Exception | None = None
     try:
         with file_lock.locked_within(path, dev_constants.EMOTION_VOCABULARY_LOCK_WAIT_S):
             data = read_json_result(
                 path, default=default_vocabulary, recover=Recovery.RAISE, validate=validate_schema
             ).data
             payload, registry_step = mutate(data)
-            if registry_step is not None and not write_json(path, data, backups=count, verify=True):
-                raise OSError("the write did not verify (the previous file was restored)")
+            if registry_step is not None:
+                if not write_json(path, data, backups=count, verify=True):
+                    raise OSError("the write did not verify (the previous file was restored)")
+                # Still inside the file lock, so two writers' registry changes follow their file changes in the same order.
+                # A registry error is kept apart from the file errors handled below: the file is written, so it is not a
+                # `cannot_write`, and it is raised once the lock is released.
+                try:
+                    with _REGISTRY_LOCK:
+                        registry_step()
+                except Exception as exc:  # noqa: BLE001  re-raised below, after the file lock is released
+                    registry_error = exc
     except (OSError, ValueError) as exc:
         logger.warning("vocabulary: %s of %s failed (%s: %s); the file and the registry are as they were", action, path.name, type(exc).__name__, exc)
         return None, False
-    # The file is written (or there was nothing to write). The registry follows, outside the file errors above, so a registry
-    # problem is never reported as a failed write of a file that was written.
-    if registry_step is not None:
-        with _REGISTRY_LOCK:
-            registry_step()
+    if registry_error is not None:
+        raise registry_error
     return payload, True
 
 

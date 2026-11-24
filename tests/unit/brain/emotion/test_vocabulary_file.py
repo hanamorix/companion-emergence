@@ -90,21 +90,35 @@ def test_add_of_a_name_already_in_the_file_is_used_under_the_file_spelling_and_w
     assert writes == []
 
 
-def test_the_registry_is_changed_after_the_file_is_written_and_not_inside_its_lock(tmp_path: Path, monkeypatch) -> None:
+def test_the_registry_is_changed_after_the_file_is_written_and_inside_the_file_lock(tmp_path: Path, monkeypatch) -> None:
     path = _write(tmp_path, [])
     seen: dict = {}
     real = vocabulary_file._register_new
 
     def probe(entry: dict) -> None:
         seen["file_had_it"] = [e["name"] for e in _read(path)] == [entry["name"]]
-        with file_lock.file_lock(path, blocking=False) as acquired:  # the file lock is free again
-            seen["lock_free"] = acquired
+        with file_lock.file_lock(path, blocking=False) as acquired:  # still held by this very transaction
+            seen["lock_held"] = not acquired
         real(entry)
 
     monkeypatch.setattr(vocabulary_file, "_register_new", probe)
     vocabulary_file.add(path, [("ordered one", None)])
-    assert seen == {"file_had_it": True, "lock_free": True}
+    assert seen == {"file_had_it": True, "lock_held": True}
     assert vocabulary.get("ordered_one") is not None
+
+
+def test_an_error_in_the_registry_step_is_raised_and_is_not_reported_as_a_failed_write(tmp_path: Path, monkeypatch) -> None:
+    path = _write(tmp_path, [])
+
+    def broken(emotion):
+        raise RuntimeError("registry bug")
+
+    monkeypatch.setattr(vocabulary, "register", broken)
+    with pytest.raises(RuntimeError, match="registry bug"):
+        vocabulary_file.add(path, [("registry broken", None)])
+    assert [e["name"] for e in _read(path)] == ["registry_broken"]  # the file is written
+    with file_lock.file_lock(path, blocking=False) as acquired:  # and its lock was released
+        assert acquired
 
 
 def test_add_dedupes_against_the_file_not_the_registry(tmp_path: Path) -> None:
