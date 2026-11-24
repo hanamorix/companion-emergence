@@ -900,6 +900,14 @@ REMOVED: tuple[Removed, ...] = (
         ref="#801 (draft PR #803), build step 5",
         kind="code",
     ),
+    # --- one spelling of her file's name (#803 step 17) -------------------------------------------------------------------------
+    Removed(
+        names=("_VOCABULARY_FILE",),
+        why="the walker's own copy of her vocabulary file's name went: the name is spelled once, as `vocabulary.VOCABULARY_FILENAME`, and tests/unit/test_vocabulary_bypass_guards.py fails on the literal anywhere else in brain/",
+        ref="#803 step 17 (bypass guards)",
+        kind="code",
+        scope=("brain/health/walker.py",),
+    ),
     # --- core feelings are never in her file; the #648 swap is gone (#801 step 7) --------------------------------------------------
     Removed(
         names=("vocabulary_swap", "run_vocabulary_swap_648", "_SWAPPED_NAMES", "_swap_file", "vocabulary_swap_648.json"),

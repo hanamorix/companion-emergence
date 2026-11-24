@@ -9,6 +9,7 @@ from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
+from brain.emotion.vocabulary import VOCABULARY_FILENAME
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
 from brain.health.attempt_heal import _classify_cause
 from brain.health.json_io import JsonFileError, Recovery, anomaly_kind_for, read_json_result
@@ -27,7 +28,7 @@ _DEFAULTS: dict[str, dict] = {
     "heartbeat_state.json": {},  # triggers fresh-init via load fallback
     "interests.json": {"version": 1, "interests": []},
     "reflex_arcs.json": {"version": 1, "arcs": []},
-    "emotion_vocabulary.json": {"version": 1, "emotions": []},
+    VOCABULARY_FILENAME: {"version": 1, "emotions": []},
 }
 
 
@@ -42,9 +43,6 @@ _DEFAULTS: dict[str, dict] = {
 #     them.
 _AUTO_CREATE_TEXT_FILES: tuple[str, ...] = ("voice.md",)
 _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
-
-
-_VOCABULARY_FILE = "emotion_vocabulary.json"
 
 
 def _read_vocabulary(path: Path, default: dict) -> BrainAnomaly | None:
@@ -86,7 +84,7 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     Iterates atomic-rewrite files via read_json_result (HEAL) (captures corruption +
     repairs in one shot) then opens each SQLite store so the constructor's
     PRAGMA integrity_check runs. Returns an empty list when everything is
-    healthy. The one exception is her vocabulary file (`emotion_vocabulary.json`),
+    healthy. The one exception is her vocabulary file (`VOCABULARY_FILENAME`),
     which only the bridge repairs (#803 step 16): see `_read_vocabulary`.
     """
     anomalies: list[BrainAnomaly] = []
@@ -95,7 +93,7 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     # to avoid Python's late-binding closure gotcha.
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
-        if name == _VOCABULARY_FILE:
+        if name == VOCABULARY_FILENAME:
             anomaly = _read_vocabulary(path, default)
         else:
             _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)

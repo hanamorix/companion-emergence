@@ -82,7 +82,7 @@ class MergeResult:
 
 def vocabulary_path(persona_dir: Path) -> Path:
     """Her vocabulary file (``emotion_vocabulary.json``): the one place its name is joined to a persona folder."""
-    return Path(persona_dir) / "emotion_vocabulary.json"
+    return Path(persona_dir) / vocabulary.VOCABULARY_FILENAME
 
 
 def default_vocabulary() -> dict:

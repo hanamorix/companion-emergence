@@ -92,7 +92,7 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
     start, bounded by _DESCRIBE_BATCH per run.
     """
     data = read_json(
-        persona_dir / "emotion_vocabulary.json",
+        vocabulary_file.vocabulary_path(persona_dir),
         default=lambda: None,
         recover=Recovery.CONTENT,
         expect=dict,
@@ -130,7 +130,7 @@ def run_vocab_repair(
     prior_repaired = int(existing.get("repaired", 0)) if prior_complete else 0
     prior_described = int(existing.get("described", 0)) if prior_complete else 0
 
-    vocab_path = persona_dir / "emotion_vocabulary.json"
+    vocab_path = vocabulary_file.vocabulary_path(persona_dir)
     data = read_json(vocab_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
     if data is None or not isinstance(data.get("emotions"), list):
         # missing, corrupt (the module logged it), or a file with no emotions list: skip, as before

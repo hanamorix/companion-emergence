@@ -2066,8 +2066,9 @@ def _run_heartbeat_tick(
         # crystallizers see the same emotion universe the user does.
         try:
             from brain.emotion.persona_loader import load_persona_vocabulary
+            from brain.emotion.vocabulary_file import vocabulary_path
 
-            load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+            load_persona_vocabulary(vocabulary_path(persona_dir), store=store)
         except Exception:
             logger.exception("supervisor heartbeat: vocabulary load skipped")
 
@@ -2177,8 +2178,9 @@ def _run_soul_review_tick(
 
         try:
             from brain.emotion.persona_loader import load_persona_vocabulary
+            from brain.emotion.vocabulary_file import vocabulary_path
 
-            load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+            load_persona_vocabulary(vocabulary_path(persona_dir), store=store)
         except Exception:
             logger.exception("supervisor soul-review: vocabulary load skipped")
 

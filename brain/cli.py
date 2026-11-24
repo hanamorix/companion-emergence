@@ -22,6 +22,7 @@ from brain.emotion import engine as emotion_engine
 from brain.emotion import engine_files, vocabulary_access, vocabulary_file
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
+from brain.emotion.vocabulary import VOCABULARY_FILENAME
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
 from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine
@@ -1360,7 +1361,7 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
     # Listing only reads (#708): a corrupt vocabulary is left as it is for the bridge's start-up, which has the store and can rebuild it.
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+        load_persona_vocabulary(vocabulary_file.vocabulary_path(persona_dir), read_only=True)
     except JsonFileError as exc:
         print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
     interests = InterestSet.load(
@@ -1520,7 +1521,7 @@ def _health_check_handler(args: argparse.Namespace) -> int:
         "heartbeat_state.json",
         "interests.json",
         "reflex_arcs.json",
-        "emotion_vocabulary.json",
+        VOCABULARY_FILENAME,
         "memories.db",
         "hebbian.db",
     ]
