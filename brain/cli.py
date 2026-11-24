@@ -2360,6 +2360,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         break
                     if not user_input:
                         continue
+                    vocabulary_access.start_turn(persona_dir)  # a new turn: ask the bridge again after a timeout (#803 step 9)
                     result = respond(
                         persona_dir,
                         user_input,

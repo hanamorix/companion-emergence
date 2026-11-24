@@ -229,6 +229,7 @@ def test_any_other_failure_is_reported_once_with_its_kind(tmp_path: Path, bridge
     bridge_calls.answer = answer
     with caplog.at_level(logging.WARNING):
         vocabulary_access.lookup(tmp_path, ["joy"])
+        vocabulary_access.start_turn(tmp_path)  # a timeout skips the rest of the turn (below); this test is about each call's report
         vocabulary_access.check(tmp_path, [("brand_new", None)])
     messages = _warnings(caplog)
     assert len(messages) == 2 and all("read-only" in m for m in messages)
@@ -340,3 +341,176 @@ def test_the_bridge_timeout_is_a_named_dev_constant() -> None:
 def test_the_entry_fields_a_caller_may_give_are_the_files_fields_but_the_name() -> None:
     assert set(vocabulary_access.ENTRY_FIELDS) == {"description", "category", "decay_half_life_days", "intensity_clamp"}
     assert vocabulary_file.vocabulary_path(Path("/x")) == Path("/x") / FILE
+
+
+# ---------------------------------------------------------------------------------------------
+# a bridge that is up but never answers: one wait per turn (#803 step 9)
+# ---------------------------------------------------------------------------------------------
+
+TIMEOUT = {"error": "bridge timeout"}
+
+
+def test_after_one_timeout_later_lookups_and_adds_make_no_call_and_use_the_file(tmp_path: Path, bridge_calls: _Calls) -> None:
+    path = _write(tmp_path, [_entry("Quiet Dread", 6.0)])
+    before = path.read_bytes()
+    bridge_calls.answer = TIMEOUT
+    first = vocabulary_access.lookup(tmp_path, ["quiet_dread", "no_such_word"])
+    assert len(bridge_calls) == 1
+    for _ in range(3):
+        assert vocabulary_access.lookup(tmp_path, ["quiet_dread", "no_such_word"]) == first
+    adds = vocabulary_access.check(tmp_path, [("quiet_dread", None), ("Brand New Feeling", None), ("---", None)])
+    assert [(r.outcome, r.spelling) for r in adds] == [("used", "Quiet Dread"), ("missing", None), ("refused", None)]
+    assert len(bridge_calls) == 1  # one wait, then nothing was sent
+    assert path.read_bytes() == before and vocabulary.get("brand_new_feeling") is None
+
+
+def test_a_skipped_call_returns_what_a_timed_out_call_returns(tmp_path: Path, bridge_calls: _Calls) -> None:
+    _write(tmp_path, [_entry("Quiet Dread", 6.0)])
+    bridge_calls.answer = TIMEOUT
+    items = [("quiet_dread", None), ("Brand New Feeling", None), ("---", None)]
+    timed_out_add = vocabulary_access.check(tmp_path, items)
+    skipped_add = vocabulary_access.check(tmp_path, items)
+    vocabulary_access.start_turn(tmp_path)
+    timed_out_lookup = vocabulary_access.lookup(tmp_path, ["quiet_dread", "nope"])
+    skipped_lookup = vocabulary_access.lookup(tmp_path, ["quiet_dread", "nope"])
+    assert skipped_add == timed_out_add and skipped_lookup == timed_out_lookup
+    assert len(bridge_calls) == 2
+
+
+def test_an_add_timeout_skips_later_lookups_and_a_lookup_timeout_skips_later_adds(tmp_path: Path, bridge_calls: _Calls) -> None:
+    _write(tmp_path, [_entry("Quiet Dread", 6.0)])
+    bridge_calls.answer = TIMEOUT
+    vocabulary_access.check(tmp_path, [("brand_new", None)])
+    vocabulary_access.lookup(tmp_path, ["quiet_dread"])
+    assert len(bridge_calls) == 1
+    vocabulary_access.start_turn(tmp_path)
+    vocabulary_access.lookup(tmp_path, ["quiet_dread"])
+    vocabulary_access.check(tmp_path, [("brand_new", None)])
+    assert len(bridge_calls) == 2
+
+
+def test_the_next_turn_asks_the_bridge_again_and_only_for_the_persona_that_timed_out(tmp_path: Path, bridge_calls: _Calls) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    bridge_calls.answer = TIMEOUT
+    vocabulary_access.lookup(tmp_path, ["joy"])
+    vocabulary_access.lookup(tmp_path, ["joy"])
+    assert [c[0] for c in bridge_calls] == [tmp_path]
+    vocabulary_access.lookup(other, ["joy"])  # another persona's bridge was not the one that timed out
+    assert [c[0] for c in bridge_calls] == [tmp_path, other]
+    vocabulary_access.start_turn(tmp_path)
+    bridge_calls.answer = {"entries": [{"name": "joy", "unknown": True}]}
+    assert vocabulary_access.lookup(tmp_path, ["joy"]) == {"joy": None}  # the bridge's answer is used again
+    assert [c[0] for c in bridge_calls] == [tmp_path, other, tmp_path]
+
+
+@pytest.mark.parametrize("answer", [{"error": "bridge unreachable"}, {"error": "bridge error 500"}, {"entries": "wrong"}, ["no"]])
+def test_only_a_timeout_stops_the_calls(tmp_path: Path, bridge_calls: _Calls, answer: object) -> None:
+    bridge_calls.answer = answer
+    vocabulary_access.lookup(tmp_path, ["joy"])
+    vocabulary_access.lookup(tmp_path, ["joy"])
+    assert len(bridge_calls) == 2
+
+
+def test_the_owner_never_reads_the_flag(tmp_path: Path, bridge_calls: _Calls, monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[str] = []
+
+    class Recording(dict):
+        def get(self, *a, **k):
+            reads.append("get")
+            return super().get(*a, **k)
+
+        def __getitem__(self, key):
+            reads.append("getitem")
+            return super().__getitem__(key)
+
+        def __contains__(self, key):
+            reads.append("contains")
+            return super().__contains__(key)
+
+    monkeypatch.setattr(vocabulary_access, "_BRIDGE_TIMED_OUT", Recording({tmp_path: True}))
+    vocabulary.set_bridge_owner(True)
+    assert vocabulary_access.lookup(tmp_path, ["joy"])["joy"] is not None
+    assert vocabulary_access.lookup(tmp_path, vocabulary_access.ALL)
+    assert vocabulary_access.check(tmp_path, [("Fresh Word", None)])[0].outcome == "used"
+    assert vocabulary_access.names_used(tmp_path, ["fresh_word"]) == {"fresh_word": "fresh_word"}
+    assert vocabulary_access.names_known(tmp_path, ["fresh_word"]) == {"fresh_word": "fresh_word"}
+    assert reads == [] and bridge_calls == []
+
+
+def test_the_timeout_report_says_later_calls_go_to_the_file_until_the_next_turn_and_a_skipped_call_says_nothing(
+    tmp_path: Path, bridge_calls: _Calls, no_throttle: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge_calls.answer = TIMEOUT
+    with caplog.at_level(logging.WARNING):
+        vocabulary_access.lookup(tmp_path, ["joy"])
+        first = _warnings(caplog)
+        vocabulary_access.lookup(tmp_path, ["joy"])
+        vocabulary_access.check(tmp_path, [("brand_new", None)])
+    assert first == [
+        "vocabulary: the bridge did not answer /vocabulary/lookup (bridge timeout); "
+        "her file is read read-only for this call and for later vocabulary calls until the next turn"
+    ]
+    assert _warnings(caplog) == first
+
+
+def test_the_add_timeout_report_keeps_its_may_have_added_words(tmp_path: Path, bridge_calls: _Calls, no_throttle: None, caplog: pytest.LogCaptureFixture) -> None:
+    bridge_calls.answer = TIMEOUT
+    with caplog.at_level(logging.WARNING):
+        vocabulary_access.check(tmp_path, [("brand_new", None)])
+    assert _warnings(caplog) == [
+        "vocabulary: the bridge did not answer /vocabulary/add (bridge timeout; the bridge may still have added the names); "
+        "her file is read read-only for this call and for later vocabulary calls until the next turn"
+    ]
+
+
+def test_a_real_bridge_that_accepts_and_never_answers_costs_one_wait_per_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole path with a real socket: the stub accepts a connection and never replies; `post_to_bridge` is not replaced."""
+    import socket
+    import threading
+    import time
+
+    from brain.bridge import state_file
+
+    wait = 0.4
+    monkeypatch.setattr(dev_constants, "VOCABULARY_BRIDGE_TIMEOUT_S", wait)
+    _write(tmp_path, [_entry("Quiet Dread", 6.0)])
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    accepted: list[socket.socket] = []
+
+    def accept_forever() -> None:
+        while True:
+            try:
+                accepted.append(server.accept()[0])
+            except OSError:
+                return
+
+    thread = threading.Thread(target=accept_forever, daemon=True)
+    thread.start()
+    state_file.write(
+        tmp_path,
+        state_file.BridgeState(
+            persona="p", pid=None, port=server.getsockname()[1], started_at="2026-11-24T10:00:00Z", stopped_at=None,
+            shutdown_clean=False, client_origin="tests", auth_token="t",
+        ),
+    )
+    try:
+        begin = time.monotonic()
+        first = vocabulary_access.lookup(tmp_path, ["quiet_dread", "no_such_word"])
+        first_wait = time.monotonic() - begin
+        begin = time.monotonic()
+        for _ in range(3):
+            assert vocabulary_access.lookup(tmp_path, ["quiet_dread", "no_such_word"]) == first
+        adds = vocabulary_access.check(tmp_path, [("quiet_dread", None), ("Brand New Feeling", None)])
+        later = time.monotonic() - begin
+        assert first["quiet_dread"] is not None and first["no_such_word"] is None
+        assert [r.outcome for r in adds] == ["used", "missing"]
+        assert first_wait >= wait * 0.9 and later < wait * 0.5  # one wait, then no wait at all
+        assert len(accepted) == 1  # one connection was ever made
+    finally:
+        server.close()
+        for conn in accepted:
+            conn.close()
+        thread.join(timeout=2)

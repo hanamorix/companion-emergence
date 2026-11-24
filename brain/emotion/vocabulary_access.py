@@ -14,6 +14,10 @@ When the bridge cannot be reached, a process reads `emotion_vocabulary.json` rea
 spelling; any other name is discarded (`check` reports it `missing`, and nothing is written); the process adds no name and runs no
 memory heal.
 
+A bridge that is up but does not answer is waited for once per turn: after one call times out, later calls of that process go straight
+to the read-only file (a skipped lookup reads the file, a skipped add takes the same fallback as `check` above) until `start_turn`
+(`_BRIDGE_TIMED_OUT`, below).
+
 In the owner (`vocabulary.is_bridge_owner()`) both calls run in process, with no HTTP.
 """
 
@@ -159,29 +163,68 @@ def _result_from_wire(item: Any) -> NameResult:
 # ------------------------------------------------------------------------------------------------
 
 
+# A bridge that is up but does not answer (#803 step 9). After ONE vocabulary call to it times out, this process stops calling the
+# bridge's vocabulary routes for that persona_dir until its next turn boundary, so one stuck bridge costs one wait of
+# `dev_constants.VOCABULARY_BRIDGE_TIMEOUT_S` per turn, not one per call. Set and read in `_ask` only (the owner never gets there:
+# `lookup` and `check` answer in process first). The boundaries are the ones the processes already have, so there is no window and
+# no constant: a `nell` command's run ends its turn; the memory server is one process per `claude` CLI run (the CLI starts it
+# from `--mcp-config`, `brain.bridge.provider.brain_tools_mcp_entry`, once per `claude -p` call) and ends with that run; the
+# interactive `nell chat --no-bridge` loop calls `start_turn` at the top of each turn. The websocket chat path (`nell chat` with a
+# bridge) makes no vocabulary call in the client process: the bridge, the owner, does them.
+_BRIDGE_TIMED_OUT: dict[Path, bool] = {}
+
+
+class _SkippedReply(dict):
+    """The reply of a call that was not sent because the bridge already timed out this turn: equal to a timed-out call's reply, so
+    every caller treats it the same, and `_note_failure` can tell it apart and say nothing."""
+
+
+_SKIPPED = _SkippedReply(error="bridge timeout")
+
+
+def start_turn(persona_dir: Path) -> None:
+    """A new turn begins in this process: ask the bridge again."""
+    _BRIDGE_TIMED_OUT[persona_dir] = False
+
+
 def _ask(persona_dir: Path, route: str, body: dict[str, Any]) -> Any:
-    """One call to the bridge. A body that is not JSON is reported as an error result like the other failures."""
+    """One call to the bridge, unless it already timed out this turn (then the reply of a timed-out call, with no call made).
+
+    A body that is not JSON is reported as an error result like the other failures.
+    """
+    if _BRIDGE_TIMED_OUT.get(persona_dir):
+        return _SKIPPED
     try:
-        return post_to_bridge(persona_dir, route, body, timeout=dev_constants.VOCABULARY_BRIDGE_TIMEOUT_S)
+        reply = post_to_bridge(persona_dir, route, body, timeout=dev_constants.VOCABULARY_BRIDGE_TIMEOUT_S)
     except ValueError:
         return {"error": "bridge answer is not JSON"}
+    if isinstance(reply, dict) and reply.get("error") == "bridge timeout":
+        _BRIDGE_TIMED_OUT[persona_dir] = True
+    return reply
 
 
 def _note_failure(route: str, reply: Any) -> None:
     """Say why the read-only file is used for a call. A bridge that is simply not running is the quiet case; every other failure
-    (a refused token, a server error, a timeout, an answer of the wrong shape) is reported once per kind."""
+    (a refused token, a server error, a timeout, an answer of the wrong shape) is reported once per kind. A call that was skipped
+    after a timeout says nothing of its own."""
+    if isinstance(reply, _SkippedReply):
+        return
     error = reply.get("error") if isinstance(reply, dict) else None
     if error == "bridge unreachable":
         return
     detail = error if isinstance(error, str) else "an answer that is not a vocabulary reply"
-    if route == ADD_ROUTE and error == "bridge timeout":
-        detail += "; the bridge may still have added the names"
+    use = "her file is read read-only for this run"
+    if error == "bridge timeout":
+        use = "her file is read read-only for this call and for later vocabulary calls until the next turn"
+        if route == ADD_ROUTE:
+            detail += "; the bridge may still have added the names"
     warn_throttled(
         logger,
         f"vocabulary_access:bridge:{route}:{detail}",
-        "vocabulary: the bridge did not answer %s (%s); her file is read read-only for this run",
+        "vocabulary: the bridge did not answer %s (%s); %s",
         route,
         detail,
+        use,
     )
 
 

@@ -138,7 +138,7 @@ EMOTION_VOCABULARY_LOCK_WAIT_S: float = 5.0
 # (`brain.emotion.vocabulary_access`). An add waits for the vocabulary file's lock (up to `EMOTION_VOCABULARY_LOCK_WAIT_S`) and
 # then makes one verified write, so the bound is twice that wait: room for a slow disk, and well under the claude CLI's 60 s
 # tool-silence kill that the search call is sized against. A call that runs out is the same "bridge timeout" as for search, and
-# the process goes on with the read-only file.
+# the process goes on with the read-only file until its next turn (one wait per turn, not per call).
 VOCABULARY_BRIDGE_TIMEOUT_S: float = 10.0
 # Seconds a feeling name whose add could not be written (`cannot_write`: the file's lock wait ran out, or the disk is full) is left
 # alone before the check asks again (`brain.emotion.vocabulary_access.names_used`). One failed add costs up to

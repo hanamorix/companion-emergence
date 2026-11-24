@@ -999,7 +999,19 @@ def _vocabulary_registry_restore() -> Iterator[None]:
     is_owner = getattr(vocabulary, "is_bridge_owner", None)
     set_owner = getattr(vocabulary, "set_bridge_owner", None)
     saved_owner = is_owner() if is_owner is not None else False  # a bridge app started in a test marks this process the owner
+    # The "bridge timed out this turn" flag (#803 step 9) is per process: no test may leave it set for the next. Same guard: the module
+    # and the flag are absent on main's product code.
+    try:
+        from brain.emotion import vocabulary_access
+    except ImportError:
+        timed_out = None
+    else:
+        timed_out = getattr(vocabulary_access, "_BRIDGE_TIMED_OUT", None)
+    if timed_out is not None:
+        timed_out.clear()
     yield
+    if timed_out is not None:
+        timed_out.clear()
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
     if set_owner is not None:
