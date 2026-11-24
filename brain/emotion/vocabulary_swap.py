@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.emotion import vocabulary, vocabulary_file
-from brain.emotion.engine_files import vocabulary_path
+from brain.emotion.vocabulary_file import vocabulary_path
 from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.utils import file_ops
 from brain.utils.time import iso_utc

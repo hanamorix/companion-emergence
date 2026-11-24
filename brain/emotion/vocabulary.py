@@ -223,6 +223,23 @@ def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
     return pooled
 
 
+# Which process owns her vocabulary (#801 section 5): True only in the bridge, set at its start-up and cleared when it stops. The
+# owner answers a lookup from the registry and runs a change itself; any other process asks the bridge
+# (`brain.emotion.vocabulary_access`).
+_BRIDGE_OWNER: bool = False
+
+
+def set_bridge_owner(owner: bool) -> None:
+    """Mark this process as the one that owns her vocabulary (the bridge, at start-up) or not (the bridge, when it stops)."""
+    global _BRIDGE_OWNER
+    _BRIDGE_OWNER = owner
+
+
+def is_bridge_owner() -> bool:
+    """True in the process that owns her vocabulary (the bridge)."""
+    return _BRIDGE_OWNER
+
+
 def get(name: str) -> Emotion | None:
     """Return the Emotion with the given name (any spelling variant), or None."""
     return _REGISTRY.get(canonical_name(name))

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from brain.emotion import vocabulary, vocabulary_file
 from brain.growth.proposal import EmotionProposal
 from brain.growth.scheduler import (
     GrowthTickResult,
@@ -144,14 +145,30 @@ def test_run_growth_tick_skips_a_proposal_whose_tidied_name_matches_an_entry_spe
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-def test_read_current_vocabulary_names_gives_the_tidied_form_and_skips_a_non_string_name(persona_dir: Path) -> None:
+def test_read_current_vocabulary_names_come_from_the_lookup_in_the_tidied_form(persona_dir: Path) -> None:
+    """The names are her registered vocabulary, tidied (an entry keeps its file spelling): the framework's own and her entries."""
+    entry = {"description": "d", "category": "persona_extension", "decay_half_life_days": 5.0}
     (persona_dir / "emotion_vocabulary.json").write_text(
-        json.dumps({"version": 1, "emotions": [{"name": "Quiet Dread"}, {"name": 5}, {"name": "joy"}, "x"]}),
+        json.dumps({"version": 1, "emotions": [{"name": "Quiet Dread", **entry}, {"name": 5}, "x"]}),
         encoding="utf-8",
     )
-    names, anomaly = _read_current_vocabulary_names(persona_dir / "emotion_vocabulary.json")
+    vocabulary_file.load(persona_dir / "emotion_vocabulary.json")
+    names, anomaly = _read_current_vocabulary_names(persona_dir)
     assert anomaly is None
-    assert names == {"quiet_dread", "joy"}
+    assert {"quiet_dread", "joy"} <= names
+    assert "Quiet Dread" not in names
+
+
+def test_read_current_vocabulary_names_read_the_file_for_nothing_but_its_health(persona_dir: Path) -> None:
+    """In the bridge (the owner) the names are the registry's: a file entry that was never registered is not a name."""
+    entry = {"description": "d", "category": "persona_extension", "decay_half_life_days": 5.0}
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "unregistered_word", **entry}]}), encoding="utf-8"
+    )
+    vocabulary.set_bridge_owner(True)  # the fixture in tests/conftest.py puts the flag back
+    names, anomaly = _read_current_vocabulary_names(persona_dir)
+    assert anomaly is None
+    assert "unregistered_word" not in names
 
 
 _OLD_GATE_ALSO_REFUSED = "the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
@@ -418,9 +435,9 @@ def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        names, anomaly = _read_current_vocabulary_names(vocab_path)
+        names, anomaly = _read_current_vocabulary_names(persona_dir)
 
-    # Names restored from .bak1
+    # The names are the lookup's (the framework's own are there with no file at all)
     assert "joy" in names
     assert "love" in names
     # Anomaly captures the heal action so caller can surface to audit log
@@ -434,16 +451,16 @@ def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
 def test_read_current_vocabulary_names_corrupt_no_bak_resets_to_default(
     persona_dir: Path, caplog
 ) -> None:
-    """Corrupt vocab + no .bak → empty set returned + warning logged."""
+    """Corrupt vocab + no .bak → the anomaly is returned + warning logged; the names are still the lookup's."""
     import logging
 
     vocab_path = persona_dir / "emotion_vocabulary.json"
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        names, anomaly = _read_current_vocabulary_names(vocab_path)
+        names, anomaly = _read_current_vocabulary_names(persona_dir)
 
-    assert names == set()
+    assert "joy" in names
     assert anomaly is not None
     assert anomaly.action == "reset_to_default"
     # Some warning surfaced (either from json_io or the existing path)

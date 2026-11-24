@@ -4,7 +4,7 @@ Every public call exists with its final signature, so the code that calls the en
 engine behind every call exists.
 
 Real now:
-- `half_life`, the lookup of an emotion's half-life in days (the persona's vocabulary file, then
+- `half_life`, the lookup of an emotion's half-life in days (her vocabulary through `vocabulary_access.lookup`, then
   `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `EMOTION_DEFAULT_HALF_LIFE_DAYS`), and `is_live()`, which is True once the
   state holds `switch_over_at` (nothing writes it until the switch-over; there is no switch file: "switched" is read off the
   state, `engine_files.switch_over_state`). A state that exists but cannot be read is not switched (owner 2026-11-05); only a
@@ -65,7 +65,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NoReturn
 
 from brain import dev_constants
-from brain.emotion import engine_files, engine_rebuild, nudge_scale_fix, persona_loader, vocabulary
+from brain.emotion import (
+    engine_files,
+    engine_rebuild,
+    nudge_scale_fix,
+    persona_loader,
+    vocabulary,
+    vocabulary_file,
+)
 from brain.emotion.engine_files import VocabularyHalfLives
 from brain.emotion.engine_utils import (
     EngineState,
@@ -776,7 +783,7 @@ class EmotionEngine:
         if refresh is None:
             return
         try:
-            refresh(engine_files.vocabulary_path(self.persona_dir))
+            refresh(vocabulary_file.vocabulary_path(self.persona_dir))
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
             if failure not in self._refresh_logged:
@@ -882,9 +889,9 @@ class EmotionEngine:
     def half_life(self, emotion: str) -> float:
         """The emotion's half-life in days.
 
-        The name is made canonical first (`vocabulary.canonical_name`), because the persona file's
-        names are made canonical the same way. Order: the persona's vocabulary file (an entry with a
-        numeric half-life; a null entry is "never fades" and the lookup goes on), then
+        The name is made canonical first (`vocabulary.canonical_name`), because her vocabulary is matched
+        by the tidied name. Order: her vocabulary, through the lookup (`engine_files.VocabularyHalfLives`: a persona entry
+        with a numeric half-life; a null entry is "never fades" and the lookup goes on; a framework name has none), then
         `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS`.
         """
         name = vocabulary.canonical_name(emotion)

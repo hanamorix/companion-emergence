@@ -498,6 +498,65 @@ def test_emergence_gate_4_rejects_unknown_emotion(persona_dir):
     assert "vocabulary" in reason.lower() or "unknown" in reason.lower()
 
 
+def test_emergence_gate_4_matches_trigger_names_by_their_tidied_form(persona_dir):
+    """A trigger written `quiet_dread` is known when her vocabulary holds `Quiet Dread` (#801): both sides are tidied."""
+    for trigger in ({"quiet_dread": 7.0}, {"Quiet-Dread": 7.0}, {"QUIET DREAD": 7.0}):
+        accepted, reason = _validate_emergence_proposal(
+            proposal_dict=_good_proposal(trigger=trigger),
+            current_arc_names=set(),
+            removed_arc_names=set(),
+            emotion_vocabulary={"Quiet Dread"},
+            existing_trigger_keysets=[],
+            active_arc_count=4,
+            total_cap=16,
+        )
+        assert accepted is True, (trigger, reason)
+
+
+def test_load_emotion_vocabulary_is_the_lookup_every_entry_in_the_spelling_her_vocabulary_uses(persona_dir):
+    """The names gate 4 and the corpus use come from `vocabulary_access.lookup` ("all"), not from a read of her file (#801 step 4)."""
+    from brain.emotion import vocabulary
+    from brain.growth.crystallizers.reflex import _load_emotion_vocabulary
+
+    vocabulary.register(vocabulary.Emotion("Quiet Dread", "d", "persona_extension", 5.0))
+    vocabulary.set_bridge_owner(True)  # the owner answers from its registry; tests/conftest.py puts the flag back
+    (persona_dir / "emotion_vocabulary.json").write_text('{"version": 1, "emotions": [{"name": "only_in_the_file"}]}')
+    names = _load_emotion_vocabulary(persona_dir)
+    assert "Quiet Dread" in names and "joy" in names  # her entry in its own spelling, and the framework's names
+    assert "only_in_the_file" not in names  # the file is not read
+
+
+def test_crystallize_reflex_accepts_a_trigger_on_a_framework_name_her_file_does_not_hold(persona_dir, store):
+    """Gate 4 knows the framework's own feelings through the lookup: a file with no `love` entry no longer refuses a `love` trigger."""
+    _seed_vocab(persona_dir, ["creative_hunger"])
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "love_arc",
+                    "description": "a steady warmth",
+                    "trigger": {"love": 7.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_pitch",
+                    "prompt_template": "You are {persona_name}. {emotion_summary}",
+                    "reasoning": "Love held high four times this month.",
+                }
+            ],
+            "prunings": [],
+        }
+    )
+    result = crystallize_reflex(
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(),
+        provider=_FakeProvider(response),
+        persona_name="nell",
+        persona_pronouns="she/her",
+    )
+    assert [e.name for e in result.emergences] == ["love_arc"]
+
+
 def test_emergence_gate_5_rejects_unrenderable_prompt_template(persona_dir):
     """Gate 5 catches malformed format spec in the prompt template."""
     proposal = _good_proposal(prompt_template="invalid {missing_var:0.2f")

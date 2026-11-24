@@ -86,7 +86,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
-from brain.emotion import vocabulary_swap
+from brain.emotion import vocabulary, vocabulary_access, vocabulary_file, vocabulary_swap
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -155,13 +155,21 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
     the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
+    Once it has loaded, two entries in her file whose names tidy the same are merged under the spelling that comes first in the
+    file (#801 section 3), through the shared writer. A load that failed skips the merge.
+
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
     Any exception → logged and swallowed so bridge startup is never blocked.
     """
     try:
         from brain.emotion.persona_loader import load_persona_vocabulary
 
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        path = vocabulary_file.vocabulary_path(persona_dir)
+        load_persona_vocabulary(path, store=store)
+        if path.exists():
+            merged = vocabulary_file.merge(path)
+            if merged.pairs:
+                logger.warning("startup: merged %d twin entr(ies) in %s under their first spelling", len(merged.pairs), path.name)
     except Exception:
         logger.exception("startup persona-vocabulary load skipped")
 
@@ -1107,6 +1115,35 @@ class SearchMemoriesReq(BaseModel):
     order: Literal["relevance", "age"] = "relevance"
 
 
+class VocabularyAddItem(BaseModel):
+    """One name for POST /vocabulary/add, with the entry fields its caller wants (any other key is ignored)."""
+
+    name: str
+    fields: dict[str, Any] | None = None
+
+
+class VocabularyAddReq(BaseModel):
+    """Wire body for POST /vocabulary/add (#801 section 5): the names of one memory or batch."""
+
+    items: list[VocabularyAddItem]
+
+
+class VocabularyLookupReq(BaseModel):
+    """Wire body for POST /vocabulary/lookup (#801 section 5): a list of names, or "all"."""
+
+    names: list[str] | Literal["all"]
+
+
+def _vocabulary_add_blocking(persona_dir: Path, req: VocabularyAddReq) -> dict:
+    """Run the batch through the shared writer (the bridge is the owner); blocks on the vocabulary file's lock."""
+    items = [
+        (item.name, {k: v for k, v in (item.fields or {}).items() if k in vocabulary_access.ENTRY_FIELDS})
+        for item in req.items
+    ]
+    results = vocabulary_file.add(vocabulary_file.vocabulary_path(persona_dir), items)
+    return {"results": [vocabulary_access.result_to_wire(r) for r in results]}
+
+
 class ChatHistoryEntry(BaseModel):
     """One turn surfaced to the renderer.
 
@@ -1416,6 +1453,9 @@ def build_app(
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
         # fires for the first time). Uses a short-lived store — no persistent
         # handle held on app.state per HA hardening rule.
+        # This process owns her vocabulary from here on (#801 section 5): lookups run on the registry, and the add route and
+        # every change run the shared writer here. Cleared when the bridge stops.
+        vocabulary.set_bridge_owner(True)
         _vocab_store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         try:
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
@@ -1637,6 +1677,7 @@ def build_app(
 
             # 5. Clear publisher
             events.set_publisher(None)
+            vocabulary.set_bridge_owner(False)
             logger.info("bridge stopped persona=%s", persona_dir.name)
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
@@ -3025,6 +3066,17 @@ def build_app(
     async def search_memories_endpoint(req: SearchMemoriesReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
         return await tracked_to_thread("memory search", _search_memories_blocking, s.persona_dir, req)
+
+    # ── POST /vocabulary/lookup and /vocabulary/add: the bridge owns her vocabulary (#801 section 5) ──
+    @app.post("/vocabulary/lookup", dependencies=[Depends(require_http_auth)])
+    async def vocabulary_lookup_endpoint(req: VocabularyLookupReq) -> dict[str, Any]:
+        found = vocabulary_access.lookup_local(req.names)
+        return {"entries": [vocabulary_access.found_to_wire(raw, entry) for raw, entry in found.items()]}
+
+    @app.post("/vocabulary/add", dependencies=[Depends(require_http_auth)])
+    async def vocabulary_add_endpoint(req: VocabularyAddReq) -> dict[str, Any]:
+        s: BridgeAppState = app.state.bridge
+        return await tracked_to_thread("vocabulary add", _vocabulary_add_blocking, s.persona_dir, req)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])

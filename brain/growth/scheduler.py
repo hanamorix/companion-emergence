@@ -19,8 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from brain.emotion import vocabulary_file
-from brain.emotion.vocabulary import canonical_name, gate_name
+from brain.emotion import vocabulary_access, vocabulary_file
+from brain.emotion.vocabulary import gate_name
 from brain.growth.crystallizers.vocabulary import (
     VOCABULARY_CRYSTALLIZER_STATUS,
     crystallize_vocabulary,
@@ -96,7 +96,7 @@ def run_growth_tick(
     vocab_path = persona_dir / "emotion_vocabulary.json"
     log_path = persona_dir / "emotion_growth.log.jsonl"
 
-    current_names, vocab_anomaly = _read_current_vocabulary_names(vocab_path)
+    current_names, vocab_anomaly = _read_current_vocabulary_names(persona_dir)
     if vocab_anomaly is not None and anomalies_collector is not None:
         anomalies_collector.append(vocab_anomaly)
 
@@ -184,41 +184,29 @@ def run_growth_tick(
 
 
 def _read_current_vocabulary_names(
-    vocab_path: Path,
+    persona_dir: Path,
 ) -> tuple[set[str], BrainAnomaly | None]:
-    """Return (set of emotion names in their tidied form, optional anomaly) for the vocabulary file.
+    """Return (set of emotion names in their tidied form, optional anomaly) for her vocabulary.
 
-    The tidied form (`vocabulary.canonical_name`), because an entry keeps the spelling in her file and the dedupe compares tidied names.
-
-    Distinguishes three load outcomes:
-      - Missing file → (empty set, None) silently (fresh persona; expected).
-      - Corrupt JSON or wrong schema → quarantine + heal from .bak or reset to
-        default; returns (names_from_recovered_data, BrainAnomaly). The caller
-        (run_growth_tick) feeds the anomaly into its `anomalies_collector` so
-        it surfaces in the heartbeat audit log. Logs WARNING locally too.
-      - Well-formed → (set of names, None).
+    The names come from the lookup (`vocabulary_access.lookup`, "all": every entry of her vocabulary, the framework's own
+    included), tidied, because the dedupe compares tidied names. The file is read only for its health: a damaged file is
+    quarantined and healed from a backup or reset to the default (json_io's own recovery), and the anomaly is returned so
+    the caller (run_growth_tick) feeds it into its `anomalies_collector` and it surfaces in the heartbeat audit log. Logs
+    WARNING locally too. A missing file gives no anomaly (fresh persona; expected).
     """
-    if not vocab_path.exists():
-        return set(), None
-
-    res = vocabulary_file.read(vocab_path, recover=Recovery.HEAL)
-    data, anomaly = res.data, res.anomaly
-
-    if anomaly is not None:
-        logger.warning(
-            "growth scheduler: emotion_vocabulary at %s anomaly %s (action=%s); "
-            "proceeding with recovered data",
-            vocab_path,
-            anomaly.kind,
-            anomaly.action,
-        )
-
-    names = {
-        canonical_name(e["name"])
-        for e in data.get("emotions", [])
-        if isinstance(e, dict) and isinstance(e.get("name"), str)
-    }
-    return names, anomaly
+    vocab_path = vocabulary_file.vocabulary_path(persona_dir)
+    anomaly = None
+    if vocab_path.exists():
+        anomaly = vocabulary_file.read(vocab_path, recover=Recovery.HEAL).anomaly
+        if anomaly is not None:
+            logger.warning(
+                "growth scheduler: emotion_vocabulary at %s anomaly %s (action=%s); "
+                "proceeding with her registered vocabulary",
+                vocab_path,
+                anomaly.kind,
+                anomaly.action,
+            )
+    return set(vocabulary_access.lookup(persona_dir, vocabulary_access.ALL)), anomaly
 
 
 def _entry_fields(proposal: EmotionProposal) -> dict:

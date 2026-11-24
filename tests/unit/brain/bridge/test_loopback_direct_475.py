@@ -201,8 +201,9 @@ def test_the_daemon_shutdown_request_goes_direct(world):
 
 def test_the_mcp_search_call_goes_direct(world, monkeypatch):
     import brain.mcp_server.tools as tools
+    from brain.bridge import client as bridge_client
 
-    monkeypatch.setattr(tools.state_file, "read", lambda persona_dir: world.state)
+    monkeypatch.setattr(bridge_client.state_file, "read", lambda persona_dir: world.state)
 
     result = tools._search_via_bridge(world.tmp, {"query": "x", "limit": 3})
 

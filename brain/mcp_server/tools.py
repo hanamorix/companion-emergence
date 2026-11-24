@@ -13,12 +13,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 from mcp.server import Server
 from mcp.types import ImageContent, TextContent, Tool
 
 from brain import dev_constants
-from brain.bridge import state_file
+from brain.bridge.client import post_to_bridge
 from brain.mcp_server.audit import log_invocation
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.known_names import note_tool_call
@@ -54,8 +53,8 @@ _RESULT_SUMMARY_MAX_CHARS = 140
 def _search_via_bridge(persona_dir: Path, arguments: dict[str, Any]) -> dict:
     """Forward a search_memories call to the running bridge over HTTP (INC-4).
 
-    Reads bridge.json for the port + bearer token (the same auth /health
-    uses, S54) and posts to POST /tools/search_memories. No fallback: any
+    Posts to POST /tools/search_memories through `brain.bridge.client.post_to_bridge`
+    (bridge.json's port + bearer token, the same auth /health uses, S54). No fallback: any
     failure here becomes an error result — nothing in this process ever
     builds the embedder/reranker/vector matrix (S10).
 
@@ -74,25 +73,9 @@ def _search_via_bridge(persona_dir: Path, arguments: dict[str, Any]) -> dict:
     outcome="error" audit row. Fail-soft (S10) still holds end to end;
     it's just handled one frame up, not inside this function.
     """
-    state = state_file.read(persona_dir)
-    if state is None or state.port is None:
-        return {"error": "bridge unreachable"}
-    headers = {"Authorization": f"Bearer {state.auth_token}"} if state.auth_token else {}
-    try:
-        resp = httpx.post(
-            f"http://127.0.0.1:{state.port}/tools/search_memories",
-            json=arguments,
-            headers=headers,
-            timeout=dev_constants.SEARCH_BRIDGE_TIMEOUT_S,
-            trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
-        )
-    except httpx.TimeoutException:
-        return {"error": "bridge timeout"}
-    except httpx.HTTPError:
-        return {"error": "bridge unreachable"}
-    if resp.status_code == 200:
-        return resp.json()
-    return {"error": f"bridge error {resp.status_code}"}
+    return post_to_bridge(
+        persona_dir, "/tools/search_memories", arguments, timeout=dev_constants.SEARCH_BRIDGE_TIMEOUT_S
+    )
 
 
 def register_tools(

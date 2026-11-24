@@ -889,10 +889,14 @@ def test_faded_value_numbers_for_importance_the_floor_a_vocabulary_half_life_and
     # a future-dated row never grows: age is held at 0
     clock.now = T[10]
     assert instance.faded_value(_memory(T[20], {"joy": 8.0}), "joy") == 8.0
-    # a vocabulary half-life (6 days) replaces the table's 3 days: 12 days after the switch = two half-lives, 8 x 0.25
-    (tmp_path / "emotion_vocabulary.json").write_text(json.dumps({"emotions": [{"name": "joy", "decay_half_life_days": 6.0}]}), encoding="utf-8")
+    # a vocabulary half-life (6 days) replaces the table's 5 days for a name outside the framework: 12 days after the switch =
+    # two half-lives, 8 x 0.25. (A framework name such as joy keeps the table's number whatever her file says: #801 section 8.)
+    (tmp_path / "emotion_vocabulary.json").write_text(
+        json.dumps({"emotions": [{"name": "creative_hunger", "description": "d", "category": "persona_extension", "decay_half_life_days": 6.0}]}),
+        encoding="utf-8",
+    )
     clock.now = T[12]
-    assert instance.faded_value(_memory(T[0], {"joy": 8.0}), "joy") == pytest.approx(2.0)
+    assert instance.faded_value(_memory(T[0], {"creative_hunger": 8.0}), "creative_hunger") == pytest.approx(2.0)
 
 
 def test_faded_value_needs_no_store_so_it_serves_a_row_that_hard_delete_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

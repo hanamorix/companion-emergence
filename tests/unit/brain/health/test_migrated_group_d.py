@@ -32,9 +32,6 @@ READERS = {
         "forgetting_state.json", lambda pd: _imp("brain.forgetting")._load_forgetting_state(pd), "DEFAULT", {}),
     "forgetting._load_migration_grace": (
         "source-manifest.json", lambda pd: _imp("brain.forgetting")._load_migration_grace(pd), "DEFAULT", (None, 0.0)),
-    "crystallizers.reflex._load_emotion_vocabulary": (
-        "emotion_vocabulary.json",
-        lambda pd: _imp("brain.growth.crystallizers.reflex")._load_emotion_vocabulary(pd), "DEFAULT", set()),
     "soul_candidate_repair._load_state": (
         "soul_candidate_repair_state.json",
         lambda pd: _imp("brain.health.soul_candidate_repair")._load_state(pd), "CONTENT", None),

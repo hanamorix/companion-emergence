@@ -885,6 +885,14 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/ingest/emotion_tagger.py",),
     ),
+    # --- the bridge owns her vocabulary; other readers use the lookup (#801 step 4) ---------------------------------------------
+    Removed(
+        names=("_VOCABULARY_FILENAME", "vocabulary_path", "_StatKey", "_Entry", "_Fault", "_emotions_list", "_classify", "_refresh"),
+        why="the engine's half-life lookup no longer reads her vocabulary file (its stat-key cache, entry classifier and file-name helper went): `VocabularyHalfLives` asks `vocabulary_access.lookup`, and the one join of her file's name to a persona folder is `vocabulary_file.vocabulary_path`",
+        ref="#801 (draft PR #803), build step 4",
+        kind="code",
+        scope=("brain/emotion/engine_files.py",),
+    ),
 )
 
 

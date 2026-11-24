@@ -994,9 +994,11 @@ def _vocabulary_registry_restore() -> Iterator[None]:
     from brain.emotion import vocabulary
 
     saved_registry = dict(vocabulary._REGISTRY)
+    saved_owner = vocabulary.is_bridge_owner()  # a bridge app started in a test marks this process the owner
     yield
     vocabulary._REGISTRY.clear()
     vocabulary._REGISTRY.update(saved_registry)
+    vocabulary.set_bridge_owner(saved_owner)
 
 
 @pytest.fixture(autouse=True)
