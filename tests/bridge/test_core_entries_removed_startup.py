@@ -80,6 +80,9 @@ def test_the_first_bridge_start_removes_both_core_entries_and_a_second_start_rem
     assert "removed core feeling entries" not in caplog.text
 
 
+@pytest.mark.no_base_failure(
+    reason="the engine already took a core feeling's half-life from the framework since step 4 (the old swap also wrote the framework values into the file); this pins the end state of criterion 9 after the removal"
+)
 def test_after_the_removal_the_engine_takes_a_core_half_life_from_the_framework(persona_dir):
     make_persona(persona_dir, [row(T35, emotions={"joy": 6.0, "contentment": 5.0}, mid="seed")])
     _with_core_entries(persona_dir)
@@ -117,6 +120,9 @@ def test_the_old_marker_file_is_left_on_disk_and_never_read_or_written(persona_d
     assert _names(persona_dir) == ["her own word"]
 
 
+@pytest.mark.no_base_failure(
+    reason="control: the old swap also created no file for a persona that has none; this pins that the removal does not create one either"
+)
 def test_a_start_with_no_vocabulary_file_creates_none(persona_dir):
     make_persona(persona_dir, [row(T35, emotions={"joy": 6.0}, mid="seed")])
     assert not (persona_dir / VOCAB).exists()
@@ -182,6 +188,9 @@ def test_a_command_start_runs_no_vocabulary_step_and_leaves_her_file_alone(cli_p
     assert (cli_persona / VOCAB).read_bytes() == before
 
 
+@pytest.mark.no_base_failure(
+    reason="control: a dry run never ran the old swap and writes nothing now either; it pins that no vocabulary step was added to the dry-run path"
+)
 def test_a_dry_run_writes_nothing(cli_persona, emotion_engine_stub, capsys):
     emotion_engine_stub.live = False
     before = {str(p.relative_to(cli_persona)): p.read_bytes() for p in cli_persona.rglob("*") if p.is_file()}
