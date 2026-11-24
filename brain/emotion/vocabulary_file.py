@@ -120,8 +120,7 @@ def repair(path: Path) -> tuple[JsonRead, int]:
     vocabulary function), `_REGISTRY_LOCK` innermost (the reload). Callers hold neither this lock nor the registry lock.
 
     Returns (the heal's `JsonRead`, the count of registry changes the reload made; 0 when nothing was repaired): the `anomaly` says
-    what was done. A repair that fails (the lock wait ran out, the heal could not
-    quarantine or install) logs one warning, leaves the file as found and the copy as it was, and raises what the heal raised
+    what was done. A repair that fails (the lock wait ran out, the heal could not quarantine or install) logs one warning, leaves the file as found and the copy as it was, and raises what the heal raised
     (`JsonFileError`, `LockTimeoutError`: both OSError); an unreadable file (kind io) raises as the heal's read did. A reload that
     cannot read the repaired file is logged and left: the file changed, so the next read's stat check reloads.
     """

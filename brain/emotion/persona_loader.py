@@ -240,7 +240,7 @@ def _load_followed(path: Path, *, store: MemoryStore | None, read_only: bool) ->
 
     registered += vocabulary_file.reload_entries(data)
     if _res.outcome == "ok" and _res.sig is not None:
-        vocabulary.note_copy_key(path, _res.sig)  # the copy matches the bytes this read parsed; a heal or rebuild leaves it stale
+        vocabulary.note_copy_key(path, _res.sig)  # the copy matches the bytes this read parsed; a heal's own reload noted its key already, a rebuild leaves it stale
 
     # The owner's clean-up on what was just read (core entries out, twins merged), so a load that sees a hand edit first does not
     # record its key with a core name or twin left in the file. After the key above, so the clean-up's own write advances it.
