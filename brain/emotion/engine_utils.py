@@ -955,3 +955,54 @@ def close_days(state: EngineState, t: datetime) -> None:
     if state.last_update is not None:
         state.last_update += _day_start(today) - after
     state.active_day = today
+
+
+def _merged_average(first: Average, second: Average) -> Average:
+    """The weighted mean of two averages with the weights added: `second` folded into a copy of `first` by `_fold_average`.
+
+    Both weights 0 keeps `first`; a first weight of 0 gives the second's value.
+    """
+    merged = Average(first.avg, first.weight)
+    _fold_average(merged, second.avg, second.weight)
+    return merged
+
+
+def merge_emotion_states(first: EmotionState, second: EmotionState) -> EmotionState:
+    """One feeling's saved state made from two that land on one name (#801 section 7). Pure: neither input is changed.
+
+    The short and the long average are each the weighted mean of the two with the weights added (`_fold_average`; both weights
+    0 keeps the first). The later `last_entry_day` is kept (a missing one loses). The snapshots are joined by day: a day in both
+    has its short and its long value averaged and counts as felt if either was; the window then keeps the days fewer than
+    `EMOTION_LONG_HALF_LIFE_D` before the latest day, as `close_days` does. The oldest kept day keeps the run record it was stored
+    with (the first one's, else the second's: nothing before it is known); every later day gets its run recomputed from the
+    merged long series by the run tracker, the way `close_days` builds one (a zero move for each calendar day between two
+    snapshot days, then the day's move, seeded by the previous day's record).
+    """
+    by_day: dict[str, SnapshotDay] = {}
+    for day in (*first.snapshot, *second.snapshot):
+        held = by_day.get(day.day)
+        if held is None:
+            by_day[day.day] = day
+        else:
+            by_day[day.day] = SnapshotDay(
+                day.day, (held.short + day.short) / 2, (held.long + day.long) / 2, held.felt or day.felt, held.run or day.run
+            )
+    days = [by_day[key] for key in sorted(by_day)]
+    if days:
+        latest = days[-1].day
+        window = dev_constants.EMOTION_LONG_HALF_LIFE_D
+        days = [d for d in days if _days_between(d.day, latest) < window]
+    for index in range(1, len(days)):
+        previous = days[index - 1]
+        off_days = [Move(_add_days(previous.day, n), 0.0) for n in range(1, _days_between(previous.day, days[index].day))]
+        moves = [*off_days, Move(days[index].day, days[index].long - previous.long)]
+        current = run_tracker(moves, seed=_seed_for(days, index - 1)).current
+        run = None if current is None else RunRecord(current.start_day, current.direction, current.last_with_day)
+        days[index] = days[index]._replace(run=run)
+    last_days = [d for d in (first.last_entry_day, second.last_entry_day) if d is not None]
+    return EmotionState(
+        short=_merged_average(first.short, second.short),
+        long=_merged_average(first.long, second.long),
+        last_entry_day=max(last_days) if last_days else None,
+        snapshot=days,
+    )

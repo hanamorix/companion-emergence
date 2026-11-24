@@ -87,6 +87,7 @@ from brain.chat.session import (
 )
 from brain.emotion import engine as emotion_engine
 from brain.emotion import vocabulary, vocabulary_access, vocabulary_file, vocabulary_swap
+from brain.emotion.engine_state_names import run_state_names_pass
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -147,8 +148,13 @@ def _validate_path_session_id(session_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -> None:
+def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -> bool:
     """Load the persona emotion vocabulary into the process-global registry at startup.
+
+    Returns True when her vocabulary has loaded: the load returned, and it did not have to reset a corrupt file to the empty
+    default without rebuilding it from memories (a missing file of a fresh persona counts as loaded). False when the load raised or
+    ended in that reset. The check on `emotion_state.json` (#801 section 7) runs only after a True; the twin merge below does not
+    change the answer.
 
     Idempotent — re-registering emotions is a no-op. Mirrors the supervisor tick
     load (brain/bridge/supervisor.py ~line 639), but called at bridge startup so
@@ -161,11 +167,13 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
     Any exception → logged and swallowed so bridge startup is never blocked.
     """
+    loaded = False
     try:
-        from brain.emotion.persona_loader import load_persona_vocabulary
+        from brain.emotion.persona_loader import load_persona_vocabulary_with_anomaly
 
         path = vocabulary_file.vocabulary_path(persona_dir)
-        load_persona_vocabulary(path, store=store)
+        _count, anomaly = load_persona_vocabulary_with_anomaly(path, store=store)
+        loaded = anomaly is None or anomaly.action != "reset_to_default"
         if path.exists():
             merged = vocabulary_file.merge(path)
             if merged.cannot_write:
@@ -174,6 +182,7 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
                 logger.warning("startup: merged %d twin entr(ies) in %s under their first spelling", len(merged.pairs), path.name)
     except Exception:
         logger.exception("startup persona-vocabulary load skipped")
+    return loaded
 
 
 async def _drain_emotion_engine(persona_dir: Path) -> None:
@@ -1456,9 +1465,14 @@ def build_app(
         vocabulary.set_bridge_owner(True)
         _vocab_store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         try:
-            ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
+            _vocabulary_loaded = ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
             _vocab_store.close()
+
+        # The check on the feeling names in emotion_state.json (#801 section 7): once per start, only after her vocabulary has
+        # loaded (a failed load drops nothing), before the start-up drain below. It never raises.
+        if _vocabulary_loaded:
+            run_state_names_pass(persona_dir)
 
         # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648). A start that needs a
         # rebuild has already run it in the rebuild child (`_supervisor_rebuild_handler`), right before that rebuild; this call covers
