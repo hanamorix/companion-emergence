@@ -223,7 +223,7 @@ def build_system_message(
         if reply_block.strip():
             parts.append(reply_block)
 
-    # 5. Body block (NEW — spec docs/superpowers/specs/2026-04-29-body-state-design.md §4)
+    # 5. Body block (NEW — spec docs/source-spec/2026-04-29-body-state-design.md §4)
     body_block = _build_body_block(persona_dir)
     if body_block.strip():
         parts.append(body_block)

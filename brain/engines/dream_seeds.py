@@ -4,7 +4,7 @@ No I/O — every function takes plain Memory / EmotionalState / Crystallization
 objects so it is unit-testable in isolation. The functions that read a memory's
 feelings take ``eng``: the live emotion engine, whose one per-memory read (faded
 values) they use, or None for the pure read of the stored values.
-See docs/superpowers/specs/2026-05-26-multi-signal-dream-seeds-design.md.
+Its design (the 2026-05-26 multi-signal dream-seeds design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations

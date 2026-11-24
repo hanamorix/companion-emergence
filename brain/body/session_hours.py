@@ -13,9 +13,8 @@ shows. Moving it here gives both callers a layer-neutral import:
 ``brain.bridge`` and ``brain.tools`` can both depend on ``brain.body``
 without crossing each other.
 
-See `docs/superpowers/specs/2026-05-16-body-state-divergence-fix.md`
-(if/when one exists) and the 2026-05-17 commit that wired this into
-``brain.tools.dispatch``.
+See `docs/source-spec/2026-04-29-body-state-design.md` §8 (the 2026-05-16 divergence-fix note was never committed, #797)
+and the 2026-05-17 commit that wired this into ``brain.tools.dispatch``.
 """
 
 from __future__ import annotations

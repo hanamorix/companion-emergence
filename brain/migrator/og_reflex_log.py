@@ -14,7 +14,7 @@ preserved verbatim in legacy/nell_reflex_log.json by Layer 2A.
 Fires with missing arc or fired_at are dropped (cannot meaningfully
 migrate without those).
 
-See docs/superpowers/specs/2026-05-05-migrator-soul-candidates-and-reflex-log-design.md.
+Its design (the 2026-05-05 migrator soul-candidates and reflex-log design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations

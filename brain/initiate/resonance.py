@@ -5,7 +5,7 @@ Per-heartbeat-tick batch evaluator: walks the top-N most-active memories
 compares against per-memory EMA baseline, emits initiate candidates for
 memories whose activation has spiked vs. their own history.
 
-Spec: docs/superpowers/specs/2026-05-13-v0.0.11-design.md (Section D)
+Spec: the 2026-05-13 v0.0.11 design (Section D), never committed and lost (#797).
 """
 
 from __future__ import annotations

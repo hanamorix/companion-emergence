@@ -112,7 +112,7 @@ _BASELINE: tuple[Emotion, ...] = (
         EMOTION_HALF_LIFE_DAYS["groundedness"],
     ),
     # ── body (4) ──
-    # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.
+    # Spec docs/source-spec/2026-04-29-body-state-design.md §2.1.
     # Existing `arousal` (core, 0.5d) and `desire` (core, 2.0d) reused;
     # they're already body-coded by description, no need to duplicate.
     Emotion(
@@ -162,12 +162,16 @@ def canonical_name(name: str) -> str:
     """Collapse spelling variants of one emotion channel to a single key (#174).
 
     Lowercase, hyphens to underscores, surrounding whitespace dropped. A
-    two-part ``<a>_<b>_blend`` name has its parts sorted so ``love_grief_blend``
-    and ``grief_love_blend`` are the same channel.
+    ``<a>_<b>_blend`` name (any number of parts) has its parts sorted so
+    ``love_grief_blend`` and ``grief_love_blend`` are the same channel. Empty
+    parts (a doubled, leading or trailing underscore before ``_blend``) are
+    dropped first, so ``love_grief__blend`` and ``_love_grief_blend`` give
+    ``grief_love_blend`` too (#800). A name with no parts left (``_blend``,
+    ``__blend``) gives ``_blend``. Other names keep their underscores as spelled.
     """
     key = name.strip().lower().replace("-", "_")
     if key.endswith(_BLEND_SUFFIX):
-        parts = key[: -len(_BLEND_SUFFIX)].split("_")
+        parts = [part for part in key[: -len(_BLEND_SUFFIX)].split("_") if part]
         key = "_".join(sorted(parts)) + _BLEND_SUFFIX
     return key
 

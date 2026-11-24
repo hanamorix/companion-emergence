@@ -45,6 +45,25 @@ describe("VoiceEditPanel", () => {
     expect(screen.getByText(/line C/)).toBeInTheDocument();
   });
 
+  it("keeps the rationale and diff in the scrolling body and the buttons outside it (#532)", () => {
+    const { container } = render(
+      <VoiceEditPanel proposal={proposal} persona="nell" onAccept={vi.fn()} onReject={vi.fn()} />,
+    );
+    const body = container.querySelector(".voice-edit-panel__body");
+    expect(body).not.toBeNull();
+    expect(body).toContainElement(screen.getByText(/the old wording felt too clipped/));
+    expect(body).toContainElement(screen.getByText(/I get quieter when tired/));
+    expect(body).not.toContainElement(screen.getByRole("button", { name: /^accept$/i }));
+    expect(body).not.toContainElement(screen.getByRole("button", { name: /reject/i }));
+  });
+
+  it("shows no evidence line when there is no evidence (#532)", () => {
+    render(
+      <VoiceEditPanel proposal={{ ...proposal, evidence: [] }} persona="nell" onAccept={vi.fn()} onReject={vi.fn()} />,
+    );
+    expect(screen.queryByText(/evidence:/i)).toBeNull();
+  });
+
   it("calls onAccept with null when Accept clicked", () => {
     const onAccept = vi.fn();
     render(<VoiceEditPanel proposal={proposal} persona="nell" onAccept={onAccept} onReject={vi.fn()} />);

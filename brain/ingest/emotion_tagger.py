@@ -16,10 +16,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings
+from brain.emotion import vocabulary
 from brain.utils.llm_output import find_json_object_block
 from brain.utils.log_throttle import warn_throttled
 
@@ -31,36 +33,65 @@ logger = logging.getLogger(__name__)
 
 EmotionTagger = Callable[["Memory"], dict[str, float]]
 
+_SEPARATOR_RUN = re.compile(r"[\W_]+")  # a run of characters that are not letters or digits
+
 
 def _load_vocab() -> frozenset[str]:
     try:
-        from brain.emotion.vocabulary import list_all
-        return frozenset(e.name for e in list_all())
+        return frozenset(e.name for e in vocabulary.list_all())
     except Exception:  # noqa: BLE001
         logger.warning("emotion_tagger: failed to load vocab; all names allowed")
         return frozenset()
 
 
 def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
-    """Keep only registered names with a finite intensity above 0; clamp to 10. NaN and inf are dropped."""
-    result: dict[str, float] = {}
+    """Keep only registered emotions with a finite intensity above 0; clamp to 10. NaN and inf are dropped.
+
+    A name matches the vocabulary in any spelling its lookup accepts (`vocabulary.get`: case, hyphens, the order of a blend's parts),
+    and also when each run of characters that are not letters or digits (space, slash, plus, several hyphens, one before "blend")
+    is read as a single underscore, with leading and trailing ones stripped. A name is looked up as the model spelled it first, so
+    a registered name that itself holds such a character still matches. The stored key is the registered name; spellings of one
+    emotion in one reply are pooled by `vocabulary.pool_by_canonical_name` (larger value kept).
+
+    ``vocab`` is the "vocabulary loaded" signal: empty means it could not be loaded, and every name is then kept as the model
+    spelled it (no lookup).
+
+    "Could not be loaded" covers two cases, and both give an empty set: `_load_vocab` caught an exception from
+    `vocabulary.list_all()` (it logs a warning), or the registry holds no emotions. In either case every name is kept, including
+    one that is empty or only separators (it is stored as spelled if its intensity passes the number filter).
+
+    The lookup (`vocabulary.get`) reads the live registry at the time of each call. ``vocab`` is only the set `_load_vocab` read
+    at the start of the tagger call, and it is what the prompt's name list is built from. Here it is only tested for empty or not
+    (to choose between the lookup and the cannot-load branch); it is not used to check whether a name is a member.
+
+    If `vocabulary.get` or `vocabulary.pool_by_canonical_name` raises, the exception is not caught here. It reaches the catch-all
+    in `_tagger`, which logs `emotion_tagger.tagger_error` (throttled) and returns `{}`.
+    """
+    usable: dict[str, float] = {}
     for name, intensity in raw.items():
-        if vocab and name not in vocab:
-            continue
+        spelling = name
+        if vocab:
+            # An empty spelling is skipped (`s and ...`) without a lookup. So an empty name is dropped, and a name of only separators
+            # is dropped unless the as-spelled lookup finds a registered name.
+            spelling = next((s for s in (name, _SEPARATOR_RUN.sub("_", name).strip("_")) if s and vocabulary.get(s) is not None), "")
+            if not spelling:
+                continue
         try:
             v = float(intensity)
         except (TypeError, ValueError):
             continue
         if not math.isfinite(v) or v <= 0.0:
             continue
-        result[name] = min(v, 10.0)
-    return result
+        # Two raw names can share one spelling here (they differ only in separators): keep the larger, as the pooling below does.
+        # Clamping to 10 before pooling gives the same value as clamping after: min(v, 10) never reverses the order of two values (it can only tie them).
+        usable[spelling] = max(min(v, 10.0), usable.get(spelling, 0.0))
+    return vocabulary.pool_by_canonical_name(usable) if vocab else usable
 
 
-# Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2a).
-_TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_backfill.tagger_system_prompt")
-# Text externalized to prompt_strings.toml [ingest.emotion_backfill] (issue #129 stage 2b).
-_TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backfill.tagger_prompt_segments")
+# Text externalized to prompt_strings.toml [ingest.emotion_tagger] (issue #129 stage 2a).
+_TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_tagger.tagger_system_prompt")
+# Text externalized to prompt_strings.toml [ingest.emotion_tagger] (issue #129 stage 2b).
+_TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_tagger.tagger_prompt_segments")
 
 
 def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
@@ -68,6 +99,10 @@ def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
 
     ``provider`` is the background-classifier tier provider the consolidation gate already holds. The reply is read with the
     shared `find_json_object_block` (a fenced reply or a reply with prose around the object is read), then `_normalize`.
+
+    A reply with no JSON object tags nothing and logs one throttled warning naming the kind: an empty (or whitespace-only) reply, or
+    a reply that held no object (its length is logged, never its text). Each kind has its own throttle key. A valid `{}` logs nothing.
+    A failed call (an exception from ``provider.generate``, or an invalid object) logs the `tagger error` line instead.
     """
 
     def _tagger(memory: Memory) -> dict[str, float]:
@@ -79,6 +114,19 @@ def make_emotion_tagger(provider: LLMProvider) -> EmotionTagger:
             raw_text = provider.generate(prompt, system=_TAGGER_SYSTEM_PROMPT)
             block = find_json_object_block(raw_text)
             if block is None:
+                # No object at all: a reply that is empty or only prose points at something else going wrong (a model that
+                # answered nothing or only prose; a failed call raises instead), so it is logged, one throttle key per kind. A valid `{}` is not here: it is the model's answer.
+                if not raw_text.strip():
+                    warn_throttled(logger, "emotion_tagger.empty_reply", "emotion_tagger: empty reply for memory %s", memory.id, exc_info=False)
+                else:
+                    warn_throttled(
+                        logger,
+                        "emotion_tagger.no_json_object",
+                        "emotion_tagger: reply held no JSON object for memory %s (%d characters)",
+                        memory.id,
+                        len(raw_text),
+                        exc_info=False,
+                    )
                 return {}
             return _normalize(json.loads(block), vocab)
         except Exception as exc:  # noqa: BLE001
@@ -105,6 +153,8 @@ def tag_if_feelingless(store: MemoryStore, tagger: EmotionTagger | None, memory:
     Raises whatever the tagger or the store raises (a deferred model call included): the gate's caller makes it fail-soft.
 
     Accepted cost (P4): a memory the tagger returns nothing for stays untagged and is sent to the tagger again at each recall.
+
+    Accepted cost (P4): a memory long enough to time out the tagging call at every recall is accepted as it is (no length cap, no "tried" mark).
 
     Accepted edge (P4): this does not filter on ``active``. An inactive row reaches the helper only if a gate path writes onto
     it (a row opened by id after a deactivation, or a merge verdict that names an inactive id: the merge branch in

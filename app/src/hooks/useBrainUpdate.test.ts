@@ -2,7 +2,7 @@
 // wrappers, bridge's fetchHealth, and useRestartBridge wholesale so no real
 // network call, restart flow, or timer runs.
 //
-// Spec: docs/superpowers/specs/2026-09-28-brain-update-app §4 + §6.
+// Spec: the 2026-09-28 brain-update app design (§4 + §6), never committed and lost (#797).
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor, cleanup } from "@testing-library/react";

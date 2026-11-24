@@ -7,6 +7,8 @@ shrunk to 0.05 s of CPU so the plants stay quick (`KINDLED_SLOW_BUDGET_S`); they
 from __future__ import annotations
 
 import ast
+import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +19,11 @@ from tests.no_base_failure import marker_problems
 
 REPO = Path(__file__).resolve().parents[2]
 _REASON = "test-suite machinery (#540): checks how the suite itself runs, which the product code does not affect, so it passes on the old code"
+_LOG_REASON = (
+    "test-suite machinery (#790): the fix is in tests/conftest.py and tests/slow_budget.py, which the base check keeps at "
+    "the PR head; before the fix these ended in an INTERNALERROR (FileNotFoundError from the patched open, IsADirectoryError) "
+    "or an AttributeError (no log_min_s)"
+)
 
 # The number of `@pytest.mark.slow(...)` decorators under tests/. It can only go down: when a slow test is made fast and its
 # mark removed, lower this number to the count the failure message shows. Raising it is a one-number edit that shows in the
@@ -42,6 +49,14 @@ def test_the_budget_is_on_only_when_asked_and_can_be_shrunk() -> None:
     assert slow_budget.budget_s({}) == 2.0
     assert slow_budget.budget_s({"KINDLED_SLOW_BUDGET_S": "0.3"}) == 0.3
     assert slow_budget.budget_s({"KINDLED_SLOW_BUDGET_S": "nonsense"}) == 2.0
+
+
+@pytest.mark.no_base_failure(reason=_LOG_REASON)
+def test_the_cpu_log_threshold_is_half_a_second_and_can_be_lowered() -> None:
+    """#790: the planted log tests lower it, so they need not burn half a second of CPU each."""
+    assert slow_budget.log_min_s({}) == 0.5
+    assert slow_budget.log_min_s({"KINDLED_SLOW_BUDGET_LOG_MIN_S": "0.05"}) == 0.05
+    assert slow_budget.log_min_s({"KINDLED_SLOW_BUDGET_LOG_MIN_S": "nonsense"}) == 0.5
 
 
 def _item(nodeid: str, *marks: dict, inherited: int = 0) -> SimpleNamespace:
@@ -153,6 +168,60 @@ def test_with_the_budget_off_everything_passes(pytester: pytest.Pytester, monkey
     result.assert_outcomes(passed=6, failed=1, xpassed=1)  # only the test that fails by itself
 
 
+_LOG_PLANTS = '''
+import builtins
+import time
+
+
+def burn(seconds=0.08):
+    start = time.process_time()
+    while time.process_time() - start < seconds:
+        pass
+
+
+def test_patches_open_and_burns_cpu(monkeypatch):
+    def unknown_path(*args, **kwargs):
+        raise FileNotFoundError(args[0] if args else "?")
+
+    monkeypatch.setattr(builtins, "open", unknown_path)  # like the cgroup fakes in test_reranker.py
+    burn()
+'''
+
+
+def _run_logged(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, log: Path) -> pytest.RunResult:
+    """The plant in an inner session, logging every call phase over 0.05 s of CPU to `log`, the budget itself off."""
+    pytester.makeini(_INNER_INI)
+    pytester.makeconftest(_INNER_CONFTEST)
+    pytester.makepyfile(_LOG_PLANTS)
+    with monkeypatch.context() as m:
+        m.delenv("KINDLED_SLOW_BUDGET", raising=False)
+        m.setenv("KINDLED_SLOW_BUDGET_LOG", str(log))
+        m.setenv("KINDLED_SLOW_BUDGET_LOG_MIN_S", "0.05")
+        return pytester.runpytest("-p", "no:cacheprovider", "-p", "no:randomly", "-p", "no:tdd-guard")
+
+
+@pytest.mark.no_base_failure(reason=_LOG_REASON)
+def test_a_test_that_patches_open_cannot_break_the_cpu_log(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#790: the log is written while the test's monkeypatch is still on. Through a patched `builtins.open` the write
+    raised, pytest reported an INTERNALERROR and the rest of the CI shard never ran."""
+    log = pytester.path / "cpu.jsonl"
+    result = _run_logged(pytester, monkeypatch, log)
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0
+    [line] = log.read_text(encoding="utf-8").splitlines()
+    assert json.loads(line)["id"].endswith("::test_patches_open_and_burns_cpu")
+
+
+@pytest.mark.no_base_failure(reason=_LOG_REASON)
+def test_a_cpu_log_that_cannot_be_written_warns_and_the_run_goes_on(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#790: a measurement log may not end the session. A path that cannot be opened (here a folder) is a warning."""
+    log = pytester.mkdir("not-a-file")
+    result = _run_logged(pytester, monkeypatch, log)
+    result.assert_outcomes(passed=1, warnings=1)
+    assert result.ret == 0
+    result.stdout.fnmatch_lines(["*the slow-test CPU log * could not be written*test_patches_open_and_burns_cpu*"])
+
+
 def _slow_mark_scan() -> tuple[int, list[str]]:
     """(decorators of the form `@pytest.mark.slow(...)` directly on a function under tests/, other uses of `mark.slow`)."""
     direct = 0
@@ -186,12 +255,34 @@ def _is_slow_call(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "slow" and _is_mark(node.func.value)
 
 
+@pytest.fixture(scope="module")
+def slow_mark_scan() -> tuple[int, list[str]]:
+    """The scan of the real tests/ tree, run once in setup: reading every file and parsing those that mention `mark.slow`
+    grows with the tree and once used 2.5 s of CPU on CI, which belongs to no one test (the call-phase budget, #787)."""
+    return _slow_mark_scan()
+
+
 @pytest.mark.no_base_failure(reason=_REASON)
-def test_slow_marks_are_only_function_decorators_and_their_number_never_goes_up() -> None:
-    count, elsewhere = _slow_mark_scan()
+def test_slow_marks_are_only_function_decorators_and_their_number_never_goes_up(slow_mark_scan: tuple[int, list[str]]) -> None:
+    count, elsewhere = slow_mark_scan
     assert not elsewhere, f"mark a slow test with a decorator on the function itself, not like this: {elsewhere}"
     assert count <= PINNED_SLOW_MARKS, (
         f"{count} `@pytest.mark.slow` decorators, the pin is {PINNED_SLOW_MARKS}: a new slow test needs the pin raised in this file "
         "(a visible, reviewable edit); first try to make the test fast"
     )
     assert count == PINNED_SLOW_MARKS, f"{count} slow marks now: lower PINNED_SLOW_MARKS in {Path(__file__).name} to {count} (the pin only goes down)"
+
+
+@pytest.mark.no_base_failure(
+    reason="the change is in this test file, which the base check keeps at the PR head; against main's version of the "
+    "file it fails (the test there takes no fixture and calls _slow_mark_scan() itself, #787)"
+)
+def test_the_slow_mark_scan_runs_in_setup_not_in_the_budgeted_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#787: the scan reads every file under tests/ and parses those that mention `mark.slow`, which grows with the tree
+    and used 2.5 s of the 2 s call-phase budget on a loaded runner. Setup is not budgeted, so the scan belongs in a module
+    fixture, as the Windows-pitfalls lint's does (#665); the test itself only checks the result."""
+    def scanned_in_the_call() -> tuple[int, list[str]]:
+        raise AssertionError("the test called _slow_mark_scan() itself, in its budgeted call phase")
+
+    monkeypatch.setattr(sys.modules[__name__], "_slow_mark_scan", scanned_in_the_call)
+    test_slow_marks_are_only_function_decorators_and_their_number_never_goes_up(slow_mark_scan=(PINNED_SLOW_MARKS, []))

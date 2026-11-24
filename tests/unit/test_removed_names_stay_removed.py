@@ -812,9 +812,15 @@ REMOVED: tuple[Removed, ...] = (
             "emotion_backfill_state.json",
             "emotion_backfill_budget.json",
         ),
-        why="the emotion backfill is a step of the consolidation gate (a written or recalled memory without feelings is tagged by `tag_if_feelingless`), so the idle job with its cursor, daily cap, pacing, yield-to-chat and two state files is gone; the prompt-string section `[ingest.emotion_backfill]` keeps its name by design, and the tagger now lives in brain/ingest/emotion_tagger.py",
+        why="the emotion backfill is a step of the consolidation gate (a written or recalled memory without feelings is tagged by `tag_if_feelingless`), so the idle job with its cursor, daily cap, pacing, yield-to-chat and two state files is gone; the tagger now lives in brain/ingest/emotion_tagger.py and its prompt-string section is `[ingest.emotion_tagger]`",
         ref="#747 (draft PR #656)",
         kind="code",
+    ),
+    Removed(
+        names=("ingest.emotion_backfill",),
+        why="the tagger's prompt-string section is `[ingest.emotion_tagger]`; the old section name belonged to the removed backfill job",
+        ref="#747 (draft PR #656)",
+        scope=("brain/prompt_strings.toml", "brain/ingest/emotion_tagger.py"),
     ),
     Removed(
         names=("brain/ingest/emotion_backfill.py",),

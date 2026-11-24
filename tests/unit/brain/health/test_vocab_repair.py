@@ -422,6 +422,45 @@ def test_repair_merges_variant_entries_keeping_the_described_one(tmp_path: Path)
     assert by_name["anticipatory_grief"]["description"] == "dread ahead"
 
 
+def test_repair_merges_a_stray_underscore_blend_key_with_its_twin(tmp_path: Path) -> None:
+    """#800: a vocabulary file already holding `_grief_love_blend` (the old canonical_name output) is
+    merged with `grief_love_blend` on the next repair run; the described entry wins, the stray key goes."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [
+        _stub_entry("grief_love_blend"),
+        _proper_entry("_grief_love_blend", "braided"),
+        _proper_entry("love"),
+    ])
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert set(by_name) == {"grief_love_blend", "love"}
+    assert by_name["grief_love_blend"]["description"] == "braided"
+
+
+def test_repair_renames_a_lone_stray_underscore_blend_key(tmp_path: Path) -> None:
+    """#800: with no twin, the stray key is renamed to the canonical one and keeps its description."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_proper_entry("_grief_love_blend", "braided"), _stub_entry("emergence")])
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert set(by_name) == {"grief_love_blend", "emergence"}
+    assert by_name["grief_love_blend"]["description"] == "braided"
+
+
 def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:
     """#173: a ```json-fenced reply must still describe the stubs (shared extract_json_object)."""
     from brain.health.vocab_repair import run_vocab_repair

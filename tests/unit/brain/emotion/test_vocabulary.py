@@ -222,6 +222,86 @@ def test_canonical_name_sorts_blend_parts() -> None:
     assert canonical_name("Love-Grief_blend") == "grief_love_blend"
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    ["c__b_a_blend", "_c_b__a_blend", "c_b_a__blend", "a_c__b_blend", "__a_b_c__blend"],
+)
+def test_three_part_blend_with_doubled_leading_or_trailing_separators_sorts_its_real_parts(spelling: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(spelling) == "a_b_c_blend"
+
+
+def test_get_finds_a_registered_blend_by_a_doubled_separator_spelling() -> None:
+    e = vocabulary.Emotion(
+        name="love_grief_blend",
+        description="x",
+        category="persona_extension",
+        decay_half_life_days=14.0,
+        intensity_clamp=10.0,
+    )
+    vocabulary.register(e)
+    try:
+        stored = vocabulary.get("grief_love_blend")
+        assert stored is not None
+        for spelling in ("love_grief__blend", "love__grief_blend", "_love_grief_blend"):
+            assert vocabulary.get(spelling) is stored
+    finally:
+        vocabulary._unregister("grief_love_blend")
+
+
+def test_pool_by_canonical_name_pools_a_doubled_separator_spelling_with_its_twin() -> None:
+    from brain.emotion.vocabulary import pool_by_canonical_name
+
+    # the larger value comes first for one pair and last for the other, so neither first-wins nor last-wins passes
+    values = {"love_grief__blend": 6.0, "grief_love_blend": 2.0, "_gold_iron_blend": 1.0, "iron_gold_blend": 4.0}
+
+    assert pool_by_canonical_name(values) == {"grief_love_blend": 6.0, "gold_iron_blend": 4.0}
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("love_grief__blend", "grief_love_blend"),
+        ("love__grief_blend", "grief_love_blend"),
+        ("_love_grief_blend", "grief_love_blend"),
+        ("Love__Grief_Blend", "grief_love_blend"),
+        ("-love-grief--blend", "grief_love_blend"),
+        # no parts left once the empty ones are dropped: one underscore before _blend (was __blend)
+        ("__blend", "_blend"),
+    ],
+)
+def test_canonical_name_changed_outputs_are_pinned(name: str, expected: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(name) == expected
+
+
+@pytest.mark.no_base_failure(reason="pins canonical_name's outputs for names without an empty blend part, which the #800 fix leaves unchanged, so every row passes on the old code by design; the rows the fix changes are in test_canonical_name_changed_outputs_are_pinned")
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("joy", "joy"),
+        ("Joy", "joy"),
+        (" Present-ness ", "present_ness"),
+        ("Anticipatory-Grief", "anticipatory_grief"),
+        ("love_grief_blend", "grief_love_blend"),
+        ("Love-Grief_blend", "grief_love_blend"),
+        ("grief_love_blend", "grief_love_blend"),
+        ("comfort_seeking", "comfort_seeking"),
+        ("grief love blend", "grief love blend"),
+        ("love/grief_blend", "love/grief_blend"),
+        ("_blend", "_blend"),
+        ("blend", "blend"),
+        ("", ""),
+    ],
+)
+def test_canonical_name_outputs_are_pinned(name: str, expected: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(name) == expected
+
+
 def test_get_resolves_variant_spellings_to_registered_entry() -> None:
     from brain.emotion import vocabulary
 

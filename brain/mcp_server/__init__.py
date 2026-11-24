@@ -9,7 +9,7 @@ Public surface:
     run_server(persona_dir: Path) — entry; runs until stdio closes
     register_tools                 — re-exported from .tools for testing
 
-Spec: docs/superpowers/specs/2026-04-27-mcp-config-path-for-brain-tools-design.md
+Spec: the 2026-04-27 MCP-config-path design, never committed and lost (#797).
 """
 
 from __future__ import annotations
