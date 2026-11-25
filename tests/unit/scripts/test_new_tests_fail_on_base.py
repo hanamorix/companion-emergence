@@ -318,6 +318,20 @@ def test_reports_recorded_under_an_xdist_group_suffix_are_read_back_under_the_co
     assert "t.py::unknown@g" in got, "an id that matches no collected id is kept as recorded, never dropped"
 
 
+def test_pytest_children_write_and_are_read_as_utf8(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """On Windows both ends default to cp1252: the child must write UTF-8 (PYTHONUTF8) and we must decode it as UTF-8."""
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ntf.subprocess, "run", fake_run)
+    ntf._pytest(sys.executable, tmp_path, {}, ["--collect-only"])
+    assert seen["encoding"] == "utf-8"
+    assert seen["env"]["PYTHONUTF8"] == "1"
+
+
 def test_the_collected_count_is_read_from_pytests_last_line() -> None:
     assert ntf.collected_count("tests/a.py::t\n\n1 test collected in 0.01s\n") == 1
     assert ntf.collected_count("tests/a.py::t\n\n191/4812 tests collected (4621 deselected) in 1.2s\n") == 191

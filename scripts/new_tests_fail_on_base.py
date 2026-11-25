@@ -216,7 +216,7 @@ def smallest_unchanged_test(ls_tree_l: str, changed: set[str], min_size: int = 3
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
-    res = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=False)
+    res = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, encoding="utf-8", check=False)
     if check and res.returncode != 0:
         print(f"git {' '.join(args)} failed ({res.returncode}): {res.stderr.strip()}", file=sys.stderr)
         raise SystemExit(2)
@@ -227,12 +227,15 @@ def _pytest(py: str, cwd: Path, env_extra: Mapping[str, str], args: Sequence[str
     env = {**os.environ, **env_extra}
     env["PYTEST_ADDOPTS"] = ""  # the output format is parsed below: no inherited -q/-qq/-p/-n
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(cwd), env_extra.get("NTFOB_PLUGIN_DIR", ""), env.get("PYTHONPATH", "")]))
+    env["PYTHONUTF8"] = "1"  # the child writes UTF-8 (Windows defaults to cp1252), matching how its output is read
     return subprocess.run(
         [py, "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:tdd-guard", *args],
         cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",  # a stray non-UTF-8 byte in a test's output must not crash the parse
         check=False,
     )
 
@@ -364,8 +367,8 @@ def _judge_pr(py, repo, base, head, workers, expr, files, renamed, entries, scra
         raise CheckError("after the swap the product paths still differ from the base commit")
     probe = subprocess.run(
         [py, "-c", "import brain, sys; sys.stdout.write(brain.__file__)"],
-        cwd=head_tree, capture_output=True, text=True, check=False,
-        env={**os.environ, "PYTHONPATH": str(head_tree)},
+        cwd=head_tree, capture_output=True, text=True, encoding="utf-8", check=False,
+        env={**os.environ, "PYTHONPATH": str(head_tree), "PYTHONUTF8": "1"},
     )
     if not probe.stdout.startswith(str(head_tree)):
         print(f"CANARY FAILED: brain imports from {probe.stdout!r}, not from the swapped tree {head_tree}")

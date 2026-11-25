@@ -54,6 +54,17 @@ def test_the_real_tree_is_scanned_in_setup_not_in_the_budgeted_call(monkeypatch)
     test_brain_tree_has_no_unreviewed_windows_pitfalls(real_findings=[])
 
 
+def test_scripts_are_linted_too(tmp_path) -> None:
+    """The CI scripts run on Windows runners as well (the new-tests check spawned git and pytest with no encoding=)."""
+    (tmp_path / "brain").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "tool.py").write_text(
+        "import subprocess\nsubprocess.run(['git', 'status'], capture_output=True, text=True)\n", encoding="utf-8"
+    )
+    findings = lint.scan(tmp_path)
+    assert len(findings) == 1 and findings[0].startswith("scripts/tool.py:2:")
+
+
 def _tree(tmp_path: Path, source: str) -> Path:
     (tmp_path / "brain").mkdir(parents=True)
     (tmp_path / "brain" / "mod.py").write_text(source, encoding="utf-8")
