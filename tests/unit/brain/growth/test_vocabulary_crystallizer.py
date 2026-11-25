@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from brain.growth.crystallizers.vocabulary import crystallize_vocabulary
 from brain.memory.store import Memory, MemoryStore
 
@@ -51,6 +53,30 @@ def test_crystallizer_proposes_recurring_unnamed_emotional_configuration() -> No
         assert proposal.score >= 0.7
         assert proposal.relational_context == "recurring emotional configuration in us memories"
 
+    finally:
+        store.close()
+
+
+@pytest.mark.no_base_failure(
+    reason="guards list_recent_light's newest-first window: the base's list_active kept write order on tied times"
+)
+def test_crystallizer_evidence_keeps_write_order_when_times_tie() -> None:
+    """Windows' coarse clock gives memories made in a row the same created_at; evidence is still oldest first."""
+    from datetime import UTC, datetime
+
+    store = MemoryStore(":memory:")
+    try:
+        same = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
+        written = []
+        for content in ("love and grief braided", "another love-grief evening", "grief softened by love"):
+            memory = _mem(content, {"love": 9, "grief": 8})
+            memory.created_at = same
+            store.create(memory)
+            written.append(memory.id)
+
+        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief"}, eng=None)
+
+        assert [p.evidence_memory_ids for p in result] == [tuple(written)]
     finally:
         store.close()
 
@@ -120,3 +146,75 @@ def test_crystallizer_treats_hyphen_and_case_variants_as_existing() -> None:
         assert result == []
     finally:
         store.close()
+
+
+def _half_life_of_blend(emotions: dict[str, float]) -> float:
+    store = MemoryStore(":memory:")
+    try:
+        for n in range(3):
+            store.create(_mem(f"blend moment {n}", dict(emotions)))
+        (proposal,) = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
+        return proposal.decay_half_life_days
+    finally:
+        store.close()
+
+
+def test_crystallizer_scans_only_the_newest_window(monkeypatch) -> None:
+    """A cluster older than the scan window forms no proposal; one inside it does."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.growth.crystallizers import vocabulary as crystallizer
+
+    monkeypatch.setattr(crystallizer, "_SCAN_LIMIT", 3)
+    store = MemoryStore(":memory:")
+    try:
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        # Oldest: a grief/love cluster, then the three newest: a joy/awe cluster.
+        for n, emotions in enumerate([{"grief": 8, "love": 7}] * 3 + [{"joy": 8, "awe": 7}] * 3):
+            m = _mem(f"moment {n}", dict(emotions))
+            m.created_at = base + timedelta(days=n)
+            store.create(m)
+
+        result = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
+
+        assert [p.name for p in result] == ["awe_joy_blend"]  # canonical sorted spelling
+
+        monkeypatch.setattr(crystallizer, "_SCAN_LIMIT", 2)
+        assert crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None) == []
+    finally:
+        store.close()
+
+
+def test_crystallized_blend_half_life_is_parent_mean() -> None:
+    assert _half_life_of_blend({"joy": 8, "grief": 7}) == (3.0 + 60.0) / 2
+
+
+def test_crystallizer_skips_a_refused_blend_name_and_proposes_the_next_cluster() -> None:
+    """A top cluster whose blend name the gate refuses must not block every other blend each tick."""
+    store = MemoryStore(":memory:")
+    try:
+        for n in range(4):
+            store.create(_mem(f"digit moment {n}", {"grief2": 9, "love": 8}))
+        for n in range(3):
+            store.create(_mem(f"bright moment {n}", {"joy": 8, "awe": 7}))
+
+        result = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
+
+        assert [p.name for p in result] == ["awe_joy_blend"]
+    finally:
+        store.close()
+
+
+def test_crystallized_blend_parent_uses_its_registered_half_life() -> None:
+    """Without an engine, a registered persona-extension parent lends its own half-life, not the default."""
+    from brain.emotion import vocabulary
+    from brain.emotion.vocabulary import Emotion
+
+    vocabulary.register(
+        Emotion(name="ember_feel", description="d", category="persona_extension", decay_half_life_days=40.0)
+    )
+    assert _half_life_of_blend({"ember_feel": 8, "joy": 7}) == (40.0 + 3.0) / 2
+
+
+def test_crystallized_blend_with_love_uses_its_dev_half_life() -> None:
+    assert _half_life_of_blend({"love": 8, "joy": 7}) == (730.0 + 3.0) / 2

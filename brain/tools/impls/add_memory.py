@@ -3,14 +3,30 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
+from brain.emotion import vocabulary
 from brain.emotion.engine_utils import memory_feelings
+from brain.emotion.persona_loader import register_new_word
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls._common import _write_gate_check
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_HALF_LIFE_DAYS = 3650.0
+
+
+def _valid_half_life(value: object) -> float | None:
+    """A real finite number with 0 < v <= 3650, else None (the default applies). bool is not a number here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    # The range first: comparing works on any int, while math.isfinite raises OverflowError on one too large for a float.
+    if not 0 < value <= _MAX_HALF_LIFE_DAYS or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 def add_memory(
@@ -20,6 +36,7 @@ def add_memory(
     emotions: dict[str, int],
     tags: list[str] | None = None,
     importance: int | None = None,
+    emotion_half_lives: dict[str, float] | None = None,
     *,
     store: MemoryStore,
     hebbian: HebbianMatrix,
@@ -45,6 +62,20 @@ def add_memory(
     dict — either a rejection dict (created=False) or a success dict (created=True).
     """
     tags = list(tags or [])
+    if not isinstance(emotion_half_lives, dict):
+        emotion_half_lives = {}
+
+    # A name already in the vocabulary skips the gate; a new word must pass it. Raw
+    # spellings are checked before pooling, so refusals name what was actually written.
+    kept: dict[str, float] = {}
+    refused: list[str] = []
+    for raw, value in emotions.items():
+        if vocabulary.get(raw) is None and vocabulary.validate_new_name(raw) is None:
+            refused.append(raw)
+        else:
+            kept[raw] = value
+    refused.sort()
+    emotions = vocabulary.pool_by_canonical_name(kept)
 
     passes, effective_importance, emotion_score, rejection_reason = _write_gate_check(
         emotions, importance
@@ -54,7 +85,32 @@ def add_memory(
         return {
             "created": False,
             "reason": rejection_reason,
+            "refused_emotions": refused,
         }
+
+    canonical_half_lives = {
+        vocabulary.canonical_name(raw): value
+        for raw, value in emotion_half_lives.items()
+        if isinstance(raw, str)
+    }
+    unregistered: list[str] = []
+    for name in emotions:
+        if vocabulary.get(name) is None:
+            registered_as = register_new_word(
+                persona_dir / "emotion_vocabulary.json",
+                name,
+                half_life_days=_valid_half_life(
+                    emotion_half_lives.get(name, canonical_half_lives.get(name))
+                ),
+            )
+            if registered_as is None:
+                unregistered.append(name)
+    unregistered.sort()
+    if unregistered:
+        # The memory still keeps these feelings; only the vocabulary entry is missing.
+        logger.warning(
+            "add_memory could not register new emotion word(s) %s in the vocabulary", unregistered
+        )
 
     # Build the memory with importance as a float (Memory.create_new normalises
     # importance to score/10 if None, but we've already calculated it — pass
@@ -127,6 +183,8 @@ def add_memory(
         "id": memory.id,
         "importance": effective_importance,
         "auto_linked_to": related_ids,
+        "refused_emotions": refused,
+        "unregistered_emotions": unregistered,
     }
     if auto_link_error is not None:
         result["auto_link_error"] = auto_link_error

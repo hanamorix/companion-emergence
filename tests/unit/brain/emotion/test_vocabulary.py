@@ -284,3 +284,71 @@ def test_pool_by_canonical_name_leaves_unknown_names_apart() -> None:
 
     # Two spellings of the unknown name share one key; look-alikes of a registered name stay their own keys.
     assert pooled == {unknown: 2.0, "comfort": 3.0, "comfort_seeking_extra": 4.0, "comfort_seeking": 5.0}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Comfort-Seeking", "comfort_seeking"),
+        ("grief_love_blend", "grief_love_blend"),
+        ("love_grief_blend", "grief_love_blend"),
+        ("x" * 100, "x" * 100),
+        ("x" * 101, None),
+        ("Love!!", None),
+        ("", None),
+        ("   ", None),
+        ("comfort seeking", None),
+        ("_joy", None),
+        ("joy2", None),
+        ("日本", None),
+        ("joy\nsorrow", None),
+    ],
+)
+def test_validate_new_name(raw: str, expected: str | None) -> None:
+    assert vocabulary.validate_new_name(raw) == expected
+
+
+def test_by_category_survives_a_register_during_iteration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A register landing mid-iteration must not break a reader (iterate a snapshot)."""
+    registry: dict[str, object] = {}
+
+    class _Probe:
+        """Registers a new word the moment the reader looks at its category."""
+
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.fired = False
+
+        @property
+        def category(self) -> str:
+            if not self.fired:
+                self.fired = True
+                registry[f"late_{self.key}"] = _Probe(f"late_{self.key}")
+            return "core"
+
+    registry["a"] = _Probe("a")
+    registry["b"] = _Probe("b")
+    monkeypatch.setattr(vocabulary, "_REGISTRY", registry)
+
+    assert len(vocabulary.by_category("core")) == 2
+
+
+@pytest.mark.no_base_failure(
+    reason="guards the registry lock: CPython makes a lone dict store atomic, so the unlocked base doesn't lose a register"
+)
+def test_register_is_safe_across_threads() -> None:
+    import threading
+
+    before = len(vocabulary.list_all())
+
+    def worker(i: int) -> None:
+        for j in range(25):
+            vocabulary.register(Emotion(f"t{i}_{j}", "thread word", "persona_extension", 1.0))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(vocabulary.list_all()) == before + 200

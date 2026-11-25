@@ -144,8 +144,8 @@ def test_name_grows_vocab_only_via_crystalliser_not_placeholder_stub(tmp_path: P
     assert any(n.endswith("_blend") for n in names)
 
     entry = next(e for e in data["emotions"] if e["name"].endswith("_blend"))
-    # Proper half-life — NOT the 1.0-day placeholder stub the v0.0.32 bug minted.
-    assert entry["decay_half_life_days"] == 45.0
+    # Proper half-life (#784: the mean of its parents', grief 60 and loneliness 10) — NOT the 1.0-day stub.
+    assert entry["decay_half_life_days"] == (60.0 + 10.0) / 2
     assert entry["decay_half_life_days"] != 1.0
     # Real description, not an empty/placeholder string.
     assert isinstance(entry.get("description"), str) and len(entry["description"]) > 20

@@ -63,6 +63,8 @@ def cli_persona(tmp_path: Path) -> Path:
     make_persona(persona, [row(T35, emotions={"joy": 6.0}, mid="seed")])
     (persona / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}', encoding="utf-8")
     (persona / "emotion_vocabulary.json").write_text('{"version": 1, "emotions": []}', encoding="utf-8")
+    # No vocabulary heal marker: a dry run loads the vocabulary read-only (no store), so even a persona whose one-time heal
+    # hasn't run yet stays write-free (#784).
     return persona
 
 

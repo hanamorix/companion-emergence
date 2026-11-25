@@ -3,13 +3,18 @@ and triggered automatically when a heartbeat tick produces >=2 anomalies."""
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
-from brain.health.json_io import Recovery, read_json_result
+from brain.health.json_io import JsonFileError, Recovery, read_json, read_json_result
+from brain.paths import cadence_state_path
+from brain.utils.file_lock import file_lock
+
+logger = logging.getLogger(__name__)  # the heal-marker unlink warning in walk_persona
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
 #
@@ -40,6 +45,17 @@ _AUTO_CREATE_TEXT_FILES: tuple[str, ...] = ("voice.md",)
 _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 
 
+def _vocabulary_needs_repair(path: Path) -> bool:
+    """True when the file exists and a plain read fails, so the heal that follows will write it."""
+    if not path.exists():
+        return False
+    try:
+        read_json(path, default=lambda: None, recover=Recovery.RAISE)
+    except JsonFileError:
+        return True
+    return False
+
+
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
@@ -54,10 +70,28 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     # to avoid Python's late-binding closure gotcha.
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
-        _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
+        # The vocabulary's repair holds the lock register_new_word and the loader take, so a word added meanwhile is kept.
+        # A healthy file is only read, without the lock: `GET /health` walks on every probe and must not wait on a writer.
+        guard = file_lock(path) if name == "emotion_vocabulary.json" and _vocabulary_needs_repair(path) else nullcontext()
+        with guard:
+            _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
         _, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             anomalies.append(anomaly)
+            if name == "emotion_vocabulary.json":
+                # This heal has no store: a restored .bak or a reset can drop words only the
+                # memories still carry. Delete the one-time heal marker so the next load that
+                # has a store re-registers them (#784). A failure is logged, never fatal to the walk.
+                marker = cadence_state_path(persona_dir, "vocab_heal_final.json")
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "could not remove %s after repairing %s; the vocabulary heal may not re-run",
+                        marker,
+                        name,
+                        exc_info=True,
+                    )
 
     # Auto-creating text identity scan (voice.md). load_voice() owns the
     # default template and the attempt_heal_text invocation.

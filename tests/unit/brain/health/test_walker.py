@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -146,3 +148,186 @@ def test_walk_corrupt_voicecraft_no_bak_resets_to_empty(tmp_path: Path) -> None:
     voicecraft_anomalies = [a for a in anomalies if a.file == "voicecraft.md"]
     assert len(voicecraft_anomalies) == 1
     assert voicecraft_anomalies[0].action == "reset_to_default"
+
+
+def _persona_with_heal_marker_and_words(tmp_path: Path, words: list[str]) -> Path:
+    """A persona whose memories carry ``words`` and whose one-time vocabulary heal has already run."""
+    from brain.health.json_io import write_json
+    from brain.memory.store import Memory
+    from brain.paths import cadence_state_path
+
+    persona = _setup_persona(tmp_path)
+    store = MemoryStore(db_path=persona / "memories.db")
+    try:
+        for word in words:
+            store.create(
+                Memory.create_new(content=word, memory_type="conversation", domain="us", emotions={word: 8.0})
+            )
+    finally:
+        store.close()
+    write_json(cadence_state_path(persona, "vocab_heal_final.json"), {"healed_at": "x", "count": 0})
+    return persona
+
+
+def _load_with_store(persona: Path) -> None:
+    from brain.emotion.persona_loader import load_persona_vocabulary
+
+    store = MemoryStore(db_path=persona / "memories.db")
+    try:
+        load_persona_vocabulary(persona / "emotion_vocabulary.json", store=store)
+    finally:
+        store.close()
+
+
+@pytest.mark.no_base_failure(
+    reason="guards the new heal marker: the base has no marker and heals on every store load, so it passes there"
+)
+def test_walker_reset_of_vocabulary_re_arms_the_heal(tmp_path: Path) -> None:
+    """The walker resets a corrupt vocabulary with no store; the next store-carrying load re-learns the words."""
+    from brain.emotion import vocabulary
+
+    persona = _persona_with_heal_marker_and_words(tmp_path, ["kappa_feel"])
+    (persona / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    vocabulary._unregister("kappa_feel")
+
+    anomalies = walk_persona(persona)
+    assert any(a.file == "emotion_vocabulary.json" and a.action == "reset_to_default" for a in anomalies)
+
+    _load_with_store(persona)
+
+    assert vocabulary.get("kappa_feel") is not None
+
+
+@pytest.mark.no_base_failure(
+    reason="guards the new heal marker: the base has no marker and heals on every store load, so it passes there"
+)
+def test_walker_bak_restore_re_arms_the_heal(tmp_path: Path) -> None:
+    """The walker restores an older .bak1 that lacks the newest word; the next store-carrying load re-learns it."""
+    import json
+
+    from brain.emotion import vocabulary
+
+    persona = _persona_with_heal_marker_and_words(tmp_path, ["lambda_feel", "mu_feel"])
+    old_entry = {
+        "name": "lambda_feel",
+        "description": "d",
+        "category": "persona_extension",
+        "decay_half_life_days": 14.0,
+        "intensity_clamp": 10.0,
+    }
+    (persona / "emotion_vocabulary.json.bak1").write_text(
+        json.dumps({"version": 1, "emotions": [old_entry]}), encoding="utf-8"
+    )
+    (persona / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    vocabulary._unregister("lambda_feel")
+    vocabulary._unregister("mu_feel")
+
+    anomalies = walk_persona(persona)
+    assert any(a.file == "emotion_vocabulary.json" and a.action == "restored_from_bak1" for a in anomalies)
+
+    _load_with_store(persona)
+
+    assert vocabulary.get("lambda_feel") is not None
+    assert vocabulary.get("mu_feel") is not None
+    names = {e["name"] for e in json.loads((persona / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]}
+    assert names == {"lambda_feel", "mu_feel"}
+
+
+def test_walker_reset_then_same_process_load_restores_the_word(tmp_path: Path) -> None:
+    """The bridge's registry still holds the word when the walker resets the file; the next load must write it back."""
+    import json
+
+    from brain.emotion import vocabulary
+
+    persona = _setup_persona(tmp_path)
+    store = MemoryStore(db_path=persona / "memories.db")
+    try:
+        from brain.memory.store import Memory
+
+        store.create(Memory.create_new(content="x", memory_type="conversation", domain="us", emotions={"nu_feel": 8.0}))
+    finally:
+        store.close()
+    vocab_path = persona / "emotion_vocabulary.json"
+    vocab_path.write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+    _load_with_store(persona)
+    assert vocabulary.get("nu_feel") is not None
+    for bak in persona.glob("emotion_vocabulary.json.bak*"):
+        bak.unlink()
+    vocab_path.write_text("{not json", encoding="utf-8")
+
+    anomalies = walk_persona(persona)
+    assert any(a.file == "emotion_vocabulary.json" and a.action == "reset_to_default" for a in anomalies)
+
+    _load_with_store(persona)  # same process: no _unregister
+
+    names = {e["name"] for e in json.loads(vocab_path.read_text(encoding="utf-8"))["emotions"]}
+    assert "nu_feel" in names
+
+
+def test_walker_keeps_going_when_the_heal_marker_cannot_be_removed(tmp_path: Path, monkeypatch, caplog) -> None:
+    """A failed unlink of the heal marker is logged; the walk still checks every file and returns its anomalies."""
+    import logging
+
+    persona = _persona_with_heal_marker_and_words(tmp_path, ["omicron_feel"])
+    (persona / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    (persona / "voicecraft.md").write_text("", encoding="utf-8")  # walked after the JSON files
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "vocab_heal_final.json":
+            raise PermissionError("marker is locked")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with caplog.at_level(logging.WARNING, logger="brain.health.walker"):
+        anomalies = walk_persona(persona)
+
+    assert {"emotion_vocabulary.json", "voicecraft.md"} <= {a.file for a in anomalies}
+    assert any(r.name == "brain.health.walker" and "vocab_heal_final.json" in r.getMessage() for r in caplog.records)
+
+
+def test_walker_takes_no_vocabulary_lock_for_a_healthy_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`GET /health` walks on every probe: a healthy file must not wait behind a writer that holds the lock."""
+    import json
+    from contextlib import contextmanager
+
+    from brain.health import walker
+
+    persona = _setup_persona(tmp_path)
+    (persona / "emotion_vocabulary.json").write_text(json.dumps({"version": 1, "emotions": []}), encoding="utf-8")
+    locked: list[Path] = []
+
+    @contextmanager
+    def recording_lock(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        locked.append(Path(path))
+        yield True
+
+    monkeypatch.setattr(walker, "file_lock", recording_lock)
+
+    assert walk_persona(persona) == []
+    assert locked == []
+
+
+def test_walker_repairs_the_vocabulary_under_its_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The walker's repair of the vocabulary file holds the lock register_new_word takes, so a word added meanwhile isn't lost."""
+    from brain.health import walker
+    from brain.utils.file_lock import file_lock
+
+    persona = _setup_persona(tmp_path)
+    vocab_path = persona / "emotion_vocabulary.json"
+    vocab_path.write_text("{not json", encoding="utf-8")
+    held: list[bool] = []
+    real_read = walker.read_json_result
+
+    def spy(path, *args, **kwargs):  # noqa: ANN001, ANN202
+        if Path(path) == vocab_path:
+            with file_lock(vocab_path, blocking=False) as acquired:
+                held.append(not acquired)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(walker, "read_json_result", spy)
+
+    walk_persona(persona)
+
+    assert held == [True]

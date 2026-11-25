@@ -495,6 +495,174 @@ def test_add_memory_importance_clamped_to_1_10(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_add_memory_registers_new_word_with_given_half_life(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="a quiet ache settled in after she left",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives={"quiet_ache": 5},
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    registered = vocabulary.get("quiet_ache")
+    assert registered is not None
+    assert registered.decay_half_life_days == 5.0
+
+
+def test_add_memory_refuses_junk_names_keeps_valid_ones(tmp_path: Path) -> None:
+    from brain.emotion.engine_utils import memory_feelings
+    from brain.tools.impls.add_memory import add_memory
+
+    ctx = _ctx(tmp_path)
+    result = add_memory(
+        content="a mixed bag of names",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "Love!!": 9, "": 5, "comfort seeking": 6},
+        importance=8,
+        **ctx,
+    )
+
+    assert result["created"] is True
+    assert result["refused_emotions"] == ["", "Love!!", "comfort seeking"]
+    stored = ctx["store"].get(result["id"], bump=False)
+    assert memory_feelings(stored, None, None, None).feelings == {"love": 9.0}
+
+
+@pytest.mark.parametrize("bad", [-1, 0, float("nan"), "soon", 1e9, True])
+def test_add_memory_bad_half_life_falls_back_to_default(tmp_path: Path, bad) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="a word with a bad half-life",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives={"quiet_ache": bad},
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
+
+
+def test_add_memory_half_life_too_large_for_a_float_falls_back_to_default(tmp_path: Path) -> None:
+    """A 400-digit integer in the tool call: math.isfinite raises OverflowError on it rather than answering False."""
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="a word with a huge half-life",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives={"quiet_ache": 10**400},
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
+
+
+def test_add_memory_non_dict_half_lives_is_ignored(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="half lives as a string",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "quiet_ache": 8},
+        emotion_half_lives="soon",
+        importance=8,
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is True
+    assert vocabulary.get("quiet_ache").decay_half_life_days == 14.0
+
+
+@pytest.mark.no_base_failure(
+    reason="pins Decision 2 against the new registration: the base never registers words, so a refused write mints none there"
+)
+def test_add_memory_refused_write_registers_no_word(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    result = add_memory(
+        content="too faint to keep",
+        memory_type="event",
+        domain="relationship",
+        emotions={"quiet_ache": 3},
+        **_ctx(tmp_path),
+    )
+
+    assert result["created"] is False
+    assert vocabulary.get("quiet_ache") is None
+
+
+def test_add_memory_keeps_an_already_registered_name_the_gate_would_refuse(tmp_path: Path) -> None:
+    """R3: the gate is for new words; a name the vocabulary already holds is kept as written."""
+    from brain.emotion import vocabulary
+    from brain.emotion.engine_utils import memory_feelings
+    from brain.emotion.vocabulary import Emotion
+    from brain.tools.impls.add_memory import add_memory
+
+    vocabulary.register(
+        Emotion(name="old2_word", description="d", category="persona_extension", decay_half_life_days=14.0)
+    )
+    assert vocabulary.validate_new_name("old2_word") is None
+    ctx = _ctx(tmp_path)
+    result = add_memory(
+        content="an old word with a digit",
+        memory_type="event",
+        domain="relationship",
+        emotions={"love": 9, "old2_word": 8},
+        importance=8,
+        **ctx,
+    )
+
+    assert result["created"] is True
+    assert result["refused_emotions"] == []
+    stored = ctx["store"].get(result["id"], bump=False)
+    assert memory_feelings(stored, None, None, None).feelings == {"love": 9.0, "old2_word": 8.0}
+    assert not (tmp_path / "emotion_vocabulary.json").exists()
+
+
+def test_add_memory_lists_and_logs_words_it_could_not_register(tmp_path: Path, caplog) -> None:
+    import logging
+
+    from brain.emotion import vocabulary
+    from brain.tools.impls.add_memory import add_memory
+
+    (tmp_path / "emotion_vocabulary.json").write_bytes(b"{not json")
+    with caplog.at_level(logging.WARNING, logger="brain.tools.impls.add_memory"):
+        result = add_memory(
+            content="two new words and a corrupt vocabulary",
+            memory_type="event",
+            domain="relationship",
+            emotions={"love": 9, "zeta_ache": 8, "Alpha-Ache": 7},
+            importance=8,
+            **_ctx(tmp_path),
+        )
+
+    assert result["created"] is True
+    assert result["unregistered_emotions"] == ["alpha_ache", "zeta_ache"]
+    assert vocabulary.get("zeta_ache") is None
+    assert any(
+        r.name == "brain.tools.impls.add_memory" and "zeta_ache" in r.getMessage() for r in caplog.records
+    )
+
+
 def test_boot_returns_all_composition_keys(tmp_path: Path) -> None:
     """boot() returns a dict with all 5+1 required keys."""
     from brain.tools.impls.boot import boot

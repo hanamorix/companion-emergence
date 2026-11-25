@@ -150,3 +150,19 @@ def test_dream_handler_friendly_message_when_no_seed(
     assert "Traceback" not in captured.out
     assert "Traceback" not in captured.err
     assert "NoSeedAvailable" not in captured.out
+
+
+def test_a_dry_run_leaves_a_corrupt_vocabulary_as_it_is_and_warns(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A dry run writes nothing: a corrupt vocabulary is read-only failed, not quarantined or reset, and the user is told (#784)."""
+    persona = tmp_path / "persona"
+    persona.mkdir()
+    (persona / "emotion_vocabulary.json").write_text("{not json", encoding="utf-8")
+    store = MemoryStore(":memory:")
+    try:
+        cli._load_command_vocabulary(persona, store, True)
+    finally:
+        store.close()
+
+    assert (persona / "emotion_vocabulary.json").read_text(encoding="utf-8") == "{not json"
+    assert sorted(p.name for p in persona.iterdir()) == ["emotion_vocabulary.json"]
+    assert "could not be read and was left as it is" in capsys.readouterr().err
