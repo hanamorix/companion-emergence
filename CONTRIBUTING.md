@@ -172,7 +172,7 @@ Every parametrized id is a test the suite collects, runs and reports. A grid tha
 
 **The two flags that will block** (on new test functions only, meaning functions with at least one new id):
 
-- **Scanner.** The parametrize values are built at collection time from the repository: the values argument is not a literal list or tuple, and it calls (or names a module-level value built by calling) `glob`, `rglob`, `iterdir`, `os.listdir`, `os.scandir`, `os.walk`, or a `git ls-files` subprocess. Each scanned file adds an id, so the count grows with the repository.
+- **Scanner.** The parametrize values are built at collection time from the repository: the values argument is not a literal list or tuple (or a name bound to one), and it calls (or names a module-level value built by calling) `glob`, `rglob`, `iterdir`, `os.listdir`, `os.scandir`, `os.walk`, or a `git ls-files` subprocess. Each scanned file adds an id, so the count grows with the repository.
 - **Cross-product.** Two or more parametrize axes, and more ids than the sum of the axis sizes. 2×2 gives 4 ids against 4 and isn't flagged; 2×3 gives 6 against 5 and is.
 
 **Reported, never blocking.** A single-axis grid whose new ids outnumber the PR's changed product lines (non-blank added or removed lines in `.py`, `.ts`, `.tsx` and `.rs` files outside tests). Likely duplicate tests, whose bodies match once names and literals are normalised, are listed too. Both are hints for the reviewer: a small grid on a small fix is often good testing, and a duplicate may be a deliberate copy.
@@ -180,6 +180,10 @@ Every parametrized id is a test the suite collects, runs and reports. A grid tha
 **The usual fix is one test that checks every item and reports all failures together:**
 
 ```python
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"  # from a file in tests/unit/
+
 def test_every_script_reads_files_as_utf8():
     failures = [str(p) for p in sorted(SCRIPTS.glob("*.py")) if "read_text()" in p.read_text(encoding="utf-8")]
     assert not failures, f"read_text() without encoding in: {failures}"
@@ -195,7 +199,7 @@ You keep the coverage, you see every failure at once instead of one per id, and 
 def test_provider_round_trips(provider): ...
 ```
 
-The reason is mandatory. Mark the function, not a class, module or `pytest.param`; a `large_grid` mark with no reason, or on one of those, is a problem the guard reports on its own. A marked flag is listed as an exemption with its reason, so it stays visible.
+The reason is mandatory. Mark the function, not a class, module or `pytest.param`; a `large_grid` mark with no reason, or on one of those, is a problem the guard reports on its own, and once the guard is enforced a marker problem fails the check just like an unjustified scanner or cross-product flag. A marked flag is listed as an exemption with its reason, so it stays visible.
 
 **Run it locally** (it works in its own temporary git worktrees, so commit first):
 

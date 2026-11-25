@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -100,9 +101,31 @@ def _duplicates(tree: Path, files: Sequence[str], new_ids: set[str]) -> list[tup
         new.update({k: v for k, v in _bodies(tree, path).items() if k in new_functions})
     pool: dict[str, list[str]] = {}
     for folder in sorted({str(Path(p).parent.as_posix()) for p in files}):
-        for sibling in sorted((tree / folder).glob("test_*.py")):
+        # The test files directly in the folder, named as the new-tests check names them: test_*.py or *_test.py.
+        siblings = {*(tree / folder).glob("test_*.py"), *(tree / folder).glob("*_test.py")}
+        for sibling in sorted(siblings):
             pool.update(_bodies(tree, sibling.relative_to(tree).as_posix()))
     return rules.likely_duplicates(new, pool)
+
+
+def _product_diff(repo: Path, base: str, head: str) -> str:
+    """The ``-U0`` diff the budget is counted from, as UTF-8 text, free of the user's diff drivers and colour."""
+    res = subprocess.run(
+        [
+            "git", "-c", "core.quotepath=false", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv",
+            "--src-prefix=a/", "--dst-prefix=b/", base, head,
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if res.returncode != 0:
+        print(f"git diff {base} {head} failed ({res.returncode}): {res.stderr.strip()}", file=sys.stderr)
+        raise SystemExit(2)
+    return res.stdout
 
 
 def _judge(repo: Path, base: str, head: str, files: list[str], renamed: dict[str, str], deleted: list[str], scratch: Path) -> rules.Report:
@@ -125,13 +148,12 @@ def _judge(repo: Path, base: str, head: str, files: list[str], renamed: dict[str
     new_ids = set(head_ids) - base_set
 
     counts = rules.count_files([*sorted(files), *deleted], base_set, set(head_ids))
-    diff = ntf._git(repo, "diff", "-U0", "--src-prefix=a/", "--dst-prefix=b/", base, head)
     return rules.build_report(
         counts=counts,
         head_rows=head_rows,
         new_ids=new_ids,
         scanners=_scanners(head_tree, files),
-        budget=rules.product_lines(diff),
+        budget=rules.product_lines(_product_diff(repo, base, head)),
         duplicates=_duplicates(head_tree, files, new_ids),
     )
 
@@ -145,14 +167,14 @@ def run(repo: Path, base: str, head: str, *, enforce: bool) -> int:
     deleted = sorted({old for status, old, _ in entries if status == "D" and ntf.is_test_file(old)})
     print(f"base {base[:10]}  head {head[:10]}  changed test files: {len(files) + len(deleted)}")
     if not files and not deleted:
-        print("no test changes")
+        _emit("no test changes\n")
         return 0
 
     scratch = Path(tempfile.mkdtemp(prefix="tgg-")).resolve()
     try:
         report = _judge(repo, base, head, files, renamed, deleted, scratch)
     except CannotJudgeError as err:
-        print(f"the guard can't judge this PR: {err}")
+        _emit(f"the guard can't judge this PR: {err}\n")
         return 1
     finally:
         for tree in (scratch / "head", scratch / "base"):
@@ -160,13 +182,17 @@ def run(repo: Path, base: str, head: str, *, enforce: bool) -> int:
                 ntf._git(repo, "worktree", "remove", "--force", str(tree), check=False)
         shutil.rmtree(scratch, ignore_errors=True)
 
-    summary = rules.render_summary(report)
-    print(summary)
+    _emit(rules.render_summary(report))
+    return rules.exit_status(report, enforce=enforce)
+
+
+def _emit(text: str) -> None:
+    """Print ``text`` and append it to ``$GITHUB_STEP_SUMMARY`` when that is set."""
+    print(text)
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:
         with open(target, "a", encoding="utf-8") as handle:
-            handle.write(summary)
-    return rules.exit_status(report, enforce=enforce)
+            handle.write(text)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

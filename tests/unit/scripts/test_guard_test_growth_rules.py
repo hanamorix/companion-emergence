@@ -370,6 +370,12 @@ def test_likely_duplicates_never_pairs_a_test_with_itself_or_repeats_a_pair():
     assert [t[:2] for t in got] == [("x.py::test_a", "y.py::test_b")]
 
 
+def test_test_bodies_drops_the_docstring():
+    plain = "def test_a():\n    box = make(1)\n    assert box.total == 1\n"
+    documented = 'def test_a():\n    """Checks the total."""\n    box = make(1)\n    assert box.total == 1\n'
+    assert rules.test_bodies(documented) == rules.test_bodies(plain)
+
+
 def test_test_bodies_names_a_method_with_its_class_and_includes_async_tests():
     src = (
         "class TestX:\n"
@@ -447,12 +453,27 @@ def _scan_rows():
 def test_build_report_flags_a_new_scanner_function():
     report = _report(_scan_rows(), scanners={_SCAN_FN})
     assert [(f.function, f.rule) for f in report.flags] == [(_SCAN_FN, "scanner")]
-    assert "scanning the repository" in report.flags[0].detail
+    assert report.flags[0].detail == "its parametrize values are built by scanning the repository (1 new id)"
+
+
+def test_build_report_scanner_detail_counts_the_new_ids():
+    rows = [{"nodeid": f"{_SCAN_FN}[{n}]", "params": {"p": n}, "large_grid": [], "problems": []} for n in "abc"]
+    report = _report(rows, scanners={_SCAN_FN})
+    assert [f.detail for f in report.flags if f.rule == "scanner"] == [
+        "its parametrize values are built by scanning the repository (3 new ids)"
+    ]
 
 
 def test_exit_status_is_zero_without_enforce_even_with_a_scanner_flag():
     report = _report(_scan_rows(), scanners={_SCAN_FN})
     assert rules.exit_status(report, enforce=False) == 0
+
+
+def test_exit_status_is_zero_with_enforce_when_the_only_scanner_flag_is_exempted():
+    rows = [{"nodeid": f"{_SCAN_FN}[a]", "params": {}, "large_grid": ["one id per schema file is the point"], "problems": []}]
+    report = _report(rows, scanners={_SCAN_FN})
+    assert report.flags == [] and [f.rule for f, _ in report.exempt] == ["scanner"]
+    assert rules.exit_status(report, enforce=True) == 0
 
 
 def test_exit_status_is_one_with_enforce_and_an_unexempted_scanner_flag():
@@ -462,7 +483,7 @@ def test_exit_status_is_one_with_enforce_and_an_unexempted_scanner_flag():
 
 def test_render_summary_has_totals_row_and_every_section_with_content():
     rows = _grid_rows() + _scan_rows() + _single_axis_rows()
-    rows[0]["problems"] = ["bad mark"]
+    rows[0]["problems"] = [_no_reason(rows[0]["nodeid"])]
     exempt_rows = [
         {
             "nodeid": f"tests/unit/test_y.py::test_e[{a}-{b}]",
@@ -531,34 +552,27 @@ def test_exit_status_is_zero_with_enforce_for_single_axis_and_duplicates_only():
 
 
 def test_exit_status_is_one_with_enforce_and_a_marker_problem():
-    rows = [{"nodeid": f"{_SCAN_FN}[a]", "params": {}, "large_grid": [], "problems": ["bad mark"]}]
+    rows = [{"nodeid": f"{_SCAN_FN}[a]", "params": {}, "large_grid": [], "problems": [_no_reason(f"{_SCAN_FN}[a]")]}]
     assert rules.exit_status(_report(rows), enforce=True) == 1
 
 
-def test_build_report_collects_deduped_problems_from_new_functions_only():
-    rows = _scan_rows() + [
-        {
-            "nodeid": f"{_SCAN_FN}[b]",
-            "params": {},
-            "large_grid": [],
-            "problems": ["large_grid needs a reason", "bad mark"],
-        },
-        {
-            "nodeid": f"{_SCAN_FN}[c]",
-            "params": {},
-            "large_grid": [],
-            "problems": ["large_grid needs a reason"],
-        },
-        {
-            "nodeid": "tests/unit/test_x.py::test_old[a]",
-            "params": {},
-            "large_grid": [],
-            "problems": ["old problem"],
-        },
+def _no_reason(nodeid):
+    """The problem the plugin (``marker_problems``) records for a bare ``large_grid`` mark."""
+    return f'{nodeid}: @pytest.mark.large_grid needs reason="why"'
+
+
+def _on_param(nodeid):
+    return f"{nodeid}: @pytest.mark.large_grid is on a pytest.param; mark the test function itself"
+
+
+def test_build_report_lists_each_problem_once_per_function_and_only_for_new_functions():
+    rows = [
+        {"nodeid": f"{_GRID_FN}[{a}-{b}]", "params": {"a": a, "b": b}, "large_grid": [], "problems": [_no_reason(f"{_GRID_FN}[{a}-{b}]")]}
+        for a in ("a1", "a2")
+        for b in ("b1", "b2", "b3")
     ]
-    report = _report(rows, new_ids={f"{_SCAN_FN}[b]", f"{_SCAN_FN}[c]"})
-    assert report.problems == [
-        f"{_SCAN_FN}[b]: large_grid needs a reason",
-        f"{_SCAN_FN}[b]: bad mark",
-        f"{_SCAN_FN}[c]: large_grid needs a reason",
-    ]
+    rows[0]["problems"].append(_on_param(rows[0]["nodeid"]))
+    old = "tests/unit/test_x.py::test_old[a]"
+    rows.append({"nodeid": old, "params": {}, "large_grid": [], "problems": [_no_reason(old)]})
+    report = _report(rows, new_ids={r["nodeid"] for r in rows if r["nodeid"] != old})
+    assert report.problems == [_no_reason(_GRID_FN), _on_param(_GRID_FN)]

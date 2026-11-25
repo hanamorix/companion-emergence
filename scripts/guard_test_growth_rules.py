@@ -371,16 +371,20 @@ def build_report(
         new_rows = [r for r in rows if r["nodeid"] in new_ids]
         if not new_rows:
             continue
-        for row in rows:
+        for row in sorted(rows, key=lambda r: r["nodeid"]):
             for problem in row.get("problems", []):
-                text = f"{row['nodeid']}: {problem}"
+                # Each problem starts with its item's node id; naming the function instead gives one line per
+                # function and problem, however many parametrized ids share the mark.
+                head = f"{row['nodeid']}: "
+                text = f"{function}: {problem[len(head):]}" if problem.startswith(head) else problem
                 if text not in problems:
                     problems.append(text)
         axis_sizes = axes(new_rows)
         found: list[Flag] = []
         if function in scanners:
+            count = f"{len(new_rows)} new id" + ("" if len(new_rows) == 1 else "s")
             found.append(
-                Flag(function, "scanner", "its parametrize values are built by scanning the repository")
+                Flag(function, "scanner", f"its parametrize values are built by scanning the repository ({count})")
             )
         if is_cross_product(len(new_rows), axis_sizes):
             sizes = ", ".join(f"{k}={v}" for k, v in sorted(axis_sizes.items()))
