@@ -267,6 +267,48 @@ def test_scanner_tests_treats_a_literal_list_as_never_a_scan():
     assert rules.scanner_tests(src) == set()
 
 
+def test_scanner_tests_treats_a_name_bound_to_a_literal_list_as_never_a_scan():
+    src = (
+        "N = ['git ls-files', 'git status']\n"
+        "@pytest.mark.parametrize('x', N)\n"
+        "def test_a(x):\n"
+        "    pass\n"
+        "@pytest.mark.parametrize('x', list(N))\n"
+        "def test_b(x):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == set()
+
+
+def test_scanner_tests_ignores_an_ls_files_string_that_is_not_a_call_argument():
+    src = (
+        "CASES = {'git ls-files': 1, 'git status': 2}\n"
+        "@pytest.mark.parametrize('x', sorted(CASES))\n"
+        "def test_a(x):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == set()
+
+
+def test_scanner_tests_ignores_ast_walk_and_other_walk_methods():
+    src = (
+        "TREE = ast.parse('x = 1')\n"
+        "@pytest.mark.parametrize('n', [n for n in ast.walk(TREE) if n])\n"
+        "def test_a(n):\n"
+        "    pass\n"
+        "@pytest.mark.parametrize('n', list(graph.walk()))\n"
+        "def test_b(n):\n"
+        "    pass\n"
+    )
+    assert rules.scanner_tests(src) == set()
+
+
+def test_scanner_tests_flags_a_bare_walk_and_an_ls_files_shell_string():
+    for values in ("list(walk('.'))", "check_output('git ls-files tests', shell=True).split()"):
+        src = f"@pytest.mark.parametrize('p', {values})\ndef test_a(p):\n    pass\n"
+        assert rules.scanner_tests(src) == {"test_a"}, values
+
+
 _DUP_A = (
     "def test_a():\n"
     '    """First."""\n'

@@ -144,16 +144,27 @@ def product_lines(diff_u0: str) -> int:
 SCANNER_CALLS = frozenset({"glob", "rglob", "iterdir", "listdir", "scandir", "walk"})
 
 
+def _names_ls_files(arg: ast.expr) -> bool:
+    """A string constant containing ``ls-files``, alone or as an element of a list or tuple literal."""
+    elements = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
+    return any(isinstance(e, ast.Constant) and isinstance(e.value, str) and "ls-files" in e.value for e in elements)
+
+
 def _is_scan(node: ast.AST) -> bool:
-    """True when the subtree calls a filesystem scanner or names ``ls-files``."""
+    """True when the subtree calls a filesystem scanner, or passes ``ls-files`` to a call (a git subprocess)."""
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
             func = sub.func
             name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-            if name in SCANNER_CALLS:
+            if name == "walk":
+                # Only os.walk or a bare walk (from os import walk): ast.walk and other .walk methods don't scan.
+                on_os = isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "os"
+                if on_os or isinstance(func, ast.Name):
+                    return True
+            elif name in SCANNER_CALLS:
                 return True
-        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and "ls-files" in sub.value:
-            return True
+            if any(_names_ls_files(arg) for arg in [*sub.args, *(kw.value for kw in sub.keywords)]):
+                return True
     return False
 
 
@@ -175,15 +186,21 @@ def _parametrize_values(dec: ast.expr) -> ast.expr | None:
     return None
 
 
+_LITERALS = (ast.List, ast.Tuple, ast.Set)
+
+
 def _resolved(
     values: ast.expr, assigns: dict[str, ast.expr], funcs: dict[str, ast.AST]
 ) -> list[ast.AST]:
-    """The values expression plus, one level down, each module-level name's value and same-file callee's body."""
-    if isinstance(values, (ast.List, ast.Tuple, ast.Set)):
+    """The values expression plus, one level down, each module-level name's value and same-file callee's body.
+
+    A literal list, tuple or set is never a scan, whether it is written inline or bound to a name.
+    """
+    if isinstance(values, _LITERALS):
         return []
     nodes: list[ast.AST] = [values]
     for sub in ast.walk(values):
-        if isinstance(sub, ast.Name) and sub.id in assigns:
+        if isinstance(sub, ast.Name) and sub.id in assigns and not isinstance(assigns[sub.id], _LITERALS):
             nodes.append(assigns[sub.id])
         if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in funcs:
             nodes.append(funcs[sub.func.id])
