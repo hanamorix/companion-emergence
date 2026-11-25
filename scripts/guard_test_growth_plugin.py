@@ -17,6 +17,23 @@ def _function_marks(item):
     return [m for m in getattr(function, "pytestmark", []) if m.name == MARKER]
 
 
+def _groups(item, params: dict) -> list[list[str]]:
+    """The argnames of each ``parametrize`` mark: one decorator over a written-out table is one axis.
+
+    Params no mark names (a parametrized fixture's, ``pytest_generate_tests``') are left out; the rules count
+    each of those as its own axis.
+    """
+    groups = []
+    for mark in item.iter_markers("parametrize"):
+        names = mark.args[0] if mark.args else mark.kwargs.get("argnames", ())
+        if isinstance(names, str):
+            names = names.split(",")
+        group = [name.strip() for name in names if name.strip() in params]
+        if group:
+            groups.append(group)
+    return groups
+
+
 def _row(item) -> dict:
     from tests.no_base_failure import marker_problems
 
@@ -30,6 +47,7 @@ def _row(item) -> dict:
     return {
         "nodeid": item.nodeid,
         "params": params,
+        "groups": _groups(item, params),
         "large_grid": [m.kwargs["reason"] for m in function_marks if isinstance(m.kwargs.get("reason"), str)],
         "problems": problems,
     }

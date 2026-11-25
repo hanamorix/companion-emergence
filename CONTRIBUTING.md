@@ -173,7 +173,7 @@ Every parametrized id is a test the suite collects, runs and reports. A grid tha
 **The two flags that will block** (on new test functions only, meaning functions with at least one new id):
 
 - **Scanner.** The parametrize values are built at collection time from the repository: the values argument is not a literal list or tuple (or a name bound to one), and it calls (or names a module-level value built by calling) `glob`, `rglob`, `iterdir`, `os.listdir`, `os.scandir`, `os.walk`, or a `git ls-files` subprocess. Each scanned file adds an id, so the count grows with the repository.
-- **Cross-product.** Two or more parametrize axes, and more ids than the sum of the axis sizes. 2×2 gives 4 ids against 4 and isn't flagged; 2×3 gives 6 against 5 and is.
+- **Cross-product.** Two or more parametrize axes, and more ids than the sum of the axis sizes. 2×2 gives 4 ids against 4 and isn't flagged; 2×3 gives 6 against 5 and is. An axis is one `parametrize` decorator (or a parametrized fixture), so a single decorator over a written-out table, such as `parametrize("kind,path", [...])`, is one axis however many names it sets.
 
 **Reported, never blocking.** A single-axis grid whose new ids outnumber the PR's changed product lines (non-blank added or removed lines in `.py`, `.ts`, `.tsx` and `.rs` files outside tests). Likely duplicate tests, whose bodies match once names and literals are normalised, are listed too. Both are hints for the reviewer: a small grid on a small fix is often good testing, and a duplicate may be a deliberate copy.
 

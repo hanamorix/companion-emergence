@@ -59,11 +59,24 @@ def count_files(files: list[str], base_ids: set[str], head_ids: set[str]) -> lis
 
 
 def axes(rows: list[dict]) -> dict[str, int]:
-    """Per param name, the number of distinct reprs across the rows (read from ``params``, never the id text)."""
-    seen: dict[str, set[str]] = {}
+    """Per axis, the number of distinct values across the rows (read from ``params``, never the id text).
+
+    An axis is one ``parametrize`` decorator: its names (the row's ``groups``) count once, by their distinct value
+    combinations, so a written-out table of 7 ``(kind, path)`` pairs is one axis of 7, not a 3x3 cross. A param no
+    decorator names (a parametrized fixture's) is its own axis, as is every param of a row without ``groups``.
+    """
+    seen: dict[str, set] = {}
     for row in rows:
-        for name, value in row.get("params", {}).items():
-            seen.setdefault(name, set()).add(value)
+        params = row.get("params", {})
+        grouped: set[str] = set()
+        for group in row.get("groups", []):
+            names = [name for name in group if name in params]
+            if names:
+                seen.setdefault(",".join(names), set()).add(tuple(params[name] for name in names))
+                grouped.update(names)
+        for name, value in params.items():
+            if name not in grouped:
+                seen.setdefault(name, set()).add(value)
     return {name: len(values) for name, values in seen.items()}
 
 

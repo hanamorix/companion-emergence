@@ -51,6 +51,14 @@ SAMPLE = textwrap.dedent(
     @parametrize("o", [object(), object()])
     def test_obj(o):
         pass
+
+
+    @parametrize(
+        "kind,path",
+        [("a", "x"), ("a", "y"), ("b", "x"), ("b", "z"), ("c", "y"), ("c", "z"), ("a", "z")],
+    )
+    def test_table(kind, path):
+        pass
     """
 )
 
@@ -107,6 +115,14 @@ def test_large_grid_without_reason_is_a_problem(rows):
 def test_large_grid_on_param_is_a_problem(rows):
     (row,) = [r for r in rows if "test_param_mark[" in r["nodeid"]]
     assert any("is on a pytest.param" in p for p in row["problems"])
+
+
+def test_each_parametrize_decorator_is_recorded_as_one_group_of_names(rows):
+    """One decorator over a written-out table is one axis, however many names it sets (ThinkerOfThoughts on #806)."""
+    (table, *_) = [r for r in rows if "test_table[" in r["nodeid"]]
+    assert table["groups"] == [["kind", "path"]]
+    (cross, *_) = [r for r in rows if "test_cross[" in r["nodeid"]]
+    assert sorted(cross["groups"]) == [["a"], ["b"]]
 
 
 def test_object_params_stay_distinct(rows):

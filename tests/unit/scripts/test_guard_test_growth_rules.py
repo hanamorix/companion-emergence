@@ -69,6 +69,28 @@ def test_axes_counts_distinct_reprs_per_param_name():
     assert rules.axes(rows) == {"a": 2, "b": 2}
 
 
+def test_a_written_out_table_in_one_decorator_is_one_axis_and_never_a_cross_product():
+    """ThinkerOfThoughts' case on #806: 7 hand-written (kind, path) pairs are not a 3x3 cross."""
+    pairs = [("a", "x"), ("a", "y"), ("b", "x"), ("b", "z"), ("c", "y"), ("c", "z"), ("a", "z")]
+    table = [
+        {"nodeid": f"tests/test_t.py::test_table[{k}-{p}]", "params": {"kind": repr(k), "path": repr(p)},
+         "groups": [["kind", "path"]], "large_grid": [], "problems": []}
+        for k, p in pairs
+    ]
+    assert rules.axes(table) == {"kind,path": 7}
+    stacked = [
+        {"nodeid": f"tests/test_t.py::test_cross[{b}-{a}]", "params": {"a": str(a), "b": str(b)},
+         "groups": [["b"], ["a"]], "large_grid": [], "problems": []}
+        for a in (1, 2) for b in (1, 2, 3)
+    ]
+    assert rules.axes(stacked) == {"a": 2, "b": 3}
+    report = rules.build_report(
+        counts=[], head_rows=table + stacked, new_ids={r["nodeid"] for r in table + stacked},
+        scanners=set(), budget=100, duplicates=[],
+    )
+    assert [(f.function, f.rule) for f in report.flags] == [("tests/test_t.py::test_cross", "cross-product")]
+
+
 def test_is_product_path_true_for_brain_and_app_sources():
     assert rules.is_product_path("brain/x.py") is True
     assert rules.is_product_path("app/src/a.tsx") is True
