@@ -83,31 +83,39 @@ def _step_failed(
     step: str,
     *,
     exc: BaseException | None = None,
-    failure: type[BaseException] | None = None,
+    outcome: HookOutcome | None = None,
 ) -> dict[str, Any]:
     """The error result for a step that failed: `stem` and the reason for the error's class; the detail goes to the log only.
 
-    `exc` is an exception the step raised. `failure` is the class `fold_change` reports when the engine swallowed a failure
-    (`HookOutcome.failure`: `LockTimeoutError`, `OSError` for a failed write or a failed queue append, or `Exception` for a
-    bug); the engine has already logged what failed, so the line here names the step and that class.
+    `exc` is an exception the step raised. `outcome` is the `HookOutcome` `fold_change` returns when the engine swallowed a
+    failure: its `failure` class (`LockTimeoutError`, `OSError` for a failed write or a failed queue append, or `Exception`
+    for a bug) picks the reason row, and the log line carries the detail: the swallowed exception when there is one (class,
+    text, file when it names one, traceback), or, for a queue append that returned False, a plain statement of that and the
+    queue file. The engine's own line for the same failure can be throttled, so this line says it in full.
     """
+    if outcome is not None and exc is None:
+        exc = outcome.error
+    # The row is chosen by the class the caller passed (the exception's own class, or the outcome's `failure` class), exactly
+    # as before; the swallowed exception's own class goes to the log line only.
+    if outcome is not None:
+        error_class: type[BaseException] = outcome.failure if outcome.failure is not None else Exception
+    else:
+        error_class = type(exc) if exc is not None else Exception
     if exc is not None:
-        error_class: type[BaseException] = type(exc)
         file = getattr(exc, "filename", None)
         logger.warning(
             "reconcile_self_read: the %s step failed (file: %s): %s: %s",
             step,
             file if file else "none named",
-            error_class.__name__,
+            type(exc).__name__,
             exc,
-            exc_info=True,
+            exc_info=(type(exc), exc, exc.__traceback__),
         )
     else:
-        error_class = failure if failure is not None else Exception
         logger.warning(
-            "reconcile_self_read: the %s step failed: the engine did not queue the change (%s); the engine logged what failed",
+            "reconcile_self_read: the %s step failed (file: %s): the engine's append to its queue returned False, so the change was not queued",
             step,
-            error_class.__name__,
+            outcome.file if outcome is not None and outcome.file else "none named",
         )
     return {"error": f"{stem}: {_reason_for(error_class)}"}
 
@@ -248,7 +256,7 @@ def reconcile_self_read(
             # The engine swallowed a failure: the change did not reach the queue, so no success is reported. The gap is already
             # acknowledged with its channel cooldown (the state change came first, as RC18 left it), and the kindled can make
             # the call again straight away: a retry is not refused, and with nothing queued it cannot write the change twice.
-            return _step_failed(_CHANGE_UNFINISHED, "change", failure=outcome.failure)
+            return _step_failed(_CHANGE_UNFINISHED, "change", outcome=outcome)
         # Dead-loop observability (R-E4): record a successful reconcile so the
         # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
         increment_reconciles(persona_dir)

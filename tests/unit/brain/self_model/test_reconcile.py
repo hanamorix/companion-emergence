@@ -525,3 +525,104 @@ def test_a_change_dropped_whole_for_its_names_is_false_with_no_error(tmp_path: P
     _seed_open_gap(tmp_path, per_channel={"zorblesque": 4.0})
     result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="zorblesque", delta=0.5)
     assert result["delta_written"] is False and "error" not in result
+
+
+# --- the log line for a swallowed engine failure says specifically what went wrong (#803 step 20b) ----------------------
+
+
+def _change_log_text(tmp_path: Path, caplog) -> str:
+    return " ".join(r.getMessage() for r in caplog.records if r.getMessage().startswith("reconcile_self_read:"))
+
+
+def test_the_log_line_for_a_swallowed_lock_timeout_names_the_class_and_text(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.emotion import engine_files
+    from brain.utils.file_lock import LockTimeoutError
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+    def boom(*_a, **_k):
+        raise LockTimeoutError("waited 30s for the engine lock")
+
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "state_lock", boom)
+        result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert result == {"error": f"{_CHANGE_STEM}: something you needed was busy for too long, so you can make the same call again in a moment."}
+    logged = _change_log_text(tmp_path, caplog)
+    assert "the change step failed" in logged and "LockTimeoutError: waited 30s for the engine lock" in logged
+
+
+def test_the_log_line_for_a_swallowed_oserror_names_class_text_file_and_carries_the_traceback(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.emotion import engine_files
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+    refused = tmp_path / "emotion" / "queue.jsonl"
+
+    def boom(*_a, **_k):
+        raise PermissionError(13, "Permission denied", str(refused))
+
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "state_lock", boom)
+        result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert result == {"error": f"{_CHANGE_STEM}: something could not be read or saved."}
+    records = [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    assert "PermissionError" in logged and "Permission denied" in logged and str(refused) in logged
+    assert records[0].exc_info is not None and records[0].exc_info[0] is PermissionError  # the traceback is kept
+
+
+def test_the_log_line_for_an_append_that_returned_false_says_so_and_names_the_queue_file(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.emotion import engine_files
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "append_event", lambda *_a, **_k: False)
+        result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="joy", delta=-0.2)
+    assert result == {"error": f"{_CHANGE_STEM}: something could not be read or saved."}
+    records = [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    assert "returned False" in logged and str(engine_files.queue_path(tmp_path)) in logged
+    assert records[0].exc_info is None  # no exception exists for this kind
+
+
+def test_the_log_line_for_an_unexpected_exception_in_the_engine_names_class_and_text(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.bridge.cli_throttle import ThrottleDeferred
+    from brain.emotion import engine_files
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+    def boom(*_a, **_k):
+        raise RuntimeError("a bug in the hook")
+
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "state_lock", boom)
+        result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert result == {"error": f"{_CHANGE_STEM}: an unexpected error happened."}
+    records = [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+    assert len(records) == 1 and "RuntimeError: a bug in the hook" in records[0].getMessage()
+    assert records[0].exc_info is not None and records[0].exc_info[0] is RuntimeError
+
+    # The reason row follows the guard's class, not the swallowed exception's own class: a ThrottleDeferred that the
+    # guard swallowed as a bug still gets the unexpected-error row, as before this step.
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+    def deferred(*_a, **_k):
+        raise ThrottleDeferred("a CLI slot was not free")
+
+    with monkeypatch.context() as m:
+        m.setattr(engine_files, "state_lock", deferred)
+        again = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert again == {"error": f"{_CHANGE_STEM}: an unexpected error happened."}

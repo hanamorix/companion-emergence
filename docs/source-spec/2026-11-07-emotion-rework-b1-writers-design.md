@@ -76,7 +76,7 @@ Files: `chat/extractor.py` `_apply_emotion_delta` (`:360`), `self_model/reconcil
 
 New `signed_change_values(delta)` in the extractor: `sign(v) × min(|v| × 10, 3.0)`, skipping zeros. Reconcile imports it.
 
-Switch on: `fold_change(values, None, source)` with sources `monologue_emotion` and `self_model_reconcile`, and no memory row. In reconcile, `True` means folded. Switch off: today's path.
+Switch on: `fold_change(values, None, source)` with sources `monologue_emotion` and `self_model_reconcile`, and no memory row. In reconcile, `fold_change` returns an outcome: `delta_written` is true only when the change reached the engine's queue, false with no error when the change was dropped whole because none of its names can be held, and a failure the engine swallowed (a lock timeout, a failed queue append, a bug) returns the tool's error result instead, with the detail in the log line. Switch off: today's path.
 
 The existing accepted repeat when pass 2 processes an entry again stays as it is.
 

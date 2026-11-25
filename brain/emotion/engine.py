@@ -60,7 +60,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
@@ -160,17 +160,26 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class HookOutcome(NamedTuple):
+@dataclass(frozen=True)
+class HookOutcome:
     """What `fold_change` (and the guard after a swallowed failure) tells its caller about one change.
 
     `queued` is True only when the change reached the queue (the append that makes it reach her emotions). When it is
     False, `failure` says why, and only then: it is `LockTimeoutError` (the engine lock wait ran out), `OSError` (the
     engine's folder or a file refused us, or the queue append returned False) or `Exception` (a bug in the hook). `failure`
     None with `queued` False is a change dropped whole because none of its names can be held; nothing failed.
+
+    `failure` is the class that picks the caller's reason row. `error` and `file` are the detail for the caller's log line,
+    and only ever accompany a `failure`: `error` is the exception the guard swallowed (its class, text, filename and
+    traceback); `file` is the file a queue append that RETURNED False was appending to (the append swallows its own error
+    and says only "False"; the cause is in the engine's own log line, which can be throttled). Neither takes part in
+    equality, so two outcomes are equal when `queued` and `failure` are.
     """
 
     queued: bool
     failure: type[BaseException] | None = None
+    error: BaseException | None = field(default=None, compare=False)
+    file: Path | None = field(default=None, compare=False)
 
 
 def _never_raises(hook: Callable[..., Any]) -> Callable[..., Any]:
@@ -183,7 +192,7 @@ def _never_raises(hook: Callable[..., Any]) -> Callable[..., Any]:
     bug in the hook: one error line with the traceback, every time.
 
     The guard returns what the hook returned, and after a swallowed failure a `HookOutcome(False, <the class of the
-    outcome above>)`: `LockTimeoutError`, `OSError` or `Exception`. Only `fold_change` has a caller that reads it
+    outcome above>, <the exception>)`: `LockTimeoutError`, `OSError` or `Exception`. Only `fold_change` has a caller that reads it
     (`reconcile_self_read`); the other three hooks and the extractor's call ignore it.
     """
 
@@ -202,7 +211,7 @@ def _never_raises(hook: Callable[..., Any]) -> Callable[..., Any]:
                 hook.__name__,
                 exc,
             )
-            return HookOutcome(False, LockTimeoutError)
+            return HookOutcome(False, LockTimeoutError, exc)
         except OSError as exc:
             count_throttled(
                 logger,
@@ -213,10 +222,10 @@ def _never_raises(hook: Callable[..., Any]) -> Callable[..., Any]:
                 type(exc).__name__,
                 exc,
             )
-            return HookOutcome(False, OSError)
-        except Exception:
+            return HookOutcome(False, OSError, exc)
+        except Exception as exc:
             logger.error("emotion engine: %s failed; its event is lost", hook.__name__, exc_info=True)
-            return HookOutcome(False, Exception)
+            return HookOutcome(False, Exception, exc)
 
     return guarded
 
@@ -296,14 +305,16 @@ class EmotionEngine:
         """Queue a signed chat change and say whether it reached the queue (`HookOutcome`); never raises (`_never_raises`).
 
         A change with no name her vocabulary can hold is dropped whole: `HookOutcome(False)`, nothing failed. A queue append
-        that returned False is `HookOutcome(False, OSError)` (the append logged why). A failure the guard swallows is its
-        outcome. The kindled-facing tool (`reconcile_self_read`) reads this; the extractor's call ignores it.
+        that returned False is `HookOutcome(False, OSError, file=<the queue file>)` (the append logged why). A failure the
+        guard swallows is its outcome, carrying the exception itself. The kindled-facing tool (`reconcile_self_read`) reads this; the extractor's call ignores it.
         """
         amounts = resolve_emotions(emotions, signed=True, check=self.persona_dir)
         if not amounts:  # an empty change folds nothing
             return HookOutcome(False)
         queued = self._queue(Event(kind="change", at=at if at is not None else self._now(), emotions=amounts, source=source))
-        return HookOutcome(True) if queued else HookOutcome(False, OSError)
+        if queued:
+            return HookOutcome(True)
+        return HookOutcome(False, OSError, file=engine_files.queue_path(self.persona_dir))
 
     @_never_raises
     def on_memory_shown(self, memory: Memory, at: datetime | None) -> None:
