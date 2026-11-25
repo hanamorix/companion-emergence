@@ -8,7 +8,7 @@
 - **A1** — Task 1
 - **A2a** — Tasks 2–3
 - **A4** — Tasks 4–7
-- **A2b** — Task 8, after #385 merges
+- **A2b** — Task 8 (no longer waits for #385; see Status)
 
 A1, A2a and A4 touch disjoint files and can run in parallel. B1 (writers) gets its own plan once step 0's interface is agreed; §B1 at the end records what's already fixed for it.
 
@@ -20,7 +20,7 @@ A1, A2a and A4 touch disjoint files and can run in parallel. B1 (writers) gets i
 - **A1 (Task 1):** merged as #671.
 - **A2a (Tasks 2-3):** merged as #673.
 - **A4 (Tasks 4-7):** mostly not built. Of Task 6, `add_memory`'s `last_accessed_at` and its auto-link `bump=False` shipped in #745. Tasks 4, 5 and 7, and the rest of Task 6 (write-time registration, `emotion_half_lives`), are open.
-- **A2b (Task 8):** not started; it waits on #385.
+- **A2b (Task 8):** built on branch `hana/785-weather-shift-removal` (#785, 2026-11-22). It no longer waits for #385 (Hana, 2026-11-06 on #385, confirmed 2026-11-22): whichever of the two lands second handles the small overlap in `felt_time/state.py` and `tests/felt_time/`.
 
 The spec's Status section lists each A4 piece that's missing.
 
@@ -266,7 +266,7 @@ The spec's Status section lists each A4 piece that's missing.
 
 ---
 
-## PR A2b — weather-shift anchor (branch `hana/emotion-a2b-weather-shift`, after #385 merges)
+## PR A2b — weather-shift anchor (branch `hana/785-weather-shift-removal`, #785)
 
 ### Task 8: Remove the dead weather-shift anchor; keep `update_baseline`
 
@@ -281,7 +281,7 @@ The spec's Status section lists each A4 piece that's missing.
 **Interfaces:**
 - Produces: `"weather_shift"` is no longer a valid anchor type anywhere. `update_baseline` and `Baseline` are unchanged for `supervisor._derive_intensity_drivers`.
 
-- [ ] **Step 1: Rebase on `main`** after #385 merges, then run `grep -rn "weather_shift\|weather_shifts\|detect_shift\|append_shift_log" brain tests docs scripts` and record the hit list.
+- [ ] **Step 1: Branch from `main`** (if #385 has merged first, its `weather_shift` cases go too), then run `grep -rn "weather_shift\|weather_shifts\|detect_shift\|append_shift_log" brain tests docs scripts` and record the hit list.
 - [ ] **Step 2: Write the failing test** `test_weather_shift_is_not_an_anchor_type` in `tests/felt_time/test_state.py`:
   - `"weather_shift" not in ANCHOR_TYPES`;
   - no `LOG_SOURCES` entry names `weather_shifts.log.jsonl`;

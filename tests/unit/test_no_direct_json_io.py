@@ -801,7 +801,6 @@ def test_cs2_h_the_allowlist_end_state_has_only_not_file_io_and_held_entries() -
         "brain/felt_time/anchors.py",
         "brain/felt_time/chat_log.py",
         "brain/felt_time/state.py",
-        "brain/felt_time/weather_shift.py",
         "brain/health/attempt_heal.py",
     }, held
     from tests.source_tree import brain_sources

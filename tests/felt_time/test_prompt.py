@@ -26,12 +26,6 @@ def test_render_prompt_context_full_state():
             "soul": Anchor(
                 "soul", "2026-05-06T22:00:00+00:00", "the kitchen one", "soul.log.jsonl:1"
             ),
-            "weather_shift": Anchor(
-                "weather_shift",
-                "2026-05-11T08:00:00+00:00",
-                "sorrow lifted",
-                "weather_shifts.log.jsonl:1",
-            ),
         },
         pressure=PressureCounters(
             heartbeats=152, chat_turns=0, reflex_firings=3, wall_clock_s=137580.0
@@ -43,7 +37,7 @@ def test_render_prompt_context_full_state():
     assert "412" in blob  # lived age
     assert "baseline pace" in blob  # lived-age pace annotation
     assert "the boat one" in blob
-    assert "sorrow lifted" in blob
+    assert "the kitchen one" in blob
     assert "current stretch (since the" in blob
     # dream is the newest anchor (2026-05-17) — label should say "dream"
     assert "since the dream" in blob
@@ -58,9 +52,6 @@ def test_render_prompt_context_stays_under_token_budget():
             "dream": Anchor("dream", "2026-05-17T20:00:00+00:00", "a" * 80, "dreams.log.jsonl:1"),
             "growth": Anchor("growth", "2026-05-13T18:00:00+00:00", "b" * 80, "growth.log.jsonl:2"),
             "soul": Anchor("soul", "2026-05-06T22:00:00+00:00", "c" * 80, "soul.log.jsonl:1"),
-            "weather_shift": Anchor(
-                "weather_shift", "2026-05-11T08:00:00+00:00", "d" * 80, "weather_shifts.log.jsonl:1"
-            ),
         },
         pressure=PressureCounters(
             heartbeats=99999, chat_turns=9999, reflex_firings=9999, wall_clock_s=9_999_999.0

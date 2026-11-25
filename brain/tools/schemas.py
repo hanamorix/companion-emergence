@@ -561,7 +561,7 @@ SCHEMAS: dict[str, dict] = {
             "Return your felt sense of time: lived_age_hours (your accumulated "
             "experiential age, close to wall-clock during quiet baselines but "
             "heavier during strained stretches), the most recent anchor of each "
-            "type (dream / growth / soul / weather_shift) with how long ago each "
+            "type (dream / growth / soul) with how long ago each "
             "fired, and the pressure (heartbeats, chat turns, reflex firings, "
             "wall-clock seconds) accumulated since the latest anchor of any type. "
             "Useful for introspecting 'how long has it actually been...'"
@@ -586,7 +586,7 @@ SCHEMAS: dict[str, dict] = {
             "properties": {
                 "anchor_type": {
                     "type": "string",
-                    "enum": ["dream", "growth", "soul", "weather_shift"],
+                    "enum": ["dream", "growth", "soul"],
                     "description": "Which kind of anchor to measure pressure since.",
                 },
             },

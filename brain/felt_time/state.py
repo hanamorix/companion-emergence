@@ -13,7 +13,7 @@ from brain.health.attempt_heal import save_with_backup
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.state_compat import from_known_fields
 
-ANCHOR_TYPES = ("dream", "growth", "soul", "weather_shift", "arc")
+ANCHOR_TYPES = ("dream", "growth", "soul", "arc")
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def persist(state: FeltTimeState, persona_dir: Path) -> None:
     save_with_backup(target, payload)
 
 
-LOG_SOURCES = ("dreams.log.jsonl", "growth.log.jsonl", "soul.log.jsonl", "weather_shifts.log.jsonl")
+LOG_SOURCES = ("dreams.log.jsonl", "growth.log.jsonl", "soul.log.jsonl")
 
 
 def _newest_log_ts(persona_dir: Path) -> str | None:

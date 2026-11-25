@@ -10,7 +10,7 @@ Verified against `origin/main` @ `44af2447` on 2026-10-27/28. #321 is merged (20
 |---|---|
 | A1 writer-side safety net | Merged: #671 (2026-11-10), closing #670. Its pins now pass on the live path: none still carries `_flipped_by`. |
 | A2a cleanup | Merged: #673 (2026-11-10), closing #672. |
-| A2b weather-shift anchor | Not started. It waits on #385 (ThinkerOfThoughts' draft, last updated 2026-11-06). |
+| A2b weather-shift anchor | Built on branch `hana/785-weather-shift-removal` (#785), 2026-11-22. It no longer waits on #385 (§7). |
 | A4 vocabulary | Partly built. Shipped: `add_memory` sets `last_accessed_at` and its auto-link search passes `bump=False` (#745, 2026-11-16); the MCP server loads the persona's vocabulary at start (#691, closing #689); the CLI's interest list loads it read-only (#713, closing #708). Not built: the new-word gate (`validate_new_name`), the lock in `register()`, `refresh_if_changed`, `add_memory`'s write-time registration and `emotion_half_lives`, the crystallizer's register-on-write, parent half-lives and `list_recent_emotions`, vocab repair's `bump=False`, and the one-time final heal. |
 | B1 writers | Done: all seven PRs are merged. See the Status section of `2026-11-07-emotion-rework-b1-writers-design.md`. |
 
@@ -73,7 +73,7 @@ New file `tests/unit/brain/emotion/test_rework_writer_pins.py`, temp `KINDLED_HO
 - Remove `protected` from `brain/migrator/transform.py:159`, `brain/cli.py:635`, `brain/recovery/source_reader.py:66`. The `Memory` field, the column and the heartbeat check stay until ThinkerOfThoughts removes them in C.
 - Fix wrong comments in Hana-owned files. Tool-text wording waits for the final pass.
 
-### A2b — weather-shift anchor removal (after #385 merges)
+### A2b — weather-shift anchor removal (#785; no longer after #385, see §7)
 
 - `brain/felt_time/weather_shift.py`: delete `detect_shift`, `ShiftDetection`, `_LABEL_TEMPLATES`/`_label_for`, `append_shift_log` and their constants. Keep `Baseline`, `update_baseline`, `BASELINE_WINDOW`.
 - Remove the `weather_shift` anchor from `anchors.py:39`, `state.py:16,97`, `prompt.py:18,26,146`, `tool.py:61-64`, `tools/schemas.py:504,529`.
@@ -125,7 +125,7 @@ The design is in `2026-11-07-emotion-rework-b1-writers-design.md`. Names used el
 ## 7. Coordination
 
 - Assign #125 to Hana (its fix is B1-1), or note it there.
-- #385 (ThinkerOfThoughts) touches `felt_time/state.py` and pins `weather_shift`, so A2b waits for it.
+- #385 (ThinkerOfThoughts) touches `felt_time/state.py` and pins `weather_shift`. A2b no longer waits for it (Hana, 2026-11-06 on #385, confirmed 2026-11-22): whichever lands second removes the `weather_shift` entries from `ANCHOR_TYPES`, `LOG_SOURCES` and #385's test tables.
 - #417 (Hana) touches `tools/schemas.py`. A4 / A2b / B1-5 edit different tools there; whichever lands second rebases.
 - Discord heads-up at each sequential point (shared plan §9).
 

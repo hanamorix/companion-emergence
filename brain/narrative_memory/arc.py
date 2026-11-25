@@ -29,8 +29,7 @@ class Arc:
     state transitions are one-way ("open" -> "closed"); a re-emerging
     theme produces a fresh arc seeded by a new anchor.
 
-    seed_anchor_type is one of {"dream", "growth", "soul"} in v1
-    (weather_shift anchors are skipped per spec §2).
+    seed_anchor_type is one of {"dream", "growth", "soul"}.
     """
 
     id: str
