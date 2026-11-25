@@ -2586,12 +2586,18 @@ class OllamaProvider(LLMProvider):
     Streaming
     ---------
     ``chat_stream()`` POSTs with ``stream=True`` and yields each content
-    chunk as Ollama emits it. The bridge WS handler (or any other
-    streaming consumer) can pipe these straight to the client without
-    waiting for the full reply. Tool-calling is intentionally not on
+    chunk as Ollama emits it, for a consumer that wants raw text as it
+    arrives. The bridge's ``/stream`` WebSocket does not use it: chat turns
+    carry tools, so ``_StreamingProxy`` calls :meth:`chat` and word-chunks
+    the reply (see ``chat_stream_speaks_events``). Tool-calling is intentionally not on
     the streaming path — pass ``tools=`` through :meth:`chat` instead,
     which returns a structured ChatResponse with parsed tool_calls.
     """
+
+    # chat_stream() yields plain str chunks and takes no tools, so the bridge's
+    # _StreamingProxy must not treat it as an event stream; it sends Ollama
+    # turns through chat() and word-chunks the reply instead (#810).
+    chat_stream_speaks_events = False
 
     def __init__(
         self,

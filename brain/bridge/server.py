@@ -389,9 +389,13 @@ class _StreamingProxy:
     send reply_chunk frames in real time — while memory recall, tool dispatch,
     and buffer persistence still go through the full engine pipeline.
 
-    If the real provider does not implement chat_stream() (e.g. OllamaProvider,
-    FakeProvider), chat() falls back to the real provider's chat() unchanged and
-    no chunks are forwarded (the None sentinel is still sent so the WS loop exits).
+    If the real provider has no chat_stream() (e.g. FakeProvider), or has one
+    that does not speak the TextDelta/StreamDone event protocol — marked by
+    ``chat_stream_speaks_events = False``, as OllamaProvider is, whose
+    chat_stream() yields plain str chunks and takes no tools (#810) — chat()
+    calls the real provider's blocking chat() with the turn's tools and
+    forwards the reply as word chunks via _word_chunks. Tool calls come back
+    on that ChatResponse unchanged.
     """
 
     def __init__(
@@ -456,8 +460,10 @@ class _StreamingProxy:
                 audit_offset_before = 0
 
         chat_stream = getattr(self._real, "chat_stream", None)
-        if chat_stream is None:
-            # Provider has no streaming support; call chat() and forward the
+        if chat_stream is None or not getattr(self._real, "chat_stream_speaks_events", True):
+            # Provider has no chat_stream, or one that yields plain text and
+            # takes no tools (OllamaProvider, #810); call chat() — the only
+            # path that carries tools out and tool calls back — and forward the
             # full content as word tokens so the WS still emits reply_chunk frames.
             resp = self._real.chat(messages, tools=tools, options=options)
             if not suppress:
