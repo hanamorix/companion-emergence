@@ -309,6 +309,37 @@ def test_scanner_tests_flags_a_bare_walk_and_an_ls_files_shell_string():
         assert rules.scanner_tests(src) == {"test_a"}, values
 
 
+def test_scanner_tests_flags_a_git_ls_files_subprocess_however_its_command_is_written():
+    prelude = "D = 'tests'\nCMD = ['git', 'ls-files']\n"
+    for values in (
+        "check_output(f'git ls-files {D}', shell=True).split()",
+        "check_output('git ls-files'.split()).split()",
+        "subprocess.run(CMD, capture_output=True).stdout.split()",
+    ):
+        src = f"{prelude}@pytest.mark.parametrize('p', {values})\ndef test_a(p):\n    pass\n"
+        assert rules.scanner_tests(src) == {"test_a"}, values
+
+
+def test_scanner_tests_flags_path_walk_and_an_os_imported_under_another_name():
+    prelude = "import os as _os\nROOT = Path(__file__).parent\n"
+    for values in (
+        "[d for d, _, _ in Path('tests').walk()]",
+        "[d for d, _, _ in ROOT.walk()]",
+        "[d for d, _, _ in _os.walk('.')]",
+    ):
+        src = f"{prelude}@pytest.mark.parametrize('p', {values})\ndef test_a(p):\n    pass\n"
+        assert rules.scanner_tests(src) == {"test_a"}, values
+
+
+def test_scanner_tests_flags_a_scan_unpacked_into_a_literal_list():
+    prelude = "N = [*Path('.').glob('*.py')]\nCASES = [1, 2]\n"
+    for values in ("[*Path('.').glob('*.py')]", "N", "sorted(N)"):
+        src = f"{prelude}@pytest.mark.parametrize('p', {values})\ndef test_a(p):\n    pass\n"
+        assert rules.scanner_tests(src) == {"test_a"}, values
+    src = f"{prelude}@pytest.mark.parametrize('p', [*CASES, 3])\ndef test_a(p):\n    pass\n"
+    assert rules.scanner_tests(src) == set()
+
+
 _DUP_A = (
     "def test_a():\n"
     '    """First."""\n'

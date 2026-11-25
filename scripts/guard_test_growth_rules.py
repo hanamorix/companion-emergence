@@ -144,26 +144,78 @@ def product_lines(diff_u0: str) -> int:
 SCANNER_CALLS = frozenset({"glob", "rglob", "iterdir", "listdir", "scandir", "walk"})
 
 
-def _names_ls_files(arg: ast.expr) -> bool:
-    """A string constant containing ``ls-files``, alone or as an element of a list or tuple literal."""
-    elements = arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
-    return any(isinstance(e, ast.Constant) and isinstance(e.value, str) and "ls-files" in e.value for e in elements)
+# The calls that start a subprocess: an ``ls-files`` among their arguments is a ``git ls-files`` scan.
+SUBPROCESS_CALLS = frozenset({"run", "check_output", "check_call", "call", "Popen", "getoutput", "getstatusoutput"})
 
 
-def _is_scan(node: ast.AST) -> bool:
-    """True when the subtree calls a filesystem scanner, or passes ``ls-files`` to a call (a git subprocess)."""
+def _call_name(func: ast.expr) -> str | None:
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+
+def _has_ls_files(node: ast.AST) -> bool:
+    """A string anywhere in the subtree (an f-string's text, a ``.split()`` receiver) contains ``ls-files``."""
+    return any(isinstance(s, ast.Constant) and isinstance(s.value, str) and "ls-files" in s.value for s in ast.walk(node))
+
+
+def _names_ls_files(arg: ast.expr, assigns: dict[str, ast.expr]) -> bool:
+    """A subprocess argument that holds ``ls-files``, written in place or through a module-level name."""
+    if _has_ls_files(arg):
+        return True
+    return any(isinstance(s, ast.Name) and s.id in assigns and _has_ls_files(assigns[s.id]) for s in ast.walk(arg))
+
+
+PATH_TYPES = frozenset({"Path", "PurePath", "PosixPath", "WindowsPath"})
+
+
+def _builds_path(node: ast.AST, assigns: dict[str, ast.expr]) -> bool:
+    """The expression calls ``Path(...)`` (or a sibling type), in place or through a module-level name."""
+
+    def calls_path(n: ast.AST) -> bool:
+        return any(isinstance(s, ast.Call) and _call_name(s.func) in PATH_TYPES for s in ast.walk(n))
+
+    if calls_path(node):
+        return True
+    return any(isinstance(s, ast.Name) and s.id in assigns and calls_path(assigns[s.id]) for s in ast.walk(node))
+
+
+def _scans_by_walk(func: ast.expr, assigns: dict[str, ast.expr], os_names: frozenset[str]) -> bool:
+    """``os.walk`` (under any import name), a bare ``walk`` (``from os import walk``), or ``Path.walk``.
+
+    ``ast.walk`` and other ``.walk`` methods (a graph's, a tree's) don't scan the repository.
+    """
+    if isinstance(func, ast.Name):
+        return True
+    receiver = func.value if isinstance(func, ast.Attribute) else None
+    if receiver is None:
+        return False
+    if isinstance(receiver, ast.Name) and receiver.id in os_names:
+        return True
+    return _builds_path(receiver, assigns)
+
+
+def _os_names(tree: ast.Module) -> frozenset[str]:
+    """``os`` and every name the module imports it under (``import os as _os``)."""
+    names = {"os"}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            names.update(alias.asname for alias in stmt.names if alias.name == "os" and alias.asname)
+    return frozenset(names)
+
+
+def _is_scan(node: ast.AST, assigns: dict[str, ast.expr], os_names: frozenset[str] = frozenset({"os"})) -> bool:
+    """True when the subtree calls a filesystem scanner, or runs a ``git ls-files`` subprocess."""
     for sub in ast.walk(node):
         if isinstance(sub, ast.Call):
             func = sub.func
-            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            name = _call_name(func)
             if name == "walk":
-                # Only os.walk or a bare walk (from os import walk): ast.walk and other .walk methods don't scan.
-                on_os = isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "os"
-                if on_os or isinstance(func, ast.Name):
+                if _scans_by_walk(func, assigns, os_names):
                     return True
             elif name in SCANNER_CALLS:
                 return True
-            if any(_names_ls_files(arg) for arg in [*sub.args, *(kw.value for kw in sub.keywords)]):
+            if name in SUBPROCESS_CALLS and any(
+                _names_ls_files(arg, assigns) for arg in [*sub.args, *(kw.value for kw in sub.keywords)]
+            ):
                 return True
     return False
 
@@ -194,16 +246,23 @@ def _resolved(
 ) -> list[ast.AST]:
     """The values expression plus, one level down, each module-level name's value and same-file callee's body.
 
-    A literal list, tuple or set is never a scan, whether it is written inline or bound to a name.
+    A literal list, tuple or set is written-out data, whether inline or bound to a name: only its ``*unpacked``
+    elements are looked at, since ``[*Path().glob(...)]`` grows by one id per file like a bare ``glob``.
     """
-    if isinstance(values, _LITERALS):
-        return []
-    nodes: list[ast.AST] = [values]
-    for sub in ast.walk(values):
-        if isinstance(sub, ast.Name) and sub.id in assigns and not isinstance(assigns[sub.id], _LITERALS):
-            nodes.append(assigns[sub.id])
-        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in funcs:
-            nodes.append(funcs[sub.func.id])
+
+    def roots(expr: ast.expr) -> list[ast.expr]:
+        if isinstance(expr, _LITERALS):
+            return [e.value for e in expr.elts if isinstance(e, ast.Starred)]
+        return [expr]
+
+    top = roots(values)
+    nodes: list[ast.AST] = list(top)
+    for root in top:
+        for sub in ast.walk(root):
+            if isinstance(sub, ast.Name) and sub.id in assigns:
+                nodes.extend(roots(assigns[sub.id]))
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in funcs:
+                nodes.append(funcs[sub.func.id])
     return nodes
 
 
@@ -228,6 +287,7 @@ def scanner_tests(source: str) -> set[str]:
     """Qualnames (``func`` or ``Class::func``) of tests whose parametrize values scan the filesystem."""
     tree = ast.parse(source)
     module_assigns, module_funcs = _scope(tree.body)
+    os_names = _os_names(tree)
     found: set[str] = set()
 
     def visit(body: list[ast.stmt], prefix: str, assigns: dict, funcs: dict) -> None:
@@ -244,7 +304,9 @@ def scanner_tests(source: str) -> set[str]:
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for dec in node.decorator_list:
                     values = _parametrize_values(dec)
-                    if values is not None and any(_is_scan(n) for n in _resolved(values, assigns, funcs)):
+                    if values is not None and any(
+                        _is_scan(n, assigns, os_names) for n in _resolved(values, assigns, funcs)
+                    ):
                         found.add(f"{prefix}{node.name}")
 
     visit(tree.body, "", module_assigns, module_funcs)
