@@ -48,21 +48,16 @@ class CannotJudgeError(Exception):
     """The guard cannot give a trustworthy report; never a silent pass."""
 
 
-def _collect(
-    tree: Path, files: Sequence[str], plugin_dir: Path, rows_file: Path, *, tolerate_errors: bool
-) -> tuple[list[str], list[dict]]:
-    """Node ids and plugin rows of ``files`` collected in ``tree`` (no files, no collection)."""
+def _collect_head(tree: Path, files: Sequence[str], plugin_dir: Path, rows_file: Path) -> tuple[list[str], list[dict]]:
+    """Node ids and plugin rows of ``files`` collected in the head ``tree`` (no files, no collection)."""
     if not files:
         return [], []
     env_extra = {"NTFOB_PLUGIN_DIR": str(plugin_dir), "TGG_ROWS_FILE": str(rows_file)}
     args = ["--collect-only", "-q", "--continue-on-collection-errors", "-p", _PLUGIN, *files]
     res = ntf._pytest(sys.executable, tree, env_extra, args)
-    allowed = (0, 5, 1, 2) if tolerate_errors else (0, 5)
-    if res.returncode not in allowed:
+    if res.returncode not in (0, 5):
         raise CannotJudgeError(f"collecting in {tree.name} exited {res.returncode}:\n{(res.stdout + res.stderr)[-1500:]}")
     ids = ntf.parse_collected(res.stdout)
-    if tolerate_errors:
-        return ids, []
     expected = 0 if res.returncode == 5 else ntf.collected_count(res.stdout)
     if expected != len(ids):
         raise CannotJudgeError(f"collecting in {tree.name}: pytest reported {expected} tests, {len(ids)} ids were read from its output")
@@ -118,10 +113,14 @@ def _judge(repo: Path, base: str, head: str, files: list[str], renamed: dict[str
     ntf._git(repo, "worktree", "add", "--detach", str(head_tree), head)
     ntf._git(repo, "worktree", "add", "--detach", str(base_tree), base)
 
-    head_ids, head_rows = _collect(head_tree, files, plugin_dir, scratch / "head_rows.json", tolerate_errors=False)
+    head_ids, head_rows = _collect_head(head_tree, files, plugin_dir, scratch / "head_rows.json")
     at_base = set(filter(None, ntf._git(repo, "ls-tree", "-r", "--name-only", base).splitlines()))
     base_files = sorted(({renamed.get(f, f) for f in files} | set(deleted)) & at_base)
-    base_ids, _ = _collect(base_tree, base_files, plugin_dir, scratch / "base_rows.json", tolerate_errors=True)
+    # The base rows are never used: the new-tests check's own collection, with its integrity checks, is enough.
+    try:
+        base_ids = ntf._collect(sys.executable, base_tree, base_files, "", str(plugin_dir), tolerate_import_errors=True) if base_files else []
+    except ntf.CheckError as err:
+        raise CannotJudgeError(str(err)) from err
     base_set = ntf.remap_base_ids(base_ids, renamed)
     new_ids = set(head_ids) - base_set
 

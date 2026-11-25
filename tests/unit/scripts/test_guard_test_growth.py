@@ -68,6 +68,13 @@ _NEW_TESTS = textwrap.dedent(
 
 _OLD_TESTS = "def test_one():\n    assert True\n\n\ndef test_two():\n    assert True\n"
 
+_GHOST_CONFTEST = textwrap.dedent(
+    """\
+    def pytest_collection_finish(session):
+        session.config.pluginmanager.get_plugin("terminalreporter").write_line("tests/ghost.py::test_ghost")
+    """
+)
+
 
 def _git(cwd: Path, *args: str) -> str:
     done = subprocess.run(
@@ -139,6 +146,12 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Outcome]:
         repo, base = _base_repo(root, "broken", {})
         (repo / "tests" / "test_broken.py").write_text("def test_x(:\n    pass\n", encoding="utf-8")
         results["broken"] = _invoke(repo, base, _commit_head(repo))
+
+        # The base conftest prints an id pytest never collected, so the base ids disagree with pytest's count.
+        repo, base = _base_repo(root, "base_mismatch", {"tests/test_old.py": _OLD_TESTS, "tests/conftest.py": _GHOST_CONFTEST})
+        (repo / "tests" / "conftest.py").write_text("", encoding="utf-8")
+        (repo / "tests" / "test_old.py").write_text(_OLD_TESTS + "\n\ndef test_three():\n    assert True\n", encoding="utf-8")
+        results["base_mismatch"] = _invoke(repo, base, _commit_head(repo))
     return results
 
 
@@ -165,6 +178,12 @@ def test_enforce_fails_on_the_flagged_tests(runs: dict[str, Outcome]) -> None:
 def test_a_deleted_test_file_is_counted_with_no_head_ids(runs: dict[str, Outcome]) -> None:
     assert runs["deleted"].code == 0, runs["deleted"].out
     assert "| tests/test_old.py | 2 → 0 | 2 → 0 | +0 | −2 |" in runs["deleted"].out
+
+
+def test_a_base_collection_whose_ids_disagree_with_pytest_cannot_be_judged(runs: dict[str, Outcome]) -> None:
+    assert runs["base_mismatch"].code == 1, runs["base_mismatch"].out
+    assert "can't judge" in runs["base_mismatch"].out
+    assert "pytest reported 2 tests, 3 ids" in runs["base_mismatch"].out
 
 
 def test_a_head_test_file_that_does_not_parse_cannot_be_judged(runs: dict[str, Outcome]) -> None:
