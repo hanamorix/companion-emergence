@@ -200,6 +200,12 @@ def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Outcome]:
         (repo / "tests" / "test_old.py").write_text(_OLD_TESTS + "\n\ndef test_three():\n    assert True\n", encoding="utf-8")
         results["base_mismatch"] = _invoke(patch, repo, base, _commit_head(repo))
 
+        # git quotes a non-ASCII path in a plain listing, so the base file would look missing and its tests new.
+        repo, base = _base_repo(root, "non_ascii", {"tests/test_café.py": _OLD_TESTS})
+        with open(repo / "tests" / "test_café.py", "a", encoding="utf-8") as handle:
+            handle.write("\n\ndef test_three():\n    assert True\n")
+        results["non_ascii"] = _invoke(patch, repo, base, _commit_head(repo))
+
         repo, base = _base_repo(root, "product_only", {})
         (repo / "brain" / "x.py").write_text("VALUE = 3\n", encoding="utf-8")
         results["product_only"] = _invoke(patch, repo, base, _commit_head(repo))
@@ -245,6 +251,11 @@ def test_enforce_fails_on_the_flagged_tests(runs: dict[str, Outcome]) -> None:
 def test_a_deleted_test_file_is_counted_with_no_head_ids(runs: dict[str, Outcome]) -> None:
     assert runs["deleted"].code == 0, runs["deleted"].out
     assert "| tests/test_old.py | 2 → 0 | 2 → 0 | +0 | −2 |" in runs["deleted"].out
+
+
+def test_a_non_ascii_test_file_is_matched_at_base(runs: dict[str, Outcome]) -> None:
+    assert runs["non_ascii"].code == 0, runs["non_ascii"].out
+    assert "| tests/test_café.py | 2 → 3 | 2 → 3 | +1 | −0 |" in runs["non_ascii"].out
 
 
 def test_a_base_collection_whose_ids_disagree_with_pytest_cannot_be_judged(runs: dict[str, Outcome]) -> None:

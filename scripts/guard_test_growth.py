@@ -137,7 +137,8 @@ def _judge(repo: Path, base: str, head: str, files: list[str], renamed: dict[str
     ntf._git(repo, "worktree", "add", "--detach", str(base_tree), base)
 
     head_ids, head_rows = _collect_head(head_tree, files, plugin_dir, scratch / "head_rows.json")
-    at_base = set(filter(None, ntf._git(repo, "ls-tree", "-r", "--name-only", base).splitlines()))
+    # -z: a plain listing quotes a non-ASCII path ("tests/test_caf\303\251.py"), which then matches no changed file.
+    at_base = set(filter(None, ntf._git(repo, "ls-tree", "-r", "-z", "--name-only", base).split("\0")))
     base_files = sorted(({renamed.get(f, f) for f in files} | set(deleted)) & at_base)
     # The base rows are never used: the new-tests check's own collection, with its integrity checks, is enough.
     try:
