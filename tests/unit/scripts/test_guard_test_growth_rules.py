@@ -313,6 +313,13 @@ def test_likely_duplicates_skips_bodies_under_the_token_minimum_even_when_identi
     assert rules.likely_duplicates({"x.py::test_s": short}, {"y.py::test_s": short}) == []
 
 
+def test_likely_duplicates_counts_source_tokens_so_a_two_line_body_is_skipped():
+    src = "def test_p():\n    x = f(1)\n    assert x == 2\n"
+    short = rules.test_bodies(src)["test_p"]
+    assert len(short) < 20
+    assert rules.likely_duplicates({"x.py::test_p": short}, {"y.py::test_p": short}) == []
+
+
 def test_likely_duplicates_never_pairs_a_test_with_itself_or_repeats_a_pair():
     a = rules.test_bodies(_DUP_A)["test_a"]
     b = rules.test_bodies(_DUP_B)["test_b"]

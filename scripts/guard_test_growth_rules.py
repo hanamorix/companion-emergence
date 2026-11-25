@@ -5,10 +5,18 @@ from __future__ import annotations
 import ast
 import copy
 import difflib
-import re
+import io
+import tokenize
 from dataclasses import dataclass
 
-_TOKEN = re.compile(r"\w+|[^\w\s]")
+_SKIP_TOKENS = {
+    tokenize.NEWLINE,
+    tokenize.NL,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.COMMENT,
+    tokenize.ENDMARKER,
+}
 
 
 def function_of(nodeid: str) -> str:
@@ -253,7 +261,8 @@ def _normalised_tokens(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str
                 node.arg = rename(node.arg)
             elif isinstance(node, ast.Constant):
                 node.value = f"c:{type(node.value).__name__}"
-        tokens += _TOKEN.findall(ast.dump(stmt, include_attributes=False))
+        readline = io.StringIO(ast.unparse(stmt) + "\n").readline
+        tokens += [t.string for t in tokenize.generate_tokens(readline) if t.type not in _SKIP_TOKENS]
     return tokens
 
 
