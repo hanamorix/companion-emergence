@@ -207,7 +207,7 @@ Which writers fire which hook:
 | the gate merge | the merge's own `update` fires none (`fold=False`); the gate then sends the incoming memory's commit event itself (3.1) |
 | ingest | hanamorix's call; the default folds, and it is the one batch caller |
 | a full open through the memory door (3.5) | showing (`on_memory_shown(memory, at)`), queued |
-| pass 2's chat changes and `reconcile_self_read` | change (`fold_change`), queued; on a live persona also one change-log line, appended first, in the same lock hold |
+| pass 2's chat changes and `reconcile_self_read` | change (`fold_change`), queued; on a live persona also one change-log line, appended after the queue line and only when that append succeeded, in the same lock hold (#803 RE19: a failed queue append leaves nothing in either file, so a retry cannot leave a second copy) |
 
 **The queue.** `state/emotion_pending.jsonl` holds one JSON event per line, no header, and only showings and chat changes (a memory's own emotions are never queued, so losing a queue line never loses a memory's emotions). Lines are numbered from 0. The file is never deleted: a drain empties it. A bad line is dropped with an ordinary error log line and still counts as a line, as does a blank line; a queue whose every line is bad is in effect discarded, and none of this starts a rebuild. The state carries `queue_line`, the number of queue lines already folded, saved in the same write as the averages they went into. A reader that finds `queue_line` greater than the number of lines in the file knows the queue was emptied since and reads from line 0.
 
