@@ -2268,12 +2268,10 @@ def test_a_queue_append_that_fails_leaves_the_change_log_empty_and_is_reported_a
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine = _live_engine(tmp_path, monkeypatch)
-    real_event = engine_files.append_event
     with monkeypatch.context() as patch:
         patch.setattr(engine_files, "append_event", lambda *a, **k: False)
         assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(False, OSError)
     assert _events(tmp_path) == [] and _logged_lines(tmp_path) == 0  # nothing in either file
-    assert engine_files.append_event is real_event
     assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(True)  # the retry
     assert len(_events(tmp_path)) == 1 and _logged_lines(tmp_path) == 1  # one copy of each, no second one
 

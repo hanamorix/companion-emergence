@@ -497,6 +497,7 @@ def test_a_failed_queue_append_returns_the_error_leaves_the_change_log_empty_and
 
 def test_a_lock_timeout_or_a_bug_inside_the_engine_is_an_error_not_a_written_change(tmp_path: Path, monkeypatch) -> None:
     from brain.emotion import engine_files
+    from brain.self_model.resolve import load_audit
     from brain.utils.file_lock import LockTimeoutError
 
     _go_live(tmp_path, joy=5.0)
@@ -514,6 +515,8 @@ def test_a_lock_timeout_or_a_bug_inside_the_engine_is_an_error_not_a_written_cha
             m.setattr(engine_files, "state_lock", boom)
             result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
         assert result == {"error": f"{_CHANGE_STEM}: {reason}"}
+        assert load_audit(tmp_path)["reconciles_called"] == 0
+        assert engine_files.read_queue(tmp_path, from_line=0).events == []  # nothing reached the queue
 
 
 @pytest.mark.no_base_failure(reason="pins behaviour that already holds and that RE19 keeps: a change dropped whole for its names is delta_written false with no error")
