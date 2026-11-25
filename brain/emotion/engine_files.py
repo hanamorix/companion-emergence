@@ -1345,7 +1345,8 @@ def append_change(persona_dir: Path, event: Event) -> bool:
     """Append a change event as one line to the file of its local day (the caller holds the lock). True if it was written.
 
     Best effort, by design: a failure (a full disk, a value that cannot be encoded, a time that cannot be dated) gets an
-    ordinary error log line and False, and never stops the caller's queue append; the change still folds through the queue.
+    ordinary error log line and False, and never raises into the caller; the change was already queued (the caller appends here
+    only after the queue append succeeded), so it still folds through the queue.
     Only a `change` event belongs here (anything else is a ValueError).
     """
     if event.kind != "change":

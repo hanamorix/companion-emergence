@@ -46,7 +46,8 @@ The switch-over and the live engine (Engine 6, #584):
 - `memory_feelings(memory)` is the one read of a memory's feelings, peak and score (`engine_utils.memory_feelings` with this
   engine's half-lives, switch time and clock). Its fade is the same one copy `faded_value` uses.
 - `needs_recovery()` and `recovery_rebuild()`: a live persona whose state is missing or unreadable is rebuilt from its rows.
-- `fold_change` also writes a change-log line once the persona is live.
+- `fold_change` also writes a change-log line once the persona is live (after the queue append succeeded) and returns a
+  `HookOutcome`: whether the change reached the queue, and the failure class when it did not.
 
 Callers use the receiver form `engine.engine_for(persona_dir).<call>` and import the module
 (`from brain.emotion import engine`), not its names, so one patch reaches every call site.
@@ -62,7 +63,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 from brain import dev_constants
 from brain.emotion import (
@@ -159,7 +160,20 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
+class HookOutcome(NamedTuple):
+    """What `fold_change` (and the guard after a swallowed failure) tells its caller about one change.
+
+    `queued` is True only when the change reached the queue (the append that makes it reach her emotions). When it is
+    False, `failure` says why, and only then: it is `LockTimeoutError` (the engine lock wait ran out), `OSError` (the
+    engine's folder or a file refused us, or the queue append returned False) or `Exception` (a bug in the hook). `failure`
+    None with `queued` False is a change dropped whole because none of its names can be held; nothing failed.
+    """
+
+    queued: bool
+    failure: type[BaseException] | None = None
+
+
+def _never_raises(hook: Callable[..., Any]) -> Callable[..., Any]:
     """Make a hook unable to raise into the write that called it (E6.9): the one guard of all four hooks.
 
     Three outcomes. A `LockTimeoutError` is the engine lock not coming within its wait (a drain, a rebuild or a wedged
@@ -167,12 +181,16 @@ def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
     folder or the lock's file refusing us (a read-only or full disk, a share that went away). It stays true for every write
     until the cause is fixed, so it is logged once per interval, without a traceback (`count_throttled`). Anything else is a
     bug in the hook: one error line with the traceback, every time.
+
+    The guard returns what the hook returned, and after a swallowed failure a `HookOutcome(False, <the class of the
+    outcome above>)`: `LockTimeoutError`, `OSError` or `Exception`. Only `fold_change` has a caller that reads it
+    (`reconcile_self_read`); the other three hooks and the extractor's call ignore it.
     """
 
     @functools.wraps(hook)
-    def guarded(self: EmotionEngine, *args: object, **kwargs: object) -> None:
+    def guarded(self: EmotionEngine, *args: object, **kwargs: object) -> Any:
         try:
-            hook(self, *args, **kwargs)
+            return hook(self, *args, **kwargs)
         except LockTimeoutError as exc:
             # Before `except OSError`: `LockTimeoutError` IS an `OSError` (a `TimeoutError`), and a lock wait that ran out is
             # not a disk fault. Its own throttle key, so neither line hides the other.
@@ -184,6 +202,7 @@ def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
                 hook.__name__,
                 exc,
             )
+            return HookOutcome(False, LockTimeoutError)
         except OSError as exc:
             count_throttled(
                 logger,
@@ -194,8 +213,10 @@ def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
                 type(exc).__name__,
                 exc,
             )
+            return HookOutcome(False, OSError)
         except Exception:
             logger.error("emotion engine: %s failed; its event is lost", hook.__name__, exc_info=True)
+            return HookOutcome(False, Exception)
 
     return guarded
 
@@ -271,11 +292,18 @@ class EmotionEngine:
         )
 
     @_never_raises
-    def fold_change(self, emotions: Mapping[str, float], at: datetime | None, source: str) -> None:
+    def fold_change(self, emotions: Mapping[str, float], at: datetime | None, source: str) -> HookOutcome:
+        """Queue a signed chat change and say whether it reached the queue (`HookOutcome`); never raises (`_never_raises`).
+
+        A change with no name her vocabulary can hold is dropped whole: `HookOutcome(False)`, nothing failed. A queue append
+        that returned False is `HookOutcome(False, OSError)` (the append logged why). A failure the guard swallows is its
+        outcome. The kindled-facing tool (`reconcile_self_read`) reads this; the extractor's call ignores it.
+        """
         amounts = resolve_emotions(emotions, signed=True, check=self.persona_dir)
         if not amounts:  # an empty change folds nothing
-            return
-        self._queue(Event(kind="change", at=at if at is not None else self._now(), emotions=amounts, source=source))
+            return HookOutcome(False)
+        queued = self._queue(Event(kind="change", at=at if at is not None else self._now(), emotions=amounts, source=source))
+        return HookOutcome(True) if queued else HookOutcome(False, OSError)
 
     @_never_raises
     def on_memory_shown(self, memory: Memory, at: datetime | None) -> None:
@@ -373,23 +401,34 @@ class EmotionEngine:
         if self._start_needed(created_at):
             self._apply(Event(kind="start", at=created_at))
 
-    def _queue(self, event: Event) -> None:
-        """Append `event` (a showing or a chat change) to the queue, holding the engine's lock for the append only.
+    def _queue(self, event: Event) -> bool:
+        """Append `event` (a showing or a chat change) to the queue, holding the engine's lock for the append only. True if it was queued.
 
         Accepted edge (E2, R12, owner 2026-10-21: "treat it as a fairly minor edge case, noted in code"): an entry can be lost
         (a failed append, a hook that raised, a lock wait that timed out, a crash between the commit and this append, a line
         damaged by an unclean stop). `state_lock` is the bounded acquisition: a hook's caller does not wait for ever, and the
         guard (`_never_raises`) handles its `LockTimeoutError`. It is not recovered. A lost entry is a minor edge while
         appends succeed; a fault that persists loses every entry for as long as it lasts, and the log line is then the only
-        signal. `append_event` logs a failed append and returns False; nothing more is done with that here.
+        signal. `append_event` logs a failed append and returns False; that result is returned here, and `fold_change` passes
+        it on to its caller (a chat change that was not queued is reported, not folded).
 
-        A chat change of a LIVE persona also goes to the change log first, inside the same lock hold: a rebuild replays it
-        from there, because the queue is emptied at a rebuild.
+        A chat change of a LIVE persona also goes to the change log, inside the same lock hold, AFTER the queue append
+        succeeded: a rebuild replays it from there, because the queue is emptied at a rebuild. The queue comes first so a
+        change that did not reach the queue leaves nothing in either file, and the caller's retry cannot leave a second copy.
+        Accepted edges that remain (E7.18, `engine_rebuild.py`, and design 2.10: "the change still folds through the queue, so
+        only a later rebuild loses it"): the change-log append failing alone, or a crash between the two appends, leaves the
+        change folding live with no change-log line. A failure of the change-log step is logged and never turns a queued
+        change into a reported loss.
         """
         with engine_files.state_lock(self.persona_dir):
-            if event.kind == "change" and self.is_live():
-                engine_files.append_change(self.persona_dir, event)
-            engine_files.append_event(self.persona_dir, event)
+            to_log = event.kind == "change" and self.is_live()
+            queued = engine_files.append_event(self.persona_dir, event)
+            if queued and to_log:
+                try:
+                    engine_files.append_change(self.persona_dir, event)
+                except Exception:  # noqa: BLE001  the change is queued: report that, and say here what was lost
+                    logger.error("emotion engine: the change log line of a queued change was not written", exc_info=True)
+            return queued
 
     # --- the direct apply and the batch scope --------------------------------------------------------
 

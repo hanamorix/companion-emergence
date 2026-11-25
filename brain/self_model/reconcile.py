@@ -23,14 +23,20 @@ Actions:
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
+from brain.bridge.provider_auth import ProviderAuthDeferred
 from brain.self_model.gap import Gap
 from brain.self_model.state import SelfModelState, load_or_recover, locked, save
 from brain.utils.file_lock import LockTimeoutError
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import HookOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +51,65 @@ _TICK_HOURS = 6.0
 _DELTA_BOUND = 1.0
 
 
-# The tool results for a step that raised after the gap state was saved. Each says only that the step did not finish: it
-# makes no claim about the gap's status or about what the step changed before it stopped.
-_NAMING_UNFINISHED = "the naming step did not finish this time."
-_CHANGE_UNFINISHED = "the step that applies your change to your emotions did not finish this time."
+# The tool results for a step that failed after the gap state was saved: the stem, then one plain reason from the table below.
+# Each says that the step did not finish and why, and makes no claim about the gap's status or about what the step changed
+# before it stopped (each stays true whether or not something was saved). The raw error goes to the log, never into the result.
+_NAMING_UNFINISHED = "the naming step did not finish this time"
+_CHANGE_UNFINISHED = "the step that applies your change to your emotions did not finish this time"
+
+# The one reason table, keyed by the class of the error caught (never by a guess at which step raised it), most specific class
+# first: `ShutdownDeferred` and `ProviderAuthDeferred` are `ThrottleDeferred`s, and `LockTimeoutError` is an `OSError`.
+_REASONS: tuple[tuple[type[BaseException], str], ...] = (
+    (ShutdownDeferred, "the app is shutting down."),
+    (ProviderAuthDeferred, "background work needs the login renewed."),
+    (ThrottleDeferred, "background work was paused, so you can make the same call again later."),
+    (LockTimeoutError, "something you needed was busy for too long, so you can make the same call again in a moment."),
+    (sqlite3.Error, "your memory database could not be opened or read."),
+    (OSError, "something could not be read or saved."),
+)
+_REASON_UNEXPECTED = "an unexpected error happened."
 
 
-def _step_failed(message: str, exc: Exception) -> dict[str, Any]:
-    """The error result for a step that raised; the exception goes to the log, never into the result."""
-    logger.warning("reconcile_self_read: a step after the state change raised (%s: %s)", type(exc).__name__, exc, exc_info=True)
-    return {"error": message}
+def _reason_for(error: type[BaseException]) -> str:
+    """The plain reason for an error class: the first row of `_REASONS` it belongs to, else the unexpected-error row."""
+    for cls, reason in _REASONS:
+        if issubclass(error, cls):
+            return reason
+    return _REASON_UNEXPECTED
+
+
+def _step_failed(
+    stem: str,
+    step: str,
+    *,
+    exc: BaseException | None = None,
+    failure: type[BaseException] | None = None,
+) -> dict[str, Any]:
+    """The error result for a step that failed: `stem` and the reason for the error's class; the detail goes to the log only.
+
+    `exc` is an exception the step raised. `failure` is the class `fold_change` reports when the engine swallowed a failure
+    (`HookOutcome.failure`: `LockTimeoutError`, `OSError` for a failed write or a failed queue append, or `Exception` for a
+    bug); the engine has already logged what failed, so the line here names the step and that class.
+    """
+    if exc is not None:
+        error_class: type[BaseException] = type(exc)
+        file = getattr(exc, "filename", None)
+        logger.warning(
+            "reconcile_self_read: the %s step failed (file: %s): %s: %s",
+            step,
+            file if file else "none named",
+            error_class.__name__,
+            exc,
+            exc_info=True,
+        )
+    else:
+        error_class = failure if failure is not None else Exception
+        logger.warning(
+            "reconcile_self_read: the %s step failed: the engine did not queue the change (%s); the engine logged what failed",
+            step,
+            error_class.__name__,
+        )
+    return {"error": f"{stem}: {_reason_for(error_class)}"}
 
 
 def _utcnow() -> datetime:
@@ -100,7 +155,7 @@ def is_channel_in_cooldown(gap, channel: str, *, now: datetime | None = None) ->
     return now < expiry
 
 
-def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) -> bool:
+def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) -> HookOutcome:
     """Fold a self-authored revision into the emotion engine as a signed change; no row is written.
 
     The delta is clamped to [-1, 1]; the signed change is the delta times 10, capped at ``extractor._MAX_DELTA_INTENSITY``
@@ -108,19 +163,21 @@ def _write_self_authored_delta(persona_dir: Path, channel: str, delta: float) ->
     is checked against her vocabulary by the engine's fold (``fold_change``), which discards a channel she does not have
     when no bridge can add it.
 
-    Returns True if a change was folded, False if the channel was one her vocabulary cannot hold or the delta was effectively zero
-    (the channel is checked here too, so the answer the tool reports is true; the fold's own check then finds the name in place).
+    Returns the engine's outcome (`HookOutcome`): ``queued`` True only when the change reached the engine's queue;
+    ``HookOutcome(False)`` when the channel is one her vocabulary cannot hold or the delta was effectively zero (the channel
+    is checked here too, so the answer the tool reports is true; the fold's own check then finds the name in place); and
+    ``failure`` set when the engine swallowed a failure (``fold_change`` never raises). It can still RAISE from the
+    vocabulary check (``vocabulary_access.names_used``) or ``engine_for``; the caller catches that.
     """
     from brain.chat.extractor import signed_change_values
     from brain.emotion import engine, vocabulary_access
 
     changes = signed_change_values({channel: _clamp_delta(delta)})
     if not changes:
-        return False
+        return engine.HookOutcome(False)
     if vocabulary_access.names_used(persona_dir, [channel])[channel] is None:
-        return False
-    engine.engine_for(persona_dir).fold_change(changes, None, "self_model_reconcile")
-    return True
+        return engine.HookOutcome(False)
+    return engine.engine_for(persona_dir).fold_change(changes, None, "self_model_reconcile")
 
 
 def _propose_vocabulary_candidate(persona_dir: Path) -> dict[str, Any]:
@@ -160,9 +217,10 @@ def reconcile_self_read(
     """Self-authored reconciliation of the current gap. See module docstring.
 
     Always fail-soft: a malformed call, a state lock that never came, and a step after the state change that
-    raised (the growth tick for ``name``, the fold of the delta for accept/revise) each return an ``{"error": ...}``
-    dict rather than raising into the chat turn. A change already saved stays saved and the audit counter is not
-    incremented for a call that returned an error.
+    failed (the growth tick for ``name`` raised; the fold of the delta for accept/revise raised, or the engine swallowed a
+    failure and the change did not reach its queue) each return an ``{"error": ...}`` dict, with a plain reason for the
+    class of the error, rather than raising into the chat turn. A change already saved stays saved and the audit counter
+    is not incremented for a call that returned an error. ``delta_written`` is True only when the change reached the queue.
     """
     from brain.self_model.resolve import increment_reconciles
 
@@ -183,13 +241,18 @@ def reconcile_self_read(
         if busy is not None:
             return busy
         try:
-            wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
-        except Exception as exc:  # noqa: BLE001  the tool result says the step did not finish; the cause goes to the log
-            return _step_failed(_CHANGE_UNFINISHED, exc)
+            outcome = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
+        except Exception as exc:  # noqa: BLE001  the tool result says the step did not finish and why; the cause goes to the log
+            return _step_failed(_CHANGE_UNFINISHED, "change", exc=exc)
+        if outcome.failure is not None:
+            # The engine swallowed a failure: the change did not reach the queue, so no success is reported. The gap is already
+            # acknowledged with its channel cooldown (the state change came first, as RC18 left it), and the kindled can make
+            # the call again straight away: a retry is not refused, and with nothing queued it cannot write the change twice.
+            return _step_failed(_CHANGE_UNFINISHED, "change", failure=outcome.failure)
         # Dead-loop observability (R-E4): record a successful reconcile so the
         # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
         increment_reconciles(persona_dir)
-        return {"ok": True, "action": action, "channel": channel, "delta_written": wrote}
+        return {"ok": True, "action": action, "channel": channel, "delta_written": outcome.queued}
 
     if action == "dismiss":
 
@@ -228,7 +291,7 @@ def reconcile_self_read(
             candidate = _propose_vocabulary_candidate(persona_dir)
         except Exception as exc:  # noqa: BLE001  the tool result says the step did not finish; the cause goes to the log
             # The state change above stays saved, and so does any name the tick added before it raised; the counter is skipped.
-            return _step_failed(_NAMING_UNFINISHED, exc)
+            return _step_failed(_NAMING_UNFINISHED, "naming", exc=exc)
         increment_reconciles(persona_dir)
         return {"ok": True, "action": "name", "name": name, **candidate}
 

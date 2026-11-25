@@ -2084,13 +2084,14 @@ def test_a_failure_inside_a_hook_is_logged_once_and_the_row_stays(
         caplog.clear()
         patch.setattr(engine_files, "append_event", raiser)
         engine = engine_module.engine_for(tmp_path)
-        assert engine.on_memory_shown(_hook_mem(), None) is None
+        # A swallowed bug is reported as the outcome `Exception` (only `fold_change`'s caller reads it).
+        assert engine.on_memory_shown(_hook_mem(), None) == engine_module.HookOutcome(False, Exception)
         _one_error(caplog, boom)
         caplog.clear()
-        assert engine.fold_change({"joy": 1.0}, None, "test") is None
+        assert engine.fold_change({"joy": 1.0}, None, "test") == engine_module.HookOutcome(False, Exception)
         _one_error(caplog, boom)
         caplog.clear()
-        assert engine.on_emotions_assigned(_hook_mem()) is None
+        assert engine.on_emotions_assigned(_hook_mem()) == engine_module.HookOutcome(False, Exception)
         _one_error(caplog, boom)
 
 
@@ -2237,6 +2238,90 @@ def test_fold_change_queues_one_change_event_and_a_live_engine_writes_one_change
     engine.fold_change({}, None, "x")
     engine.fold_change({"joy": math.nan}, None, "x")
     assert len(_events(tmp_path)) == 2 and logged() == 2
+
+
+# --- the outcome of a change (#803 step 20): queued first, logged only after, and reported ---------------------------
+
+
+def _logged_lines(persona_dir: Path) -> int:
+    return sum(len(path.read_text(encoding="utf-8").splitlines()) for path in engine_files.changes_dir(persona_dir).glob("*.jsonl"))
+
+
+def _live_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> EngineCls:
+    monkeypatch.setattr(EngineCls, "is_live", lambda self: True)
+    return EngineCls(tmp_path, now=lambda: NOW)
+
+
+def test_fold_change_says_it_was_queued_and_the_queue_line_is_written_before_the_change_log_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    real_event, real_change = engine_files.append_event, engine_files.append_change
+    monkeypatch.setattr(engine_files, "append_event", lambda *a, **k: order.append("queue") or real_event(*a, **k))
+    monkeypatch.setattr(engine_files, "append_change", lambda *a, **k: order.append("log") or real_change(*a, **k))
+    engine = _live_engine(tmp_path, monkeypatch)
+    assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(True)
+    assert order == ["queue", "log"]
+
+
+def test_a_queue_append_that_fails_leaves_the_change_log_empty_and_is_reported_and_a_retry_leaves_one_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = _live_engine(tmp_path, monkeypatch)
+    real_event = engine_files.append_event
+    with monkeypatch.context() as patch:
+        patch.setattr(engine_files, "append_event", lambda *a, **k: False)
+        assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(False, OSError)
+    assert _events(tmp_path) == [] and _logged_lines(tmp_path) == 0  # nothing in either file
+    assert engine_files.append_event is real_event
+    assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(True)  # the retry
+    assert len(_events(tmp_path)) == 1 and _logged_lines(tmp_path) == 1  # one copy of each, no second one
+
+
+def test_a_not_live_change_is_queued_with_no_change_log_line(tmp_path: Path) -> None:
+    engine = EngineCls(tmp_path, now=lambda: NOW)
+    assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(True)
+    assert len(_events(tmp_path)) == 1 and _logged_lines(tmp_path) == 0
+
+
+def test_a_change_with_no_name_she_can_hold_is_dropped_whole_with_no_failure(tmp_path: Path) -> None:
+    engine = EngineCls(tmp_path, now=lambda: NOW)
+    assert engine.fold_change({"joy": math.nan}, None, "x") == engine_module.HookOutcome(False)
+    assert engine.fold_change({}, None, "x") == engine_module.HookOutcome(False)
+    assert _events(tmp_path) == []
+
+
+def test_the_guard_reports_the_class_of_each_swallowed_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = EngineCls(tmp_path, now=lambda: NOW)
+    for raised, reported in (
+        (file_lock.LockTimeoutError("waited"), file_lock.LockTimeoutError),
+        (PermissionError("denied"), OSError),
+        (RuntimeError("bug"), Exception),
+    ):
+
+        def raiser(persona_dir: Path, raised: BaseException = raised) -> object:
+            raise raised
+
+        with monkeypatch.context() as patch:
+            patch.setattr(engine_files, "state_lock", raiser)
+            outcome = engine.fold_change({"joy": 1.0}, None, "chat")
+        assert outcome == engine_module.HookOutcome(False, reported)
+        assert outcome.failure is reported
+
+
+def test_a_change_log_step_that_raises_after_the_queue_append_still_reports_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine = _live_engine(tmp_path, monkeypatch)
+
+    def raiser(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("log bug")
+
+    monkeypatch.setattr(engine_files, "append_change", raiser)
+    with caplog.at_level(logging.ERROR):
+        assert engine.fold_change({"joy": 1.0}, None, "chat") == engine_module.HookOutcome(True)
+    assert len(_events(tmp_path)) == 1  # queued once: a retry would not be needed, so no second copy
+    assert any("change log line" in r.getMessage() for r in caplog.records)
 
 
 # --- C12(c): the store reaches the stub through the module attribute ----------------------------

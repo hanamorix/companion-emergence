@@ -619,8 +619,11 @@ class EmotionEngineStub:
     def on_emotions_assigned(self, memory: Any) -> None:
         self.recorded_calls.append(("on_emotions_assigned", memory))
 
-    def fold_change(self, emotions: Any, at: Any, source: str) -> None:
+    def fold_change(self, emotions: Any, at: Any, source: str) -> Any:
+        from brain.emotion.engine import HookOutcome
+
         self.recorded_calls.append(("fold_change", emotions, at, source))
+        return HookOutcome(True)  # the real one says whether the change reached the queue
 
     def on_memory_shown(self, memory: Any, at: Any) -> None:
         self.recorded_calls.append(("on_memory_shown", memory, at))
