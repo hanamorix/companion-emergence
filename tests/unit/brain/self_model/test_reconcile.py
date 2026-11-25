@@ -530,8 +530,8 @@ def test_a_change_dropped_whole_for_its_names_is_false_with_no_error(tmp_path: P
 # --- the log line for a swallowed engine failure says specifically what went wrong (#803 step 20b) ----------------------
 
 
-def _change_log_text(tmp_path: Path, caplog) -> str:
-    return " ".join(r.getMessage() for r in caplog.records if r.getMessage().startswith("reconcile_self_read:"))
+def _reconcile_log_records(caplog) -> list:
+    return [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
 
 
 def test_the_log_line_for_a_swallowed_lock_timeout_names_the_class_and_text(tmp_path: Path, monkeypatch, caplog) -> None:
@@ -550,8 +550,12 @@ def test_the_log_line_for_a_swallowed_lock_timeout_names_the_class_and_text(tmp_
         m.setattr(engine_files, "state_lock", boom)
         result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
     assert result == {"error": f"{_CHANGE_STEM}: something you needed was busy for too long, so you can make the same call again in a moment."}
-    logged = _change_log_text(tmp_path, caplog)
+    records = _reconcile_log_records(caplog)
+    assert len(records) == 1
+    logged = records[0].getMessage()
     assert "the change step failed" in logged and "LockTimeoutError: waited 30s for the engine lock" in logged
+    assert "file: none named" in logged  # a lock timeout names no file
+    assert records[0].exc_info is not None and records[0].exc_info[0] is LockTimeoutError
 
 
 def test_the_log_line_for_a_swallowed_oserror_names_class_text_file_and_carries_the_traceback(tmp_path: Path, monkeypatch, caplog) -> None:
