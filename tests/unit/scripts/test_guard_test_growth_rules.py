@@ -341,3 +341,182 @@ def test_test_bodies_names_a_method_with_its_class_and_includes_async_tests():
         "    pass\n"
     )
     assert set(rules.test_bodies(src)) == {"TestX::test_m", "test_n"}
+
+
+_GRID_FN = "tests/unit/test_x.py::test_grid"
+
+
+def _grid_rows(*, large_grid=None):
+    rows = []
+    for a in ("a1", "a2"):
+        for b in ("b1", "b2", "b3"):
+            rows.append(
+                {
+                    "nodeid": f"{_GRID_FN}[{a}-{b}]",
+                    "params": {"a": a, "b": b},
+                    "large_grid": list(large_grid or []),
+                    "problems": [],
+                }
+            )
+    return rows
+
+
+def _report(rows, *, new_ids=None, scanners=None, duplicates=None, budget=0):
+    ids = {r["nodeid"] for r in rows} if new_ids is None else new_ids
+    return rules.build_report(
+        counts=[],
+        head_rows=rows,
+        new_ids=ids,
+        scanners=scanners or set(),
+        budget=budget,
+        duplicates=duplicates or [],
+    )
+
+
+def test_build_report_flags_a_new_two_by_three_function_as_cross_product():
+    report = _report(_grid_rows())
+    assert [(f.function, f.rule) for f in report.flags] == [(_GRID_FN, "cross-product")]
+    assert "6 ids" in report.flags[0].detail
+    assert "sum 5" in report.flags[0].detail
+    assert report.exempt == []
+
+
+def test_build_report_moves_a_large_grid_function_to_exempt_with_its_reason():
+    report = _report(_grid_rows(large_grid=["full matrix is the point"]))
+    assert report.flags == []
+    assert [(f.function, f.rule, why) for f, why in report.exempt] == [
+        (_GRID_FN, "cross-product", "full matrix is the point")
+    ]
+
+
+def test_build_report_never_flags_a_function_with_no_new_ids():
+    report = _report(_grid_rows(), new_ids=set(), scanners={_GRID_FN})
+    assert report.flags == []
+    assert report.exempt == []
+
+
+_SCAN_FN = "tests/unit/test_x.py::test_s"
+
+
+def _scan_rows():
+    return [{"nodeid": f"{_SCAN_FN}[a]", "params": {}, "large_grid": [], "problems": []}]
+
+
+def test_build_report_flags_a_new_scanner_function():
+    report = _report(_scan_rows(), scanners={_SCAN_FN})
+    assert [(f.function, f.rule) for f in report.flags] == [(_SCAN_FN, "scanner")]
+    assert "scanning the repository" in report.flags[0].detail
+
+
+def test_exit_status_is_zero_without_enforce_even_with_a_scanner_flag():
+    report = _report(_scan_rows(), scanners={_SCAN_FN})
+    assert rules.exit_status(report, enforce=False) == 0
+
+
+def test_exit_status_is_one_with_enforce_and_an_unexempted_scanner_flag():
+    report = _report(_scan_rows(), scanners={_SCAN_FN})
+    assert rules.exit_status(report, enforce=True) == 1
+
+
+def test_render_summary_has_totals_row_and_every_section_with_content():
+    rows = _grid_rows() + _scan_rows() + _single_axis_rows()
+    rows[0]["problems"] = ["bad mark"]
+    exempt_rows = [
+        {
+            "nodeid": f"tests/unit/test_y.py::test_e[{a}-{b}]",
+            "params": {"a": a, "b": b},
+            "large_grid": ["whole matrix"],
+            "problems": [],
+        }
+        for a in "xy"
+        for b in "pqr"
+    ]
+    report = rules.build_report(
+        counts=[
+            rules.FileCount("tests/unit/test_x.py", 1, 3, 4, 14, 10, 0),
+            rules.FileCount("tests/unit/test_y.py", 0, 1, 0, 6, 6, 0),
+        ],
+        head_rows=rows + exempt_rows,
+        new_ids={r["nodeid"] for r in rows + exempt_rows},
+        scanners={_SCAN_FN},
+        budget=0,
+        duplicates=[("a.py::t", "b.py::t", 0.953)],
+    )
+    text = rules.render_summary(report)
+    assert "| tests/unit/test_x.py | 1 → 3 | 4 → 14 | +10 | −0 |" in text
+    assert "| **Total** | 1 → 4 | 4 → 20 | +16 | −0 |" in text
+    for heading in (
+        "Flagged (blocks once enforced)",
+        "Reported (never blocks)",
+        "Justified with large_grid",
+        "Marker problems",
+        "Likely duplicates",
+    ):
+        assert heading in text
+    assert "trim it, or add @pytest.mark.large_grid(reason=...)" in text
+    assert "whole matrix" in text
+    assert "a.py::t" in text and "0.95" in text
+
+
+def test_render_summary_omits_empty_sections_and_says_nothing_was_flagged():
+    text = rules.render_summary(_report(_scan_rows(), new_ids=set()))
+    assert "Total" in text
+    assert "Flagged" not in text and "Reported" not in text
+    assert "Marker problems" not in text and "Likely duplicates" not in text
+    assert "nothing was flagged" in text.lower()
+
+
+_SINGLE_FN = "tests/unit/test_x.py::test_one_axis"
+
+
+def _single_axis_rows():
+    return [
+        {"nodeid": f"{_SINGLE_FN}[{n}]", "params": {"n": n}, "large_grid": [], "problems": []}
+        for n in ("1", "2", "3", "4")
+    ]
+
+
+def test_build_report_reports_single_axis_growth_over_the_budget():
+    report = _report(_single_axis_rows(), budget=0)
+    assert [(f.function, f.rule) for f in report.flags] == [(_SINGLE_FN, "single-axis")]
+    assert "4 new ids against 0 changed product lines" in report.flags[0].detail
+
+
+def test_exit_status_is_zero_with_enforce_for_single_axis_and_duplicates_only():
+    report = _report(_single_axis_rows(), duplicates=[("a.py::t", "b.py::t", 0.95)])
+    assert report.flags and report.duplicates
+    assert rules.exit_status(report, enforce=True) == 0
+
+
+def test_exit_status_is_one_with_enforce_and_a_marker_problem():
+    rows = [{"nodeid": f"{_SCAN_FN}[a]", "params": {}, "large_grid": [], "problems": ["bad mark"]}]
+    assert rules.exit_status(_report(rows), enforce=True) == 1
+
+
+def test_build_report_collects_deduped_problems_from_new_functions_only():
+    rows = _scan_rows() + [
+        {
+            "nodeid": f"{_SCAN_FN}[b]",
+            "params": {},
+            "large_grid": [],
+            "problems": ["large_grid needs a reason", "bad mark"],
+        },
+        {
+            "nodeid": f"{_SCAN_FN}[c]",
+            "params": {},
+            "large_grid": [],
+            "problems": ["large_grid needs a reason"],
+        },
+        {
+            "nodeid": "tests/unit/test_x.py::test_old[a]",
+            "params": {},
+            "large_grid": [],
+            "problems": ["old problem"],
+        },
+    ]
+    report = _report(rows, new_ids={f"{_SCAN_FN}[b]", f"{_SCAN_FN}[c]"})
+    assert report.problems == [
+        f"{_SCAN_FN}[b]: large_grid needs a reason",
+        f"{_SCAN_FN}[b]: bad mark",
+        f"{_SCAN_FN}[c]: large_grid needs a reason",
+    ]

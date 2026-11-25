@@ -309,3 +309,125 @@ def likely_duplicates(
 def is_single_axis_over_budget(new_ids: int, axis_sizes: dict[str, int], budget: int) -> bool:
     """Exactly one axis, at least two new ids, and more new ids than the budget (changed product lines)."""
     return len(axis_sizes) == 1 and new_ids >= 2 and new_ids > budget
+
+
+@dataclass
+class Flag:
+    function: str
+    rule: str  # "scanner", "cross-product" or "single-axis"
+    detail: str
+
+
+@dataclass
+class Report:
+    counts: list[FileCount]
+    flags: list[Flag]
+    exempt: list[tuple[Flag, str]]
+    problems: list[str]
+    duplicates: list[tuple[str, str, float]]
+    budget: int
+
+
+def build_report(
+    *,
+    counts: list[FileCount],
+    head_rows: list[dict],
+    new_ids: set[str],
+    scanners: set[str],
+    budget: int,
+    duplicates: list[tuple[str, str, float]],
+) -> Report:
+    """Flag the functions that gained ids in ``new_ids``; large_grid-marked ones move to ``exempt``."""
+    by_function: dict[str, list[dict]] = {}
+    for row in head_rows:
+        by_function.setdefault(function_of(row["nodeid"]), []).append(row)
+
+    flags: list[Flag] = []
+    exempt: list[tuple[Flag, str]] = []
+    problems: list[str] = []
+    for function, rows in by_function.items():
+        new_rows = [r for r in rows if r["nodeid"] in new_ids]
+        if not new_rows:
+            continue
+        for row in rows:
+            for problem in row.get("problems", []):
+                text = f"{row['nodeid']}: {problem}"
+                if text not in problems:
+                    problems.append(text)
+        axis_sizes = axes(new_rows)
+        found: list[Flag] = []
+        if function in scanners:
+            found.append(
+                Flag(function, "scanner", "its parametrize values are built by scanning the repository")
+            )
+        if is_cross_product(len(new_rows), axis_sizes):
+            sizes = ", ".join(f"{k}={v}" for k, v in sorted(axis_sizes.items()))
+            detail = f"{len(new_rows)} ids from axes {sizes} (sum {sum(axis_sizes.values())})"
+            found.append(Flag(function, "cross-product", detail))
+        if not found and is_single_axis_over_budget(len(new_rows), axis_sizes, budget):
+            detail = f"{len(new_rows)} new ids against {budget} changed product lines"
+            found.append(Flag(function, "single-axis", detail))
+        reason = next(
+            (r["large_grid"][0] for r in sorted(rows, key=lambda r: r["nodeid"]) if r.get("large_grid")),
+            None,
+        )
+        for flag in found:
+            if reason is None:
+                flags.append(flag)
+            else:
+                exempt.append((flag, reason))
+    flags.sort(key=lambda f: (f.function, f.rule))
+    exempt.sort(key=lambda e: (e[0].function, e[0].rule))
+    return Report(counts, flags, exempt, problems, duplicates, budget)
+
+
+_TRIM = "trim it, or add @pytest.mark.large_grid(reason=...)"
+
+
+def render_summary(report: Report) -> str:
+    """Markdown for the PR step summary: counts table, then a section for each non-empty list."""
+    lines = [
+        "| File | Functions base → head | Ids base → head | +added | −removed |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for c in report.counts:
+        lines.append(
+            f"| {c.path} | {c.base_functions} → {c.head_functions} | {c.base_ids} → {c.head_ids}"
+            f" | +{c.added_ids} | −{c.removed_ids} |"
+        )
+    totals = report.counts
+    lines.append(
+        f"| **Total** | {sum(c.base_functions for c in totals)} → {sum(c.head_functions for c in totals)}"
+        f" | {sum(c.base_ids for c in totals)} → {sum(c.head_ids for c in totals)}"
+        f" | +{sum(c.added_ids for c in totals)} | −{sum(c.removed_ids for c in totals)} |"
+    )
+
+    def flag_line(flag: Flag) -> str:
+        return f"- `{flag.function}` [{flag.rule}]: {flag.detail}; {_TRIM}"
+
+    blocking = [f for f in report.flags if f.rule in ("scanner", "cross-product")]
+    reported = [f for f in report.flags if f.rule == "single-axis"]
+    if blocking:
+        lines += ["", "### Flagged (blocks once enforced)", ""] + [flag_line(f) for f in blocking]
+    if reported:
+        lines += ["", "### Reported (never blocks)", ""] + [flag_line(f) for f in reported]
+    if report.exempt:
+        lines += ["", "### Justified with large_grid", ""]
+        lines += [f"- `{f.function}` [{f.rule}]: {f.detail}; reason: {why}" for f, why in report.exempt]
+    if report.problems:
+        lines += ["", "### Marker problems", ""] + [f"- {p}" for p in report.problems]
+    if report.duplicates:
+        lines += ["", "### Likely duplicates", ""]
+        lines += [f"- `{a}` and `{b}` (ratio {ratio:.2f})" for a, b, ratio in report.duplicates]
+    if not (report.flags or report.exempt or report.problems or report.duplicates):
+        lines += ["", "Nothing was flagged."]
+    return "\n".join(lines) + "\n"
+
+
+def exit_status(report: Report, *, enforce: bool) -> int:
+    """0 unless enforcing; enforcing, 1 on an unexempted scanner or cross-product flag or any problem."""
+    if not enforce:
+        return 0
+    if report.problems or any(f.rule in ("scanner", "cross-product") for f in report.flags):
+        return 1
+    return 0
