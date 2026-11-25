@@ -59,8 +59,10 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         sorted by name, computed here so the app holds no fixed level of its own; None when the engine cannot be asked
       - body: dict | None — body state projected from the engine's short averages
       - interior: dict — last_dream / last_research / last_heartbeat themes
-      - soul_highlight: dict | None — one crystallization (highest resonance,
-        most recent on tie)
+      - soul_highlight: dict | None — the newest crystallization (the stronger
+        one of a tie), #637
+      - soul_strongest: dict | None — the highest-resonance crystallization (the
+        most recent of a tie), or None when it is soul_highlight itself
       - mode: "live" | "offline" — derived from data availability
       - persona: str — persona name (from persona_dir.name)
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
@@ -81,6 +83,7 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         now = datetime.now(UTC)
     persona_name = persona_dir.name
     connection = _build_connection(persona_dir)
+    soul_highlight, soul_strongest = _build_soul(persona_dir)
     from brain import tunables
 
     return {
@@ -90,7 +93,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
         "feels_high": _build_feels_high(persona_dir),
         "body": _build_body(persona_dir, now=now),
         "interior": _build_interior(persona_dir),
-        "soul_highlight": _build_soul_highlight(persona_dir),
+        "soul_highlight": soul_highlight,
+        "soul_strongest": soul_strongest,
         "pending_writes": _build_pending_writes(persona_dir),
         "connection": connection,
         "mode": "live",
@@ -531,10 +535,27 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
     return out
 
 
-def _build_soul_highlight(persona_dir: Path) -> dict | None:
-    """Pick one crystallization to display: highest resonance, then most recent.
+def _soul_moment(c) -> dict:
+    """One crystallization as the app shows it."""
+    return {
+        "id": c.id,
+        "moment": c.moment,
+        "love_type": c.love_type,
+        "resonance": c.resonance,
+        "crystallized_at": (
+            c.crystallized_at.isoformat() if hasattr(c.crystallized_at, "isoformat") else str(c.crystallized_at)
+        ),
+        "why_it_matters": getattr(c, "why_it_matters", None),
+    }
 
-    None when the soul is empty or the read fails.
+
+def _build_soul(persona_dir: Path) -> tuple[dict | None, dict | None]:
+    """(highlight, strongest): the two crystallizations the Soul tab shows (#637).
+
+    The highlight is the newest active crystallization (the stronger one of two crystallized at the same time), so the
+    tab moves as the soul grows and the app's new-crystallization flash, which watches its id, fires. The strongest is
+    the highest-resonance one (the most recent of a tie), or None when it is the highlight itself. Both None when the
+    soul is empty or the read fails.
     """
     try:
         from brain.soul.store import SoulStore
@@ -542,28 +563,13 @@ def _build_soul_highlight(persona_dir: Path) -> dict | None:
         store = SoulStore(persona_dir / "crystallizations.db")
         try:
             actives = store.list_active()
-            if not actives:
-                return None
-            # sort by (resonance desc, crystallized_at desc)
-            actives.sort(
-                key=lambda c: (c.resonance, c.crystallized_at),
-                reverse=True,
-            )
-            top = actives[0]
-            return {
-                "id": top.id,
-                "moment": top.moment,
-                "love_type": top.love_type,
-                "resonance": top.resonance,
-                "crystallized_at": (
-                    top.crystallized_at.isoformat()
-                    if hasattr(top.crystallized_at, "isoformat")
-                    else str(top.crystallized_at)
-                ),
-                "why_it_matters": getattr(top, "why_it_matters", None),
-            }
         finally:
             store.close() if hasattr(store, "close") else None
+        if not actives:
+            return None, None
+        newest = max(actives, key=lambda c: (c.crystallized_at, c.resonance))
+        strongest = max(actives, key=lambda c: (c.resonance, c.crystallized_at))
+        return _soul_moment(newest), (None if strongest.id == newest.id else _soul_moment(strongest))
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: soul highlight read failed", exc_info=True)
-        return None
+        return None, None
