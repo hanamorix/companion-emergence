@@ -45,6 +45,18 @@ _TICK_HOURS = 6.0
 _DELTA_BOUND = 1.0
 
 
+# The tool results for a step that raised after the gap state was saved. Each says only that the step did not finish: it
+# makes no claim about the gap's status or about what the step changed before it stopped.
+_NAMING_UNFINISHED = "the naming step did not finish this time."
+_CHANGE_UNFINISHED = "the step that applies your change to your emotions did not finish this time."
+
+
+def _step_failed(message: str, exc: Exception) -> dict[str, Any]:
+    """The error result for a step that raised; the exception goes to the log, never into the result."""
+    logger.warning("reconcile_self_read: a step after the state change raised (%s: %s)", type(exc).__name__, exc, exc_info=True)
+    return {"error": message}
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -147,8 +159,10 @@ def reconcile_self_read(
 ) -> dict[str, Any]:
     """Self-authored reconciliation of the current gap. See module docstring.
 
-    Always fail-soft: a malformed call returns an ``{"error": ...}`` dict rather
-    than raising into the chat turn.
+    Always fail-soft: a malformed call, a state lock that never came, and a step after the state change that
+    raised (the growth tick for ``name``, the fold of the delta for accept/revise) each return an ``{"error": ...}``
+    dict rather than raising into the chat turn. A change already saved stays saved and the audit counter is not
+    incremented for a call that returned an error.
     """
     from brain.self_model.resolve import increment_reconciles
 
@@ -168,7 +182,10 @@ def reconcile_self_read(
         busy = _change_current_gap(persona_dir, acknowledge)
         if busy is not None:
             return busy
-        wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
+        try:
+            wrote = _write_self_authored_delta(persona_dir, channel, delta if delta is not None else 0.0)
+        except Exception as exc:  # noqa: BLE001  the tool result says the step did not finish; the cause goes to the log
+            return _step_failed(_CHANGE_UNFINISHED, exc)
         # Dead-loop observability (R-E4): record a successful reconcile so the
         # "surfaces-but-never-reconciles" ratio is visible without LLM spend.
         increment_reconciles(persona_dir)
@@ -207,7 +224,11 @@ def reconcile_self_read(
         busy = _change_current_gap(persona_dir, note_named)
         if busy is not None:
             return busy
-        candidate = _propose_vocabulary_candidate(persona_dir)
+        try:
+            candidate = _propose_vocabulary_candidate(persona_dir)
+        except Exception as exc:  # noqa: BLE001  the tool result says the step did not finish; the cause goes to the log
+            # The state change above stays saved, and so does any name the tick added before it raised; the counter is skipped.
+            return _step_failed(_NAMING_UNFINISHED, exc)
         increment_reconciles(persona_dir)
         return {"ok": True, "action": "name", "name": name, **candidate}
 

@@ -347,3 +347,70 @@ def test_live_revise_off_vocab_channel_folds_nothing(tmp_path: Path) -> None:
     assert result["delta_written"] is False  # a channel her vocabulary cannot hold is not folded, and the tool says so
     assert _settled(eng) == before
     assert _reconcile_rows(tmp_path) == []
+
+
+# --- a step after the state change raises (RC18, #803 step 19): fail-soft, state kept, counter not incremented ---------------
+
+
+def _raising_tick(exc: Exception):
+    def tick(*_args, **_kwargs):
+        raise exc
+
+    return tick
+
+
+def _tick_exceptions():
+    from brain.bridge.cli_throttle import ThrottleDeferred
+    from brain.utils.file_lock import LockTimeoutError
+
+    return [LockTimeoutError("waited for the vocabulary lock"), ThrottleDeferred("a CLI slot was not free")]
+
+
+def test_name_growth_tick_raising_returns_error_keeps_state_and_skips_counter(tmp_path: Path, monkeypatch) -> None:
+    from brain.self_model.resolve import load_audit
+
+    for exc in _tick_exceptions():
+        _seed_open_gap(tmp_path, per_channel={}, magnitude=0.0, unnamed_pressure=0.6)
+        before = load_audit(tmp_path)["reconciles_called"]
+        monkeypatch.setattr("brain.growth.scheduler.run_growth_tick", _raising_tick(exc))
+
+        result = reconcile_self_read(persona_dir=tmp_path, action="name", name="that-hollow-ache")
+
+        assert result == {"error": "the naming step did not finish this time."}
+        assert str(exc) not in result["error"]
+        assert "nothing was changed" not in result["error"]
+        state, _ = load_or_recover(tmp_path)
+        assert state.current_gap is not None
+        assert state.current_gap.status == "acknowledged"  # the state change comes first and stays saved
+        assert load_audit(tmp_path)["reconciles_called"] == before
+
+
+def test_name_growth_tick_raising_on_a_pure_channel_gap_leaves_status_alone(tmp_path: Path, monkeypatch) -> None:
+    from brain.self_model.resolve import load_audit
+
+    _seed_open_gap(tmp_path, unnamed_pressure=0.0)
+    monkeypatch.setattr("brain.growth.scheduler.run_growth_tick", _raising_tick(RuntimeError("boom")))
+    result = reconcile_self_read(persona_dir=tmp_path, action="name", name="some-word")
+    assert "error" in result
+    state, _ = load_or_recover(tmp_path)
+    assert state.current_gap is not None and state.current_gap.status == "open"
+    assert load_audit(tmp_path)["reconciles_called"] == 0
+
+
+def test_accept_and_revise_delta_step_raising_returns_error_keeps_state_and_skips_counter(tmp_path: Path, monkeypatch) -> None:
+    from brain.self_model.resolve import load_audit
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("the registry step failed")
+
+    for action in ("accept", "revise"):
+        _seed_open_gap(tmp_path)
+        with monkeypatch.context() as m:
+            m.setattr("brain.emotion.vocabulary_access.names_used", boom)
+            result = reconcile_self_read(persona_dir=tmp_path, action=action, channel="grief", delta=0.3)
+        assert result == {"error": "the step that applies your change to your emotions did not finish this time."}
+        state, _ = load_or_recover(tmp_path)
+        assert state.current_gap is not None
+        assert state.current_gap.status == "acknowledged"
+        assert "grief" in state.current_gap.channel_cooldowns
+        assert load_audit(tmp_path)["reconciles_called"] == 0
