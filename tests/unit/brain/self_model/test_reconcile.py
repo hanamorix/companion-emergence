@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from brain.self_model.gap import Gap
 from brain.self_model.reconcile import reconcile_self_read
 from brain.self_model.state import SelfModelState, load_or_recover, save
@@ -514,6 +516,7 @@ def test_a_lock_timeout_or_a_bug_inside_the_engine_is_an_error_not_a_written_cha
         assert result == {"error": f"{_CHANGE_STEM}: {reason}"}
 
 
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds and that RE19 keeps: a change dropped whole for its names is delta_written false with no error")
 def test_a_change_dropped_whole_for_its_names_is_false_with_no_error(tmp_path: Path) -> None:
     _go_live(tmp_path, joy=5.0)
     _seed_open_gap(tmp_path, per_channel={"zorblesque": 4.0})
