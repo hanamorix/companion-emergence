@@ -164,6 +164,45 @@ python scripts/new_tests_fail_on_base.py --base origin/main --workers 0
 
 `--only <text>` limits a local run to changed test files whose path contains the text; `--mark-expr "<expr>"` adds a `-m` expression to every pytest call.
 
+## Test growth: keep grids and scans small
+
+Every parametrized id is a test the suite collects, runs and reports. A grid that grows with the repository, or crosses several axes, can add hundreds of ids for one idea. The `test growth guard` check (the `test-growth-guard` job in `test.yml`, pull requests only) lists what your PR adds. It collects the test files the PR changes at the merge-base and at the head, counts functions and ids for each, and writes the result to the job's step summary.
+
+**During the trial nothing blocks.** The job is report-only. After the trial, the two flags below will block unless you justify them.
+
+**The two flags that will block** (on new test functions only, meaning functions with at least one new id):
+
+- **Scanner.** The parametrize values are built at collection time from the repository: the values argument is not a literal list or tuple, and it calls (or names a module-level value built by calling) `glob`, `rglob`, `iterdir`, `os.listdir`, `os.scandir`, `os.walk`, or a `git ls-files` subprocess. Each scanned file adds an id, so the count grows with the repository.
+- **Cross-product.** Two or more parametrize axes, and more ids than the sum of the axis sizes. 2×2 gives 4 ids against 4 and isn't flagged; 2×3 gives 6 against 5 and is.
+
+**Reported, never blocking.** A single-axis grid whose new ids outnumber the PR's changed product lines (non-blank added or removed lines in `.py`, `.ts`, `.tsx` and `.rs` files outside tests). Likely duplicate tests, whose bodies match once names and literals are normalised, are listed too. Both are hints for the reviewer: a small grid on a small fix is often good testing, and a duplicate may be a deliberate copy.
+
+**The usual fix is one test that checks every item and reports all failures together:**
+
+```python
+def test_every_script_reads_files_as_utf8():
+    failures = [str(p) for p in sorted(SCRIPTS.glob("*.py")) if "read_text()" in p.read_text(encoding="utf-8")]
+    assert not failures, f"read_text() without encoding in: {failures}"
+```
+
+You keep the coverage, you see every failure at once instead of one per id, and the suite doesn't grow when someone adds a file.
+
+**When a big grid is right** (each case really is a separate behaviour, and a failure in one must not hide the others), keep it and say why on the test function:
+
+```python
+@pytest.mark.large_grid(reason="each provider is a separate wire format; one failing must not hide the rest")
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_provider_round_trips(provider): ...
+```
+
+The reason is mandatory. Mark the function, not a class, module or `pytest.param`; a `large_grid` mark with no reason, or on one of those, is a problem the guard reports on its own. A marked flag is listed as an exemption with its reason, so it stays visible.
+
+**Run it locally** (it works in its own temporary git worktrees, so commit first):
+
+```bash
+python scripts/guard_test_growth.py --base origin/main --head HEAD
+```
+
 ## One value, one place: the shared-settings guard
 
 A user tunable (`tunables.register`, read through `tunables.get_tunable`) and a developer constant (`brain/dev_constants.py`) are meant to live in one place, so changing the setting changes it everywhere. `tests/unit/test_shared_settings_guard.py` fails when code in `brain/` writes to a setting from outside its owner (an attribute store, `setattr`, a rebinding of an imported name, or `set_values` outside the sanctioned writers), defines a constant with the same name, repeats its value (a number or a string distinctive enough to be recognised, a list of the same strings, or a value bound to a name that carries the setting's words), passes a literal as the default of `get_tunable`, keeps a `get_tunable` result somewhere that outlives the call (module or class level, a default argument, an attribute, a cache), or makes a second name for a developer constant (a module-level alias, or a default argument that is a developer constant). In the app's TypeScript and Rust it only looks for a number or a string that mirrors a setting, and for model names. The model-choice rules of the old model guard are one case of it. Read a setting where you use it (`tunables.get_tunable(key, _DEFAULT)` or `dev_constants.NAME` inside the function), and do not copy it.

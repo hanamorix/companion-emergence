@@ -261,6 +261,41 @@ jobs:
           base="$(git merge-base HEAD "origin/${BASE_REF}")"
           uv run python scripts/new_tests_fail_on_base.py --base "$base" --head HEAD --workers auto
 
+  # #746: the test-growth guard. It lists the tests a PR adds, flags grids built by scanning the repository and
+  # cross-product grids, and reports the rest. Report-only during the trial: `continue-on-error: true` comes off
+  # in the PR that adds `--enforce`. What it flags and how to justify it: CONTRIBUTING.md, "Test growth: keep grids
+  # and scans small". Pull requests only (a push to main has no base to compare with).
+  test-growth-guard:
+    name: test growth guard
+    if: github.event_name == 'pull_request'
+    continue-on-error: true
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the PR head with its history
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run the test-growth guard
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          base="$(git merge-base HEAD "origin/${BASE_REF}")"
+          uv run python scripts/guard_test_growth.py --base "$base" --head HEAD
+
   # #363: the shipped runtime is Python 3.13 (app/build_python_runtime.sh) but
   # the job above runs 3.12. The bridge tests (threads, sockets, streaming, the
   # past order-dependent flakes) are the ones most likely to behave differently,

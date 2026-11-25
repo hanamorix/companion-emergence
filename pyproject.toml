@@ -128,7 +128,8 @@ addopts = '-m "not live and not requires_claude_cli"'
 timeout = 600
 markers = [
     "no_base_failure(reason): a new test that passes on the code the PR started from by design (a refactor guard, test infrastructure); exempt from the new-tests-must-fail-on-base check (#540, CONTRIBUTING.md). The reason is mandatory.",
-    "slow(reason): a test whose call phase legitimately uses more than 2 s of CPU time; without it the CI slow-test budget (ubuntu job) (tests/slow_budget.py) fails the test. The reason is mandatory and the number of marks is pinned and can only go down (#540).",
+    "large_grid(reason): a new parametrized or scanning test kept on purpose; exempts it from the test-growth guard's flags (#746, CONTRIBUTING.md). The reason is mandatory and the mark goes on the test function.",
+    "slow(reason):a test whose call phase legitimately uses more than 2 s of CPU time; without it the CI slow-test budget (ubuntu job) (tests/slow_budget.py) fails the test. The reason is mandatory and the number of marks is pinned and can only go down (#540).",
     "real_rebuild_step(reason): a test of the start's rebuild step (brain.bridge.daemon._rebuild_under_lock) or of a command that really calls register_command_run; tests/conftest.py then lets it reach the real rebuild step and replaces the daemon's Popen with a recorder (a rebuild child is never spawned for real). The reason is mandatory and the mark goes on the test itself.",
     "real_rebuild_child(reason): the one test that lets the production step spawn the real rebuild child (a real interpreter start), on every CI leg; carried together with real_rebuild_step. The reason is mandatory and the mark goes on the test itself.",
     "unit: unit tests",
