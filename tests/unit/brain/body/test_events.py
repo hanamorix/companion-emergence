@@ -1,6 +1,6 @@
 """Unit tests for brain/body/events.py — record_climax_event helper.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §5.1.
 """
 
 from __future__ import annotations

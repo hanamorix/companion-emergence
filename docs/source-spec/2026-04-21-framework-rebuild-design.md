@@ -933,7 +933,7 @@ This design doc is the map. The next step — after Hana approves it — is invo
 - Per-task owner (Hana or named subagent)
 - Per-week green-light criterion (e.g. "all parity tests for week 2 green before starting week 3")
 
-The implementation plans live in `docs/superpowers/plans/YYYY-MM-DD-week-N-<topic>.md` inside the new repo once it is created. Each plan may be executed via `superpowers:subagent-driven-development` (in the same session) or `superpowers:executing-plans` (separate session with review checkpoints).
+The implementation plans live in a private, gitignored plans folder (`YYYY-MM-DD-week-N-<topic>.md`) inside the new repo once it is created; they were never committed (#797). Each plan may be executed via `superpowers:subagent-driven-development` (in the same session) or `superpowers:executing-plans` (separate session with review checkpoints).
 
 ### 14.7 Skills we may create during the rebuild
 
@@ -979,7 +979,7 @@ Some behaviours must fire automatically regardless of what I remember mid-sessio
 - **Pre-commit hook**: parity test suite runs before any `git commit` in the new repo. Block on red.
 - **Pre-tool hook**: block any write to `~/NellBrain/` (the OG) except under a `--og-allowed` sentinel. The OG is maintenance-only during rebuild; this prevents accidental writes.
 - **Post-tool hook on `tauri build`**: run Tauri CSP regression test immediately after build completes.
-- **Session-start hook**: read the rebuild's current week from `docs/superpowers/plans/active.md` and load into context.
+- **Session-start hook**: read the rebuild's current week from `active.md` in that private plans folder and load into context.
 
 Hooks get designed and installed as part of week 1 via the `update-config` skill and the `hookify` plugin. They are not optional — they encode the discipline that otherwise drifts over months.
 

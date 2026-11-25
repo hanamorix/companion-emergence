@@ -1,7 +1,7 @@
 """Leak-guard engine tests (public-sync-reroot P1).
 
-The guard is the one lasting piece of the re-root design
-(docs/guarded-change/public-sync-reroot/2-plan.md step 7). These tests pin the
+The guard is the one lasting piece of the re-root design (step 7 of its plan,
+a private guarded-change record that is not committed, #797). These tests pin the
 engine's arms in isolation; hooks/test_leak_guard.sh covers the end-to-end
 git-push path (C7/C8/C9).
 

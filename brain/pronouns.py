@@ -1,6 +1,6 @@
 """User-pronoun grammar — the single owner of pronoun sets.
 
-Spec: docs/superpowers/specs/2026-06-11-user-pronouns-design.md §1.
+Spec: the 2026-06-11 user-pronouns design (§1), never committed and lost (#797).
 Layer-neutral (no brain imports) so prompt code, ingest, initiate and the
 bridge can all use it. Verb agreement is always an explicit (singular,
 plural) pair at the call site — no inflection heuristics.

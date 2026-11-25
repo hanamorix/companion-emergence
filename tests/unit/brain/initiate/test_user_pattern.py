@@ -1242,3 +1242,137 @@ def test_621_hour_histogram_counts_only_the_user_rows(tmp_path: Path) -> None:
     hour_counts, _threshold = _build_hour_histogram(persona_dir, _now=_T621_NOW)
 
     assert hour_counts == _user_only_hour_counts(user_times)
+
+
+# --- #804: the histogram counts the archived sessions too ------------------------------------------------------------
+# A closed session's buffer is archived in full (``_archive_buffer``) and then deleted, so the live folder holds only the
+# sessions not yet closed. The 30 days of turns the histogram counts are in ``archived_conversations/``.
+
+_T804_NOW = datetime(2026, 1, 15, 14, 30, 0, tzinfo=UTC)
+
+
+def _write_rows(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _user_row(ts: datetime, text: str = "hi") -> dict:
+    return {"speaker": "user", "text": text, "ts": ts.isoformat()}
+
+
+def _daily_user_turns(hour: int, days: range, per_day: int) -> list[datetime]:
+    """``per_day`` user turns at ``hour`` UTC on each day before _T804_NOW in ``days``, a minute apart."""
+    return [
+        datetime(2026, 1, 15, hour, m, 0, tzinfo=UTC) - timedelta(days=d) for d in days for m in range(per_day)
+    ]
+
+
+def _hour_counts(times: list[datetime]) -> list[int]:
+    counts = [0] * 24
+    for ts in times:
+        counts[ts.astimezone().hour] += 1
+    return counts
+
+
+def test_804_the_daily_recompute_builds_the_histogram_from_archived_sessions(tmp_path: Path) -> None:
+    """Through compute_user_presence: every session is closed, so all 30 days of history are in the archive."""
+    from brain.initiate.user_pattern import compute_user_presence
+
+    archive = tmp_path / "archived_conversations"
+    user_times = _daily_user_turns(14, range(1, 30), 2)  # 58 user turns at 14:00 UTC, all inside the 30-day window
+    for i, ts in enumerate(user_times):
+        _write_rows(archive / f"sess_{i % 6}.000.jsonl", [_user_row(ts), {"speaker": "assistant", "text": "x", "ts": ts.replace(hour=2).isoformat()}])
+    # User turns at 02:00 UTC older than the 30-day window, which must not count.
+    _write_rows(archive / "sess_old.jsonl", [_user_row(ts) for ts in _daily_user_turns(2, range(31, 61), 2)])
+    (archive / "sess_dir.000.jsonl").mkdir()  # not a file: skipped
+    (tmp_path / "active_conversations").mkdir()
+
+    at_peak = compute_user_presence(tmp_path, _now=_T804_NOW)
+    off_peak = _T804_NOW.replace(hour=2)
+    assert off_peak.astimezone().hour != _T804_NOW.astimezone().hour
+    # The histogram was built at the first call; the second reads it from the presence state.
+    assert at_peak.likely_active is True
+    assert compute_user_presence(tmp_path, _now=off_peak).likely_active is False
+
+
+def test_804_one_open_session_does_not_become_the_whole_pattern(tmp_path: Path) -> None:
+    """An open session holding 50 user turns from one day must not make every other hour look inactive."""
+    from brain.initiate import presence_state
+    from brain.initiate.user_pattern import _run_daily_presence_recompute, compute_user_presence
+
+    today = [datetime(2026, 1, 15, 10, m, 0, tzinfo=UTC) for m in range(50)]
+    _write_rows(tmp_path / "active_conversations" / "sess_open.jsonl", [_user_row(ts) for ts in today])
+    earlier = _daily_user_turns(20, range(1, 30), 2)
+    _write_rows(tmp_path / "archived_conversations" / "sess_closed.000.jsonl", [_user_row(ts) for ts in earlier])
+
+    _run_daily_presence_recompute(tmp_path, _now=_T804_NOW)
+
+    assert list(presence_state.load_presence_state(tmp_path).hour_counts) == _hour_counts(today + earlier)
+    evening = _T804_NOW.replace(hour=20)
+    assert compute_user_presence(tmp_path, _now=evening).likely_active is True
+
+
+def _write_repeated_turns(persona_dir: Path) -> list[datetime]:
+    """58 distinct user turns inside the window, with copies in several files, as a crash-retried close and a retained
+    buffer leave them."""
+    times = _daily_user_turns(9, range(1, 30), 1) + _daily_user_turns(21, range(1, 30), 1)
+    rows = [_user_row(ts, text=f"turn {i}") for i, ts in enumerate(times)]
+    archive = persona_dir / "archived_conversations"
+    _write_rows(archive / "sess_a.000.jsonl", rows[:40])
+    _write_rows(archive / "sess_a.000.jsonl", rows[:40])  # the same batch again: a crash between append and marker
+    _write_rows(archive / "sess_a.001.jsonl", rows[20:])  # a later close of the retained buffer
+    _write_rows(persona_dir / "active_conversations" / "sess_a.jsonl", rows[48:])  # still in the live buffer
+    return times
+
+
+def test_804_a_turn_archived_more_than_once_is_counted_once(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _daily_scan_conversations
+
+    times = _write_repeated_turns(tmp_path)
+
+    hour_counts, _threshold, _latest = _daily_scan_conversations(tmp_path, _now=_T804_NOW)
+
+    assert hour_counts == _hour_counts(times)
+
+
+def test_804_the_reference_histogram_reads_the_archive_too(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _build_hour_histogram
+
+    times = _write_repeated_turns(tmp_path)
+
+    hour_counts, _threshold = _build_hour_histogram(tmp_path, _now=_T804_NOW)
+
+    assert hour_counts == _hour_counts(times)
+
+
+def test_804_an_archived_file_last_written_before_the_window_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file's rows are no later than its last write, so a file last written before the window holds none of its turns."""
+    import os
+
+    from brain.initiate import user_pattern
+
+    archive = tmp_path / "archived_conversations"
+    old = archive / "sess_old.000.jsonl"
+    recent = archive / "sess_new.000.jsonl"
+    _write_rows(old, [_user_row(ts) for ts in _daily_user_turns(3, range(40, 45), 1)])
+    _write_rows(recent, [_user_row(ts) for ts in _daily_user_turns(14, range(1, 3), 1)])
+    written = (_T804_NOW - timedelta(days=31)).timestamp()
+    os.utime(old, (written, written))
+    os.utime(recent, (_T804_NOW.timestamp(), _T804_NOW.timestamp()))
+
+    read: list[str] = []
+    real_iter_jsonl = user_pattern.iter_jsonl
+
+    def recording_iter_jsonl(path, *args, **kwargs):
+        read.append(Path(path).name)
+        return real_iter_jsonl(path, *args, **kwargs)
+
+    monkeypatch.setattr(user_pattern, "iter_jsonl", recording_iter_jsonl)
+    user_pattern._daily_scan_conversations(tmp_path, _now=_T804_NOW)
+    user_pattern._build_hour_histogram(tmp_path, _now=_T804_NOW)
+
+    assert read == ["sess_new.000.jsonl", "sess_new.000.jsonl"]

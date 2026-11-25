@@ -333,7 +333,7 @@ export function ConnectionPanel({
         onChange={onReducedMotionChange}
       />
       {/* Extended-reasoning toggle removed in v0.0.26 — monologue is always on now.
-          See docs/superpowers/specs/2026-05-30-inner-monologue-tool-call-design.md §6. */}
+          The 2026-05-30 inner-monologue tool-call design (§6) was never committed and is lost (#797). */}
 
       <Divider />
       {claudePersona && <SectionLabel>Model</SectionLabel>}

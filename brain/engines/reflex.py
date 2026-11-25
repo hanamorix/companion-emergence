@@ -1,6 +1,6 @@
 """Reflex — autonomous emotional-threshold creative expression.
 
-See docs/superpowers/specs/2026-04-24-week-4-reflex-engine-design.md.
+Its design (the 2026-04-24 week-4 reflex design) was never committed and is lost (#797).
 This module ships the types, loaders, and engine scaffold. run_tick
 evaluation + firing logic lands in Task 2.
 """

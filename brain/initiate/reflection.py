@@ -1,6 +1,6 @@
 """D-reflection: editorial layer between candidate emission and composition.
 
-Spec: docs/superpowers/specs/2026-05-12-initiate-d-reflection-design.md
+Spec: the 2026-05-12 initiate D-reflection design, never committed and lost (#797).
 
 Once per non-empty heartbeat tick, D reads queued candidates and decides
 which (if any) deserve to flow to the three-prompt composition pipeline.

@@ -3,7 +3,7 @@
 All threshold/decay/scale values from the spec §3, §4, §5 live here so
 callers and tests can reference a single source.
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md
+Spec: the 2026-05-19 grief design, never committed and lost (#797).
 """
 
 from __future__ import annotations

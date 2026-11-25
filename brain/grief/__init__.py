@@ -15,7 +15,7 @@ call sites:
         Called by chat.prompt._build_recall_block, tools.dispatch (after
         recall_forgotten resolves), and narrative_memory membership refresh.
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md
+Spec: the 2026-05-19 grief design, never committed and lost (#797).
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """Ops-tier tunables: the install's settings file, ``$KINDLED_HOME/tunables.toml``.
 
-Spec: docs/superpowers/specs/2026-07-04-ops-tunables-design.md (reshaped in #529)
+Spec: the 2026-07-04 ops-tunables design (reshaped in #529), never committed and lost (#797).
 
 Call sites register their key at import time and read at call time:
 

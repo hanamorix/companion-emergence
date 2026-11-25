@@ -29,8 +29,7 @@ The rolling-size and yearly functions:
 * Leave the active log intact on partial failure — the alternative is
   silently losing audit data.
 
-Spec: docs/superpowers/specs/2026-05-11-jsonl-log-retention-design.md
-Plan: docs/superpowers/plans/2026-05-11-jsonl-log-retention.md
+Spec and plan: the 2026-05-11 JSONL log-retention design and plan, never committed and lost (#797).
 """
 
 from __future__ import annotations
