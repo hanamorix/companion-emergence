@@ -281,6 +281,11 @@ def test_a_failing_product_diff_is_a_git_error(runs: dict[str, Outcome]) -> None
     assert "git diff" in runs["diff_error"].out and "failed" in runs["diff_error"].out
 
 
+def test_the_one_line_outcomes_print_no_trailing_blank_line(runs: dict[str, Outcome]) -> None:
+    assert runs["product_only"].out.endswith("no test changes\n")
+    assert not runs["broken"].out.endswith("\n\n")
+
+
 def test_no_test_changes_and_cant_judge_reach_the_step_summary(runs: dict[str, Outcome]) -> None:
     assert runs["product_only"].code == 0
     assert "no test changes" in runs["product_only"].summary

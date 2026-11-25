@@ -174,7 +174,7 @@ def run(repo: Path, base: str, head: str, *, enforce: bool) -> int:
     try:
         report = _judge(repo, base, head, files, renamed, deleted, scratch)
     except CannotJudgeError as err:
-        _emit(f"the guard can't judge this PR: {err}\n")
+        _emit(f"the guard can't judge this PR: {str(err).rstrip()}\n")
         return 1
     finally:
         for tree in (scratch / "head", scratch / "base"):
@@ -188,7 +188,7 @@ def run(repo: Path, base: str, head: str, *, enforce: bool) -> int:
 
 def _emit(text: str) -> None:
     """Print ``text`` and append it to ``$GITHUB_STEP_SUMMARY`` when that is set."""
-    print(text)
+    print(text, end="" if text.endswith("\n") else "\n")
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:
         with open(target, "a", encoding="utf-8") as handle:
