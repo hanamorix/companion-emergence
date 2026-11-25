@@ -317,7 +317,12 @@ def likely_duplicates(
             if a == b or pair in seen or len(b_tokens) < min_tokens:
                 continue
             seen.add(pair)
-            ratio = difflib.SequenceMatcher(None, a_tokens, b_tokens, autojunk=False).ratio()
+            # a is the new body, b the pool body: ratio() is not symmetric, so the order is fixed. The two quick
+            # ratios are upper bounds of ratio(), so a pair under either can't reach the threshold.
+            sm = difflib.SequenceMatcher(None, a_tokens, b_tokens, autojunk=False)
+            if sm.real_quick_ratio() < threshold or sm.quick_ratio() < threshold:
+                continue
+            ratio = sm.ratio()
             if ratio >= threshold:
                 found.append((a, b, ratio))
     return sorted(found, key=lambda t: -t[2])
