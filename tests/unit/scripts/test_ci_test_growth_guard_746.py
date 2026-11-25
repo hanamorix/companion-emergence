@@ -48,6 +48,17 @@ def test_the_guard_job_runs_the_script_without_enforce():
 
 
 @_HEAD_ONLY
+def test_a_branch_without_the_script_gets_a_notice_and_a_crash_cannot_turn_the_check_red():
+    (step,) = [s for s in JOBS["test-growth-guard"]["steps"] if "guard_test_growth.py" in s.get("run", "")]
+    first = step["run"].lstrip().splitlines()[0]
+    assert first == (
+        'if [ ! -f scripts/guard_test_growth.py ]; then echo "::notice::this branch predates the test-growth guard;'
+        ' merge main to get its report"; exit 0; fi'
+    )
+    assert step["continue-on-error"] is True
+
+
+@_HEAD_ONLY
 def test_the_large_grid_marker_is_registered_with_a_mandatory_reason():
     data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
     markers = data["tool"]["pytest"]["ini_options"]["markers"]

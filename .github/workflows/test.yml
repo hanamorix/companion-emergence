@@ -289,10 +289,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
+      # The step-level continue-on-error keeps a guard crash from showing as a red check during the trial; the
+      # presence check covers open PRs whose branch predates the script (the workflow runs merged with main).
       - name: Run the test-growth guard
+        continue-on-error: true
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
+          if [ ! -f scripts/guard_test_growth.py ]; then echo "::notice::this branch predates the test-growth guard; merge main to get its report"; exit 0; fi
           base="$(git merge-base HEAD "origin/${BASE_REF}")"
           uv run python scripts/guard_test_growth.py --base "$base" --head HEAD
 
