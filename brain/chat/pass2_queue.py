@@ -51,8 +51,8 @@ drain_all_locked(persona_dir, *, should_pause=None, on_progress=None,
     including the first — never before/during one). Returns the count run.
     Two callers in this codebase: the bridge supervisor's central cadence
     function (the pass-2 gated job, ram-spike-fix INC-9 — first in the S55
-    order, run at every idle pass while the queue is non-empty, with
-    ``should_pause`` = "chat is not idle") and ``nell chat --no-bridge``'s
+    order, run at every central pass while the queue is non-empty and no reply is in flight, #817,
+    with ``should_pause`` = "a stop was requested or a reply is in flight") and ``nell chat --no-bridge``'s
     exit drain (cli.py, S78/S80 — no ``should_pause`` at all, a bounded
     ``time_budget_s`` instead).
 drain_pending(persona_dir, max_items=None) -> int

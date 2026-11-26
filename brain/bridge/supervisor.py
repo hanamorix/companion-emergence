@@ -1085,7 +1085,8 @@ def _build_gated_jobs(
             return JobOutcome.SKIPPED
         # INC-10 (C8): drained something but the saved queue (S64, the queue
         # file itself IS pass 2's saved progress) still has items — the
-        # between-items hook stopped the drain for chat, not an empty queue.
+        # between-items hook stopped the drain (a reply started, or a stop was
+        # requested), not an empty queue.
         if pass2_queue.queue_length(persona_dir) > 0:
             return JobOutcome.PAUSED
         return JobOutcome.COMPLETED
